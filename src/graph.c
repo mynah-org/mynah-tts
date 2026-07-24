@@ -698,9 +698,8 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
         if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
         layer_norm(x, nrm, 1u, width, t.data);
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.self_attention.qkv_net.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, nrm, qkv, 1u, width, width * 3u, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, qkv,
+                              1u, width, width * 3u, NULL, error, error_capacity) != 0) { failed = 1; break; }
         float *kb = cache->k + layer * cache->capacity * width;
         float *vb = cache->v + layer * cache->capacity * width;
         memcpy(kb + p * width, qkv + width, width * sizeof(float));
@@ -726,22 +725,19 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
             }
         }
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.self_attention.o_net.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, attn, proj, 1u, width, width, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, attn, proj,
+                              1u, width, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t d = 0; d < width; ++d) x[d] += proj[d];
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.norm_pos_ff.weight", layer);
         if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
         layer_norm(x, nrm, 1u, width, t.data);
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.pos_ff.proj.conv.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, nrm, hidden, 1u, width, ffn, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, hidden,
+                              1u, width, ffn, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t i = 0; i < ffn; ++i) hidden[i] = gelu_tanh(hidden[i]);
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.pos_ff.o_net.conv.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, hidden, proj, 1u, ffn, width, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, hidden, proj,
+                              1u, ffn, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t d = 0; d < width; ++d) x[d] += proj[d];
     }
     if (!failed) memcpy(out_row, x, width * sizeof(float));
@@ -1385,9 +1381,8 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
         layer_norm(x, nrm, count, width, t.data);
         snprintf(name, sizeof(name), "decoder.layers.%zu.self_attention.qkv_net.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, nrm, qkv, count, width, width * 3u, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, qkv,
+                              count, width, width * 3u, NULL, error, error_capacity) != 0) { failed = 1; break; }
         float *kbase = cache->self_k + layer * cache->capacity * width;
         float *vbase = cache->self_v + layer * cache->capacity * width;
         for (size_t i = 0; i < count; ++i) {
@@ -1443,18 +1438,16 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             }
         }
         snprintf(name, sizeof(name), "decoder.layers.%zu.self_attention.o_net.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, attn, proj, count, width, width, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, attn, proj,
+                              count, width, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* cross-attention over cached text memory */
         snprintf(name, sizeof(name), "decoder.layers.%zu.norm_xattn_query.weight", layer);
         if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
         layer_norm(x, nrm, count, width, t.data);
         snprintf(name, sizeof(name), "decoder.layers.%zu.cross_attention.q_net.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, nrm, q_x, count, width, xw, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, q_x,
+                              count, width, xw, NULL, error, error_capacity) != 0) { failed = 1; break; }
         const float *ck = cache->cross_k + layer * cache->memory_length * xw;
         const float *cv = cache->cross_v + layer * cache->memory_length * xw;
         for (size_t i = 0; i < count; ++i) {
@@ -1478,23 +1471,20 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             }
         }
         snprintf(name, sizeof(name), "decoder.layers.%zu.cross_attention.o_net.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, xctx, proj, count, xw, width, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, xctx, proj,
+                              count, xw, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* position-wise FFN (kernel size 1) */
         snprintf(name, sizeof(name), "decoder.layers.%zu.norm_pos_ff.weight", layer);
         if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
         layer_norm(x, nrm, count, width, t.data);
         snprintf(name, sizeof(name), "decoder.layers.%zu.pos_ff.proj.conv.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, nrm, hidden, count, width, ffn, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, hidden,
+                              count, width, ffn, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * ffn; ++k) hidden[k] = gelu_tanh(hidden[k]);
         snprintf(name, sizeof(name), "decoder.layers.%zu.pos_ff.o_net.conv.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
-            linear(model->backend, hidden, proj, count, ffn, width, t.data, NULL,
-                   error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, hidden, proj,
+                              count, ffn, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
     }
     if (!failed) {

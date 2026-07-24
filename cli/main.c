@@ -1,6 +1,7 @@
 #include "audio.h"
 #include "kernels.h"
 #include "mynah_tts.h"
+#include "qmat.h"
 
 #include <math.h>
 #include <errno.h>
@@ -331,6 +332,10 @@ int main(int argc, char **argv) {
         char error[256];
         if (mynah_kernels_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_qmat_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "qmat self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_tts_device_self_test(MYNAH_TTS_DEVICE_CPU, error, sizeof(error)) != 0) {

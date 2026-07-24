@@ -4,6 +4,7 @@
 #include "mynah_tts.h"
 #include "backend.h"
 #include "safetensors.h"
+#include "qmat.h"
 
 struct mynah_tts_model {
     char *model_dir;
@@ -11,6 +12,7 @@ struct mynah_tts_model {
     mynah_safetensors *tts;
     mynah_safetensors *codec;
     mynah_backend *backend;
+    mynah_qmat_cache *qcache;
 };
 
 #endif

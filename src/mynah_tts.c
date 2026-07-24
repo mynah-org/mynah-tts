@@ -238,6 +238,18 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
         free(manifest);
         return -1;
     }
+    /* -1: read MYNAH_QUANT env (int8 opt-in; default f32). */
+    model->qcache = mynah_qmat_cache_new(-1);
+    if (model->qcache == NULL) {
+        mynah_backend_close(model->backend);
+        mynah_safetensors_close(model->tts);
+        mynah_safetensors_close(model->codec);
+        free(model->model_dir);
+        free(model);
+        free(manifest);
+        set_error(error, error_capacity, "out of memory creating quant cache");
+        return -1;
+    }
     snprintf(model->info.device, sizeof(model->info.device), "%s",
              mynah_backend_name(model->backend));
     free(manifest);
@@ -254,6 +266,7 @@ int mynah_tts_model_open(const char *model_dir, mynah_tts_model **out_model,
 
 void mynah_tts_model_close(mynah_tts_model *model) {
     if (model == NULL) return;
+    mynah_qmat_cache_free(model->qcache);
     mynah_backend_close(model->backend);
     mynah_safetensors_close(model->tts);
     mynah_safetensors_close(model->codec);

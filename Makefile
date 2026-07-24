@@ -47,7 +47,7 @@ else
 BLAS_NAME := scalar
 endif
 
-CORE_SOURCES := src/mynah_tts.c src/safetensors.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c
+CORE_SOURCES := src/mynah_tts.c src/safetensors.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
