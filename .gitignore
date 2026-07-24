@@ -1,0 +1,28 @@
+# Local planning/agent notes
+/PLAN.md
+/CLAUDE.md
+
+# Model packs and downloaded checkpoints
+/models/
+*.nemo
+*.safetensors
+*.pt
+*.ckpt
+
+# Build and runtime artifacts
+/build/
+*.o
+*.d
+/mynah-tts
+/mynah-tts-server
+*.wav
+*.raw
+
+# Python tooling
+/.venv/
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+
