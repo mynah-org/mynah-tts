@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,13 @@
 
 static void graph_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
+}
+
+/* Optional phase timing, enabled with MYNAH_TIMING=1, printed to stderr. */
+static double phase_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
 static int tensor(const mynah_safetensors *file, const char *name,
@@ -563,6 +571,143 @@ static int embed_audio_frame(const mynah_tts_model *model, const unsigned *codes
     return 0;
 }
 
+/* Small KV cache for the autoregressive local transformer.  It has no cross
+ * attention and its sequence is at most stream_count+1 (17) positions, so the
+ * attention stays scalar and each of the 16 codebook streams is a single-row
+ * step instead of re-running the whole stack from scratch every time. */
+typedef struct {
+    size_t layers;
+    size_t width;
+    size_t heads;
+    size_t head_width;
+    size_t ffn_width;
+    size_t capacity;
+    size_t length;
+    float *k; /* layers * capacity * width */
+    float *v; /* layers * capacity * width */
+    const float *position; /* local_transformer.position_embeddings.weight */
+} local_cache;
+
+static void local_cache_free(local_cache *cache) {
+    if (cache == NULL) return;
+    free(cache->k);
+    free(cache->v);
+    cache->k = NULL;
+    cache->v = NULL;
+}
+
+static int local_cache_init(const mynah_tts_model *model, local_cache *cache,
+                            size_t capacity, char *error, size_t error_capacity) {
+    memset(cache, 0, sizeof(*cache));
+    const size_t width = model->info.hidden_dim;
+    cache->layers = model->info.local_transformer_layers;
+    cache->width = width;
+    cache->heads = 12u;
+    cache->head_width = width / cache->heads;
+    cache->ffn_width = width * 4u;
+    cache->capacity = capacity;
+    mynah_tensor position;
+    if (tensor(model->tts, "local_transformer.position_embeddings.weight", &position,
+               error, error_capacity) != 0) {
+        return -1;
+    }
+    cache->position = position.data;
+    cache->k = allocate_floats(cache->layers * capacity * width, error, error_capacity);
+    cache->v = allocate_floats(cache->layers * capacity * width, error, error_capacity);
+    if (cache->k == NULL || cache->v == NULL) {
+        local_cache_free(cache);
+        return -1;
+    }
+    return 0;
+}
+
+/* Append one position to the local transformer and return its output row. */
+static int local_step(const mynah_tts_model *model, local_cache *cache,
+                      const float *input_row, float *out_row,
+                      char *error, size_t error_capacity) {
+    const size_t width = cache->width;
+    const size_t heads = cache->heads;
+    const size_t hw = cache->head_width;
+    const size_t ffn = cache->ffn_width;
+    const size_t p = cache->length;
+    if (p >= cache->capacity) {
+        graph_error(error, error_capacity, "local transformer cache overflow");
+        return -1;
+    }
+    float *x = allocate_floats(width, error, error_capacity);
+    float *nrm = allocate_floats(width, error, error_capacity);
+    float *qkv = allocate_floats(width * 3u, error, error_capacity);
+    float *attn = allocate_floats(width, error, error_capacity);
+    float *proj = allocate_floats(width, error, error_capacity);
+    float *hidden = allocate_floats(ffn, error, error_capacity);
+    float *scores = allocate_floats(cache->capacity, error, error_capacity);
+    if (x == NULL || nrm == NULL || qkv == NULL || attn == NULL || proj == NULL ||
+        hidden == NULL || scores == NULL) {
+        free(x); free(nrm); free(qkv); free(attn); free(proj); free(hidden); free(scores);
+        return -1;
+    }
+    for (size_t d = 0; d < width; ++d) x[d] = input_row[d] + cache->position[p * width + d];
+    const float scale = 1.0f / sqrtf((float)hw);
+    char name[256];
+    int failed = 0;
+    for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
+        mynah_tensor t;
+        snprintf(name, sizeof(name), "local_transformer.layers.%zu.norm_self.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
+        layer_norm(x, nrm, 1u, width, t.data);
+        snprintf(name, sizeof(name), "local_transformer.layers.%zu.self_attention.qkv_net.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
+            linear(model->backend, nrm, qkv, 1u, width, width * 3u, t.data, NULL,
+                   error, error_capacity) != 0) { failed = 1; break; }
+        float *kb = cache->k + layer * cache->capacity * width;
+        float *vb = cache->v + layer * cache->capacity * width;
+        memcpy(kb + p * width, qkv + width, width * sizeof(float));
+        memcpy(vb + p * width, qkv + width * 2u, width * sizeof(float));
+        for (size_t h = 0; h < heads; ++h) {
+            const float *qh = qkv + h * hw;
+            float maxv = -FLT_MAX;
+            for (size_t s = 0; s <= p; ++s) {
+                const float *k = kb + s * width + h * hw;
+                float sc = 0.0f;
+                for (size_t d = 0; d < hw; ++d) sc += qh[d] * k[d];
+                sc *= scale;
+                scores[s] = sc;
+                if (sc > maxv) maxv = sc;
+            }
+            float denom = 0.0f;
+            for (size_t s = 0; s <= p; ++s) { scores[s] = expf(scores[s] - maxv); denom += scores[s]; }
+            float *outh = attn + h * hw;
+            for (size_t d = 0; d < hw; ++d) {
+                float acc = 0.0f;
+                for (size_t s = 0; s <= p; ++s) acc += (scores[s] / denom) * vb[s * width + h * hw + d];
+                outh[d] = acc;
+            }
+        }
+        snprintf(name, sizeof(name), "local_transformer.layers.%zu.self_attention.o_net.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
+            linear(model->backend, attn, proj, 1u, width, width, t.data, NULL,
+                   error, error_capacity) != 0) { failed = 1; break; }
+        for (size_t d = 0; d < width; ++d) x[d] += proj[d];
+        snprintf(name, sizeof(name), "local_transformer.layers.%zu.norm_pos_ff.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
+        layer_norm(x, nrm, 1u, width, t.data);
+        snprintf(name, sizeof(name), "local_transformer.layers.%zu.pos_ff.proj.conv.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
+            linear(model->backend, nrm, hidden, 1u, width, ffn, t.data, NULL,
+                   error, error_capacity) != 0) { failed = 1; break; }
+        for (size_t i = 0; i < ffn; ++i) hidden[i] = gelu_tanh(hidden[i]);
+        snprintf(name, sizeof(name), "local_transformer.layers.%zu.pos_ff.o_net.conv.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0 ||
+            linear(model->backend, hidden, proj, 1u, ffn, width, t.data, NULL,
+                   error, error_capacity) != 0) { failed = 1; break; }
+        for (size_t d = 0; d < width; ++d) x[d] += proj[d];
+    }
+    if (!failed) memcpy(out_row, x, width * sizeof(float));
+    free(x); free(nrm); free(qkv); free(attn); free(proj); free(hidden); free(scores);
+    if (!failed) cache->length += 1u;
+    return failed ? -1 : 0;
+}
+
 /* The local AR helper emits one stacked frame (two raw codec frames). */
 static int sample_local_frame(const mynah_tts_model *model, const float *decoder_last,
                               unsigned *codes, size_t raw_offset, size_t code_stride,
@@ -572,37 +717,42 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                               size_t *eos_frame, char *error, size_t error_capacity) {
     const size_t width = model->info.hidden_dim;
     const size_t stream_count = model->info.codebook_count * model->info.frame_stacking_factor;
-    float *input = allocate_floats((stream_count + 1u) * width, error, error_capacity);
-    float *output = allocate_floats((stream_count + 1u) * width, error, error_capacity);
-    if (input == NULL || output == NULL) {
-        free(input);
-        free(output);
+    local_cache lc;
+    memset(&lc, 0, sizeof(lc));
+    float *row_in = allocate_floats(width, error, error_capacity);
+    float *row_out = allocate_floats(width, error, error_capacity);
+    if (row_in == NULL || row_out == NULL ||
+        local_cache_init(model, &lc, stream_count + 1u, error, error_capacity) != 0) {
+        free(row_in);
+        free(row_out);
+        local_cache_free(&lc);
         return -1;
     }
-    memcpy(input, decoder_last, width * sizeof(float));
+    memcpy(row_in, decoder_last, width * sizeof(float));
     *saw_eos = 0;
     *eos_frame = SIZE_MAX;
     char name[160];
     for (size_t stream = 0; stream < stream_count; ++stream) {
-        if (transformer_stack(model->tts, model->backend, "local_transformer", model->info.local_transformer_layers,
-                              stream + 1u, width, width * 4u, 12u, 1u, 0, 0, NULL, 0,
-                              input, output, error, error_capacity) != 0) {
-            free(input);
-            free(output);
+        if (local_step(model, &lc, row_in, row_out, error, error_capacity) != 0) {
+            free(row_in);
+            free(row_out);
+            local_cache_free(&lc);
             return -1;
         }
         snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
         mynah_tensor weight;
         if (tensor(model->tts, name, &weight, error, error_capacity) != 0) {
-            free(input);
-            free(output);
+            free(row_in);
+            free(row_out);
+            local_cache_free(&lc);
             return -1;
         }
         snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.bias", stream);
         mynah_tensor bias;
         if (tensor(model->tts, name, &bias, error, error_capacity) != 0) {
-            free(input);
-            free(output);
+            free(row_in);
+            free(row_out);
+            local_cache_free(&lc);
             return -1;
         }
         const int forbid_eos = generated_raw_length < min_raw_length;
@@ -612,8 +762,9 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         float best = -FLT_MAX;
         float *logits = allocate_floats(vocab, error, error_capacity);
         if (logits == NULL) {
-            free(input);
-            free(output);
+            free(row_in);
+            free(row_out);
+            local_cache_free(&lc);
             return -1;
         }
         /* Forbid every special token except AUDIO_EOS, and forbid EOS too while
@@ -627,7 +778,7 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
             }
             float score = bias.data[candidate];
             const float *row = weight.data + candidate * width;
-            for (size_t d = 0; d < width; ++d) score += row[d] * output[stream * width + d];
+            for (size_t d = 0; d < width; ++d) score += row[d] * row_out[d];
             logits[candidate] = score;
             if (score > best) {
                 best = score;
@@ -646,8 +797,9 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                 free(top_indices);
                 free(top_logits);
                 free(logits);
-                free(input);
-                free(output);
+                free(row_in);
+                free(row_out);
+                local_cache_free(&lc);
                 graph_error(error, error_capacity, "out of memory in audio sampler");
                 return -1;
             }
@@ -714,15 +866,18 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
         mynah_tensor audio_table;
         if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0) {
-            free(input);
-            free(output);
+            free(row_in);
+            free(row_out);
+            local_cache_free(&lc);
             return -1;
         }
-        memcpy(input + (stream + 1u) * width,
-               audio_table.data + (size_t)emit * width, width * sizeof(float));
+        /* The embedding of this stream's token becomes the input row for the
+         * next local-transformer position. */
+        memcpy(row_in, audio_table.data + (size_t)emit * width, width * sizeof(float));
     }
-    free(input);
-    free(output);
+    free(row_in);
+    free(row_out);
+    local_cache_free(&lc);
     return 0;
 }
 
@@ -1151,10 +1306,26 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     float *xctx = allocate_floats(count * xw, error, error_capacity);
     float *hidden = allocate_floats(count * ffn, error, error_capacity);
     float *scores = allocate_floats(scores_len, error, error_capacity);
+    /* For a multi-row call (the context prefill) the self-attention is a dense
+     * batched matmul; a single-row decode step stays scalar over the KV cache
+     * (a matvec where sgemm's per-call overhead would dominate). */
+    const size_t total_kv = start + count;
+    float *score_matrix = NULL;
+    float *head_ctx = NULL;
+    int batched = 0;
+#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+    if (count > 1u && total_kv <= (size_t)INT_MAX && hw <= (size_t)INT_MAX) {
+        batched = 1;
+        score_matrix = allocate_floats(count * total_kv, error, error_capacity);
+        head_ctx = allocate_floats(count * hw, error, error_capacity);
+    }
+#endif
     if (x == NULL || nrm == NULL || qkv == NULL || attn == NULL || proj == NULL ||
-        q_x == NULL || xctx == NULL || hidden == NULL || scores == NULL) {
+        q_x == NULL || xctx == NULL || hidden == NULL || scores == NULL ||
+        (batched && (score_matrix == NULL || head_ctx == NULL))) {
         free(x); free(nrm); free(qkv); free(attn); free(proj);
         free(q_x); free(xctx); free(hidden); free(scores);
+        free(score_matrix); free(head_ctx);
         return -1;
     }
     for (size_t i = 0; i < count; ++i) {
@@ -1181,6 +1352,30 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             memcpy(kbase + (start + i) * width, qkv + i * width * 3u + width, width * sizeof(float));
             memcpy(vbase + (start + i) * width, qkv + i * width * 3u + width * 2u, width * sizeof(float));
         }
+#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+        if (batched) {
+            for (size_t h = 0; h < heads; ++h) {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            (int)count, (int)total_kv, (int)hw,
+                            self_scale, qkv + h * hw, (int)(width * 3u),
+                            kbase + h * hw, (int)width, 0.0f,
+                            score_matrix, (int)total_kv);
+                for (size_t i = 0; i < count; ++i) {
+                    const size_t valid = start + i + 1u;
+                    float *row = score_matrix + i * total_kv;
+                    softmax_row_inplace(row, valid);
+                    for (size_t s = valid; s < total_kv; ++s) row[s] = 0.0f;
+                }
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            (int)count, (int)hw, (int)total_kv,
+                            1.0f, score_matrix, (int)total_kv,
+                            vbase + h * hw, (int)width, 0.0f, head_ctx, (int)hw);
+                for (size_t i = 0; i < count; ++i) {
+                    memcpy(attn + i * width + h * hw, head_ctx + i * hw, hw * sizeof(float));
+                }
+            }
+        } else
+#endif
         for (size_t i = 0; i < count; ++i) {
             const size_t abs = start + i;
             const float *qrow = qkv + i * width * 3u;
@@ -1270,6 +1465,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     }
     free(x); free(nrm); free(qkv); free(attn); free(proj);
     free(q_x); free(xctx); free(hidden); free(scores);
+    free(score_matrix); free(head_ctx);
     if (!failed) cache->length += count;
     return failed ? -1 : 0;
 }
@@ -1290,6 +1486,9 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
         return -1;
     }
     const size_t width = model->info.hidden_dim;
+    const int timing = getenv("MYNAH_TIMING") != NULL;
+    const double t_start = timing ? phase_seconds() : 0.0;
+    double t_prep = t_start, t_ar = t_start;
     float *memory = NULL;
     if (encode_text(model, request->text_ids, request->text_length, &memory,
                     error, error_capacity) != 0) return -1;
@@ -1344,6 +1543,7 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
         free(audio_row);
         return -1;
     }
+    if (timing) t_prep = phase_seconds();
     for (size_t stacked_length = 1u; stacked_length <= max_steps; ++stacked_length) {
         const size_t raw_length = stacked_length * model->info.frame_stacking_factor;
         if (embed_audio_frame(model, codes, max_raw_length, stacked_length - 1u,
@@ -1403,6 +1603,7 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
             break;
         }
     }
+    if (timing) t_ar = phase_seconds();
     const size_t generated_stacks = predicted_stacks;
     size_t generated_raw = generated_stacks * model->info.frame_stacking_factor;
     if (eos_frame != SIZE_MAX && generated_stacks > 0) {
@@ -1430,6 +1631,12 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
                                   error, error_capacity);
             free(predicted_codes);
         }
+    }
+    if (timing) {
+        const double t_codec = phase_seconds();
+        fprintf(stderr,
+                "phase: prep=%.3fs ar=%.3fs codec=%.3fs (stacks=%zu)\n",
+                t_prep - t_start, t_ar - t_prep, t_codec - t_ar, generated_stacks);
     }
     decoder_cache_free(&cache);
     free(memory);

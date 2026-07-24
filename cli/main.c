@@ -8,6 +8,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+}
 
 static void usage(const char *program) {
     printf("Usage:\n");
@@ -232,11 +239,13 @@ static int synthesize(int argc, char **argv) {
     }
     mynah_tts_model *model = NULL;
     char error[256];
+    const double load_start = now_seconds();
     if (mynah_tts_model_open_device(model_dir, device, &model, error, sizeof(error)) != 0) {
         fprintf(stderr, "model check failed: %s\n", error);
         free(tokens);
         return 1;
     }
+    const double load_seconds = now_seconds() - load_start;
     mynah_tts_model_info info;
     mynah_tts_model_get_info(model, &info);
     if (normalized_text != NULL) {
@@ -262,12 +271,19 @@ static int synthesize(int argc, char **argv) {
     };
     float *samples = NULL;
     size_t sample_count = 0;
+    const double synth_start = now_seconds();
     const int result = mynah_tts_synthesize(model, &request, &samples, &sample_count,
                                              error, sizeof(error));
+    const double synth_seconds = now_seconds() - synth_start;
     if (result == 0 && mynah_wav_write_f32(output_path, samples, sample_count,
                                            info.sample_rate, error, sizeof(error)) == 0) {
+        const double audio_seconds = info.sample_rate > 0
+            ? (double)sample_count / (double)info.sample_rate : 0.0;
         printf("wrote native WAV: %s (%zu samples at %u Hz)\n", output_path,
                sample_count, info.sample_rate);
+        printf("timing: load=%.3fs synth=%.3fs audio=%.3fs RTF=%.3f\n",
+               load_seconds, synth_seconds, audio_seconds,
+               audio_seconds > 0.0 ? synth_seconds / audio_seconds : 0.0);
     } else {
         fprintf(stderr, "native synthesis failed: %s\n", error);
     }
