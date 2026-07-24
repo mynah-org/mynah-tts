@@ -2340,6 +2340,28 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
     if (eos_frame != SIZE_MAX && generated_stacks > 0) {
         generated_raw = (generated_stacks - 1u) * model->info.frame_stacking_factor + eos_frame;
     }
+    if (getenv("MYNAH_DUMP_CODES") != NULL && generated_stacks > 0) {
+        FILE *dump = fopen(getenv("MYNAH_DUMP_CODES"), "w");
+        if (dump != NULL) {
+            const size_t cb = model->info.codebook_count;
+            const size_t fs = model->info.frame_stacking_factor;
+            fprintf(dump, "[");
+            for (size_t step = 0; step < generated_stacks; ++step) {
+                if (step > 0) fprintf(dump, ",");
+                fprintf(dump, "[[");
+                for (size_t c = 0; c < cb; ++c) {
+                    if (c > 0) fprintf(dump, "],[");
+                    for (size_t f = 0; f < fs; ++f) {
+                        if (f > 0) fprintf(dump, ",");
+                        fprintf(dump, "%u", codes[c * max_raw_length + (step + 1u) * fs + f]);
+                    }
+                }
+                fprintf(dump, "]]");
+            }
+            fprintf(dump, "]\n");
+            fclose(dump);
+        }
+    }
     int result = 0;
     if (error[0] != '\0') {
         result = -1;
