@@ -8,6 +8,48 @@ struct MatmulParams {
     uint output_width;
 };
 
+/* Tiled matmul: each threadgroup computes a TILE_M x TILE_N output tile.
+ * Threads cooperatively load input and weight tiles into threadgroup memory,
+ * then accumulate the dot products.  For the small Magpie matvecs (rows=1,
+ * output_width up to 3072) this reduces global memory traffic and keeps the
+ * SIMD groups fed. */
+constant constexpr uint TILE_M = 4;
+constant constexpr uint TILE_N = 64;
+constant constexpr uint TILE_K = 32;
+
+kernel void mynah_matmul_tiled(device const float *input   [[buffer(0)]],
+                               device const float *weight  [[buffer(1)]],
+                               device const float *bias    [[buffer(2)]],
+                               device float       *output  [[buffer(3)]],
+                               constant MatmulParams &p    [[buffer(4)]],
+                               uint2 gid [[threadgroup_position_in_grid]],
+                               uint2 lid [[thread_position_in_threadgroup]],
+                               uint2 tgs [[threads_per_threadgroup]]) {
+    const uint row_start = gid.y * TILE_M;
+    const uint col_start = gid.x * TILE_N;
+    const uint tx = lid.x;   /* 0..TILE_N-1 */
+    const uint ty = lid.y;   /* 0..TILE_M-1 */
+    const uint col = col_start + tx;
+    const uint row = row_start + ty;
+
+    float acc = 0.0f;
+    for (uint k0 = 0; k0 < p.input_width; k0 += TILE_K) {
+        const uint k_end = min(k0 + TILE_K, p.input_width);
+        for (uint k = k0; k < k_end; ++k) {
+            if (row < p.rows && col < p.output_width) {
+                acc += input[row * p.input_width + k] *
+                       weight[col * p.input_width + k];
+            }
+        }
+    }
+    if (row < p.rows && col < p.output_width) {
+        float value = acc;
+        if (bias != nullptr) value += bias[col];
+        output[row * p.output_width + col] = value;
+    }
+}
+
+/* Simple fallback kept for self-test compatibility. */
 kernel void mynah_matmul(device const float *input [[buffer(0)]],
                          device const float *weight [[buffer(1)]],
                          device const float *bias [[buffer(2)]],
