@@ -1,4 +1,5 @@
 #include "mynah_tts_internal.h"
+#include "threads.h"
 
 #include <float.h>
 #include <limits.h>
@@ -777,14 +778,6 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
             local_cache_free(&lc);
             return -1;
         }
-        snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
-        mynah_tensor weight;
-        if (tensor(model->tts, name, &weight, error, error_capacity) != 0) {
-            free(row_in);
-            free(row_out);
-            local_cache_free(&lc);
-            return -1;
-        }
         snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.bias", stream);
         mynah_tensor bias;
         if (tensor(model->tts, name, &bias, error, error_capacity) != 0) {
@@ -796,8 +789,6 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         const int forbid_eos = generated_raw_length < min_raw_length;
         const unsigned eos_id = model->info.audio_eos_id;
         const size_t vocab = model->info.audio_vocab_size;
-        unsigned argmax = 0;
-        float best = -FLT_MAX;
         float *logits = allocate_floats(vocab, error, error_capacity);
         if (logits == NULL) {
             free(row_in);
@@ -805,8 +796,20 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
             local_cache_free(&lc);
             return -1;
         }
-        /* Forbid every special token except AUDIO_EOS, and forbid EOS too while
-         * we are still below min_generated_frames (NeMo clear_forbidden_logits). */
+        /* Project to the full audio vocab (INT8 when enabled), then forbid every
+         * special token except AUDIO_EOS (and EOS too while below
+         * min_generated_frames), matching NeMo clear_forbidden_logits. */
+        snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, row_out, logits,
+                              1u, width, vocab, bias.data, error, error_capacity) != 0) {
+            free(logits);
+            free(row_in);
+            free(row_out);
+            local_cache_free(&lc);
+            return -1;
+        }
+        unsigned argmax = 0;
+        float best = -FLT_MAX;
         for (size_t candidate = 0; candidate < vocab; ++candidate) {
             const int is_code = candidate < model->info.codebook_size;
             const int is_eos = candidate == eos_id;
@@ -814,12 +817,8 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                 logits[candidate] = -FLT_MAX;
                 continue;
             }
-            float score = bias.data[candidate];
-            const float *row = weight.data + candidate * width;
-            for (size_t d = 0; d < width; ++d) score += row[d] * row_out[d];
-            logits[candidate] = score;
-            if (score > best) {
-                best = score;
+            if (logits[candidate] > best) {
+                best = logits[candidate];
                 argmax = (unsigned)candidate;
             }
         }
@@ -977,6 +976,43 @@ static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
     return 0;
 }
 
+/* Causal transposed conv1d.  Each output channel `o` owns a disjoint output row
+ * and reads only its group's input channels, so parallelizing over `o` keeps
+ * the per-row accumulation order and is bit-identical to the serial form. */
+typedef struct {
+    const float *input;
+    float *output;
+    const float *weight;
+    const float *bias;
+    size_t length;
+    size_t output_length;
+    size_t kernel;
+    size_t stride;
+    size_t in_per_group;
+    size_t out_per_group;
+} convt_ctx;
+
+static void convt_channel(void *ctx, int oi) {
+    const convt_ctx *x = (const convt_ctx *)ctx;
+    const size_t o = (size_t)oi;
+    const size_t group = o / x->out_per_group;
+    const size_t o_local = o % x->out_per_group;
+    float *row = x->output + o * x->output_length;
+    for (size_t t = 0; t < x->output_length; ++t) row[t] = x->bias[o];
+    const size_t i0 = group * x->in_per_group;
+    for (size_t i = i0; i < i0 + x->in_per_group; ++i) {
+        const float *in_row = x->input + i * x->length;
+        const float *w = x->weight + (i * x->out_per_group + o_local) * x->kernel;
+        for (size_t t = 0; t < x->length; ++t) {
+            const float in_v = in_row[t];
+            for (size_t k = 0; k < x->kernel; ++k) {
+                const size_t position = t * x->stride + k;
+                if (position < x->output_length) row[position] += in_v * w[k];
+            }
+        }
+    }
+}
+
 static int conv_transpose_causal(const mynah_safetensors *file, const char *weight_name,
                                  const char *bias_name, const float *input, float *output,
                                  size_t in_channels, size_t out_channels, size_t length,
@@ -989,29 +1025,36 @@ static int conv_transpose_causal(const mynah_safetensors *file, const char *weig
     const size_t full_length = (length - 1u) * stride + kernel;
     const size_t trim = kernel - stride;
     const size_t output_length = full_length - trim;
-    memset(output, 0, out_channels * output_length * sizeof(float));
-    for (size_t o = 0; o < out_channels; ++o) {
-        for (size_t t = 0; t < output_length; ++t) output[o * output_length + t] = bias.data[o];
-    }
-    const size_t in_per_group = in_channels / groups;
-    const size_t out_per_group = out_channels / groups;
-    for (size_t i = 0; i < in_channels; ++i) {
-        const size_t group = i / in_per_group;
-        for (size_t o_local = 0; o_local < out_per_group; ++o_local) {
-            const size_t o = group * out_per_group + o_local;
-            for (size_t t = 0; t < length; ++t) {
-                for (size_t k = 0; k < kernel; ++k) {
-                    const long position = (long)(t * stride + k);
-                    if (position >= 0 && (size_t)position < output_length) {
-                        const size_t weight_index = (i * out_per_group + o_local) * kernel + k;
-                        output[o * output_length + (size_t)position] +=
-                            input[i * length + t] * weight.data[weight_index];
-                    }
-                }
-            }
+    convt_ctx ctx = {input, output, weight.data, bias.data, length, output_length,
+                     kernel, stride, in_channels / groups, out_channels / groups};
+    mynah_parallel_for((int)out_channels, convt_channel, &ctx);
+    return 0;
+}
+
+/* Snake activation on the first half of the channels, leaky-ReLU on the rest.
+ * Each channel is an independent row, so this parallelizes bit-identically. */
+typedef struct {
+    float *signal;
+    const float *alpha;
+    size_t snake_channels;
+    size_t length;
+} snake_ctx;
+
+static void snake_channel(void *ctx, int c) {
+    const snake_ctx *s = (const snake_ctx *)ctx;
+    float *row = s->signal + (size_t)c * s->length;
+    if ((size_t)c < s->snake_channels) {
+        const float a = s->alpha[c];
+        for (size_t t = 0; t < s->length; ++t) {
+            const float value = row[t];
+            const float sn = sinf(a * value);
+            row[t] = value + sn * sn / (a + 1.0e-9f);
+        }
+    } else {
+        for (size_t t = 0; t < s->length; ++t) {
+            if (row[t] < 0.0f) row[t] *= 0.01f;
         }
     }
-    return 0;
 }
 
 static int half_snake(const mynah_safetensors *file, const char *alpha_name,
@@ -1019,21 +1062,8 @@ static int half_snake(const mynah_safetensors *file, const char *alpha_name,
                       char *error, size_t error_capacity) {
     mynah_tensor alpha;
     if (tensor(file, alpha_name, &alpha, error, error_capacity) != 0) return -1;
-    const size_t snake_channels = channels / 2u;
-    for (size_t c = 0; c < snake_channels; ++c) {
-        const float a = alpha.data[c];
-        for (size_t t = 0; t < length; ++t) {
-            const size_t index = c * length + t;
-            const float value = signal[index];
-            signal[index] = value + sinf(a * value) * sinf(a * value) / (a + 1.0e-9f);
-        }
-    }
-    for (size_t c = snake_channels; c < channels; ++c) {
-        for (size_t t = 0; t < length; ++t) {
-            const size_t index = c * length + t;
-            if (signal[index] < 0.0f) signal[index] *= 0.01f;
-        }
-    }
+    snake_ctx ctx = {signal, alpha.data, channels / 2u, length};
+    mynah_parallel_for((int)channels, snake_channel, &ctx);
     return 0;
 }
 
