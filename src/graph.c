@@ -732,6 +732,7 @@ typedef struct {
     float *proj;
     float *hidden;
     float *scores;
+    float *gelu_scratch;
 } local_workspace;
 
 static void local_workspace_free(local_workspace *workspace) {
@@ -743,6 +744,7 @@ static void local_workspace_free(local_workspace *workspace) {
     free(workspace->proj);
     free(workspace->hidden);
     free(workspace->scores);
+    free(workspace->gelu_scratch);
     memset(workspace, 0, sizeof(*workspace));
 }
 
@@ -756,9 +758,16 @@ static int local_workspace_init(local_workspace *workspace, const local_cache *c
     workspace->proj = allocate_floats(cache->width, error, error_capacity);
     workspace->hidden = allocate_floats(cache->ffn_width, error, error_capacity);
     workspace->scores = allocate_floats(cache->capacity, error, error_capacity);
+#if defined(MYNAH_USE_ACCELERATE)
+    workspace->gelu_scratch = allocate_floats(cache->ffn_width, error, error_capacity);
+#endif
     if (workspace->x == NULL || workspace->nrm == NULL || workspace->qkv == NULL ||
         workspace->attn == NULL || workspace->proj == NULL || workspace->hidden == NULL ||
-        workspace->scores == NULL) {
+        workspace->scores == NULL
+#if defined(MYNAH_USE_ACCELERATE)
+        || workspace->gelu_scratch == NULL
+#endif
+    ) {
         local_workspace_free(workspace);
         return -1;
     }
@@ -867,7 +876,7 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.pos_ff.proj.conv.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, hidden,
                               1u, width, ffn, NULL, error, error_capacity) != 0) { failed = 1; break; }
-        for (size_t i = 0; i < ffn; ++i) hidden[i] = gelu_tanh(hidden[i]);
+        gelu_tanh_array(hidden, ffn, workspace->gelu_scratch);
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.pos_ff.o_net.conv.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, hidden, proj,
                               1u, ffn, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
