@@ -51,7 +51,7 @@ else
 BLAS_NAME := scalar
 endif
 
-CORE_SOURCES := src/mynah_tts.c src/safetensors.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c
+CORE_SOURCES := src/mynah_tts.c src/safetensors.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
@@ -109,11 +109,22 @@ bench-matrix: self-test
 	done
 
 gen-matrix: $(TARGET)
-	@test -n "$(MODEL_DIR)" || (echo "usage: make gen-matrix MODEL_DIR=pack ARCHIVE=magpie.nemo CODEC=codec.nemo BYT5=tokenizer" >&2; exit 2)
-	@test -n "$(ARCHIVE)" || (echo "usage: make gen-matrix MODEL_DIR=pack ARCHIVE=magpie.nemo CODEC=codec.nemo BYT5=tokenizer" >&2; exit 2)
-	.venv/bin/python tools/gen_matrix.py --model-dir "$(MODEL_DIR)" \
-		--archive "$(ARCHIVE)" --codec "$(CODEC)" --byt5 "$(BYT5)" \
-		--binary "$(TARGET)" --output build/gen-matrix
+	@test -n "$(MODEL_DIR)" || (echo "usage: make gen-matrix MODEL_DIR=pack" >&2; exit 2)
+	@mkdir -p build/gen-matrix
+	@for entry in \
+		"en:hello world" "fr:bonjour le monde" "it:ciao mondo" \
+		"es:hola mundo" "de:hallo Welt" "pt:olá mundo" \
+		"vi:xin chào thế giới" "ko:안녕하세요 세계" \
+		"ja:こんにちは世界" "zh:你好世界" \
+		"hi:नमस्ते दुनिया" "ar:مرحبا بالعالم"; do \
+		lang="$${entry%%:*}"; text="$${entry#*:}"; \
+		echo "  $$lang: $$text"; \
+		MYNAH_THREADS=1 MYNAH_QUANT=int8 $(TARGET) --synthesize "$(MODEL_DIR)" \
+			--text "$$text" --lang "$$lang" \
+			--output "build/gen-matrix/$$lang.wav" \
+			--speaker 4 --max-steps 30 --seed 42 --temperature 0 || exit 1; \
+	done
+	@echo "Done: build/gen-matrix/*.wav"
 
 inspect:
 	@test -n "$(MODEL)" || (echo "usage: make inspect MODEL=path/to/model.nemo" >&2; exit 2)

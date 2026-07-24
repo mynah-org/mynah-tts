@@ -3,6 +3,7 @@
 #include "kernels.h"
 #include "mynah_tts.h"
 #include "qmat.h"
+#include "tokenizer.h"
 
 #include <math.h>
 #include <errno.h>
@@ -24,6 +25,7 @@ static void usage(const char *program) {
     printf("  %s --inspect MODEL_DIR\n", program);
     printf("  %s --write-test-wav OUTPUT.wav\n", program);
     printf("  %s --synthesize MODEL_DIR --tokens IDS --output OUTPUT.wav [options]\n", program);
+    printf("  %s --synthesize MODEL_DIR --text \"hello world\" --lang en --output OUTPUT.wav [options]\n", program);
     printf("      options: --speaker N --max-steps N --temperature F --topk N --seed N\n");
     printf("               --parallel --device cpu|metal|cuda --warmup N --runs N\n");
     printf("  %s --gpu-self-test metal|cuda\n", program);
@@ -207,6 +209,8 @@ static int synthesize(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *token_text = NULL;
     const char *normalized_text = NULL;
+    const char *raw_text = NULL;
+    const char *lang = "en";
     const char *output_path = NULL;
     unsigned speaker = 0;
     unsigned max_steps = 0;
@@ -220,6 +224,8 @@ static int synthesize(int argc, char **argv) {
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) token_text = argv[++i];
         else if (strcmp(argv[i], "--normalized") == 0 && i + 1 < argc) normalized_text = argv[++i];
+        else if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) raw_text = argv[++i];
+        else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) lang = argv[++i];
         else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) output_path = argv[++i];
         else if (strcmp(argv[i], "--speaker") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &speaker) == 0) {}
         else if (strcmp(argv[i], "--max-steps") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &max_steps) == 0) {}
@@ -237,18 +243,38 @@ static int synthesize(int argc, char **argv) {
             return 2;
         }
     }
-    if (model_dir == NULL || (token_text == NULL && normalized_text == NULL) || output_path == NULL ||
+    if (model_dir == NULL || (token_text == NULL && normalized_text == NULL && raw_text == NULL) || output_path == NULL ||
         runs == 0 || warmups > UINT_MAX - runs ||
-        (token_text != NULL && normalized_text != NULL)) {
-        fprintf(stderr, "synthesis requires MODEL_DIR, one of --tokens/--normalized and --output\n");
+        (token_text != NULL && normalized_text != NULL) ||
+        (token_text != NULL && raw_text != NULL) ||
+        (normalized_text != NULL && raw_text != NULL)) {
+        fprintf(stderr, "synthesis requires MODEL_DIR, one of --tokens/--normalized/--text and --output\n");
         return 2;
     }
     int *tokens = NULL;
     size_t token_count = 0;
-    if ((token_text != NULL && parse_tokens(token_text, &tokens, &token_count) != 0) ||
-        (normalized_text != NULL && parse_normalized(model_dir, normalized_text, &tokens, &token_count) != 0)) {
+    if (token_text != NULL && parse_tokens(token_text, &tokens, &token_count) != 0) {
         fprintf(stderr, "invalid token list\n");
         return 2;
+    }
+    if (normalized_text != NULL && parse_normalized(model_dir, normalized_text, &tokens, &token_count) != 0) {
+        fprintf(stderr, "invalid token list\n");
+        return 2;
+    }
+    if (raw_text != NULL) {
+        char tok_err[256];
+        mynah_tokenizer *tok = mynah_tokenizer_open(model_dir, tok_err, sizeof(tok_err));
+        if (tok == NULL) {
+            fprintf(stderr, "tokenizer error: %s\n", tok_err);
+            return 2;
+        }
+        if (mynah_tokenizer_encode(tok, lang, raw_text, &tokens, &token_count,
+                                   tok_err, sizeof(tok_err)) != 0) {
+            fprintf(stderr, "tokenization error: %s\n", tok_err);
+            mynah_tokenizer_close(tok);
+            return 2;
+        }
+        mynah_tokenizer_close(tok);
     }
     mynah_tts_model *model = NULL;
     char error[256];
