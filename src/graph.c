@@ -2196,6 +2196,15 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
     float *memory = NULL;
     if (encode_text(model, request->text_ids, request->text_length, &memory,
                     error, error_capacity) != 0) return -1;
+    if (getenv("MYNAH_DUMP_ENCODER") != NULL) {
+        FILE *ef = fopen(getenv("MYNAH_DUMP_ENCODER"), "w");
+        if (ef != NULL) {
+            for (size_t t = 0; t < request->text_length; ++t)
+                for (size_t d = 0; d < width; ++d)
+                    fprintf(ef, "%.9g\n", (double)memory[t * width + d]);
+            fclose(ef);
+        }
+    }
     if (timing) prep_encode_seconds = phase_seconds() - t_start;
     mynah_tensor context_tensor;
     if (tensor(model->tts, "baked_context_embedding.weight", &context_tensor,
@@ -2261,6 +2270,14 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
         free(audio_row);
         return -1;
     }
+    if (getenv("MYNAH_DUMP_PREFILL") != NULL) {
+        FILE *pf = fopen(getenv("MYNAH_DUMP_PREFILL"), "w");
+        if (pf != NULL) {
+            for (size_t d = 0; d < width; ++d)
+                fprintf(pf, "%.9g\n", (double)out_last[d]);
+            fclose(pf);
+        }
+    }
     if (timing) prep_context_seconds = phase_seconds() - prep_stage_start;
     if (timing) t_prep = phase_seconds();
     for (size_t stacked_length = 1u; stacked_length <= max_steps; ++stacked_length) {
@@ -2274,6 +2291,14 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
             stage_start = now;
         }
         if (decoder_run(model, &cache, audio_row, 1u, out_last, error, error_capacity) != 0) break;
+        if (stacked_length == 1u && getenv("MYNAH_DUMP_HIDDEN") != NULL) {
+            FILE *hf = fopen(getenv("MYNAH_DUMP_HIDDEN"), "w");
+            if (hf != NULL) {
+                for (size_t d = 0; d < model->info.hidden_dim; ++d)
+                    fprintf(hf, "%.9g\n", (double)out_last[d]);
+                fclose(hf);
+            }
+        }
         if (timing) {
             const double now = phase_seconds();
             ar_decoder_seconds += now - stage_start;
