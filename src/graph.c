@@ -1,4 +1,5 @@
 #include "mynah_tts_internal.h"
+#include "graph.h"
 #include "threads.h"
 
 #include <float.h>
@@ -76,6 +77,69 @@ static float gelu_tanh(float x) {
     const float cubic = x * x * x;
     const float inner = 0.7978845608028654f * (x + 0.044715f * cubic);
     return 0.5f * x * (1.0f + tanhf(inner));
+}
+
+static void gelu_tanh_array(float *values, size_t length, float *scratch) {
+#if defined(MYNAH_USE_ACCELERATE)
+    if (scratch != NULL) {
+        for (size_t i = 0; i < length; ++i) {
+            const float x = values[i];
+            const float cubic = x * x * x;
+            scratch[i] = 0.7978845608028654f *
+                         (x + 0.044715f * cubic);
+        }
+        size_t offset = 0;
+        while (offset < length) {
+            const size_t remaining = length - offset;
+            const int batch = remaining > (size_t)INT_MAX
+                ? INT_MAX : (int)remaining;
+            vvtanhf(scratch + offset, scratch + offset, &batch);
+            offset += (size_t)batch;
+        }
+        for (size_t i = 0; i < length; ++i) {
+            values[i] = 0.5f * values[i] * (1.0f + scratch[i]);
+        }
+        return;
+    }
+#else
+    (void)scratch;
+#endif
+    for (size_t i = 0; i < length; ++i) values[i] = gelu_tanh(values[i]);
+}
+
+int mynah_graph_self_test(char *error, size_t error_capacity) {
+#if defined(MYNAH_USE_ACCELERATE)
+    float values[] = {
+        -INFINITY, -10.0f, -3.0f, -1.0f, -0.25f, -0.0f, 0.0f,
+        0.125f, 0.5f, 1.0f, 2.0f, 3.0f, 8.0f, INFINITY, NAN,
+        -6.75f, 0.03125f, 4.5f, -2.125f
+    };
+    float expected[sizeof(values) / sizeof(values[0])];
+    float scratch[sizeof(values) / sizeof(values[0])];
+    const size_t count = sizeof(values) / sizeof(values[0]);
+    for (size_t i = 0; i < count; ++i) expected[i] = gelu_tanh(values[i]);
+    gelu_tanh_array(values, count, scratch);
+    for (size_t i = 0; i < count; ++i) {
+        if (isnan(expected[i])) {
+            if (isnan(values[i])) continue;
+        } else if (isinf(expected[i])) {
+            if (isinf(values[i]) && signbit(values[i]) == signbit(expected[i])) continue;
+        } else {
+            const float tolerance = 2.0e-6f * (1.0f + fabsf(expected[i]));
+            if (fabsf(values[i] - expected[i]) <= tolerance) continue;
+        }
+        if (error != NULL && error_capacity > 0) {
+            snprintf(error, error_capacity,
+                     "vForce GELU mismatch at %zu: got %.9g expected %.9g",
+                     i, (double)values[i], (double)expected[i]);
+        }
+        return -1;
+    }
+#else
+    (void)error;
+    (void)error_capacity;
+#endif
+    return 0;
 }
 
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
@@ -631,6 +695,47 @@ typedef struct {
     const float *position; /* local_transformer.position_embeddings.weight */
 } local_cache;
 
+typedef struct {
+    float *x;
+    float *nrm;
+    float *qkv;
+    float *attn;
+    float *proj;
+    float *hidden;
+    float *scores;
+} local_workspace;
+
+static void local_workspace_free(local_workspace *workspace) {
+    if (workspace == NULL) return;
+    free(workspace->x);
+    free(workspace->nrm);
+    free(workspace->qkv);
+    free(workspace->attn);
+    free(workspace->proj);
+    free(workspace->hidden);
+    free(workspace->scores);
+    memset(workspace, 0, sizeof(*workspace));
+}
+
+static int local_workspace_init(local_workspace *workspace, const local_cache *cache,
+                                char *error, size_t error_capacity) {
+    memset(workspace, 0, sizeof(*workspace));
+    workspace->x = allocate_floats(cache->width, error, error_capacity);
+    workspace->nrm = allocate_floats(cache->width, error, error_capacity);
+    workspace->qkv = allocate_floats(cache->width * 3u, error, error_capacity);
+    workspace->attn = allocate_floats(cache->width, error, error_capacity);
+    workspace->proj = allocate_floats(cache->width, error, error_capacity);
+    workspace->hidden = allocate_floats(cache->ffn_width, error, error_capacity);
+    workspace->scores = allocate_floats(cache->capacity, error, error_capacity);
+    if (workspace->x == NULL || workspace->nrm == NULL || workspace->qkv == NULL ||
+        workspace->attn == NULL || workspace->proj == NULL || workspace->hidden == NULL ||
+        workspace->scores == NULL) {
+        local_workspace_free(workspace);
+        return -1;
+    }
+    return 0;
+}
+
 static void local_cache_free(local_cache *cache) {
     if (cache == NULL) return;
     free(cache->k);
@@ -666,7 +771,7 @@ static int local_cache_init(const mynah_tts_model *model, local_cache *cache,
 
 /* Append one position to the local transformer and return its output row. */
 static int local_step(const mynah_tts_model *model, local_cache *cache,
-                      const float *input_row, float *out_row,
+                      local_workspace *workspace, const float *input_row, float *out_row,
                       char *error, size_t error_capacity) {
     const size_t width = cache->width;
     const size_t heads = cache->heads;
@@ -677,18 +782,18 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
         graph_error(error, error_capacity, "local transformer cache overflow");
         return -1;
     }
-    float *x = allocate_floats(width, error, error_capacity);
-    float *nrm = allocate_floats(width, error, error_capacity);
-    float *qkv = allocate_floats(width * 3u, error, error_capacity);
-    float *attn = allocate_floats(width, error, error_capacity);
-    float *proj = allocate_floats(width, error, error_capacity);
-    float *hidden = allocate_floats(ffn, error, error_capacity);
-    float *scores = allocate_floats(cache->capacity, error, error_capacity);
-    if (x == NULL || nrm == NULL || qkv == NULL || attn == NULL || proj == NULL ||
-        hidden == NULL || scores == NULL) {
-        free(x); free(nrm); free(qkv); free(attn); free(proj); free(hidden); free(scores);
-        return -1;
+    local_workspace owned;
+    if (workspace == NULL) {
+        if (local_workspace_init(&owned, cache, error, error_capacity) != 0) return -1;
+        workspace = &owned;
     }
+    float *x = workspace->x;
+    float *nrm = workspace->nrm;
+    float *qkv = workspace->qkv;
+    float *attn = workspace->attn;
+    float *proj = workspace->proj;
+    float *hidden = workspace->hidden;
+    float *scores = workspace->scores;
     for (size_t d = 0; d < width; ++d) x[d] = input_row[d] + cache->position[p * width + d];
     const float scale = 1.0f / sqrtf((float)hw);
     char name[256];
@@ -742,7 +847,7 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
         for (size_t d = 0; d < width; ++d) x[d] += proj[d];
     }
     if (!failed) memcpy(out_row, x, width * sizeof(float));
-    free(x); free(nrm); free(qkv); free(attn); free(proj); free(hidden); free(scores);
+    if (workspace == &owned) local_workspace_free(&owned);
     if (!failed) cache->length += 1u;
     return failed ? -1 : 0;
 }
@@ -756,15 +861,44 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                               size_t *eos_frame, char *error, size_t error_capacity) {
     const size_t width = model->info.hidden_dim;
     const size_t stream_count = model->info.codebook_count * model->info.frame_stacking_factor;
+    const int reuse_workspace = getenv("MYNAH_LOCAL_STEP_ALLOCS") == NULL;
     local_cache lc;
+    local_workspace workspace;
     memset(&lc, 0, sizeof(lc));
+    memset(&workspace, 0, sizeof(workspace));
     float *row_in = allocate_floats(width, error, error_capacity);
     float *row_out = allocate_floats(width, error, error_capacity);
     if (row_in == NULL || row_out == NULL ||
-        local_cache_init(model, &lc, stream_count + 1u, error, error_capacity) != 0) {
+        local_cache_init(model, &lc, stream_count + 1u, error, error_capacity) != 0 ||
+        (reuse_workspace &&
+         local_workspace_init(&workspace, &lc, error, error_capacity) != 0)) {
         free(row_in);
         free(row_out);
+        local_workspace_free(&workspace);
         local_cache_free(&lc);
+        return -1;
+    }
+    const size_t vocab = model->info.audio_vocab_size;
+    const int sampling = temperature > 0.0f && topk > 1u && rng_state != NULL;
+    const size_t top_count = topk < vocab ? topk : vocab;
+    const int reuse_sampler = getenv("MYNAH_LOCAL_SAMPLER_ALLOCS") == NULL;
+    float *shared_logits = reuse_sampler
+        ? allocate_floats(vocab, error, error_capacity) : NULL;
+    size_t *shared_top_indices = reuse_sampler && sampling
+        ? (size_t *)malloc(top_count * sizeof(*shared_top_indices)) : NULL;
+    float *shared_top_logits = reuse_sampler && sampling
+        ? (float *)malloc(top_count * sizeof(*shared_top_logits)) : NULL;
+    if ((reuse_sampler && shared_logits == NULL) ||
+        (reuse_sampler && sampling &&
+         (shared_top_indices == NULL || shared_top_logits == NULL))) {
+        free(shared_logits);
+        free(shared_top_indices);
+        free(shared_top_logits);
+        free(row_in);
+        free(row_out);
+        local_workspace_free(&workspace);
+        local_cache_free(&lc);
+        graph_error(error, error_capacity, "out of memory allocating local sampler scratch");
         return -1;
     }
     memcpy(row_in, decoder_last, width * sizeof(float));
@@ -772,27 +906,41 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
     *eos_frame = SIZE_MAX;
     char name[160];
     for (size_t stream = 0; stream < stream_count; ++stream) {
-        if (local_step(model, &lc, row_in, row_out, error, error_capacity) != 0) {
+        local_workspace *step_workspace = reuse_workspace ? &workspace : NULL;
+        if (local_step(model, &lc, step_workspace, row_in, row_out,
+                       error, error_capacity) != 0) {
+            free(shared_logits);
+            free(shared_top_indices);
+            free(shared_top_logits);
             free(row_in);
             free(row_out);
+            local_workspace_free(&workspace);
             local_cache_free(&lc);
             return -1;
         }
         snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.bias", stream);
         mynah_tensor bias;
         if (tensor(model->tts, name, &bias, error, error_capacity) != 0) {
+            free(shared_logits);
+            free(shared_top_indices);
+            free(shared_top_logits);
             free(row_in);
             free(row_out);
+            local_workspace_free(&workspace);
             local_cache_free(&lc);
             return -1;
         }
         const int forbid_eos = generated_raw_length < min_raw_length;
         const unsigned eos_id = model->info.audio_eos_id;
-        const size_t vocab = model->info.audio_vocab_size;
-        float *logits = allocate_floats(vocab, error, error_capacity);
+        float *logits = shared_logits != NULL
+            ? shared_logits : allocate_floats(vocab, error, error_capacity);
         if (logits == NULL) {
+            free(shared_logits);
+            free(shared_top_indices);
+            free(shared_top_logits);
             free(row_in);
             free(row_out);
+            local_workspace_free(&workspace);
             local_cache_free(&lc);
             return -1;
         }
@@ -802,7 +950,10 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, row_out, logits,
                               1u, width, vocab, bias.data, error, error_capacity) != 0) {
-            free(logits);
+            if (logits != shared_logits) free(logits);
+            free(shared_logits);
+            free(shared_top_indices);
+            free(shared_top_logits);
             free(row_in);
             free(row_out);
             local_cache_free(&lc);
@@ -826,16 +977,21 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         /* argmax_or_multinomial: EOS fires if either the greedy or the sampled
          * token is AUDIO_EOS in any codebook of this frame. */
         int stream_eos = (argmax == eos_id);
-        if (temperature > 0.0f && topk > 1u && rng_state != NULL) {
-            size_t top_count = topk < vocab ? topk : vocab;
-            size_t *top_indices = (size_t *)malloc(top_count * sizeof(*top_indices));
-            float *top_logits = (float *)malloc(top_count * sizeof(*top_logits));
+        if (sampling) {
+            size_t *top_indices = shared_top_indices != NULL
+                ? shared_top_indices : (size_t *)malloc(top_count * sizeof(*top_indices));
+            float *top_logits = shared_top_logits != NULL
+                ? shared_top_logits : (float *)malloc(top_count * sizeof(*top_logits));
             if (top_indices == NULL || top_logits == NULL) {
-                free(top_indices);
-                free(top_logits);
-                free(logits);
+                if (top_indices != shared_top_indices) free(top_indices);
+                if (top_logits != shared_top_logits) free(top_logits);
+                if (logits != shared_logits) free(logits);
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
                 free(row_in);
                 free(row_out);
+                local_workspace_free(&workspace);
                 local_cache_free(&lc);
                 graph_error(error, error_capacity, "out of memory in audio sampler");
                 return -1;
@@ -882,10 +1038,10 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                     break;
                 }
             }
-            free(top_indices);
-            free(top_logits);
+            if (top_indices != shared_top_indices) free(top_indices);
+            if (top_logits != shared_top_logits) free(top_logits);
         }
-        free(logits);
+        if (logits != shared_logits) free(logits);
         if (value == eos_id) stream_eos = 1;
         if (stream_eos) {
             *saw_eos = 1;
@@ -903,8 +1059,12 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
         mynah_tensor audio_table;
         if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0) {
+            free(shared_logits);
+            free(shared_top_indices);
+            free(shared_top_logits);
             free(row_in);
             free(row_out);
+            local_workspace_free(&workspace);
             local_cache_free(&lc);
             return -1;
         }
@@ -912,20 +1072,176 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
          * next local-transformer position. */
         memcpy(row_in, audio_table.data + (size_t)emit * width, width * sizeof(float));
     }
+    free(shared_logits);
+    free(shared_top_indices);
+    free(shared_top_logits);
     free(row_in);
     free(row_out);
+    local_workspace_free(&workspace);
     local_cache_free(&lc);
+    return 0;
+}
+
+typedef struct {
+    double pack_seconds;
+    double gemm_seconds;
+    double transpose_seconds;
+    double snake_seconds;
+    double bnns_create_seconds;
+    double bnns_apply_seconds;
+    double bnns_destroy_seconds;
+    size_t calls;
+    size_t transpose_calls;
+    size_t snake_calls;
+} codec_conv_profile;
+
+#if defined(MYNAH_USE_ACCELERATE)
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+static int conv1d_causal_bnns(const float *weight, const float *bias,
+                              const float *input, float *output,
+                              size_t in_channels, size_t out_channels,
+                              size_t length, size_t kernel, size_t dilation,
+                              codec_conv_profile *profile) {
+    if (length == 0u || kernel == 0u || dilation == 0u ||
+        (kernel - 1u) > SIZE_MAX / dilation) {
+        return -1;
+    }
+    BNNSLayerParametersConvolution parameters;
+    memset(&parameters, 0, sizeof(parameters));
+    parameters.i_desc.layout = BNNSDataLayoutImageCHW;
+    parameters.i_desc.size[0] = length;
+    parameters.i_desc.size[1] = 1u;
+    parameters.i_desc.size[2] = in_channels;
+    parameters.i_desc.data_type = BNNSDataTypeFloat32;
+    parameters.w_desc.layout = BNNSDataLayoutConvolutionWeightsOIHW;
+    parameters.w_desc.size[0] = kernel;
+    parameters.w_desc.size[1] = 1u;
+    parameters.w_desc.size[2] = in_channels;
+    parameters.w_desc.size[3] = out_channels;
+    parameters.w_desc.data = (void *)weight;
+    parameters.w_desc.data_type = BNNSDataTypeFloat32;
+    parameters.o_desc.layout = BNNSDataLayoutImageCHW;
+    parameters.o_desc.size[0] = length;
+    parameters.o_desc.size[1] = 1u;
+    parameters.o_desc.size[2] = out_channels;
+    parameters.o_desc.data_type = BNNSDataTypeFloat32;
+    parameters.bias.layout = BNNSDataLayoutVector;
+    parameters.bias.size[0] = out_channels;
+    parameters.bias.data = (void *)bias;
+    parameters.bias.data_type = BNNSDataTypeFloat32;
+    parameters.activation.function = BNNSActivationFunctionIdentity;
+    parameters.x_stride = 1u;
+    parameters.y_stride = 1u;
+    parameters.x_dilation_stride = dilation;
+    parameters.y_dilation_stride = 1u;
+    parameters.pad[0] = (kernel - 1u) * dilation;
+    double operation_start = profile != NULL ? phase_seconds() : 0.0;
+    BNNSFilter filter = BNNSFilterCreateLayerConvolution(&parameters, NULL);
+    if (filter == NULL) return -1;
+    if (profile != NULL) {
+        profile->bnns_create_seconds += phase_seconds() - operation_start;
+        operation_start = phase_seconds();
+    }
+    const int result = BNNSFilterApply(filter, input, output);
+    if (profile != NULL) {
+        profile->bnns_apply_seconds += phase_seconds() - operation_start;
+        operation_start = phase_seconds();
+    }
+    BNNSFilterDestroy(filter);
+    if (profile != NULL) {
+        profile->bnns_destroy_seconds += phase_seconds() - operation_start;
+    }
+    return result;
+}
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+#endif
+
+int mynah_graph_bnns_self_test(char *error, size_t error_capacity) {
+#if defined(MYNAH_USE_ACCELERATE)
+    enum { IN_CHANNELS = 2, OUT_CHANNELS = 3, LENGTH = 9, KERNEL = 3 };
+    float input[IN_CHANNELS * LENGTH];
+    float weight[OUT_CHANNELS * IN_CHANNELS * KERNEL];
+    float bias[OUT_CHANNELS];
+    float expected[OUT_CHANNELS * LENGTH];
+    float actual[OUT_CHANNELS * LENGTH];
+    for (size_t i = 0; i < IN_CHANNELS * LENGTH; ++i) {
+        input[i] = sinf(0.17f * (float)i) - 0.2f;
+    }
+    for (size_t i = 0; i < OUT_CHANNELS * IN_CHANNELS * KERNEL; ++i) {
+        weight[i] = cosf(0.11f * (float)(i + 3u)) * 0.25f;
+    }
+    for (size_t o = 0; o < OUT_CHANNELS; ++o) bias[o] = (float)o * 0.1f - 0.05f;
+    const size_t dilation = 2u;
+    for (size_t o = 0; o < OUT_CHANNELS; ++o) {
+        for (size_t t = 0; t < LENGTH; ++t) {
+            float value = bias[o];
+            for (size_t i = 0; i < IN_CHANNELS; ++i) {
+                for (size_t k = 0; k < KERNEL; ++k) {
+                    const long source = (long)t -
+                        (long)((KERNEL - 1u) * dilation) +
+                        (long)(k * dilation);
+                    if (source >= 0) {
+                        value += weight[(o * IN_CHANNELS + i) * KERNEL + k] *
+                                 input[i * LENGTH + (size_t)source];
+                    }
+                }
+            }
+            expected[o * LENGTH + t] = value;
+        }
+    }
+    if (conv1d_causal_bnns(weight, bias, input, actual,
+                           IN_CHANNELS, OUT_CHANNELS, LENGTH,
+                           KERNEL, dilation, NULL) != 0) {
+        graph_error(error, error_capacity, "BNNS causal-conv self-test failed to apply");
+        return -1;
+    }
+    for (size_t i = 0; i < OUT_CHANNELS * LENGTH; ++i) {
+        const float tolerance = 2.0e-5f * (1.0f + fabsf(expected[i]));
+        if (fabsf(actual[i] - expected[i]) > tolerance) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "BNNS causal-conv mismatch at %zu: got %.9g expected %.9g",
+                         i, (double)actual[i], (double)expected[i]);
+            }
+            return -1;
+        }
+    }
+#else
+    (void)error;
+    (void)error_capacity;
+#endif
     return 0;
 }
 
 static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
                          const char *bias_name, const float *input, float *output,
                          size_t in_channels, size_t out_channels, size_t length,
-                         size_t kernel, size_t dilation, char *error, size_t error_capacity) {
+                         size_t kernel, size_t dilation,
+                         float *columns_workspace, size_t columns_capacity,
+                         codec_conv_profile *profile,
+                         char *error, size_t error_capacity) {
+#if !defined(MYNAH_USE_ACCELERATE) && !defined(MYNAH_USE_OPENBLAS)
+    (void)columns_workspace;
+    (void)columns_capacity;
+#endif
     mynah_tensor weight;
     mynah_tensor bias;
     if (tensor(file, weight_name, &weight, error, error_capacity) != 0 ||
         tensor(file, bias_name, &bias, error, error_capacity) != 0) return -1;
+    if (profile != NULL) profile->calls++;
+#if defined(MYNAH_USE_ACCELERATE)
+    if (getenv("MYNAH_CODEC_SGEMM") == NULL &&
+        conv1d_causal_bnns(weight.data, bias.data, input, output,
+                           in_channels, out_channels, length,
+                           kernel, dilation, profile) == 0) {
+        return 0;
+    }
+#endif
     /* Seed the output with the per-channel bias; each kernel tap then adds its
      * contribution.  A causal conv1d is a sum of `kernel` shifted matmuls
      * (weight tap k) [out x in] . input[:, 0:length-shift], so on BLAS builds we
@@ -937,7 +1253,52 @@ static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (in_channels <= (size_t)INT_MAX && out_channels <= (size_t)INT_MAX &&
         length <= (size_t)INT_MAX) {
-        float *wk = (float *)malloc(out_channels * in_channels * sizeof(float));
+        size_t inner = 0;
+        size_t column_count = 0;
+        if (in_channels > 0 && getenv("MYNAH_CONV_TAP_GEMMS") == NULL &&
+            kernel <= SIZE_MAX / in_channels &&
+            (inner = in_channels * kernel) <= (size_t)INT_MAX &&
+            length <= SIZE_MAX / inner &&
+            (column_count = inner * length) <= SIZE_MAX / sizeof(float)) {
+            const double pack_start = profile != NULL ? phase_seconds() : 0.0;
+            const int owns_columns = columns_workspace == NULL ||
+                                     columns_capacity < column_count;
+            float *columns = owns_columns
+                ? (float *)malloc(column_count * sizeof(*columns))
+                : columns_workspace;
+            if (columns != NULL) {
+                for (size_t i = 0; i < in_channels; ++i) {
+                    const float *source_row = input + i * length;
+                    for (size_t k = 0; k < kernel; ++k) {
+                        const size_t shift = (kernel - 1u - k) * dilation;
+                        float *column = columns + (i * kernel + k) * length;
+                        const size_t zero_count = shift < length ? shift : length;
+                        memset(column, 0, zero_count * sizeof(*column));
+                        if (shift < length) {
+                            memcpy(column + shift, source_row,
+                                   (length - shift) * sizeof(*column));
+                        }
+                    }
+                }
+                if (profile != NULL) profile->pack_seconds += phase_seconds() - pack_start;
+                const double gemm_start = profile != NULL ? phase_seconds() : 0.0;
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            (int)out_channels, (int)length, (int)inner,
+                            1.0f, weight.data, (int)inner, columns, (int)length,
+                            1.0f, output, (int)length);
+                if (profile != NULL) profile->gemm_seconds += phase_seconds() - gemm_start;
+                if (owns_columns) free(columns);
+                return 0;
+            }
+        }
+        if (in_channels == 0u || out_channels > SIZE_MAX / in_channels ||
+            out_channels * in_channels > SIZE_MAX / sizeof(float)) {
+            graph_error(error, error_capacity,
+                        "causal conv1d tap workspace size overflow");
+            return -1;
+        }
+        float *wk = (float *)malloc(
+            out_channels * in_channels * sizeof(float));
         if (wk == NULL) {
             graph_error(error, error_capacity, "out of memory in causal conv1d");
             return -1;
@@ -945,16 +1306,20 @@ static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
         for (size_t k = 0; k < kernel; ++k) {
             const size_t shift = (kernel - 1u - k) * dilation;
             if (shift >= length) continue;
+            const double pack_start = profile != NULL ? phase_seconds() : 0.0;
             for (size_t o = 0; o < out_channels; ++o) {
                 for (size_t i = 0; i < in_channels; ++i) {
                     wk[o * in_channels + i] = weight.data[(o * in_channels + i) * kernel + k];
                 }
             }
+            if (profile != NULL) profile->pack_seconds += phase_seconds() - pack_start;
             const size_t n = length - shift;
+            const double gemm_start = profile != NULL ? phase_seconds() : 0.0;
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         (int)out_channels, (int)n, (int)in_channels,
                         1.0f, wk, (int)in_channels, input, (int)length,
                         1.0f, output + shift, (int)length);
+            if (profile != NULL) profile->gemm_seconds += phase_seconds() - gemm_start;
         }
         free(wk);
         return 0;
@@ -1017,7 +1382,9 @@ static int conv_transpose_causal(const mynah_safetensors *file, const char *weig
                                  const char *bias_name, const float *input, float *output,
                                  size_t in_channels, size_t out_channels, size_t length,
                                  size_t kernel, size_t stride, size_t groups,
+                                 codec_conv_profile *profile,
                                  char *error, size_t error_capacity) {
+    const double operation_start = profile != NULL ? phase_seconds() : 0.0;
     mynah_tensor weight;
     mynah_tensor bias;
     if (tensor(file, weight_name, &weight, error, error_capacity) != 0 ||
@@ -1028,6 +1395,10 @@ static int conv_transpose_causal(const mynah_safetensors *file, const char *weig
     convt_ctx ctx = {input, output, weight.data, bias.data, length, output_length,
                      kernel, stride, in_channels / groups, out_channels / groups};
     mynah_parallel_for((int)out_channels, convt_channel, &ctx);
+    if (profile != NULL) {
+        profile->transpose_seconds += phase_seconds() - operation_start;
+        profile->transpose_calls++;
+    }
     return 0;
 }
 
@@ -1059,23 +1430,72 @@ static void snake_channel(void *ctx, int c) {
 
 static int half_snake(const mynah_safetensors *file, const char *alpha_name,
                       float *signal, size_t channels, size_t length,
+                      codec_conv_profile *profile,
                       char *error, size_t error_capacity) {
+    const double operation_start = profile != NULL ? phase_seconds() : 0.0;
     mynah_tensor alpha;
     if (tensor(file, alpha_name, &alpha, error, error_capacity) != 0) return -1;
+#if defined(MYNAH_USE_ACCELERATE)
+    const size_t snake_channels = channels / 2u;
+    if (getenv("MYNAH_SNAKE_SCALAR") == NULL && snake_channels > 0u &&
+        length <= SIZE_MAX / snake_channels) {
+        const size_t count = snake_channels * length;
+        if (count <= (size_t)INT_MAX && count <= SIZE_MAX / sizeof(float)) {
+            float *sines = (float *)malloc(count * sizeof(*sines));
+            if (sines != NULL) {
+                for (size_t c = 0; c < snake_channels; ++c) {
+                    const float a = alpha.data[c];
+                    vDSP_vsmul(signal + c * length, 1, &a, sines + c * length, 1,
+                               (vDSP_Length)length);
+                }
+                const int vector_count = (int)count;
+                vvsinf(sines, sines, &vector_count);
+                vDSP_vsq(sines, 1, sines, 1, (vDSP_Length)count);
+                for (size_t c = 0; c < snake_channels; ++c) {
+                    const float inverse_alpha = 1.0f / (alpha.data[c] + 1.0e-9f);
+                    float *row = signal + c * length;
+                    vDSP_vsma(sines + c * length, 1, &inverse_alpha,
+                              row, 1, row, 1, (vDSP_Length)length);
+                }
+                free(sines);
+                for (size_t c = snake_channels; c < channels; ++c) {
+                    float *row = signal + c * length;
+                    for (size_t t = 0; t < length; ++t) {
+                        if (row[t] < 0.0f) row[t] *= 0.01f;
+                    }
+                }
+                if (profile != NULL) {
+                    profile->snake_seconds += phase_seconds() - operation_start;
+                    profile->snake_calls++;
+                }
+                return 0;
+            }
+        }
+    }
+#endif
     snake_ctx ctx = {signal, alpha.data, channels / 2u, length};
     mynah_parallel_for((int)channels, snake_channel, &ctx);
+    if (profile != NULL) {
+        profile->snake_seconds += phase_seconds() - operation_start;
+        profile->snake_calls++;
+    }
     return 0;
 }
 
 static int res_layer(const mynah_safetensors *file, size_t stage, const float *input,
                      float *output, size_t channels, size_t length,
-                     char *error, size_t error_capacity) {
+                     codec_conv_profile *profile, char *error, size_t error_capacity) {
     const size_t kernels[3] = {3u, 7u, 11u};
     const size_t dilations[3] = {1u, 3u, 5u};
-    float *branch = allocate_floats(channels * length, error, error_capacity);
-    float *current = allocate_floats(channels * length, error, error_capacity);
-    float *activated = allocate_floats(channels * length, error, error_capacity);
-    float *residual = allocate_floats(channels * length, error, error_capacity);
+    if (channels == 0u || length == 0u || channels > SIZE_MAX / length) {
+        graph_error(error, error_capacity, "invalid codec residual workspace size");
+        return -1;
+    }
+    const size_t elements = channels * length;
+    float *branch = allocate_floats(elements, error, error_capacity);
+    float *current = allocate_floats(elements, error, error_capacity);
+    float *activated = allocate_floats(elements, error, error_capacity);
+    float *residual = allocate_floats(elements, error, error_capacity);
     if (branch == NULL || current == NULL || activated == NULL || residual == NULL) {
         free(branch);
         free(current);
@@ -1083,16 +1503,39 @@ static int res_layer(const mynah_safetensors *file, size_t stage, const float *i
         free(residual);
         return -1;
     }
-    memset(output, 0, channels * length * sizeof(float));
+    float *columns_workspace = NULL;
+    size_t columns_capacity = 0;
+#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+    int needs_columns_workspace = 1;
+#if defined(MYNAH_USE_ACCELERATE)
+    if (getenv("MYNAH_CODEC_SGEMM") == NULL &&
+        getenv("MYNAH_BNNS_IM2COL_WORKSPACE") == NULL) {
+        needs_columns_workspace = 0;
+    }
+#endif
+    if (needs_columns_workspace &&
+        getenv("MYNAH_CODEC_CONV_ALLOCS") == NULL &&
+        length > 0u && channels <= SIZE_MAX / 11u &&
+        channels * 11u <= SIZE_MAX / length) {
+        columns_capacity = channels * 11u * length;
+        if (columns_capacity <= SIZE_MAX / sizeof(*columns_workspace)) {
+            columns_workspace = (float *)malloc(
+                columns_capacity * sizeof(*columns_workspace));
+        }
+        if (columns_workspace == NULL) columns_capacity = 0;
+    }
+#endif
+    memset(output, 0, elements * sizeof(float));
     char name[256];
     for (size_t branch_index = 0; branch_index < 3u; ++branch_index) {
-        memcpy(current, input, channels * length * sizeof(float));
+        memcpy(current, input, elements * sizeof(float));
         for (size_t dilation_index = 0; dilation_index < 3u; ++dilation_index) {
             snprintf(name, sizeof(name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.input_activation.activation.snake_act.alpha",
                      stage, branch_index, dilation_index);
-            memcpy(activated, current, channels * length * sizeof(float));
-            if (half_snake(file, name, activated, channels, length, error, error_capacity) != 0) break;
+            memcpy(activated, current, elements * sizeof(float));
+            if (half_snake(file, name, activated, channels, length, profile,
+                           error, error_capacity) != 0) break;
             char weight_name[256];
             char bias_name[256];
             snprintf(weight_name, sizeof(weight_name),
@@ -1103,11 +1546,14 @@ static int res_layer(const mynah_safetensors *file, size_t stage, const float *i
                      stage, branch_index, dilation_index);
             if (conv1d_causal(file, weight_name, bias_name, activated, residual,
                               channels, channels, length, kernels[branch_index],
-                              dilations[dilation_index], error, error_capacity) != 0) break;
+                              dilations[dilation_index],
+                              columns_workspace, columns_capacity,
+                              profile, error, error_capacity) != 0) break;
             snprintf(name, sizeof(name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_activation.activation.snake_act.alpha",
                      stage, branch_index, dilation_index);
-            if (half_snake(file, name, residual, channels, length, error, error_capacity) != 0) break;
+            if (half_snake(file, name, residual, channels, length, profile,
+                           error, error_capacity) != 0) break;
             snprintf(weight_name, sizeof(weight_name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_conv.conv.weight",
                      stage, branch_index, dilation_index);
@@ -1116,23 +1562,30 @@ static int res_layer(const mynah_safetensors *file, size_t stage, const float *i
                      stage, branch_index, dilation_index);
             if (conv1d_causal(file, weight_name, bias_name, residual, branch,
                               channels, channels, length, kernels[branch_index], 1u,
+                              columns_workspace, columns_capacity, profile,
                               error, error_capacity) != 0) break;
-            for (size_t i = 0; i < channels * length; ++i) current[i] += branch[i];
+            for (size_t i = 0; i < elements; ++i) current[i] += branch[i];
         }
-        for (size_t i = 0; i < channels * length; ++i) output[i] += current[i];
+        for (size_t i = 0; i < elements; ++i) output[i] += current[i];
         if (error != NULL && error[0] != '\0') break;
     }
-    for (size_t i = 0; i < channels * length; ++i) output[i] /= 3.0f;
+    for (size_t i = 0; i < elements; ++i) output[i] /= 3.0f;
     free(branch);
     free(current);
     free(activated);
     free(residual);
+    free(columns_workspace);
     return error == NULL || error[0] == '\0' ? 0 : -1;
 }
 
 static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
                         size_t raw_length, float **samples, size_t *sample_count,
                         char *error, size_t error_capacity) {
+    const int timing = getenv("MYNAH_TIMING") != NULL;
+    const double codec_start = timing ? phase_seconds() : 0.0;
+    double stage_seconds[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    codec_conv_profile conv_profile = {0};
+    codec_conv_profile *profile = timing ? &conv_profile : NULL;
     const size_t levels[4] = {8u, 7u, 6u, 6u};
     const size_t bases[4] = {1u, 8u, 56u, 336u};
     const size_t groups = 8u;
@@ -1157,19 +1610,22 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     float *current = allocate_floats(864u * raw_length, error, error_capacity);
     if (current == NULL || conv1d_causal(model->codec, weight_name, bias_name, latent,
                                          current, 32u, 864u, raw_length, 7u, 1u,
-                                         error, error_capacity) != 0) {
+                                         NULL, 0,
+                                         profile, error, error_capacity) != 0) {
         free(latent);
         free(current);
         return -1;
     }
     free(latent);
+    const double preconv_end = timing ? phase_seconds() : 0.0;
     size_t current_channels = 864u;
     size_t current_length = raw_length;
     const size_t rates[5] = {8u, 8u, 4u, 2u, 2u};
     for (size_t stage = 0; stage < 5u; ++stage) {
+        const double stage_start = timing ? phase_seconds() : 0.0;
         snprintf(weight_name, sizeof(weight_name), "audio_decoder.activations.%zu.activation.snake_act.alpha", stage);
         if (half_snake(model->codec, weight_name, current, current_channels, current_length,
-                       error, error_capacity) != 0) {
+                       profile, error, error_capacity) != 0) {
             free(current);
             return -1;
         }
@@ -1185,7 +1641,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
         if (conv_transpose_causal(model->codec, weight_name, bias_name, current, upsampled,
                                   current_channels, next_channels, current_length,
                                   rates[stage] * 2u, rates[stage], next_channels,
-                                  error, error_capacity) != 0) {
+                                  profile, error, error_capacity) != 0) {
             free(current);
             free(upsampled);
             return -1;
@@ -1196,7 +1652,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
             free(upsampled);
             return -1;
         }
-        if (res_layer(model->codec, stage, upsampled, current, next_channels, next_length,
+        if (res_layer(model->codec, stage, upsampled, current, next_channels, next_length, profile,
                       error, error_capacity) != 0) {
             free(upsampled);
             free(current);
@@ -1205,10 +1661,11 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
         free(upsampled);
         current_channels = next_channels;
         current_length = next_length;
+        if (timing) stage_seconds[stage] = phase_seconds() - stage_start;
     }
     snprintf(weight_name, sizeof(weight_name), "audio_decoder.post_activation.activation.snake_act.alpha");
     if (half_snake(model->codec, weight_name, current, current_channels, current_length,
-                   error, error_capacity) != 0) {
+                   profile, error, error_capacity) != 0) {
         free(current);
         return -1;
     }
@@ -1221,7 +1678,8 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     snprintf(bias_name, sizeof(bias_name), "audio_decoder.post_conv.conv.bias");
     if (conv1d_causal(model->codec, weight_name, bias_name, current, audio,
                       current_channels, 1u, current_length, 3u, 1u,
-                      error, error_capacity) != 0) {
+                      NULL, 0,
+                      profile, error, error_capacity) != 0) {
         free(current);
         free(audio);
         return -1;
@@ -1231,6 +1689,27 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
         if (audio[i] < -1.0f) audio[i] = -1.0f;
     }
     free(current);
+    if (timing) {
+        const double codec_end = phase_seconds();
+        fprintf(stderr,
+                "codec detail: pre=%.3fs stages=[%.3f %.3f %.3f %.3f %.3f] "
+                "post=%.3fs conv_calls=%zu pack=%.3fs gemm=%.3fs "
+                "transpose_calls=%zu transpose=%.3fs snake_calls=%zu snake=%.3fs\n",
+                preconv_end - codec_start, stage_seconds[0], stage_seconds[1],
+                stage_seconds[2], stage_seconds[3], stage_seconds[4],
+                codec_end - preconv_end - stage_seconds[0] - stage_seconds[1] -
+                    stage_seconds[2] - stage_seconds[3] - stage_seconds[4],
+                conv_profile.calls, conv_profile.pack_seconds, conv_profile.gemm_seconds,
+                conv_profile.transpose_calls, conv_profile.transpose_seconds,
+                conv_profile.snake_calls, conv_profile.snake_seconds);
+        if (conv_profile.bnns_create_seconds > 0.0) {
+            fprintf(stderr,
+                    "codec BNNS: create=%.3fs apply=%.3fs destroy=%.3fs\n",
+                    conv_profile.bnns_create_seconds,
+                    conv_profile.bnns_apply_seconds,
+                    conv_profile.bnns_destroy_seconds);
+        }
+    }
     *samples = audio;
     *sample_count = current_length;
     return 0;
@@ -1359,12 +1838,23 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     const size_t ffn = cache->ffn_width;
     const size_t xw = cache->xattn_width;
     const size_t start = cache->length;
+    const int profile_prefill = getenv("MYNAH_TIMING") != NULL && count > 1u;
+    double self_projection_seconds = 0.0;
+    double self_attention_seconds = 0.0;
+    double cross_projection_seconds = 0.0;
+    double cross_attention_seconds = 0.0;
+    double ffn_seconds = 0.0;
     if (count == 0 || start + count > cache->capacity) {
         graph_error(error, error_capacity, "decoder cache capacity exceeded");
         return -1;
     }
     const size_t scores_len = cache->capacity > cache->memory_length
         ? cache->capacity : cache->memory_length;
+    if (ffn == 0 || count > SIZE_MAX / ffn) {
+        graph_error(error, error_capacity, "decoder FFN workspace size overflow");
+        return -1;
+    }
+    const size_t hidden_elements = count * ffn;
     float *x = allocate_floats(count * width, error, error_capacity);
     float *nrm = allocate_floats(count * width, error, error_capacity);
     float *qkv = allocate_floats(count * width * 3u, error, error_capacity);
@@ -1372,16 +1862,22 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     float *proj = allocate_floats(count * width, error, error_capacity);
     float *q_x = allocate_floats(count * xw, error, error_capacity);
     float *xctx = allocate_floats(count * xw, error, error_capacity);
-    float *hidden = allocate_floats(count * ffn, error, error_capacity);
+    float *hidden = allocate_floats(hidden_elements, error, error_capacity);
     float *scores = allocate_floats(scores_len, error, error_capacity);
+    float *gelu_scratch = NULL;
+#if defined(MYNAH_USE_ACCELERATE)
+    if (count > 1u && getenv("MYNAH_GELU_SCALAR") == NULL) {
+        gelu_scratch = allocate_floats(hidden_elements, error, error_capacity);
+    }
+#endif
     /* For a multi-row call (the context prefill) the self-attention is a dense
      * batched matmul; a single-row decode step stays scalar over the KV cache
      * (a matvec where sgemm's per-call overhead would dominate). */
-    const size_t total_kv = start + count;
     float *score_matrix = NULL;
     float *head_ctx = NULL;
     int batched = 0;
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+    const size_t total_kv = start + count;
     if (count > 1u && total_kv <= (size_t)INT_MAX && hw <= (size_t)INT_MAX) {
         batched = 1;
         score_matrix = allocate_floats(count * total_kv, error, error_capacity);
@@ -1390,10 +1886,13 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
 #endif
     if (x == NULL || nrm == NULL || qkv == NULL || attn == NULL || proj == NULL ||
         q_x == NULL || xctx == NULL || hidden == NULL || scores == NULL ||
+#if defined(MYNAH_USE_ACCELERATE)
+        (count > 1u && getenv("MYNAH_GELU_SCALAR") == NULL && gelu_scratch == NULL) ||
+#endif
         (batched && (score_matrix == NULL || head_ctx == NULL))) {
         free(x); free(nrm); free(qkv); free(attn); free(proj);
         free(q_x); free(xctx); free(hidden); free(scores);
-        free(score_matrix); free(head_ctx);
+        free(gelu_scratch); free(score_matrix); free(head_ctx);
         return -1;
     }
     for (size_t i = 0; i < count; ++i) {
@@ -1406,6 +1905,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     int failed = 0;
     for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
         mynah_tensor t;
+        double operation_start = profile_prefill ? phase_seconds() : 0.0;
         /* self-attention */
         snprintf(name, sizeof(name), "decoder.layers.%zu.norm_self.weight", layer);
         if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
@@ -1413,6 +1913,10 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         snprintf(name, sizeof(name), "decoder.layers.%zu.self_attention.qkv_net.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, qkv,
                               count, width, width * 3u, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (profile_prefill) {
+            self_projection_seconds += phase_seconds() - operation_start;
+            operation_start = phase_seconds();
+        }
         float *kbase = cache->self_k + layer * cache->capacity * width;
         float *vbase = cache->self_v + layer * cache->capacity * width;
         for (size_t i = 0; i < count; ++i) {
@@ -1467,6 +1971,10 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                 }
             }
         }
+        if (profile_prefill) {
+            self_attention_seconds += phase_seconds() - operation_start;
+            operation_start = phase_seconds();
+        }
         snprintf(name, sizeof(name), "decoder.layers.%zu.self_attention.o_net.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, attn, proj,
                               count, width, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
@@ -1478,6 +1986,10 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         snprintf(name, sizeof(name), "decoder.layers.%zu.cross_attention.q_net.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, q_x,
                               count, width, xw, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (profile_prefill) {
+            cross_projection_seconds += phase_seconds() - operation_start;
+            operation_start = phase_seconds();
+        }
         const float *ck = cache->cross_k + layer * cache->memory_length * xw;
         const float *cv = cache->cross_v + layer * cache->memory_length * xw;
         for (size_t i = 0; i < count; ++i) {
@@ -1500,6 +2012,10 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                 outh[d] = v;
             }
         }
+        if (profile_prefill) {
+            cross_attention_seconds += phase_seconds() - operation_start;
+            operation_start = phase_seconds();
+        }
         snprintf(name, sizeof(name), "decoder.layers.%zu.cross_attention.o_net.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, xctx, proj,
                               count, xw, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
@@ -1511,11 +2027,12 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         snprintf(name, sizeof(name), "decoder.layers.%zu.pos_ff.proj.conv.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, hidden,
                               count, width, ffn, NULL, error, error_capacity) != 0) { failed = 1; break; }
-        for (size_t k = 0; k < count * ffn; ++k) hidden[k] = gelu_tanh(hidden[k]);
+        gelu_tanh_array(hidden, hidden_elements, gelu_scratch);
         snprintf(name, sizeof(name), "decoder.layers.%zu.pos_ff.o_net.conv.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, hidden, proj,
                               count, ffn, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
+        if (profile_prefill) ffn_seconds += phase_seconds() - operation_start;
     }
     if (!failed) {
         mynah_tensor norm_out;
@@ -1527,7 +2044,14 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     }
     free(x); free(nrm); free(qkv); free(attn); free(proj);
     free(q_x); free(xctx); free(hidden); free(scores);
-    free(score_matrix); free(head_ctx);
+    free(gelu_scratch); free(score_matrix); free(head_ctx);
+    if (profile_prefill) {
+        fprintf(stderr,
+                "decoder prefill detail: self_proj=%.3fs self_attn=%.3fs "
+                "cross_proj=%.3fs cross_attn=%.3fs ffn=%.3fs\n",
+                self_projection_seconds, self_attention_seconds,
+                cross_projection_seconds, cross_attention_seconds, ffn_seconds);
+    }
     if (!failed) cache->length += count;
     return failed ? -1 : 0;
 }
@@ -1551,9 +2075,16 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
     const int timing = getenv("MYNAH_TIMING") != NULL;
     const double t_start = timing ? phase_seconds() : 0.0;
     double t_prep = t_start, t_ar = t_start;
+    double prep_encode_seconds = 0.0;
+    double prep_cross_cache_seconds = 0.0;
+    double prep_context_seconds = 0.0;
+    double ar_embed_seconds = 0.0;
+    double ar_decoder_seconds = 0.0;
+    double ar_local_seconds = 0.0;
     float *memory = NULL;
     if (encode_text(model, request->text_ids, request->text_length, &memory,
                     error, error_capacity) != 0) return -1;
+    if (timing) prep_encode_seconds = phase_seconds() - t_start;
     mynah_tensor context_tensor;
     if (tensor(model->tts, "baked_context_embedding.weight", &context_tensor,
                error, error_capacity) != 0 || context_tensor.rank != 2 ||
@@ -1595,9 +2126,9 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
     size_t eos_frame = SIZE_MAX;
     /* Cache the constant text cross-attention and prefill the baked speaker
      * context once, so every autoregressive step is a single-row decoder pass. */
+    double prep_stage_start = timing ? phase_seconds() : 0.0;
     if (decoder_cache_init(model, &cache, memory, request->text_length,
-                           context_length + max_steps + 2u, error, error_capacity) != 0 ||
-        decoder_run(model, &cache, context, context_length, out_last, error, error_capacity) != 0) {
+                           context_length + max_steps + 2u, error, error_capacity) != 0) {
         decoder_cache_free(&cache);
         free(memory);
         free(codes);
@@ -1605,12 +2136,37 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
         free(audio_row);
         return -1;
     }
+    if (timing) {
+        prep_cross_cache_seconds = phase_seconds() - prep_stage_start;
+        prep_stage_start = phase_seconds();
+    }
+    if (decoder_run(model, &cache, context, context_length, out_last,
+                    error, error_capacity) != 0) {
+        decoder_cache_free(&cache);
+        free(memory);
+        free(codes);
+        free(out_last);
+        free(audio_row);
+        return -1;
+    }
+    if (timing) prep_context_seconds = phase_seconds() - prep_stage_start;
     if (timing) t_prep = phase_seconds();
     for (size_t stacked_length = 1u; stacked_length <= max_steps; ++stacked_length) {
         const size_t raw_length = stacked_length * model->info.frame_stacking_factor;
+        double stage_start = timing ? phase_seconds() : 0.0;
         if (embed_audio_frame(model, codes, max_raw_length, stacked_length - 1u,
                               audio_row, error, error_capacity) != 0) break;
+        if (timing) {
+            const double now = phase_seconds();
+            ar_embed_seconds += now - stage_start;
+            stage_start = now;
+        }
         if (decoder_run(model, &cache, audio_row, 1u, out_last, error, error_capacity) != 0) break;
+        if (timing) {
+            const double now = phase_seconds();
+            ar_decoder_seconds += now - stage_start;
+            stage_start = now;
+        }
         int saw_eos = 0;
         size_t step_eos_frame = SIZE_MAX;
         if (request->use_local_transformer) {
@@ -1657,6 +2213,7 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
                 codes[codebook * max_raw_length + raw_length + fs] = store;
             }
         }
+        if (timing) ar_local_seconds += phase_seconds() - stage_start;
         ++predicted_stacks;
         if (step_eos_frame != SIZE_MAX) {
             eos_frame = step_eos_frame;
@@ -1697,8 +2254,15 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
     if (timing) {
         const double t_codec = phase_seconds();
         fprintf(stderr,
-                "phase: prep=%.3fs ar=%.3fs codec=%.3fs (stacks=%zu)\n",
-                t_prep - t_start, t_ar - t_prep, t_codec - t_ar, generated_stacks);
+                "phase: prep=%.3fs [encode=%.3fs cross_cache=%.3fs context=%.3fs setup=%.3fs] "
+                "ar=%.3fs [embed=%.3fs decoder=%.3fs local=%.3fs] "
+                "codec=%.3fs (stacks=%zu)\n",
+                t_prep - t_start, prep_encode_seconds, prep_cross_cache_seconds,
+                prep_context_seconds,
+                t_prep - t_start - prep_encode_seconds - prep_cross_cache_seconds -
+                    prep_context_seconds,
+                t_ar - t_prep, ar_embed_seconds, ar_decoder_seconds,
+                ar_local_seconds, t_codec - t_ar, generated_stacks);
     }
     decoder_cache_free(&cache);
     free(memory);

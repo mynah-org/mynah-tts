@@ -9,6 +9,10 @@ BLAS ?= auto
 SIMD ?= auto
 SPEAKER ?= 0
 MAX_STEPS ?= 0
+BENCH_TEXT ?= h|ə|ˈ|l|o|ʊ|<space>|f|ɹ|ʌ|m
+BENCH_WARMUP ?= 2
+BENCH_RUNS ?= 5
+BENCH_OUTPUT ?= build/bench.wav
 
 ifeq ($(SIMD),scalar)
 CFLAGS += -DMYNAH_DISABLE_SIMD
@@ -54,7 +58,7 @@ CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
 TARGET := $(BUILD_DIR)/mynah-tts
 LIBRARY := $(BUILD_DIR)/libmynah_tts.a
 
-.PHONY: all cpu info caps self-test test bench inspect convert convert-codec tokenizer synthesize oracle \
+.PHONY: all cpu info caps self-test test bench bench-matrix inspect convert convert-codec tokenizer synthesize oracle \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist
 
 all: $(TARGET)
@@ -90,7 +94,19 @@ test: self-test
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
 bench: self-test
-	@echo "No model benchmark requested; run make test MODEL_DIR=... after conversion."
+	@test -n "$(MODEL_DIR)" || (echo "usage: make bench MODEL_DIR=pack [QUANT=int8|int4] [MYNAH_THREADS=N]" >&2; exit 2)
+	@MYNAH_QUANT="$(QUANT)" $(TARGET) --synthesize "$(MODEL_DIR)" \
+		--normalized "$(BENCH_TEXT)" --output "$(BENCH_OUTPUT)" --speaker 4 \
+		--max-steps 20 --seed 42 --warmup "$(BENCH_WARMUP)" --runs "$(BENCH_RUNS)"
+
+bench-matrix: self-test
+	@test -n "$(MODEL_DIR)" || (echo "usage: make bench-matrix MODEL_DIR=pack [MYNAH_THREADS=N]" >&2; exit 2)
+	@for quant in f32 int8 int4; do \
+		if test "$$quant" = f32; then qenv=""; else qenv="$$quant"; fi; \
+		$(MAKE) --no-print-directory bench MODEL_DIR="$(MODEL_DIR)" QUANT="$$qenv" \
+			BENCH_OUTPUT="build/bench-$$quant.wav" BENCH_WARMUP="$(BENCH_WARMUP)" \
+			BENCH_RUNS="$(BENCH_RUNS)"; \
+	done
 
 inspect:
 	@test -n "$(MODEL)" || (echo "usage: make inspect MODEL=path/to/model.nemo" >&2; exit 2)
@@ -179,7 +195,14 @@ gpu-selftest:
 	else echo "usage: make gpu-selftest [DEVICE=metal|cuda]" >&2; exit 2; fi
 
 leaks:
-	@$(MAKE) BUILD_DIR=build/leaks CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address,undefined' LDFLAGS='-fsanitize=address,undefined' test
+ifeq ($(UNAME_S),Darwin)
+	@command -v leaks >/dev/null 2>&1 || (echo "macOS leaks tool is unavailable" >&2; exit 2)
+	@$(MAKE) BUILD_DIR=build/leaks-native CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g' build/leaks-native/mynah-tts
+	@leaks --atExit -- build/leaks-native/mynah-tts --self-test
+else
+	@echo "make leaks is macOS-only; use make asan on Linux" >&2
+	@exit 2
+endif
 
 ubsan:
 	@$(MAKE) BUILD_DIR=build/ubsan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=undefined' LDFLAGS='-fsanitize=undefined' test

@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "graph.h"
 #include "kernels.h"
 #include "mynah_tts.h"
 #include "qmat.h"
@@ -24,7 +25,7 @@ static void usage(const char *program) {
     printf("  %s --write-test-wav OUTPUT.wav\n", program);
     printf("  %s --synthesize MODEL_DIR --tokens IDS --output OUTPUT.wav [options]\n", program);
     printf("      options: --speaker N --max-steps N --temperature F --topk N --seed N\n");
-    printf("               --parallel --device cpu|metal|cuda\n");
+    printf("               --parallel --device cpu|metal|cuda --warmup N --runs N\n");
     printf("  %s --gpu-self-test metal|cuda\n", program);
     printf("\nNative Magpie inference is CPU-first; Metal/CUDA are explicit build variants.\n");
 }
@@ -80,6 +81,12 @@ static int parse_seed(const char *text, uint64_t *out) {
     if (errno != 0 || end == text || *end != '\0') return -1;
     *out = (uint64_t)value;
     return 0;
+}
+
+static int compare_double(const void *left, const void *right) {
+    const double a = *(const double *)left;
+    const double b = *(const double *)right;
+    return (a > b) - (a < b);
 }
 
 static int parse_device(const char *text, mynah_tts_device *out) {
@@ -206,6 +213,8 @@ static int synthesize(int argc, char **argv) {
     float temperature = -1.0f;
     unsigned topk = 0;
     uint64_t seed = UINT64_C(42);
+    unsigned warmups = 0;
+    unsigned runs = 1;
     int use_local = 1;
     mynah_tts_device device = MYNAH_TTS_DEVICE_CPU;
     for (int i = 2; i < argc; ++i) {
@@ -217,6 +226,8 @@ static int synthesize(int argc, char **argv) {
         else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc && parse_float(argv[++i], &temperature) == 0) {}
         else if (strcmp(argv[i], "--topk") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &topk) == 0) {}
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc && parse_seed(argv[++i], &seed) == 0) {}
+        else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &warmups) == 0) {}
+        else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &runs) == 0) {}
         else if (strcmp(argv[i], "--parallel") == 0) use_local = 0;
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc &&
                  parse_device(argv[++i], &device) == 0) {}
@@ -227,6 +238,7 @@ static int synthesize(int argc, char **argv) {
         }
     }
     if (model_dir == NULL || (token_text == NULL && normalized_text == NULL) || output_path == NULL ||
+        runs == 0 || warmups > UINT_MAX - runs ||
         (token_text != NULL && normalized_text != NULL)) {
         fprintf(stderr, "synthesis requires MODEL_DIR, one of --tokens/--normalized and --output\n");
         return 2;
@@ -272,10 +284,35 @@ static int synthesize(int argc, char **argv) {
     };
     float *samples = NULL;
     size_t sample_count = 0;
-    const double synth_start = now_seconds();
-    const int result = mynah_tts_synthesize(model, &request, &samples, &sample_count,
-                                             error, sizeof(error));
-    const double synth_seconds = now_seconds() - synth_start;
+    double *timings = (size_t)runs > SIZE_MAX / sizeof(*timings)
+        ? NULL : (double *)malloc((size_t)runs * sizeof(*timings));
+    int result = timings == NULL ? -1 : 0;
+    if (timings == NULL) snprintf(error, sizeof(error), "out of memory allocating benchmark timings");
+    for (unsigned iteration = 0; result == 0 && iteration < warmups + runs; ++iteration) {
+        float *iteration_samples = NULL;
+        size_t iteration_count = 0;
+        const double synth_start = now_seconds();
+        result = mynah_tts_synthesize(model, &request, &iteration_samples, &iteration_count,
+                                      error, sizeof(error));
+        const double elapsed = now_seconds() - synth_start;
+        if (result != 0) {
+            mynah_tts_free_samples(iteration_samples);
+            break;
+        }
+        if (iteration >= warmups) timings[iteration - warmups] = elapsed;
+        if (iteration + 1u == warmups + runs) {
+            samples = iteration_samples;
+            sample_count = iteration_count;
+        } else {
+            mynah_tts_free_samples(iteration_samples);
+        }
+    }
+    if (result == 0) qsort(timings, runs, sizeof(*timings), compare_double);
+    const double synth_seconds = result == 0
+        ? (runs % 2u == 0u
+               ? (timings[runs / 2u - 1u] + timings[runs / 2u]) * 0.5
+               : timings[runs / 2u])
+        : 0.0;
     if (result == 0 && mynah_wav_write_f32(output_path, samples, sample_count,
                                            info.sample_rate, error, sizeof(error)) == 0) {
         const double audio_seconds = info.sample_rate > 0
@@ -285,10 +322,19 @@ static int synthesize(int argc, char **argv) {
         printf("timing: load=%.3fs synth=%.3fs audio=%.3fs RTF=%.3f\n",
                load_seconds, synth_seconds, audio_seconds,
                audio_seconds > 0.0 ? synth_seconds / audio_seconds : 0.0);
+        if (warmups > 0 || runs > 1) {
+            printf("benchmark: warmup=%u runs=%u statistic=median "
+                   "synth_range=[%.3f,%.3f]s RTF_range=[%.3f,%.3f]\n",
+                   warmups, runs, timings[0], timings[runs - 1u],
+                   audio_seconds > 0.0 ? timings[0] / audio_seconds : 0.0,
+                   audio_seconds > 0.0 ? timings[runs - 1u] / audio_seconds : 0.0);
+        }
     } else {
         fprintf(stderr, "native synthesis failed: %s\n", error);
+        if (result == 0) result = -1;
     }
     mynah_tts_free_samples(samples);
+    free(timings);
     mynah_tts_model_close(model);
     free(tokens);
     return result == 0 ? 0 : 1;
@@ -336,6 +382,14 @@ int main(int argc, char **argv) {
         }
         if (mynah_qmat_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "qmat self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_graph_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "graph self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_graph_bnns_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "BNNS graph self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_tts_device_self_test(MYNAH_TTS_DEVICE_CPU, error, sizeof(error)) != 0) {

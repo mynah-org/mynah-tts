@@ -168,6 +168,41 @@ Measure before changing kernels. Report RTF, TTFA, frames/s, peak RSS, model
 load time, thread count, ISA, backend and model revision. Single-request latency
 and batched throughput are different metrics.
 
+### Execution discipline for tests and benchmarks
+
+1. Run exactly one test or benchmark process at a time. Do not use parallel
+   tool calls, background jobs, `make -j`, or concurrent A/B runs for latency,
+   RTF, memory, sanitizer, leak, or correctness measurements.
+2. Distinguish process count from worker-thread count. Always report both.
+   Default performance investigations to one process and `MYNAH_THREADS=1`;
+   sweep threads only as a separate, explicitly labelled experiment.
+3. Change one variable per A/B comparison. Keep binary, model revision, prompt,
+   speaker, seed, step cap, sampler, backend, ISA, environment, warm-ups and run
+   count identical. Run A and B sequentially on the same machine.
+4. Use at least two warm-ups and five measured runs for accepted performance
+   results. Report the median and visible variance/outliers; never mix cold
+   page-in, lazy cache construction or model load into synthesis-only RTF.
+5. Treat exploratory or contended numbers as invalid immediately. Do not quote,
+   average, document or use them to justify a change.
+6. Verify correctness before calling a speedup: byte identity when required,
+   otherwise token/EOS parity plus explicit maximum error, RMS/mel correlation,
+   duration and finite-value checks. Cross-quantization RTF is not an A/B when
+   generated duration or EOS changes.
+7. Accept an optimization only when it beats the declared noise floor (normally
+   3%), survives the smallest relevant tests, and its complexity is justified.
+   Revert failed experiments completely.
+8. After interrupting a command, confirm all child processes exited before
+   starting another command. If a child survives, terminate its exact PID and
+   verify absence. Never leave benchmark or sanitizer processes consuming the
+   user's machine.
+9. Use the smallest sufficient validation serially: focused self-test, exact A/B,
+   full test, then sanitizer/leak checks when relevant. A broken or hanging
+   validation target is a defect to diagnose; do not silently substitute it.
+10. Communicate like an owner: state the measured bottleneck, hypothesis,
+    change, exact evidence, correctness result, remaining risk and next decision.
+    Be precise about what was tested and what was not; never claim the RTF goal
+    before the measured release gate passes.
+
 Priority order:
 
 1. mmap and buffer reuse;

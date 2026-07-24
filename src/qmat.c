@@ -6,8 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__ARM_FEATURE_DOTPROD)
+#if !defined(MYNAH_DISABLE_SIMD) && defined(__ARM_FEATURE_DOTPROD)
 #include <arm_neon.h>
+#define MYNAH_QMAT_DOTPROD 1
 #endif
 
 /* count at/below this uses the native int dot; above it falls back to the f32
@@ -97,7 +98,7 @@ static float quantize_act_int8(int8_t *qx, const float *x, size_t k) {
 
 /* ---------------------------------------------------------- int dot kernels */
 static float dot_q8(const int8_t *qx, float sx, const int8_t *w, float ws, size_t k) {
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(MYNAH_QMAT_DOTPROD)
     int32x4_t acc = vdupq_n_s32(0);
     size_t j = 0;
     for (; j + 16 <= k; j += 16) acc = vdotq_s32(acc, vld1q_s8(w + j), vld1q_s8(qx + j));
@@ -115,7 +116,7 @@ static float dot_q8(const int8_t *qx, float sx, const int8_t *w, float ws, size_
  * one entry per group of 32.  k must be a multiple of 32. */
 static float dot_q4(const int8_t *qx, float sx, const uint8_t *q, const float *scales, size_t k) {
     const size_t groups = k / QMAT_Q4_GROUP;
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(MYNAH_QMAT_DOTPROD)
     const int8x16_t off = vdupq_n_s8(8);
     const uint8x16_t maskv = vdupq_n_u8(0x0F);
     float acc = 0.0f;
@@ -144,6 +145,111 @@ static float dot_q4(const int8_t *qx, float sx, const uint8_t *q, const float *s
 #endif
 }
 
+/* Decode is a stream of matrix-vector products.  On ARM, keep four independent
+ * output rows in flight so SDOT latency is hidden and the quantized activation
+ * vector is loaded once for four weight rows.  Each row retains the same
+ * accumulation order as dot_q8/dot_q4; the scalar tail is the reference path. */
+static void matvec_q8(float *out, const int8_t *qx, float sx,
+                      const int8_t *weights, const float *scales,
+                      const float *bias, size_t rows, size_t cols) {
+    size_t row = 0;
+#if defined(MYNAH_QMAT_DOTPROD)
+    for (; row + 4u <= rows; row += 4u) {
+        const int8_t *w0 = weights + row * cols;
+        const int8_t *w1 = w0 + cols;
+        const int8_t *w2 = w1 + cols;
+        const int8_t *w3 = w2 + cols;
+        int32x4_t a0 = vdupq_n_s32(0);
+        int32x4_t a1 = vdupq_n_s32(0);
+        int32x4_t a2 = vdupq_n_s32(0);
+        int32x4_t a3 = vdupq_n_s32(0);
+        size_t j = 0;
+        for (; j + 16u <= cols; j += 16u) {
+            const int8x16_t x = vld1q_s8(qx + j);
+            a0 = vdotq_s32(a0, vld1q_s8(w0 + j), x);
+            a1 = vdotq_s32(a1, vld1q_s8(w1 + j), x);
+            a2 = vdotq_s32(a2, vld1q_s8(w2 + j), x);
+            a3 = vdotq_s32(a3, vld1q_s8(w3 + j), x);
+        }
+        int32_t s0 = vaddvq_s32(a0);
+        int32_t s1 = vaddvq_s32(a1);
+        int32_t s2 = vaddvq_s32(a2);
+        int32_t s3 = vaddvq_s32(a3);
+        for (; j < cols; ++j) {
+            const int32_t x = qx[j];
+            s0 += (int32_t)w0[j] * x;
+            s1 += (int32_t)w1[j] * x;
+            s2 += (int32_t)w2[j] * x;
+            s3 += (int32_t)w3[j] * x;
+        }
+        out[row] = (float)s0 * scales[row] * sx + (bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = (float)s1 * scales[row + 1u] * sx +
+                        (bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = (float)s2 * scales[row + 2u] * sx +
+                        (bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = (float)s3 * scales[row + 3u] * sx +
+                        (bias == NULL ? 0.0f : bias[row + 3u]);
+    }
+#endif
+    for (; row < rows; ++row) {
+        float value = dot_q8(qx, sx, weights + row * cols, scales[row], cols);
+        if (bias != NULL) value += bias[row];
+        out[row] = value;
+    }
+}
+
+static void matvec_q4(float *out, const int8_t *qx, float sx,
+                      const uint8_t *weights, const float *scales,
+                      const float *bias, size_t rows, size_t cols) {
+    size_t row = 0;
+#if defined(MYNAH_QMAT_DOTPROD)
+    const size_t groups = cols / QMAT_Q4_GROUP;
+    const size_t packed_row = cols / 2u;
+    const int8x16_t off = vdupq_n_s8(8);
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    for (; row + 4u <= rows; row += 4u) {
+        const uint8_t *w0 = weights + row * packed_row;
+        const uint8_t *w1 = w0 + packed_row;
+        const uint8_t *w2 = w1 + packed_row;
+        const uint8_t *w3 = w2 + packed_row;
+        const float *s0 = scales + row * groups;
+        const float *s1 = s0 + groups;
+        const float *s2 = s1 + groups;
+        const float *s3 = s2 + groups;
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float a3 = 0.0f;
+        for (size_t group = 0; group < groups; ++group) {
+            const int8x16x2_t x = vld2q_s8(qx + group * QMAT_Q4_GROUP);
+#define Q4_DOT_ROW(weight, scale, accumulator) do { \
+                const uint8x16_t packed = vld1q_u8((weight) + group * 16u); \
+                const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(packed, mask)), off); \
+                const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), off); \
+                const int32x4_t dot = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x.val[0]), \
+                                                hi, x.val[1]); \
+                (accumulator) += (float)vaddvq_s32(dot) * (scale)[group]; \
+            } while (0)
+            Q4_DOT_ROW(w0, s0, a0);
+            Q4_DOT_ROW(w1, s1, a1);
+            Q4_DOT_ROW(w2, s2, a2);
+            Q4_DOT_ROW(w3, s3, a3);
+#undef Q4_DOT_ROW
+        }
+        out[row] = a0 * sx + (bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = a1 * sx + (bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = a2 * sx + (bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = a3 * sx + (bias == NULL ? 0.0f : bias[row + 3u]);
+    }
+#endif
+    for (; row < rows; ++row) {
+        float value = dot_q4(qx, sx, weights + row * (cols / 2u),
+                             scales + row * (cols / QMAT_Q4_GROUP), cols);
+        if (bias != NULL) value += bias[row];
+        out[row] = value;
+    }
+}
+
 /* --------------------------------------------------------------- weight cache */
 typedef struct {
     char *name;
@@ -157,6 +263,7 @@ typedef struct {
 
 struct mynah_qmat_cache {
     int qtype; /* QMAT_F32 (off) / QMAT_INT8 / QMAT_INT4 */
+    int use_row4;
     qmat_entry *entries;
     size_t count;
     size_t capacity;
@@ -174,6 +281,7 @@ mynah_qmat_cache *mynah_qmat_cache_new(int enabled) {
         qtype = enabled;
     }
     c->qtype = qtype;
+    c->use_row4 = getenv("MYNAH_QMAT_SINGLE_ROW") == NULL;
     return c;
 }
 
@@ -205,6 +313,7 @@ static const qmat_entry *cache_lookup(const mynah_qmat_cache *cache, const char 
  * multiple of 32) so the caller can fall back to f32. */
 static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
                                       const float *w, size_t n, size_t k) {
+    if (k == 0 || n > SIZE_MAX / k || n > SIZE_MAX / sizeof(float)) return NULL;
     if (cache->qtype == QMAT_INT4 && (k % QMAT_Q4_GROUP) != 0) return NULL;
     if (cache->count == cache->capacity) {
         const size_t next = cache->capacity == 0 ? 16u : cache->capacity * 2u;
@@ -270,19 +379,26 @@ int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_safetensors *file,
         const float *xr = in + t * k;
         float *orow = out + t * n;
         const float sx = quantize_act_int8(qx, xr, k);
-        for (size_t i = 0; i < n; ++i) {
-            float v = e->qtype == QMAT_INT8
-                          ? dot_q8(qx, sx, e->q8 + i * k, e->scales[i], k)
-                          : dot_q4(qx, sx, e->q4 + i * (k / 2u), e->scales + i * (k / QMAT_Q4_GROUP), k);
-            if (bias != NULL) v += bias[i];
-            orow[i] = v;
+        if (!cache->use_row4) {
+            for (size_t row = 0; row < n; ++row) {
+                float value = e->qtype == QMAT_INT8
+                                  ? dot_q8(qx, sx, e->q8 + row * k, e->scales[row], k)
+                                  : dot_q4(qx, sx, e->q4 + row * (k / 2u),
+                                           e->scales + row * (k / QMAT_Q4_GROUP), k);
+                if (bias != NULL) value += bias[row];
+                orow[row] = value;
+            }
+        } else if (e->qtype == QMAT_INT8) {
+            matvec_q8(orow, qx, sx, e->q8, e->scales, bias, n, k);
+        } else {
+            matvec_q4(orow, qx, sx, e->q4, e->scales, bias, n, k);
         }
     }
     return 0;
 }
 
 static int self_test_one(int qtype, char *error, size_t error_capacity) {
-    enum { N = 48, K = 768 };
+    enum { N = 48, K = 768, MATVEC_ROWS = 5 };
     static float w[N * K];
     static float x[K];
     static int8_t q8[N * K];
@@ -290,6 +406,8 @@ static int self_test_one(int qtype, char *error, size_t error_capacity) {
     static float scales8[N];
     static float scales4[N * K / QMAT_Q4_GROUP];
     static int8_t qx[K];
+    float bias[MATVEC_ROWS];
+    float matvec[MATVEC_ROWS];
     for (size_t i = 0; i < (size_t)N; ++i) {
         for (size_t j = 0; j < (size_t)K; ++j) {
             w[i * K + j] = sinf(0.017f * (float)(i * 7u + j)) * (0.5f + 0.5f * cosf(0.003f * (float)j));
@@ -297,10 +415,13 @@ static int self_test_one(int qtype, char *error, size_t error_capacity) {
     }
     for (size_t j = 0; j < (size_t)K; ++j) x[j] = cosf(0.011f * (float)j) - 0.3f;
     const float sx = quantize_act_int8(qx, x, K);
+    for (size_t i = 0; i < MATVEC_ROWS; ++i) bias[i] = (float)i * 0.125f - 0.25f;
     if (qtype == QMAT_INT8) {
         quantize_weight_int8(w, N, K, q8, scales8);
+        matvec_q8(matvec, qx, sx, q8, scales8, bias, MATVEC_ROWS, K);
     } else {
         quantize_weight_int4(w, N, K, q4, scales4);
+        matvec_q4(matvec, qx, sx, q4, scales4, bias, MATVEC_ROWS, K);
     }
     float max_rel = 0.0f;
     float ref_energy = 0.0f;
@@ -310,6 +431,18 @@ static int self_test_one(int qtype, char *error, size_t error_capacity) {
         const float got = qtype == QMAT_INT8
                               ? dot_q8(qx, sx, q8 + i * K, scales8[i], K)
                               : dot_q4(qx, sx, q4 + i * (K / 2), scales4 + i * (K / QMAT_Q4_GROUP), K);
+        if (i < MATVEC_ROWS) {
+            const float expected = got + bias[i];
+            const float tolerance = 1.0e-6f * (1.0f + fabsf(expected));
+            if (fabsf(matvec[i] - expected) > tolerance) {
+                if (error != NULL && error_capacity > 0) {
+                    snprintf(error, error_capacity,
+                             "qmat %s four-row matvec mismatch at row %zu",
+                             qtype == QMAT_INT8 ? "int8" : "int4", i);
+                }
+                return -1;
+            }
+        }
         ref_energy += ref * ref;
         const float denom = fabsf(ref) > 1.0e-3f ? fabsf(ref) : 1.0e-3f;
         const float rel = fabsf(got - ref) / denom;
