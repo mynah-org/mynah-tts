@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "threads.h"
 
 #include <errno.h>
 #include <math.h>
@@ -67,6 +68,46 @@ static float dot_product(const float *left, const float *right, size_t count) {
     return sum;
 }
 
+#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+/* out[rows, output_width] = input[rows, input_width] @ weight[output_width,
+ * input_width]^T (+ bias).  A multi-row call (prefill/encoder) is split across
+ * worker threads over disjoint row blocks — each block is one sgemm, so the
+ * result is bit-identical to the single-call form.  A single-row decode step
+ * has one block and runs inline. */
+typedef struct {
+    const float *input;
+    float *output;
+    const float *weight;
+    const float *bias;
+    size_t rows;
+    size_t input_width;
+    size_t output_width;
+    int blocks;
+} matmul_job;
+
+static void matmul_block(void *ctx, int b) {
+    const matmul_job *j = (const matmul_job *)ctx;
+    const size_t per = (j->rows + (size_t)j->blocks - 1u) / (size_t)j->blocks;
+    const size_t r0 = (size_t)b * per;
+    if (r0 >= j->rows) return;
+    size_t r1 = r0 + per;
+    if (r1 > j->rows) r1 = j->rows;
+    const size_t m = r1 - r0;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                (int)m, (int)j->output_width, (int)j->input_width,
+                1.0f, j->input + r0 * j->input_width, (int)j->input_width,
+                j->weight, (int)j->input_width,
+                0.0f, j->output + r0 * j->output_width, (int)j->output_width);
+    if (j->bias != NULL) {
+        for (size_t row = r0; row < r1; ++row) {
+            for (size_t column = 0; column < j->output_width; ++column) {
+                j->output[row * j->output_width + column] += j->bias[column];
+            }
+        }
+    }
+}
+#endif
+
 static int cpu_matmul(void *state, const float *input, float *output, size_t rows,
                       size_t input_width, size_t output_width, const float *weight,
                       const float *bias, char *error, size_t error_capacity) {
@@ -76,18 +117,19 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (rows <= (size_t)INT_MAX && input_width <= (size_t)INT_MAX &&
         output_width <= (size_t)INT_MAX) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)rows, (int)output_width, (int)input_width,
-                    1.0f, input, (int)input_width,
-                    weight, (int)input_width,
-                    0.0f, output, (int)output_width);
-        if (bias != NULL) {
-            for (size_t row = 0; row < rows; ++row) {
-                for (size_t column = 0; column < output_width; ++column) {
-                    output[row * output_width + column] += bias[column];
-                }
-            }
+        int blocks = 1;
+#if defined(MYNAH_USE_OPENBLAS)
+        /* Accelerate (macOS) threads sgemm internally, so splitting there only
+         * oversubscribes; on OpenBLAS we drive the parallelism ourselves (the
+         * pool forces BLAS to one thread per block).  Thread only matmuls big
+         * enough to amortize dispatch. */
+        const int threads = mynah_num_threads();
+        if (threads > 1 && rows >= 8u && input_width * output_width >= 65536u) {
+            blocks = (int)rows < threads ? (int)rows : threads;
         }
+#endif
+        matmul_job job = {input, output, weight, bias, rows, input_width, output_width, blocks};
+        mynah_parallel_for(blocks, matmul_block, &job);
         return 0;
     }
 #endif

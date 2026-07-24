@@ -127,6 +127,48 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
         free(hidden);
         return result;
     }
+#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+    if (length <= (size_t)INT_MAX && width <= (size_t)INT_MAX && ffn_width <= (size_t)INT_MAX) {
+        /* A causal conv-FFN is a sum of `kernel` shifted matmuls (weight tap k),
+         * the same trick as conv1d_causal but with time-major rows.  This is the
+         * encoder's dominant cost, so accumulate the taps with sgemm instead of
+         * the scalar quadruple loop. */
+        float *wk = (float *)malloc(ffn_width * width * sizeof(float));
+        if (wk == NULL) {
+            free(hidden);
+            graph_error(error, error_capacity, "out of memory in causal conv-ffn");
+            return -1;
+        }
+        memset(hidden, 0, length * ffn_width * sizeof(float));
+        for (size_t k = 0; k < kernel; ++k) {
+            const size_t shift = kernel - 1u - k;
+            if (shift >= length) continue;
+            for (size_t o = 0; o < ffn_width; ++o) {
+                for (size_t i = 0; i < width; ++i) wk[o * width + i] = proj.data[(o * width + i) * kernel + k];
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)(length - shift), (int)ffn_width, (int)width,
+                        1.0f, input, (int)width, wk, (int)width,
+                        1.0f, hidden + shift * ffn_width, (int)ffn_width);
+        }
+        for (size_t i = 0; i < length * ffn_width; ++i) hidden[i] = gelu_tanh(hidden[i]);
+        memset(output, 0, length * width * sizeof(float));
+        for (size_t k = 0; k < kernel; ++k) {
+            const size_t shift = kernel - 1u - k;
+            if (shift >= length) continue;
+            for (size_t o = 0; o < width; ++o) {
+                for (size_t i = 0; i < ffn_width; ++i) wk[o * ffn_width + i] = out_net.data[(o * ffn_width + i) * kernel + k];
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)(length - shift), (int)width, (int)ffn_width,
+                        1.0f, hidden, (int)ffn_width, wk, (int)ffn_width,
+                        1.0f, output + shift * width, (int)width);
+        }
+        free(wk);
+        free(hidden);
+        return 0;
+    }
+#endif
     for (size_t t = 0; t < length; ++t) {
         for (size_t o = 0; o < ffn_width; ++o) {
             float value = 0.0f;
