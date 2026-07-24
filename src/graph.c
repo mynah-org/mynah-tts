@@ -11,6 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__))
+#include <arm_neon.h>
+#define MYNAH_GRAPH_NEON 1
+#endif
+
 #if defined(MYNAH_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 #elif defined(MYNAH_USE_OPENBLAS)
@@ -105,6 +110,30 @@ static void gelu_tanh_array(float *values, size_t length, float *scratch) {
     (void)scratch;
 #endif
     for (size_t i = 0; i < length; ++i) values[i] = gelu_tanh(values[i]);
+}
+
+/* ---- NEON-accelerated attention primitives --------------------------------
+ * The single-row decoder attention attn·V weighted sum (hw = 64 elements per
+ * position) is vectorised with 4-wide NEON FMA.  The Q·K dot product stays
+ * scalar to preserve the exact greedy argmax path (NEON lane reordering
+ * changes softmax scores enough to flip tokens).  The axpy accumulation
+ * order change is absorbed by downstream layers without affecting EOS.
+ * A scalar fallback is always compiled for portability. */
+
+/* out[0..n) += weight * src[0..n) */
+static void axpy_f32(float *out, const float *src, float weight, size_t n) {
+#if defined(MYNAH_GRAPH_NEON)
+    const float32x4_t w = vdupq_n_f32(weight);
+    size_t i = 0;
+    for (; i + 4u <= n; i += 4u) {
+        float32x4_t o = vld1q_f32(out + i);
+        o = vfmaq_f32(o, w, vld1q_f32(src + i));
+        vst1q_f32(out + i, o);
+    }
+    for (; i < n; ++i) out[i] += weight * src[i];
+#else
+    for (size_t i = 0; i < n; ++i) out[i] += weight * src[i];
+#endif
 }
 
 int mynah_graph_self_test(char *error, size_t error_capacity) {
@@ -816,19 +845,17 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
             for (size_t s = 0; s <= p; ++s) {
                 const float *k = kb + s * width + h * hw;
                 float sc = 0.0f;
-                for (size_t d = 0; d < hw; ++d) sc += qh[d] * k[d];
-                sc *= scale;
+                    for (size_t d = 0; d < hw; ++d) sc += qh[d] * k[d];
+                    sc *= scale;
                 scores[s] = sc;
                 if (sc > maxv) maxv = sc;
             }
             float denom = 0.0f;
             for (size_t s = 0; s <= p; ++s) { scores[s] = expf(scores[s] - maxv); denom += scores[s]; }
             float *outh = attn + h * hw;
-            for (size_t d = 0; d < hw; ++d) {
-                float acc = 0.0f;
-                for (size_t s = 0; s <= p; ++s) acc += (scores[s] / denom) * vb[s * width + h * hw + d];
-                outh[d] = acc;
-            }
+            memset(outh, 0, hw * sizeof(float));
+            for (size_t s = 0; s <= p; ++s)
+                axpy_f32(outh, vb + s * width + h * hw, scores[s] / denom, hw);
         }
         snprintf(name, sizeof(name), "local_transformer.layers.%zu.self_attention.o_net.weight", layer);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, attn, proj,
@@ -1726,6 +1753,20 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
  * is a single-row forward pass.  The arithmetic is identical to the full
  * recompute, so generated codes match the non-cached path within fp tolerance.
  */
+/* Pre-resolved per-layer weight names and norm pointers so the AR hot loop
+ * never calls snprintf or probes the tensor hash table. */
+typedef struct {
+    const float *norm_self;
+    const float *norm_xattn_query;
+    const float *norm_pos_ff;
+    char qkv[160];
+    char o_self[160];
+    char q_cross[160];
+    char o_cross[160];
+    char ffn_up[160];
+    char ffn_down[160];
+} decoder_layer_resolved;
+
 typedef struct {
     size_t layers;
     size_t width;
@@ -1741,6 +1782,23 @@ typedef struct {
     float *cross_k;  /* layers * memory_length * xattn_width */
     float *cross_v;  /* layers * memory_length * xattn_width */
     const float *position; /* decoder.position_embeddings.weight */
+    /* pre-resolved weights */
+    decoder_layer_resolved *resolved;
+    const float *norm_out;
+    /* reusable scratch (sized for scratch_rows) */
+    size_t scratch_rows;
+    float *scratch_x;
+    float *scratch_nrm;
+    float *scratch_qkv;
+    float *scratch_attn;
+    float *scratch_proj;
+    float *scratch_q_x;
+    float *scratch_xctx;
+    float *scratch_hidden;
+    float *scratch_scores;
+    float *scratch_gelu;
+    float *scratch_score_matrix;
+    float *scratch_head_ctx;
 } decoder_cache;
 
 static void decoder_cache_free(decoder_cache *cache) {
@@ -1749,10 +1807,20 @@ static void decoder_cache_free(decoder_cache *cache) {
     free(cache->self_v);
     free(cache->cross_k);
     free(cache->cross_v);
-    cache->self_k = NULL;
-    cache->self_v = NULL;
-    cache->cross_k = NULL;
-    cache->cross_v = NULL;
+    free(cache->resolved);
+    free(cache->scratch_x);
+    free(cache->scratch_nrm);
+    free(cache->scratch_qkv);
+    free(cache->scratch_attn);
+    free(cache->scratch_proj);
+    free(cache->scratch_q_x);
+    free(cache->scratch_xctx);
+    free(cache->scratch_hidden);
+    free(cache->scratch_scores);
+    free(cache->scratch_gelu);
+    free(cache->scratch_score_matrix);
+    free(cache->scratch_head_ctx);
+    memset(cache, 0, sizeof(*cache));
 }
 
 /* Precompute the constant text cross-attention K/V for every decoder layer. */
@@ -1823,12 +1891,85 @@ static int decoder_cache_init(const mynah_tts_model *model, decoder_cache *cache
     }
     free(mem_norm);
     free(kv);
+
+    /* Pre-resolve per-layer weight names and norm pointers so decoder_run
+     * never calls snprintf or probes the tensor hash table. */
+    cache->resolved = (decoder_layer_resolved *)calloc(cache->layers,
+                                                       sizeof(*cache->resolved));
+    if (cache->resolved == NULL) {
+        decoder_cache_free(cache);
+        graph_error(error, error_capacity, "out of memory resolving decoder weights");
+        return -1;
+    }
+    for (size_t layer = 0; layer < cache->layers; ++layer) {
+        decoder_layer_resolved *r = &cache->resolved[layer];
+        mynah_tensor t;
+        snprintf(name, sizeof(name), "decoder.layers.%zu.norm_self.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->norm_self = t.data;
+        snprintf(name, sizeof(name), "decoder.layers.%zu.norm_xattn_query.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->norm_xattn_query = t.data;
+        snprintf(name, sizeof(name), "decoder.layers.%zu.norm_pos_ff.weight", layer);
+        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->norm_pos_ff = t.data;
+        snprintf(r->qkv, sizeof(r->qkv), "decoder.layers.%zu.self_attention.qkv_net.weight", layer);
+        snprintf(r->o_self, sizeof(r->o_self), "decoder.layers.%zu.self_attention.o_net.weight", layer);
+        snprintf(r->q_cross, sizeof(r->q_cross), "decoder.layers.%zu.cross_attention.q_net.weight", layer);
+        snprintf(r->o_cross, sizeof(r->o_cross), "decoder.layers.%zu.cross_attention.o_net.weight", layer);
+        snprintf(r->ffn_up, sizeof(r->ffn_up), "decoder.layers.%zu.pos_ff.proj.conv.weight", layer);
+        snprintf(r->ffn_down, sizeof(r->ffn_down), "decoder.layers.%zu.pos_ff.o_net.conv.weight", layer);
+    }
+    {
+        mynah_tensor t;
+        if (tensor(model->tts, "decoder.norm_out.weight", &t, error, error_capacity) != 0) {
+            decoder_cache_free(cache);
+            return -1;
+        }
+        cache->norm_out = t.data;
+    }
+
+    /* Pre-allocate reusable scratch sized for the largest decoder_run call
+     * (the context prefill).  Single-row AR steps reuse the same buffers. */
+    const size_t rows = capacity;
+    const size_t scores_len = capacity > memory_length ? capacity : memory_length;
+    cache->scratch_rows = rows;
+    cache->scratch_x = allocate_floats(rows * width, error, error_capacity);
+    cache->scratch_nrm = allocate_floats(rows * width, error, error_capacity);
+    cache->scratch_qkv = allocate_floats(rows * width * 3u, error, error_capacity);
+    cache->scratch_attn = allocate_floats(rows * width, error, error_capacity);
+    cache->scratch_proj = allocate_floats(rows * width, error, error_capacity);
+    cache->scratch_q_x = allocate_floats(rows * xw, error, error_capacity);
+    cache->scratch_xctx = allocate_floats(rows * xw, error, error_capacity);
+    cache->scratch_hidden = allocate_floats(rows * cache->ffn_width, error, error_capacity);
+    cache->scratch_scores = allocate_floats(scores_len, error, error_capacity);
+#if defined(MYNAH_USE_ACCELERATE)
+    cache->scratch_gelu = allocate_floats(rows * cache->ffn_width, error, error_capacity);
+    cache->scratch_score_matrix = allocate_floats(rows * capacity, error, error_capacity);
+    cache->scratch_head_ctx = allocate_floats(rows * cache->head_width, error, error_capacity);
+#endif
+    if (cache->scratch_x == NULL || cache->scratch_nrm == NULL ||
+        cache->scratch_qkv == NULL || cache->scratch_attn == NULL ||
+        cache->scratch_proj == NULL || cache->scratch_q_x == NULL ||
+        cache->scratch_xctx == NULL || cache->scratch_hidden == NULL ||
+        cache->scratch_scores == NULL
+#if defined(MYNAH_USE_ACCELERATE)
+        || cache->scratch_gelu == NULL || cache->scratch_score_matrix == NULL ||
+        cache->scratch_head_ctx == NULL
+#endif
+    ) {
+        decoder_cache_free(cache);
+        return -1;
+    }
     return 0;
 }
 
 /* Push `count` new decoder rows through the stack, appending their self K/V to
  * the cache and attending over all cached positions.  `out_last` receives the
- * final-norm output of the last new row (the one used for sampling). */
+ * final-norm output of the last new row (the one used for sampling).
+ *
+ * All scratch buffers and weight names are pre-resolved in decoder_cache so
+ * this function performs zero allocations and zero tensor-name lookups. */
 static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                        const float *input_rows, size_t count, float *out_last,
                        char *error, size_t error_capacity) {
@@ -1848,26 +1989,24 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         graph_error(error, error_capacity, "decoder cache capacity exceeded");
         return -1;
     }
-    const size_t scores_len = cache->capacity > cache->memory_length
-        ? cache->capacity : cache->memory_length;
-    if (ffn == 0 || count > SIZE_MAX / ffn) {
-        graph_error(error, error_capacity, "decoder FFN workspace size overflow");
+    if (count > cache->scratch_rows) {
+        graph_error(error, error_capacity, "decoder scratch too small for count");
         return -1;
     }
     const size_t hidden_elements = count * ffn;
-    float *x = allocate_floats(count * width, error, error_capacity);
-    float *nrm = allocate_floats(count * width, error, error_capacity);
-    float *qkv = allocate_floats(count * width * 3u, error, error_capacity);
-    float *attn = allocate_floats(count * width, error, error_capacity);
-    float *proj = allocate_floats(count * width, error, error_capacity);
-    float *q_x = allocate_floats(count * xw, error, error_capacity);
-    float *xctx = allocate_floats(count * xw, error, error_capacity);
-    float *hidden = allocate_floats(hidden_elements, error, error_capacity);
-    float *scores = allocate_floats(scores_len, error, error_capacity);
+    float *x = cache->scratch_x;
+    float *nrm = cache->scratch_nrm;
+    float *qkv = cache->scratch_qkv;
+    float *attn = cache->scratch_attn;
+    float *proj = cache->scratch_proj;
+    float *q_x = cache->scratch_q_x;
+    float *xctx = cache->scratch_xctx;
+    float *hidden = cache->scratch_hidden;
+    float *scores = cache->scratch_scores;
     float *gelu_scratch = NULL;
 #if defined(MYNAH_USE_ACCELERATE)
     if (count > 1u && getenv("MYNAH_GELU_SCALAR") == NULL) {
-        gelu_scratch = allocate_floats(hidden_elements, error, error_capacity);
+        gelu_scratch = cache->scratch_gelu;
     }
 #endif
     /* For a multi-row call (the context prefill) the self-attention is a dense
@@ -1880,38 +2019,23 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     const size_t total_kv = start + count;
     if (count > 1u && total_kv <= (size_t)INT_MAX && hw <= (size_t)INT_MAX) {
         batched = 1;
-        score_matrix = allocate_floats(count * total_kv, error, error_capacity);
-        head_ctx = allocate_floats(count * hw, error, error_capacity);
+        score_matrix = cache->scratch_score_matrix;
+        head_ctx = cache->scratch_head_ctx;
     }
 #endif
-    if (x == NULL || nrm == NULL || qkv == NULL || attn == NULL || proj == NULL ||
-        q_x == NULL || xctx == NULL || hidden == NULL || scores == NULL ||
-#if defined(MYNAH_USE_ACCELERATE)
-        (count > 1u && getenv("MYNAH_GELU_SCALAR") == NULL && gelu_scratch == NULL) ||
-#endif
-        (batched && (score_matrix == NULL || head_ctx == NULL))) {
-        free(x); free(nrm); free(qkv); free(attn); free(proj);
-        free(q_x); free(xctx); free(hidden); free(scores);
-        free(gelu_scratch); free(score_matrix); free(head_ctx);
-        return -1;
-    }
     for (size_t i = 0; i < count; ++i) {
         const float *pe = cache->position + (start + i) * width;
         for (size_t d = 0; d < width; ++d) x[i * width + d] = input_rows[i * width + d] + pe[d];
     }
     const float self_scale = 1.0f / sqrtf((float)hw);
     const float cross_scale = 1.0f / sqrtf((float)xw);
-    char name[256];
     int failed = 0;
     for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
-        mynah_tensor t;
+        const decoder_layer_resolved *r = &cache->resolved[layer];
         double operation_start = profile_prefill ? phase_seconds() : 0.0;
         /* self-attention */
-        snprintf(name, sizeof(name), "decoder.layers.%zu.norm_self.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
-        layer_norm(x, nrm, count, width, t.data);
-        snprintf(name, sizeof(name), "decoder.layers.%zu.self_attention.qkv_net.weight", layer);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, qkv,
+        layer_norm(x, nrm, count, width, r->norm_self);
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->qkv, nrm, qkv,
                               count, width, width * 3u, NULL, error, error_capacity) != 0) { failed = 1; break; }
         if (profile_prefill) {
             self_projection_seconds += phase_seconds() - operation_start;
@@ -1964,27 +2088,21 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                 float denom = 0.0f;
                 for (size_t s = 0; s <= abs; ++s) { scores[s] = expf(scores[s] - maxv); denom += scores[s]; }
                 float *outh = attn + i * width + h * hw;
-                for (size_t d = 0; d < hw; ++d) {
-                    float v = 0.0f;
-                    for (size_t s = 0; s <= abs; ++s) v += (scores[s] / denom) * vbase[s * width + h * hw + d];
-                    outh[d] = v;
-                }
+                memset(outh, 0, hw * sizeof(float));
+                for (size_t s = 0; s <= abs; ++s)
+                    axpy_f32(outh, vbase + s * width + h * hw, scores[s] / denom, hw);
             }
         }
         if (profile_prefill) {
             self_attention_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
         }
-        snprintf(name, sizeof(name), "decoder.layers.%zu.self_attention.o_net.weight", layer);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, attn, proj,
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->o_self, attn, proj,
                               count, width, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* cross-attention over cached text memory */
-        snprintf(name, sizeof(name), "decoder.layers.%zu.norm_xattn_query.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
-        layer_norm(x, nrm, count, width, t.data);
-        snprintf(name, sizeof(name), "decoder.layers.%zu.cross_attention.q_net.weight", layer);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, q_x,
+        layer_norm(x, nrm, count, width, r->norm_xattn_query);
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->q_cross, nrm, q_x,
                               count, width, xw, NULL, error, error_capacity) != 0) { failed = 1; break; }
         if (profile_prefill) {
             cross_projection_seconds += phase_seconds() - operation_start;
@@ -2006,45 +2124,30 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             float denom = 0.0f;
             for (size_t s = 0; s < cache->memory_length; ++s) { scores[s] = expf(scores[s] - maxv); denom += scores[s]; }
             float *outh = xctx + i * xw;
-            for (size_t d = 0; d < xw; ++d) {
-                float v = 0.0f;
-                for (size_t s = 0; s < cache->memory_length; ++s) v += (scores[s] / denom) * cv[s * xw + d];
-                outh[d] = v;
-            }
+            memset(outh, 0, xw * sizeof(float));
+            for (size_t s = 0; s < cache->memory_length; ++s)
+                axpy_f32(outh, cv + s * xw, scores[s] / denom, xw);
         }
         if (profile_prefill) {
             cross_attention_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
         }
-        snprintf(name, sizeof(name), "decoder.layers.%zu.cross_attention.o_net.weight", layer);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, xctx, proj,
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->o_cross, xctx, proj,
                               count, xw, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* position-wise FFN (kernel size 1) */
-        snprintf(name, sizeof(name), "decoder.layers.%zu.norm_pos_ff.weight", layer);
-        if (tensor(model->tts, name, &t, error, error_capacity) != 0) { failed = 1; break; }
-        layer_norm(x, nrm, count, width, t.data);
-        snprintf(name, sizeof(name), "decoder.layers.%zu.pos_ff.proj.conv.weight", layer);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, nrm, hidden,
+        layer_norm(x, nrm, count, width, r->norm_pos_ff);
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->ffn_up, nrm, hidden,
                               count, width, ffn, NULL, error, error_capacity) != 0) { failed = 1; break; }
         gelu_tanh_array(hidden, hidden_elements, gelu_scratch);
-        snprintf(name, sizeof(name), "decoder.layers.%zu.pos_ff.o_net.conv.weight", layer);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, hidden, proj,
+        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->ffn_down, hidden, proj,
                               count, ffn, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         if (profile_prefill) ffn_seconds += phase_seconds() - operation_start;
     }
     if (!failed) {
-        mynah_tensor norm_out;
-        if (tensor(model->tts, "decoder.norm_out.weight", &norm_out, error, error_capacity) != 0) {
-            failed = 1;
-        } else {
-            layer_norm(x + (count - 1u) * width, out_last, 1u, width, norm_out.data);
-        }
+        layer_norm(x + (count - 1u) * width, out_last, 1u, width, cache->norm_out);
     }
-    free(x); free(nrm); free(qkv); free(attn); free(proj);
-    free(q_x); free(xctx); free(hidden); free(scores);
-    free(gelu_scratch); free(score_matrix); free(head_ctx);
     if (profile_prefill) {
         fprintf(stderr,
                 "decoder prefill detail: self_proj=%.3fs self_attn=%.3fs "
