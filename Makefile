@@ -58,7 +58,7 @@ CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
 TARGET := $(BUILD_DIR)/mynah-tts
 LIBRARY := $(BUILD_DIR)/libmynah_tts.a
 
-.PHONY: all cpu info caps self-test test bench bench-matrix inspect convert convert-codec tokenizer synthesize oracle \
+.PHONY: all cpu info caps self-test test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist
 
 all: $(TARGET)
@@ -107,6 +107,13 @@ bench-matrix: self-test
 			BENCH_OUTPUT="build/bench-$$quant.wav" BENCH_WARMUP="$(BENCH_WARMUP)" \
 			BENCH_RUNS="$(BENCH_RUNS)"; \
 	done
+
+gen-matrix: $(TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make gen-matrix MODEL_DIR=pack ARCHIVE=magpie.nemo CODEC=codec.nemo BYT5=tokenizer" >&2; exit 2)
+	@test -n "$(ARCHIVE)" || (echo "usage: make gen-matrix MODEL_DIR=pack ARCHIVE=magpie.nemo CODEC=codec.nemo BYT5=tokenizer" >&2; exit 2)
+	.venv/bin/python tools/gen_matrix.py --model-dir "$(MODEL_DIR)" \
+		--archive "$(ARCHIVE)" --codec "$(CODEC)" --byt5 "$(BYT5)" \
+		--binary "$(TARGET)" --output build/gen-matrix
 
 inspect:
 	@test -n "$(MODEL)" || (echo "usage: make inspect MODEL=path/to/model.nemo" >&2; exit 2)
