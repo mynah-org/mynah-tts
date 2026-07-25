@@ -808,3 +808,17 @@ extern "C" int mynah_cuda_conv1d(void *opaque,
     std::memcpy(output, st->host_buf, out_count * sizeof(float));
     return 0;
 }
+
+/* GELU on host data: upload → kernel → download → sync. */
+extern "C" int mynah_cuda_gelu_host(void *opaque, float *data, size_t n,
+                          char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t bytes = n * sizeof(float);
+    if (ensure_scratch(st, bytes, e, ec)) return -1;
+    float *d = st->dev_scratch;
+    if (ce(cudaMemcpyAsync(d, data, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    k_gelu<<<((int)n+255)/256, 256, 0, st->stream>>>(d, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (ce(cudaMemcpyAsync(data, d, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
+    return ce(cudaStreamSynchronize(st->stream), e, ec);
+}

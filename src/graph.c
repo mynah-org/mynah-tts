@@ -899,7 +899,12 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
         layer_norm(x, nrm, 1u, width, cache->norm_ff[layer]);
         if (mynah_backend_matmul(model->backend, nrm, hidden, 1u, width, ffn,
                                  cache->ffn_up_w[layer], NULL, error, error_capacity) != 0) { failed = 1; break; }
-        gelu_tanh_array(hidden, ffn, workspace->gelu_scratch);
+        if (getenv("MYNAH_GPU_GELU") != NULL &&
+            mynah_backend_gelu_host(model->backend, hidden, ffn, error, error_capacity) == 0) {
+            /* GPU GELU done */
+        } else {
+            gelu_tanh_array(hidden, ffn, workspace->gelu_scratch);
+        }
         if (mynah_backend_matmul(model->backend, hidden, proj, 1u, ffn, width,
                                  cache->ffn_down_w[layer], NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t d = 0; d < width; ++d) x[d] += proj[d];

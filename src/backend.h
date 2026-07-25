@@ -58,6 +58,7 @@ int mynah_backend_matmul_to_dev(const mynah_backend *, const float *, float *, s
 int mynah_backend_matmul_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 int mynah_backend_im2col(const mynah_backend *, const float *, float *, int, int, int, int, char *, size_t);
 int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
+int mynah_backend_gelu_host(const mynah_backend *, float *, size_t, char *, size_t);
 
 /* Device-side matvec: out[N] = in[K] @ W[N,K]^T + bias. No sync. */
 int mynah_backend_matvec_dev(const mynah_backend *backend,
