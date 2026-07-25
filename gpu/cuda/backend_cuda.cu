@@ -313,9 +313,15 @@ static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k
     if (ensure_host(st, need, e, ec)) return -1;
     float *ha = st->host_buf, *hb = ha+ap, *hc = hb+bp;
     float *da = st->dev_buf,  *db2 = da+ap, *dc = db2+bp;
-    for (size_t r=0;r<ar;r++) std::memcpy(ha+r*ac, a+r*lda, ac*4);
-    for (size_t r=0;r<br;r++) std::memcpy(hb+r*bc, b+r*ldb, bc*4);
-    if (beta!=0.0f) for (size_t r=0;r<m;r++) std::memcpy(hc+r*n, c+r*ldc, n*4);
+    /* Bulk copy when contiguous (common for im2col + weight). */
+    if (lda == ac) std::memcpy(ha, a, ap*4);
+    else for (size_t r=0;r<ar;r++) std::memcpy(ha+r*ac, a+r*lda, ac*4);
+    if (ldb == bc) std::memcpy(hb, b, bp*4);
+    else for (size_t r=0;r<br;r++) std::memcpy(hb+r*bc, b+r*ldb, bc*4);
+    if (beta!=0.0f) {
+        if (ldc == n) std::memcpy(hc, c, cp*4);
+        else for (size_t r=0;r<m;r++) std::memcpy(hc+r*n, c+r*ldc, n*4);
+    }
     cublasSetStream(st->cublas, st->stream);
     cublasOperation_t oa = tb?CUBLAS_OP_T:CUBLAS_OP_N;
     cublasOperation_t ob = ta?CUBLAS_OP_T:CUBLAS_OP_N;
@@ -325,7 +331,8 @@ static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k
                         CUBLAS_COMPUTE_32F_FAST_16F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),e,ec)) return -1;
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
-    for (size_t r=0;r<m;r++) std::memcpy(c+r*ldc, hc+r*n, n*4);
+    if (ldc == n) std::memcpy(c, hc, cp*4);
+    else for (size_t r=0;r<m;r++) std::memcpy(c+r*ldc, hc+r*n, n*4);
     return 0;
 }
 
@@ -696,4 +703,31 @@ extern "C" int mynah_cuda_matmul_d2d(void *opaque, const float *d_in, float *d_o
         cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones3,1,d_out,(int)ow);
     }
     return 0; /* no sync */
+}
+
+/* im2col kernel for causal conv1d: builds the columns matrix on GPU.
+ * columns[(i*kernel+k)*length + l] = input[i*length + l - shift] or 0. */
+__global__ static void k_im2col_causal(const float *__restrict__ input,
+                                       float *__restrict__ columns,
+                                       int in_ch, int length, int kernel, int dilation) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = in_ch * kernel * length;
+    if (idx >= total) return;
+    int l = idx % length;
+    int ik = idx / length;
+    int k = ik % kernel;
+    int i = ik / kernel;
+    int shift = (kernel - 1 - k) * dilation;
+    int src = l - shift;
+    columns[idx] = (src >= 0) ? input[i * length + src] : 0.0f;
+}
+
+extern "C" int mynah_cuda_im2col(void *opaque, const float *input, float *columns,
+                       int in_ch, int length, int kernel, int dilation,
+                       char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    int total = in_ch * kernel * length;
+    k_im2col_causal<<<(total+255)/256, 256, 0, st->stream>>>(
+        input, columns, in_ch, length, kernel, dilation);
+    return ce(cudaGetLastError(), e, ec);
 }
