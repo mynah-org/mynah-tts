@@ -240,30 +240,41 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
          * the same trick as conv1d_causal but with time-major rows.  This is the
          * encoder's dominant cost, so accumulate the taps with sgemm instead of
          * the scalar quadruple loop. */
-        float *wk = (float *)malloc(ffn_width * width * sizeof(float));
+        float *wk = (float *)malloc(ffn_width * width * kernel * sizeof(float));
         if (wk == NULL) {
             free(hidden);
             graph_error(error, error_capacity, "out of memory in causal conv-ffn");
             return -1;
         }
+        /* Extract all taps at once: wk[k][o][i] = proj[(o*width+i)*kernel+k].
+         * Inner loop over k has stride=1 (sequential reads). */
+        for (size_t o = 0; o < ffn_width; ++o) {
+            for (size_t i = 0; i < width; ++i) {
+                const float *src = proj.data + (o * width + i) * kernel;
+                for (size_t k = 0; k < kernel; ++k)
+                    wk[k * ffn_width * width + o * width + i] = src[k];
+            }
+        }
         memset(hidden, 0, length * ffn_width * sizeof(float));
         for (size_t k = 0; k < kernel; ++k) {
             const size_t shift = kernel - 1u - k;
             if (shift >= length) continue;
-            for (size_t o = 0; o < ffn_width; ++o) {
-                for (size_t i = 0; i < width; ++i) wk[o * width + i] = proj.data[(o * width + i) * kernel + k];
-            }
-            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)ffn_width, (int)width, 1.0f, input, (int)width, wk, (int)width, 1.0f, hidden + shift * ffn_width, (int)ffn_width, error, error_capacity);
+            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)ffn_width, (int)width, 1.0f, input, (int)width, wk + k * ffn_width * width, (int)width, 1.0f, hidden + shift * ffn_width, (int)ffn_width, error, error_capacity);
         }
         mynah_backend_gelu_dev(backend, hidden, length * ffn_width, error, error_capacity);
+        /* Extract out_net taps with same optimized pattern. */
+        for (size_t o = 0; o < width; ++o) {
+            for (size_t i = 0; i < ffn_width; ++i) {
+                const float *src = out_net.data + (o * ffn_width + i) * kernel;
+                for (size_t k = 0; k < kernel; ++k)
+                    wk[k * width * ffn_width + o * ffn_width + i] = src[k];
+            }
+        }
         memset(output, 0, length * width * sizeof(float));
         for (size_t k = 0; k < kernel; ++k) {
             const size_t shift = kernel - 1u - k;
             if (shift >= length) continue;
-            for (size_t o = 0; o < width; ++o) {
-                for (size_t i = 0; i < ffn_width; ++i) wk[o * ffn_width + i] = out_net.data[(o * ffn_width + i) * kernel + k];
-            }
-            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)width, (int)ffn_width, 1.0f, hidden, (int)ffn_width, wk, (int)ffn_width, 1.0f, output + shift * width, (int)width, error, error_capacity);
+            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)width, (int)ffn_width, 1.0f, hidden, (int)ffn_width, wk + k * width * ffn_width, (int)ffn_width, 1.0f, output + shift * width, (int)width, error, error_capacity);
         }
         free(wk);
         free(hidden);
