@@ -52,6 +52,7 @@ struct mynah_backend {
     int (*im2col)(void *, const float *, float *, int, int, int, int, char *, size_t);
     int (*conv1d)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
     int (*gelu_host)(void *, float *, size_t, char *, size_t);
+    int (*gelu_host_f64)(void *, float *, size_t, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -88,6 +89,7 @@ extern int mynah_cuda_matmul_d2d(void *, const float *, float *, size_t, size_t,
 extern int mynah_cuda_im2col(void *, const float *, float *, int, int, int, int, char *, size_t);
 extern int mynah_cuda_conv1d(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 extern int mynah_cuda_gelu_host(void *, float *, size_t, char *, size_t);
+extern int mynah_cuda_gelu_host_f64(void *, float *, size_t, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -333,6 +335,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->im2col = mynah_cuda_im2col;
         backend->conv1d = mynah_cuda_conv1d;
         backend->gelu_host = mynah_cuda_gelu_host;
+        backend->gelu_host_f64 = mynah_cuda_gelu_host_f64;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -670,5 +673,11 @@ int mynah_backend_conv1d(const mynah_backend *bk,
 int mynah_backend_gelu_host(const mynah_backend *bk, float *data, size_t n,
                             char *e, size_t ec) {
     if (bk && bk->gelu_host) return bk->gelu_host(bk->state, data, n, e, ec);
+    return -1;
+}
+
+int mynah_backend_gelu_host_f64(const mynah_backend *bk, float *data, size_t n,
+                                char *e, size_t ec) {
+    if (bk && bk->gelu_host_f64) return bk->gelu_host_f64(bk->state, data, n, e, ec);
     return -1;
 }

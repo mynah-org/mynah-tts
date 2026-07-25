@@ -73,16 +73,8 @@ __global__ static void k_gelu(float *data, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float x = data[i];
-        /* Match CPU gelu_tanh exactly: no FMA, same constant, same order. */
-        float x2 = __fmul_rn(x, x);
-        float cubic = __fmul_rn(x2, x);
-        float term = __fmul_rn(0.044715f, cubic);
-        float sum = __fadd_rn(x, term);
-        float inner = __fmul_rn(0.7978845608028654f, sum);
-        float t = tanhf(inner);
-        float one_plus_t = __fadd_rn(1.0f, t);
-        float half_x = __fmul_rn(0.5f, x);
-        data[i] = __fmul_rn(half_x, one_plus_t);
+        float c = 0.7978845608f * (x + 0.044715f * x * x * x);
+        data[i] = 0.5f * x * (1.0f + tanhf(c));
     }
 }
 
@@ -826,6 +818,32 @@ extern "C" int mynah_cuda_gelu_host(void *opaque, float *data, size_t n,
     float *d = st->dev_scratch;
     if (ce(cudaMemcpyAsync(d, data, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
     k_gelu<<<((int)n+255)/256, 256, 0, st->stream>>>(d, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (ce(cudaMemcpyAsync(data, d, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
+    return ce(cudaStreamSynchronize(st->stream), e, ec);
+}
+
+/* GELU in double precision for CPU-matching accuracy.
+ * Avoids FP16/FMA precision drift in autoregressive loops. */
+__global__ static void k_gelu_f64(float *data, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double x = (double)data[i];
+        double cubic = x * x * x;
+        double inner = 0.7978845608028654 * (x + 0.044715 * cubic);
+        double t = tanh(inner);
+        data[i] = (float)(0.5 * x * (1.0 + t));
+    }
+}
+
+extern "C" int mynah_cuda_gelu_host_f64(void *opaque, float *data, size_t n,
+                              char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t bytes = n * sizeof(float);
+    if (ensure_scratch(st, bytes, e, ec)) return -1;
+    float *d = st->dev_scratch;
+    if (ce(cudaMemcpyAsync(d, data, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    k_gelu_f64<<<((int)n+255)/256, 256, 0, st->stream>>>(d, (int)n);
     if (ce(cudaGetLastError(), e, ec)) return -1;
     if (ce(cudaMemcpyAsync(data, d, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
     return ce(cudaStreamSynchronize(st->stream), e, ec);
