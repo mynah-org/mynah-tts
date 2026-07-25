@@ -731,3 +731,80 @@ extern "C" int mynah_cuda_im2col(void *opaque, const float *input, float *column
         input, columns, in_ch, length, kernel, dilation);
     return ce(cudaGetLastError(), e, ec);
 }
+
+/* Broadcast bias: out[o*length+t] = bias[o] for all t. */
+__global__ static void k_broadcast_bias(float *out, const float *bias,
+                                        int out_ch, int length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_ch * length) return;
+    out[i] = bias[i / length];
+}
+
+/* Full GPU conv1d causal: im2col on GPU + cuBLAS sgemm, single call.
+ * Replaces CPU im2col pack + cuda_sgemm (eliminates intermediate copy).
+ * weight is [out_ch, in_ch*kernel] row-major (already packed for sgemm). */
+extern "C" int mynah_cuda_conv1d(void *opaque,
+                       const float *input, float *output,
+                       int in_ch, int out_ch, int length,
+                       int kernel, int dilation,
+                       const float *weight, const float *bias,
+                       char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    const size_t inner = (size_t)in_ch * kernel;
+    const size_t col_count = inner * length;
+    const size_t in_count = (size_t)in_ch * length;
+    const size_t out_count = (size_t)out_ch * length;
+
+    /* Cache weight on device. */
+    float *dw = nullptr;
+    if (cached_weight(st, weight, inner * out_ch * sizeof(float), &dw, e, ec)) return -1;
+
+    /* Scratch: FP32 columns + FP32 output. */
+    size_t scratch_need = (col_count + out_count) * sizeof(float);
+    if (ensure_scratch(st, scratch_need, e, ec)) return -1;
+    float *d_cols = st->dev_scratch;
+    float *d_out = st->dev_scratch + col_count;
+
+    /* Upload input via mapped buffer. */
+    if (ensure_host(st, in_count * sizeof(float), e, ec)) return -1;
+    std::memcpy(st->host_buf, input, in_count * sizeof(float));
+
+    /* GPU im2col. */
+    int total = in_ch * kernel * length;
+    k_im2col_causal<<<(total+255)/256, 256, 0, st->stream>>>(
+        st->dev_buf, d_cols, in_ch, length, kernel, dilation);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+
+    /* Seed output with bias. */
+    if (bias != nullptr) {
+        float *db = nullptr;
+        if (cached_weight(st, bias, out_ch * sizeof(float), &db, e, ec)) return -1;
+        k_broadcast_bias<<<((int)out_count+255)/256, 256, 0, st->stream>>>(
+            d_out, db, out_ch, length);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    } else {
+        cudaMemsetAsync(d_out, 0, out_count * sizeof(float), st->stream);
+    }
+
+    /* sgemm: output[out_ch, length] += weight[out_ch, inner] @ columns[inner, length] */
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b1 = 1.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                         length, out_ch, (int)inner,
+                         &a1,
+                         d_cols, CUDA_R_32F, length,
+                         dw, CUDA_R_32F, (int)inner,
+                         &b1,
+                         d_out, CUDA_R_32F, length,
+                         CUBLAS_COMPUTE_32F_FAST_16F,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+
+    /* Download output via mapped buffer. */
+    size_t out_mapped_need = out_count * sizeof(float);
+    if (ensure_host(st, out_mapped_need, e, ec)) return -1;
+    cudaMemcpy(st->host_buf, d_out, out_count * sizeof(float), cudaMemcpyDeviceToHost);
+    std::memcpy(output, st->host_buf, out_count * sizeof(float));
+    return 0;
+}

@@ -1280,6 +1280,23 @@ static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *bac
     if (tensor(file, weight_name, &weight, error, error_capacity) != 0 ||
         tensor(file, bias_name, &bias, error, error_capacity) != 0) return -1;
     if (profile != NULL) profile->calls++;
+    /* GPU fast path: im2col + sgemm in one backend call. */
+    if (backend != NULL && in_channels <= (size_t)INT_MAX &&
+        out_channels <= (size_t)INT_MAX && length <= (size_t)INT_MAX &&
+        kernel <= (size_t)INT_MAX && dilation <= (size_t)INT_MAX) {
+        const double t0 = profile != NULL ? phase_seconds() : 0.0;
+        if (mynah_backend_conv1d(backend, input, output,
+                                 (int)in_channels, (int)out_channels, (int)length,
+                                 (int)kernel, (int)dilation,
+                                 weight.data, bias.data,
+                                 error, error_capacity) == 0) {
+            if (profile != NULL) {
+                profile->gemm_seconds += phase_seconds() - t0;
+            }
+            return 0;
+        }
+        /* Fall through to CPU path on failure. */
+    }
 #if defined(MYNAH_USE_ACCELERATE)
     if (getenv("MYNAH_CODEC_SGEMM") == NULL &&
         conv1d_causal_bnns(weight.data, bias.data, input, output,
