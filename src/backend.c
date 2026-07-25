@@ -43,6 +43,7 @@ struct mynah_backend {
     void (*dev_free)(void *, float *);
     int (*h2d)(void *, const float *, float *, size_t, char *, size_t);
     int (*d2h)(void *, const float *, float *, size_t, char *, size_t);
+    int (*matvec_dev)(void *, const float *, float *, size_t, size_t, const float *, const float *, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -70,6 +71,7 @@ extern int mynah_cuda_dev_alloc(void *, size_t, float **, char *, size_t);
 extern void mynah_cuda_dev_free(void *, float *);
 extern int mynah_cuda_h2d(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_cuda_d2h(void *, const float *, float *, size_t, char *, size_t);
+extern int mynah_cuda_matvec_dev(void *, const float *, float *, size_t, size_t, const float *, const float *, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -306,6 +308,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->dev_free = mynah_cuda_dev_free;
         backend->h2d = mynah_cuda_h2d;
         backend->d2h = mynah_cuda_d2h;
+        backend->matvec_dev = mynah_cuda_matvec_dev;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -567,4 +570,18 @@ int mynah_backend_d2h(const mynah_backend *backend, const float *dev_ptr,
         return backend->d2h(backend->state, dev_ptr, host, n, error, error_capacity);
     memcpy(host, dev_ptr, n * sizeof(float));
     return 0;
+}
+
+int mynah_backend_matvec_dev(const mynah_backend *backend,
+                             const float *dev_in, float *dev_out,
+                             size_t K, size_t N,
+                             const float *weight, const float *bias,
+                             char *error, size_t error_capacity) {
+    if (backend == NULL) return -1;
+    if (backend->matvec_dev != NULL)
+        return backend->matvec_dev(backend->state, dev_in, dev_out, K, N,
+                                   weight, bias, error, error_capacity);
+    /* CPU fallback */
+    return mynah_backend_matmul(backend, dev_in, dev_out, 1u, K, N,
+                                weight, bias, error, error_capacity);
 }

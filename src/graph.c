@@ -2058,7 +2058,8 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     /* ---- GPU resident-step fast path (count==1, backend has matmul_dev) ----
      * Device buffers allocated once; matmul_dev/gelu_dev pipeline without
      * per-op sync.  Sync only at CPU attention boundaries. */
-    if (count == 1u && mynah_backend_has_dev_ops(backend)) {
+    if (count == 1u && mynah_backend_has_dev_ops(backend) &&
+        getenv("MYNAH_GPU_RESIDENT") != NULL) {
         const mynah_backend *bk = backend;
         /* Lazy one-time device buffer allocation (reused across AR steps). */
         if (!cache->dev_allocated) {
@@ -2083,7 +2084,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             layer_norm(x, nrm, 1u, width, r->norm_self);
             if (mynah_backend_h2d(bk, nrm, dnrm, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_safetensors_get(model->tts, r->qkv, &w)!=0) { failed=1; break; }
-            if (mynah_backend_matmul_dev(bk, dnrm, dqkv, 1u, width, width*3u, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_matvec_dev(bk, dnrm, dqkv, width, width*3u, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
             /* Sync + download QKV → CPU attention + KV cache */
             mynah_backend_sync(bk, error, error_capacity);
             mynah_backend_d2h(bk, dqkv, qkv, width*3u, error, error_capacity);
@@ -2106,7 +2107,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             /* attn → output proj(GPU) → residual */
             if (mynah_backend_h2d(bk, attn, dattn, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_safetensors_get(model->tts, r->o_self, &w)!=0) { failed=1; break; }
-            if (mynah_backend_matmul_dev(bk, dattn, dproj, 1u, width, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_matvec_dev(bk, dattn, dproj, width, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
             mynah_backend_sync(bk, error, error_capacity);
             mynah_backend_d2h(bk, dproj, proj, width, error, error_capacity);
             for (size_t k2 = 0; k2 < width; ++k2) x[k2] += proj[k2];
@@ -2114,7 +2115,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             layer_norm(x, nrm, 1u, width, r->norm_xattn_query);
             if (mynah_backend_h2d(bk, nrm, dnrm, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_safetensors_get(model->tts, r->q_cross, &w)!=0) { failed=1; break; }
-            if (mynah_backend_matmul_dev(bk, dnrm, dqx, 1u, width, xw, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_matvec_dev(bk, dnrm, dqx, width, xw, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
             mynah_backend_sync(bk, error, error_capacity);
             mynah_backend_d2h(bk, dqx, q_x, xw, error, error_capacity);
             { const float *ck = cache->cross_k + layer*cache->memory_length*xw;
@@ -2129,7 +2130,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
               for (size_t s = 0; s < cache->memory_length; ++s) axpy_f32(xctx, cv+s*xw, scores[s]/den, xw); }
             if (mynah_backend_h2d(bk, xctx, dxctx, xw, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_safetensors_get(model->tts, r->o_cross, &w)!=0) { failed=1; break; }
-            if (mynah_backend_matmul_dev(bk, dxctx, dproj, 1u, xw, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_matvec_dev(bk, dxctx, dproj, xw, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
             mynah_backend_sync(bk, error, error_capacity);
             mynah_backend_d2h(bk, dproj, proj, width, error, error_capacity);
             for (size_t k2 = 0; k2 < width; ++k2) x[k2] += proj[k2];
@@ -2137,7 +2138,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             layer_norm(x, nrm, 1u, width, r->norm_pos_ff);
             if (mynah_backend_h2d(bk, nrm, dnrm, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_safetensors_get(model->tts, r->ffn_up, &w)!=0) { failed=1; break; }
-            if (mynah_backend_matmul_dev(bk, dnrm, dhidden, 1u, width, ffn, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_matvec_dev(bk, dnrm, dhidden, width, ffn, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
             /* GELU: matmul_dev output is on device; gelu_dev expects host ptr.
              * Sync+download, GELU on CPU (fast for 3072 floats), re-upload. */
             mynah_backend_sync(bk, error, error_capacity);
@@ -2147,7 +2148,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                 hidden[gi] = 0.5f*gv*(1.0f+tanhf(gc)); }
             if (mynah_backend_h2d(bk, hidden, dhidden, ffn, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_safetensors_get(model->tts, r->ffn_down, &w)!=0) { failed=1; break; }
-            if (mynah_backend_matmul_dev(bk, dhidden, dproj, 1u, ffn, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_matvec_dev(bk, dhidden, dproj, ffn, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
             mynah_backend_sync(bk, error, error_capacity);
             mynah_backend_d2h(bk, dproj, proj, width, error, error_capacity);
             for (size_t k2 = 0; k2 < width; ++k2) x[k2] += proj[k2];

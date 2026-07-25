@@ -50,6 +50,13 @@ int mynah_backend_self_test(mynah_tts_device device, char *error,
 /* Query: does this backend support device-side matmul (resident GPU)? */
 int mynah_backend_has_dev_ops(const mynah_backend *backend);
 
+/* Device-side matvec: out[N] = in[K] @ W[N,K]^T + bias. No sync. */
+int mynah_backend_matvec_dev(const mynah_backend *backend,
+                             const float *dev_in, float *dev_out,
+                             size_t K, size_t N,
+                             const float *weight, const float *bias,
+                             char *error, size_t error_capacity);
+
 /* ---- Device-side operations (resident GPU inference) ----
  * These keep activations on the device between calls, eliminating
  * per-op H2D/D2H copies.  On CPU backends they are trivial wrappers.

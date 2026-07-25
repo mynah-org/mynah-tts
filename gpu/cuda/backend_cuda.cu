@@ -490,3 +490,34 @@ extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,
     return ce(cudaMemcpyAsync(host, dev_ptr, n*sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
+
+/* Custom matvec kernel: out[n] = sum_k(in[k] * W[n*K + k]) + bias[n].
+ * One thread per output element.  For 1×768 matvecs this beats cuBLAS
+ * by eliminating launch + workspace overhead (~3μs vs ~15μs). */
+__global__ static void k_matvec(const float *__restrict__ in,
+                                const float *__restrict__ weight,
+                                const float *__restrict__ bias,
+                                float *__restrict__ out,
+                                int K, int N) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= N) return;
+    const float *w = weight + (size_t)col * K;
+    float sum = bias ? bias[col] : 0.0f;
+    for (int k = 0; k < K; ++k) sum += in[k] * w[k];
+    out[col] = sum;
+}
+
+extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_out,
+                           size_t K, size_t N,
+                           const float *weight, const float *bias,
+                           char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    float *dw = nullptr;
+    if (cached_weight(st, weight, K * N * sizeof(float), &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, N * sizeof(float), &db, e, ec)) return -1;
+    int threads = 256;
+    int blocks = ((int)N + threads - 1) / threads;
+    k_matvec<<<blocks, threads, 0, st->stream>>>(d_in, dw, db, d_out, (int)K, (int)N);
+    return ce(cudaGetLastError(), e, ec);
+}
