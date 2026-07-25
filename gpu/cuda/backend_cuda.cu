@@ -73,8 +73,16 @@ __global__ static void k_gelu(float *data, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float x = data[i];
-        float c = 0.7978845608f * (x + 0.044715f * x * x * x);
-        data[i] = 0.5f * x * (1.0f + tanhf(c));
+        /* Match CPU gelu_tanh exactly: no FMA, same constant, same order. */
+        float x2 = __fmul_rn(x, x);
+        float cubic = __fmul_rn(x2, x);
+        float term = __fmul_rn(0.044715f, cubic);
+        float sum = __fadd_rn(x, term);
+        float inner = __fmul_rn(0.7978845608028654f, sum);
+        float t = tanhf(inner);
+        float one_plus_t = __fadd_rn(1.0f, t);
+        float half_x = __fmul_rn(0.5f, x);
+        data[i] = __fmul_rn(half_x, one_plus_t);
     }
 }
 
