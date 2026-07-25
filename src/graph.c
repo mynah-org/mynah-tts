@@ -1790,6 +1790,12 @@ typedef struct {
     const float *norm_self;
     const float *norm_xattn_query;
     const float *norm_pos_ff;
+    const float *qkv_w;
+    const float *o_self_w;
+    const float *q_cross_w;
+    const float *o_cross_w;
+    const float *ffn_up_w;
+    const float *ffn_down_w;
     char qkv[160];
     char o_self[160];
     char q_cross[160];
@@ -1971,6 +1977,19 @@ static int decoder_cache_init(const mynah_tts_model *model, decoder_cache *cache
         snprintf(r->o_cross, sizeof(r->o_cross), "decoder.layers.%zu.cross_attention.o_net.weight", layer);
         snprintf(r->ffn_up, sizeof(r->ffn_up), "decoder.layers.%zu.pos_ff.proj.conv.weight", layer);
         snprintf(r->ffn_down, sizeof(r->ffn_down), "decoder.layers.%zu.pos_ff.o_net.conv.weight", layer);
+        /* Pre-resolve weight data pointers for direct matmul. */
+        if (tensor(model->tts, r->qkv, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->qkv_w = t.data;
+        if (tensor(model->tts, r->o_self, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->o_self_w = t.data;
+        if (tensor(model->tts, r->q_cross, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->q_cross_w = t.data;
+        if (tensor(model->tts, r->o_cross, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->o_cross_w = t.data;
+        if (tensor(model->tts, r->ffn_up, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->ffn_up_w = t.data;
+        if (tensor(model->tts, r->ffn_down, &t, error, error_capacity) != 0) { decoder_cache_free(cache); return -1; }
+        r->ffn_down_w = t.data;
     }
     {
         mynah_tensor t;
@@ -2180,8 +2199,9 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         double operation_start = profile_prefill ? phase_seconds() : 0.0;
         /* self-attention */
         layer_norm(x, nrm, count, width, r->norm_self);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->qkv, nrm, qkv,
-                              count, width, width * 3u, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_backend_matmul(model->backend, nrm, qkv,
+                              count, width, width * 3u,
+                              r->qkv_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
         if (profile_prefill) {
             self_projection_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
@@ -2233,13 +2253,15 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             self_attention_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
         }
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->o_self, attn, proj,
-                              count, width, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_backend_matmul(model->backend, attn, proj,
+                              count, width, width,
+                              r->o_self_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* cross-attention over cached text memory */
         layer_norm(x, nrm, count, width, r->norm_xattn_query);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->q_cross, nrm, q_x,
-                              count, width, xw, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_backend_matmul(model->backend, nrm, q_x,
+                              count, width, xw,
+                              r->q_cross_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
         if (profile_prefill) {
             cross_projection_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
@@ -2268,16 +2290,19 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             cross_attention_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
         }
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->o_cross, xctx, proj,
-                              count, xw, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_backend_matmul(model->backend, xctx, proj,
+                              count, xw, width,
+                              r->o_cross_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* position-wise FFN (kernel size 1) */
         layer_norm(x, nrm, count, width, r->norm_pos_ff);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->ffn_up, nrm, hidden,
-                              count, width, ffn, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_backend_matmul(model->backend, nrm, hidden,
+                              count, width, ffn,
+                              r->ffn_up_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
         mynah_backend_gelu_dev(model->backend, hidden, hidden_elements, error, error_capacity);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->ffn_down, hidden, proj,
-                              count, ffn, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_backend_matmul(model->backend, hidden, proj,
+                              count, ffn, width,
+                              r->ffn_down_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         if (profile_prefill) ffn_seconds += phase_seconds() - operation_start;
     }
