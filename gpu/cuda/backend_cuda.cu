@@ -32,27 +32,18 @@
 __global__ static void k_layer_norm(float *out, const float *in,
                                     const float *gain,
                                     int width, float eps) {
-    int row = blockIdx.x;
+    /* One thread per row: sequential accumulation matches CPU bit-order. */
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
     const float *x = in + (size_t)row * width;
     float *y = out + (size_t)row * width;
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) sum += x[i];
-    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
-    __shared__ float s_mean, s_inv;
-    if (threadIdx.x == 0) s_mean = sum / (float)width;
-    __syncthreads();
-    float mean = s_mean;
+    float mean = 0.0f;
+    for (int d = 0; d < width; ++d) mean += x[d];
+    mean /= (float)width;
     float var = 0.0f;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) {
-        float d = x[i] - mean;
-        var += d * d;
-    }
-    for (int off = 16; off > 0; off >>= 1) var += __shfl_down_sync(0xffffffff, var, off);
-    if (threadIdx.x == 0) s_inv = rsqrtf(var / (float)width + eps);
-    __syncthreads();
-    float inv = s_inv;
-    for (int i = threadIdx.x; i < width; i += blockDim.x)
-        y[i] = (x[i] - mean) * inv * gain[i];
+    for (int d = 0; d < width; ++d) { float dd = x[d] - mean; var += dd * dd; }
+    float inv = rsqrtf(var / (float)width + eps);
+    for (int d = 0; d < width; ++d)
+        y[d] = (x[d] - mean) * inv * gain[d];
 }
 
 __global__ static void k_softmax_causal(float *data, int cols, int valid) {
@@ -320,10 +311,10 @@ extern "C" int mynah_cuda_layer_norm_dev(void *opaque, const float *in, float *o
     std::memcpy(st->host_buf, gain, gb);
     float *d_gain = st->dev_buf;
     if (ce(cudaMemcpyAsync(d_in, in, data_bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    int threads = width <= 256 ? (int)width : 256;
-    threads = ((threads + 31) / 32) * 32;
-    if (threads > 1024) threads = 1024;
-    k_layer_norm<<<(int)rows, threads, 0, st->stream>>>(
+    /* 1 thread per row, sequential accumulation for CPU bit-parity. */
+    int threads = rows <= 256 ? (int)rows : 256;
+    int blocks = ((int)rows + threads - 1) / threads;
+    k_layer_norm<<<blocks, threads, 0, st->stream>>>(
         d_out, d_in, d_gain, (int)width, 1e-5f);
     if (ce(cudaGetLastError(), e, ec)) return -1;
     if (ce(cudaMemcpyAsync(out, d_out, data_bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
