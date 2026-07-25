@@ -907,10 +907,15 @@ extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *
     float *d_out_mapped = st->dev_buf + in_n;
     std::memcpy(st->host_buf, input, in_n * sizeof(float));
 
-    /* Capture. Alpha/beta must be static (not stack) for graph capture. */
+    /* Capture. Alpha/beta must be static (not stack) for graph capture.
+     * Pre-allocate cuBLAS workspace to avoid allocation during capture. */
     static const float g_alpha = 1.0f, g_beta = 0.0f;
+    static void *cublas_ws = nullptr;
+    static size_t cublas_ws_size = 4 * 1024 * 1024; /* 4MB workspace */
+    if (!cublas_ws) cudaMalloc(&cublas_ws, cublas_ws_size);
+    cublasSetWorkspace(st->cublas, cublas_ws, cublas_ws_size);
     cublasSetStream(st->cublas, st->stream);
-    cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeGlobal);
+    cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeRelaxed);
     k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(st->dev_buf, di16, (int)in_n);
     cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                  (int)ow, (int)rows, (int)iw,
