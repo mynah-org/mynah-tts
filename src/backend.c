@@ -44,6 +44,9 @@ struct mynah_backend {
     int (*h2d)(void *, const float *, float *, size_t, char *, size_t);
     int (*d2h)(void *, const float *, float *, size_t, char *, size_t);
     int (*matvec_dev)(void *, const float *, float *, size_t, size_t, const float *, const float *, char *, size_t);
+    int (*gelu_inplace)(void *, float *, size_t, char *, size_t);
+    int (*residual_inplace)(void *, float *, const float *, size_t, char *, size_t);
+    int (*layer_norm_inplace)(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -72,6 +75,9 @@ extern void mynah_cuda_dev_free(void *, float *);
 extern int mynah_cuda_h2d(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_cuda_d2h(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_cuda_matvec_dev(void *, const float *, float *, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_cuda_gelu_inplace(void *, float *, size_t, char *, size_t);
+extern int mynah_cuda_residual_inplace(void *, float *, const float *, size_t, char *, size_t);
+extern int mynah_cuda_layer_norm_inplace(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -309,6 +315,9 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->h2d = mynah_cuda_h2d;
         backend->d2h = mynah_cuda_d2h;
         backend->matvec_dev = mynah_cuda_matvec_dev;
+        backend->gelu_inplace = mynah_cuda_gelu_inplace;
+        backend->residual_inplace = mynah_cuda_residual_inplace;
+        backend->layer_norm_inplace = mynah_cuda_layer_norm_inplace;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -584,4 +593,23 @@ int mynah_backend_matvec_dev(const mynah_backend *backend,
     /* CPU fallback */
     return mynah_backend_matmul(backend, dev_in, dev_out, 1u, K, N,
                                 weight, bias, error, error_capacity);
+}
+
+int mynah_backend_gelu_inplace(const mynah_backend *bk, float *dev, size_t n,
+                               char *e, size_t ec) {
+    if (bk && bk->gelu_inplace) return bk->gelu_inplace(bk->state, dev, n, e, ec);
+    return -1;
+}
+int mynah_backend_residual_inplace(const mynah_backend *bk, float *dev_out,
+                                   const float *dev_in, size_t n,
+                                   char *e, size_t ec) {
+    if (bk && bk->residual_inplace) return bk->residual_inplace(bk->state, dev_out, dev_in, n, e, ec);
+    return -1;
+}
+int mynah_backend_layer_norm_inplace(const mynah_backend *bk, const float *dev_in,
+                                     float *dev_out, const float *gain,
+                                     size_t rows, size_t width,
+                                     char *e, size_t ec) {
+    if (bk && bk->layer_norm_inplace) return bk->layer_norm_inplace(bk->state, dev_in, dev_out, gain, rows, width, e, ec);
+    return -1;
 }

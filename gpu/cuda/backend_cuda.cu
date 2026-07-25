@@ -579,3 +579,33 @@ extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_o
     k_matvec<<<blocks, threads, 0, st->stream>>>(d_in, dw, db, d_out, (int)K, (int)N);
     return ce(cudaGetLastError(), e, ec);
 }
+
+/* ---- Inplace device-side ops (no copy, no sync) ---- */
+
+extern "C" int mynah_cuda_gelu_inplace(void *opaque, float *dev_data, size_t n,
+                             char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    k_gelu<<<((int)n+255)/256, 256, 0, st->stream>>>(dev_data, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_residual_inplace(void *opaque, float *dev_out,
+                                 const float *dev_in, size_t n,
+                                 char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    k_residual_add<<<((int)n+255)/256, 256, 0, st->stream>>>(dev_out, dev_in, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_layer_norm_inplace(void *opaque, const float *dev_in,
+                                   float *dev_out, const float *gain,
+                                   size_t rows, size_t width,
+                                   char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    /* Upload gain to device (small, cached via host_buf). */
+    if (ensure_host(st, width * sizeof(float), e, ec)) return -1;
+    std::memcpy(st->host_buf, gain, width * sizeof(float));
+    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
+        dev_out, dev_in, st->dev_buf, (int)width, 1e-5f);
+    return ce(cudaGetLastError(), e, ec);
+}
