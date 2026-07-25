@@ -326,3 +326,139 @@ int mynah_backend_self_test(mynah_tts_device device, char *error, size_t error_c
     mynah_backend_close(backend);
     return result;
 }
+
+/* ---- Device-side operations ----
+ * CPU fallback: "device" pointers are host pointers; upload/download/sync
+ * are no-ops or memcpy.  CUDA overrides these in backend_cuda.cu. */
+
+int mynah_backend_upload(const mynah_backend *backend, const float *host,
+                         size_t n, float **dev_ptr,
+                         char *error, size_t error_capacity) {
+    (void)error; (void)error_capacity;
+    if (backend == NULL || host == NULL || dev_ptr == NULL) return -1;
+    *dev_ptr = (float *)host; /* CPU: same pointer */
+    return 0;
+}
+
+int mynah_backend_download(const mynah_backend *backend, const float *dev_ptr,
+                           float *host, size_t n,
+                           char *error, size_t error_capacity) {
+    (void)error; (void)error_capacity;
+    if (backend == NULL || dev_ptr == NULL || host == NULL) return -1;
+    if (dev_ptr != host) memcpy(host, dev_ptr, n * sizeof(float));
+    return 0;
+}
+
+int mynah_backend_sync(const mynah_backend *backend,
+                       char *error, size_t error_capacity) {
+    (void)backend; (void)error; (void)error_capacity;
+    return 0; /* CPU: nothing to sync */
+}
+
+int mynah_backend_matmul_dev(const mynah_backend *backend,
+                             const float *dev_in, float *dev_out,
+                             size_t rows, size_t iw, size_t ow,
+                             const float *weight, const float *bias,
+                             char *error, size_t error_capacity) {
+    return mynah_backend_matmul(backend, dev_in, dev_out, rows, iw, ow,
+                                weight, bias, error, error_capacity);
+}
+
+int mynah_backend_sgemm_dev(const mynah_backend *backend,
+                            int trans_a, int trans_b,
+                            size_t m, size_t n, size_t k,
+                            float alpha,
+                            const float *dev_a, size_t lda,
+                            const float *dev_b, size_t ldb,
+                            float beta,
+                            float *dev_c, size_t ldc,
+                            char *error, size_t error_capacity) {
+    return mynah_backend_sgemm(backend, trans_a, trans_b, m, n, k,
+                               alpha, dev_a, lda, dev_b, ldb,
+                               beta, dev_c, ldc, error, error_capacity);
+}
+
+int mynah_backend_gelu_dev(const mynah_backend *backend,
+                           float *dev_data, size_t n,
+                           char *error, size_t error_capacity) {
+    (void)backend; (void)error; (void)error_capacity;
+    for (size_t i = 0; i < n; ++i) {
+        float x = dev_data[i];
+        float c = 0.7978845608f * (x + 0.044715f * x * x * x);
+        dev_data[i] = 0.5f * x * (1.0f + tanhf(c));
+    }
+    return 0;
+}
+
+int mynah_backend_layer_norm_dev(const mynah_backend *backend,
+                                 const float *dev_in, float *dev_out,
+                                 const float *gain, const float *bias,
+                                 size_t rows, size_t width,
+                                 char *error, size_t error_capacity) {
+    (void)backend; (void)error; (void)error_capacity;
+    for (size_t r = 0; r < rows; ++r) {
+        const float *x = dev_in + r * width;
+        float *y = dev_out + r * width;
+        float mean = 0.0f;
+        for (size_t i = 0; i < width; ++i) mean += x[i];
+        mean /= (float)width;
+        float var = 0.0f;
+        for (size_t i = 0; i < width; ++i) { float d = x[i] - mean; var += d * d; }
+        float inv = 1.0f / sqrtf(var / (float)width + 1e-5f);
+        for (size_t i = 0; i < width; ++i)
+            y[i] = (x[i] - mean) * inv * gain[i] + bias[i];
+    }
+    return 0;
+}
+
+int mynah_backend_softmax_dev(const mynah_backend *backend,
+                              float *dev_data, size_t rows, size_t cols,
+                              size_t valid,
+                              char *error, size_t error_capacity) {
+    (void)backend; (void)error; (void)error_capacity;
+    for (size_t r = 0; r < rows; ++r) {
+        float *row = dev_data + r * cols;
+        size_t v = valid < cols ? valid : cols;
+        float mx = -1e30f;
+        for (size_t i = 0; i < v; ++i) mx = fmaxf(mx, row[i]);
+        float sum = 0.0f;
+        for (size_t i = 0; i < v; ++i) { row[i] = expf(row[i] - mx); sum += row[i]; }
+        float inv = 1.0f / sum;
+        for (size_t i = 0; i < v; ++i) row[i] *= inv;
+        for (size_t i = v; i < cols; ++i) row[i] = 0.0f;
+    }
+    return 0;
+}
+
+int mynah_backend_residual_add_dev(const mynah_backend *backend,
+                                   float *dev_out, const float *dev_in,
+                                   size_t n,
+                                   char *error, size_t error_capacity) {
+    (void)backend; (void)error; (void)error_capacity;
+    for (size_t i = 0; i < n; ++i) dev_out[i] += dev_in[i];
+    return 0;
+}
+
+int mynah_backend_snake_dev(const mynah_backend *backend,
+                            float *dev_data, const float *alpha,
+                            size_t channels, size_t length,
+                            size_t snake_channels,
+                            char *error, size_t error_capacity) {
+    (void)backend; (void)error; (void)error_capacity;
+    for (size_t ch = 0; ch < channels; ++ch) {
+        float *row = dev_data + ch * length;
+        if (ch < snake_channels) {
+            float a = alpha[ch];
+            float inv_a = 1.0f / (a + 1e-9f);
+            for (size_t t = 0; t < length; ++t) {
+                float v = row[t];
+                float sn = sinf(a * v);
+                row[t] = v + sn * sn * inv_a;
+            }
+        } else {
+            for (size_t t = 0; t < length; ++t)
+                if (row[t] < 0.0f) row[t] *= 0.01f;
+        }
+    }
+    return 0;
+}

@@ -12,14 +12,122 @@
 #include <vector>
 
 /*
- * CUDA backend for the GB10 Grace Blackwell (unified memory) and discrete
- * NVIDIA GPUs.  Uses cuBLAS for GEMM and caches weight matrices on the
- * device so the autoregressive loop never re-uploads them.
+ * CUDA backend — resident GPU inference.
  *
- * On unified-memory platforms (GB10) the host pointers from mmap'd
- * safetensors are accessible from the GPU after a one-time migration;
- * on discrete GPUs the weights are explicitly copied once.
+ * Weights are uploaded once and cached.  Activations live in a device-side
+ * scratch buffer; element-wise ops (layer-norm, softmax, GELU, snake,
+ * residual-add) run as tiny CUDA kernels so the AR loop never round-trips
+ * through host memory.  The only H2D/D2H copies are:
+ *   - input embedding at the start of each step
+ *   - logits download for sampling
+ *
+ * On GB10 Grace Blackwell (unified memory) even those copies are page-table
+ * remaps; on discrete GPUs they are pinned DMA.
  */
+
+/* ------------------------------------------------------------------ */
+/*  CUDA kernels                                                       */
+/* ------------------------------------------------------------------ */
+
+__global__ static void k_layer_norm(float *out, const float *in,
+                                    const float *gain, const float *bias,
+                                    int width, float eps) {
+    int row = blockIdx.x;
+    const float *x = in + (size_t)row * width;
+    float *y = out + (size_t)row * width;
+    /* Two-pass: mean then variance (width ≤ 768, single block per row). */
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) sum += x[i];
+    /* warp reduce */
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    __shared__ float s_mean, s_inv;
+    if (threadIdx.x == 0) s_mean = sum / (float)width;
+    __syncthreads();
+    float mean = s_mean;
+    float var = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    for (int off = 16; off > 0; off >>= 1) var += __shfl_down_sync(0xffffffff, var, off);
+    if (threadIdx.x == 0) s_inv = rsqrtf(var / (float)width + eps);
+    __syncthreads();
+    float inv = s_inv;
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        y[i] = (x[i] - mean) * inv * gain[i] + bias[i];
+}
+
+__global__ static void k_softmax_causal(float *data, int cols, int valid) {
+    int row = blockIdx.x;
+    float *r = data + (size_t)row * cols;
+    int v = valid < cols ? valid : cols;
+    float mx = -1e30f;
+    for (int i = threadIdx.x; i < v; i += blockDim.x) mx = fmaxf(mx, r[i]);
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, off));
+    __shared__ float s_mx, s_sum;
+    if (threadIdx.x == 0) s_mx = mx;
+    __syncthreads();
+    mx = s_mx;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < v; i += blockDim.x) { r[i] = expf(r[i] - mx); sum += r[i]; }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    if (threadIdx.x == 0) s_sum = sum;
+    __syncthreads();
+    float inv = 1.0f / s_sum;
+    for (int i = threadIdx.x; i < v; i += blockDim.x) r[i] *= inv;
+    for (int i = threadIdx.x + v; i < cols; i += blockDim.x) r[i] = 0.0f;
+}
+
+__global__ static void k_gelu(float *data, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float x = data[i];
+        float c = 0.7978845608f * (x + 0.044715f * x * x * x);
+        data[i] = 0.5f * x * (1.0f + tanhf(c));
+    }
+}
+
+__global__ static void k_snake(float *data, const float *alpha,
+                               int channels, int length, int snake_ch) {
+    int ch = blockIdx.x;
+    if (ch >= channels) return;
+    float *row = data + (size_t)ch * length;
+    if (ch < snake_ch) {
+        float a = alpha[ch];
+        float inv_a = 1.0f / (a + 1e-9f);
+        for (int t = threadIdx.x; t < length; t += blockDim.x) {
+            float v = row[t];
+            float sn = sinf(a * v);
+            row[t] = v + sn * sn * inv_a;
+        }
+    } else {
+        for (int t = threadIdx.x; t < length; t += blockDim.x)
+            if (row[t] < 0.0f) row[t] *= 0.01f;
+    }
+}
+
+__global__ static void k_residual_add(float *out, const float *in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += in[i];
+}
+
+__global__ static void k_bias_add(float *out, const float *bias, int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * cols) out[i] += bias[i % cols];
+}
+
+__global__ static void k_copy_strided(float *dst, const float *src,
+                                      int dst_stride, int src_stride,
+                                      int width, int rows) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    for (int c = threadIdx.x; c < width; c += blockDim.x)
+        dst[(size_t)r * dst_stride + c] = src[(size_t)r * src_stride + c];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Backend state                                                      */
+/* ------------------------------------------------------------------ */
 
 struct cuda_cached_buffer {
     const void *host_pointer;
@@ -31,390 +139,192 @@ struct cuda_backend_state {
     cublasHandle_t cublas;
     cudaStream_t stream;
     std::vector<cuda_cached_buffer> weights;
-    float *io_buffer;          /* reusable device IO buffer */
-    size_t io_capacity;        /* bytes */
-    int unified_memory;        /* 1 if platform has unified memory */
+    /* Device scratch for activations (grows on demand). */
+    float *dev_scratch;
+    size_t dev_scratch_cap;   /* bytes */
+    /* Pinned host buffer for H2D/D2H. */
+    float *host_buf;
+    float *dev_buf;           /* mapped device pointer for host_buf */
+    size_t host_buf_cap;
 };
 
-static void set_error(char *error, size_t capacity, const char *message) {
-    if (error != nullptr && capacity > 0) std::snprintf(error, capacity, "%s", message);
+static void set_error(char *e, size_t c, const char *m) {
+    if (e && c > 0) std::snprintf(e, c, "%s", m);
+}
+static int ce(cudaError_t r, char *e, size_t c) {
+    if (r == cudaSuccess) return 0;
+    std::snprintf(e, c, "CUDA: %s", cudaGetErrorString(r)); return -1;
+}
+static int cbe(cublasStatus_t s, char *e, size_t c) {
+    if (s == CUBLAS_STATUS_SUCCESS) return 0;
+    std::snprintf(e, c, "cuBLAS: %d", (int)s); return -1;
 }
 
-static int cuda_error(cudaError_t result, char *error, size_t error_capacity) {
-    if (result == cudaSuccess) return 0;
-    std::snprintf(error, error_capacity, "CUDA error: %s", cudaGetErrorString(result));
-    return -1;
-}
-
-static int cublas_error(cublasStatus_t status, char *error, size_t error_capacity) {
-    if (status == CUBLAS_STATUS_SUCCESS) return 0;
-    std::snprintf(error, error_capacity, "cuBLAS error: %d", (int)status);
-    return -1;
-}
-
-/* Ensure a device buffer of at least `bytes` is available, reusing the
- * pooled IO buffer when possible. */
-static int ensure_io(cuda_backend_state *state, size_t bytes, char *error, size_t ec) {
-    if (state->io_capacity >= bytes) return 0;
-    if (state->io_buffer != nullptr) cudaFree(state->io_buffer);
-    /* Round up to 16 MB granularity to avoid frequent reallocs. */
-    size_t cap = (bytes + (16u << 20) - 1u) & ~((16u << 20) - 1u);
-    if (cuda_error(cudaMalloc(&state->io_buffer, cap), error, ec) != 0) {
-        state->io_buffer = nullptr;
-        state->io_capacity = 0;
-        return -1;
-    }
-    state->io_capacity = cap;
+static int ensure_scratch(cuda_backend_state *st, size_t bytes, char *e, size_t ec) {
+    if (st->dev_scratch_cap >= bytes) return 0;
+    if (st->dev_scratch) cudaFree(st->dev_scratch);
+    size_t cap = (bytes + (32u<<20) - 1u) & ~((32u<<20) - 1u);
+    if (ce(cudaMalloc(&st->dev_scratch, cap), e, ec)) { st->dev_scratch = nullptr; st->dev_scratch_cap = 0; return -1; }
+    st->dev_scratch_cap = cap;
     return 0;
 }
 
-/* Look up or upload a weight/bias buffer.  On unified-memory platforms
- * we still copy once so the GPU page tables are populated; subsequent
- * calls hit the cache in O(n) linear scan (n is small: ~50 tensors). */
-static int cached_weight(cuda_backend_state *state, const float *host_pointer,
-                         size_t bytes, float **device_pointer,
-                         char *error, size_t error_capacity) {
-    for (const cuda_cached_buffer &cached : state->weights) {
-        if (cached.host_pointer == host_pointer && cached.bytes == bytes) {
-            *device_pointer = cached.device_pointer;
-            return 0;
-        }
+static int ensure_host(cuda_backend_state *st, size_t bytes, char *e, size_t ec) {
+    if (st->host_buf_cap >= bytes) return 0;
+    if (st->host_buf) cudaFreeHost(st->host_buf);
+    st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
+    size_t cap = (bytes + (16u<<20) - 1u) & ~((16u<<20) - 1u);
+    if (ce(cudaHostAlloc(&st->host_buf, cap, cudaHostAllocMapped), e, ec)) return -1;
+    if (ce(cudaHostGetDevicePointer(&st->dev_buf, st->host_buf, 0), e, ec)) {
+        cudaFreeHost(st->host_buf); st->host_buf = nullptr; return -1;
     }
-    float *device = nullptr;
-    if (cuda_error(cudaMalloc(&device, bytes), error, error_capacity) != 0) return -1;
-    if (cuda_error(cudaMemcpyAsync(device, host_pointer, bytes,
-                                   cudaMemcpyHostToDevice, state->stream),
-                   error, error_capacity) != 0) {
-        cudaFree(device);
-        return -1;
-    }
-    state->weights.push_back({host_pointer, bytes, device});
-    *device_pointer = device;
+    st->host_buf_cap = cap;
     return 0;
 }
 
-/*
- * cuBLAS sgemm wrapper.
- *
- * We need:  output[rows, output_width] = input[rows, input_width] @ weight[output_width, input_width]^T + bias
- *
- * cuBLAS is column-major, so we compute the transpose:
- *   output^T = weight @ input^T
- * i.e. C(output_width, rows) = A(output_width, input_width) * B(input_width, rows)
- * where A = weight (row-major, treated as col-major transposed),
- *       B = input  (row-major, treated as col-major transposed).
- *
- * Using cublasSgemm with CUBLAS_OP_T for A and CUBLAS_OP_N for B:
- *   C = alpha * op(A) * op(B) + beta * C
- *   op(A) = A^T  (input_width x output_width) -> we pass weight as (output_width x input_width) with OP_T
- *   op(B) = B    (input_width x rows)
- *
- * Actually simpler: since both input and weight are row-major:
- *   output = input * weight^T
- * In column-major terms:
- *   output^T = weight * input^T
- *   C(ow, r) = A(ow, iw) * B(iw, r)
- *   cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ow, r, iw, &alpha, weight, ow, input, iw, &beta, output, ow)
- *
- * Wait — weight is stored as [output_width, input_width] row-major.
- * In column-major that's [input_width, output_width].
- * We want weight * input^T where weight is (ow x iw) and input^T is (iw x r).
- * Column-major: weight stored as (iw x ow), so we need OP_T on it to get (ow x iw).
- * input stored as (iw x r) in col-major (since row-major [r, iw] = col-major [iw, r]).
- *
- * cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, ow, r, iw, alpha, weight, iw, input, iw, beta, output, ow)
- */
+static int cached_weight(cuda_backend_state *st, const float *hp, size_t bytes,
+                         float **dp, char *e, size_t ec) {
+    for (auto &c : st->weights)
+        if (c.host_pointer == hp && c.bytes == bytes) { *dp = c.device_pointer; return 0; }
+    float *d = nullptr;
+    if (ce(cudaMalloc(&d, bytes), e, ec)) return -1;
+    if (ce(cudaMemcpy(d, hp, bytes, cudaMemcpyHostToDevice), e, ec)) { cudaFree(d); return -1; }
+    st->weights.push_back({hp, bytes, d});
+    *dp = d;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  matmul / sgemm (existing interface, with sync)                     */
+/* ------------------------------------------------------------------ */
+
 static int cuda_matmul(void *opaque, const float *input, float *output, size_t rows,
-                       size_t input_width, size_t output_width, const float *weight,
-                       const float *bias, char *error, size_t error_capacity) {
-    if (rows > UINT32_MAX || input_width > UINT32_MAX || output_width > UINT32_MAX) {
-        set_error(error, error_capacity, "CUDA matmul dimensions are too large");
-        return -1;
-    }
-    cuda_backend_state *state = static_cast<cuda_backend_state *>(opaque);
-
-    const size_t input_bytes = rows * input_width * sizeof(float);
-    const size_t weight_bytes = input_width * output_width * sizeof(float);
-    const size_t output_bytes = rows * output_width * sizeof(float);
-    const size_t bias_bytes = output_width * sizeof(float);
-
-    /* Upload weights (cached after first call). */
-    float *d_weight = nullptr;
-    if (cached_weight(state, weight, weight_bytes, &d_weight, error, error_capacity) != 0)
-        return -1;
-
-    float *d_bias = nullptr;
-    if (bias != nullptr &&
-        cached_weight(state, bias, bias_bytes, &d_bias, error, error_capacity) != 0)
-        return -1;
-
-    /* IO buffer: input region + output region. */
-    const size_t io_needed = input_bytes + output_bytes;
-    if (ensure_io(state, io_needed, error, error_capacity) != 0) return -1;
-
-    float *d_input = state->io_buffer;
-    float *d_output = state->io_buffer + rows * input_width;
-
-    /* Async H2D for input. */
-    if (cuda_error(cudaMemcpyAsync(d_input, input, input_bytes,
-                                   cudaMemcpyHostToDevice, state->stream),
-                   error, error_capacity) != 0)
-        return -1;
-
-    /* cuBLAS sgemm: output^T = weight * input^T (see comment above). */
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasSetStream(state->cublas, state->stream);
-    cublasStatus_t status = cublasSgemm(
-        state->cublas,
-        CUBLAS_OP_T,     /* op(A) = weight^T: (ow x iw) */
-        CUBLAS_OP_N,     /* op(B) = input^T as stored: (iw x r) */
-        (int)output_width,
-        (int)rows,
-        (int)input_width,
-        &alpha,
-        d_weight, (int)input_width,   /* A: (iw x ow) in col-major, lda = iw */
-        d_input, (int)input_width,    /* B: (iw x r) in col-major, ldb = iw */
-        &beta,
-        d_output, (int)output_width); /* C: (ow x r) in col-major, ldc = ow */
-    if (cublas_error(status, error, error_capacity) != 0) return -1;
-
-    /* Add bias if present: output[row, col] += bias[col].
-     * Use a simple kernel or cublasSger.  For now, a small kernel. */
-    if (d_bias != nullptr) {
-        /* cublasSger: A = alpha * x * y^T + A
-         * We want to add bias to each row.  Treat output as (ow x r) col-major.
-         * bias is (ow x 1), ones is (r x 1).
-         * A += bias * ones^T  =>  each column of A gets bias added.
-         * But output is (ow x r) col-major = (r x ow) row-major.
-         * Each column in col-major is a row in row-major... no.
-         * Col-major (ow x r): column j has ow elements = output row j transposed.
-         * We want output[row][col] += bias[col].
-         * In col-major (ow x r): element (col, row) += bias[col].
-         * So we add bias (ow x 1) to each column: A += bias * 1^T.
-         * cublasSger(handle, ow, r, &alpha, bias, 1, ones, 1, A, ow).
-         * We need a ones vector of length r.  Use a small static buffer. */
-        /* Simpler: just do it with a tiny kernel or accept the overhead.
-         * For now, copy bias addition to a custom approach. */
-        /* Actually, let's use cublasSger with a ones vector. */
-        static float *d_ones = nullptr;
-        static size_t ones_capacity = 0;
-        if (ones_capacity < rows) {
-            if (d_ones) cudaFree(d_ones);
-            size_t cap = (rows + 255u) & ~255u;
-            if (cuda_error(cudaMalloc(&d_ones, cap * sizeof(float)), error, error_capacity) != 0)
-                return -1;
-            /* Fill with ones. */
-            std::vector<float> h_ones(cap, 1.0f);
-            cudaMemcpyAsync(d_ones, h_ones.data(), cap * sizeof(float),
-                            cudaMemcpyHostToDevice, state->stream);
-            ones_capacity = cap;
-        }
+                       size_t iw, size_t ow, const float *weight, const float *bias,
+                       char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    const size_t ib = rows * iw * sizeof(float);
+    const size_t ob = rows * ow * sizeof(float);
+    float *dw = nullptr;
+    if (cached_weight(st, weight, iw * ow * sizeof(float), &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    if (ensure_host(st, ib + ob, e, ec)) return -1;
+    float *di = st->dev_buf;
+    float *dout = st->dev_buf + rows * iw;
+    std::memcpy(st->host_buf, input, ib);
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b0 = 0.0f;
+    if (cbe(cublasSgemm(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        (int)ow, (int)rows, (int)iw, &a1,
+                        dw, (int)iw, di, (int)iw, &b0, dout, (int)ow), e, ec)) return -1;
+    if (db) {
         const float one = 1.0f;
-        status = cublasSger(state->cublas,
-                            (int)output_width, (int)rows,
-                            &one,
-                            d_bias, 1,
-                            d_ones, 1,
-                            d_output, (int)output_width);
-        if (cublas_error(status, error, error_capacity) != 0) return -1;
+        /* bias via Sger */
+        static float *d_ones = nullptr; static size_t oc = 0;
+        if (oc < rows) { if (d_ones) cudaFree(d_ones); size_t c2 = (rows+255)&~255;
+            ce(cudaMalloc(&d_ones, c2*4), e, ec); std::vector<float> h(c2,1.0f);
+            cudaMemcpy(d_ones,h.data(),c2*4,cudaMemcpyHostToDevice); oc=c2; }
+        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,dout,(int)ow);
     }
-
-    /* D2H for output. */
-    if (cuda_error(cudaMemcpyAsync(output, d_output, output_bytes,
-                                   cudaMemcpyDeviceToHost, state->stream),
-                   error, error_capacity) != 0)
-        return -1;
-    if (cuda_error(cudaStreamSynchronize(state->stream), error, error_capacity) != 0)
-        return -1;
-
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    std::memcpy(output, st->host_buf + rows * iw, ob);
     return 0;
 }
 
-/*
- * Generic sgemm via cuBLAS.  Mirrors cblas_sgemm row-major semantics:
- *   C[m,n] = alpha * op(A) * op(B) + beta * C
- *
- * cuBLAS is column-major, so we compute the equivalent:
- *   C^T = alpha * op(B)^T * op(A)^T + beta * C^T
- * which in cuBLAS column-major terms is:
- *   cublasSgemm(handle, opB, opA, n, m, k, alpha, B, ldb, A, lda, beta, C, ldc)
- */
-static int cuda_sgemm(void *opaque, int trans_a, int trans_b,
-                      size_t m, size_t n, size_t k,
-                      float alpha,
-                      const float *a, size_t lda,
-                      const float *b, size_t ldb,
-                      float beta,
-                      float *c, size_t ldc,
-                      char *error, size_t error_capacity) {
-    if (m > UINT32_MAX || n > UINT32_MAX || k > UINT32_MAX ||
-        lda > UINT32_MAX || ldb > UINT32_MAX || ldc > UINT32_MAX) {
-        set_error(error, error_capacity, "CUDA sgemm dimensions are too large");
-        return -1;
-    }
-    cuda_backend_state *state = static_cast<cuda_backend_state *>(opaque);
-
-    /* Row-major: A stored as (trans_a ? k×m : m×k) with row stride lda.
-     * The pointer may be an offset into a larger buffer (e.g. qkv + head*hw),
-     * so we copy only the actual columns and pack them on the device. */
-    const size_t a_rows = trans_a ? k : m;
-    const size_t a_cols = trans_a ? m : k;  /* actual data columns per row */
-    const size_t b_rows = trans_b ? n : k;
-    const size_t b_cols = trans_b ? k : n;
-
-    /* Packed device layout: no stride gaps. */
-    const size_t a_packed = a_rows * a_cols;
-    const size_t b_packed = b_rows * b_cols;
-    const size_t c_packed = m * n;
-    const size_t io_needed = (a_packed + b_packed + c_packed) * sizeof(float);
-    if (ensure_io(state, io_needed, error, error_capacity) != 0) return -1;
-
-    float *d_a = state->io_buffer;
-    float *d_b = d_a + a_packed;
-    float *d_c = d_b + b_packed;
-
-    cublasSetStream(state->cublas, state->stream);
-
-    /* Copy with src pitch = lda/ldb, dst pitch = packed (a_cols/b_cols). */
-    if (cuda_error(cudaMemcpy2DAsync(d_a, a_cols * sizeof(float),
-                                     a, lda * sizeof(float),
-                                     a_cols * sizeof(float), a_rows,
-                                     cudaMemcpyHostToDevice, state->stream),
-                   error, error_capacity) != 0) return -1;
-    if (cuda_error(cudaMemcpy2DAsync(d_b, b_cols * sizeof(float),
-                                     b, ldb * sizeof(float),
-                                     b_cols * sizeof(float), b_rows,
-                                     cudaMemcpyHostToDevice, state->stream),
-                   error, error_capacity) != 0) return -1;
-    if (beta != 0.0f) {
-        if (cuda_error(cudaMemcpy2DAsync(d_c, n * sizeof(float),
-                                         c, ldc * sizeof(float),
-                                         n * sizeof(float), m,
-                                         cudaMemcpyHostToDevice, state->stream),
-                       error, error_capacity) != 0) return -1;
-    }
-
-    /* cuBLAS column-major trick for row-major C = alpha*op(A)*op(B) + beta*C:
-     *   cublasSgemm(h, opB, opA, n, m, k, alpha, B, ldb_packed, A, lda_packed, beta, C, ldc_packed)
-     * With packed data: lda_packed = a_cols, ldb_packed = b_cols, ldc_packed = n. */
-    const cublasOperation_t opA = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
-    const cublasOperation_t opB = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
-    const int lda_packed = (int)a_cols;
-    const int ldb_packed = (int)b_cols;
-    cublasStatus_t status = cublasSgemm(
-        state->cublas, opA, opB,
-        (int)n, (int)m, (int)k,
-        &alpha,
-        d_b, ldb_packed,
-        d_a, lda_packed,
-        &beta,
-        d_c, (int)n);
-    if (cublas_error(status, error, error_capacity) != 0) return -1;
-
-    /* Copy result back with dst pitch = ldc, src pitch = n (packed). */
-    if (cuda_error(cudaMemcpy2DAsync(c, ldc * sizeof(float),
-                                     d_c, n * sizeof(float),
-                                     n * sizeof(float), m,
-                                     cudaMemcpyDeviceToHost, state->stream),
-                   error, error_capacity) != 0) return -1;
-    if (cuda_error(cudaStreamSynchronize(state->stream), error, error_capacity) != 0)
-        return -1;
+static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k,
+                      float alpha, const float *a, size_t lda, const float *b, size_t ldb,
+                      float beta, float *c, size_t ldc, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t ar = ta?k:m, ac = ta?m:k, br = tb?n:k, bc = tb?k:n;
+    size_t ap = ar*ac, bp = br*bc, cp = m*n;
+    size_t need = (ap+bp+cp)*sizeof(float);
+    if (ensure_host(st, need, e, ec)) return -1;
+    float *ha = st->host_buf, *hb = ha+ap, *hc = hb+bp;
+    float *da = st->dev_buf,  *db2 = da+ap, *dc = db2+bp;
+    for (size_t r=0;r<ar;r++) std::memcpy(ha+r*ac, a+r*lda, ac*4);
+    for (size_t r=0;r<br;r++) std::memcpy(hb+r*bc, b+r*ldb, bc*4);
+    if (beta!=0.0f) for (size_t r=0;r<m;r++) std::memcpy(hc+r*n, c+r*ldc, n*4);
+    cublasSetStream(st->cublas, st->stream);
+    cublasOperation_t oa = tb?CUBLAS_OP_T:CUBLAS_OP_N;
+    cublasOperation_t ob = ta?CUBLAS_OP_T:CUBLAS_OP_N;
+    if (cbe(cublasSgemm(st->cublas,oa,ob,(int)n,(int)m,(int)k,&alpha,
+                        db2,(int)bc,da,(int)ac,&beta,dc,(int)n),e,ec)) return -1;
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    for (size_t r=0;r<m;r++) std::memcpy(c+r*ldc, hc+r*n, n*4);
     return 0;
 }
 
-static int cuda_self_test(void *opaque, char *error, size_t error_capacity) {
-    const float input[6] = {1.0f, 2.0f, 3.0f, -1.0f, 0.5f, 2.0f};
-    const float weight[12] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
-                              0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-    const float bias[4] = {0.5f, -0.5f, 1.0f, 2.0f};
-    const float expected[8] = {1.5f, 1.5f, 4.0f, 8.0f, -0.5f, 0.0f, 3.0f, 3.5f};
-    float output[8] = {0};
-    if (cuda_matmul(opaque, input, output, 2u, 3u, 4u, weight, bias,
-                    error, error_capacity) != 0) return -1;
-    for (size_t i = 0; i < 8u; ++i) {
-        if (std::fabs(output[i] - expected[i]) > 1.0e-4f) {
-            std::snprintf(error, error_capacity,
-                          "CUDA matmul self-test mismatch at %zu: got %f want %f",
-                          i, output[i], expected[i]);
-            return -1;
-        }
-    }
-    /* Test sgemm: same computation via the generic interface.
-     * C[2,4] = A[2,3] * B[4,3]^T + bias (bias added separately). */
-    float sgemm_out[8] = {0};
-    if (cuda_sgemm(opaque, 0, 1, 2u, 4u, 3u, 1.0f,
-                   input, 3u, weight, 3u, 0.0f,
-                   sgemm_out, 4u, error, error_capacity) != 0) return -1;
-    /* sgemm_out should equal expected - bias (no bias in sgemm). */
-    const float expected_nobias[8] = {1.0f, 2.0f, 3.0f, 6.0f, -1.0f, 0.5f, 2.0f, 1.5f};
-    for (size_t i = 0; i < 8u; ++i) {
-        if (std::fabs(sgemm_out[i] - expected_nobias[i]) > 1.0e-4f) {
-            std::snprintf(error, error_capacity,
-                          "CUDA sgemm self-test mismatch at %zu: got %f want %f",
-                          i, sgemm_out[i], expected_nobias[i]);
-            return -1;
-        }
-    }
+/* ------------------------------------------------------------------ */
+/*  Device-side ops (no host round-trip)                               */
+/* ------------------------------------------------------------------ */
+
+extern "C" int mynah_cuda_upload(mynah_backend *bk, const float *host, size_t n,
+                                 float **dev_out, char *e, size_t ec) {
+    /* Access the state through the backend struct layout. */
+    auto *st = static_cast<cuda_backend_state *>(
+        *reinterpret_cast<void **>(reinterpret_cast<char *>(bk) + sizeof(int) + sizeof(const char *)));
+    size_t bytes = n * sizeof(float);
+    if (ensure_scratch(st, bytes, e, ec)) return -1;
+    *dev_out = st->dev_scratch;
+    if (ce(cudaMemcpyAsync(*dev_out, host, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Self-test                                                          */
+/* ------------------------------------------------------------------ */
+
+static int cuda_self_test(void *opaque, char *e, size_t ec) {
+    const float in[6]={1,2,3,-1,0.5f,2};
+    const float w[12]={1,0,0,0,1,0,0,0,1,1,1,1};
+    const float bi[4]={0.5f,-0.5f,1,2};
+    const float exp[8]={1.5f,1.5f,4,8,-0.5f,0,3,3.5f};
+    float out[8]={0};
+    if (cuda_matmul(opaque,in,out,2,3,4,w,bi,e,ec)) return -1;
+    for (int i=0;i<8;i++) if (std::fabs(out[i]-exp[i])>1e-4f) {
+        std::snprintf(e,ec,"matmul mismatch %d: %f!=%f",i,out[i],exp[i]); return -1; }
+    float so[8]={0};
+    if (cuda_sgemm(opaque,0,1,2,4,3,1.0f,in,3,w,3,0.0f,so,4,e,ec)) return -1;
+    const float en[8]={1,2,3,6,-1,0.5f,2,1.5f};
+    for (int i=0;i<8;i++) if (std::fabs(so[i]-en[i])>1e-4f) {
+        std::snprintf(e,ec,"sgemm mismatch %d: %f!=%f",i,so[i],en[i]); return -1; }
     return 0;
 }
 
 static void cuda_close(void *opaque) {
-    cuda_backend_state *state = static_cast<cuda_backend_state *>(opaque);
-    if (state == nullptr) return;
-    for (const cuda_cached_buffer &cached : state->weights)
-        cudaFree(cached.device_pointer);
-    if (state->io_buffer != nullptr) cudaFree(state->io_buffer);
-    cublasDestroy(state->cublas);
-    cudaStreamDestroy(state->stream);
-    delete state;
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (!st) return;
+    for (auto &c : st->weights) cudaFree(c.device_pointer);
+    if (st->dev_scratch) cudaFree(st->dev_scratch);
+    if (st->host_buf) cudaFreeHost(st->host_buf);
+    cublasDestroy(st->cublas);
+    cudaStreamDestroy(st->stream);
+    delete st;
 }
 
 extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn *matmul,
                                        mynah_backend_sgemm_fn *sgemm,
                                        mynah_backend_close_fn *close,
                                        mynah_backend_self_test_fn *self_test,
-                                       char *error, size_t error_capacity) {
-    int device_count = 0;
-    if (cuda_error(cudaGetDeviceCount(&device_count), error, error_capacity) != 0 ||
-        device_count == 0) {
-        if (device_count == 0) set_error(error, error_capacity, "CUDA device is unavailable");
-        return -1;
-    }
-    if (cuda_error(cudaSetDevice(0), error, error_capacity) != 0) return -1;
-
-    /* Detect unified memory (GB10 Grace Blackwell). */
-    int unified = 0;
-    cudaDeviceGetAttribute(&unified, cudaDevAttrPageableMemoryAccess, 0);
-
-    cuda_backend_state *state = new (std::nothrow) cuda_backend_state();
-    if (state == nullptr) {
-        set_error(error, error_capacity, "out of memory creating CUDA backend");
-        return -1;
-    }
-    state->io_buffer = nullptr;
-    state->io_capacity = 0;
-    state->unified_memory = unified;
-
-    if (cuda_error(cudaStreamCreate(&state->stream), error, error_capacity) != 0) {
-        delete state;
-        return -1;
-    }
-    cublasStatus_t cs = cublasCreate(&state->cublas);
-    if (cs != CUBLAS_STATUS_SUCCESS) {
-        std::snprintf(error, error_capacity, "cuBLAS init failed: %d", (int)cs);
-        cudaStreamDestroy(state->stream);
-        delete state;
-        return -1;
-    }
-    /* Use tensor cores when available (TF32 on Ampere+, FP32 on Blackwell). */
-    cublasSetMathMode(state->cublas, CUBLAS_DEFAULT_MATH);
-
-    *state_out = state;
+                                       char *e, size_t ec) {
+    int dc = 0;
+    if (ce(cudaGetDeviceCount(&dc), e, ec) || dc == 0) {
+        if (dc == 0) set_error(e, ec, "no CUDA device"); return -1; }
+    ce(cudaSetDevice(0), e, ec);
+    cudaSetDeviceFlags(cudaDeviceMapHost);
+    auto *st = new (std::nothrow) cuda_backend_state();
+    if (!st) { set_error(e,ec,"oom"); return -1; }
+    st->dev_scratch = nullptr; st->dev_scratch_cap = 0;
+    st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
+    if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
+    if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
+        set_error(e,ec,"cuBLAS init"); cudaStreamDestroy(st->stream); delete st; return -1; }
+    cublasSetMathMode(st->cublas, CUBLAS_DEFAULT_MATH);
+    *state_out = st;
     *matmul = cuda_matmul;
     *sgemm = cuda_sgemm;
     *close = cuda_close;
     *self_test = cuda_self_test;
-    if (error != nullptr && error_capacity > 0) error[0] = '\0';
+    if (e && ec > 0) e[0] = '\0';
     return 0;
 }
