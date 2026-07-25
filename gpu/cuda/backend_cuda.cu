@@ -669,3 +669,39 @@ extern "C" int mynah_cuda_layer_norm_inplace(void *opaque, const float *dev_in,
         dev_out, dev_in, d_gain, (int)width, 1e-5f);
     return ce(cudaGetLastError(), e, ec);
 }
+
+/* matmul device-to-device: input already on GPU, no host round-trip.
+ * Converts FP32 device input → FP16, runs cuBLAS, output stays on device.
+ * Does NOT sync. Caller syncs when needed. */
+extern "C" int mynah_cuda_matmul_d2d(void *opaque, const float *d_in, float *d_out,
+                           size_t rows, size_t iw, size_t ow,
+                           const float *weight, const float *bias,
+                           char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    const size_t in_n = rows * iw;
+    half *dw16 = nullptr;
+    if (cached_weight_fp16(st, weight, iw * ow, &dw16, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
+    half *di16 = (half *)st->dev_scratch;
+    k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(d_in, di16, (int)in_n);
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b0 = 0.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &a1, dw16, CUDA_R_16F, (int)iw,
+                         di16, CUDA_R_16F, (int)iw,
+                         &b0, d_out, CUDA_R_32F, (int)ow,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+    if (db) {
+        const float one = 1.0f;
+        static float *d_ones3 = nullptr; static size_t oc3 = 0;
+        if (oc3 < rows) { if (d_ones3) cudaFree(d_ones3); size_t c2 = (rows+255)&~255;
+            ce(cudaMalloc(&d_ones3, c2*4), e, ec); std::vector<float> h(c2,1.0f);
+            cudaMemcpy(d_ones3,h.data(),c2*4,cudaMemcpyHostToDevice); oc3=c2; }
+        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones3,1,d_out,(int)ow);
+    }
+    return 0; /* no sync */
+}

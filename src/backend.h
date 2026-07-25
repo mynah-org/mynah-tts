@@ -55,6 +55,7 @@ int mynah_backend_gelu_inplace(const mynah_backend *, float *, size_t, char *, s
 int mynah_backend_residual_inplace(const mynah_backend *, float *, const float *, size_t, char *, size_t);
 int mynah_backend_layer_norm_inplace(const mynah_backend *, const float *, float *, const float *, size_t, size_t, char *, size_t);
 int mynah_backend_matmul_to_dev(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+int mynah_backend_matmul_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 
 /* Device-side matvec: out[N] = in[K] @ W[N,K]^T + bias. No sync. */
 int mynah_backend_matvec_dev(const mynah_backend *backend,
