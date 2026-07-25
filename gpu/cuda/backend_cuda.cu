@@ -42,7 +42,7 @@ __global__ static void k_layer_norm(float *out, const float *in,
     mean /= (float)width;
     float var = 0.0f;
     for (int d = 0; d < width; ++d) { float dd = x[d] - mean; var += dd * dd; }
-    float inv = rsqrtf(var / (float)width + eps);
+    float inv = 1.0f / sqrtf(var / (float)width + eps);
     for (int d = 0; d < width; ++d)
         y[d] = (x[d] - mean) * inv * gain[d];
 }
@@ -618,10 +618,10 @@ extern "C" int mynah_cuda_layer_norm_inplace(void *opaque, const float *dev_in,
                                    size_t rows, size_t width,
                                    char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    /* Upload gain to device (small, cached via host_buf). */
-    if (ensure_host(st, width * sizeof(float), e, ec)) return -1;
-    std::memcpy(st->host_buf, gain, width * sizeof(float));
+    /* Cache gain on device (same pointer = same layer, reused across steps). */
+    float *d_gain = nullptr;
+    if (cached_weight(st, gain, width * sizeof(float), &d_gain, e, ec)) return -1;
     k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
-        dev_out, dev_in, st->dev_buf, (int)width, 1e-5f);
+        dev_out, dev_in, d_gain, (int)width, 1e-5f);
     return ce(cudaGetLastError(), e, ec);
 }
