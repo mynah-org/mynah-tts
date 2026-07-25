@@ -37,6 +37,8 @@ struct mynah_backend {
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
     int (*layer_norm_dev)(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
     int (*residual_add_dev)(void *, float *, const float *, size_t, char *, size_t);
+    int (*matmul_dev)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+    int (*sgemm_dev)(void *, int, int, size_t, size_t, size_t, float, const float *, size_t, const float *, size_t, float, float *, size_t, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -58,6 +60,8 @@ extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, 
 extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_layer_norm_dev(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
 extern int mynah_cuda_residual_add_dev(void *, float *, const float *, size_t, char *, size_t);
+extern int mynah_cuda_matmul_dev(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_cuda_sgemm_dev(void *, int, int, size_t, size_t, size_t, float, const float *, size_t, const float *, size_t, float, float *, size_t, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -288,6 +292,8 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->gelu_dev = mynah_cuda_gelu_dev;
         backend->layer_norm_dev = mynah_cuda_layer_norm_dev;
         backend->residual_add_dev = mynah_cuda_residual_add_dev;
+        backend->matmul_dev = mynah_cuda_matmul_dev;
+        backend->sgemm_dev = mynah_cuda_sgemm_dev;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -380,29 +386,6 @@ int mynah_backend_sync(const mynah_backend *backend,
     if (backend->sync != NULL)
         return backend->sync(backend->state, error, error_capacity);
     return 0; /* CPU: nothing to sync */
-}
-
-int mynah_backend_matmul_dev(const mynah_backend *backend,
-                             const float *dev_in, float *dev_out,
-                             size_t rows, size_t iw, size_t ow,
-                             const float *weight, const float *bias,
-                             char *error, size_t error_capacity) {
-    return mynah_backend_matmul(backend, dev_in, dev_out, rows, iw, ow,
-                                weight, bias, error, error_capacity);
-}
-
-int mynah_backend_sgemm_dev(const mynah_backend *backend,
-                            int trans_a, int trans_b,
-                            size_t m, size_t n, size_t k,
-                            float alpha,
-                            const float *dev_a, size_t lda,
-                            const float *dev_b, size_t ldb,
-                            float beta,
-                            float *dev_c, size_t ldc,
-                            char *error, size_t error_capacity) {
-    return mynah_backend_sgemm(backend, trans_a, trans_b, m, n, k,
-                               alpha, dev_a, lda, dev_b, ldb,
-                               beta, dev_c, ldc, error, error_capacity);
 }
 
 int mynah_backend_gelu_dev(const mynah_backend *backend,
@@ -501,4 +484,36 @@ int mynah_backend_snake_dev(const mynah_backend *backend,
         }
     }
     return 0;
+}
+
+int mynah_backend_matmul_dev(const mynah_backend *backend,
+                             const float *dev_in, float *dev_out,
+                             size_t rows, size_t iw, size_t ow,
+                             const float *weight, const float *bias,
+                             char *error, size_t error_capacity) {
+    if (backend == NULL) return -1;
+    if (backend->matmul_dev != NULL)
+        return backend->matmul_dev(backend->state, dev_in, dev_out, rows, iw, ow,
+                                   weight, bias, error, error_capacity);
+    return mynah_backend_matmul(backend, dev_in, dev_out, rows, iw, ow,
+                                weight, bias, error, error_capacity);
+}
+
+int mynah_backend_sgemm_dev(const mynah_backend *backend,
+                            int trans_a, int trans_b,
+                            size_t m, size_t n, size_t k,
+                            float alpha,
+                            const float *dev_a, size_t lda,
+                            const float *dev_b, size_t ldb,
+                            float beta,
+                            float *dev_c, size_t ldc,
+                            char *error, size_t error_capacity) {
+    if (backend == NULL) return -1;
+    if (backend->sgemm_dev != NULL)
+        return backend->sgemm_dev(backend->state, trans_a, trans_b, m, n, k,
+                                  alpha, dev_a, lda, dev_b, ldb,
+                                  beta, dev_c, ldc, error, error_capacity);
+    return mynah_backend_sgemm(backend, trans_a, trans_b, m, n, k,
+                               alpha, dev_a, lda, dev_b, ldb,
+                               beta, dev_c, ldc, error, error_capacity);
 }

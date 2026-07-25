@@ -244,7 +244,76 @@ static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k
 }
 
 /* ------------------------------------------------------------------ */
-/*  Device-side ops (CUDA implementations)                             */
+/*  Device-side matmul: in/out are device pointers, no host copy.      */
+/*  Weight/bias are host pointers (cached on device internally).       */
+/*  Does NOT sync — caller calls mynah_backend_sync when needed.       */
+/* ------------------------------------------------------------------ */
+
+static int cuda_matmul_dev(void *opaque, const float *d_in, float *d_out,
+                           size_t rows, size_t iw, size_t ow,
+                           const float *weight, const float *bias,
+                           char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    float *dw = nullptr;
+    if (cached_weight(st, weight, iw * ow * sizeof(float), &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b0 = 0.0f;
+    if (cbe(cublasSgemm(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        (int)ow, (int)rows, (int)iw, &a1,
+                        dw, (int)iw, d_in, (int)iw, &b0, d_out, (int)ow), e, ec)) return -1;
+    if (db) {
+        const float one = 1.0f;
+        static float *d_ones = nullptr; static size_t oc = 0;
+        if (oc < rows) { if (d_ones) cudaFree(d_ones); size_t c2 = (rows+255)&~255;
+            ce(cudaMalloc(&d_ones, c2*4), e, ec); std::vector<float> h(c2,1.0f);
+            cudaMemcpy(d_ones,h.data(),c2*4,cudaMemcpyHostToDevice); oc=c2; }
+        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,d_out,(int)ow);
+    }
+    return 0; /* no sync */
+}
+
+/* Device-side sgemm: all pointers are device-side. No sync. */
+static int cuda_sgemm_dev(void *opaque, int ta, int tb,
+                          size_t m, size_t n, size_t k,
+                          float alpha,
+                          const float *d_a, size_t lda,
+                          const float *d_b, size_t ldb,
+                          float beta,
+                          float *d_c, size_t ldc,
+                          char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    cublasSetStream(st->cublas, st->stream);
+    cublasOperation_t oa = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t ob = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    /* Packed leading dimensions: caller provides actual data cols. */
+    size_t ac = ta ? m : k;
+    size_t bc = tb ? k : n;
+    return cbe(cublasSgemm(st->cublas, oa, ob,
+                           (int)n, (int)m, (int)k, &alpha,
+                           d_b, (int)bc, d_a, (int)ac, &beta,
+                           d_c, (int)n), e, ec) ? -1 : 0;
+}
+
+extern "C" int mynah_cuda_matmul_dev(void *s, const float *di, float *dout,
+                           size_t rows, size_t iw, size_t ow,
+                           const float *w, const float *b,
+                           char *e, size_t ec) {
+    return cuda_matmul_dev(s, di, dout, rows, iw, ow, w, b, e, ec);
+}
+
+extern "C" int mynah_cuda_sgemm_dev(void *s, int ta, int tb,
+                          size_t m, size_t n, size_t k, float alpha,
+                          const float *da, size_t lda,
+                          const float *db, size_t ldb,
+                          float beta, float *dc, size_t ldc,
+                          char *e, size_t ec) {
+    return cuda_sgemm_dev(s, ta, tb, m, n, k, alpha, da, lda, db, ldb, beta, dc, ldc, e, ec);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Device-side element-wise ops (CUDA implementations)                */
 /* ------------------------------------------------------------------ */
 
 extern "C" int mynah_cuda_upload(void *opaque, const float *host, size_t n,
