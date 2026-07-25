@@ -30,15 +30,13 @@
 /* ------------------------------------------------------------------ */
 
 __global__ static void k_layer_norm(float *out, const float *in,
-                                    const float *gain, const float *bias,
+                                    const float *gain,
                                     int width, float eps) {
     int row = blockIdx.x;
     const float *x = in + (size_t)row * width;
     float *y = out + (size_t)row * width;
-    /* Two-pass: mean then variance (width ≤ 768, single block per row). */
     float sum = 0.0f;
     for (int i = threadIdx.x; i < width; i += blockDim.x) sum += x[i];
-    /* warp reduce */
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     __shared__ float s_mean, s_inv;
     if (threadIdx.x == 0) s_mean = sum / (float)width;
@@ -54,7 +52,7 @@ __global__ static void k_layer_norm(float *out, const float *in,
     __syncthreads();
     float inv = s_inv;
     for (int i = threadIdx.x; i < width; i += blockDim.x)
-        y[i] = (x[i] - mean) * inv * gain[i] + bias[i];
+        y[i] = (x[i] - mean) * inv * gain[i];
 }
 
 __global__ static void k_softmax_causal(float *data, int cols, int valid) {
@@ -311,23 +309,22 @@ extern "C" int mynah_cuda_layer_norm_dev(void *opaque, const float *in, float *o
                                const float *gain, const float *bias,
                                size_t rows, size_t width,
                                char *e, size_t ec) {
+    (void)bias; /* Magpie layer_norm has no bias */
     auto *st = static_cast<cuda_backend_state *>(opaque);
     size_t data_bytes = rows * width * sizeof(float);
-    size_t wb = width * sizeof(float) * 2;
+    size_t gb = width * sizeof(float);
     if (ensure_scratch(st, data_bytes * 2, e, ec)) return -1;
-    if (ensure_host(st, wb, e, ec)) return -1;
+    if (ensure_host(st, gb, e, ec)) return -1;
     float *d_in = st->dev_scratch;
     float *d_out = st->dev_scratch + rows * width;
-    std::memcpy(st->host_buf, gain, width * sizeof(float));
-    std::memcpy(st->host_buf + width, bias, width * sizeof(float));
+    std::memcpy(st->host_buf, gain, gb);
     float *d_gain = st->dev_buf;
-    float *d_bias = st->dev_buf + width;
     if (ce(cudaMemcpyAsync(d_in, in, data_bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
     int threads = width <= 256 ? (int)width : 256;
     threads = ((threads + 31) / 32) * 32;
     if (threads > 1024) threads = 1024;
     k_layer_norm<<<(int)rows, threads, 0, st->stream>>>(
-        d_out, d_in, d_gain, d_bias, (int)width, 1e-5f);
+        d_out, d_in, d_gain, (int)width, 1e-5f);
     if (ce(cudaGetLastError(), e, ec)) return -1;
     if (ce(cudaMemcpyAsync(out, d_out, data_bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
     return ce(cudaStreamSynchronize(st->stream), e, ec);
