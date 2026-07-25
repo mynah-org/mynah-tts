@@ -570,14 +570,30 @@ extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_o
                            const float *weight, const float *bias,
                            char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    float *dw = nullptr;
-    if (cached_weight(st, weight, K * N * sizeof(float), &dw, e, ec)) return -1;
+    half *dw16 = nullptr;
+    if (cached_weight_fp16(st, weight, K * N, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, N * sizeof(float), &db, e, ec)) return -1;
-    int threads = 256;
-    int blocks = ((int)N + threads - 1) / threads;
-    k_matvec<<<blocks, threads, 0, st->stream>>>(d_in, dw, db, d_out, (int)K, (int)N);
-    return ce(cudaGetLastError(), e, ec);
+    /* Convert FP32 input to FP16 in scratch. */
+    if (ensure_scratch(st, K * sizeof(half), e, ec)) return -1;
+    half *di16 = (half *)st->dev_scratch;
+    k_f32_to_f16<<<((int)K+255)/256, 256, 0, st->stream>>>(d_in, di16, (int)K);
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b0 = 0.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)N, 1, (int)K,
+                         &a1, dw16, CUDA_R_16F, (int)K,
+                         di16, CUDA_R_16F, (int)K,
+                         &b0, d_out, CUDA_R_32F, (int)N,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+    if (db) {
+        const float one = 1.0f;
+        static float *d_one = nullptr;
+        if (!d_one) { ce(cudaMalloc(&d_one, 4), e, ec); cudaMemcpy(d_one, &one, 4, cudaMemcpyHostToDevice); }
+        cublasSaxpy(st->cublas, (int)N, &one, db, 1, d_out, 1);
+    }
+    return 0; /* no sync */
 }
 
 /* ---- Inplace device-side ops (no copy, no sync) ---- */
