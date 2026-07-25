@@ -229,7 +229,7 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
             free(hidden);
             return -1;
         }
-        for (size_t i = 0; i < length * ffn_width; ++i) hidden[i] = gelu_tanh(hidden[i]);
+        mynah_backend_gelu_dev(backend, hidden, length * ffn_width, error, error_capacity);
         const int result = linear(backend, hidden, output, length, ffn_width, width,
                                   out_net.data, NULL, error, error_capacity);
         free(hidden);
@@ -255,7 +255,7 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
             }
             graph_sgemm(backend, 0, 1, (int)(length - shift), (int)ffn_width, (int)width, 1.0f, input, (int)width, wk, (int)width, 1.0f, hidden + shift * ffn_width, (int)ffn_width, error, error_capacity);
         }
-        for (size_t i = 0; i < length * ffn_width; ++i) hidden[i] = gelu_tanh(hidden[i]);
+        mynah_backend_gelu_dev(backend, hidden, length * ffn_width, error, error_capacity);
         memset(output, 0, length * width * sizeof(float));
         for (size_t k = 0; k < kernel; ++k) {
             const size_t shift = kernel - 1u - k;
@@ -2135,7 +2135,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         layer_norm(x, nrm, count, width, r->norm_pos_ff);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->ffn_up, nrm, hidden,
                               count, width, ffn, NULL, error, error_capacity) != 0) { failed = 1; break; }
-        gelu_tanh_array(hidden, hidden_elements, gelu_scratch);
+        mynah_backend_gelu_dev(model->backend, hidden, hidden_elements, error, error_capacity);
         if (mynah_qmat_linear(model->qcache, model->tts, model->backend, r->ffn_down, hidden, proj,
                               count, ffn, width, NULL, error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];

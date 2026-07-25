@@ -292,6 +292,64 @@ extern "C" int mynah_cuda_snake_dev(void *opaque, float *dev_data, const float *
     return ce(cudaGetLastError(), e, ec);
 }
 
+extern "C" int mynah_cuda_gelu_dev(void *opaque, float *data, size_t n,
+                         char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t bytes = n * sizeof(float);
+    if (ensure_scratch(st, bytes, e, ec)) return -1;
+    float *d = st->dev_scratch;
+    if (ce(cudaMemcpyAsync(d, data, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    int threads = 256;
+    int blocks = ((int)n + threads - 1) / threads;
+    k_gelu<<<blocks, threads, 0, st->stream>>>(d, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (ce(cudaMemcpyAsync(data, d, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
+    return ce(cudaStreamSynchronize(st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_layer_norm_dev(void *opaque, const float *in, float *out,
+                               const float *gain, const float *bias,
+                               size_t rows, size_t width,
+                               char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t data_bytes = rows * width * sizeof(float);
+    size_t wb = width * sizeof(float) * 2;
+    if (ensure_scratch(st, data_bytes * 2, e, ec)) return -1;
+    if (ensure_host(st, wb, e, ec)) return -1;
+    float *d_in = st->dev_scratch;
+    float *d_out = st->dev_scratch + rows * width;
+    std::memcpy(st->host_buf, gain, width * sizeof(float));
+    std::memcpy(st->host_buf + width, bias, width * sizeof(float));
+    float *d_gain = st->dev_buf;
+    float *d_bias = st->dev_buf + width;
+    if (ce(cudaMemcpyAsync(d_in, in, data_bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    int threads = width <= 256 ? (int)width : 256;
+    threads = ((threads + 31) / 32) * 32;
+    if (threads > 1024) threads = 1024;
+    k_layer_norm<<<(int)rows, threads, 0, st->stream>>>(
+        d_out, d_in, d_gain, d_bias, (int)width, 1e-5f);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (ce(cudaMemcpyAsync(out, d_out, data_bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
+    return ce(cudaStreamSynchronize(st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_residual_add_dev(void *opaque, float *out, const float *in,
+                                 size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t bytes = n * sizeof(float);
+    if (ensure_scratch(st, bytes * 2, e, ec)) return -1;
+    float *d_out = st->dev_scratch;
+    float *d_in = st->dev_scratch + n;
+    if (ce(cudaMemcpyAsync(d_out, out, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    if (ce(cudaMemcpyAsync(d_in, in, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    int threads = 256;
+    int blocks = ((int)n + threads - 1) / threads;
+    k_residual_add<<<blocks, threads, 0, st->stream>>>(d_out, d_in, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (ce(cudaMemcpyAsync(out, d_out, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
+    return ce(cudaStreamSynchronize(st->stream), e, ec);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Self-test                                                          */
 /* ------------------------------------------------------------------ */

@@ -34,6 +34,9 @@ struct mynah_backend {
     int (*download)(void *, const float *, float *, size_t, char *, size_t);
     int (*sync)(void *, char *, size_t);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
+    int (*gelu_dev)(void *, float *, size_t, char *, size_t);
+    int (*layer_norm_dev)(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
+    int (*residual_add_dev)(void *, float *, const float *, size_t, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -52,6 +55,9 @@ extern int mynah_cuda_upload(void *, const float *, size_t, float **, char *, si
 extern int mynah_cuda_download(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_cuda_sync(void *, char *, size_t);
 extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
+extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
+extern int mynah_cuda_layer_norm_dev(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
+extern int mynah_cuda_residual_add_dev(void *, float *, const float *, size_t, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -279,6 +285,9 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->download = mynah_cuda_download;
         backend->sync = mynah_cuda_sync;
         backend->snake_dev = mynah_cuda_snake_dev;
+        backend->gelu_dev = mynah_cuda_gelu_dev;
+        backend->layer_norm_dev = mynah_cuda_layer_norm_dev;
+        backend->residual_add_dev = mynah_cuda_residual_add_dev;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -399,7 +408,9 @@ int mynah_backend_sgemm_dev(const mynah_backend *backend,
 int mynah_backend_gelu_dev(const mynah_backend *backend,
                            float *dev_data, size_t n,
                            char *error, size_t error_capacity) {
-    (void)backend; (void)error; (void)error_capacity;
+    if (backend == NULL) return -1;
+    if (backend->gelu_dev != NULL)
+        return backend->gelu_dev(backend->state, dev_data, n, error, error_capacity);
     for (size_t i = 0; i < n; ++i) {
         float x = dev_data[i];
         float c = 0.7978845608f * (x + 0.044715f * x * x * x);
@@ -413,7 +424,10 @@ int mynah_backend_layer_norm_dev(const mynah_backend *backend,
                                  const float *gain, const float *bias,
                                  size_t rows, size_t width,
                                  char *error, size_t error_capacity) {
-    (void)backend; (void)error; (void)error_capacity;
+    if (backend == NULL) return -1;
+    if (backend->layer_norm_dev != NULL)
+        return backend->layer_norm_dev(backend->state, dev_in, dev_out, gain, bias,
+                                       rows, width, error, error_capacity);
     for (size_t r = 0; r < rows; ++r) {
         const float *x = dev_in + r * width;
         float *y = dev_out + r * width;
@@ -452,7 +466,10 @@ int mynah_backend_residual_add_dev(const mynah_backend *backend,
                                    float *dev_out, const float *dev_in,
                                    size_t n,
                                    char *error, size_t error_capacity) {
-    (void)backend; (void)error; (void)error_capacity;
+    if (backend == NULL) return -1;
+    if (backend->residual_add_dev != NULL)
+        return backend->residual_add_dev(backend->state, dev_out, dev_in, n,
+                                         error, error_capacity);
     for (size_t i = 0; i < n; ++i) dev_out[i] += dev_in[i];
     return 0;
 }
