@@ -255,12 +255,8 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                          CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
     if (db) {
-        const float one = 1.0f;
-        static float *d_ones = nullptr; static size_t oc = 0;
-        if (oc < rows) { if (d_ones) cudaFree(d_ones); size_t c2 = (rows+255)&~255;
-            ce(cudaMalloc(&d_ones, c2*4), e, ec); std::vector<float> h(c2,1.0f);
-            cudaMemcpy(d_ones,h.data(),c2*4,cudaMemcpyHostToDevice); oc=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,d_out_mapped,(int)ow);
+        k_bias_add<<<((int)(rows*ow)+255)/256, 256, 0, st->stream>>>(
+            d_out_mapped, db, (int)rows, (int)ow);
     }
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
     /* Host-side memcpy from mapped buffer (no cudaMemcpy API call). */
