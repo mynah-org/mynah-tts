@@ -2,6 +2,7 @@
 #include "threads.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,17 +26,20 @@ struct mynah_backend {
     const char *name;
     void *state;
     mynah_backend_matmul_fn matmul;
+    mynah_backend_sgemm_fn sgemm;
     mynah_backend_close_fn close;
     mynah_backend_self_test_fn self_test;
 };
 
 #if defined(MYNAH_ENABLE_METAL)
 int mynah_backend_metal_open(void **state, mynah_backend_matmul_fn *matmul,
+                             mynah_backend_sgemm_fn *sgemm,
                              mynah_backend_close_fn *close, mynah_backend_self_test_fn *self_test,
                              char *error, size_t error_capacity);
 #endif
 #if defined(MYNAH_ENABLE_CUDA)
 int mynah_backend_cuda_open(void **state, mynah_backend_matmul_fn *matmul,
+                            mynah_backend_sgemm_fn *sgemm,
                             mynah_backend_close_fn *close, mynah_backend_self_test_fn *self_test,
                             char *error, size_t error_capacity);
 #endif
@@ -167,6 +171,47 @@ static int cpu_self_test(void *state, char *error, size_t error_capacity) {
     return 0;
 }
 
+/* Generic sgemm: C[m,n] = alpha * op(A) * op(B) + beta * C  (row-major).
+ * On BLAS builds this delegates to cblas_sgemm; otherwise a scalar
+ * triple loop. */
+static int cpu_sgemm(void *state, int trans_a, int trans_b,
+                     size_t m, size_t n, size_t k,
+                     float alpha,
+                     const float *a, size_t lda,
+                     const float *b, size_t ldb,
+                     float beta,
+                     float *c, size_t ldc,
+                     char *error, size_t error_capacity) {
+    (void)state;
+    (void)error;
+    (void)error_capacity;
+#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+    if (m <= (size_t)INT_MAX && n <= (size_t)INT_MAX && k <= (size_t)INT_MAX &&
+        lda <= (size_t)INT_MAX && ldb <= (size_t)INT_MAX && ldc <= (size_t)INT_MAX) {
+        cblas_sgemm(CblasRowMajor,
+                    trans_a ? CblasTrans : CblasNoTrans,
+                    trans_b ? CblasTrans : CblasNoTrans,
+                    (int)m, (int)n, (int)k,
+                    alpha, a, (int)lda, b, (int)ldb,
+                    beta, c, (int)ldc);
+        return 0;
+    }
+#endif
+    /* Scalar fallback. */
+    for (size_t i = 0; i < m; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            float sum = 0.0f;
+            for (size_t p = 0; p < k; ++p) {
+                const float a_val = trans_a ? a[p * lda + i] : a[i * lda + p];
+                const float b_val = trans_b ? b[j * ldb + p] : b[p * ldb + j];
+                sum += a_val * b_val;
+            }
+            c[i * ldc + j] = alpha * sum + beta * c[i * ldc + j];
+        }
+    }
+    return 0;
+}
+
 const char *mynah_tts_device_name(mynah_tts_device device) {
     switch (device) {
         case MYNAH_TTS_DEVICE_CPU: return "cpu";
@@ -196,14 +241,17 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
     backend->device = device;
     backend->name = mynah_tts_device_name(device);
     backend->matmul = cpu_matmul;
+    backend->sgemm = cpu_sgemm;
     backend->self_test = cpu_self_test;
     if (device == MYNAH_TTS_DEVICE_METAL) {
 #if defined(MYNAH_ENABLE_METAL)
-        if (mynah_backend_metal_open(&backend->state, &backend->matmul, &backend->close,
-                                     &backend->self_test, error, error_capacity) != 0) {
+        if (mynah_backend_metal_open(&backend->state, &backend->matmul, &backend->sgemm,
+                                     &backend->close, &backend->self_test,
+                                     error, error_capacity) != 0) {
             free(backend);
             return -1;
         }
+        if (backend->sgemm == NULL) backend->sgemm = cpu_sgemm;
 #else
         free(backend);
         set_error(error, error_capacity, "Metal backend is not compiled; use make metal");
@@ -211,8 +259,9 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
 #endif
     } else if (device == MYNAH_TTS_DEVICE_CUDA) {
 #if defined(MYNAH_ENABLE_CUDA)
-        if (mynah_backend_cuda_open(&backend->state, &backend->matmul, &backend->close,
-                                    &backend->self_test, error, error_capacity) != 0) {
+        if (mynah_backend_cuda_open(&backend->state, &backend->matmul, &backend->sgemm,
+                                    &backend->close, &backend->self_test,
+                                    error, error_capacity) != 0) {
             free(backend);
             return -1;
         }
@@ -248,6 +297,25 @@ int mynah_backend_matmul(const mynah_backend *backend, const float *input,
     }
     return backend->matmul(backend->state, input, output, rows, input_width, output_width,
                            weight, bias, error, error_capacity);
+}
+
+int mynah_backend_sgemm(const mynah_backend *backend,
+                        int trans_a, int trans_b,
+                        size_t m, size_t n, size_t k,
+                        float alpha,
+                        const float *a, size_t lda,
+                        const float *b, size_t ldb,
+                        float beta,
+                        float *c, size_t ldc,
+                        char *error, size_t error_capacity) {
+    if (backend == NULL || backend->sgemm == NULL || a == NULL || b == NULL || c == NULL ||
+        m == 0 || n == 0 || k == 0) {
+        set_error(error, error_capacity, "invalid backend sgemm request");
+        return -1;
+    }
+    return backend->sgemm(backend->state, trans_a, trans_b, m, n, k,
+                          alpha, a, lda, b, ldb, beta, c, ldc,
+                          error, error_capacity);
 }
 
 int mynah_backend_self_test(mynah_tts_device device, char *error, size_t error_capacity) {

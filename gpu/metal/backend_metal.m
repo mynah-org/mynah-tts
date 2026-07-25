@@ -219,6 +219,7 @@ static void metal_close(void *opaque) {
 }
 
 int mynah_backend_metal_open(void **state_out, mynah_backend_matmul_fn *matmul,
+                             mynah_backend_sgemm_fn *sgemm,
                              mynah_backend_close_fn *close,
                              mynah_backend_self_test_fn *self_test,
                              char *error, size_t error_capacity) {
@@ -263,6 +264,7 @@ int mynah_backend_metal_open(void **state_out, mynah_backend_matmul_fn *matmul,
         }
         *state_out = (__bridge_retained void *)state;
         *matmul = metal_matmul;
+        *sgemm = NULL; /* falls back to CPU sgemm in backend.c */
         *close = metal_close;
         *self_test = metal_self_test;
         if (error != NULL && error_capacity > 0) error[0] = '\0';

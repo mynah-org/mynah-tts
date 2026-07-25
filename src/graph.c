@@ -33,6 +33,22 @@ static void graph_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
 }
 
+/* Backend-agnostic sgemm.  Replaces direct cblas_sgemm calls so that
+ * CUDA/Metal backends can accelerate all matmuls, not just linear(). */
+static int graph_sgemm(const mynah_backend *backend,
+                       int trans_a, int trans_b,
+                       size_t m, size_t n, size_t k,
+                       float alpha,
+                       const float *a, size_t lda,
+                       const float *b, size_t ldb,
+                       float beta,
+                       float *c, size_t ldc,
+                       char *error, size_t error_capacity) {
+    return mynah_backend_sgemm(backend, trans_a, trans_b, m, n, k,
+                               alpha, a, lda, b, ldb, beta, c, ldc,
+                               error, error_capacity);
+}
+
 /* Optional phase timing, enabled with MYNAH_TIMING=1, printed to stderr. */
 static double phase_seconds(void) {
     struct timespec ts;
@@ -171,7 +187,6 @@ int mynah_graph_self_test(char *error, size_t error_capacity) {
     return 0;
 }
 
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
 static void softmax_row_inplace(float *values, size_t length) {
     float maximum = -FLT_MAX;
     for (size_t i = 0; i < length; ++i) {
@@ -185,7 +200,6 @@ static void softmax_row_inplace(float *values, size_t length) {
     const float inverse = total > 0.0f ? 1.0f / total : 0.0f;
     for (size_t i = 0; i < length; ++i) values[i] *= inverse;
 }
-#endif
 
 static int linear(const mynah_backend *backend, const float *input, float *output,
                   size_t length, size_t input_width, size_t output_width,
@@ -221,7 +235,6 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
         free(hidden);
         return result;
     }
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (length <= (size_t)INT_MAX && width <= (size_t)INT_MAX && ffn_width <= (size_t)INT_MAX) {
         /* A causal conv-FFN is a sum of `kernel` shifted matmuls (weight tap k),
          * the same trick as conv1d_causal but with time-major rows.  This is the
@@ -240,10 +253,7 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
             for (size_t o = 0; o < ffn_width; ++o) {
                 for (size_t i = 0; i < width; ++i) wk[o * width + i] = proj.data[(o * width + i) * kernel + k];
             }
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        (int)(length - shift), (int)ffn_width, (int)width,
-                        1.0f, input, (int)width, wk, (int)width,
-                        1.0f, hidden + shift * ffn_width, (int)ffn_width);
+            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)ffn_width, (int)width, 1.0f, input, (int)width, wk, (int)width, 1.0f, hidden + shift * ffn_width, (int)ffn_width, error, error_capacity);
         }
         for (size_t i = 0; i < length * ffn_width; ++i) hidden[i] = gelu_tanh(hidden[i]);
         memset(output, 0, length * width * sizeof(float));
@@ -253,16 +263,12 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
             for (size_t o = 0; o < width; ++o) {
                 for (size_t i = 0; i < ffn_width; ++i) wk[o * ffn_width + i] = out_net.data[(o * ffn_width + i) * kernel + k];
             }
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        (int)(length - shift), (int)width, (int)ffn_width,
-                        1.0f, hidden, (int)ffn_width, wk, (int)ffn_width,
-                        1.0f, output + shift * width, (int)width);
+            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)width, (int)ffn_width, 1.0f, hidden, (int)ffn_width, wk, (int)ffn_width, 1.0f, output + shift * width, (int)width, error, error_capacity);
         }
         free(wk);
         free(hidden);
         return 0;
     }
-#endif
     for (size_t t = 0; t < length; ++t) {
         for (size_t o = 0; o < ffn_width; ++o) {
             float value = 0.0f;
@@ -324,7 +330,6 @@ static int self_attention(const mynah_safetensors *file, const mynah_backend *ba
         free(scores);
         return -1;
     }
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (length <= (size_t)INT_MAX && head_width <= (size_t)INT_MAX) {
         float *queries = allocate_floats(length * head_width, error, error_capacity);
         float *keys = allocate_floats(length * head_width, error, error_capacity);
@@ -353,19 +358,13 @@ static int self_attention(const mynah_safetensors *file, const mynah_backend *ba
                 memcpy(values + t * head_width, row + width * 2u + head * head_width,
                        head_width * sizeof(float));
             }
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        (int)length, (int)length, (int)head_width,
-                        1.0f / sqrtf((float)head_width), queries, (int)head_width,
-                        keys, (int)head_width, 0.0f, score_matrix, (int)length);
+            graph_sgemm(backend, 0, 1, (int)length, (int)length, (int)head_width, 1.0f / sqrtf((float)head_width), queries, (int)head_width, keys, (int)head_width, 0.0f, score_matrix, (int)length, error, error_capacity);
             for (size_t t = 0; t < length; ++t) {
                 for (size_t s = t + 1u; s < length; ++s) score_matrix[t * length + s] = 0.0f;
                 softmax_row_inplace(score_matrix + t * length, t + 1u);
                 for (size_t s = t + 1u; s < length; ++s) score_matrix[t * length + s] = 0.0f;
             }
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        (int)length, (int)head_width, (int)length,
-                        1.0f, score_matrix, (int)length,
-                        values, (int)head_width, 0.0f, head_context, (int)head_width);
+            graph_sgemm(backend, 0, 0, (int)length, (int)head_width, (int)length, 1.0f, score_matrix, (int)length, values, (int)head_width, 0.0f, head_context, (int)head_width, error, error_capacity);
             for (size_t t = 0; t < length; ++t) {
                 memcpy(context + t * width + head * head_width,
                        head_context + t * head_width, head_width * sizeof(float));
@@ -388,7 +387,6 @@ static int self_attention(const mynah_safetensors *file, const mynah_backend *ba
         free(scores);
         return 0;
     }
-#endif
     for (size_t t = 0; t < length; ++t) {
         for (size_t h = 0; h < heads; ++h) {
             float maximum = -FLT_MAX;
@@ -468,7 +466,6 @@ static int cross_attention(const mynah_safetensors *file, const mynah_backend *b
         free(scores);
         return -1;
     }
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (length <= (size_t)INT_MAX && memory_length <= (size_t)INT_MAX &&
         attention_width <= (size_t)INT_MAX) {
         float *keys = allocate_floats(memory_length * attention_width, error, error_capacity);
@@ -491,17 +488,11 @@ static int cross_attention(const mynah_safetensors *file, const mynah_backend *b
                    kv + s * attention_width * 2u + attention_width,
                    attention_width * sizeof(float));
         }
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)length, (int)memory_length, (int)attention_width,
-                    1.0f / sqrtf((float)attention_width), q, (int)attention_width,
-                    keys, (int)attention_width, 0.0f, score_matrix, (int)memory_length);
+        graph_sgemm(backend, 0, 1, (int)length, (int)memory_length, (int)attention_width, 1.0f / sqrtf((float)attention_width), q, (int)attention_width, keys, (int)attention_width, 0.0f, score_matrix, (int)memory_length, error, error_capacity);
         for (size_t t = 0; t < length; ++t) {
             softmax_row_inplace(score_matrix + t * memory_length, memory_length);
         }
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    (int)length, (int)attention_width, (int)memory_length,
-                    1.0f, score_matrix, (int)memory_length,
-                    values, (int)attention_width, 0.0f, context, (int)attention_width);
+        graph_sgemm(backend, 0, 0, (int)length, (int)attention_width, (int)memory_length, 1.0f, score_matrix, (int)memory_length, values, (int)attention_width, 0.0f, context, (int)attention_width, error, error_capacity);
         free(keys);
         free(values);
         free(score_matrix);
@@ -519,7 +510,6 @@ static int cross_attention(const mynah_safetensors *file, const mynah_backend *b
         free(scores);
         return 0;
     }
-#endif
     for (size_t t = 0; t < length; ++t) {
         float maximum = -FLT_MAX;
         for (size_t s = 0; s < memory_length; ++s) {
@@ -1254,17 +1244,16 @@ int mynah_graph_bnns_self_test(char *error, size_t error_capacity) {
     return 0;
 }
 
-static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
+static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *backend,
+                         const char *weight_name,
                          const char *bias_name, const float *input, float *output,
                          size_t in_channels, size_t out_channels, size_t length,
                          size_t kernel, size_t dilation,
                          float *columns_workspace, size_t columns_capacity,
                          codec_conv_profile *profile,
                          char *error, size_t error_capacity) {
-#if !defined(MYNAH_USE_ACCELERATE) && !defined(MYNAH_USE_OPENBLAS)
     (void)columns_workspace;
     (void)columns_capacity;
-#endif
     mynah_tensor weight;
     mynah_tensor bias;
     if (tensor(file, weight_name, &weight, error, error_capacity) != 0 ||
@@ -1286,7 +1275,6 @@ static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
     for (size_t o = 0; o < out_channels; ++o) {
         for (size_t t = 0; t < length; ++t) output[o * length + t] = bias.data[o];
     }
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (in_channels <= (size_t)INT_MAX && out_channels <= (size_t)INT_MAX &&
         length <= (size_t)INT_MAX) {
         size_t inner = 0;
@@ -1318,10 +1306,7 @@ static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
                 }
                 if (profile != NULL) profile->pack_seconds += phase_seconds() - pack_start;
                 const double gemm_start = profile != NULL ? phase_seconds() : 0.0;
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            (int)out_channels, (int)length, (int)inner,
-                            1.0f, weight.data, (int)inner, columns, (int)length,
-                            1.0f, output, (int)length);
+                graph_sgemm(backend, 0, 0, (int)out_channels, (int)length, (int)inner, 1.0f, weight.data, (int)inner, columns, (int)length, 1.0f, output, (int)length, error, error_capacity);
                 if (profile != NULL) profile->gemm_seconds += phase_seconds() - gemm_start;
                 if (owns_columns) free(columns);
                 return 0;
@@ -1351,16 +1336,12 @@ static int conv1d_causal(const mynah_safetensors *file, const char *weight_name,
             if (profile != NULL) profile->pack_seconds += phase_seconds() - pack_start;
             const size_t n = length - shift;
             const double gemm_start = profile != NULL ? phase_seconds() : 0.0;
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        (int)out_channels, (int)n, (int)in_channels,
-                        1.0f, wk, (int)in_channels, input, (int)length,
-                        1.0f, output + shift, (int)length);
+            graph_sgemm(backend, 0, 0, (int)out_channels, (int)n, (int)in_channels, 1.0f, wk, (int)in_channels, input, (int)length, 1.0f, output + shift, (int)length, error, error_capacity);
             if (profile != NULL) profile->gemm_seconds += phase_seconds() - gemm_start;
         }
         free(wk);
         return 0;
     }
-#endif
     for (size_t o = 0; o < out_channels; ++o) {
         for (size_t t = 0; t < length; ++t) {
             float value = bias.data[o];
@@ -1518,7 +1499,8 @@ static int half_snake(const mynah_safetensors *file, const char *alpha_name,
     return 0;
 }
 
-static int res_layer(const mynah_safetensors *file, size_t stage, const float *input,
+static int res_layer(const mynah_safetensors *file, const mynah_backend *backend,
+                     size_t stage, const float *input,
                      float *output, size_t channels, size_t length,
                      codec_conv_profile *profile, char *error, size_t error_capacity) {
     const size_t kernels[3] = {3u, 7u, 11u};
@@ -1541,14 +1523,12 @@ static int res_layer(const mynah_safetensors *file, size_t stage, const float *i
     }
     float *columns_workspace = NULL;
     size_t columns_capacity = 0;
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     int needs_columns_workspace = 1;
 #if defined(MYNAH_USE_ACCELERATE)
     if (getenv("MYNAH_CODEC_SGEMM") == NULL &&
         getenv("MYNAH_BNNS_IM2COL_WORKSPACE") == NULL) {
         needs_columns_workspace = 0;
     }
-#endif
     if (needs_columns_workspace &&
         getenv("MYNAH_CODEC_CONV_ALLOCS") == NULL &&
         length > 0u && channels <= SIZE_MAX / 11u &&
@@ -1580,7 +1560,7 @@ static int res_layer(const mynah_safetensors *file, size_t stage, const float *i
             snprintf(bias_name, sizeof(bias_name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.input_conv.conv.bias",
                      stage, branch_index, dilation_index);
-            if (conv1d_causal(file, weight_name, bias_name, activated, residual,
+            if (conv1d_causal(file, backend, weight_name, bias_name, activated, residual,
                               channels, channels, length, kernels[branch_index],
                               dilations[dilation_index],
                               columns_workspace, columns_capacity,
@@ -1596,7 +1576,7 @@ static int res_layer(const mynah_safetensors *file, size_t stage, const float *i
             snprintf(bias_name, sizeof(bias_name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_conv.conv.bias",
                      stage, branch_index, dilation_index);
-            if (conv1d_causal(file, weight_name, bias_name, residual, branch,
+            if (conv1d_causal(file, backend, weight_name, bias_name, residual, branch,
                               channels, channels, length, kernels[branch_index], 1u,
                               columns_workspace, columns_capacity, profile,
                               error, error_capacity) != 0) break;
@@ -1644,7 +1624,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     snprintf(weight_name, sizeof(weight_name), "audio_decoder.pre_conv.conv.weight");
     snprintf(bias_name, sizeof(bias_name), "audio_decoder.pre_conv.conv.bias");
     float *current = allocate_floats(864u * raw_length, error, error_capacity);
-    if (current == NULL || conv1d_causal(model->codec, weight_name, bias_name, latent,
+    if (current == NULL || conv1d_causal(model->codec, model->backend, weight_name, bias_name, latent,
                                          current, 32u, 864u, raw_length, 7u, 1u,
                                          NULL, 0,
                                          profile, error, error_capacity) != 0) {
@@ -1688,7 +1668,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
             free(upsampled);
             return -1;
         }
-        if (res_layer(model->codec, stage, upsampled, current, next_channels, next_length, profile,
+        if (res_layer(model->codec, model->backend, stage, upsampled, current, next_channels, next_length, profile,
                       error, error_capacity) != 0) {
             free(upsampled);
             free(current);
@@ -1712,7 +1692,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     }
     snprintf(weight_name, sizeof(weight_name), "audio_decoder.post_conv.conv.weight");
     snprintf(bias_name, sizeof(bias_name), "audio_decoder.post_conv.conv.bias");
-    if (conv1d_causal(model->codec, weight_name, bias_name, current, audio,
+    if (conv1d_causal(model->codec, model->backend, weight_name, bias_name, current, audio,
                       current_channels, 1u, current_length, 3u, 1u,
                       NULL, 0,
                       profile, error, error_capacity) != 0) {
@@ -1952,20 +1932,16 @@ static int decoder_cache_init(const mynah_tts_model *model, decoder_cache *cache
     cache->scratch_xctx = allocate_floats(rows * xw, error, error_capacity);
     cache->scratch_hidden = allocate_floats(rows * cache->ffn_width, error, error_capacity);
     cache->scratch_scores = allocate_floats(scores_len, error, error_capacity);
-#if defined(MYNAH_USE_ACCELERATE)
     cache->scratch_gelu = allocate_floats(rows * cache->ffn_width, error, error_capacity);
     cache->scratch_score_matrix = allocate_floats(rows * capacity, error, error_capacity);
     cache->scratch_head_ctx = allocate_floats(rows * cache->head_width, error, error_capacity);
-#endif
     if (cache->scratch_x == NULL || cache->scratch_nrm == NULL ||
         cache->scratch_qkv == NULL || cache->scratch_attn == NULL ||
         cache->scratch_proj == NULL || cache->scratch_q_x == NULL ||
         cache->scratch_xctx == NULL || cache->scratch_hidden == NULL ||
-        cache->scratch_scores == NULL
-#if defined(MYNAH_USE_ACCELERATE)
-        || cache->scratch_gelu == NULL || cache->scratch_score_matrix == NULL ||
+        cache->scratch_scores == NULL ||
+        cache->scratch_gelu == NULL || cache->scratch_score_matrix == NULL ||
         cache->scratch_head_ctx == NULL
-#endif
     ) {
         decoder_cache_free(cache);
         return -1;
@@ -1983,6 +1959,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                        const float *input_rows, size_t count, float *out_last,
                        char *error, size_t error_capacity) {
     const size_t width = cache->width;
+    const mynah_backend *backend = model->backend;
     const size_t heads = cache->heads;
     const size_t hw = cache->head_width;
     const size_t ffn = cache->ffn_width;
@@ -2024,14 +2001,12 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     float *score_matrix = NULL;
     float *head_ctx = NULL;
     int batched = 0;
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     const size_t total_kv = start + count;
     if (count > 1u && total_kv <= (size_t)INT_MAX && hw <= (size_t)INT_MAX) {
         batched = 1;
         score_matrix = cache->scratch_score_matrix;
         head_ctx = cache->scratch_head_ctx;
     }
-#endif
     for (size_t i = 0; i < count; ++i) {
         const float *pe = cache->position + (start + i) * width;
         for (size_t d = 0; d < width; ++d) x[i * width + d] = input_rows[i * width + d] + pe[d];
@@ -2056,30 +2031,21 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             memcpy(kbase + (start + i) * width, qkv + i * width * 3u + width, width * sizeof(float));
             memcpy(vbase + (start + i) * width, qkv + i * width * 3u + width * 2u, width * sizeof(float));
         }
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
         if (batched) {
             for (size_t h = 0; h < heads; ++h) {
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            (int)count, (int)total_kv, (int)hw,
-                            self_scale, qkv + h * hw, (int)(width * 3u),
-                            kbase + h * hw, (int)width, 0.0f,
-                            score_matrix, (int)total_kv);
+                graph_sgemm(backend, 0, 1, (int)count, (int)total_kv, (int)hw, self_scale, qkv + h * hw, (int)(width * 3u), kbase + h * hw, (int)width, 0.0f, score_matrix, (int)total_kv, error, error_capacity);
                 for (size_t i = 0; i < count; ++i) {
                     const size_t valid = start + i + 1u;
                     float *row = score_matrix + i * total_kv;
                     softmax_row_inplace(row, valid);
                     for (size_t s = valid; s < total_kv; ++s) row[s] = 0.0f;
                 }
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            (int)count, (int)hw, (int)total_kv,
-                            1.0f, score_matrix, (int)total_kv,
-                            vbase + h * hw, (int)width, 0.0f, head_ctx, (int)hw);
+                graph_sgemm(backend, 0, 0, (int)count, (int)hw, (int)total_kv, 1.0f, score_matrix, (int)total_kv, vbase + h * hw, (int)width, 0.0f, head_ctx, (int)hw, error, error_capacity);
                 for (size_t i = 0; i < count; ++i) {
                     memcpy(attn + i * width + h * hw, head_ctx + i * hw, hw * sizeof(float));
                 }
             }
         } else
-#endif
         for (size_t i = 0; i < count; ++i) {
             const size_t abs = start + i;
             const float *qrow = qkv + i * width * 3u;
