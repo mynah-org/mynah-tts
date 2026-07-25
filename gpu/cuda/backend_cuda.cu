@@ -465,3 +465,28 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     if (e && ec > 0) e[0] = '\0';
     return 0;
 }
+
+extern "C" int mynah_cuda_dev_alloc(void *opaque, size_t n, float **dev_ptr,
+                          char *e, size_t ec) {
+    (void)opaque;
+    return ce(cudaMalloc(dev_ptr, n * sizeof(float)), e, ec);
+}
+
+extern "C" void mynah_cuda_dev_free(void *opaque, float *dev_ptr) {
+    (void)opaque;
+    if (dev_ptr) cudaFree(dev_ptr);
+}
+
+extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
+                    size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return ce(cudaMemcpyAsync(dev_ptr, host, n*sizeof(float),
+                              cudaMemcpyHostToDevice, st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,
+                    size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return ce(cudaMemcpyAsync(host, dev_ptr, n*sizeof(float),
+                              cudaMemcpyDeviceToHost, st->stream), e, ec);
+}

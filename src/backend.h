@@ -47,6 +47,9 @@ int mynah_backend_sgemm(const mynah_backend *backend,
 int mynah_backend_self_test(mynah_tts_device device, char *error,
                             size_t error_capacity);
 
+/* Query: does this backend support device-side matmul (resident GPU)? */
+int mynah_backend_has_dev_ops(const mynah_backend *backend);
+
 /* ---- Device-side operations (resident GPU inference) ----
  * These keep activations on the device between calls, eliminating
  * per-op H2D/D2H copies.  On CPU backends they are trivial wrappers.
@@ -103,5 +106,21 @@ int mynah_backend_snake_dev(const mynah_backend *backend,
                             size_t channels, size_t length,
                             size_t snake_channels,
                             char *error, size_t error_capacity);
+
+/* Copy n floats from host to a specific device buffer (no scratch). */
+int mynah_backend_h2d(const mynah_backend *backend, const float *host,
+                      float *dev_ptr, size_t n,
+                      char *error, size_t error_capacity);
+/* Copy n floats from a specific device buffer to host (no scratch). */
+int mynah_backend_d2h(const mynah_backend *backend, const float *dev_ptr,
+                      float *host, size_t n,
+                      char *error, size_t error_capacity);
+
+/* Allocate a persistent device buffer of n floats.  On CPU returns a
+ * malloc'd host buffer; on CUDA a cudaMalloc'd device buffer.
+ * The caller owns the buffer and must free it with mynah_backend_dev_free. */
+int mynah_backend_dev_alloc(const mynah_backend *backend, size_t n,
+                            float **dev_ptr, char *error, size_t error_capacity);
+void mynah_backend_dev_free(const mynah_backend *backend, float *dev_ptr);
 
 #endif

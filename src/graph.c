@@ -1809,6 +1809,16 @@ typedef struct {
     float *scratch_gelu;
     float *scratch_score_matrix;
     float *scratch_head_ctx;
+    /* GPU resident-step device buffers (allocated once, reused per step). */
+    float *dev_nrm;
+    float *dev_qkv;
+    float *dev_attn;
+    float *dev_proj;
+    float *dev_qx;
+    float *dev_xctx;
+    float *dev_hidden;
+    int dev_allocated;
+    const mynah_backend *dev_backend; /* for dev_free */
 } decoder_cache;
 
 static void decoder_cache_free(decoder_cache *cache) {
@@ -1830,6 +1840,15 @@ static void decoder_cache_free(decoder_cache *cache) {
     free(cache->scratch_gelu);
     free(cache->scratch_score_matrix);
     free(cache->scratch_head_ctx);
+    if (cache->dev_allocated && cache->dev_backend != NULL) {
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_nrm);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_qkv);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_attn);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_proj);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_qx);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_xctx);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_hidden);
+    }
     memset(cache, 0, sizeof(*cache));
 }
 
@@ -2035,6 +2054,113 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     const float self_scale = 1.0f / sqrtf((float)hw);
     const float cross_scale = 1.0f / sqrtf((float)xw);
     int failed = 0;
+
+    /* ---- GPU resident-step fast path (count==1, backend has matmul_dev) ----
+     * Device buffers allocated once; matmul_dev/gelu_dev pipeline without
+     * per-op sync.  Sync only at CPU attention boundaries. */
+    if (count == 1u && mynah_backend_has_dev_ops(backend)) {
+        const mynah_backend *bk = backend;
+        /* Lazy one-time device buffer allocation (reused across AR steps). */
+        if (!cache->dev_allocated) {
+            cache->dev_backend = bk;
+            cache->dev_allocated =
+                mynah_backend_dev_alloc(bk, width, &cache->dev_nrm, error, error_capacity)==0
+             && mynah_backend_dev_alloc(bk, width*3u, &cache->dev_qkv, error, error_capacity)==0
+             && mynah_backend_dev_alloc(bk, width, &cache->dev_attn, error, error_capacity)==0
+             && mynah_backend_dev_alloc(bk, width, &cache->dev_proj, error, error_capacity)==0
+             && mynah_backend_dev_alloc(bk, xw, &cache->dev_qx, error, error_capacity)==0
+             && mynah_backend_dev_alloc(bk, xw, &cache->dev_xctx, error, error_capacity)==0
+             && mynah_backend_dev_alloc(bk, ffn, &cache->dev_hidden, error, error_capacity)==0;
+        }
+        if (cache->dev_allocated) {
+            float *dnrm=cache->dev_nrm, *dqkv=cache->dev_qkv, *dattn=cache->dev_attn;
+            float *dproj=cache->dev_proj, *dqx=cache->dev_qx, *dxctx=cache->dev_xctx;
+            float *dhidden=cache->dev_hidden;
+            for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
+            const decoder_layer_resolved *r = &cache->resolved[layer];
+            mynah_tensor w;
+            /* layer_norm(CPU) → upload → QKV matmul(GPU, no sync) */
+            layer_norm(x, nrm, 1u, width, r->norm_self);
+            if (mynah_backend_h2d(bk, nrm, dnrm, width, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_safetensors_get(model->tts, r->qkv, &w)!=0) { failed=1; break; }
+            if (mynah_backend_matmul_dev(bk, dnrm, dqkv, 1u, width, width*3u, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            /* Sync + download QKV → CPU attention + KV cache */
+            mynah_backend_sync(bk, error, error_capacity);
+            mynah_backend_d2h(bk, dqkv, qkv, width*3u, error, error_capacity);
+            { float *kb = cache->self_k + layer*cache->capacity*width;
+              float *vb = cache->self_v + layer*cache->capacity*width;
+              memcpy(kb + start*width, qkv + width, width*sizeof(float));
+              memcpy(vb + start*width, qkv + width*2u, width*sizeof(float)); }
+            { const float *qrow = qkv;
+              for (size_t h = 0; h < heads; ++h) {
+                const float *qh = qrow + h*hw; float maxv = -FLT_MAX;
+                for (size_t s = 0; s <= start; ++s) {
+                  const float *kk = cache->self_k + layer*cache->capacity*width + s*width + h*hw;
+                  float sc = 0.0f; for (size_t d = 0; d < hw; ++d) sc += qh[d]*kk[d];
+                  sc *= self_scale; scores[s] = sc; if (sc > maxv) maxv = sc; }
+                float den = 0.0f;
+                for (size_t s = 0; s <= start; ++s) { scores[s] = expf(scores[s]-maxv); den += scores[s]; }
+                float *outh = attn + h*hw; memset(outh, 0, hw*sizeof(float));
+                for (size_t s = 0; s <= start; ++s)
+                  axpy_f32(outh, cache->self_v + layer*cache->capacity*width + s*width + h*hw, scores[s]/den, hw); } }
+            /* attn → output proj(GPU) → residual */
+            if (mynah_backend_h2d(bk, attn, dattn, width, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_safetensors_get(model->tts, r->o_self, &w)!=0) { failed=1; break; }
+            if (mynah_backend_matmul_dev(bk, dattn, dproj, 1u, width, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            mynah_backend_sync(bk, error, error_capacity);
+            mynah_backend_d2h(bk, dproj, proj, width, error, error_capacity);
+            for (size_t k2 = 0; k2 < width; ++k2) x[k2] += proj[k2];
+            /* Cross-attention */
+            layer_norm(x, nrm, 1u, width, r->norm_xattn_query);
+            if (mynah_backend_h2d(bk, nrm, dnrm, width, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_safetensors_get(model->tts, r->q_cross, &w)!=0) { failed=1; break; }
+            if (mynah_backend_matmul_dev(bk, dnrm, dqx, 1u, width, xw, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            mynah_backend_sync(bk, error, error_capacity);
+            mynah_backend_d2h(bk, dqx, q_x, xw, error, error_capacity);
+            { const float *ck = cache->cross_k + layer*cache->memory_length*xw;
+              const float *cv = cache->cross_v + layer*cache->memory_length*xw;
+              float maxv = -FLT_MAX;
+              for (size_t s = 0; s < cache->memory_length; ++s) {
+                float sc = 0.0f; for (size_t d = 0; d < xw; ++d) sc += q_x[d]*ck[s*xw+d];
+                sc *= cross_scale; scores[s] = sc; if (sc > maxv) maxv = sc; }
+              float den = 0.0f;
+              for (size_t s = 0; s < cache->memory_length; ++s) { scores[s] = expf(scores[s]-maxv); den += scores[s]; }
+              memset(xctx, 0, xw*sizeof(float));
+              for (size_t s = 0; s < cache->memory_length; ++s) axpy_f32(xctx, cv+s*xw, scores[s]/den, xw); }
+            if (mynah_backend_h2d(bk, xctx, dxctx, xw, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_safetensors_get(model->tts, r->o_cross, &w)!=0) { failed=1; break; }
+            if (mynah_backend_matmul_dev(bk, dxctx, dproj, 1u, xw, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            mynah_backend_sync(bk, error, error_capacity);
+            mynah_backend_d2h(bk, dproj, proj, width, error, error_capacity);
+            for (size_t k2 = 0; k2 < width; ++k2) x[k2] += proj[k2];
+            /* FFN */
+            layer_norm(x, nrm, 1u, width, r->norm_pos_ff);
+            if (mynah_backend_h2d(bk, nrm, dnrm, width, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_safetensors_get(model->tts, r->ffn_up, &w)!=0) { failed=1; break; }
+            if (mynah_backend_matmul_dev(bk, dnrm, dhidden, 1u, width, ffn, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            /* GELU: matmul_dev output is on device; gelu_dev expects host ptr.
+             * Sync+download, GELU on CPU (fast for 3072 floats), re-upload. */
+            mynah_backend_sync(bk, error, error_capacity);
+            mynah_backend_d2h(bk, dhidden, hidden, ffn, error, error_capacity);
+            for (size_t gi = 0; gi < ffn; ++gi) { float gv = hidden[gi];
+                float gc = 0.7978845608f*(gv+0.044715f*gv*gv*gv);
+                hidden[gi] = 0.5f*gv*(1.0f+tanhf(gc)); }
+            if (mynah_backend_h2d(bk, hidden, dhidden, ffn, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_safetensors_get(model->tts, r->ffn_down, &w)!=0) { failed=1; break; }
+            if (mynah_backend_matmul_dev(bk, dhidden, dproj, 1u, ffn, width, w.data, NULL, error, error_capacity)!=0) { failed=1; break; }
+            mynah_backend_sync(bk, error, error_capacity);
+            mynah_backend_d2h(bk, dproj, proj, width, error, error_capacity);
+            for (size_t k2 = 0; k2 < width; ++k2) x[k2] += proj[k2];
+        }
+        if (!failed) {
+            layer_norm(x, out_last, 1u, width, cache->norm_out);
+            cache->length += count;
+            return 0;
+        }
+        /* GPU path failed — fall through to CPU path. */
+        }
+    }
+
     for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
         const decoder_layer_resolved *r = &cache->resolved[layer];
         double operation_start = profile_prefill ? phase_seconds() : 0.0;

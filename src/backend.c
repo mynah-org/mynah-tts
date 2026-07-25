@@ -39,6 +39,10 @@ struct mynah_backend {
     int (*residual_add_dev)(void *, float *, const float *, size_t, char *, size_t);
     int (*matmul_dev)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*sgemm_dev)(void *, int, int, size_t, size_t, size_t, float, const float *, size_t, const float *, size_t, float, float *, size_t, char *, size_t);
+    int (*dev_alloc)(void *, size_t, float **, char *, size_t);
+    void (*dev_free)(void *, float *);
+    int (*h2d)(void *, const float *, float *, size_t, char *, size_t);
+    int (*d2h)(void *, const float *, float *, size_t, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -62,6 +66,10 @@ extern int mynah_cuda_layer_norm_dev(void *, const float *, float *, const float
 extern int mynah_cuda_residual_add_dev(void *, float *, const float *, size_t, char *, size_t);
 extern int mynah_cuda_matmul_dev(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 extern int mynah_cuda_sgemm_dev(void *, int, int, size_t, size_t, size_t, float, const float *, size_t, const float *, size_t, float, float *, size_t, char *, size_t);
+extern int mynah_cuda_dev_alloc(void *, size_t, float **, char *, size_t);
+extern void mynah_cuda_dev_free(void *, float *);
+extern int mynah_cuda_h2d(void *, const float *, float *, size_t, char *, size_t);
+extern int mynah_cuda_d2h(void *, const float *, float *, size_t, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -294,6 +302,10 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->residual_add_dev = mynah_cuda_residual_add_dev;
         backend->matmul_dev = mynah_cuda_matmul_dev;
         backend->sgemm_dev = mynah_cuda_sgemm_dev;
+        backend->dev_alloc = mynah_cuda_dev_alloc;
+        backend->dev_free = mynah_cuda_dev_free;
+        backend->h2d = mynah_cuda_h2d;
+        backend->d2h = mynah_cuda_d2h;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -516,4 +528,43 @@ int mynah_backend_sgemm_dev(const mynah_backend *backend,
     return mynah_backend_sgemm(backend, trans_a, trans_b, m, n, k,
                                alpha, dev_a, lda, dev_b, ldb,
                                beta, dev_c, ldc, error, error_capacity);
+}
+
+int mynah_backend_dev_alloc(const mynah_backend *backend, size_t n,
+                            float **dev_ptr, char *error, size_t error_capacity) {
+    if (backend == NULL || dev_ptr == NULL) return -1;
+    if (backend->dev_alloc != NULL)
+        return backend->dev_alloc(backend->state, n, dev_ptr, error, error_capacity);
+    *dev_ptr = (float *)malloc(n * sizeof(float));
+    return *dev_ptr == NULL ? -1 : 0;
+}
+
+void mynah_backend_dev_free(const mynah_backend *backend, float *dev_ptr) {
+    if (backend == NULL || dev_ptr == NULL) return;
+    if (backend->dev_free != NULL) { backend->dev_free(backend->state, dev_ptr); return; }
+    free(dev_ptr);
+}
+
+int mynah_backend_has_dev_ops(const mynah_backend *backend) {
+    return backend != NULL && backend->matmul_dev != NULL;
+}
+
+int mynah_backend_h2d(const mynah_backend *backend, const float *host,
+                      float *dev_ptr, size_t n,
+                      char *error, size_t error_capacity) {
+    if (backend == NULL) return -1;
+    if (backend->h2d != NULL)
+        return backend->h2d(backend->state, host, dev_ptr, n, error, error_capacity);
+    memcpy(dev_ptr, host, n * sizeof(float));
+    return 0;
+}
+
+int mynah_backend_d2h(const mynah_backend *backend, const float *dev_ptr,
+                      float *host, size_t n,
+                      char *error, size_t error_capacity) {
+    if (backend == NULL) return -1;
+    if (backend->d2h != NULL)
+        return backend->d2h(backend->state, dev_ptr, host, n, error, error_capacity);
+    memcpy(host, dev_ptr, n * sizeof(float));
+    return 0;
 }
