@@ -227,23 +227,22 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                        char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     const size_t in_n = rows * iw;
+    const size_t out_n = rows * ow;
     const size_t w_n = iw * ow;
-    const size_t ob = rows * ow * sizeof(float);
-    /* FP16 weight (cached, half bandwidth). */
     half *dw16 = nullptr;
     if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
-    /* Device scratch for FP16 input + FP32 output. */
-    size_t scratch_need = in_n * sizeof(half) + rows * ow * sizeof(float);
-    if (ensure_scratch(st, scratch_need, e, ec)) return -1;
+    /* Scratch for FP16 input conversion only. */
+    if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
     half *di16 = (half *)st->dev_scratch;
-    float *dout = (float *)(st->dev_scratch + in_n); /* aligned after half buffer */
-    /* Upload FP32 input to host_buf, convert to FP16 on device. */
-    if (ensure_host(st, in_n * sizeof(float), e, ec)) return -1;
+    /* Mapped buffer: [FP32 input | FP32 output].  cuBLAS writes output
+     * directly to the mapped region; after sync we memcpy on the host
+     * side (no cudaMemcpy D2H API call). */
+    size_t mapped_need = (in_n + out_n) * sizeof(float);
+    if (ensure_host(st, mapped_need, e, ec)) return -1;
+    float *d_out_mapped = st->dev_buf + in_n;
     std::memcpy(st->host_buf, input, in_n * sizeof(float));
-    /* Copy FP32 to a temp device location, then convert. */
-    /* Actually: use mapped buffer as source, convert to scratch. */
     k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(
         st->dev_buf, di16, (int)in_n);
     cublasSetStream(st->cublas, st->stream);
@@ -252,7 +251,7 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                          (int)ow, (int)rows, (int)iw,
                          &a1, dw16, CUDA_R_16F, (int)iw,
                          di16, CUDA_R_16F, (int)iw,
-                         &b0, dout, CUDA_R_32F, (int)ow,
+                         &b0, d_out_mapped, CUDA_R_32F, (int)ow,
                          CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
     if (db) {
@@ -261,10 +260,11 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
         if (oc < rows) { if (d_ones) cudaFree(d_ones); size_t c2 = (rows+255)&~255;
             ce(cudaMalloc(&d_ones, c2*4), e, ec); std::vector<float> h(c2,1.0f);
             cudaMemcpy(d_ones,h.data(),c2*4,cudaMemcpyHostToDevice); oc=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,dout,(int)ow);
+        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,d_out_mapped,(int)ow);
     }
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
-    cudaMemcpy(output, dout, ob, cudaMemcpyDeviceToHost);
+    /* Host-side memcpy from mapped buffer (no cudaMemcpy API call). */
+    std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
     return 0;
 }
 
