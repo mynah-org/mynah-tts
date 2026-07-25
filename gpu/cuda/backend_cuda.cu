@@ -2,6 +2,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdint>
@@ -105,6 +106,16 @@ __global__ static void k_bias_add(float *out, const float *bias, int rows, int c
     if (i < rows * cols) out[i] += bias[i % cols];
 }
 
+__global__ static void k_f32_to_f16(const float *in, half *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(in[i]);
+}
+
+__global__ static void k_f16_to_f32(const half *in, float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(in[i]);
+}
+
 __global__ static void k_copy_strided(float *dst, const float *src,
                                       int dst_stride, int src_stride,
                                       int width, int rows) {
@@ -124,10 +135,17 @@ struct cuda_cached_buffer {
     float *device_pointer;
 };
 
+struct cuda_cached_fp16 {
+    const void *host_pointer;
+    size_t n;          /* element count */
+    half *device_ptr;
+};
+
 struct cuda_backend_state {
     cublasHandle_t cublas;
     cudaStream_t stream;
     std::vector<cuda_cached_buffer> weights;
+    std::vector<cuda_cached_fp16> weights_fp16;
     /* Device scratch for activations (grows on demand). */
     float *dev_scratch;
     size_t dev_scratch_cap;   /* bytes */
@@ -183,6 +201,22 @@ static int cached_weight(cuda_backend_state *st, const float *hp, size_t bytes,
     return 0;
 }
 
+static int cached_weight_fp16(cuda_backend_state *st, const float *hp, size_t n,
+                              half **dp, char *e, size_t ec) {
+    for (auto &c : st->weights_fp16)
+        if (c.host_pointer == hp && c.n == n) { *dp = c.device_ptr; return 0; }
+    float *tmp = nullptr;
+    half *d16 = nullptr;
+    if (ce(cudaMalloc(&tmp, n * sizeof(float)), e, ec)) return -1;
+    if (ce(cudaMalloc(&d16, n * sizeof(half)), e, ec)) { cudaFree(tmp); return -1; }
+    cudaMemcpy(tmp, hp, n * sizeof(float), cudaMemcpyHostToDevice);
+    k_f32_to_f16<<<((int)n+255)/256, 256>>>(tmp, d16, (int)n);
+    cudaFree(tmp);
+    st->weights_fp16.push_back({hp, n, d16});
+    *dp = d16;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  matmul / sgemm (existing interface, with sync)                     */
 /* ------------------------------------------------------------------ */
@@ -191,24 +225,37 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                        size_t iw, size_t ow, const float *weight, const float *bias,
                        char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    const size_t ib = rows * iw * sizeof(float);
+    const size_t in_n = rows * iw;
+    const size_t w_n = iw * ow;
     const size_t ob = rows * ow * sizeof(float);
-    float *dw = nullptr;
-    if (cached_weight(st, weight, iw * ow * sizeof(float), &dw, e, ec)) return -1;
+    /* FP16 weight (cached, half bandwidth). */
+    half *dw16 = nullptr;
+    if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
-    if (ensure_host(st, ib + ob, e, ec)) return -1;
-    float *di = st->dev_buf;
-    float *dout = st->dev_buf + rows * iw;
-    std::memcpy(st->host_buf, input, ib);
+    /* Device scratch for FP16 input + FP32 output. */
+    size_t scratch_need = in_n * sizeof(half) + rows * ow * sizeof(float);
+    if (ensure_scratch(st, scratch_need, e, ec)) return -1;
+    half *di16 = (half *)st->dev_scratch;
+    float *dout = (float *)(st->dev_scratch + in_n); /* aligned after half buffer */
+    /* Upload FP32 input to host_buf, convert to FP16 on device. */
+    if (ensure_host(st, in_n * sizeof(float), e, ec)) return -1;
+    std::memcpy(st->host_buf, input, in_n * sizeof(float));
+    /* Copy FP32 to a temp device location, then convert. */
+    /* Actually: use mapped buffer as source, convert to scratch. */
+    k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(
+        st->dev_buf, di16, (int)in_n);
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
-    if (cbe(cublasSgemm(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                        (int)ow, (int)rows, (int)iw, &a1,
-                        dw, (int)iw, di, (int)iw, &b0, dout, (int)ow), e, ec)) return -1;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &a1, dw16, CUDA_R_16F, (int)iw,
+                         di16, CUDA_R_16F, (int)iw,
+                         &b0, dout, CUDA_R_32F, (int)ow,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
     if (db) {
         const float one = 1.0f;
-        /* bias via Sger */
         static float *d_ones = nullptr; static size_t oc = 0;
         if (oc < rows) { if (d_ones) cudaFree(d_ones); size_t c2 = (rows+255)&~255;
             ce(cudaMalloc(&d_ones, c2*4), e, ec); std::vector<float> h(c2,1.0f);
@@ -216,7 +263,7 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
         cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,dout,(int)ow);
     }
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
-    std::memcpy(output, st->host_buf + rows * iw, ob);
+    cudaMemcpy(output, dout, ob, cudaMemcpyDeviceToHost);
     return 0;
 }
 
@@ -236,8 +283,11 @@ static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k
     cublasSetStream(st->cublas, st->stream);
     cublasOperation_t oa = tb?CUBLAS_OP_T:CUBLAS_OP_N;
     cublasOperation_t ob = ta?CUBLAS_OP_T:CUBLAS_OP_N;
-    if (cbe(cublasSgemm(st->cublas,oa,ob,(int)n,(int)m,(int)k,&alpha,
-                        db2,(int)bc,da,(int)ac,&beta,dc,(int)n),e,ec)) return -1;
+    if (cbe(cublasGemmEx(st->cublas,oa,ob,(int)n,(int)m,(int)k,&alpha,
+                        db2,CUDA_R_32F,(int)bc,da,CUDA_R_32F,(int)ac,
+                        &beta,dc,CUDA_R_32F,(int)n,
+                        CUBLAS_COMPUTE_32F_FAST_16F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),e,ec)) return -1;
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
     for (size_t r=0;r<m;r++) std::memcpy(c+r*ldc, hc+r*n, n*4);
     return 0;
@@ -260,9 +310,13 @@ static int cuda_matmul_dev(void *opaque, const float *d_in, float *d_out,
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
-    if (cbe(cublasSgemm(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                        (int)ow, (int)rows, (int)iw, &a1,
-                        dw, (int)iw, d_in, (int)iw, &b0, d_out, (int)ow), e, ec)) return -1;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &a1, dw, CUDA_R_32F, (int)iw,
+                         d_in, CUDA_R_32F, (int)iw,
+                         &b0, d_out, CUDA_R_32F, (int)ow,
+                         CUBLAS_COMPUTE_32F_FAST_16F,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
     if (db) {
         const float one = 1.0f;
         static float *d_ones = nullptr; static size_t oc = 0;
@@ -290,10 +344,13 @@ static int cuda_sgemm_dev(void *opaque, int ta, int tb,
     /* Packed leading dimensions: caller provides actual data cols. */
     size_t ac = ta ? m : k;
     size_t bc = tb ? k : n;
-    return cbe(cublasSgemm(st->cublas, oa, ob,
+    return cbe(cublasGemmEx(st->cublas, oa, ob,
                            (int)n, (int)m, (int)k, &alpha,
-                           d_b, (int)bc, d_a, (int)ac, &beta,
-                           d_c, (int)n), e, ec) ? -1 : 0;
+                           d_b, CUDA_R_32F, (int)bc,
+                           d_a, CUDA_R_32F, (int)ac,
+                           &beta, d_c, CUDA_R_32F, (int)n,
+                           CUBLAS_COMPUTE_32F_FAST_16F,
+                           CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec) ? -1 : 0;
 }
 
 extern "C" int mynah_cuda_matmul_dev(void *s, const float *di, float *dout,
@@ -432,6 +489,7 @@ static void cuda_close(void *opaque) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (!st) return;
     for (auto &c : st->weights) cudaFree(c.device_pointer);
+    for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
     if (st->dev_scratch) cudaFree(st->dev_scratch);
     if (st->host_buf) cudaFreeHost(st->host_buf);
     cublasDestroy(st->cublas);
