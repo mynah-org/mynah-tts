@@ -1445,15 +1445,36 @@ static void snake_channel(void *ctx, int c) {
     }
 }
 
-static int half_snake(const mynah_safetensors *file, const char *alpha_name,
+static int half_snake(const mynah_safetensors *file, const mynah_backend *backend,
+                      const char *alpha_name,
                       float *signal, size_t channels, size_t length,
                       codec_conv_profile *profile,
                       char *error, size_t error_capacity) {
     const double operation_start = profile != NULL ? phase_seconds() : 0.0;
     mynah_tensor alpha;
     if (tensor(file, alpha_name, &alpha, error, error_capacity) != 0) return -1;
-#if defined(MYNAH_USE_ACCELERATE)
     const size_t snake_channels = channels / 2u;
+    /* GPU path: upload signal → snake kernel (alpha uploaded internally) → download. */
+    if (backend != NULL && snake_channels > 0u) {
+        float *dev_signal = NULL;
+        const size_t n = channels * length;
+        if (mynah_backend_upload(backend, signal, n, &dev_signal, error, error_capacity) == 0) {
+            if (mynah_backend_snake_dev(backend, dev_signal, alpha.data,
+                                        channels, length, snake_channels,
+                                        error, error_capacity) == 0) {
+                mynah_backend_download(backend, dev_signal, signal, n,
+                                       error, error_capacity);
+                mynah_backend_sync(backend, error, error_capacity);
+                if (profile != NULL) {
+                    profile->snake_seconds += phase_seconds() - operation_start;
+                    profile->snake_calls++;
+                }
+                return 0;
+            }
+        }
+        /* Fall through to CPU path on failure. */
+    }
+#if defined(MYNAH_USE_ACCELERATE)
     if (getenv("MYNAH_SNAKE_SCALAR") == NULL && snake_channels > 0u &&
         length <= SIZE_MAX / snake_channels) {
         const size_t count = snake_channels * length;
@@ -1550,7 +1571,7 @@ static int res_layer(const mynah_safetensors *file, const mynah_backend *backend
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.input_activation.activation.snake_act.alpha",
                      stage, branch_index, dilation_index);
             memcpy(activated, current, elements * sizeof(float));
-            if (half_snake(file, name, activated, channels, length, profile,
+            if (half_snake(file, backend, name, activated, channels, length, profile,
                            error, error_capacity) != 0) break;
             char weight_name[256];
             char bias_name[256];
@@ -1568,7 +1589,7 @@ static int res_layer(const mynah_safetensors *file, const mynah_backend *backend
             snprintf(name, sizeof(name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_activation.activation.snake_act.alpha",
                      stage, branch_index, dilation_index);
-            if (half_snake(file, name, residual, channels, length, profile,
+            if (half_snake(file, backend, name, residual, channels, length, profile,
                            error, error_capacity) != 0) break;
             snprintf(weight_name, sizeof(weight_name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_conv.conv.weight",
@@ -1640,7 +1661,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     for (size_t stage = 0; stage < 5u; ++stage) {
         const double stage_start = timing ? phase_seconds() : 0.0;
         snprintf(weight_name, sizeof(weight_name), "audio_decoder.activations.%zu.activation.snake_act.alpha", stage);
-        if (half_snake(model->codec, weight_name, current, current_channels, current_length,
+        if (half_snake(model->codec, model->backend, weight_name, current, current_channels, current_length,
                        profile, error, error_capacity) != 0) {
             free(current);
             return -1;
@@ -1680,7 +1701,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
         if (timing) stage_seconds[stage] = phase_seconds() - stage_start;
     }
     snprintf(weight_name, sizeof(weight_name), "audio_decoder.post_activation.activation.snake_act.alpha");
-    if (half_snake(model->codec, weight_name, current, current_channels, current_length,
+    if (half_snake(model->codec, model->backend, weight_name, current, current_channels, current_length,
                    profile, error, error_capacity) != 0) {
         free(current);
         return -1;

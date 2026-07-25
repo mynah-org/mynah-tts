@@ -255,19 +255,41 @@ static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k
 }
 
 /* ------------------------------------------------------------------ */
-/*  Device-side ops (no host round-trip)                               */
+/*  Device-side ops (CUDA implementations)                             */
 /* ------------------------------------------------------------------ */
 
-extern "C" int mynah_cuda_upload(mynah_backend *bk, const float *host, size_t n,
-                                 float **dev_out, char *e, size_t ec) {
-    /* Access the state through the backend struct layout. */
-    auto *st = static_cast<cuda_backend_state *>(
-        *reinterpret_cast<void **>(reinterpret_cast<char *>(bk) + sizeof(int) + sizeof(const char *)));
+extern "C" int mynah_cuda_upload(void *opaque, const float *host, size_t n,
+                       float **dev_ptr, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
     size_t bytes = n * sizeof(float);
     if (ensure_scratch(st, bytes, e, ec)) return -1;
-    *dev_out = st->dev_scratch;
-    if (ce(cudaMemcpyAsync(*dev_out, host, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    return 0;
+    *dev_ptr = st->dev_scratch;
+    return ce(cudaMemcpyAsync(*dev_ptr, host, bytes, cudaMemcpyHostToDevice, st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_download(void *opaque, const float *dev_ptr, float *host,
+                         size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return ce(cudaMemcpyAsync(host, dev_ptr, n * sizeof(float),
+                              cudaMemcpyDeviceToHost, st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_sync(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return ce(cudaStreamSynchronize(st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_snake_dev(void *opaque, float *dev_data, const float *alpha,
+                          size_t channels, size_t length, size_t snake_ch,
+                          char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    /* Upload alpha to device (small, use host_buf). */
+    if (ensure_host(st, channels * sizeof(float), e, ec)) return -1;
+    std::memcpy(st->host_buf, alpha, channels * sizeof(float));
+    int threads = 256;
+    k_snake<<<(int)channels, threads, 0, st->stream>>>(
+        dev_data, st->dev_buf, (int)channels, (int)length, (int)snake_ch);
+    return ce(cudaGetLastError(), e, ec);
 }
 
 /* ------------------------------------------------------------------ */

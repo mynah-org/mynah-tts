@@ -29,6 +29,11 @@ struct mynah_backend {
     mynah_backend_sgemm_fn sgemm;
     mynah_backend_close_fn close;
     mynah_backend_self_test_fn self_test;
+    /* Device-side ops (NULL = CPU fallback in backend.c). */
+    int (*upload)(void *, const float *, size_t, float **, char *, size_t);
+    int (*download)(void *, const float *, float *, size_t, char *, size_t);
+    int (*sync)(void *, char *, size_t);
+    int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -42,6 +47,11 @@ int mynah_backend_cuda_open(void **state, mynah_backend_matmul_fn *matmul,
                             mynah_backend_sgemm_fn *sgemm,
                             mynah_backend_close_fn *close, mynah_backend_self_test_fn *self_test,
                             char *error, size_t error_capacity);
+/* Device-side ops set after open. */
+extern int mynah_cuda_upload(void *, const float *, size_t, float **, char *, size_t);
+extern int mynah_cuda_download(void *, const float *, float *, size_t, char *, size_t);
+extern int mynah_cuda_sync(void *, char *, size_t);
+extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -265,6 +275,10 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
             free(backend);
             return -1;
         }
+        backend->upload = mynah_cuda_upload;
+        backend->download = mynah_cuda_download;
+        backend->sync = mynah_cuda_sync;
+        backend->snake_dev = mynah_cuda_snake_dev;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -334,8 +348,9 @@ int mynah_backend_self_test(mynah_tts_device device, char *error, size_t error_c
 int mynah_backend_upload(const mynah_backend *backend, const float *host,
                          size_t n, float **dev_ptr,
                          char *error, size_t error_capacity) {
-    (void)error; (void)error_capacity;
     if (backend == NULL || host == NULL || dev_ptr == NULL) return -1;
+    if (backend->upload != NULL)
+        return backend->upload(backend->state, host, n, dev_ptr, error, error_capacity);
     *dev_ptr = (float *)host; /* CPU: same pointer */
     return 0;
 }
@@ -343,15 +358,18 @@ int mynah_backend_upload(const mynah_backend *backend, const float *host,
 int mynah_backend_download(const mynah_backend *backend, const float *dev_ptr,
                            float *host, size_t n,
                            char *error, size_t error_capacity) {
-    (void)error; (void)error_capacity;
     if (backend == NULL || dev_ptr == NULL || host == NULL) return -1;
+    if (backend->download != NULL)
+        return backend->download(backend->state, dev_ptr, host, n, error, error_capacity);
     if (dev_ptr != host) memcpy(host, dev_ptr, n * sizeof(float));
     return 0;
 }
 
 int mynah_backend_sync(const mynah_backend *backend,
                        char *error, size_t error_capacity) {
-    (void)backend; (void)error; (void)error_capacity;
+    if (backend == NULL) return -1;
+    if (backend->sync != NULL)
+        return backend->sync(backend->state, error, error_capacity);
     return 0; /* CPU: nothing to sync */
 }
 
@@ -444,7 +462,12 @@ int mynah_backend_snake_dev(const mynah_backend *backend,
                             size_t channels, size_t length,
                             size_t snake_channels,
                             char *error, size_t error_capacity) {
-    (void)backend; (void)error; (void)error_capacity;
+    if (backend == NULL) return -1;
+    if (backend->snake_dev != NULL)
+        return backend->snake_dev(backend->state, dev_data, alpha,
+                                  channels, length, snake_channels,
+                                  error, error_capacity);
+    /* CPU fallback. */
     for (size_t ch = 0; ch < channels; ++ch) {
         float *row = dev_data + ch * length;
         if (ch < snake_channels) {
