@@ -32,9 +32,10 @@
 
 __global__ static void k_layer_norm(float *out, const float *in,
                                     const float *gain,
-                                    int width, float eps) {
+                                    int width, float eps, int nrows) {
     /* One thread per row: sequential accumulation matches CPU bit-order. */
     int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= nrows) return;
     const float *x = in + (size_t)row * width;
     float *y = out + (size_t)row * width;
     float mean = 0.0f;
@@ -485,7 +486,7 @@ extern "C" int mynah_cuda_layer_norm_dev(void *opaque, const float *in, float *o
     int threads = rows <= 256 ? (int)rows : 256;
     int blocks = ((int)rows + threads - 1) / threads;
     k_layer_norm<<<blocks, threads, 0, st->stream>>>(
-        d_out, d_in, d_gain, (int)width, 1e-5f);
+        d_out, d_in, d_gain, (int)width, 1e-5f, (int)rows);
     if (ce(cudaGetLastError(), e, ec)) return -1;
     if (ce(cudaMemcpyAsync(out, d_out, data_bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
     return ce(cudaStreamSynchronize(st->stream), e, ec);
@@ -665,8 +666,8 @@ extern "C" int mynah_cuda_layer_norm_inplace(void *opaque, const float *dev_in,
     /* Cache gain on device (same pointer = same layer, reused across steps). */
     float *d_gain = nullptr;
     if (cached_weight(st, gain, width * sizeof(float), &d_gain, e, ec)) return -1;
-    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
-        dev_out, dev_in, d_gain, (int)width, 1e-5f);
+    k_layer_norm<<<(int)rows, 1, 0, st->stream>>>(
+        dev_out, dev_in, d_gain, (int)width, 1e-5f, (int)rows);
     return ce(cudaGetLastError(), e, ec);
 }
 
