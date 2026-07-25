@@ -848,3 +848,102 @@ extern "C" int mynah_cuda_gelu_host_f64(void *opaque, float *data, size_t n,
     if (ce(cudaMemcpyAsync(data, d, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
     return ce(cudaStreamSynchronize(st->stream), e, ec);
 }
+
+/* ---- CUDA Graph cache for matmul segments ---- */
+struct cuda_graph_entry {
+    size_t rows, iw, ow;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    bool valid;
+};
+
+#define GRAPH_CACHE_SIZE 16
+static cuda_graph_entry g_graph_cache[GRAPH_CACHE_SIZE];
+static int g_graph_count = 0;
+
+static cuda_graph_entry *find_graph(size_t rows, size_t iw, size_t ow) {
+    for (int i = 0; i < g_graph_count; ++i)
+        if (g_graph_cache[i].rows == rows && g_graph_cache[i].iw == iw &&
+            g_graph_cache[i].ow == ow)
+            return &g_graph_cache[i];
+    return nullptr;
+}
+
+/* Matmul with CUDA Graph: capture on first call, replay on subsequent.
+ * Falls back to regular matmul if capture fails. */
+extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *output,
+                             size_t rows, size_t iw, size_t ow,
+                             const float *weight, const float *bias,
+                             char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+
+    /* Try to find a cached graph. */
+    cuda_graph_entry *entry = find_graph(rows, iw, ow);
+    if (entry && entry->valid) {
+        /* Update input in mapped buffer, replay graph. */
+        const size_t in_n = rows * iw;
+        const size_t out_n = rows * ow;
+        size_t mapped_need = (in_n + out_n) * sizeof(float);
+        if (ensure_host(st, mapped_need, e, ec)) return -1;
+        std::memcpy(st->host_buf, input, in_n * sizeof(float));
+        cudaGraphLaunch(entry->exec, st->stream);
+        if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+        std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
+        return 0;
+    }
+
+    /* First call: capture the graph. */
+    const size_t in_n = rows * iw;
+    const size_t out_n = rows * ow;
+    const size_t w_n = iw * ow;
+    half *dw16 = nullptr;
+    if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
+    half *di16 = (half *)st->dev_scratch;
+    size_t mapped_need = (in_n + out_n) * sizeof(float);
+    if (ensure_host(st, mapped_need, e, ec)) return -1;
+    float *d_out_mapped = st->dev_buf + in_n;
+    std::memcpy(st->host_buf, input, in_n * sizeof(float));
+
+    /* Capture. Alpha/beta must be static (not stack) for graph capture. */
+    static const float g_alpha = 1.0f, g_beta = 0.0f;
+    cublasSetStream(st->cublas, st->stream);
+    cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeGlobal);
+    k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(st->dev_buf, di16, (int)in_n);
+    cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                 (int)ow, (int)rows, (int)iw,
+                 &g_alpha, dw16, CUDA_R_16F, (int)iw,
+                 di16, CUDA_R_16F, (int)iw,
+                 &g_beta, d_out_mapped, CUDA_R_32F, (int)ow,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (db) {
+        k_bias_add<<<((int)(rows*ow)+255)/256, 256, 0, st->stream>>>(
+            d_out_mapped, db, (int)rows, (int)ow);
+    }
+    cudaGraph_t graph;
+    cudaError_t cap_err = cudaStreamEndCapture(st->stream, &graph);
+    if (cap_err != cudaSuccess || graph == nullptr) {
+        /* Capture failed — fall back to regular matmul. */
+        return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
+    }
+
+    cudaGraphExec_t exec;
+    if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
+    }
+
+    /* Cache the graph. */
+    if (g_graph_count < GRAPH_CACHE_SIZE) {
+        g_graph_cache[g_graph_count] = {rows, iw, ow, graph, exec, true};
+        g_graph_count++;
+    }
+
+    /* Replay for this call. */
+    cudaGraphLaunch(exec, st->stream);
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
+    return 0;
+}
