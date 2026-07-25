@@ -233,12 +233,8 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
     if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
-    /* Scratch for FP16 input conversion only. */
     if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
     half *di16 = (half *)st->dev_scratch;
-    /* Mapped buffer: [FP32 input | FP32 output].  cuBLAS writes output
-     * directly to the mapped region; after sync we memcpy on the host
-     * side (no cudaMemcpy D2H API call). */
     size_t mapped_need = (in_n + out_n) * sizeof(float);
     if (ensure_host(st, mapped_need, e, ec)) return -1;
     float *d_out_mapped = st->dev_buf + in_n;
@@ -259,7 +255,6 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
             d_out_mapped, db, (int)rows, (int)ow);
     }
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
-    /* Host-side memcpy from mapped buffer (no cudaMemcpy API call). */
     std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
     return 0;
 }
