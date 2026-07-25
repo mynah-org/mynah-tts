@@ -47,6 +47,7 @@ struct mynah_backend {
     int (*gelu_inplace)(void *, float *, size_t, char *, size_t);
     int (*residual_inplace)(void *, float *, const float *, size_t, char *, size_t);
     int (*layer_norm_inplace)(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
+    int (*matmul_to_dev)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -78,6 +79,7 @@ extern int mynah_cuda_matvec_dev(void *, const float *, float *, size_t, size_t,
 extern int mynah_cuda_gelu_inplace(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_residual_inplace(void *, float *, const float *, size_t, char *, size_t);
 extern int mynah_cuda_layer_norm_inplace(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
+extern int mynah_cuda_matmul_to_dev(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -318,6 +320,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->gelu_inplace = mynah_cuda_gelu_inplace;
         backend->residual_inplace = mynah_cuda_residual_inplace;
         backend->layer_norm_inplace = mynah_cuda_layer_norm_inplace;
+        backend->matmul_to_dev = mynah_cuda_matmul_to_dev;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -611,5 +614,14 @@ int mynah_backend_layer_norm_inplace(const mynah_backend *bk, const float *dev_i
                                      size_t rows, size_t width,
                                      char *e, size_t ec) {
     if (bk && bk->layer_norm_inplace) return bk->layer_norm_inplace(bk->state, dev_in, dev_out, gain, rows, width, e, ec);
+    return -1;
+}
+
+int mynah_backend_matmul_to_dev(const mynah_backend *bk, const float *in, float *dout,
+                                size_t rows, size_t iw, size_t ow,
+                                const float *w, const float *b,
+                                char *e, size_t ec) {
+    if (bk && bk->matmul_to_dev)
+        return bk->matmul_to_dev(bk->state, in, dout, rows, iw, ow, w, b, e, ec);
     return -1;
 }

@@ -267,6 +267,50 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
     return 0;
 }
 
+/* matmul to device buffer: same FP16 pipeline, no sync, no D2H.
+ * Output stays on device at caller-provided d_out pointer. */
+static int cuda_matmul_to_dev(void *opaque, const float *input, float *d_out,
+                              size_t rows, size_t iw, size_t ow,
+                              const float *weight, const float *bias,
+                              char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    const size_t in_n = rows * iw;
+    half *dw16 = nullptr;
+    if (cached_weight_fp16(st, weight, iw * ow, &dw16, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
+    half *di16 = (half *)st->dev_scratch;
+    if (ensure_host(st, in_n * sizeof(float), e, ec)) return -1;
+    std::memcpy(st->host_buf, input, in_n * sizeof(float));
+    k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(st->dev_buf, di16, (int)in_n);
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b0 = 0.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &a1, dw16, CUDA_R_16F, (int)iw,
+                         di16, CUDA_R_16F, (int)iw,
+                         &b0, d_out, CUDA_R_32F, (int)ow,
+                         CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+    if (db) {
+        const float one = 1.0f;
+        static float *d_ones2 = nullptr; static size_t oc2 = 0;
+        if (oc2 < rows) { if (d_ones2) cudaFree(d_ones2); size_t c2 = (rows+255)&~255;
+            ce(cudaMalloc(&d_ones2, c2*4), e, ec); std::vector<float> h(c2,1.0f);
+            cudaMemcpy(d_ones2,h.data(),c2*4,cudaMemcpyHostToDevice); oc2=c2; }
+        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones2,1,d_out,(int)ow);
+    }
+    return 0; /* no sync */
+}
+
+extern "C" int mynah_cuda_matmul_to_dev(void *s, const float *in, float *dout,
+                              size_t rows, size_t iw, size_t ow,
+                              const float *w, const float *b,
+                              char *e, size_t ec) {
+    return cuda_matmul_to_dev(s, in, dout, rows, iw, ow, w, b, e, ec);
+}
+
 static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k,
                       float alpha, const float *a, size_t lda, const float *b, size_t ldb,
                       float beta, float *c, size_t ldc, char *e, size_t ec) {
