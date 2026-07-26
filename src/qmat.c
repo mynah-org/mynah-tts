@@ -354,18 +354,13 @@ fail:
 }
 
 /* --------------------------------------------------------------- public API */
-int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_safetensors *file,
-                             const char *name, const float *in, size_t k, size_t n,
+int mynah_qmat_greedy_argmax_resolved(mynah_qmat_cache *cache, const char *name,
+                             const float *weight_data, const float *in, size_t k, size_t n,
                              const float *bias, size_t allowed_rows,
                              unsigned extra_row, int allow_extra, unsigned *argmax,
                              char *error, size_t error_capacity) {
     if (cache == NULL || cache->qtype != QMAT_F32) return 1;
-    mynah_tensor weight;
-    if (mynah_safetensors_get(file, name, &weight) != 0) {
-        snprintf(error, error_capacity, "model tensor is missing: %s", name);
-        return -1;
-    }
-    if (mynah_matvec_argmax_f32(weight.data, in, bias, n, k,
+    if (mynah_matvec_argmax_f32(weight_data, in, bias, n, k,
                                 allowed_rows, (size_t)extra_row,
                                 allow_extra, argmax) != 0) {
         snprintf(error, error_capacity, "invalid greedy projection shape: %s", name);
@@ -374,25 +369,36 @@ int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_safetensors *f
     return 0;
 }
 
-int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_safetensors *file,
-                      const mynah_backend *backend, const char *name,
-                      const float *in, float *out, size_t count, size_t k, size_t n,
-                      const float *bias, char *error, size_t error_capacity) {
+int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_safetensors *file,
+                             const char *name, const float *in, size_t k, size_t n,
+                             const float *bias, size_t allowed_rows,
+                             unsigned extra_row, int allow_extra, unsigned *argmax,
+                             char *error, size_t error_capacity) {
     mynah_tensor weight;
     if (mynah_safetensors_get(file, name, &weight) != 0) {
         snprintf(error, error_capacity, "model tensor is missing: %s", name);
         return -1;
     }
+    return mynah_qmat_greedy_argmax_resolved(cache, name, weight.data, in, k, n,
+                                             bias, allowed_rows, extra_row,
+                                             allow_extra, argmax, error, error_capacity);
+}
+
+int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
+                      const mynah_backend *backend, const char *name,
+                      const float *weight_data,
+                      const float *in, float *out, size_t count, size_t k, size_t n,
+                      const float *bias, char *error, size_t error_capacity) {
     const int use_q = cache != NULL && cache->qtype != QMAT_F32 &&
                       count <= QMAT_SMALL_COUNT && k <= QMAT_K_MAX;
     const qmat_entry *e = NULL;
     if (use_q) {
         e = cache_lookup(cache, name);
-        if (e == NULL) e = cache_insert(cache, name, weight.data, n, k);
+        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k);
     }
     if (e == NULL) {
         /* Disabled, too large, unrepresentable, or OOM: exact f32 matmul. */
-        return mynah_backend_matmul(backend, in, out, count, k, n, weight.data, bias,
+        return mynah_backend_matmul(backend, in, out, count, k, n, weight_data, bias,
                                     error, error_capacity);
     }
     int8_t qx[QMAT_K_MAX];
@@ -416,6 +422,20 @@ int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_safetensors *file,
         }
     }
     return 0;
+}
+
+int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_safetensors *file,
+                      const mynah_backend *backend, const char *name,
+                      const float *in, float *out, size_t count, size_t k, size_t n,
+                      const float *bias, char *error, size_t error_capacity) {
+    mynah_tensor weight;
+    if (mynah_safetensors_get(file, name, &weight) != 0) {
+        snprintf(error, error_capacity, "model tensor is missing: %s", name);
+        return -1;
+    }
+    return mynah_qmat_linear_resolved(cache, backend, name, weight.data,
+                                      in, out, count, k, n, bias,
+                                      error, error_capacity);
 }
 
 static int self_test_one(int qtype, char *error, size_t error_capacity) {

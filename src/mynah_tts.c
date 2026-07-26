@@ -252,6 +252,7 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
         return -1;
     }
     model->codec_cache = mynah_graph_codec_cache_new();
+    model->local_projection_cache = mynah_graph_local_projection_cache_new(model);
     snprintf(model->info.device, sizeof(model->info.device), "%s",
              mynah_backend_name(model->backend));
     free(manifest);
@@ -268,6 +269,7 @@ int mynah_tts_model_open(const char *model_dir, mynah_tts_model **out_model,
 
 void mynah_tts_model_close(mynah_tts_model *model) {
     if (model == NULL) return;
+    mynah_graph_local_projection_cache_free(model->local_projection_cache);
     mynah_graph_codec_cache_free(model->codec_cache);
     mynah_qmat_cache_free(model->qcache);
     mynah_backend_close(model->backend);

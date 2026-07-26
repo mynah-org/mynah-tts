@@ -14,6 +14,7 @@ struct mynah_tts_model {
     mynah_backend *backend;
     mynah_qmat_cache *qcache;
     void *codec_cache;
+    void *local_projection_cache;
 };
 
 #endif

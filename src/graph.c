@@ -665,6 +665,16 @@ static int encode_text(const mynah_tts_model *model, const int *ids, size_t coun
     return 0;
 }
 
+typedef struct local_projection_cache local_projection_cache;
+
+struct local_projection_cache {
+    size_t stream_count;
+    const float **projection_weights;
+    const float **projection_biases;
+    const float **audio_embeddings;
+    size_t *audio_embedding_rows;
+};
+
 /* Embed a single stacked frame (one decoder input row).  The codes buffer is
  * laid out one contiguous max_raw_length row per codebook, so read with that
  * stride, not the growing current length, or every codebook after the first
@@ -679,19 +689,32 @@ static int embed_audio_frame(const mynah_tts_model *model, const unsigned *codes
         graph_error(error, error_capacity, "v1 requires a frame stacking factor of two");
         return -1;
     }
-    char name[128];
+    const local_projection_cache *projection_cache =
+        (const local_projection_cache *)model->local_projection_cache;
     memset(row, 0, width * sizeof(float));
     for (size_t fs = 0; fs < stacking; ++fs) {
         for (size_t codebook = 0; codebook < codebooks; ++codebook) {
             const unsigned code = codes[codebook * code_stride + frame * stacking + fs];
-            snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", fs * codebooks + codebook);
-            mynah_tensor table;
-            if (tensor(model->tts, name, &table, error, error_capacity) != 0) return -1;
-            if (code >= table.shape[0]) {
+            const size_t stream = fs * codebooks + codebook;
+            const float *table_data = NULL;
+            size_t table_rows = 0;
+            if (projection_cache != NULL && stream < projection_cache->stream_count) {
+                table_data = projection_cache->audio_embeddings[stream];
+                table_rows = projection_cache->audio_embedding_rows[stream];
+            } else {
+                char name[128];
+                mynah_tensor table;
+                snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
+                if (tensor(model->tts, name, &table, error, error_capacity) != 0) return -1;
+                table_data = table.data;
+                table_rows = table.shape[0];
+            }
+            if (code >= table_rows) {
                 graph_error(error, error_capacity, "audio token id is outside vocabulary");
                 return -1;
             }
-            for (size_t d = 0; d < width; ++d) row[d] += table.data[(size_t)code * width + d];
+            for (size_t d = 0; d < width; ++d)
+                row[d] += table_data[(size_t)code * width + d];
         }
     }
     for (size_t d = 0; d < width; ++d) row[d] /= (float)(stacking * codebooks);
@@ -721,6 +744,73 @@ typedef struct {
     const float *ffn_up_w[4];
     const float *ffn_down_w[4];
 } local_cache;
+
+static void local_projection_cache_free_impl(local_projection_cache *cache) {
+    if (cache == NULL) return;
+    free(cache->projection_weights);
+    free(cache->projection_biases);
+    free(cache->audio_embeddings);
+    free(cache->audio_embedding_rows);
+    free(cache);
+}
+
+void *mynah_graph_local_projection_cache_new(const mynah_tts_model *model) {
+    if (model == NULL) return NULL;
+    if (model->info.frame_stacking_factor == 0 ||
+        model->info.codebook_count > SIZE_MAX / model->info.frame_stacking_factor) {
+        return NULL;
+    }
+    const size_t streams = model->info.codebook_count *
+                           model->info.frame_stacking_factor;
+    if (streams == 0 || streams > SIZE_MAX / sizeof(float *)) return NULL;
+    local_projection_cache *cache = (local_projection_cache *)calloc(1, sizeof(*cache));
+    if (cache == NULL) return NULL;
+    cache->stream_count = streams;
+    cache->projection_weights = (const float **)calloc(streams, sizeof(float *));
+    cache->projection_biases = (const float **)calloc(streams, sizeof(float *));
+    cache->audio_embeddings = (const float **)calloc(streams, sizeof(float *));
+    cache->audio_embedding_rows = (size_t *)calloc(streams, sizeof(size_t));
+    if (cache->projection_weights == NULL || cache->projection_biases == NULL ||
+        cache->audio_embeddings == NULL || cache->audio_embedding_rows == NULL) {
+        local_projection_cache_free_impl(cache);
+        return NULL;
+    }
+    char error[256];
+    for (size_t stream = 0; stream < streams; ++stream) {
+        char name[256];
+        mynah_tensor tensor_view;
+        snprintf(name, sizeof(name),
+                 "local_transformer_out_projections.%zu.weight", stream);
+        if (tensor(model->tts, name, &tensor_view, error, sizeof(error)) != 0) {
+            local_projection_cache_free_impl(cache);
+            return NULL;
+        }
+        cache->projection_weights[stream] = tensor_view.data;
+        snprintf(name, sizeof(name),
+                 "local_transformer_out_projections.%zu.bias", stream);
+        if (tensor(model->tts, name, &tensor_view, error, sizeof(error)) != 0) {
+            local_projection_cache_free_impl(cache);
+            return NULL;
+        }
+        cache->projection_biases[stream] = tensor_view.data;
+        snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
+        if (tensor(model->tts, name, &tensor_view, error, sizeof(error)) != 0) {
+            local_projection_cache_free_impl(cache);
+            return NULL;
+        }
+        if (tensor_view.rank != 2u || tensor_view.shape[1] != model->info.hidden_dim) {
+            local_projection_cache_free_impl(cache);
+            return NULL;
+        }
+        cache->audio_embeddings[stream] = tensor_view.data;
+        cache->audio_embedding_rows[stream] = tensor_view.shape[0];
+    }
+    return cache;
+}
+
+void mynah_graph_local_projection_cache_free(void *opaque) {
+    local_projection_cache_free_impl((local_projection_cache *)opaque);
+}
 
 typedef struct {
     float *x;
@@ -854,10 +944,8 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
     float *scores = workspace->scores;
     for (size_t d = 0; d < width; ++d) x[d] = input_row[d] + cache->position[p * width + d];
     const float scale = 1.0f / sqrtf((float)hw);
-    char name[256];
     int failed = 0;
     for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
-        mynah_tensor t;
         layer_norm(x, nrm, 1u, width, cache->norm_self[layer]);
         if (mynah_backend_matmul(model->backend, nrm, qkv, 1u, width, width * 3u,
                                  cache->qkv_w[layer], NULL, error, error_capacity) != 0) { failed = 1; break; }
@@ -909,6 +997,8 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                               size_t *eos_frame, char *error, size_t error_capacity) {
     const size_t width = model->info.hidden_dim;
     const size_t stream_count = model->info.codebook_count * model->info.frame_stacking_factor;
+    const local_projection_cache *projection_cache =
+        (const local_projection_cache *)model->local_projection_cache;
     const int reuse_workspace = getenv("MYNAH_LOCAL_STEP_ALLOCS") == NULL;
     local_cache lc;
     local_workspace workspace;
@@ -966,17 +1056,24 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
             local_cache_free(&lc);
             return -1;
         }
-        snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.bias", stream);
-        mynah_tensor bias;
-        if (tensor(model->tts, name, &bias, error, error_capacity) != 0) {
-            free(shared_logits);
-            free(shared_top_indices);
-            free(shared_top_logits);
-            free(row_in);
-            free(row_out);
-            local_workspace_free(&workspace);
-            local_cache_free(&lc);
-            return -1;
+        const float *bias_data = NULL;
+        if (projection_cache != NULL && stream < projection_cache->stream_count) {
+            bias_data = projection_cache->projection_biases[stream];
+        } else {
+            snprintf(name, sizeof(name),
+                     "local_transformer_out_projections.%zu.bias", stream);
+            mynah_tensor bias;
+            if (tensor(model->tts, name, &bias, error, error_capacity) != 0) {
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
+                free(row_in);
+                free(row_out);
+                local_workspace_free(&workspace);
+                local_cache_free(&lc);
+                return -1;
+            }
+            bias_data = bias.data;
         }
         const int forbid_eos = generated_raw_length < min_raw_length;
         const unsigned eos_id = model->info.audio_eos_id;
@@ -985,10 +1082,17 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         int fused = !sampling &&
             (getenv("MYNAH_FUSED_GREEDY") == NULL ||
              strcmp(getenv("MYNAH_FUSED_GREEDY"), "0") != 0)
-            ? mynah_qmat_greedy_argmax(model->qcache, model->tts, name,
-                                       row_out, width, vocab, bias.data,
-                                       model->info.codebook_size, eos_id,
-                                       !forbid_eos, &argmax, error, error_capacity)
+            ? (projection_cache != NULL && stream < projection_cache->stream_count
+                   ? mynah_qmat_greedy_argmax_resolved(
+                         model->qcache, name,
+                         projection_cache->projection_weights[stream], row_out,
+                         width, vocab, bias_data, model->info.codebook_size,
+                         eos_id, !forbid_eos, &argmax, error, error_capacity)
+                   : mynah_qmat_greedy_argmax(model->qcache, model->tts, name,
+                                              row_out, width, vocab, bias_data,
+                                              model->info.codebook_size, eos_id,
+                                              !forbid_eos, &argmax, error,
+                                              error_capacity))
             : 1;
         if (fused < 0) {
             free(shared_logits);
@@ -1018,8 +1122,18 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
          * special token except AUDIO_EOS (and EOS too while below
          * min_generated_frames), matching NeMo clear_forbidden_logits. */
         snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
-        if (mynah_qmat_linear(model->qcache, model->tts, model->backend, name, row_out, logits,
-                              1u, width, vocab, bias.data, error, error_capacity) != 0) {
+        int projection_result;
+        if (projection_cache != NULL && stream < projection_cache->stream_count) {
+            projection_result = mynah_qmat_linear_resolved(
+                model->qcache, model->backend, name,
+                projection_cache->projection_weights[stream], row_out, logits,
+                1u, width, vocab, bias_data, error, error_capacity);
+        } else {
+            projection_result = mynah_qmat_linear(
+                model->qcache, model->tts, model->backend, name, row_out, logits,
+                1u, width, vocab, bias_data, error, error_capacity);
+        }
+        if (projection_result != 0) {
             if (logits != shared_logits) free(logits);
             free(shared_logits);
             free(shared_top_indices);
@@ -1041,6 +1155,7 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                 best = logits[candidate];
                 argmax = (unsigned)candidate;
             }
+        }
         }
         unsigned value = argmax;
         /* argmax_or_multinomial: EOS fires if either the greedy or the sampled
@@ -1125,21 +1240,27 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         const size_t fs = stream / model->info.codebook_count;
         const size_t codebook = stream % model->info.codebook_count;
         codes[codebook * code_stride + raw_offset + fs] = store;
-        snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
-        mynah_tensor audio_table;
-        if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0) {
-            free(shared_logits);
-            free(shared_top_indices);
-            free(shared_top_logits);
-            free(row_in);
-            free(row_out);
-            local_workspace_free(&workspace);
-            local_cache_free(&lc);
-            return -1;
+        const float *audio_table_data = NULL;
+        if (projection_cache != NULL && stream < projection_cache->stream_count) {
+            audio_table_data = projection_cache->audio_embeddings[stream];
+        } else {
+            snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
+            mynah_tensor audio_table;
+            if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0) {
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
+                free(row_in);
+                free(row_out);
+                local_workspace_free(&workspace);
+                local_cache_free(&lc);
+                return -1;
+            }
+            audio_table_data = audio_table.data;
         }
         /* The embedding of this stream's token becomes the input row for the
          * next local-transformer position. */
-        memcpy(row_in, audio_table.data + (size_t)emit * width, width * sizeof(float));
+        memcpy(row_in, audio_table_data + (size_t)emit * width, width * sizeof(float));
     }
     free(shared_logits);
     free(shared_top_indices);
