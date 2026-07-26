@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "kernels.h"
 #include "threads.h"
 
 #include <errno.h>
@@ -61,6 +62,24 @@ int mynah_backend_metal_open(void **state, mynah_backend_matmul_fn *matmul,
                              mynah_backend_sgemm_fn *sgemm,
                              mynah_backend_close_fn *close, mynah_backend_self_test_fn *self_test,
                              char *error, size_t error_capacity);
+extern int mynah_metal_upload(void *, const float *, size_t, float **, char *, size_t);
+extern int mynah_metal_download(void *, const float *, float *, size_t, char *, size_t);
+extern int mynah_metal_sync(void *, char *, size_t);
+extern int mynah_metal_gelu_dev(void *, float *, size_t, char *, size_t);
+extern int mynah_metal_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
+extern int mynah_metal_layer_norm_dev(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
+extern int mynah_metal_residual_add_dev(void *, float *, const float *, size_t, char *, size_t);
+extern int mynah_metal_matmul_dev(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_metal_dev_alloc(void *, size_t, float **, char *, size_t);
+extern void mynah_metal_dev_free(void *, float *);
+extern int mynah_metal_h2d(void *, const float *, float *, size_t, char *, size_t);
+extern int mynah_metal_d2h(void *, const float *, float *, size_t, char *, size_t);
+extern int mynah_metal_gelu_inplace(void *, float *, size_t, char *, size_t);
+extern int mynah_metal_residual_inplace(void *, float *, const float *, size_t, char *, size_t);
+extern int mynah_metal_layer_norm_inplace(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
+extern int mynah_metal_matmul_d2d(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_metal_conv1d(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
+extern int mynah_metal_ops_self_test(void *, char *, size_t);
 #endif
 #if defined(MYNAH_ENABLE_CUDA)
 int mynah_backend_cuda_open(void **state, mynah_backend_matmul_fn *matmul,
@@ -96,30 +115,6 @@ extern int mynah_cuda_matmul_graph(void *, const float *, float *, size_t, size_
 
 static void set_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
-}
-
-static float dot_product(const float *left, const float *right, size_t count) {
-    size_t i = 0;
-    float sum = 0.0f;
-#if defined(__AVX2__)
-    __m256 accumulator = _mm256_setzero_ps();
-    for (; i + 8u <= count; i += 8u) {
-        accumulator = _mm256_add_ps(accumulator,
-                                    _mm256_mul_ps(_mm256_loadu_ps(left + i),
-                                                  _mm256_loadu_ps(right + i)));
-    }
-    float lanes[8];
-    _mm256_storeu_ps(lanes, accumulator);
-    for (size_t lane = 0; lane < 8u; ++lane) sum += lanes[lane];
-#elif defined(__ARM_NEON)
-    float32x4_t accumulator = vdupq_n_f32(0.0f);
-    for (; i + 4u <= count; i += 4u) {
-        accumulator = vmlaq_f32(accumulator, vld1q_f32(left + i), vld1q_f32(right + i));
-    }
-    sum += vaddvq_f32(accumulator);
-#endif
-    for (; i < count; ++i) sum += left[i] * right[i];
-    return sum;
 }
 
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
@@ -168,6 +163,21 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
     (void)state;
     (void)error;
     (void)error_capacity;
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__) || defined(__AVX2__))
+    /* Decode is dominated by single-row projections.  BLAS is excellent for
+     * prefill, but its SGEMM setup costs more than a resident SIMD matvec for
+     * rows=1.  MYNAH_CPU_MATVEC=1 enables this experiment; Accelerate
+     * remains the default because the measured matvec path is slower on M1. */
+    const char *matvec_env = getenv("MYNAH_CPU_MATVEC");
+    const int matvec_shape_small = input_width != 0u &&
+        output_width <= SIZE_MAX / input_width &&
+        input_width * output_width <= 700000u;
+    if (rows == 1u && matvec_shape_small &&
+        matvec_env != NULL && strcmp(matvec_env, "1") == 0) {
+        mynah_matvec_bias_f32(weight, input, bias, output, output_width, input_width);
+        return 0;
+    }
+#endif
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (rows <= (size_t)INT_MAX && input_width <= (size_t)INT_MAX &&
         output_width <= (size_t)INT_MAX) {
@@ -190,11 +200,10 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
     for (size_t row = 0; row < rows; ++row) {
         const float *input_row = input + row * input_width;
         float *output_row = output + row * output_width;
-        for (size_t column = 0; column < output_width; ++column) {
-            output_row[column] = (bias == NULL ? 0.0f : bias[column]) +
-                                dot_product(input_row, weight + column * input_width,
-                                            input_width);
-        }
+        mynah_matvec_f32(weight, input_row, output_row, output_width, input_width);
+        if (bias != NULL)
+            for (size_t column = 0; column < output_width; ++column)
+                output_row[column] += bias[column];
     }
     return 0;
 }
@@ -302,6 +311,23 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
             return -1;
         }
         if (backend->sgemm == NULL) backend->sgemm = cpu_sgemm;
+        backend->upload = mynah_metal_upload;
+        backend->download = mynah_metal_download;
+        backend->sync = mynah_metal_sync;
+        backend->gelu_dev = mynah_metal_gelu_dev;
+        backend->snake_dev = mynah_metal_snake_dev;
+        backend->layer_norm_dev = mynah_metal_layer_norm_dev;
+        backend->residual_add_dev = mynah_metal_residual_add_dev;
+        backend->matmul_dev = mynah_metal_matmul_dev;
+        backend->dev_alloc = mynah_metal_dev_alloc;
+        backend->dev_free = mynah_metal_dev_free;
+        backend->h2d = mynah_metal_h2d;
+        backend->d2h = mynah_metal_d2h;
+        backend->gelu_inplace = mynah_metal_gelu_inplace;
+        backend->residual_inplace = mynah_metal_residual_inplace;
+        backend->layer_norm_inplace = mynah_metal_layer_norm_inplace;
+        backend->matmul_d2d = mynah_metal_matmul_d2d;
+        backend->conv1d = mynah_metal_conv1d;
 #else
         free(backend);
         set_error(error, error_capacity, "Metal backend is not compiled; use make metal");
@@ -395,8 +421,12 @@ int mynah_backend_sgemm(const mynah_backend *backend,
 int mynah_backend_self_test(mynah_tts_device device, char *error, size_t error_capacity) {
     mynah_backend *backend = NULL;
     if (mynah_backend_open(device, &backend, error, error_capacity) != 0) return -1;
-    const int result = backend->self_test == NULL ? 0 :
+    int result = backend->self_test == NULL ? 0 :
         backend->self_test(backend->state, error, error_capacity);
+#if defined(MYNAH_ENABLE_METAL)
+    if (result == 0 && device == MYNAH_TTS_DEVICE_METAL)
+        result = mynah_metal_ops_self_test(backend->state, error, error_capacity);
+#endif
     mynah_backend_close(backend);
     return result;
 }
@@ -439,11 +469,7 @@ int mynah_backend_gelu_dev(const mynah_backend *backend,
     if (backend == NULL) return -1;
     if (backend->gelu_dev != NULL)
         return backend->gelu_dev(backend->state, dev_data, n, error, error_capacity);
-    for (size_t i = 0; i < n; ++i) {
-        float x = dev_data[i];
-        float c = 0.7978845608f * (x + 0.044715f * x * x * x);
-        dev_data[i] = 0.5f * x * (1.0f + tanhf(c));
-    }
+    mynah_gelu_f32(dev_data, n);
     return 0;
 }
 
@@ -456,18 +482,7 @@ int mynah_backend_layer_norm_dev(const mynah_backend *backend,
     if (backend->layer_norm_dev != NULL)
         return backend->layer_norm_dev(backend->state, dev_in, dev_out, gain, bias,
                                        rows, width, error, error_capacity);
-    for (size_t r = 0; r < rows; ++r) {
-        const float *x = dev_in + r * width;
-        float *y = dev_out + r * width;
-        float mean = 0.0f;
-        for (size_t i = 0; i < width; ++i) mean += x[i];
-        mean /= (float)width;
-        float var = 0.0f;
-        for (size_t i = 0; i < width; ++i) { float d = x[i] - mean; var += d * d; }
-        float inv = 1.0f / sqrtf(var / (float)width + 1e-5f);
-        for (size_t i = 0; i < width; ++i)
-            y[i] = (x[i] - mean) * inv * gain[i] + bias[i];
-    }
+    mynah_layernorm_f32(dev_in, gain, bias, dev_out, rows, width, 1e-5f);
     return 0;
 }
 
@@ -498,7 +513,7 @@ int mynah_backend_residual_add_dev(const mynah_backend *backend,
     if (backend->residual_add_dev != NULL)
         return backend->residual_add_dev(backend->state, dev_out, dev_in, n,
                                          error, error_capacity);
-    for (size_t i = 0; i < n; ++i) dev_out[i] += dev_in[i];
+    mynah_residual_add_f32(dev_out, dev_in, n);
     return 0;
 }
 

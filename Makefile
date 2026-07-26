@@ -183,6 +183,7 @@ METAL_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -DMYNAH_ENABLE_METAL
 METAL_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o)
 METAL_CLI_OBJECT := $(METAL_BUILD_DIR)/cli/main.o
 METAL_HOST_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal.o
+METAL_OPS_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal_ops.o
 METAL_TARGET := $(METAL_BUILD_DIR)/mynah-tts
 
 $(METAL_BUILD_DIR)/%.o: %.c
@@ -193,7 +194,11 @@ $(METAL_BUILD_DIR)/gpu/metal/backend_metal.o: gpu/metal/backend_metal.m
 	@mkdir -p $(@D)
 	$(CC) $(METAL_CPPFLAGS) $(METAL_CFLAGS) -fobjc-arc -c $< -o $@
 
-$(METAL_TARGET): $(METAL_CORE_OBJECTS) $(METAL_CLI_OBJECT) $(METAL_HOST_OBJECT)
+$(METAL_BUILD_DIR)/gpu/metal/backend_metal_ops.o: gpu/metal/backend_metal_ops.m
+	@mkdir -p $(@D)
+	$(CC) $(METAL_CPPFLAGS) $(METAL_CFLAGS) -fobjc-arc -c $< -o $@
+
+$(METAL_TARGET): $(METAL_CORE_OBJECTS) $(METAL_CLI_OBJECT) $(METAL_HOST_OBJECT) $(METAL_OPS_OBJECT)
 	@mkdir -p $(@D)
 	$(CC) $(METAL_CFLAGS) $(LDFLAGS) $(filter %.o,$^) $(LDLIBS) -framework Foundation -framework Metal -o $@
 

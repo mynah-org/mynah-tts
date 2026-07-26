@@ -1,5 +1,6 @@
 #include "mynah_tts_internal.h"
 #include "graph.h"
+#include "kernels.h"
 #include "threads.h"
 
 #include <float.h>
@@ -10,11 +11,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__))
 #include <arm_neon.h>
 #define MYNAH_GRAPH_NEON 1
 #endif
+
+typedef struct codec_bnns_cache codec_bnns_cache;
 
 #if defined(MYNAH_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -77,21 +81,7 @@ static float *allocate_floats(size_t count, char *error, size_t error_capacity) 
 
 static void layer_norm(const float *input, float *output, size_t length,
                        size_t width, const float *weight) {
-    for (size_t t = 0; t < length; ++t) {
-        const float *row = input + t * width;
-        float *out = output + t * width;
-        float mean = 0.0f;
-        for (size_t d = 0; d < width; ++d) mean += row[d];
-        mean /= (float)width;
-        float variance = 0.0f;
-        for (size_t d = 0; d < width; ++d) {
-            const float delta = row[d] - mean;
-            variance += delta * delta;
-        }
-        variance /= (float)width;
-        const float scale = 1.0f / sqrtf(variance + 1.0e-5f);
-        for (size_t d = 0; d < width; ++d) out[d] = (row[d] - mean) * scale * weight[d];
-    }
+    mynah_layernorm_f32(input, weight, NULL, output, length, width, 1.0e-5f);
 }
 
 static float gelu_tanh(float x) {
@@ -990,7 +980,29 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         }
         const int forbid_eos = generated_raw_length < min_raw_length;
         const unsigned eos_id = model->info.audio_eos_id;
-        float *logits = shared_logits != NULL
+        snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
+        unsigned argmax = 0;
+        int fused = !sampling &&
+            (getenv("MYNAH_FUSED_GREEDY") == NULL ||
+             strcmp(getenv("MYNAH_FUSED_GREEDY"), "0") != 0)
+            ? mynah_qmat_greedy_argmax(model->qcache, model->tts, name,
+                                       row_out, width, vocab, bias.data,
+                                       model->info.codebook_size, eos_id,
+                                       !forbid_eos, &argmax, error, error_capacity)
+            : 1;
+        if (fused < 0) {
+            free(shared_logits);
+            free(shared_top_indices);
+            free(shared_top_logits);
+            free(row_in);
+            free(row_out);
+            local_workspace_free(&workspace);
+            local_cache_free(&lc);
+            return -1;
+        }
+        float *logits = NULL;
+        if (fused != 0) {
+            logits = shared_logits != NULL
             ? shared_logits : allocate_floats(vocab, error, error_capacity);
         if (logits == NULL) {
             free(shared_logits);
@@ -1017,8 +1029,7 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
             local_cache_free(&lc);
             return -1;
         }
-        unsigned argmax = 0;
-        float best = -FLT_MAX;
+            float best = -FLT_MAX;
         for (size_t candidate = 0; candidate < vocab; ++candidate) {
             const int is_code = candidate < model->info.codebook_size;
             const int is_eos = candidate == eos_id;
@@ -1154,6 +1165,61 @@ typedef struct {
 } codec_conv_profile;
 
 #if defined(MYNAH_USE_ACCELERATE)
+typedef struct {
+    const float *weight;
+    const float *bias;
+    size_t in_channels;
+    size_t out_channels;
+    size_t length;
+    size_t kernel;
+    size_t dilation;
+    BNNSFilter filter;
+} codec_bnns_entry;
+
+struct codec_bnns_cache {
+    codec_bnns_entry *entries;
+    size_t count;
+    size_t capacity;
+    pthread_mutex_t mutex;
+};
+
+static void codec_bnns_cache_free(codec_bnns_cache *cache) {
+    if (cache == NULL) return;
+    pthread_mutex_lock(&cache->mutex);
+    for (size_t i = 0; i < cache->count; ++i) {
+        if (cache->entries[i].filter != NULL)
+            BNNSFilterDestroy(cache->entries[i].filter);
+    }
+    free(cache->entries);
+    pthread_mutex_unlock(&cache->mutex);
+    pthread_mutex_destroy(&cache->mutex);
+    free(cache);
+}
+#endif
+
+void *mynah_graph_codec_cache_new(void) {
+#if defined(MYNAH_USE_ACCELERATE)
+    codec_bnns_cache *cache = (codec_bnns_cache *)calloc(1, sizeof(*cache));
+    if (cache == NULL) return NULL;
+    if (pthread_mutex_init(&cache->mutex, NULL) != 0) {
+        free(cache);
+        return NULL;
+    }
+    return cache;
+#else
+    return NULL;
+#endif
+}
+
+void mynah_graph_codec_cache_free(void *opaque) {
+#if defined(MYNAH_USE_ACCELERATE)
+    codec_bnns_cache_free((codec_bnns_cache *)opaque);
+#else
+    (void)opaque;
+#endif
+}
+
+#if defined(MYNAH_USE_ACCELERATE)
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -1162,10 +1228,26 @@ static int conv1d_causal_bnns(const float *weight, const float *bias,
                               const float *input, float *output,
                               size_t in_channels, size_t out_channels,
                               size_t length, size_t kernel, size_t dilation,
+                              codec_bnns_cache *cache,
                               codec_conv_profile *profile) {
     if (length == 0u || kernel == 0u || dilation == 0u ||
         (kernel - 1u) > SIZE_MAX / dilation) {
         return -1;
+    }
+    BNNSFilter filter = NULL;
+    int retained = 0;
+    if (cache != NULL) {
+        for (size_t i = 0; i < cache->count; ++i) {
+            codec_bnns_entry *entry = &cache->entries[i];
+            if (entry->weight == weight && entry->bias == bias &&
+                entry->in_channels == in_channels && entry->out_channels == out_channels &&
+                entry->length == length && entry->kernel == kernel &&
+                entry->dilation == dilation) {
+                filter = entry->filter;
+                retained = 1;
+                break;
+            }
+        }
     }
     BNNSLayerParametersConvolution parameters;
     memset(&parameters, 0, sizeof(parameters));
@@ -1197,21 +1279,46 @@ static int conv1d_causal_bnns(const float *weight, const float *bias,
     parameters.y_dilation_stride = 1u;
     parameters.pad[0] = (kernel - 1u) * dilation;
     double operation_start = profile != NULL ? phase_seconds() : 0.0;
-    BNNSFilter filter = BNNSFilterCreateLayerConvolution(&parameters, NULL);
-    if (filter == NULL) return -1;
-    if (profile != NULL) {
-        profile->bnns_create_seconds += phase_seconds() - operation_start;
-        operation_start = phase_seconds();
+    if (cache != NULL) pthread_mutex_lock(&cache->mutex);
+    if (filter == NULL) {
+        filter = BNNSFilterCreateLayerConvolution(&parameters, NULL);
+        if (filter == NULL) {
+            if (cache != NULL) pthread_mutex_unlock(&cache->mutex);
+            return -1;
+        }
+        if (profile != NULL) {
+            profile->bnns_create_seconds += phase_seconds() - operation_start;
+            operation_start = phase_seconds();
+        }
+        if (cache != NULL) {
+            if (cache->count == cache->capacity) {
+                const size_t next = cache->capacity == 0 ? 8u : cache->capacity * 2u;
+                codec_bnns_entry *grown = (codec_bnns_entry *)realloc(
+                    cache->entries, next * sizeof(*grown));
+                if (grown != NULL) {
+                    cache->entries = grown;
+                    cache->capacity = next;
+                }
+            }
+            if (cache->count < cache->capacity) {
+                cache->entries[cache->count++] = (codec_bnns_entry){
+                    weight, bias, in_channels, out_channels, length, kernel, dilation, filter};
+                retained = 1;
+            }
+        }
     }
     const int result = BNNSFilterApply(filter, input, output);
     if (profile != NULL) {
         profile->bnns_apply_seconds += phase_seconds() - operation_start;
         operation_start = phase_seconds();
     }
-    BNNSFilterDestroy(filter);
-    if (profile != NULL) {
-        profile->bnns_destroy_seconds += phase_seconds() - operation_start;
+    if (!retained) {
+        BNNSFilterDestroy(filter);
+        if (profile != NULL) {
+            profile->bnns_destroy_seconds += phase_seconds() - operation_start;
+        }
     }
+    if (cache != NULL) pthread_mutex_unlock(&cache->mutex);
     return result;
 }
 #if defined(__clang__)
@@ -1254,7 +1361,7 @@ int mynah_graph_bnns_self_test(char *error, size_t error_capacity) {
     }
     if (conv1d_causal_bnns(weight, bias, input, actual,
                            IN_CHANNELS, OUT_CHANNELS, LENGTH,
-                           KERNEL, dilation, NULL) != 0) {
+        KERNEL, dilation, NULL, NULL) != 0) {
         graph_error(error, error_capacity, "BNNS causal-conv self-test failed to apply");
         return -1;
     }
@@ -1277,6 +1384,7 @@ int mynah_graph_bnns_self_test(char *error, size_t error_capacity) {
 }
 
 static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *backend,
+                         codec_bnns_cache *bnns_cache,
                          const char *weight_name,
                          const char *bias_name, const float *input, float *output,
                          size_t in_channels, size_t out_channels, size_t length,
@@ -1312,7 +1420,7 @@ static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *bac
     if (getenv("MYNAH_CODEC_SGEMM") == NULL &&
         conv1d_causal_bnns(weight.data, bias.data, input, output,
                            in_channels, out_channels, length,
-                           kernel, dilation, profile) == 0) {
+            kernel, dilation, bnns_cache, profile) == 0) {
         return 0;
     }
 #endif
@@ -1570,6 +1678,7 @@ static int half_snake(const mynah_safetensors *file, const mynah_backend *backen
 }
 
 static int res_layer(const mynah_safetensors *file, const mynah_backend *backend,
+                     codec_bnns_cache *bnns_cache,
                      size_t stage, const float *input,
                      float *output, size_t channels, size_t length,
                      codec_conv_profile *profile, char *error, size_t error_capacity) {
@@ -1630,7 +1739,7 @@ static int res_layer(const mynah_safetensors *file, const mynah_backend *backend
             snprintf(bias_name, sizeof(bias_name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.input_conv.conv.bias",
                      stage, branch_index, dilation_index);
-            if (conv1d_causal(file, backend, weight_name, bias_name, activated, residual,
+            if (conv1d_causal(file, backend, bnns_cache, weight_name, bias_name, activated, residual,
                               channels, channels, length, kernels[branch_index],
                               dilations[dilation_index],
                               columns_workspace, columns_capacity,
@@ -1646,7 +1755,7 @@ static int res_layer(const mynah_safetensors *file, const mynah_backend *backend
             snprintf(bias_name, sizeof(bias_name),
                      "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_conv.conv.bias",
                      stage, branch_index, dilation_index);
-            if (conv1d_causal(file, backend, weight_name, bias_name, residual, branch,
+            if (conv1d_causal(file, backend, bnns_cache, weight_name, bias_name, residual, branch,
                               channels, channels, length, kernels[branch_index], 1u,
                               columns_workspace, columns_capacity, profile,
                               error, error_capacity) != 0) break;
@@ -1672,6 +1781,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     double stage_seconds[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
     codec_conv_profile conv_profile = {0};
     codec_conv_profile *profile = timing ? &conv_profile : NULL;
+    codec_bnns_cache *bnns_cache = (codec_bnns_cache *)model->codec_cache;
     const size_t levels[4] = {8u, 7u, 6u, 6u};
     const size_t bases[4] = {1u, 8u, 56u, 336u};
     const size_t groups = 8u;
@@ -1694,7 +1804,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     snprintf(weight_name, sizeof(weight_name), "audio_decoder.pre_conv.conv.weight");
     snprintf(bias_name, sizeof(bias_name), "audio_decoder.pre_conv.conv.bias");
     float *current = allocate_floats(864u * raw_length, error, error_capacity);
-    if (current == NULL || conv1d_causal(model->codec, model->backend, weight_name, bias_name, latent,
+    if (current == NULL || conv1d_causal(model->codec, model->backend, bnns_cache, weight_name, bias_name, latent,
                                          current, 32u, 864u, raw_length, 7u, 1u,
                                          NULL, 0,
                                          profile, error, error_capacity) != 0) {
@@ -1738,7 +1848,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
             free(upsampled);
             return -1;
         }
-        if (res_layer(model->codec, model->backend, stage, upsampled, current, next_channels, next_length, profile,
+        if (res_layer(model->codec, model->backend, bnns_cache, stage, upsampled, current, next_channels, next_length, profile,
                       error, error_capacity) != 0) {
             free(upsampled);
             free(current);
@@ -1762,7 +1872,7 @@ static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
     }
     snprintf(weight_name, sizeof(weight_name), "audio_decoder.post_conv.conv.weight");
     snprintf(bias_name, sizeof(bias_name), "audio_decoder.post_conv.conv.bias");
-    if (conv1d_causal(model->codec, model->backend, weight_name, bias_name, current, audio,
+    if (conv1d_causal(model->codec, model->backend, bnns_cache, weight_name, bias_name, current, audio,
                       current_channels, 1u, current_length, 3u, 1u,
                       NULL, 0,
                       profile, error, error_capacity) != 0) {

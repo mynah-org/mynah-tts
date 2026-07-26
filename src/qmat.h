@@ -34,6 +34,15 @@ int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_safetensors *file,
                       const float *in, float *out, size_t count, size_t k, size_t n,
                       const float *bias, char *error, size_t error_capacity);
 
+/* Greedy f32 projection fused with the constrained argmax.  Returns 0 when
+ * fused, 1 when the cache/backend is not eligible and the caller should use
+ * mynah_qmat_linear, or -1 on a model/input error. */
+int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_safetensors *file,
+                             const char *name, const float *in, size_t k, size_t n,
+                             const float *bias, size_t allowed_rows,
+                             unsigned extra_row, int allow_extra, unsigned *argmax,
+                             char *error, size_t error_capacity);
+
 /* Model-free numeric check: int8 matvec vs an exact f32 dot on deterministic
  * data, asserting a bounded relative error.  0 = ok, -1 = error. */
 int mynah_qmat_self_test(char *error, size_t error_capacity);

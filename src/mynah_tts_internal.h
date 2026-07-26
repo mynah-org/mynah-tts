@@ -13,6 +13,7 @@ struct mynah_tts_model {
     mynah_safetensors *codec;
     mynah_backend *backend;
     mynah_qmat_cache *qcache;
+    void *codec_cache;
 };
 
 #endif

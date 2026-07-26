@@ -1,5 +1,6 @@
 #include "mynah_tts.h"
 #include "mynah_tts_internal.h"
+#include "graph.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -250,6 +251,7 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
         set_error(error, error_capacity, "out of memory creating quant cache");
         return -1;
     }
+    model->codec_cache = mynah_graph_codec_cache_new();
     snprintf(model->info.device, sizeof(model->info.device), "%s",
              mynah_backend_name(model->backend));
     free(manifest);
@@ -266,6 +268,7 @@ int mynah_tts_model_open(const char *model_dir, mynah_tts_model **out_model,
 
 void mynah_tts_model_close(mynah_tts_model *model) {
     if (model == NULL) return;
+    mynah_graph_codec_cache_free(model->codec_cache);
     mynah_qmat_cache_free(model->qcache);
     mynah_backend_close(model->backend);
     mynah_safetensors_close(model->tts);
