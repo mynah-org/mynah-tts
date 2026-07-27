@@ -1321,8 +1321,33 @@ static void codec_bnns_cache_free(codec_bnns_cache *cache) {
 }
 #endif
 
+#if defined(MYNAH_USE_OPENBLAS) && !defined(MYNAH_USE_ACCELERATE)
+typedef struct {
+    const float *weight;
+    size_t in_channels;
+    size_t out_channels;
+    size_t kernel;
+    float *packed;
+} codec_tap_entry;
+
+struct codec_bnns_cache {
+    codec_tap_entry *entries;
+    size_t count;
+    size_t capacity;
+    pthread_mutex_t mutex;
+};
+#endif
+
 void *mynah_graph_codec_cache_new(void) {
 #if defined(MYNAH_USE_ACCELERATE)
+    codec_bnns_cache *cache = (codec_bnns_cache *)calloc(1, sizeof(*cache));
+    if (cache == NULL) return NULL;
+    if (pthread_mutex_init(&cache->mutex, NULL) != 0) {
+        free(cache);
+        return NULL;
+    }
+    return cache;
+#elif defined(MYNAH_USE_OPENBLAS)
     codec_bnns_cache *cache = (codec_bnns_cache *)calloc(1, sizeof(*cache));
     if (cache == NULL) return NULL;
     if (pthread_mutex_init(&cache->mutex, NULL) != 0) {
@@ -1338,10 +1363,85 @@ void *mynah_graph_codec_cache_new(void) {
 void mynah_graph_codec_cache_free(void *opaque) {
 #if defined(MYNAH_USE_ACCELERATE)
     codec_bnns_cache_free((codec_bnns_cache *)opaque);
+#elif defined(MYNAH_USE_OPENBLAS)
+    codec_bnns_cache *cache = (codec_bnns_cache *)opaque;
+    if (cache == NULL) return;
+    pthread_mutex_lock(&cache->mutex);
+    for (size_t i = 0; i < cache->count; ++i) free(cache->entries[i].packed);
+    free(cache->entries);
+    pthread_mutex_unlock(&cache->mutex);
+    pthread_mutex_destroy(&cache->mutex);
+    free(cache);
 #else
     (void)opaque;
 #endif
 }
+
+#if defined(MYNAH_USE_OPENBLAS) && !defined(MYNAH_USE_ACCELERATE)
+static float *codec_cached_taps(codec_bnns_cache *cache, const float *weight,
+                                size_t in_channels, size_t out_channels,
+                                size_t kernel) {
+    const char *cache_env = getenv("MYNAH_CODEC_TAP_CACHE");
+    if (cache_env != NULL && strcmp(cache_env, "0") == 0) return NULL;
+    if (cache == NULL || weight == NULL || in_channels == 0u ||
+        out_channels == 0u || kernel == 0u) return NULL;
+    pthread_mutex_lock(&cache->mutex);
+    for (size_t i = 0; i < cache->count; ++i) {
+        codec_tap_entry *entry = &cache->entries[i];
+        if (entry->weight == weight && entry->in_channels == in_channels &&
+            entry->out_channels == out_channels && entry->kernel == kernel) {
+            float *packed = entry->packed;
+            pthread_mutex_unlock(&cache->mutex);
+            return packed;
+        }
+    }
+    if (kernel > SIZE_MAX / out_channels ||
+        kernel * out_channels > SIZE_MAX / in_channels ||
+        kernel * out_channels * in_channels > SIZE_MAX / sizeof(float)) {
+        pthread_mutex_unlock(&cache->mutex);
+        return NULL;
+    }
+    const size_t per_tap = out_channels * in_channels;
+    const size_t total = kernel * per_tap;
+    float *packed = (float *)malloc(total * sizeof(*packed));
+    if (packed == NULL) {
+        pthread_mutex_unlock(&cache->mutex);
+        return NULL;
+    }
+    for (size_t k = 0; k < kernel; ++k) {
+        float *tap = packed + k * per_tap;
+        for (size_t o = 0; o < out_channels; ++o) {
+            for (size_t i = 0; i < in_channels; ++i) {
+                tap[o * in_channels + i] =
+                    weight[(o * in_channels + i) * kernel + k];
+            }
+        }
+    }
+    if (cache->count == cache->capacity) {
+        const size_t next_capacity = cache->capacity == 0u
+            ? 4u : cache->capacity > SIZE_MAX / 2u
+                ? 0u : cache->capacity * 2u;
+        if (next_capacity == 0u || next_capacity > SIZE_MAX / sizeof(*cache->entries)) {
+            free(packed);
+            pthread_mutex_unlock(&cache->mutex);
+            return NULL;
+        }
+        codec_tap_entry *entries = (codec_tap_entry *)realloc(
+            cache->entries, next_capacity * sizeof(*entries));
+        if (entries == NULL) {
+            free(packed);
+            pthread_mutex_unlock(&cache->mutex);
+            return NULL;
+        }
+        cache->entries = entries;
+        cache->capacity = next_capacity;
+    }
+    cache->entries[cache->count++] = (codec_tap_entry){
+        weight, in_channels, out_channels, kernel, packed};
+    pthread_mutex_unlock(&cache->mutex);
+    return packed;
+}
+#endif
 
 #if defined(MYNAH_USE_ACCELERATE)
 #if defined(__clang__)
@@ -1604,28 +1704,44 @@ static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *bac
                         "causal conv1d tap workspace size overflow");
             return -1;
         }
-        float *wk = (float *)malloc(
-            out_channels * in_channels * sizeof(float));
-        if (wk == NULL) {
+    float *wk = NULL;
+    int owns_wk = 0;
+#if defined(MYNAH_USE_OPENBLAS) && !defined(MYNAH_USE_ACCELERATE)
+    wk = codec_cached_taps(bnns_cache, weight.data,
+                           in_channels, out_channels, kernel);
+#endif
+    if (wk == NULL) {
+        wk = (float *)malloc(out_channels * in_channels * sizeof(float));
+        owns_wk = 1;
+    }
+    if (wk == NULL) {
             graph_error(error, error_capacity, "out of memory in causal conv1d");
             return -1;
         }
         for (size_t k = 0; k < kernel; ++k) {
             const size_t shift = (kernel - 1u - k) * dilation;
             if (shift >= length) continue;
+        if (owns_wk) {
             const double pack_start = profile != NULL ? phase_seconds() : 0.0;
             for (size_t o = 0; o < out_channels; ++o) {
                 for (size_t i = 0; i < in_channels; ++i) {
-                    wk[o * in_channels + i] = weight.data[(o * in_channels + i) * kernel + k];
+                    wk[o * in_channels + i] =
+                        weight.data[(o * in_channels + i) * kernel + k];
                 }
             }
             if (profile != NULL) profile->pack_seconds += phase_seconds() - pack_start;
-            const size_t n = length - shift;
-            const double gemm_start = profile != NULL ? phase_seconds() : 0.0;
-            graph_sgemm(backend, 0, 0, (int)out_channels, (int)n, (int)in_channels, 1.0f, wk, (int)in_channels, input, (int)length, 1.0f, output + shift, (int)length, error, error_capacity);
+        }
+        const size_t n = length - shift;
+        const float *tap_weights = owns_wk
+            ? wk : wk + k * out_channels * in_channels;
+        const double gemm_start = profile != NULL ? phase_seconds() : 0.0;
+        graph_sgemm(backend, 0, 0, (int)out_channels, (int)n,
+                    (int)in_channels, 1.0f, tap_weights, (int)in_channels,
+                    input, (int)length, 1.0f, output + shift, (int)length,
+                    error, error_capacity);
             if (profile != NULL) profile->gemm_seconds += phase_seconds() - gemm_start;
         }
-        free(wk);
+    if (owns_wk) free(wk);
         return 0;
     }
     for (size_t o = 0; o < out_channels; ++o) {
