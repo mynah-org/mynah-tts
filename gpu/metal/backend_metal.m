@@ -202,11 +202,29 @@ static int metal_self_test(void *opaque, char *error, size_t error_capacity) {
     const float bias[4] = {0.5f, -0.5f, 1.0f, 2.0f};
     const float expected[8] = {1.5f, 1.5f, 4.0f, 8.0f, -0.5f, 0.0f, 3.0f, 3.5f};
     float output[8] = {0};
+    float tiled_weight[128] = {0};
+    float tiled_bias[64] = {0};
+    float tiled_output[64] = {0};
     if (metal_matmul(opaque, input, output, 2u, 3u, 4u, weight, bias,
                      error, error_capacity) != 0) return -1;
     for (size_t i = 0; i < 8u; ++i) {
         if (fabsf(output[i] - expected[i]) > 1.0e-5f) {
             snprintf(error, error_capacity, "Metal backend self-test mismatch at %zu", i);
+            return -1;
+        }
+    }
+    for (size_t column = 0; column < 64u; ++column) {
+        tiled_weight[column * 2u] = 1.0f;
+        tiled_bias[column] = (float)column;
+    }
+    if (metal_matmul(opaque, input, tiled_output, 1u, 2u, 64u,
+                     tiled_weight, tiled_bias, error, error_capacity) != 0) {
+        return -1;
+    }
+    for (size_t column = 0; column < 64u; ++column) {
+        if (fabsf(tiled_output[column] - (1.0f + (float)column)) > 1.0e-5f) {
+            snprintf(error, error_capacity,
+                     "Metal tiled self-test mismatch at %zu", column);
             return -1;
         }
     }

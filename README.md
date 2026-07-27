@@ -78,6 +78,14 @@ make synthesize MODEL_DIR=models/magpie-v2607-pack \
 All model files, generated WAVs, build output, and the local `.venv` are
 ignored. The runtime never downloads weights implicitly.
 
+## Callback streaming
+
+The C API exposes `mynah_tts_stream_open/push/flush/close`. Token chunks can
+be pushed for long-form input and `flush` delivers the shared offline graph
+as fixed-size PCM callback chunks. This is buffered streaming: `push` does not
+emit audio until `flush`, preserving offline equivalence while incremental
+causal codec emission remains future work.
+
 ## Reference oracle
 
 The oracle uses the official NeMo package only offline. Its local inference

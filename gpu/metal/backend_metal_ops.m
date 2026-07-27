@@ -74,10 +74,10 @@ static id<MTLComputePipelineState> metal_ops_pipeline(MynahMetalState *state,
         "kernel void mynah_ops_gelu(device float *x [[buffer(0)]], uint i [[thread_position_in_grid]]) { float v=x[i]; float c=0.7978845608f*(v+0.044715f*v*v*v); x[i]=0.5f*v*(1.0f+tanh(c)); }\n"
         "kernel void mynah_ops_residual(device float *out [[buffer(0)]], device const float *in [[buffer(1)]], uint i [[thread_position_in_grid]]) { out[i] += in[i]; }\n"
         "struct SnakeParams { uint channels; uint length; uint snake_channels; };\n"
-        "kernel void mynah_ops_snake(device float *x [[buffer(0)]], device const float *alpha [[buffer(1)]], constant SnakeParams &p [[buffer(2)]], uint i [[thread_position_in_grid]]) { uint ch=i/p.length; uint t=i-ch*p.length; if(ch<p.snake_channels){float a=alpha[ch];float v=x[i];float s=sin(a*v);x[i]=v+s*s/(a+1.0e-9f);} else if(x[i]<0.0f) x[i]*=0.01f; }\n"
-        "struct ConvParams { uint in_channels; uint out_channels; uint length; uint kernel; uint dilation; };\n"
-        "kernel void mynah_ops_im2col(device const float *input [[buffer(0)]], device float *columns [[buffer(1)]], constant ConvParams &p [[buffer(2)]], uint index [[thread_position_in_grid]]) { uint t=index%p.length; uint ik=index/p.length; uint k=ik%p.kernel; uint ch=ik/p.kernel; int src=int(t)-int((p.kernel-1u-k)*p.dilation); columns[index]=(src>=0)?input[ch*p.length+uint(src)]:0.0f; }\n"
-        "kernel void mynah_ops_conv(device const float *columns [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant ConvParams &p [[buffer(4)]], uint index [[thread_position_in_grid]]) { uint t=index%p.length; uint o=index/p.length; float v=bias==nullptr?0.0f:bias[o]; for(uint ch=0;ch<p.in_channels;ch++) for(uint k=0;k<p.kernel;k++) v+=weight[o*(p.in_channels*p.kernel)+ch*p.kernel+k]*columns[(ch*p.kernel+k)*p.length+t]; output[index]=v; }\n"
+        "kernel void mynah_ops_snake(device float *x [[buffer(0)]], device const float *alpha [[buffer(1)]], constant SnakeParams &p [[buffer(2)]], uint i [[thread_position_in_grid]]) { uint ch=i/p.length; if(ch<p.snake_channels){float a=alpha[ch];float v=x[i];float s=sin(a*v);x[i]=v+s*s/(a+1.0e-9f);} else if(x[i]<0.0f) x[i]*=0.01f; }\n"
+        "struct ConvParams { uint in_channels; uint out_channels; uint length; uint kernel_size; uint dilation; };\n"
+        "kernel void mynah_ops_im2col(device const float *input [[buffer(0)]], device float *columns [[buffer(1)]], constant ConvParams &p [[buffer(2)]], uint index [[thread_position_in_grid]]) { uint t=index%p.length; uint ik=index/p.length; uint k=ik%p.kernel_size; uint ch=ik/p.kernel_size; int src=int(t)-int((p.kernel_size-1u-k)*p.dilation); columns[index]=(src>=0)?input[ch*p.length+uint(src)]:0.0f; }\n"
+        "kernel void mynah_ops_conv(device const float *columns [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant ConvParams &p [[buffer(4)]], uint index [[thread_position_in_grid]]) { uint t=index%p.length; uint o=index/p.length; float v=bias==nullptr?0.0f:bias[o]; for(uint ch=0;ch<p.in_channels;ch++) for(uint k=0;k<p.kernel_size;k++) v+=weight[o*(p.in_channels*p.kernel_size)+ch*p.kernel_size+k]*columns[(ch*p.kernel_size+k)*p.length+t]; output[index]=v; }\n"
         "kernel void mynah_ops_layer_norm(device const float *in [[buffer(0)]], device float *out [[buffer(1)]], device const float *gain [[buffer(2)]], device const float *bias [[buffer(3)]], constant NormParams &p [[buffer(4)]], uint row [[thread_position_in_grid]]) {\n"
         " if (row >= p.rows) return; device const float *x=in+row*p.width; device float *y=out+row*p.width; float mean=0.0f; for(uint i=0;i<p.width;i++) mean+=x[i]; mean/=float(p.width); float var=0.0f; for(uint i=0;i<p.width;i++){float d=x[i]-mean;var+=d*d;} float inv=rsqrt(var/float(p.width)+p.epsilon); for(uint i=0;i<p.width;i++) y[i]=(x[i]-mean)*inv*gain[i]+(bias==nullptr?0.0f:bias[i]); }\n";
         NSError *compile_error = nil;
@@ -235,8 +235,11 @@ static int metal_ops_dispatch_vector(MynahMetalState *state, NSString *name,
     id<MTLBuffer> out = metal_ops_buffer(state, data, n * sizeof(float));
     id<MTLBuffer> in = other == NULL ? nil : metal_ops_buffer(state, other, n * sizeof(float));
     id<MTLComputePipelineState> pipeline = metal_ops_pipeline(state, name, error, capacity);
-    if (out == nil || (other != NULL && in == nil) || pipeline == nil) {
+    if (out == nil || (other != NULL && in == nil)) {
         metal_ops_error(error, capacity, @"Metal resident buffer lookup failed");
+        return -1;
+    }
+    if (pipeline == nil) {
         return -1;
     }
     id<MTLCommandBuffer> command = [state.queue commandBuffer];

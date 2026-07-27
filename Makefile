@@ -80,8 +80,10 @@ CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
 TARGET := $(BUILD_DIR)/mynah-tts
 LIBRARY := $(BUILD_DIR)/libmynah_tts.a
+STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
+STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
-.PHONY: all cpu info caps self-test test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+.PHONY: all cpu info caps self-test test stream-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist
 
 all: $(TARGET)
@@ -98,6 +100,14 @@ $(TARGET): $(CORE_OBJECTS) $(CLI_OBJECT)
 $(LIBRARY): $(CORE_OBJECTS)
 	@mkdir -p $(@D)
 	$(AR) rcs $@ $^
+
+$(STREAM_TEST_TARGET): $(CORE_OBJECTS) $(STREAM_TEST_OBJECT)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+stream-test: $(STREAM_TEST_TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make stream-test MODEL_DIR=pack" >&2; exit 2)
+	@$(STREAM_TEST_TARGET) "$(MODEL_DIR)"
 
 lib: $(LIBRARY)
 shared: $(TARGET)
@@ -278,4 +288,4 @@ dist:
 clean:
 	rm -rf build
 
--include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d)
+-include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d)

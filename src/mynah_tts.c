@@ -11,6 +11,52 @@
 #include <string.h>
 #include <sys/stat.h>
 
+struct mynah_tts_stream {
+    const mynah_tts_model *model;
+    mynah_tts_request request;
+    int *text_ids;
+    size_t text_length;
+    size_t text_capacity;
+    size_t chunk_samples;
+    mynah_tts_audio_callback callback;
+    void *user_data;
+    int flushed;
+};
+
+static void stream_error(char *error, size_t capacity, const char *message) {
+    if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
+}
+
+static int stream_reserve(mynah_tts_stream *stream, size_t extra,
+                          char *error, size_t error_capacity) {
+    if (stream->text_length > SIZE_MAX - extra) {
+        stream_error(error, error_capacity, "stream token length overflow");
+        return -1;
+    }
+    const size_t required = stream->text_length + extra;
+    if (required <= stream->text_capacity) return 0;
+    size_t capacity = stream->text_capacity == 0 ? 64u : stream->text_capacity;
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2u) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2u;
+    }
+    if (capacity > SIZE_MAX / sizeof(*stream->text_ids)) {
+        stream_error(error, error_capacity, "stream token allocation overflow");
+        return -1;
+    }
+    int *grown = (int *)realloc(stream->text_ids, capacity * sizeof(*grown));
+    if (grown == NULL) {
+        stream_error(error, error_capacity, "out of memory growing stream tokens");
+        return -1;
+    }
+    stream->text_ids = grown;
+    stream->text_capacity = capacity;
+    return 0;
+}
+
 static void set_error(char *error, size_t capacity, const char *message) {
     if (capacity == 0) return;
     snprintf(error, capacity, "%s", message);
@@ -289,4 +335,117 @@ int mynah_tts_model_get_info(const mynah_tts_model *model,
 int mynah_tts_device_self_test(mynah_tts_device device, char *error,
                                size_t error_capacity) {
     return mynah_backend_self_test(device, error, error_capacity);
+}
+
+int mynah_tts_stream_open(const mynah_tts_model *model,
+                          const mynah_tts_request *request,
+                          size_t chunk_samples,
+                          mynah_tts_audio_callback callback,
+                          void *user_data,
+                          mynah_tts_stream **out_stream,
+                          char *error, size_t error_capacity) {
+    if (out_stream != NULL) *out_stream = NULL;
+    if (model == NULL || request == NULL || out_stream == NULL ||
+        callback == NULL || chunk_samples == 0 || error == NULL ||
+        error_capacity == 0) {
+        stream_error(error, error_capacity, "invalid stream arguments");
+        return -1;
+    }
+    if (request->text_length > 0 && request->text_ids == NULL) {
+        stream_error(error, error_capacity, "stream text ids are missing");
+        return -1;
+    }
+    mynah_tts_stream *stream = (mynah_tts_stream *)calloc(1, sizeof(*stream));
+    if (stream == NULL) {
+        stream_error(error, error_capacity, "out of memory creating stream");
+        return -1;
+    }
+    stream->model = model;
+    stream->request = *request;
+    stream->request.text_ids = NULL;
+    stream->request.text_length = 0;
+    stream->chunk_samples = chunk_samples;
+    stream->callback = callback;
+    stream->user_data = user_data;
+    if (request->text_length > 0 &&
+        (stream_reserve(stream, request->text_length, error, error_capacity) != 0 ||
+         (request->text_length > 0 && stream->text_ids == NULL))) {
+        mynah_tts_stream_close(stream);
+        return -1;
+    }
+    if (request->text_length > 0) {
+        memcpy(stream->text_ids, request->text_ids,
+               request->text_length * sizeof(*stream->text_ids));
+        stream->text_length = request->text_length;
+    }
+    *out_stream = stream;
+    error[0] = '\0';
+    return 0;
+}
+
+int mynah_tts_stream_push(mynah_tts_stream *stream, const int *text_ids,
+                          size_t text_length, char *error, size_t error_capacity) {
+    if (stream == NULL || error == NULL || error_capacity == 0 ||
+        (text_length > 0 && text_ids == NULL)) {
+        stream_error(error, error_capacity, "invalid stream push arguments");
+        return -1;
+    }
+    if (stream->flushed) {
+        stream_error(error, error_capacity, "stream is already flushed");
+        return -1;
+    }
+    if (stream_reserve(stream, text_length, error, error_capacity) != 0) return -1;
+    if (text_length > 0) {
+        memcpy(stream->text_ids + stream->text_length, text_ids,
+               text_length * sizeof(*stream->text_ids));
+        stream->text_length += text_length;
+    }
+    error[0] = '\0';
+    return 0;
+}
+
+int mynah_tts_stream_flush(mynah_tts_stream *stream,
+                           char *error, size_t error_capacity) {
+    if (stream == NULL || error == NULL || error_capacity == 0) {
+        stream_error(error, error_capacity, "invalid stream flush arguments");
+        return -1;
+    }
+    if (stream->flushed) {
+        error[0] = '\0';
+        return 0;
+    }
+    if (stream->text_length == 0) {
+        stream_error(error, error_capacity, "cannot flush an empty stream");
+        return -1;
+    }
+    stream->request.text_ids = stream->text_ids;
+    stream->request.text_length = stream->text_length;
+    float *samples = NULL;
+    size_t sample_count = 0;
+    if (mynah_tts_synthesize(stream->model, &stream->request, &samples,
+                             &sample_count, error, error_capacity) != 0) {
+        mynah_tts_free_samples(samples);
+        return -1;
+    }
+    for (size_t offset = 0; offset < sample_count; ) {
+        const size_t remaining = sample_count - offset;
+        const size_t count = remaining < stream->chunk_samples
+            ? remaining : stream->chunk_samples;
+        if (stream->callback(samples + offset, count, stream->user_data) != 0) {
+            mynah_tts_free_samples(samples);
+            stream_error(error, error_capacity, "audio callback aborted stream");
+            return -1;
+        }
+        offset += count;
+    }
+    mynah_tts_free_samples(samples);
+    stream->flushed = 1;
+    error[0] = '\0';
+    return 0;
+}
+
+void mynah_tts_stream_close(mynah_tts_stream *stream) {
+    if (stream == NULL) return;
+    free(stream->text_ids);
+    free(stream);
 }

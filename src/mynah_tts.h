@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYNAH_TTS_VERSION "1.0.0"
+#define MYNAH_TTS_VERSION "1.1.0"
 
 typedef struct mynah_tts_model mynah_tts_model;
 
@@ -51,6 +51,10 @@ typedef struct {
     uint64_t seed;
 } mynah_tts_request;
 
+typedef int (*mynah_tts_audio_callback)(const float *samples, size_t count,
+                                        void *user_data);
+typedef struct mynah_tts_stream mynah_tts_stream;
+
 int mynah_tts_model_open(const char *model_dir, mynah_tts_model **out_model,
                          char *error, size_t error_capacity);
 int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
@@ -69,5 +73,20 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
                          float **samples, size_t *sample_count,
                          char *error, size_t error_capacity);
 void mynah_tts_free_samples(float *samples);
+
+/* Buffered streaming/long-form sink. Push accepts token chunks; synthesis is
+ * performed once at flush and delivered as fixed-size PCM chunks. */
+int mynah_tts_stream_open(const mynah_tts_model *model,
+                          const mynah_tts_request *request,
+                          size_t chunk_samples,
+                          mynah_tts_audio_callback callback,
+                          void *user_data,
+                          mynah_tts_stream **out_stream,
+                          char *error, size_t error_capacity);
+int mynah_tts_stream_push(mynah_tts_stream *stream, const int *text_ids,
+                          size_t text_length, char *error, size_t error_capacity);
+int mynah_tts_stream_flush(mynah_tts_stream *stream,
+                           char *error, size_t error_capacity);
+void mynah_tts_stream_close(mynah_tts_stream *stream);
 
 #endif
