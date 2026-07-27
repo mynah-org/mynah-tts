@@ -168,13 +168,17 @@ typedef struct {
     size_t output_width;
 } matvec_rows_job;
 
-static void matvec_row(void *opaque, int row_index) {
+static void matvec_block(void *opaque, int block_index) {
     const matvec_rows_job *job = (const matvec_rows_job *)opaque;
-    const size_t row = (size_t)row_index;
-    float *out = job->output + row;
-    *out = mynah_dot_f32(job->weight + row * job->input_width,
-                         job->input, job->input_width);
-    if (job->bias != NULL) *out += job->bias[row];
+    const size_t row = (size_t)block_index * 4u;
+    const size_t count = row + 4u <= job->output_width
+                       ? 4u : job->output_width - row;
+    mynah_matvec_f32(job->weight + row * job->input_width,
+                     job->input, job->output + row, count, job->input_width);
+    if (job->bias != NULL) {
+        for (size_t i = 0; i < count; ++i)
+            job->output[row + i] += job->bias[row + i];
+    }
 }
 
 static int cpu_matmul(void *state, const float *input, float *output, size_t rows,
@@ -205,7 +209,8 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
             const matvec_rows_job job = {
                 input, output, weight, bias, input_width, output_width
             };
-            mynah_parallel_for((int)output_width, matvec_row, (void *)&job);
+            const size_t blocks = (output_width + 3u) / 4u;
+            mynah_parallel_for((int)blocks, matvec_block, (void *)&job);
         } else {
             mynah_matvec_bias_f32(weight, input, bias, output,
                                   output_width, input_width);
