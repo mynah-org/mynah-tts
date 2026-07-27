@@ -20,6 +20,7 @@ void mynah_layernorm_f32(const float *input, const float *weight,
                          size_t width, float epsilon);
 void mynah_residual_add_f32(float *output, const float *input, size_t n);
 void mynah_gelu_f32(float *data, size_t n);
+void mynah_gelu_f32_scalar(float *data, size_t n);
 int mynah_softmax_f32(const float *logits, float *probabilities, size_t n);
 size_t mynah_argmax_f32(const float *values, size_t n);
 int mynah_kernels_self_test(char *error, size_t error_capacity);

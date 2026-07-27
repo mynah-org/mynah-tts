@@ -222,7 +222,7 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
         /* This buffer is host-owned in the non-resident graph path.  Device
          * GELU APIs require device pointers; use the scalar/reference kernel
          * here so CPU and Metal follow the same host-side contract. */
-        mynah_gelu_f32(hidden, length * ffn_width);
+        mynah_gelu_f32_scalar(hidden, length * ffn_width);
         const int result = linear(backend, hidden, output, length, ffn_width, width,
                                   out_net.data, NULL, error, error_capacity);
         free(hidden);
@@ -254,7 +254,7 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
             if (shift >= length) continue;
             graph_sgemm(backend, 0, 1, (int)(length - shift), (int)ffn_width, (int)width, 1.0f, input, (int)width, wk + k * ffn_width * width, (int)width, 1.0f, hidden + shift * ffn_width, (int)ffn_width, error, error_capacity);
         }
-        mynah_gelu_f32(hidden, length * ffn_width);
+        mynah_gelu_f32_scalar(hidden, length * ffn_width);
         /* Extract out_net taps with same optimized pattern. */
         for (size_t o = 0; o < width; ++o) {
             for (size_t i = 0; i < ffn_width; ++i) {
@@ -2561,7 +2561,11 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         if (mynah_backend_matmul(model->backend, nrm, hidden,
                               count, width, ffn,
                               r->ffn_up_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
-        mynah_gelu_f32(hidden, hidden_elements);
+        if (getenv("MYNAH_GELU_SCALAR") == NULL && count > 1u) {
+            mynah_gelu_f32(hidden, hidden_elements);
+        } else {
+            mynah_gelu_f32_scalar(hidden, hidden_elements);
+        }
         if (mynah_backend_matmul(model->backend, hidden, proj,
                               count, ffn, width,
                               r->ffn_down_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
