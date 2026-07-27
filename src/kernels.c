@@ -313,6 +313,63 @@ void mynah_gelu_f32(float *data, size_t n) {
         return;
     }
 #endif
+#if defined(MYNAH_KERNELS_NEON)
+    if (getenv("MYNAH_GELU_SCALAR") == NULL) {
+        const float32x4_t half = vdupq_n_f32(0.5f);
+        const float32x4_t one = vdupq_n_f32(1.0f);
+        const float32x4_t scale = vdupq_n_f32(0.7978845608f);
+        const float32x4_t cubic_scale = vdupq_n_f32(0.044715f);
+        const float32x4_t p0 = vdupq_n_f32(1.0f);
+        const float32x4_t p1 = vdupq_n_f32(1.0f / 7.0f);
+        const float32x4_t p2 = vdupq_n_f32(4.0f / 855.0f);
+        const float32x4_t p3 = vdupq_n_f32(1.0f / 20349.0f);
+        const float32x4_t p4 = vdupq_n_f32(1.0f / 6409935.0f);
+        const float32x4_t p5 = vdupq_n_f32(1.0f / 13749310575.0f);
+        const float32x4_t q1 = vdupq_n_f32(10.0f / 21.0f);
+        const float32x4_t q2 = vdupq_n_f32(4.0f / 133.0f);
+        const float32x4_t q3 = vdupq_n_f32(8.0f / 14535.0f);
+        const float32x4_t q4 = vdupq_n_f32(1.0f / 305235.0f);
+        const float32x4_t q5 = vdupq_n_f32(2.0f / 416645775.0f);
+        const float32x4_t lower = vdupq_n_f32(-6.0f);
+        const float32x4_t upper = vdupq_n_f32(6.0f);
+        size_t i = 0;
+        for (; i + 4u <= n; i += 4u) {
+            const float32x4_t x = vld1q_f32(data + i);
+            const float32x4_t x2 = vmulq_f32(x, x);
+            const float32x4_t x3 = vmulq_f32(x2, x);
+            const float32x4_t inner = vmulq_f32(
+                scale, vaddq_f32(x, vmulq_f32(cubic_scale, x3)));
+            const float32x4_t u = vminq_f32(vmaxq_f32(inner, lower), upper);
+            const float32x4_t u2 = vmulq_f32(u, u);
+            float32x4_t numerator = p5;
+            numerator = vmlaq_f32(p4, numerator, u2);
+            numerator = vmlaq_f32(p3, numerator, u2);
+            numerator = vmlaq_f32(p2, numerator, u2);
+            numerator = vmlaq_f32(p1, numerator, u2);
+            numerator = vmlaq_f32(p0, numerator, u2);
+            float32x4_t denominator = q5;
+            denominator = vmlaq_f32(q4, denominator, u2);
+            denominator = vmlaq_f32(q3, denominator, u2);
+            denominator = vmlaq_f32(q2, denominator, u2);
+            denominator = vmlaq_f32(q1, denominator, u2);
+#if defined(__aarch64__)
+            denominator = vmlaq_f32(one, denominator, u2);
+            const float32x4_t tanh_u = vmulq_f32(u, vdivq_f32(numerator, denominator));
+            vst1q_f32(data + i, vmulq_f32(vmulq_f32(half, x), vaddq_f32(one, tanh_u)));
+#else
+            (void)denominator;
+            break;
+#endif
+        }
+        for (; i < n; ++i) {
+            const float x = data[i];
+            const float cubic = x * x * x;
+            const float c = 0.7978845608f * (x + 0.044715f * cubic);
+            data[i] = 0.5f * x * (1.0f + tanhf(c));
+        }
+        return;
+    }
+#endif
     /* Keep the calibrated CUDA/CPU formula as the scalar reference. */
     for (size_t i = 0; i < n; ++i) {
         const float x = data[i];
