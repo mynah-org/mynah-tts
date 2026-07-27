@@ -251,7 +251,16 @@ static int metal_ops_dispatch_vector(MynahMetalState *state, NSString *name,
     [encoder dispatchThreads:MTLSizeMake(n, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
     [encoder endEncoding];
-    return metal_ops_commit(state, command, error, capacity);
+    if (metal_ops_commit(state, command, error, capacity) != 0) return -1;
+    /* Host callers pass ordinary malloc'd arrays.  bufferForHostPointer: uses
+     * a private shared MTLBuffer for those arrays, so the GPU result must be
+     * copied back before returning.  Resident callers pass buffer.contents;
+     * in that case the pointers are identical and the copy is unnecessary. */
+    if (out.contents != data) {
+        if (metal_ops_sync_state(state, error, capacity) != 0) return -1;
+        memcpy(data, out.contents, n * sizeof(float));
+    }
+    return 0;
 }
 
 static int metal_ops_layer_norm(MynahMetalState *state, const float *input,
@@ -267,11 +276,14 @@ static int metal_ops_layer_norm(MynahMetalState *state, const float *input,
         metal_ops_error(error, capacity, @"Metal layer norm buffer lookup failed");
         return -1;
     }
-    if (state.params_buffer == nil)
-        state.params_buffer = [state.device newBufferWithLength:sizeof(metal_ops_norm_params)
-                                                         options:MTLResourceStorageModeShared];
     metal_ops_norm_params params = {(uint32_t)rows, (uint32_t)width, 1.0e-5f};
-    memcpy(state.params_buffer.contents, &params, sizeof(params));
+ id<MTLBuffer> params_buffer = [state.device newBufferWithBytes:&params
+                                                           length:sizeof(params)
+                                                          options:MTLResourceStorageModeShared];
+ if (params_buffer == nil) {
+ metal_ops_error(error, capacity, @"Metal layer norm parameter buffer allocation failed");
+ return -1;
+ }
     id<MTLCommandBuffer> command = [state.queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
@@ -279,7 +291,7 @@ static int metal_ops_layer_norm(MynahMetalState *state, const float *input,
     [encoder setBuffer:out offset:0 atIndex:1];
     [encoder setBuffer:dg offset:0 atIndex:2];
     [encoder setBuffer:db offset:0 atIndex:3];
-    [encoder setBuffer:state.params_buffer offset:0 atIndex:4];
+ [encoder setBuffer:params_buffer offset:0 atIndex:4];
     [encoder dispatchThreads:MTLSizeMake(rows, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
     [encoder endEncoding];
@@ -302,11 +314,14 @@ static int metal_ops_matmul(MynahMetalState *state, const float *input,
         metal_ops_error(error, capacity, @"Metal matmul resident buffer lookup failed");
         return -1;
     }
-    if (state.params_buffer == nil)
-        state.params_buffer = [state.device newBufferWithLength:sizeof(metal_ops_matmul_params)
-                                                         options:MTLResourceStorageModeShared];
     metal_ops_matmul_params params = {(uint32_t)rows, (uint32_t)iw, (uint32_t)ow};
-    memcpy(state.params_buffer.contents, &params, sizeof(params));
+ id<MTLBuffer> params_buffer = [state.device newBufferWithBytes:&params
+                                                           length:sizeof(params)
+                                                          options:MTLResourceStorageModeShared];
+ if (params_buffer == nil) {
+ metal_ops_error(error, capacity, @"Metal matmul parameter buffer allocation failed");
+ return -1;
+ }
     id<MTLComputePipelineState> pipeline = ow >= 64u ? state.tiled_pipeline : state.matmul_pipeline;
     if (pipeline == nil) {
         metal_ops_error(error, capacity, @"Metal matmul pipeline unavailable");
@@ -319,7 +334,7 @@ static int metal_ops_matmul(MynahMetalState *state, const float *input,
     [encoder setBuffer:dw offset:0 atIndex:1];
     [encoder setBuffer:db offset:0 atIndex:2];
     [encoder setBuffer:out offset:0 atIndex:3];
-    [encoder setBuffer:state.params_buffer offset:0 atIndex:4];
+ [encoder setBuffer:params_buffer offset:0 atIndex:4];
     if (pipeline == state.tiled_pipeline) {
         NSUInteger tgx = MIN((NSUInteger)64, pipeline.maxTotalThreadsPerThreadgroup);
         NSUInteger tgy = MIN((NSUInteger)4, pipeline.maxTotalThreadsPerThreadgroup / tgx);

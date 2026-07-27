@@ -38,14 +38,23 @@ static int fail(const char *where, const char *error) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL_DIR\n", argv[0]);
+    if (argc != 2 && argc != 3) {
+        fprintf(stderr, "usage: %s MODEL_DIR [cpu|metal]\n", argv[0]);
         return 2;
     }
     const int tokens[] = {55, 79, 90, 59, 62, 87, 93, 27, 39, 36, 34};
     char error[256] = {0};
     mynah_tts_model *model = NULL;
-    if (mynah_tts_model_open(argv[1], &model, error, sizeof(error)) != 0)
+    mynah_tts_device device = MYNAH_TTS_DEVICE_CPU;
+    if (argc == 3) {
+        if (strcmp(argv[2], "metal") == 0) device = MYNAH_TTS_DEVICE_METAL;
+        else if (strcmp(argv[2], "cpu") != 0) {
+            fprintf(stderr, "unknown device: %s\n", argv[2]);
+            return 2;
+        }
+    }
+    if (mynah_tts_model_open_device(argv[1], device, &model,
+                                    error, sizeof(error)) != 0)
         return fail("model_open", error);
     mynah_tts_request request = {
         .text_ids = tokens,

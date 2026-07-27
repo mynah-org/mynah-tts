@@ -219,7 +219,10 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
             free(hidden);
             return -1;
         }
-        mynah_backend_gelu_dev(backend, hidden, length * ffn_width, error, error_capacity);
+        /* This buffer is host-owned in the non-resident graph path.  Device
+         * GELU APIs require device pointers; use the scalar/reference kernel
+         * here so CPU and Metal follow the same host-side contract. */
+        mynah_gelu_f32(hidden, length * ffn_width);
         const int result = linear(backend, hidden, output, length, ffn_width, width,
                                   out_net.data, NULL, error, error_capacity);
         free(hidden);
@@ -251,7 +254,7 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
             if (shift >= length) continue;
             graph_sgemm(backend, 0, 1, (int)(length - shift), (int)ffn_width, (int)width, 1.0f, input, (int)width, wk + k * ffn_width * width, (int)width, 1.0f, hidden + shift * ffn_width, (int)ffn_width, error, error_capacity);
         }
-        mynah_backend_gelu_dev(backend, hidden, length * ffn_width, error, error_capacity);
+        mynah_gelu_f32(hidden, length * ffn_width);
         /* Extract out_net taps with same optimized pattern. */
         for (size_t o = 0; o < width; ++o) {
             for (size_t i = 0; i < ffn_width; ++i) {
@@ -2550,7 +2553,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         if (mynah_backend_matmul(model->backend, nrm, hidden,
                               count, width, ffn,
                               r->ffn_up_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
-        mynah_backend_gelu_dev(model->backend, hidden, hidden_elements, error, error_capacity);
+        mynah_gelu_f32(hidden, hidden_elements);
         if (mynah_backend_matmul(model->backend, hidden, proj,
                               count, ffn, width,
                               r->ffn_down_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
@@ -2571,17 +2574,40 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     return failed ? -1 : 0;
 }
 
-int mynah_tts_synthesize(const mynah_tts_model *model,
-                         const mynah_tts_request *request,
-                         float **samples, size_t *sample_count,
-                         char *error, size_t error_capacity) {
+static int emit_stream_samples(mynah_tts_audio_callback callback, void *user_data,
+                               const float *samples, size_t count,
+                               size_t chunk_samples, char *error,
+                               size_t error_capacity) {
+    if (callback == NULL || count == 0) return 0;
+    size_t offset = 0;
+    while (offset < count) {
+        const size_t remaining = count - offset;
+        const size_t chunk = remaining < chunk_samples ? remaining : chunk_samples;
+        if (callback(samples + offset, chunk, user_data) != 0) {
+            graph_error(error, error_capacity, "audio callback aborted streaming");
+            return -1;
+        }
+        offset += chunk;
+    }
+    return 0;
+}
+
+int mynah_graph_synthesize_stream(const mynah_tts_model *model,
+                                  const mynah_tts_request *request,
+                                  float **samples, size_t *sample_count,
+                                  mynah_tts_audio_callback callback,
+                                  void *user_data, size_t chunk_samples,
+                                  char *error, size_t error_capacity) {
     if (samples != NULL) *samples = NULL;
     if (sample_count != NULL) *sample_count = 0;
-    if (model == NULL || request == NULL || samples == NULL || sample_count == NULL ||
-        error == NULL || error_capacity == 0 || request->text_ids == NULL || request->text_length == 0) {
+    if (model == NULL || request == NULL ||
+        ((samples == NULL || sample_count == NULL) && callback == NULL) ||
+        error == NULL || error_capacity == 0 || request->text_ids == NULL ||
+        request->text_length == 0 || (callback != NULL && chunk_samples == 0)) {
         graph_error(error, error_capacity, "invalid synthesis request");
         return -1;
     }
+    size_t streamed_samples = 0;
     if (request->speaker >= model->info.speaker_count) {
         graph_error(error, error_capacity, "speaker index is outside the model");
         return -1;
@@ -2755,7 +2781,49 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
         }
         if (timing) ar_local_seconds += phase_seconds() - stage_start;
         ++predicted_stacks;
-        if (step_eos_frame != SIZE_MAX) {
+        if (callback != NULL) {
+            size_t stream_raw = predicted_stacks * model->info.frame_stacking_factor;
+            if (step_eos_frame != SIZE_MAX) {
+                stream_raw = (predicted_stacks - 1u) * model->info.frame_stacking_factor +
+                             step_eos_frame;
+            }
+            if (stream_raw > 0) {
+                unsigned *stream_codes = (unsigned *)calloc(
+                    model->info.codebook_count * stream_raw, sizeof(*stream_codes));
+                if (stream_codes == NULL) {
+                    graph_error(error, error_capacity, "out of memory preparing streamed codes");
+                    break;
+                }
+                for (size_t c = 0; c < model->info.codebook_count; ++c) {
+                    memcpy(stream_codes + c * stream_raw,
+                           codes + c * max_raw_length + model->info.frame_stacking_factor,
+                           stream_raw * sizeof(*stream_codes));
+                }
+                float *stream_audio = NULL;
+                size_t stream_count = 0;
+                if (decode_codec(model, stream_codes, stream_raw, &stream_audio,
+                                 &stream_count, error, error_capacity) != 0) {
+                    free(stream_codes);
+                    break;
+                }
+                if (stream_count < streamed_samples ||
+                    emit_stream_samples(callback, user_data,
+                                        stream_audio + streamed_samples,
+                                        stream_count - streamed_samples, chunk_samples,
+                                        error, error_capacity) != 0) {
+                    free(stream_audio);
+                    free(stream_codes);
+                    if (stream_count < streamed_samples) {
+                        graph_error(error, error_capacity, "streamed codec output regressed");
+                    }
+                    break;
+                }
+                streamed_samples = stream_count;
+                free(stream_audio);
+                free(stream_codes);
+            }
+        }
+ if (step_eos_frame != SIZE_MAX) {
             eos_frame = step_eos_frame;
         }
         if (saw_eos && predicted_stacks >= 4u) {
@@ -2796,6 +2864,11 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
     } else if (generated_raw == 0) {
         if (error[0] == '\0') graph_error(error, error_capacity, "decoder generated no audio frames");
         result = -1;
+    } else if (callback != NULL) {
+        if (streamed_samples == 0) {
+            graph_error(error, error_capacity, "stream produced no audio frames");
+            result = -1;
+        }
     } else {
         unsigned *predicted_codes = (unsigned *)calloc(
             model->info.codebook_count * generated_raw, sizeof(*predicted_codes));
@@ -2833,6 +2906,14 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
     free(audio_row);
     if (result == 0) error[0] = '\0';
     return result;
+}
+
+int mynah_tts_synthesize(const mynah_tts_model *model,
+                         const mynah_tts_request *request,
+                         float **samples, size_t *sample_count,
+                         char *error, size_t error_capacity) {
+    return mynah_graph_synthesize_stream(model, request, samples, sample_count,
+                                          NULL, NULL, 0, error, error_capacity);
 }
 
 void mynah_tts_free_samples(float *samples) {

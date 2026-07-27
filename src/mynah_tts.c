@@ -420,25 +420,11 @@ int mynah_tts_stream_flush(mynah_tts_stream *stream,
     }
     stream->request.text_ids = stream->text_ids;
     stream->request.text_length = stream->text_length;
-    float *samples = NULL;
-    size_t sample_count = 0;
-    if (mynah_tts_synthesize(stream->model, &stream->request, &samples,
-                             &sample_count, error, error_capacity) != 0) {
-        mynah_tts_free_samples(samples);
+    if (mynah_graph_synthesize_stream(stream->model, &stream->request, NULL, NULL,
+                                      stream->callback, stream->user_data,
+                                      stream->chunk_samples, error, error_capacity) != 0) {
         return -1;
     }
-    for (size_t offset = 0; offset < sample_count; ) {
-        const size_t remaining = sample_count - offset;
-        const size_t count = remaining < stream->chunk_samples
-            ? remaining : stream->chunk_samples;
-        if (stream->callback(samples + offset, count, stream->user_data) != 0) {
-            mynah_tts_free_samples(samples);
-            stream_error(error, error_capacity, "audio callback aborted stream");
-            return -1;
-        }
-        offset += count;
-    }
-    mynah_tts_free_samples(samples);
     stream->flushed = 1;
     error[0] = '\0';
     return 0;

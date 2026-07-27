@@ -81,10 +81,11 @@ ignored. The runtime never downloads weights implicitly.
 ## Callback streaming
 
 The C API exposes `mynah_tts_stream_open/push/flush/close`. Token chunks can
-be pushed for long-form input and `flush` delivers the shared offline graph
-as fixed-size PCM callback chunks. This is buffered streaming: `push` does not
-emit audio until `flush`, preserving offline equivalence while incremental
-causal codec emission remains future work.
+be pushed for long-form input; `flush` drives the shared autoregressive graph
+and emits causal, already-stable PCM prefixes through fixed-size callback
+chunks. The callback stream is sample-identical to offline synthesis for the
+same request. A future codec-state refactor can remove the current prefix
+re-decode cost; see the streaming/design TODO in `PLAN.md`.
 
 ## Reference oracle
 

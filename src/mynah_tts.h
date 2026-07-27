@@ -74,8 +74,8 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
                          char *error, size_t error_capacity);
 void mynah_tts_free_samples(float *samples);
 
-/* Buffered streaming/long-form sink. Push accepts token chunks; synthesis is
- * performed once at flush and delivered as fixed-size PCM chunks. */
+/* Incremental causal-prefix sink. Push accepts token chunks; flush runs the
+ * shared AR graph and emits stable PCM prefixes through the callback. */
 int mynah_tts_stream_open(const mynah_tts_model *model,
                           const mynah_tts_request *request,
                           size_t chunk_samples,
