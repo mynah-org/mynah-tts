@@ -20,6 +20,8 @@ typedef struct {
  * cached by host pointer; activation/IO buffers are pre-allocated at
  * maximum size and reused. */
 @interface MynahMetalState : NSObject
+@property(nonatomic, strong) NSMutableArray *params_buffers;
+@property(nonatomic, assign) NSUInteger params_cursor;
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLComputePipelineState> matmul_pipeline;
@@ -114,6 +116,53 @@ static NSString *metal_shader_source(void) {
 " float value = bias == nullptr ? 0.0f : bias[column];\n"
 " for (uint i = 0; i < p.input_width; ++i) value += in[i] * w[i];\n"
 " output[index] = value; }\n";
+}
+
+/* Keep the runtime shader in sync with gpu/metal/matmul.metal.  This version
+ * uses cooperative threadgroup tiles instead of rereading global memory for
+ * every output element. */
+static NSString *metal_shader_source_cooperative(void) {
+    return
+    @"#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct MatmulParams { uint rows; uint input_width; uint output_width; };\n"
+    "constant uint TILE_M = 4; constant uint TILE_N = 64; constant uint TILE_K = 32;\n"
+    "kernel void mynah_matmul_tiled(device const float *input [[buffer(0)]],\n"
+    " device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]],\n"
+    " device float *output [[buffer(3)]], constant MatmulParams &p [[buffer(4)]],\n"
+    " uint2 gid [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]]) {\n"
+    " const uint row_start = gid.y * TILE_M; const uint col_start = gid.x * TILE_N;\n"
+    " const uint tx = lid.x; const uint ty = lid.y; const uint col = col_start + tx;\n"
+    " const uint row = row_start + ty; const uint linear = ty * TILE_N + tx;\n"
+    " threadgroup float input_tile[TILE_M * TILE_K];\n"
+    " threadgroup float weight_tile[TILE_N * TILE_K]; float acc = 0.0f;\n"
+    " for (uint k0 = 0; k0 < p.input_width; k0 += TILE_K) {\n"
+    "  for (uint i = linear; i < TILE_M * TILE_K; i += TILE_M * TILE_N) {\n"
+    "   const uint tile_row = i / TILE_K; const uint tile_k = i - tile_row * TILE_K;\n"
+    "   const uint src_row = row_start + tile_row; const uint src_k = k0 + tile_k;\n"
+    "   input_tile[i] = (src_row < p.rows && src_k < p.input_width) ? input[src_row * p.input_width + src_k] : 0.0f;\n"
+    "  }\n"
+    "  for (uint i = linear; i < TILE_N * TILE_K; i += TILE_M * TILE_N) {\n"
+    "   const uint tile_col = i / TILE_K; const uint tile_k = i - tile_col * TILE_K;\n"
+    "   const uint src_col = col_start + tile_col; const uint src_k = k0 + tile_k;\n"
+    "   weight_tile[i] = (src_col < p.output_width && src_k < p.input_width) ? weight[src_col * p.input_width + src_k] : 0.0f;\n"
+    "  }\n"
+    "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "  for (uint k = 0; k < TILE_K; ++k) acc += input_tile[ty * TILE_K + k] * weight_tile[tx * TILE_K + k];\n"
+    "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    " }\n"
+    " if (row < p.rows && col < p.output_width) output[row * p.output_width + col] = acc + (bias == nullptr ? 0.0f : bias[col]);\n"
+    "}\n"
+    "kernel void mynah_matmul(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]],\n"
+    " device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant MatmulParams &p [[buffer(4)]],\n"
+    " uint index [[thread_position_in_grid]]) {\n"
+    " const uint total = p.rows * p.output_width; if (index >= total) return;\n"
+    " const uint row = index / p.output_width; const uint column = index - row * p.output_width;\n"
+    " const device float *input_row = input + row * p.input_width; const device float *weight_row = weight + column * p.input_width;\n"
+    " float value = bias == nullptr ? 0.0f : bias[column];\n"
+    " for (uint i = 0; i < p.input_width; ++i) value += input_row[i] * weight_row[i];\n"
+    " output[index] = value;\n"
+    "}\n";
 }
 
 static int metal_matmul(void *opaque, const float *input, float *output, size_t rows,
@@ -248,7 +297,7 @@ int mynah_backend_metal_open(void **state_out, mynah_backend_matmul_fn *matmul,
             return -1;
         }
         NSError *library_error = nil;
-        id<MTLLibrary> library = [device newLibraryWithSource:metal_shader_source()
+        id<MTLLibrary> library = [device newLibraryWithSource:metal_shader_source_cooperative()
                                                         options:nil error:&library_error];
         if (library == nil) {
             NSString *message = [NSString stringWithFormat:@"Metal shader compilation failed: %@",

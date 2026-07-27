@@ -18,6 +18,8 @@
 @end
 
 @interface MynahMetalState : NSObject
+@property(nonatomic, strong) NSMutableArray *params_buffers;
+@property(nonatomic, assign) NSUInteger params_cursor;
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLComputePipelineState> matmul_pipeline;
@@ -54,6 +56,30 @@ static void metal_ops_error(char *error, size_t capacity, NSString *message) {
     if (error == NULL || capacity == 0) return;
     const char *text = message.UTF8String;
     snprintf(error, capacity, "%s", text == NULL ? "Metal operation failed" : text);
+}
+
+static id<MTLBuffer> metal_ops_params_buffer(MynahMetalState *state,
+                                               const void *value, NSUInteger bytes,
+                                               char *error, size_t capacity) {
+    if (state.params_buffers == nil)
+        state.params_buffers = [NSMutableArray array];
+    const NSUInteger index = state.params_cursor++;
+    id<MTLBuffer> buffer = index < state.params_buffers.count
+        ? state.params_buffers[index] : nil;
+    if (buffer == nil || buffer.length < bytes) {
+        buffer = [state.device newBufferWithLength:bytes
+                                             options:MTLResourceStorageModeShared];
+        if (buffer == nil) {
+            metal_ops_error(error, capacity, @"Metal parameter buffer allocation failed");
+            return nil;
+        }
+        if (index < state.params_buffers.count)
+            state.params_buffers[index] = buffer;
+        else
+            [state.params_buffers addObject:buffer];
+    }
+    memcpy(buffer.contents, value, bytes);
+    return buffer;
 }
 
 static id<MTLBuffer> metal_ops_buffer(MynahMetalState *state,
@@ -135,6 +161,7 @@ static id<MTLCommandBuffer> metal_ops_command(MynahMetalState *state) {
 
 static int metal_ops_batch_begin(MynahMetalState *state, char *error, size_t capacity) {
     if (objc_getAssociatedObject(state, k_metal_ops_active_command) != nil) return 0;
+    state.params_cursor = 0;
     id<MTLCommandBuffer> command = [state.queue commandBuffer];
     if (command == nil) {
         metal_ops_error(error, capacity, @"Metal command batch allocation failed");
@@ -303,13 +330,12 @@ static int metal_ops_layer_norm(MynahMetalState *state, const float *input,
         return -1;
     }
     metal_ops_norm_params params = {(uint32_t)rows, (uint32_t)width, 1.0e-5f};
- id<MTLBuffer> params_buffer = [state.device newBufferWithBytes:&params
-                                                           length:sizeof(params)
-                                                          options:MTLResourceStorageModeShared];
- if (params_buffer == nil) {
- metal_ops_error(error, capacity, @"Metal layer norm parameter buffer allocation failed");
- return -1;
- }
+    id<MTLBuffer> params_buffer = metal_ops_params_buffer(state, &params,
+                                                           sizeof(params), error, capacity);
+    if (params_buffer == nil) {
+        metal_ops_error(error, capacity, @"Metal layer norm parameter buffer allocation failed");
+        return -1;
+    }
     id<MTLCommandBuffer> command = metal_ops_command(state);
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
@@ -317,7 +343,7 @@ static int metal_ops_layer_norm(MynahMetalState *state, const float *input,
     [encoder setBuffer:out offset:0 atIndex:1];
     [encoder setBuffer:dg offset:0 atIndex:2];
     [encoder setBuffer:db offset:0 atIndex:3];
- [encoder setBuffer:params_buffer offset:0 atIndex:4];
+    [encoder setBuffer:params_buffer offset:0 atIndex:4];
     [encoder dispatchThreads:MTLSizeMake(rows, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
     [encoder endEncoding];
@@ -341,13 +367,12 @@ static int metal_ops_matmul(MynahMetalState *state, const float *input,
         return -1;
     }
     metal_ops_matmul_params params = {(uint32_t)rows, (uint32_t)iw, (uint32_t)ow};
- id<MTLBuffer> params_buffer = [state.device newBufferWithBytes:&params
-                                                           length:sizeof(params)
-                                                          options:MTLResourceStorageModeShared];
- if (params_buffer == nil) {
- metal_ops_error(error, capacity, @"Metal matmul parameter buffer allocation failed");
- return -1;
- }
+    id<MTLBuffer> params_buffer = metal_ops_params_buffer(state, &params,
+                                                           sizeof(params), error, capacity);
+    if (params_buffer == nil) {
+        metal_ops_error(error, capacity, @"Metal matmul parameter buffer allocation failed");
+        return -1;
+    }
     id<MTLComputePipelineState> pipeline = ow >= 64u ? state.tiled_pipeline : state.matmul_pipeline;
     if (pipeline == nil) {
         metal_ops_error(error, capacity, @"Metal matmul pipeline unavailable");
