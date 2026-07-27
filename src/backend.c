@@ -34,6 +34,7 @@ struct mynah_backend {
     int (*upload)(void *, const float *, size_t, float **, char *, size_t);
     int (*download)(void *, const float *, float *, size_t, char *, size_t);
     int (*sync)(void *, char *, size_t);
+    int (*batch_begin)(void *, char *, size_t);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
     int (*layer_norm_dev)(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
@@ -65,6 +66,7 @@ int mynah_backend_metal_open(void **state, mynah_backend_matmul_fn *matmul,
 extern int mynah_metal_upload(void *, const float *, size_t, float **, char *, size_t);
 extern int mynah_metal_download(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_metal_sync(void *, char *, size_t);
+extern int mynah_metal_batch_begin(void *, char *, size_t);
 extern int mynah_metal_gelu_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_metal_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_metal_layer_norm_dev(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
@@ -157,6 +159,24 @@ static void matmul_block(void *ctx, int b) {
 }
 #endif
 
+typedef struct {
+    const float *input;
+    float *output;
+    const float *weight;
+    const float *bias;
+    size_t input_width;
+    size_t output_width;
+} matvec_rows_job;
+
+static void matvec_row(void *opaque, int row_index) {
+    const matvec_rows_job *job = (const matvec_rows_job *)opaque;
+    const size_t row = (size_t)row_index;
+    float *out = job->output + row;
+    *out = mynah_dot_f32(job->weight + row * job->input_width,
+                         job->input, job->input_width);
+    if (job->bias != NULL) *out += job->bias[row];
+}
+
 static int cpu_matmul(void *state, const float *input, float *output, size_t rows,
                       size_t input_width, size_t output_width, const float *weight,
                       const float *bias, char *error, size_t error_capacity) {
@@ -169,12 +189,27 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
      * rows=1.  MYNAH_CPU_MATVEC=1 enables this experiment; Accelerate
      * remains the default because the measured matvec path is slower on M1. */
     const char *matvec_env = getenv("MYNAH_CPU_MATVEC");
+    int matvec_parallel = matvec_env != NULL &&
+                          strcmp(matvec_env, "parallel") == 0;
+#if defined(MYNAH_USE_OPENBLAS) && defined(__AVX2__)
+    if (matvec_env == NULL) matvec_parallel = 1;
+#endif
     const int matvec_shape_small = input_width != 0u &&
         output_width <= SIZE_MAX / input_width &&
-        input_width * output_width <= 700000u;
+        (matvec_parallel || input_width * output_width <= 700000u);
     if (rows == 1u && matvec_shape_small &&
-        matvec_env != NULL && strcmp(matvec_env, "1") == 0) {
-        mynah_matvec_bias_f32(weight, input, bias, output, output_width, input_width);
+        (matvec_parallel ||
+         (matvec_env != NULL && strcmp(matvec_env, "1") == 0))) {
+        if (matvec_parallel && output_width <= (size_t)INT_MAX &&
+            mynah_num_threads() > 1) {
+            const matvec_rows_job job = {
+                input, output, weight, bias, input_width, output_width
+            };
+            mynah_parallel_for((int)output_width, matvec_row, (void *)&job);
+        } else {
+            mynah_matvec_bias_f32(weight, input, bias, output,
+                                  output_width, input_width);
+        }
         return 0;
     }
 #endif
@@ -247,6 +282,11 @@ static int cpu_sgemm(void *state, int trans_a, int trans_b,
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
     if (m <= (size_t)INT_MAX && n <= (size_t)INT_MAX && k <= (size_t)INT_MAX &&
         lda <= (size_t)INT_MAX && ldb <= (size_t)INT_MAX && ldc <= (size_t)INT_MAX) {
+#if defined(MYNAH_USE_OPENBLAS)
+        /* Codec SGEMM bypasses the pthread pool. Keep direct calls aligned
+         * with MYNAH_THREADS instead of OpenBLAS' process-wide default team. */
+        mynah_blas_set_threads(mynah_num_threads());
+#endif
         cblas_sgemm(CblasRowMajor,
                     trans_a ? CblasTrans : CblasNoTrans,
                     trans_b ? CblasTrans : CblasNoTrans,
@@ -314,6 +354,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->upload = mynah_metal_upload;
         backend->download = mynah_metal_download;
         backend->sync = mynah_metal_sync;
+        backend->batch_begin = mynah_metal_batch_begin;
         backend->gelu_dev = mynah_metal_gelu_dev;
         backend->snake_dev = mynah_metal_snake_dev;
         backend->layer_norm_dev = mynah_metal_layer_norm_dev;
@@ -461,6 +502,14 @@ int mynah_backend_sync(const mynah_backend *backend,
     if (backend->sync != NULL)
         return backend->sync(backend->state, error, error_capacity);
     return 0; /* CPU: nothing to sync */
+}
+
+int mynah_backend_batch_begin(const mynah_backend *backend,
+                              char *error, size_t error_capacity) {
+    if (backend == NULL) return -1;
+    if (backend->batch_begin != NULL)
+        return backend->batch_begin(backend->state, error, error_capacity);
+    return 0;
 }
 
 int mynah_backend_gelu_dev(const mynah_backend *backend,

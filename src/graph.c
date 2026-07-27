@@ -1523,6 +1523,11 @@ static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *bac
     if (tensor(file, weight_name, &weight, error, error_capacity) != 0 ||
         tensor(file, bias_name, &bias, error, error_capacity) != 0) return -1;
     if (profile != NULL) profile->calls++;
+    const char *tap_env = getenv("MYNAH_CONV_TAP_GEMMS");
+    int use_tap_gemms = tap_env != NULL && strcmp(tap_env, "0") != 0;
+#if defined(MYNAH_USE_OPENBLAS)
+    if (tap_env == NULL) use_tap_gemms = 1;
+#endif
     /* GPU fast path: im2col + sgemm in one backend call. */
     if (backend != NULL && in_channels <= (size_t)INT_MAX &&
         out_channels <= (size_t)INT_MAX && length <= (size_t)INT_MAX &&
@@ -1560,7 +1565,7 @@ static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *bac
         length <= (size_t)INT_MAX) {
         size_t inner = 0;
         size_t column_count = 0;
-        if (in_channels > 0 && getenv("MYNAH_CONV_TAP_GEMMS") == NULL &&
+        if (in_channels > 0 && !use_tap_gemms &&
             kernel <= SIZE_MAX / in_channels &&
             (inner = in_channels * kernel) <= (size_t)INT_MAX &&
             length <= SIZE_MAX / inner &&
@@ -2385,6 +2390,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         mynah_backend_h2d(bk, x, dx, width, error, error_capacity);
         for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
             const decoder_layer_resolved *r = &cache->resolved[layer];
+            if (mynah_backend_batch_begin(bk, error, error_capacity) != 0) { failed=1; break; }
             /* ln(GPU) → QKV d2d(GPU, no sync) */
             if (mynah_backend_layer_norm_inplace(bk, dx, dnrm, r->norm_self, 1u, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dnrm, dqkv, 1u, width, width*3u, r->qkv_w, NULL, error, error_capacity)!=0) { failed=1; break; }
@@ -2409,6 +2415,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                   axpy_f32(outh, cache->self_v + layer*cache->capacity*width + s*width + h*hw, scores[s]/den, hw); } }
             /* attn → output d2d(GPU) → residual(GPU) → ln(GPU) → cross-Q d2d(GPU) */
             if (mynah_backend_h2d(bk, attn, dattn, width, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_batch_begin(bk, error, error_capacity) != 0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dattn, dproj, 1u, width, width, r->o_self_w, NULL, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_residual_inplace(bk, dx, dproj, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_layer_norm_inplace(bk, dx, dnrm, r->norm_xattn_query, 1u, width, error, error_capacity)!=0) { failed=1; break; }
@@ -2428,6 +2435,7 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
               for (size_t s = 0; s < cache->memory_length; ++s) axpy_f32(xctx, cv+s*xw, scores[s]/den, xw); }
             /* xctx → cross-output d2d(GPU) → residual(GPU) → ln(GPU) → FFN d2d(GPU) */
             if (mynah_backend_h2d(bk, xctx, dxctx, xw, error, error_capacity)!=0) { failed=1; break; }
+            if (mynah_backend_batch_begin(bk, error, error_capacity) != 0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dxctx, dproj, 1u, xw, width, r->o_cross_w, NULL, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_residual_inplace(bk, dx, dproj, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_layer_norm_inplace(bk, dx, dnrm, r->norm_pos_ff, 1u, width, error, error_capacity)!=0) { failed=1; break; }

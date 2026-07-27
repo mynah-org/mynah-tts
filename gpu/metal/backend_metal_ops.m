@@ -42,6 +42,7 @@ typedef struct {
 
 static const void *k_metal_ops_library = &k_metal_ops_library;
 static const void *k_metal_ops_last_command = &k_metal_ops_last_command;
+static const void *k_metal_ops_active_command = &k_metal_ops_active_command;
 static const void *k_metal_ops_gelu_pipeline = &k_metal_ops_gelu_pipeline;
 static const void *k_metal_ops_residual_pipeline = &k_metal_ops_residual_pipeline;
 static const void *k_metal_ops_norm_pipeline = &k_metal_ops_norm_pipeline;
@@ -114,6 +115,8 @@ static id<MTLComputePipelineState> metal_ops_pipeline(MynahMetalState *state,
 
 static int metal_ops_commit(MynahMetalState *state, id<MTLCommandBuffer> command,
                             char *error, size_t capacity) {
+    id<MTLCommandBuffer> active = objc_getAssociatedObject(state, k_metal_ops_active_command);
+    if (active == command) return 0;
     [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         (void)completed;
     }];
@@ -125,7 +128,30 @@ static int metal_ops_commit(MynahMetalState *state, id<MTLCommandBuffer> command
     return 0;
 }
 
+static id<MTLCommandBuffer> metal_ops_command(MynahMetalState *state) {
+    id<MTLCommandBuffer> active = objc_getAssociatedObject(state, k_metal_ops_active_command);
+    return active == nil ? [state.queue commandBuffer] : active;
+}
+
+static int metal_ops_batch_begin(MynahMetalState *state, char *error, size_t capacity) {
+    if (objc_getAssociatedObject(state, k_metal_ops_active_command) != nil) return 0;
+    id<MTLCommandBuffer> command = [state.queue commandBuffer];
+    if (command == nil) {
+        metal_ops_error(error, capacity, @"Metal command batch allocation failed");
+        return -1;
+    }
+    objc_setAssociatedObject(state, k_metal_ops_active_command, command,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return 0;
+}
+
 static int metal_ops_sync_state(MynahMetalState *state, char *error, size_t capacity) {
+    id<MTLCommandBuffer> active = objc_getAssociatedObject(state, k_metal_ops_active_command);
+    if (active != nil) {
+        objc_setAssociatedObject(state, k_metal_ops_active_command, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (metal_ops_commit(state, active, error, capacity) != 0) return -1;
+    }
     id<MTLCommandBuffer> command = objc_getAssociatedObject(state, k_metal_ops_last_command);
     if (command == nil) return 0;
     [command waitUntilCompleted];
@@ -153,7 +179,7 @@ static int metal_ops_snake(MynahMetalState *state, float *data, const float *alp
                                                          options:MTLResourceStorageModeShared];
     uint32_t params[3] = {(uint32_t)channels, (uint32_t)length, (uint32_t)snake_channels};
     memcpy(state.params_buffer.contents, params, sizeof(params));
-    id<MTLCommandBuffer> command = [state.queue commandBuffer];
+    id<MTLCommandBuffer> command = metal_ops_command(state);
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:dx offset:0 atIndex:0];
@@ -202,7 +228,7 @@ static int metal_ops_conv1d(MynahMetalState *state, const float *input, float *o
     id<MTLComputePipelineState> im2col = metal_ops_pipeline(state, @"mynah_ops_im2col", error, capacity);
     id<MTLComputePipelineState> conv = metal_ops_pipeline(state, @"mynah_ops_conv", error, capacity);
     if (im2col == nil || conv == nil) return -1;
-    id<MTLCommandBuffer> command = [state.queue commandBuffer];
+    id<MTLCommandBuffer> command = metal_ops_command(state);
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:im2col];
     [encoder setBuffer:io offset:0 atIndex:0];
@@ -242,7 +268,7 @@ static int metal_ops_dispatch_vector(MynahMetalState *state, NSString *name,
     if (pipeline == nil) {
         return -1;
     }
-    id<MTLCommandBuffer> command = [state.queue commandBuffer];
+    id<MTLCommandBuffer> command = metal_ops_command(state);
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:out offset:0 atIndex:0];
@@ -284,7 +310,7 @@ static int metal_ops_layer_norm(MynahMetalState *state, const float *input,
  metal_ops_error(error, capacity, @"Metal layer norm parameter buffer allocation failed");
  return -1;
  }
-    id<MTLCommandBuffer> command = [state.queue commandBuffer];
+    id<MTLCommandBuffer> command = metal_ops_command(state);
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:in offset:0 atIndex:0];
@@ -327,7 +353,7 @@ static int metal_ops_matmul(MynahMetalState *state, const float *input,
         metal_ops_error(error, capacity, @"Metal matmul pipeline unavailable");
         return -1;
     }
-    id<MTLCommandBuffer> command = [state.queue commandBuffer];
+    id<MTLCommandBuffer> command = metal_ops_command(state);
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:in offset:0 atIndex:0];
@@ -409,6 +435,10 @@ int mynah_metal_download(void *opaque, const float *device, float *host, size_t 
 
 int mynah_metal_sync(void *opaque, char *error, size_t capacity) {
     return metal_ops_sync_state((__bridge MynahMetalState *)opaque, error, capacity);
+}
+
+int mynah_metal_batch_begin(void *opaque, char *error, size_t capacity) {
+    return metal_ops_batch_begin((__bridge MynahMetalState *)opaque, error, capacity);
 }
 
 int mynah_metal_gelu_dev(void *opaque, float *data, size_t n, char *error, size_t capacity) {

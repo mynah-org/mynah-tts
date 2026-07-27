@@ -86,6 +86,11 @@ int mynah_backend_download(const mynah_backend *backend, const float *dev_ptr,
 int mynah_backend_sync(const mynah_backend *backend,
                        char *error, size_t error_capacity);
 
+/* Begin a resident GPU command batch.  CPU backends are no-ops.  The batch is
+ * submitted by mynah_backend_sync at the next CPU-visible boundary. */
+int mynah_backend_batch_begin(const mynah_backend *backend,
+                              char *error, size_t error_capacity);
+
 /* Device-side matmul: out[rows,ow] = in[rows,iw] @ W[ow,iw]^T + bias.
  * Weight/bias are host pointers (cached on device internally). */
 int mynah_backend_matmul_dev(const mynah_backend *backend,

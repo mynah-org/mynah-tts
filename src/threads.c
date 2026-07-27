@@ -94,6 +94,14 @@ static void blas_set_threads(int n) {
 #endif
 }
 
+void mynah_blas_set_threads(int n) {
+#if defined(__GNUC__) && !defined(__APPLE__)
+    blas_set_threads(n);
+#else
+    (void)n;
+#endif
+}
+
 void mynah_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     if (n <= 0) return;
     const int nth = mynah_num_threads();

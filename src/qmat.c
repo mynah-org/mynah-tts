@@ -11,6 +11,10 @@
 #include <arm_neon.h>
 #define MYNAH_QMAT_DOTPROD 1
 #endif
+#if !defined(MYNAH_DISABLE_SIMD) && defined(__AVX2__)
+#include <immintrin.h>
+#define MYNAH_QMAT_AVX2 1
+#endif
 
 /* count at/below this uses the native int dot; above it falls back to the f32
  * BLAS matmul (the prefill, already fast and kept bit-exact). */
@@ -98,6 +102,26 @@ static float quantize_act_int8(int8_t *qx, const float *x, size_t k) {
 }
 
 /* ---------------------------------------------------------- int dot kernels */
+#if defined(MYNAH_QMAT_AVX2)
+static int32_t dot_q8_i32_avx2(const int8_t *qx, const int8_t *w, size_t k) {
+    __m256i acc = _mm256_setzero_si256();
+    size_t j = 0;
+    for (; j + 16u <= k; j += 16u) {
+        const __m128i x0 = _mm_loadu_si128((const __m128i *)(qx + j));
+        const __m128i w0 = _mm_loadu_si128((const __m128i *)(w + j));
+        const __m256i x16_0 = _mm256_cvtepi8_epi16(x0);
+        const __m256i w16_0 = _mm256_cvtepi8_epi16(w0);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(x16_0, w16_0));
+    }
+    __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(acc),
+                                _mm256_extracti128_si256(acc, 1));
+    sum = _mm_hadd_epi32(sum, sum);
+    sum = _mm_hadd_epi32(sum, sum);
+    int32_t result = _mm_cvtsi128_si32(sum);
+    for (; j < k; ++j) result += (int32_t)qx[j] * (int32_t)w[j];
+    return result;
+}
+#endif
 static float dot_q8(const int8_t *qx, float sx, const int8_t *w, float ws, size_t k) {
 #if defined(MYNAH_QMAT_DOTPROD)
     int32x4_t acc = vdupq_n_s32(0);
@@ -105,6 +129,9 @@ static float dot_q8(const int8_t *qx, float sx, const int8_t *w, float ws, size_
     for (; j + 16 <= k; j += 16) acc = vdotq_s32(acc, vld1q_s8(w + j), vld1q_s8(qx + j));
     int32_t s = vaddvq_s32(acc);
     for (; j < k; ++j) s += (int32_t)w[j] * (int32_t)qx[j];
+    return (float)s * ws * sx;
+#elif defined(MYNAH_QMAT_AVX2)
+    const int32_t s = dot_q8_i32_avx2(qx, w, k);
     return (float)s * ws * sx;
 #else
     int32_t s = 0;
@@ -183,6 +210,20 @@ static void matvec_q8(float *out, const int8_t *qx, float sx,
             s2 += (int32_t)w2[j] * x;
             s3 += (int32_t)w3[j] * x;
         }
+        out[row] = (float)s0 * scales[row] * sx + (bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = (float)s1 * scales[row + 1u] * sx +
+                        (bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = (float)s2 * scales[row + 2u] * sx +
+                        (bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = (float)s3 * scales[row + 3u] * sx +
+                        (bias == NULL ? 0.0f : bias[row + 3u]);
+    }
+#elif defined(MYNAH_QMAT_AVX2)
+    for (; row + 4u <= rows; row += 4u) {
+        const int32_t s0 = dot_q8_i32_avx2(qx, weights + row * cols, cols);
+        const int32_t s1 = dot_q8_i32_avx2(qx, weights + (row + 1u) * cols, cols);
+        const int32_t s2 = dot_q8_i32_avx2(qx, weights + (row + 2u) * cols, cols);
+        const int32_t s3 = dot_q8_i32_avx2(qx, weights + (row + 3u) * cols, cols);
         out[row] = (float)s0 * scales[row] * sx + (bias == NULL ? 0.0f : bias[row]);
         out[row + 1u] = (float)s1 * scales[row + 1u] * sx +
                         (bias == NULL ? 0.0f : bias[row + 1u]);

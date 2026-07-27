@@ -9,6 +9,9 @@
 
 int mynah_num_threads(void);
 
+/* Configure direct BLAS calls to match MYNAH_THREADS. */
+void mynah_blas_set_threads(int n);
+
 /* Runs fn(ctx, i) for i in [0, n): tasks are distributed over
  * min(n, mynah_num_threads()) threads (the caller participates).
  * With n <= 1 or a single thread it runs inline with no spawn. */
