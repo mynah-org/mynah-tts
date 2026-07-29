@@ -13,6 +13,7 @@ make server
 | `-m, --model DIR` | model pack directory (required) |
 | `-p, --port N` | listen port (default 8080) |
 | `--host ADDR` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose) |
+| `-w, --workers N` | connection workers (default 4) — see Concurrency |
 | `--device cpu\|metal\|cuda` | backend, same rules as the CLI |
 
 It binds to loopback by default. Exposing it means `--host 0.0.0.0`, which is a
@@ -38,8 +39,14 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `stream` | bool | stream PCM as it is produced |
 | `language` | string | language code, default `en` — an extension, not OpenAI |
 | `temperature` | number | sampling temperature; defaults to the pack's value |
+| `top_k` | number | top-k sampling; defaults to the pack's value |
+| `max_steps` | number | cap on decoder steps; 0 (default) means the model decides |
 | `seed` | number | RNG seed, default 42 |
 | `model` | string | accepted and ignored — one pack is served per process |
+
+`POST /v1/tts` is the same handler with native field names: `text` instead of
+`input`, `speaker` instead of `voice`. Use whichever reads better; the audio is
+identical and the test suite asserts that.
 
 `response_format` supports `wav` and `pcm` only. `mp3`, `opus`, `aac` and
 `flac` return 400 rather than silently handing back WAV under another name:
@@ -64,6 +71,31 @@ X-Sample-Rate: 22050
 X-Bits-Per-Sample: 16
 X-Channels: 1
 Transfer-Encoding: chunked
+```
+
+Play it as it arrives, rather than writing bytes to disk:
+
+```bash
+# macOS — ffplay
+curl -sN -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"hello from mynah","voice":"Sofia","stream":true}' | \
+  ffplay -f s16le -ar 22050 -ac 1 -nodisp -autoexit -
+
+# macOS — sox
+curl -sN -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"hello from mynah","voice":"Sofia","stream":true}' | \
+  play -t raw -r 22050 -e signed -b 16 -c 1 -
+
+# Linux — aplay
+curl -sN -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"hello from mynah","voice":"Sofia","stream":true}' | \
+  aplay -f S16_LE -r 22050 -c 1
+
+# Save raw PCM, convert later
+curl -sN ... -o out.raw && ffmpeg -f s16le -ar 22050 -ac 1 -i out.raw out.wav
 ```
 
 Each chunk is a stable causal prefix from the same streaming API the C library
@@ -97,6 +129,15 @@ OpenAI-shaped listing of the single pack this process serves.
 ```
 
 ## Concurrency
+
+Connections are handled by a **fixed worker pool draining a bounded queue**
+(`-w`, default 4; queue depth 256). Thread-per-connection was rejected: it has
+no ceiling, so a client that merely opens sockets grows threads until the
+process dies. When the queue is full the server answers **503 with
+`Retry-After`** and closes — shedding load beats unbounded growth.
+
+Accepted sockets carry a 30 s send/receive timeout, so a client that connects
+and never sends cannot pin a worker forever.
 
 **Synthesis is serialized.** Connections are accepted and parsed concurrently,
 but one mutex guards the synthesis itself.
@@ -132,6 +173,13 @@ Errors are OpenAI-shaped:
 | 404 | unknown route |
 | 413 | request body over 1 MiB |
 | 500 | synthesis failure |
+| 503 | connection queue full (with `Retry-After: 1`) |
+
+`make server-test MODEL_DIR=...` covers every route plus three properties worth
+stating: streamed audio equals batch audio byte for byte, three identical
+requests return identical audio (guarding against state leaking through the
+model's mutable caches), and two concurrent clients both complete without
+perturbing each other.
 
 CORS is open (`Access-Control-Allow-Origin: *`) and `OPTIONS` preflight is
 answered, so a browser page can call it directly.

@@ -84,4 +84,45 @@ else
     fail "streamed audio differs from batch (batch $a bytes, stream $b bytes)"
 fi
 
+# --- Reproducibility -------------------------------------------------------
+# Three identical requests must return identical audio. This is the highest
+# value check for this codebase: mynah_tts_model carries mutable caches (qmat,
+# codec filters, local projection cache) that synthesis populates, so a stale
+# entry surviving between requests would show up exactly here. qwen-tts shipped
+# this test after hitting that bug for real.
+for n in 1 2 3; do
+    curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+        -H 'Content-Type: application/json' -d "$REQ" -o "$TMP/repro$n.wav"
+    [ -s "$TMP/repro$n.wav" ] || fail "repro request $n returned nothing"
+done
+cmp -s "$TMP/repro1.wav" "$TMP/repro2.wav" || fail "request 2 differs from request 1"
+cmp -s "$TMP/repro1.wav" "$TMP/repro3.wav" || fail "request 3 differs from request 1"
+cmp -s "$TMP/repro1.wav" "$TMP/batch.wav"  || fail "repro differs from the first batch call"
+echo "repro x3    ok (byte-identical, and equal to the earlier call)"
+
+# --- Concurrency -----------------------------------------------------------
+# Synthesis is serialized behind a mutex; this asserts the lock actually holds
+# instead of assuming it. Both clients must get complete, correct audio.
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$REQ" -o "$TMP/c1.wav" &
+p1=$!
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"a different concurrent request","voice":"Leo","seed":9}' -o "$TMP/c2.wav" &
+p2=$!
+wait $p1 || fail "concurrent client 1 failed"
+wait $p2 || fail "concurrent client 2 failed"
+[ -s "$TMP/c1.wav" ] && [ -s "$TMP/c2.wav" ] || fail "a concurrent client got no audio"
+head -c 4 "$TMP/c1.wav" | grep -q RIFF || fail "concurrent client 1 got a corrupt WAV"
+head -c 4 "$TMP/c2.wav" | grep -q RIFF || fail "concurrent client 2 got a corrupt WAV"
+cmp -s "$TMP/c1.wav" "$TMP/repro1.wav" || fail "concurrency perturbed the identical request"
+echo "concurrent  ok (both complete; the repeated request is still identical)"
+
+# --- Native route ----------------------------------------------------------
+curl -s --max-time 600 -X POST "$BASE/v1/tts" \
+    -H 'Content-Type: application/json' \
+    -d '{"text":"server parity check","speaker":"Sofia","seed":7}' -o "$TMP/native.wav"
+cmp -s "$TMP/native.wav" "$TMP/repro1.wav" || fail "/v1/tts differs from /v1/audio/speech"
+echo "native /tts ok (same audio as the OpenAI route)"
+
 echo "server test: PASS"

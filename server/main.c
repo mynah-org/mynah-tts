@@ -28,11 +28,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define MAX_BODY (1u << 20)          /* 1 MiB of JSON is far beyond any prompt */
 #define MAX_TEXT 8192u
 #define STREAM_CHUNK 4096u           /* samples per streamed chunk */
+#define CONN_QUEUE_CAP 256u          /* connections parked before we shed load */
+#define CLIENT_TIMEOUT_S 30          /* recv deadline, so a silent client cannot pin a worker */
 
 typedef struct {
     char name[64];
@@ -47,6 +50,7 @@ static struct {
     voice_entry voices[64];
     size_t voice_count;
     unsigned default_speaker;
+    int worker_count;
     pthread_mutex_t synth_lock;
 } g;
 
@@ -220,17 +224,26 @@ static int stream_callback(const float *samples, size_t count, void *user_data) 
 
 /* ------------------------------------------------------------------ routes */
 
+/* Serves both the OpenAI shape ("input"/"voice") and the native one
+ * ("text"/"speaker"), so a caller need not pretend to be OpenAI to be clear. */
 static void handle_speech(int fd, const char *body) {
     char text[MAX_TEXT];
-    if (mynah_json_string(body, "input", text, sizeof(text)) != 0 ||
-        text[0] == '\0') {
+    if (mynah_json_string(body, "input", text, sizeof(text)) != 0 &&
+        mynah_json_string(body, "text", text, sizeof(text)) != 0) {
         send_error(fd, "400 Bad Request", "invalid_request_error",
-                   "missing or empty 'input'");
+                   "missing 'input' (or 'text')");
+        return;
+    }
+    if (text[0] == '\0') {
+        send_error(fd, "400 Bad Request", "invalid_request_error",
+                   "empty 'input'");
         return;
     }
 
     char voice[64] = {0};
-    (void)mynah_json_string(body, "voice", voice, sizeof(voice));
+    if (mynah_json_string(body, "voice", voice, sizeof(voice)) != 0) {
+        (void)mynah_json_string(body, "speaker", voice, sizeof(voice));
+    }
     unsigned speaker = 0;
     if (resolve_voice(voice, &speaker) != 0) {
         send_error(fd, "400 Bad Request", "invalid_request_error",
@@ -259,6 +272,10 @@ static void handle_speech(int fd, const char *body) {
     (void)mynah_json_number(body, "temperature", &temperature);
     double seed = 42.0;
     (void)mynah_json_number(body, "seed", &seed);
+    double topk = (double)g.info.default_topk;
+    (void)mynah_json_number(body, "top_k", &topk);
+    double max_steps = 0.0;
+    (void)mynah_json_number(body, "max_steps", &max_steps);
 
     int *ids = NULL;
     size_t id_count = 0;
@@ -274,9 +291,9 @@ static void handle_speech(int fd, const char *body) {
     request.text_ids = ids;
     request.text_length = id_count;
     request.speaker = speaker;
-    request.max_steps = 0;
+    request.max_steps = max_steps > 0.0 ? (unsigned)max_steps : 0u;
     request.temperature = (float)temperature;
-    request.topk = g.info.default_topk;
+    request.topk = topk > 0.0 ? (unsigned)topk : g.info.default_topk;
     request.use_local_transformer = 1;
     request.seed = (uint64_t)seed;
 
@@ -388,12 +405,67 @@ static void handle_health(int fd) {
     if (n > 0) send_status(fd, "200 OK", "application/json", body, (size_t)n);
 }
 
+/* ------------------------------------------------------- connection queue */
+
+/* A fixed worker pool draining a bounded queue, rather than one thread per
+ * connection.  Thread-per-connection has no ceiling: a client that only opens
+ * sockets spawns threads until the process dies -- no exploit needed, just a
+ * loop.  When the queue is full we answer 503 and close, because shedding load
+ * is a better failure mode than unbounded growth. */
+typedef struct {
+    int fds[CONN_QUEUE_CAP];
+    size_t head, tail, count;
+    int shutdown;
+    pthread_mutex_t mu;
+    pthread_cond_t not_empty;
+} conn_queue;
+
+static conn_queue g_queue;
+
+static void queue_init(conn_queue *q) {
+    q->head = q->tail = q->count = 0;
+    q->shutdown = 0;
+    pthread_mutex_init(&q->mu, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+}
+
+/* 0 when parked, -1 when full or shutting down and the caller must close. */
+static int queue_push(conn_queue *q, int fd) {
+    pthread_mutex_lock(&q->mu);
+    if (q->count == CONN_QUEUE_CAP || q->shutdown) {
+        pthread_mutex_unlock(&q->mu);
+        return -1;
+    }
+    q->fds[q->tail] = fd;
+    q->tail = (q->tail + 1u) % CONN_QUEUE_CAP;
+    ++q->count;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mu);
+    return 0;
+}
+
+/* A client fd, or -1 once shut down and drained. */
+static int queue_pop(conn_queue *q) {
+    pthread_mutex_lock(&q->mu);
+    while (q->count == 0 && !q->shutdown) {
+        pthread_cond_wait(&q->not_empty, &q->mu);
+    }
+    if (q->count == 0) {
+        pthread_mutex_unlock(&q->mu);
+        return -1;
+    }
+    const int fd = q->fds[q->head];
+    q->head = (q->head + 1u) % CONN_QUEUE_CAP;
+    --q->count;
+    pthread_mutex_unlock(&q->mu);
+    return fd;
+}
+
 /* ------------------------------------------------------------- connection */
 
-static void *serve(void *arg) {
-    const int fd = (int)(intptr_t)arg;
+static void handle_connection(int fd) {
     char *buf = (char *)malloc(MAX_BODY + 8192u);
-    if (buf == NULL) { close(fd); return NULL; }
+    if (buf == NULL) { close(fd); return; }
 
     size_t len = 0;
     const char *head_end = NULL;
@@ -405,7 +477,7 @@ static void *serve(void *arg) {
         head_end = mynah_memmem(buf, len, "\r\n\r\n", 4);
         if (head_end != NULL) break;
     }
-    if (head_end == NULL) { free(buf); close(fd); return NULL; }
+    if (head_end == NULL) { free(buf); close(fd); return; }
 
     const size_t head_len = (size_t)(head_end - buf);
     char length_header[32] = {0};
@@ -417,7 +489,7 @@ static void *serve(void *arg) {
         else if (v > (long)MAX_BODY) {
             send_error(fd, "413 Payload Too Large", "invalid_request_error",
                        "request body too large");
-            free(buf); close(fd); return NULL;
+            free(buf); close(fd); return;
         }
     }
 
@@ -439,7 +511,8 @@ static void *serve(void *arg) {
             "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
             "Connection: close\r\n\r\n";
         write_all(fd, pre, strlen(pre));
-    } else if (strncmp(buf, "POST /v1/audio/speech", 21) == 0) {
+    } else if (strncmp(buf, "POST /v1/audio/speech", 21) == 0 ||
+               strncmp(buf, "POST /v1/tts", 12) == 0) {
         handle_speech(fd, body);
     } else if (strncmp(buf, "GET /v1/voices", 14) == 0) {
         handle_voices(fd);
@@ -453,6 +526,15 @@ static void *serve(void *arg) {
 
     free(buf);
     close(fd);
+}
+
+static void *worker_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        const int fd = queue_pop(&g_queue);
+        if (fd < 0) break;
+        handle_connection(fd);
+    }
     return NULL;
 }
 
@@ -460,9 +542,11 @@ static void *serve(void *arg) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s -m MODEL_DIR [-p PORT] [--host ADDR] [--device cpu|metal|cuda]\n"
+            "usage: %s -m MODEL_DIR [-p PORT] [--host ADDR] [-w WORKERS]\n"
+            "       [--device cpu|metal|cuda]\n"
             "\n"
             "  POST /v1/audio/speech   {\"input\":\"...\",\"voice\":\"Sofia\"}\n"
+            "  POST /v1/tts            {\"text\":\"...\",\"speaker\":\"Sofia\"}\n"
             "  GET  /v1/voices\n"
             "  GET  /v1/models\n"
             "  GET  /health\n", argv0);
@@ -473,6 +557,7 @@ int main(int argc, char **argv) {
     int port = 8080;
     const char *host = "127.0.0.1";
     mynah_tts_device device = MYNAH_TTS_DEVICE_CPU;
+    g.worker_count = 4;
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
@@ -481,6 +566,8 @@ int main(int argc, char **argv) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             host = argv[++i];
+        } else if ((strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--workers") == 0) && i + 1 < argc) {
+            g.worker_count = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
             const char *d = argv[++i];
             if (strcmp(d, "metal") == 0) device = MYNAH_TTS_DEVICE_METAL;
@@ -491,6 +578,8 @@ int main(int argc, char **argv) {
         }
     }
     if (model_dir == NULL || port <= 0 || port > 65535) { usage(argv[0]); return 2; }
+    if (g.worker_count < 1) g.worker_count = 1;
+    if (g.worker_count > 64) g.worker_count = 64;
 
     signal(SIGPIPE, SIG_IGN);   /* a client hanging up mid-stream is routine */
 
@@ -528,8 +617,22 @@ int main(int argc, char **argv) {
     }
     if (listen(listen_fd, 64) != 0) { perror("listen"); return 1; }
 
-    fprintf(stderr, "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu\n",
-            host, port, g.model_id, mynah_tts_device_name(device), g.voice_count);
+    fprintf(stderr,
+            "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu  workers=%d\n"
+            "note: synthesis is serialized; workers overlap I/O and parsing only\n",
+            host, port, g.model_id, mynah_tts_device_name(device), g.voice_count,
+            g.worker_count);
+
+    queue_init(&g_queue);
+    pthread_t workers[64];
+    int worker_count = g.worker_count;
+    for (int i = 0; i < worker_count; ++i) {
+        if (pthread_create(&workers[i], NULL, worker_main, NULL) != 0) {
+            worker_count = i;
+            break;
+        }
+    }
+    if (worker_count == 0) { fprintf(stderr, "cannot start workers\n"); return 1; }
 
     for (;;) {
         const int fd = accept(listen_fd, NULL, NULL);
@@ -537,13 +640,30 @@ int main(int argc, char **argv) {
             if (errno == EINTR) continue;
             break;
         }
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, serve, (void *)(intptr_t)fd) != 0) {
+        /* A client that connects and never sends must not pin a worker
+         * forever; without this the bounded queue would still fill up. */
+        struct timeval tv = {CLIENT_TIMEOUT_S, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (queue_push(&g_queue, fd) != 0) {
+            /* Queue full: shed the connection rather than grow without bound. */
+            const char *busy =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 62\r\n"
+                "Retry-After: 1\r\n"
+                "Connection: close\r\n\r\n"
+                "{\"error\":{\"message\":\"server busy\",\"type\":\"server_error\"}}";
+            (void)!write(fd, busy, strlen(busy));
             close(fd);
-            continue;
         }
-        pthread_detach(tid);
     }
+
+    pthread_mutex_lock(&g_queue.mu);
+    g_queue.shutdown = 1;
+    pthread_cond_broadcast(&g_queue.not_empty);
+    pthread_mutex_unlock(&g_queue.mu);
+    for (int i = 0; i < worker_count; ++i) pthread_join(workers[i], NULL);
 
     close(listen_fd);
     mynah_tokenizer_close(g.tokenizer);
