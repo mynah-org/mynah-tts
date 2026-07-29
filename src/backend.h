@@ -58,6 +58,7 @@ int mynah_backend_matmul_to_dev(const mynah_backend *, const float *, float *, s
 int mynah_backend_matmul_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 int mynah_backend_im2col(const mynah_backend *, const float *, float *, int, int, int, int, char *, size_t);
 int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
+int mynah_backend_conv_transpose_dev(const mynah_backend *, const float *, float *, int, int, int, int, int, int, int, const float *, const float *, char *, size_t);
 int mynah_backend_gelu_host(const mynah_backend *, float *, size_t, char *, size_t);
 int mynah_backend_gelu_host_f64(const mynah_backend *, float *, size_t, char *, size_t);
 int mynah_backend_matmul_graph(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
@@ -131,6 +132,27 @@ int mynah_backend_snake_dev(const mynah_backend *backend,
                             size_t snake_channels,
                             char *error, size_t error_capacity);
 
+/* Device-side single-token attention over resident K/V.  The self variant
+ * reads Q/K/V from qkv and appends K/V at position; the cross variant reads a
+ * separate Q and resident K/V cache.  Neither function synchronizes. */
+int mynah_backend_has_attention_dev(const mynah_backend *backend);
+int mynah_backend_self_attention_dev(const mynah_backend *backend,
+                                     const float *dev_qkv,
+                                     float *dev_k_cache, float *dev_v_cache,
+                                     size_t position, size_t cache_stride,
+                                     size_t valid, size_t heads,
+                                     size_t head_width, float scale,
+                                     float *dev_out,
+                                     char *error, size_t error_capacity);
+int mynah_backend_cross_attention_dev(const mynah_backend *backend,
+                                      const float *dev_q,
+                                      const float *dev_k_cache,
+                                      const float *dev_v_cache,
+                                      size_t valid, size_t cache_stride,
+                                      size_t heads, size_t head_width,
+                                      float scale, float *dev_out,
+                                      char *error, size_t error_capacity);
+
 /* Copy n floats from host to a specific device buffer (no scratch). */
 int mynah_backend_h2d(const mynah_backend *backend, const float *host,
                       float *dev_ptr, size_t n,
@@ -139,6 +161,22 @@ int mynah_backend_h2d(const mynah_backend *backend, const float *host,
 int mynah_backend_d2h(const mynah_backend *backend, const float *dev_ptr,
                       float *host, size_t n,
                       char *error, size_t error_capacity);
+
+/* Device-side buffer helpers and constrained greedy argmax.  The argmax
+ * returns one scalar token because the next autoregressive position depends
+ * on it; the logits themselves never leave the device. */
+int mynah_backend_copy_dev(const mynah_backend *backend, float *dev_dst,
+                           const float *dev_src, size_t n,
+                           char *error, size_t error_capacity);
+int mynah_backend_scale_dev(const mynah_backend *backend, float *dev_data,
+                            size_t n, float scale,
+                            char *error, size_t error_capacity);
+int mynah_backend_clip_dev(const mynah_backend *backend, float *dev_data,
+                           size_t n, char *error, size_t error_capacity);
+int mynah_backend_argmax_dev(const mynah_backend *backend, const float *dev_logits,
+                             size_t vocab, size_t codebook_size, size_t eos_id,
+                             int allow_eos, unsigned *argmax,
+                             char *error, size_t error_capacity);
 
 /* Allocate a persistent device buffer of n floats.  On CPU returns a
  * malloc'd host buffer; on CUDA a cudaMalloc'd device buffer.

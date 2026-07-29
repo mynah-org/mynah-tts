@@ -45,6 +45,11 @@ struct mynah_backend {
     void (*dev_free)(void *, float *);
     int (*h2d)(void *, const float *, float *, size_t, char *, size_t);
     int (*d2h)(void *, const float *, float *, size_t, char *, size_t);
+    int (*copy_dev)(void *, float *, const float *, size_t, char *, size_t);
+    int (*scale_dev)(void *, float *, size_t, float, char *, size_t);
+    int (*clip_dev)(void *, float *, size_t, char *, size_t);
+    int (*argmax_dev)(void *, const float *, size_t, size_t, size_t, int,
+                      unsigned *, char *, size_t);
     int (*matvec_dev)(void *, const float *, float *, size_t, size_t, const float *, const float *, char *, size_t);
     int (*gelu_inplace)(void *, float *, size_t, char *, size_t);
     int (*residual_inplace)(void *, float *, const float *, size_t, char *, size_t);
@@ -53,9 +58,14 @@ struct mynah_backend {
     int (*matmul_d2d)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*im2col)(void *, const float *, float *, int, int, int, int, char *, size_t);
     int (*conv1d)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
+    int (*conv_transpose_dev)(void *, const float *, float *, int, int, int, int, int, int, int, const float *, const float *, char *, size_t);
     int (*gelu_host)(void *, float *, size_t, char *, size_t);
     int (*gelu_host_f64)(void *, float *, size_t, char *, size_t);
     int (*matmul_graph)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+    int (*self_attention_dev)(void *, const float *, float *, float *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
+    int (*cross_attention_dev)(void *, const float *, const float *, const float *, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
+    int metal_cpu_matmul;
+    int metal_cpu_codec;
 };
 
 #if defined(MYNAH_ENABLE_METAL)
@@ -76,11 +86,19 @@ extern int mynah_metal_dev_alloc(void *, size_t, float **, char *, size_t);
 extern void mynah_metal_dev_free(void *, float *);
 extern int mynah_metal_h2d(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_metal_d2h(void *, const float *, float *, size_t, char *, size_t);
+extern int mynah_metal_copy_dev(void *, float *, const float *, size_t, char *, size_t);
+extern int mynah_metal_scale_dev(void *, float *, size_t, float, char *, size_t);
+extern int mynah_metal_clip_dev(void *, float *, size_t, char *, size_t);
+extern int mynah_metal_argmax_dev(void *, const float *, size_t, size_t, size_t, int,
+                                  unsigned *, char *, size_t);
 extern int mynah_metal_gelu_inplace(void *, float *, size_t, char *, size_t);
 extern int mynah_metal_residual_inplace(void *, float *, const float *, size_t, char *, size_t);
 extern int mynah_metal_layer_norm_inplace(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
 extern int mynah_metal_matmul_d2d(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_metal_self_attention_dev(void *, const float *, float *, float *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
+extern int mynah_metal_cross_attention_dev(void *, const float *, const float *, const float *, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_metal_conv1d(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
+extern int mynah_metal_conv_transpose_dev(void *, const float *, float *, int, int, int, int, int, int, int, const float *, const float *, char *, size_t);
 extern int mynah_metal_ops_self_test(void *, char *, size_t);
 #endif
 #if defined(MYNAH_ENABLE_CUDA)
@@ -117,6 +135,15 @@ extern int mynah_cuda_matmul_graph(void *, const float *, float *, size_t, size_
 
 static void set_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
+}
+
+static int metal_cpu_path_enabled(const char *cpu_name, const char *gpu_name,
+                                  int default_cpu) {
+    const char *cpu = getenv(cpu_name);
+    if (cpu != NULL) return strcmp(cpu, "0") != 0;
+    const char *gpu = getenv(gpu_name);
+    if (gpu != NULL) return strcmp(gpu, "1") != 0;
+    return default_cpu;
 }
 
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
@@ -190,8 +217,16 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
 #if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__) || defined(__AVX2__))
     /* Decode is dominated by single-row projections.  BLAS is excellent for
      * prefill, but its SGEMM setup costs more than a resident SIMD matvec for
-     * rows=1.  MYNAH_CPU_MATVEC=1 enables this experiment; Accelerate
-     * remains the default because the measured matvec path is slower on M1. */
+     * rows=1.  MYNAH_CPU_MATVEC=1 selects the serial SIMD matvec; `parallel`
+     * splits the output rows over the pool.
+     *
+     * The AR phase is DRAM-bandwidth bound, not compute bound, and Accelerate
+     * never threads an M=1 sgemm, so a single-row projection only ever gets one
+     * core's share of memory bandwidth.  Splitting the output rows across the
+     * pool is byte-exact (every output row is an independent dot product, so no
+     * reduction is reordered) and lifts the whole decode toward the measured
+     * ~59 GB/s ceiling.  Serial Accelerate still wins at one thread, so the
+     * default only switches over when the pool actually has workers. */
     const char *matvec_env = getenv("MYNAH_CPU_MATVEC");
     int matvec_parallel = matvec_env != NULL &&
                           strcmp(matvec_env, "parallel") == 0;
@@ -344,6 +379,12 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
     }
     backend->device = device;
     backend->name = mynah_tts_device_name(device);
+    backend->metal_cpu_matmul = device == MYNAH_TTS_DEVICE_METAL &&
+        metal_cpu_path_enabled("MYNAH_METAL_CPU_MATMUL",
+                               "MYNAH_METAL_GPU_MATMUL", 1);
+    backend->metal_cpu_codec = device == MYNAH_TTS_DEVICE_METAL &&
+        metal_cpu_path_enabled("MYNAH_METAL_CPU_CODEC",
+                               "MYNAH_METAL_GPU_CODEC", 0);
     backend->matmul = cpu_matmul;
     backend->sgemm = cpu_sgemm;
     backend->self_test = cpu_self_test;
@@ -369,11 +410,18 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->dev_free = mynah_metal_dev_free;
         backend->h2d = mynah_metal_h2d;
         backend->d2h = mynah_metal_d2h;
+        backend->copy_dev = mynah_metal_copy_dev;
+        backend->scale_dev = mynah_metal_scale_dev;
+        backend->clip_dev = mynah_metal_clip_dev;
+        backend->argmax_dev = mynah_metal_argmax_dev;
         backend->gelu_inplace = mynah_metal_gelu_inplace;
         backend->residual_inplace = mynah_metal_residual_inplace;
         backend->layer_norm_inplace = mynah_metal_layer_norm_inplace;
         backend->matmul_d2d = mynah_metal_matmul_d2d;
+        backend->self_attention_dev = mynah_metal_self_attention_dev;
+        backend->cross_attention_dev = mynah_metal_cross_attention_dev;
         backend->conv1d = mynah_metal_conv1d;
+        backend->conv_transpose_dev = mynah_metal_conv_transpose_dev;
 #else
         free(backend);
         set_error(error, error_capacity, "Metal backend is not compiled; use make metal");
@@ -440,6 +488,13 @@ int mynah_backend_matmul(const mynah_backend *backend, const float *input,
         weight == NULL || rows == 0 || input_width == 0 || output_width == 0) {
         set_error(error, error_capacity, "invalid backend matmul request");
         return -1;
+    }
+    /* Apple GPU dispatch is not competitive for the small, synchronization-
+     * heavy projections in this model.  Keep the choice explicit while the
+     * Metal path is being tuned; this also provides a stable hybrid baseline. */
+    if (backend->device == MYNAH_TTS_DEVICE_METAL && backend->metal_cpu_matmul) {
+        return cpu_matmul(NULL, input, output, rows, input_width, output_width,
+                          weight, bias, error, error_capacity);
     }
     return backend->matmul(backend->state, input, output, rows, input_width, output_width,
                            weight, bias, error, error_capacity);
@@ -600,6 +655,41 @@ int mynah_backend_snake_dev(const mynah_backend *backend,
     return 0;
 }
 
+int mynah_backend_has_attention_dev(const mynah_backend *backend) {
+    return backend != NULL && backend->self_attention_dev != NULL &&
+           backend->cross_attention_dev != NULL;
+}
+
+int mynah_backend_self_attention_dev(const mynah_backend *backend,
+                                     const float *dev_qkv,
+                                     float *dev_k_cache, float *dev_v_cache,
+                                     size_t position, size_t cache_stride,
+                                     size_t valid, size_t heads,
+                                     size_t head_width, float scale,
+                                     float *dev_out,
+                                     char *error, size_t error_capacity) {
+    if (backend == NULL || backend->self_attention_dev == NULL) return -1;
+    return backend->self_attention_dev(backend->state, dev_qkv, dev_k_cache,
+                                       dev_v_cache, position, cache_stride,
+                                       valid, heads, head_width, scale,
+                                       dev_out, error, error_capacity);
+}
+
+int mynah_backend_cross_attention_dev(const mynah_backend *backend,
+                                      const float *dev_q,
+                                      const float *dev_k_cache,
+                                      const float *dev_v_cache,
+                                      size_t valid, size_t cache_stride,
+                                      size_t heads, size_t head_width,
+                                      float scale, float *dev_out,
+                                      char *error, size_t error_capacity) {
+    if (backend == NULL || backend->cross_attention_dev == NULL) return -1;
+    return backend->cross_attention_dev(backend->state, dev_q,
+                                        dev_k_cache, dev_v_cache, valid,
+                                        cache_stride, heads, head_width, scale,
+                                        dev_out, error, error_capacity);
+}
+
 int mynah_backend_matmul_dev(const mynah_backend *backend,
                              const float *dev_in, float *dev_out,
                              size_t rows, size_t iw, size_t ow,
@@ -671,6 +761,68 @@ int mynah_backend_d2h(const mynah_backend *backend, const float *dev_ptr,
     return 0;
 }
 
+int mynah_backend_copy_dev(const mynah_backend *backend, float *dev_dst,
+                           const float *dev_src, size_t n,
+                           char *error, size_t error_capacity) {
+    if (backend == NULL || dev_dst == NULL || dev_src == NULL ||
+        n > SIZE_MAX / sizeof(float)) return -1;
+    if (backend->copy_dev != NULL)
+        return backend->copy_dev(backend->state, dev_dst, dev_src, n,
+                                 error, error_capacity);
+    memmove(dev_dst, dev_src, n * sizeof(float));
+    return 0;
+}
+
+int mynah_backend_scale_dev(const mynah_backend *backend, float *dev_data,
+                            size_t n, float scale,
+                            char *error, size_t error_capacity) {
+    if (backend == NULL || dev_data == NULL) return -1;
+    if (backend->scale_dev != NULL)
+        return backend->scale_dev(backend->state, dev_data, n, scale,
+                                  error, error_capacity);
+    for (size_t i = 0; i < n; ++i) dev_data[i] *= scale;
+    return 0;
+}
+
+int mynah_backend_clip_dev(const mynah_backend *backend, float *dev_data,
+                           size_t n, char *error, size_t error_capacity) {
+    if (backend == NULL || dev_data == NULL) return -1;
+    if (backend->clip_dev != NULL)
+        return backend->clip_dev(backend->state, dev_data, n,
+                                 error, error_capacity);
+    if (backend->device != MYNAH_TTS_DEVICE_CPU) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        if (!isfinite(dev_data[i])) dev_data[i] = 0.0f;
+        else if (dev_data[i] > 1.0f) dev_data[i] = 1.0f;
+        else if (dev_data[i] < -1.0f) dev_data[i] = -1.0f;
+    }
+    return 0;
+}
+
+int mynah_backend_argmax_dev(const mynah_backend *backend, const float *dev_logits,
+                             size_t vocab, size_t codebook_size, size_t eos_id,
+                             int allow_eos, unsigned *argmax,
+                             char *error, size_t error_capacity) {
+    if (backend == NULL || dev_logits == NULL || argmax == NULL || vocab == 0u ||
+        codebook_size > vocab || eos_id > UINT_MAX) return -1;
+    if (backend->argmax_dev != NULL)
+        return backend->argmax_dev(backend->state, dev_logits, vocab, codebook_size,
+                                   eos_id, allow_eos, argmax, error, error_capacity);
+    float best = -FLT_MAX;
+    unsigned result = 0u;
+    for (size_t i = 0; i < vocab; ++i) {
+        if (!(i < codebook_size || (allow_eos && i == eos_id))) continue;
+        /* Keep the first token on ties, matching the scalar kernel. */
+        const float value = dev_logits[i];
+        if (value > best) {
+            best = value;
+            result = (unsigned)i;
+        }
+    }
+    *argmax = result;
+    return 0;
+}
+
 int mynah_backend_matvec_dev(const mynah_backend *backend,
                              const float *dev_in, float *dev_out,
                              size_t K, size_t N,
@@ -736,10 +888,23 @@ int mynah_backend_conv1d(const mynah_backend *bk,
                          int kernel, int dilation,
                          const float *weight, const float *bias,
                          char *e, size_t ec) {
+    if (bk != NULL && bk->device == MYNAH_TTS_DEVICE_METAL && bk->metal_cpu_codec)
+        return -1; /* Let graph.c select BNNS/CPU fallback. */
     if (bk && bk->conv1d)
         return bk->conv1d(bk->state, input, output, in_ch, out_ch, length,
                           kernel, dilation, weight, bias, e, ec);
     return -1; /* no GPU conv1d — caller falls back to CPU */
+}
+
+int mynah_backend_conv_transpose_dev(const mynah_backend *bk, const float *input,
+                                     float *output, int in_ch, int out_ch,
+                                     int length, int output_length, int kernel,
+                                     int stride, int groups, const float *weight,
+                                     const float *bias, char *e, size_t ec) {
+    if (bk == NULL || bk->conv_transpose_dev == NULL) return -1;
+    return bk->conv_transpose_dev(bk->state, input, output, in_ch, out_ch,
+                                  length, output_length, kernel, stride, groups,
+                                  weight, bias, e, ec);
 }
 
 int mynah_backend_gelu_host(const mynah_backend *bk, float *data, size_t n,

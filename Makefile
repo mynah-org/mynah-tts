@@ -188,8 +188,8 @@ oracle:
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
 
 METAL_BUILD_DIR := build/metal
-METAL_CPPFLAGS := -Isrc
-METAL_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -DMYNAH_ENABLE_METAL
+METAL_CPPFLAGS := -Isrc -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+METAL_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -ffast-math -fno-finite-math-only -DMYNAH_ENABLE_METAL
 METAL_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o)
 METAL_CLI_OBJECT := $(METAL_BUILD_DIR)/cli/main.o
 METAL_HOST_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal.o
@@ -210,7 +210,7 @@ $(METAL_BUILD_DIR)/gpu/metal/backend_metal_ops.o: gpu/metal/backend_metal_ops.m
 
 $(METAL_TARGET): $(METAL_CORE_OBJECTS) $(METAL_CLI_OBJECT) $(METAL_HOST_OBJECT) $(METAL_OPS_OBJECT)
 	@mkdir -p $(@D)
-	$(CC) $(METAL_CFLAGS) $(LDFLAGS) $(filter %.o,$^) $(LDLIBS) -framework Foundation -framework Metal -o $@
+	$(CC) $(METAL_CFLAGS) $(LDFLAGS) $(filter %.o,$^) $(LDLIBS) -framework Foundation -framework Metal -framework MetalPerformanceShaders -o $@
 
 ifeq ($(shell uname -s),Darwin)
 metal: $(METAL_TARGET)

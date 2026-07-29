@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include "backend.h"
 
@@ -15,6 +16,8 @@ typedef struct {
     uint32_t output_width;
 } metal_matmul_params;
 
+@class MynahMetalMPSMatmul;
+
 /* Pooled reusable buffers eliminate per-call allocation, which is the
  * dominant overhead in the per-op dispatch model.  Weight buffers are
  * cached by host pointer; activation/IO buffers are pre-allocated at
@@ -26,12 +29,24 @@ typedef struct {
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLComputePipelineState> matmul_pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> tiled_pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> row_tiled_pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> row_simd_pipeline;
 @property(nonatomic, strong) NSMutableArray *weight_cache;
+@property(nonatomic, strong) NSMutableArray *mps_matmul_cache;
+@property(nonatomic, assign) BOOL use_mps;
+@property(nonatomic, assign) BOOL use_simd_matvec;
+@property(nonatomic, strong) id<MTLBuffer> scalar_buffer;
 @property(nonatomic, strong) id<MTLBuffer> io_buffer;      /* reusable input/output */
 @property(nonatomic, strong) id<MTLBuffer> params_buffer;   /* reusable params */
+@property(nonatomic, strong) id<MTLBuffer> conv_columns_buffer;
 @property(nonatomic, assign) NSUInteger io_capacity;
+@property(nonatomic, assign) NSUInteger conv_columns_capacity;
 - (id<MTLBuffer>)bufferForHostPointer:(const void *)pointer length:(NSUInteger)length;
 - (id<MTLBuffer>)ioBufferWithLength:(NSUInteger)length;
+- (id<MTLBuffer>)convColumnsBufferWithLength:(NSUInteger)length;
+- (MynahMetalMPSMatmul *)mpsMatmulForRows:(NSUInteger)rows
+                              inputWidth:(NSUInteger)input_width
+                             outputWidth:(NSUInteger)output_width;
 @end
 
 @interface MynahMetalCachedBuffer : NSObject
@@ -40,10 +55,62 @@ typedef struct {
 @property(nonatomic, strong) id<MTLBuffer> buffer;
 @end
 
+@interface MynahMetalMPSMatmul : NSObject
+@property(nonatomic, assign) NSUInteger rows;
+@property(nonatomic, assign) NSUInteger input_width;
+@property(nonatomic, assign) NSUInteger output_width;
+@property(nonatomic, strong) MPSMatrixMultiplication *kernel;
+@property(nonatomic, strong) MPSMatrixDescriptor *input_descriptor;
+@property(nonatomic, strong) MPSMatrixDescriptor *weight_descriptor;
+@property(nonatomic, strong) MPSMatrixDescriptor *output_descriptor;
+@end
+
+@implementation MynahMetalMPSMatmul
+@end
+
 @implementation MynahMetalCachedBuffer
 @end
 
 @implementation MynahMetalState
+- (MynahMetalMPSMatmul *)mpsMatmulForRows:(NSUInteger)rows
+                              inputWidth:(NSUInteger)input_width
+                             outputWidth:(NSUInteger)output_width {
+    for (MynahMetalMPSMatmul *cached in self.mps_matmul_cache) {
+        if (cached.rows == rows && cached.input_width == input_width &&
+            cached.output_width == output_width) return cached;
+    }
+    MPSMatrixDescriptor *input_descriptor =
+        [MPSMatrixDescriptor matrixDescriptorWithRows:rows columns:input_width
+                                              rowBytes:input_width * sizeof(float)
+                                              dataType:MPSDataTypeFloat32];
+    MPSMatrixDescriptor *weight_descriptor =
+        [MPSMatrixDescriptor matrixDescriptorWithRows:output_width columns:input_width
+                                              rowBytes:input_width * sizeof(float)
+                                              dataType:MPSDataTypeFloat32];
+    MPSMatrixDescriptor *output_descriptor =
+        [MPSMatrixDescriptor matrixDescriptorWithRows:rows columns:output_width
+                                              rowBytes:output_width * sizeof(float)
+                                              dataType:MPSDataTypeFloat32];
+    MPSMatrixMultiplication *kernel =
+        [[MPSMatrixMultiplication alloc] initWithDevice:self.device
+                                         transposeLeft:NO transposeRight:YES
+                                            resultRows:rows resultColumns:output_width
+                                       interiorColumns:input_width alpha:1.0 beta:1.0];
+    if (input_descriptor == nil || weight_descriptor == nil ||
+        output_descriptor == nil || kernel == nil) return nil;
+    MynahMetalMPSMatmul *cached = [MynahMetalMPSMatmul new];
+    cached.rows = rows;
+    cached.input_width = input_width;
+    cached.output_width = output_width;
+    cached.kernel = kernel;
+    cached.input_descriptor = input_descriptor;
+    cached.weight_descriptor = weight_descriptor;
+    cached.output_descriptor = output_descriptor;
+    if (self.mps_matmul_cache == nil) self.mps_matmul_cache = [NSMutableArray array];
+    [self.mps_matmul_cache addObject:cached];
+    return cached;
+}
+
 - (id<MTLBuffer>)bufferForHostPointer:(const void *)pointer length:(NSUInteger)length {
     for (MynahMetalCachedBuffer *cached in self.weight_cache) {
         if (cached.host_pointer == pointer && cached.length == length) return cached.buffer;
@@ -68,6 +135,15 @@ typedef struct {
         self.io_capacity = cap;
     }
     return self.io_buffer;
+}
+
+- (id<MTLBuffer>)convColumnsBufferWithLength:(NSUInteger)length {
+    if (self.conv_columns_buffer == nil || self.conv_columns_capacity < length) {
+        self.conv_columns_buffer = [self.device newBufferWithLength:length
+                                                               options:MTLResourceStorageModeShared];
+        self.conv_columns_capacity = self.conv_columns_buffer == nil ? 0 : length;
+    }
+    return self.conv_columns_buffer;
 }
 @end
 
@@ -127,6 +203,28 @@ static NSString *metal_shader_source_cooperative(void) {
     "using namespace metal;\n"
     "struct MatmulParams { uint rows; uint input_width; uint output_width; };\n"
     "constant uint TILE_M = 4; constant uint TILE_N = 64; constant uint TILE_K = 32;\n"
+    "kernel void mynah_matmul_row_simd(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant MatmulParams &p [[buffer(4)]], uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sgid [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {\n"
+    " uint row=tgid.x*nsg+sgid; if(row>=p.output_width) return; float acc=0.0f; uint n4=p.input_width/4u; device const float4 *in4=(device const float4 *)input; device const float4 *w4=(device const float4 *)(weight+(ulong)row*p.input_width);\n"
+    " for(uint c=lane;c<n4;c+=32u) acc+=dot(w4[c],in4[c]); for(uint k=n4*4u+lane;k<p.input_width;k+=32u) acc+=input[k]*weight[(ulong)row*p.input_width+k]; acc=simd_sum(acc); if(lane==0) output[row]=acc+(bias==nullptr?0.0f:bias[row]);\n"
+    "}\n"
+    "kernel void mynah_matmul_row_tiled(device const float *input [[buffer(0)]],\n"
+    " device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]],\n"
+    " device float *output [[buffer(3)]], constant MatmulParams &p [[buffer(4)]],\n"
+    " uint2 gid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {\n"
+    " const uint col = gid.x * 64u + tid;\n"
+    " threadgroup float input_tile[TILE_K]; float acc = 0.0f;\n"
+    " for (uint k0 = 0; k0 < p.input_width; k0 += TILE_K) {\n"
+    "  if (tid < TILE_K) input_tile[tid] = k0 + tid < p.input_width ? input[k0 + tid] : 0.0f;\n"
+    "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "  if (col < p.output_width) {\n"
+    "   const uint base = col * p.input_width + k0;\n"
+    "   for (uint k = 0; k < TILE_K && k0 + k < p.input_width; ++k)\n"
+    "    acc += input_tile[k] * weight[base + k];\n"
+    "  }\n"
+    "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    " }\n"
+    " if (col < p.output_width) output[col] = acc + (bias == nullptr ? 0.0f : bias[col]);\n"
+    "}\n"
     "kernel void mynah_matmul_tiled(device const float *input [[buffer(0)]],\n"
     " device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]],\n"
     " device float *output [[buffer(3)]], constant MatmulParams &p [[buffer(4)]],\n"
@@ -195,6 +293,43 @@ static int metal_matmul(void *opaque, const float *input, float *output, size_t 
         float *io_ptr = (float *)io.contents;
         memcpy(io_ptr, input, input_bytes);
 
+        /* MPS uses the existing resident weight buffers and the pooled IO
+         * buffer.  Seed C with the bias so GEMM computes A*B^T + C in one
+         * MPS operation without a second bias-dispatch kernel. */
+        if (state.use_mps && rows > 1u && input_width > 0 && output_width > 0) {
+            MynahMetalMPSMatmul *mps =
+                [state mpsMatmulForRows:rows inputWidth:input_width outputWidth:output_width];
+            if (mps != nil) {
+                float *result = io_ptr + input_bytes / sizeof(float);
+                if (bias != NULL) {
+                    for (NSUInteger row = 0; row < rows; ++row)
+                        memcpy(result + row * output_width, bias, bias_bytes);
+                } else {
+                    memset(result, 0, output_bytes);
+                }
+                MPSMatrix *left = [[MPSMatrix alloc] initWithBuffer:io offset:0
+                                                            descriptor:mps.input_descriptor];
+                MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:weight_buffer
+                                                                 descriptor:mps.weight_descriptor];
+                MPSMatrix *destination = [[MPSMatrix alloc] initWithBuffer:io
+                                                                      offset:input_bytes
+                                                                  descriptor:mps.output_descriptor];
+                id<MTLCommandBuffer> command = [state.queue commandBuffer];
+                if (left != nil && right != nil && destination != nil && command != nil) {
+                    [mps.kernel encodeToCommandBuffer:command leftMatrix:left
+                                         rightMatrix:right resultMatrix:destination];
+                    [command commit];
+                    [command waitUntilCompleted];
+                    if (command.status != MTLCommandBufferStatusCompleted) {
+                        set_error(error, error_capacity, command.error.localizedDescription);
+                        return -1;
+                    }
+                    memcpy(output, result, output_bytes);
+                    return 0;
+                }
+            }
+        }
+
         metal_matmul_params params = {(uint32_t)rows, (uint32_t)input_width,
                                       (uint32_t)output_width};
         if (state.params_buffer == nil) {
@@ -208,7 +343,29 @@ static int metal_matmul(void *opaque, const float *input, float *output, size_t 
 
         /* Use the tiled kernel for larger outputs, simple for tiny. */
         const NSUInteger total = rows * output_width;
-        if (output_width >= 64u && state.tiled_pipeline != nil) {
+        if (rows == 1u && state.use_simd_matvec && state.row_simd_pipeline != nil &&
+            state.row_simd_pipeline.maxTotalThreadsPerThreadgroup >= 32u) {
+            [encoder setComputePipelineState:state.row_simd_pipeline];
+            [encoder setBuffer:io offset:0 atIndex:0];
+            [encoder setBuffer:weight_buffer offset:0 atIndex:1];
+            [encoder setBuffer:bias_buffer offset:0 atIndex:2];
+            [encoder setBuffer:io offset:input_bytes atIndex:3];
+            [encoder setBuffer:state.params_buffer offset:0 atIndex:4];
+            const NSUInteger nsg = MIN((NSUInteger)8,
+                                       state.row_simd_pipeline.maxTotalThreadsPerThreadgroup / 32u);
+            [encoder dispatchThreadgroups:MTLSizeMake((output_width + nsg - 1u) / nsg, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
+        } else if (rows == 1u && output_width >= 64u && state.row_tiled_pipeline != nil &&
+            state.row_tiled_pipeline.maxTotalThreadsPerThreadgroup >= 64u) {
+            [encoder setComputePipelineState:state.row_tiled_pipeline];
+            [encoder setBuffer:io offset:0 atIndex:0];
+            [encoder setBuffer:weight_buffer offset:0 atIndex:1];
+            [encoder setBuffer:bias_buffer offset:0 atIndex:2];
+            [encoder setBuffer:io offset:input_bytes atIndex:3];
+            [encoder setBuffer:state.params_buffer offset:0 atIndex:4];
+            [encoder dispatchThreadgroups:MTLSizeMake((output_width + 63u) / 64u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else if (output_width >= 64u && state.tiled_pipeline != nil) {
             [encoder setComputePipelineState:state.tiled_pipeline];
             [encoder setBuffer:io offset:0 atIndex:0];
             [encoder setBuffer:weight_buffer offset:0 atIndex:1];
@@ -319,12 +476,31 @@ int mynah_backend_metal_open(void **state_out, mynah_backend_matmul_fn *matmul,
             tiled_pipeline = [device newComputePipelineStateWithFunction:tiled_fn
                                                                    error:&pipeline_error];
         }
+        id<MTLComputePipelineState> row_tiled_pipeline = nil;
+        id<MTLFunction> row_tiled_fn = [library newFunctionWithName:@"mynah_matmul_row_tiled"];
+        if (row_tiled_fn != nil) {
+            row_tiled_pipeline = [device newComputePipelineStateWithFunction:row_tiled_fn
+                                                                         error:&pipeline_error];
+        }
+        id<MTLComputePipelineState> row_simd_pipeline = nil;
+        id<MTLFunction> row_simd_fn = [library newFunctionWithName:@"mynah_matmul_row_simd"];
+        if (row_simd_fn != nil) {
+            row_simd_pipeline = [device newComputePipelineStateWithFunction:row_simd_fn
+                                                                        error:&pipeline_error];
+        }
         MynahMetalState *state = [MynahMetalState new];
         state.device = device;
         state.queue = [device newCommandQueue];
         state.matmul_pipeline = simple_pipeline;
         state.tiled_pipeline = tiled_pipeline;
+        state.row_tiled_pipeline = row_tiled_pipeline;
+        state.row_simd_pipeline = row_simd_pipeline;
+        const char *simd_env = getenv("MYNAH_METAL_SIMD_MATVEC");
+        state.use_simd_matvec = simd_env == NULL || strcmp(simd_env, "0") != 0;
         state.weight_cache = [NSMutableArray array];
+        state.mps_matmul_cache = [NSMutableArray array];
+        const char *mps_env = getenv("MYNAH_METAL_MPS");
+        state.use_mps = mps_env == NULL || strcmp(mps_env, "0") != 0;
         if (state.queue == nil) {
             set_error(error, error_capacity, @"Metal could not create a command queue");
             return -1;

@@ -15,6 +15,64 @@ constant constexpr uint TILE_M = 4;
 constant constexpr uint TILE_N = 64;
 constant constexpr uint TILE_K = 32;
 
+/* Qwen-style simdgroup matvec: one output row per simdgroup, coalesced float4
+ * reads and a hardware subgroup reduction.  This is the critical B=1 decode
+ * path; the tiled kernel below is retained for comparison and fallback. */
+kernel void mynah_matmul_row_simd(
+    device const float *input [[buffer(0)]],
+    device const float *weight [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant MatmulParams &p [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint nsg [[simdgroups_per_threadgroup]]) {
+    const uint row = tgid.x * nsg + sgid;
+    if (row >= p.output_width) return;
+    float acc = 0.0f;
+    const uint n4 = p.input_width / 4u;
+    device const float4 *input4 = (device const float4 *)input;
+    device const float4 *weight4 =
+        (device const float4 *)(weight + (ulong)row * p.input_width);
+    for (uint c = lane; c < n4; c += 32u)
+        acc += dot(weight4[c], input4[c]);
+    for (uint k = n4 * 4u + lane; k < p.input_width; k += 32u)
+        acc += input[k] * weight[(ulong)row * p.input_width + k];
+    acc = simd_sum(acc);
+    if (lane == 0)
+        output[row] = acc + (bias == nullptr ? 0.0f : bias[row]);
+}
+
+/* A decoder step is a single row.  Use one 64-thread group per output tile:
+ * the generic 4x64 kernel launches four row groups and does unnecessary input
+ * loads/barriers when rows == 1. */
+kernel void mynah_matmul_row_tiled(
+    device const float *input [[buffer(0)]],
+    device const float *weight [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant MatmulParams &p [[buffer(4)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint col = gid.x * 64u + tid;
+    threadgroup float input_tile[TILE_K];
+    float acc = 0.0f;
+    for (uint k0 = 0; k0 < p.input_width; k0 += TILE_K) {
+        if (tid < TILE_K)
+            input_tile[tid] = k0 + tid < p.input_width ? input[k0 + tid] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (col < p.output_width) {
+            const uint base = col * p.input_width + k0;
+            for (uint k = 0; k < TILE_K && k0 + k < p.input_width; ++k)
+                acc += input_tile[k] * weight[base + k];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (col < p.output_width)
+        output[col] = acc + (bias == nullptr ? 0.0f : bias[col]);
+}
+
 kernel void mynah_matmul_tiled(
     device const float *input [[buffer(0)]],
     device const float *weight [[buffer(1)]],

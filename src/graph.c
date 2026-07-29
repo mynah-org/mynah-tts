@@ -746,6 +746,20 @@ typedef struct {
     const float *norm_ff[4];
     const float *ffn_up_w[4];
     const float *ffn_down_w[4];
+    /* Metal resident local-transformer state.  Host K/V and scratch remain
+     * for the scalar path; the GPU path never downloads its hidden row. */
+    float *dev_k;
+    float *dev_v;
+    float *dev_x;
+    float *dev_nrm;
+    float *dev_qkv;
+    float *dev_attn;
+    float *dev_proj;
+    float *dev_hidden;
+    float *dev_logits;
+    float *dev_input;
+    const mynah_backend *dev_backend;
+    int gpu_ready;
 } local_cache;
 
 static void local_projection_cache_free_impl(local_projection_cache *cache) {
@@ -871,6 +885,30 @@ static void local_cache_free(local_cache *cache) {
     free(cache->v);
     cache->k = NULL;
     cache->v = NULL;
+    if (cache->gpu_ready && cache->dev_backend != NULL) {
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_k);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_v);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_x);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_nrm);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_qkv);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_attn);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_proj);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_hidden);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_logits);
+        mynah_backend_dev_free(cache->dev_backend, cache->dev_input);
+    }
+    cache->dev_k = NULL;
+    cache->dev_v = NULL;
+    cache->dev_x = NULL;
+    cache->dev_nrm = NULL;
+    cache->dev_qkv = NULL;
+    cache->dev_attn = NULL;
+    cache->dev_proj = NULL;
+    cache->dev_hidden = NULL;
+    cache->dev_logits = NULL;
+    cache->dev_input = NULL;
+    cache->dev_backend = NULL;
+    cache->gpu_ready = 0;
 }
 
 static int local_cache_init(const mynah_tts_model *model, local_cache *cache,
@@ -917,6 +955,106 @@ static int local_cache_init(const mynah_tts_model *model, local_cache *cache,
         if (tensor(model->tts, nm, &t, error, error_capacity)!=0) return -1;
         cache->ffn_down_w[l] = t.data;
     }
+    if (mynah_backend_has_dev_ops(model->backend) &&
+        mynah_backend_has_attention_dev(model->backend) &&
+        cache->layers > 0u && cache->layers <= 4u &&
+        cache->layers <= SIZE_MAX / capacity &&
+        cache->layers * capacity <= SIZE_MAX / width) {
+        const size_t kv_count = cache->layers * capacity * width;
+        const size_t qkv_count = width * 3u;
+        int ok = 1;
+        cache->dev_backend = model->backend;
+        ok = ok && mynah_backend_dev_alloc(model->backend, kv_count, &cache->dev_k,
+                                            error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, kv_count, &cache->dev_v,
+                                            error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, width, &cache->dev_x,
+                                            error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, width, &cache->dev_nrm,
+                                            error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, qkv_count, &cache->dev_qkv,
+                                            error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, width, &cache->dev_attn,
+                                            error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, width, &cache->dev_proj,
+                                            error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, cache->ffn_width,
+                                            &cache->dev_hidden, error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, model->info.audio_vocab_size,
+                                            &cache->dev_logits, error, error_capacity) == 0;
+        ok = ok && mynah_backend_dev_alloc(model->backend, width, &cache->dev_input,
+                                            error, error_capacity) == 0;
+        if (ok) {
+            cache->gpu_ready = 1;
+        } else {
+            local_cache_free(cache);
+            graph_error(error, error_capacity, "Metal local-transformer buffers unavailable");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* One local-transformer position with all activations and KV state resident on
+ * the GPU.  The caller owns the synchronization boundary: argmax must observe
+ * this row before the next token embedding is uploaded. */
+static int local_step_device(const mynah_tts_model *model, local_cache *cache,
+                             const float *dev_input, float **dev_output,
+                             char *error, size_t error_capacity) {
+    if (model == NULL || cache == NULL || !cache->gpu_ready ||
+        dev_input == NULL || dev_output == NULL || cache->dev_backend == NULL)
+        return -1;
+    const mynah_backend *backend = cache->dev_backend;
+    const size_t width = cache->width;
+    const size_t p = cache->length;
+    const size_t hw = cache->head_width;
+    if (p >= cache->capacity) {
+        graph_error(error, error_capacity, "Metal local transformer cache overflow");
+        return -1;
+    }
+    if (mynah_backend_batch_begin(backend, error, error_capacity) != 0 ||
+        mynah_backend_copy_dev(backend, cache->dev_x, dev_input, width,
+                               error, error_capacity) != 0 ||
+        mynah_backend_residual_inplace(backend, cache->dev_x,
+                                       cache->position + p * width, width,
+                                       error, error_capacity) != 0) return -1;
+    const float scale = 1.0f / sqrtf((float)hw);
+    for (size_t layer = 0; layer < cache->layers; ++layer) {
+        if (mynah_backend_layer_norm_inplace(backend, cache->dev_x, cache->dev_nrm,
+                                             cache->norm_self[layer], 1u, width,
+                                             error, error_capacity) != 0 ||
+            mynah_backend_matmul_d2d(backend, cache->dev_nrm, cache->dev_qkv,
+                                     1u, width, width * 3u, cache->qkv_w[layer],
+                                     NULL, error, error_capacity) != 0 ||
+            mynah_backend_self_attention_dev(
+                backend, cache->dev_qkv,
+                cache->dev_k + layer * cache->capacity * width,
+                cache->dev_v + layer * cache->capacity * width,
+                p, width, p + 1u, cache->heads, hw, scale, cache->dev_attn,
+                error, error_capacity) != 0 ||
+            mynah_backend_matmul_d2d(backend, cache->dev_attn, cache->dev_proj,
+                                     1u, width, width, cache->o_w[layer], NULL,
+                                     error, error_capacity) != 0 ||
+            mynah_backend_residual_inplace(backend, cache->dev_x, cache->dev_proj,
+                                            width, error, error_capacity) != 0 ||
+            mynah_backend_layer_norm_inplace(backend, cache->dev_x, cache->dev_nrm,
+                                             cache->norm_ff[layer], 1u, width,
+                                             error, error_capacity) != 0 ||
+            mynah_backend_matmul_d2d(backend, cache->dev_nrm, cache->dev_hidden,
+                                     1u, width, cache->ffn_width,
+                                     cache->ffn_up_w[layer], NULL,
+                                     error, error_capacity) != 0 ||
+            mynah_backend_gelu_inplace(backend, cache->dev_hidden, cache->ffn_width,
+                                       error, error_capacity) != 0 ||
+            mynah_backend_matmul_d2d(backend, cache->dev_hidden, cache->dev_proj,
+                                     1u, cache->ffn_width, width,
+                                     cache->ffn_down_w[layer], NULL,
+                                     error, error_capacity) != 0 ||
+            mynah_backend_residual_inplace(backend, cache->dev_x, cache->dev_proj,
+                                            width, error, error_capacity) != 0) return -1;
+    }
+    cache->length += 1u;
+    *dev_output = cache->dev_x;
     return 0;
 }
 
@@ -993,6 +1131,7 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
 
 /* The local AR helper emits one stacked frame (two raw codec frames). */
 static int sample_local_frame(const mynah_tts_model *model, const float *decoder_last,
+                              const float *decoder_dev_last,
                               unsigned *codes, size_t raw_offset, size_t code_stride,
                               size_t generated_raw_length, size_t min_raw_length,
                               float temperature, unsigned topk,
@@ -1021,6 +1160,13 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
     }
     const size_t vocab = model->info.audio_vocab_size;
     const int sampling = temperature > 0.0f && topk > 1u && rng_state != NULL;
+    const char *metal_local_env = getenv("MYNAH_METAL_GPU_LOCAL");
+    const char *metal_attention_local_env = getenv("MYNAH_METAL_GPU_ATTENTION");
+    const int gpu_local = lc.gpu_ready && lc.dev_backend != NULL &&
+        (metal_local_env == NULL || strcmp(metal_local_env, "0") != 0) &&
+        (strcmp(mynah_backend_name(lc.dev_backend), "metal") != 0 ||
+         (metal_attention_local_env != NULL &&
+          strcmp(metal_attention_local_env, "1") == 0));
     const size_t top_count = topk < vocab ? topk : vocab;
     const int reuse_sampler = getenv("MYNAH_LOCAL_SAMPLER_ALLOCS") == NULL;
     float *shared_logits = reuse_sampler
@@ -1042,14 +1188,36 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         graph_error(error, error_capacity, "out of memory allocating local sampler scratch");
         return -1;
     }
-    memcpy(row_in, decoder_last, width * sizeof(float));
+    if (!gpu_local || decoder_dev_last == NULL)
+        memcpy(row_in, decoder_last, width * sizeof(float));
+    if (gpu_local && ((decoder_dev_last != NULL
+                           ? mynah_backend_copy_dev(lc.dev_backend, lc.dev_input,
+                                                    decoder_dev_last, width,
+                                                    error, error_capacity)
+                           : mynah_backend_h2d(lc.dev_backend, decoder_last,
+                                               lc.dev_input, width,
+                                               error, error_capacity)) != 0)) {
+        free(shared_logits);
+        free(shared_top_indices);
+        free(shared_top_logits);
+        free(row_in);
+        free(row_out);
+        local_workspace_free(&workspace);
+        local_cache_free(&lc);
+        return -1;
+    }
     *saw_eos = 0;
     *eos_frame = SIZE_MAX;
     char name[160];
     for (size_t stream = 0; stream < stream_count; ++stream) {
         local_workspace *step_workspace = reuse_workspace ? &workspace : NULL;
-        if (local_step(model, &lc, step_workspace, row_in, row_out,
-                       error, error_capacity) != 0) {
+        float *dev_row_out = NULL;
+        const int step_failed = gpu_local
+            ? local_step_device(model, &lc, lc.dev_input, &dev_row_out,
+                                error, error_capacity)
+            : local_step(model, &lc, step_workspace, row_in, row_out,
+                         error, error_capacity);
+        if (step_failed != 0) {
             free(shared_logits);
             free(shared_top_indices);
             free(shared_top_logits);
@@ -1082,83 +1250,121 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         const unsigned eos_id = model->info.audio_eos_id;
         snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
         unsigned argmax = 0;
-        int fused = !sampling &&
-            (getenv("MYNAH_FUSED_GREEDY") == NULL ||
-             strcmp(getenv("MYNAH_FUSED_GREEDY"), "0") != 0)
-            ? (projection_cache != NULL && stream < projection_cache->stream_count
-                   ? mynah_qmat_greedy_argmax_resolved(
-                         model->qcache, name,
-                         projection_cache->projection_weights[stream], row_out,
-                         width, vocab, bias_data, model->info.codebook_size,
-                         eos_id, !forbid_eos, &argmax, error, error_capacity)
-                   : mynah_qmat_greedy_argmax(model->qcache, model->tts, name,
-                                              row_out, width, vocab, bias_data,
-                                              model->info.codebook_size, eos_id,
-                                              !forbid_eos, &argmax, error,
-                                              error_capacity))
-            : 1;
-        if (fused < 0) {
-            free(shared_logits);
-            free(shared_top_indices);
-            free(shared_top_logits);
-            free(row_in);
-            free(row_out);
-            local_workspace_free(&workspace);
-            local_cache_free(&lc);
-            return -1;
+        const float *projection_weight = NULL;
+        if (projection_cache != NULL && stream < projection_cache->stream_count) {
+            projection_weight = projection_cache->projection_weights[stream];
+        } else {
+            mynah_tensor projection;
+            if (tensor(model->tts, name, &projection, error, error_capacity) != 0) {
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
+                free(row_in);
+                free(row_out);
+                local_workspace_free(&workspace);
+                local_cache_free(&lc);
+                return -1;
+            }
+            projection_weight = projection.data;
         }
         float *logits = NULL;
-        if (fused != 0) {
+        int fused = 1;
+        if (gpu_local) {
+            if (mynah_backend_matmul_d2d(lc.dev_backend, dev_row_out, lc.dev_logits,
+                                          1u, width, vocab, projection_weight,
+                                          bias_data, error, error_capacity) != 0) {
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
+                free(row_in);
+                free(row_out);
+                local_workspace_free(&workspace);
+                local_cache_free(&lc);
+                return -1;
+            }
+            if (!sampling) {
+                fused = 0;
+                if (mynah_backend_argmax_dev(lc.dev_backend, lc.dev_logits, vocab,
+                                              model->info.codebook_size, eos_id,
+                                              !forbid_eos, &argmax, error,
+                                              error_capacity) != 0) {
+                    free(shared_logits);
+                    free(shared_top_indices);
+                    free(shared_top_logits);
+                    free(row_in);
+                    free(row_out);
+                    local_workspace_free(&workspace);
+                    local_cache_free(&lc);
+                    return -1;
+                }
+            } else {
+                logits = shared_logits != NULL
+                    ? shared_logits : allocate_floats(vocab, error, error_capacity);
+                if (logits == NULL ||
+                    mynah_backend_d2h(lc.dev_backend, lc.dev_logits, logits, vocab,
+                                      error, error_capacity) != 0) {
+                    if (logits != shared_logits) free(logits);
+                    free(shared_logits);
+                    free(shared_top_indices);
+                    free(shared_top_logits);
+                    free(row_in);
+                    free(row_out);
+                    local_workspace_free(&workspace);
+                    local_cache_free(&lc);
+                    return -1;
+                }
+            }
+        } else if (!sampling &&
+                   (getenv("MYNAH_FUSED_GREEDY") == NULL ||
+                    strcmp(getenv("MYNAH_FUSED_GREEDY"), "0") != 0)) {
+            fused = mynah_qmat_greedy_argmax_resolved(
+                model->qcache, name, projection_weight, row_out, width, vocab,
+                bias_data, model->info.codebook_size, eos_id, !forbid_eos,
+                &argmax, error, error_capacity);
+            if (fused < 0) {
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
+                free(row_in);
+                free(row_out);
+                local_workspace_free(&workspace);
+                local_cache_free(&lc);
+                return -1;
+            }
+        }
+        if (!gpu_local && fused != 0) {
             logits = shared_logits != NULL
-            ? shared_logits : allocate_floats(vocab, error, error_capacity);
-        if (logits == NULL) {
-            free(shared_logits);
-            free(shared_top_indices);
-            free(shared_top_logits);
-            free(row_in);
-            free(row_out);
-            local_workspace_free(&workspace);
-            local_cache_free(&lc);
-            return -1;
+                ? shared_logits : allocate_floats(vocab, error, error_capacity);
+            if (logits == NULL ||
+                mynah_qmat_linear_resolved(model->qcache, model->backend, name,
+                                           projection_weight, row_out, logits,
+                                           1u, width, vocab, bias_data,
+                                           error, error_capacity) != 0) {
+                if (logits != shared_logits) free(logits);
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
+                free(row_in);
+                free(row_out);
+                local_workspace_free(&workspace);
+                local_cache_free(&lc);
+                return -1;
+            }
         }
-        /* Project to the full audio vocab (INT8 when enabled), then forbid every
-         * special token except AUDIO_EOS (and EOS too while below
-         * min_generated_frames), matching NeMo clear_forbidden_logits. */
-        snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
-        int projection_result;
-        if (projection_cache != NULL && stream < projection_cache->stream_count) {
-            projection_result = mynah_qmat_linear_resolved(
-                model->qcache, model->backend, name,
-                projection_cache->projection_weights[stream], row_out, logits,
-                1u, width, vocab, bias_data, error, error_capacity);
-        } else {
-            projection_result = mynah_qmat_linear(
-                model->qcache, model->tts, model->backend, name, row_out, logits,
-                1u, width, vocab, bias_data, error, error_capacity);
-        }
-        if (projection_result != 0) {
-            if (logits != shared_logits) free(logits);
-            free(shared_logits);
-            free(shared_top_indices);
-            free(shared_top_logits);
-            free(row_in);
-            free(row_out);
-            local_cache_free(&lc);
-            return -1;
-        }
+        if (fused != 0) {
             float best = -FLT_MAX;
-        for (size_t candidate = 0; candidate < vocab; ++candidate) {
-            const int is_code = candidate < model->info.codebook_size;
-            const int is_eos = candidate == eos_id;
-            if (!is_code && !(is_eos && !forbid_eos)) {
-                logits[candidate] = -FLT_MAX;
-                continue;
+            for (size_t candidate = 0; candidate < vocab; ++candidate) {
+                const int is_code = candidate < model->info.codebook_size;
+                const int is_eos = candidate == eos_id;
+                if (!is_code && !(is_eos && !forbid_eos)) {
+                    logits[candidate] = -FLT_MAX;
+                    continue;
+                }
+                if (logits[candidate] > best) {
+                    best = logits[candidate];
+                    argmax = (unsigned)candidate;
+                }
             }
-            if (logits[candidate] > best) {
-                best = logits[candidate];
-                argmax = (unsigned)candidate;
-            }
-        }
         }
         unsigned value = argmax;
         /* argmax_or_multinomial: EOS fires if either the greedy or the sampled
@@ -1263,7 +1469,23 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         }
         /* The embedding of this stream's token becomes the input row for the
          * next local-transformer position. */
-        memcpy(row_in, audio_table_data + (size_t)emit * width, width * sizeof(float));
+        if (gpu_local) {
+            if (mynah_backend_h2d(lc.dev_backend,
+                                  audio_table_data + (size_t)emit * width,
+                                  lc.dev_input, width, error, error_capacity) != 0) {
+                free(shared_logits);
+                free(shared_top_indices);
+                free(shared_top_logits);
+                free(row_in);
+                free(row_out);
+                local_workspace_free(&workspace);
+                local_cache_free(&lc);
+                return -1;
+            }
+        } else {
+            memcpy(row_in, audio_table_data + (size_t)emit * width,
+                   width * sizeof(float));
+        }
     }
     free(shared_logits);
     free(shared_top_indices);
@@ -2018,9 +2240,232 @@ static int res_layer(const mynah_safetensors *file, const mynah_backend *backend
     return error == NULL || error[0] == '\0' ? 0 : -1;
 }
 
+/* Metal-resident residual stack.  The three branches and three dilated blocks
+ * reuse four device workspaces; no intermediate activation crosses back to C. */
+static int res_layer_device(const mynah_safetensors *file, const mynah_backend *backend,
+                            size_t stage, const float *dev_input, float *dev_output,
+                            size_t channels, size_t length, char *error,
+                            size_t error_capacity) {
+    const size_t kernels[3] = {3u, 7u, 11u};
+    const size_t dilations[3] = {1u, 3u, 5u};
+    if (file == NULL || backend == NULL || dev_input == NULL || dev_output == NULL ||
+        channels == 0u || length == 0u || channels > SIZE_MAX / length) return -1;
+    const size_t elements = channels * length;
+    float *branch = NULL, *current = NULL, *activated = NULL, *residual = NULL;
+    int ok = mynah_backend_dev_alloc(backend, elements, &branch, error, error_capacity) == 0;
+    ok = ok && mynah_backend_dev_alloc(backend, elements, &current, error, error_capacity) == 0;
+    ok = ok && mynah_backend_dev_alloc(backend, elements, &activated, error, error_capacity) == 0;
+    ok = ok && mynah_backend_dev_alloc(backend, elements, &residual, error, error_capacity) == 0;
+    float *zeros = ok ? (float *)calloc(elements, sizeof(float)) : NULL;
+    if (ok && zeros == NULL) ok = 0;
+    if (ok && (mynah_backend_h2d(backend, zeros, dev_output, elements,
+                                 error, error_capacity) != 0 ||
+               mynah_backend_batch_begin(backend, error, error_capacity) != 0)) ok = 0;
+    free(zeros);
+    char name[256], weight_name[256], bias_name[256];
+    for (size_t branch_index = 0; ok && branch_index < 3u; ++branch_index) {
+        ok = mynah_backend_copy_dev(backend, current, dev_input, elements,
+                                    error, error_capacity) == 0;
+        for (size_t dilation_index = 0; ok && dilation_index < 3u; ++dilation_index) {
+            mynah_tensor alpha, weight, bias;
+            snprintf(name, sizeof(name),
+                     "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.input_activation.activation.snake_act.alpha",
+                     stage, branch_index, dilation_index);
+            snprintf(weight_name, sizeof(weight_name),
+                     "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.input_conv.conv.weight",
+                     stage, branch_index, dilation_index);
+            snprintf(bias_name, sizeof(bias_name),
+                     "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.input_conv.conv.bias",
+                     stage, branch_index, dilation_index);
+            ok = tensor(file, name, &alpha, error, error_capacity) == 0 &&
+                 tensor(file, weight_name, &weight, error, error_capacity) == 0 &&
+                 tensor(file, bias_name, &bias, error, error_capacity) == 0 &&
+                 mynah_backend_copy_dev(backend, activated, current, elements,
+                                        error, error_capacity) == 0 &&
+                 mynah_backend_snake_dev(backend, activated, alpha.data, channels,
+                                         length, channels / 2u, error,
+                                         error_capacity) == 0 &&
+                 mynah_backend_conv1d(backend, activated, residual,
+                                      (int)channels, (int)channels, (int)length,
+                                      (int)kernels[branch_index],
+                                      (int)dilations[dilation_index], weight.data,
+                                      bias.data, error, error_capacity) == 0;
+            snprintf(name, sizeof(name),
+                     "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_activation.activation.snake_act.alpha",
+                     stage, branch_index, dilation_index);
+            snprintf(weight_name, sizeof(weight_name),
+                     "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_conv.conv.weight",
+                     stage, branch_index, dilation_index);
+            snprintf(bias_name, sizeof(bias_name),
+                     "audio_decoder.res_layers.%zu.res_blocks.%zu.res_blocks.%zu.skip_conv.conv.bias",
+                     stage, branch_index, dilation_index);
+            if (ok) ok = tensor(file, name, &alpha, error, error_capacity) == 0 &&
+                         tensor(file, weight_name, &weight, error, error_capacity) == 0 &&
+                         tensor(file, bias_name, &bias, error, error_capacity) == 0 &&
+                         mynah_backend_snake_dev(backend, residual, alpha.data, channels,
+                                                 length, channels / 2u, error,
+                                                 error_capacity) == 0 &&
+                         mynah_backend_conv1d(backend, residual, branch,
+                                              (int)channels, (int)channels, (int)length,
+                                              (int)kernels[branch_index], 1,
+                                              weight.data, bias.data, error,
+                                              error_capacity) == 0 &&
+                         mynah_backend_residual_inplace(backend, current, branch,
+                                                        elements, error,
+                                                        error_capacity) == 0;
+        }
+        if (ok) ok = mynah_backend_residual_inplace(backend, dev_output, current,
+                                                    elements, error, error_capacity) == 0;
+    }
+    if (ok) ok = mynah_backend_scale_dev(backend, dev_output, elements, 1.0f / 3.0f,
+                                         error, error_capacity) == 0;
+    if (mynah_backend_sync(backend, error, error_capacity) != 0) ok = 0;
+    mynah_backend_dev_free(backend, branch);
+    mynah_backend_dev_free(backend, current);
+    mynah_backend_dev_free(backend, activated);
+    mynah_backend_dev_free(backend, residual);
+    return ok ? 0 : -1;
+}
+
+/* Complete NanoCodec decode with persistent Metal activations.  This is kept
+ * as a separate graph path so the existing CPU/BNNS implementation remains a
+ * reference oracle and a deliberate fallback for non-Metal builds. */
+static int decode_codec_resident(const mynah_tts_model *model, const unsigned *codes,
+                                size_t raw_length, float **samples, size_t *sample_count,
+                                char *error, size_t error_capacity) {
+    const mynah_backend *backend = model->backend;
+    if (backend == NULL || !mynah_backend_has_dev_ops(backend) ||
+        !mynah_backend_has_attention_dev(backend) ||
+        (getenv("MYNAH_METAL_CPU_CODEC") != NULL &&
+         strcmp(getenv("MYNAH_METAL_CPU_CODEC"), "0") != 0)) return 1;
+    const size_t levels[4] = {8u, 7u, 6u, 6u};
+    const size_t bases[4] = {1u, 8u, 56u, 336u};
+    const size_t groups = 8u;
+    const size_t latent_channels = 32u;
+    if (raw_length == 0u || raw_length > SIZE_MAX / latent_channels) return -1;
+    float *latent = allocate_floats(latent_channels * raw_length, error, error_capacity);
+    float *dev_latent = NULL, *current = NULL, *upsampled = NULL, *audio_dev = NULL;
+    float *audio = NULL;
+    if (latent == NULL) return -1;
+    for (size_t t = 0; t < raw_length; ++t) {
+        for (size_t group = 0; group < groups; ++group) {
+            const unsigned index = codes[group * raw_length + t];
+            for (size_t d = 0; d < 4u; ++d) {
+                const size_t digit = (index / bases[d]) % levels[d];
+                latent[(group * 4u + d) * raw_length + t] =
+                    ((float)digit - (float)(levels[d] / 2u)) /
+                    (float)(levels[d] / 2u);
+            }
+        }
+    }
+    if (mynah_backend_dev_alloc(backend, latent_channels * raw_length, &dev_latent,
+                                 error, error_capacity) != 0 ||
+        mynah_backend_h2d(backend, latent, dev_latent, latent_channels * raw_length,
+                          error, error_capacity) != 0 ||
+        mynah_backend_dev_alloc(backend, 864u * raw_length, &current,
+                                error, error_capacity) != 0) goto fail;
+    free(latent);
+    latent = NULL;
+    mynah_tensor weight, bias;
+    if (tensor(model->codec, "audio_decoder.pre_conv.conv.weight", &weight,
+               error, error_capacity) != 0 ||
+        tensor(model->codec, "audio_decoder.pre_conv.conv.bias", &bias,
+               error, error_capacity) != 0 ||
+        mynah_backend_batch_begin(backend, error, error_capacity) != 0 ||
+        mynah_backend_conv1d(backend, dev_latent, current, 32, 864, (int)raw_length,
+                             7, 1, weight.data, bias.data, error, error_capacity) != 0 ||
+        mynah_backend_sync(backend, error, error_capacity) != 0) goto fail;
+    mynah_backend_dev_free(backend, dev_latent);
+    dev_latent = NULL;
+    size_t current_channels = 864u, current_length = raw_length;
+    const size_t rates[5] = {8u, 8u, 4u, 2u, 2u};
+    char name[256], weight_name[256], bias_name[256];
+    for (size_t stage = 0; stage < 5u; ++stage) {
+        snprintf(name, sizeof(name),
+                 "audio_decoder.activations.%zu.activation.snake_act.alpha", stage);
+        if (tensor(model->codec, name, &weight, error, error_capacity) != 0 ||
+            mynah_backend_batch_begin(backend, error, error_capacity) != 0 ||
+            mynah_backend_snake_dev(backend, current, weight.data, current_channels,
+                                    current_length, current_channels / 2u,
+                                    error, error_capacity) != 0) goto fail;
+        const size_t next_channels = current_channels / 2u;
+        if (current_length > SIZE_MAX / rates[stage]) goto fail;
+        const size_t next_length = current_length * rates[stage];
+        if (next_channels > SIZE_MAX / next_length) goto fail;
+        if (mynah_backend_dev_alloc(backend, next_channels * next_length, &upsampled,
+                                    error, error_capacity) != 0) goto fail;
+        snprintf(weight_name, sizeof(weight_name),
+                 "audio_decoder.up_sample_conv_layers.%zu.conv.weight", stage);
+        snprintf(bias_name, sizeof(bias_name),
+                 "audio_decoder.up_sample_conv_layers.%zu.conv.bias", stage);
+        if (tensor(model->codec, weight_name, &weight, error, error_capacity) != 0 ||
+            tensor(model->codec, bias_name, &bias, error, error_capacity) != 0 ||
+            mynah_backend_conv_transpose_dev(
+                backend, current, upsampled, (int)current_channels,
+                (int)next_channels, (int)current_length, (int)next_length,
+                (int)(rates[stage] * 2u), (int)rates[stage], (int)next_channels,
+                weight.data, bias.data, error, error_capacity) != 0) goto fail;
+        float *next = NULL;
+        if (mynah_backend_dev_alloc(backend, next_channels * next_length, &next,
+                                    error, error_capacity) != 0 ||
+            res_layer_device(model->codec, backend, stage, upsampled, next,
+                             next_channels, next_length, error, error_capacity) != 0) {
+            mynah_backend_dev_free(backend, next);
+            goto fail;
+        }
+        mynah_backend_dev_free(backend, current);
+        mynah_backend_dev_free(backend, upsampled);
+        current = next;
+        upsampled = NULL;
+        current_channels = next_channels;
+        current_length = next_length;
+    }
+    snprintf(name, sizeof(name),
+             "audio_decoder.post_activation.activation.snake_act.alpha");
+    snprintf(weight_name, sizeof(weight_name), "audio_decoder.post_conv.conv.weight");
+    snprintf(bias_name, sizeof(bias_name), "audio_decoder.post_conv.conv.bias");
+    if (tensor(model->codec, name, &weight, error, error_capacity) != 0 ||
+        mynah_backend_batch_begin(backend, error, error_capacity) != 0 ||
+        mynah_backend_snake_dev(backend, current, weight.data, current_channels,
+                                current_length, current_channels / 2u,
+                                error, error_capacity) != 0 ||
+        tensor(model->codec, bias_name, &bias, error, error_capacity) != 0) goto fail;
+    /* Reload the post-conv views after using `weight` for Snake's alpha. */
+    if (tensor(model->codec, weight_name, &weight, error, error_capacity) != 0 ||
+        tensor(model->codec, bias_name, &bias, error, error_capacity) != 0 ||
+        mynah_backend_dev_alloc(backend, current_length, &audio_dev,
+                                error, error_capacity) != 0 ||
+        mynah_backend_conv1d(backend, current, audio_dev, (int)current_channels, 1,
+                             (int)current_length, 3, 1, weight.data, bias.data,
+                             error, error_capacity) != 0 ||
+        mynah_backend_clip_dev(backend, audio_dev, current_length,
+                               error, error_capacity) != 0 ||
+        mynah_backend_sync(backend, error, error_capacity) != 0) goto fail;
+    audio = allocate_floats(current_length, error, error_capacity);
+    if (audio == NULL || mynah_backend_d2h(backend, audio_dev, audio, current_length,
+                                           error, error_capacity) != 0) goto fail;
+    mynah_backend_dev_free(backend, current);
+    mynah_backend_dev_free(backend, audio_dev);
+    *samples = audio;
+    *sample_count = current_length;
+    return 0;
+fail:
+    free(latent);
+    free(audio);
+    mynah_backend_dev_free(backend, dev_latent);
+    mynah_backend_dev_free(backend, current);
+    mynah_backend_dev_free(backend, upsampled);
+    mynah_backend_dev_free(backend, audio_dev);
+    return -1;
+}
+
 static int decode_codec(const mynah_tts_model *model, const unsigned *codes,
                         size_t raw_length, float **samples, size_t *sample_count,
                         char *error, size_t error_capacity) {
+    const int resident_codec = decode_codec_resident(model, codes, raw_length,
+                                                     samples, sample_count,
+                                                     error, error_capacity);
+    if (resident_codec != 1) return resident_codec;
     const int timing = getenv("MYNAH_TIMING") != NULL;
     const double codec_start = timing ? phase_seconds() : 0.0;
     double stage_seconds[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -2228,7 +2673,12 @@ typedef struct {
     float *dev_xctx;
     float *dev_hidden;
     float *dev_x;
+    float *dev_self_k;
+    float *dev_self_v;
+    float *dev_cross_k;
+    float *dev_cross_v;
     int dev_allocated;
+    int dev_attention_allocated;
     const mynah_backend *dev_backend; /* for dev_free */
 } decoder_cache;
 
@@ -2260,8 +2710,76 @@ static void decoder_cache_free(decoder_cache *cache) {
         mynah_backend_dev_free(cache->dev_backend, cache->dev_xctx);
         mynah_backend_dev_free(cache->dev_backend, cache->dev_hidden);
         mynah_backend_dev_free(cache->dev_backend, cache->dev_x);
+        if (cache->dev_attention_allocated) {
+            mynah_backend_dev_free(cache->dev_backend, cache->dev_self_k);
+            mynah_backend_dev_free(cache->dev_backend, cache->dev_self_v);
+            mynah_backend_dev_free(cache->dev_backend, cache->dev_cross_k);
+            mynah_backend_dev_free(cache->dev_backend, cache->dev_cross_v);
+        }
     }
     memset(cache, 0, sizeof(*cache));
+}
+
+static int decoder_gpu_attention_init(decoder_cache *cache,
+                                      const mynah_backend *backend,
+                                      char *error, size_t error_capacity) {
+    if (cache == NULL || backend == NULL || !mynah_backend_has_attention_dev(backend))
+        return -1;
+    if (cache->dev_attention_allocated) return 0;
+    if (cache->layers == 0 || cache->capacity == 0 || cache->width == 0 ||
+        cache->memory_length == 0 || cache->xattn_width == 0 ||
+        cache->layers > SIZE_MAX / cache->capacity ||
+        cache->layers * cache->capacity > SIZE_MAX / cache->width ||
+        cache->layers > SIZE_MAX / cache->memory_length ||
+        cache->layers * cache->memory_length > SIZE_MAX / cache->xattn_width) {
+        graph_error(error, error_capacity, "GPU attention cache dimensions overflow");
+        return -1;
+    }
+    const size_t self_count = cache->layers * cache->capacity * cache->width;
+    const size_t cross_count = cache->layers * cache->memory_length * cache->xattn_width;
+    float *self_k = NULL, *self_v = NULL, *cross_k = NULL, *cross_v = NULL;
+    if (mynah_backend_dev_alloc(backend, self_count, &self_k, error, error_capacity) != 0 ||
+        mynah_backend_dev_alloc(backend, self_count, &self_v, error, error_capacity) != 0 ||
+        mynah_backend_dev_alloc(backend, cross_count, &cross_k, error, error_capacity) != 0 ||
+        mynah_backend_dev_alloc(backend, cross_count, &cross_v, error, error_capacity) != 0) {
+        mynah_backend_dev_free(backend, self_k);
+        mynah_backend_dev_free(backend, self_v);
+        mynah_backend_dev_free(backend, cross_k);
+        mynah_backend_dev_free(backend, cross_v);
+        return -1;
+    }
+    for (size_t layer = 0; layer < cache->layers; ++layer) {
+        const size_t self_offset = layer * cache->capacity * cache->width;
+        const size_t offset = layer * cache->memory_length * cache->xattn_width;
+        if ((cache->length > 0 &&
+             (mynah_backend_h2d(backend, cache->self_k + self_offset,
+                                self_k + self_offset,
+                                cache->length * cache->width,
+                                error, error_capacity) != 0 ||
+              mynah_backend_h2d(backend, cache->self_v + self_offset,
+                                self_v + self_offset,
+                                cache->length * cache->width,
+                                error, error_capacity) != 0)) ||
+            mynah_backend_h2d(backend, cache->cross_k + offset, cross_k + offset,
+                               cache->memory_length * cache->xattn_width,
+                               error, error_capacity) != 0 ||
+            mynah_backend_h2d(backend, cache->cross_v + offset, cross_v + offset,
+                              cache->memory_length * cache->xattn_width,
+                              error, error_capacity) != 0) {
+            mynah_backend_dev_free(backend, self_k);
+            mynah_backend_dev_free(backend, self_v);
+            mynah_backend_dev_free(backend, cross_k);
+            mynah_backend_dev_free(backend, cross_v);
+            return -1;
+        }
+    }
+    cache->dev_backend = backend;
+    cache->dev_self_k = self_k;
+    cache->dev_self_v = self_v;
+    cache->dev_cross_k = cross_k;
+    cache->dev_cross_v = cross_v;
+    cache->dev_attention_allocated = 1;
+    return 0;
 }
 
 /* Precompute the constant text cross-attention K/V for every decoder layer. */
@@ -2422,7 +2940,9 @@ static int decoder_cache_init(const mynah_tts_model *model, decoder_cache *cache
  * this function performs zero allocations and zero tensor-name lookups. */
 static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                        const float *input_rows, size_t count, float *out_last,
+                       float **dev_out,
                        char *error, size_t error_capacity) {
+    if (dev_out != NULL) *dev_out = NULL;
     const size_t width = cache->width;
     const mynah_backend *backend = model->backend;
     const size_t heads = cache->heads;
@@ -2483,9 +3003,18 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
     /* ---- GPU resident-step fast path (count==1, backend has dev ops) ----
      * All ops on GPU via matmul_d2d (FP16 cuBLAS, device-to-device).
      * Sync only at CPU attention boundaries (2/layer vs 6).
-     * Enable with MYNAH_GPU_RESIDENT=1. */
-    if (count == 1u && mynah_backend_has_dev_ops(backend) &&
-        getenv("MYNAH_GPU_RESIDENT") != NULL) {
+     * Metal keeps this path opt-in until its AR token/EOS parity gate passes;
+     * CUDA retains the resident default. */
+    const char *metal_attention_env = getenv("MYNAH_METAL_GPU_ATTENTION");
+    const int metal_attention_enabled =
+        strcmp(mynah_backend_name(backend), "metal") != 0 ||
+        (metal_attention_env != NULL && strcmp(metal_attention_env, "1") == 0);
+    const int gpu_attention_candidate = count == 1u && mynah_backend_has_dev_ops(backend) &&
+        mynah_backend_has_attention_dev(backend) &&
+        metal_attention_enabled &&
+        (getenv("MYNAH_GPU_RESIDENT") == NULL ||
+         strcmp(getenv("MYNAH_GPU_RESIDENT"), "0") != 0);
+    if (gpu_attention_candidate) {
         const mynah_backend *bk = backend;
         if (!cache->dev_allocated) {
             cache->dev_backend = bk;
@@ -2499,10 +3028,14 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
              && mynah_backend_dev_alloc(bk, ffn, &cache->dev_hidden, error, error_capacity)==0
              && mynah_backend_dev_alloc(bk, width, &cache->dev_x, error, error_capacity)==0;
         }
-        if (cache->dev_allocated) {
+        const int attention_ready = cache->dev_allocated &&
+            decoder_gpu_attention_init(cache, bk, error, error_capacity) == 0;
+        if (attention_ready) {
         float *dx=cache->dev_x, *dnrm=cache->dev_nrm, *dqkv=cache->dev_qkv;
         float *dattn=cache->dev_attn, *dproj=cache->dev_proj;
         float *dqx=cache->dev_qx, *dxctx=cache->dev_xctx, *dhidden=cache->dev_hidden;
+        float *dself_k=cache->dev_self_k, *dself_v=cache->dev_self_v;
+        float *dcross_k=cache->dev_cross_k, *dcross_v=cache->dev_cross_v;
         mynah_backend_h2d(bk, x, dx, width, error, error_capacity);
         for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
             const decoder_layer_resolved *r = &cache->resolved[layer];
@@ -2510,60 +3043,95 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             /* ln(GPU) → QKV d2d(GPU, no sync) */
             if (mynah_backend_layer_norm_inplace(bk, dx, dnrm, r->norm_self, 1u, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dnrm, dqkv, 1u, width, width*3u, r->qkv_w, NULL, error, error_capacity)!=0) { failed=1; break; }
-            /* SYNC → CPU self-attention + KV cache */
-            mynah_backend_sync(bk, error, error_capacity);
-            mynah_backend_d2h(bk, dqkv, qkv, width*3u, error, error_capacity);
-            { float *kb = cache->self_k + layer*cache->capacity*width;
-              float *vb = cache->self_v + layer*cache->capacity*width;
-              memcpy(kb + start*width, qkv + width, width*sizeof(float));
-              memcpy(vb + start*width, qkv + width*2u, width*sizeof(float)); }
-            { const float *qrow = qkv;
-              for (size_t h = 0; h < heads; ++h) {
-                const float *qh = qrow + h*hw; float maxv = -FLT_MAX;
-                for (size_t s = 0; s <= start; ++s) {
-                  const float *kk = cache->self_k + layer*cache->capacity*width + s*width + h*hw;
-                  float sc = 0.0f; for (size_t d = 0; d < hw; ++d) sc += qh[d]*kk[d];
-                  sc *= self_scale; scores[s] = sc; if (sc > maxv) maxv = sc; }
-                float den = 0.0f;
-                for (size_t s = 0; s <= start; ++s) { scores[s] = expf(scores[s]-maxv); den += scores[s]; }
-                float *outh = attn + h*hw; memset(outh, 0, hw*sizeof(float));
-                for (size_t s = 0; s <= start; ++s)
-                  axpy_f32(outh, cache->self_v + layer*cache->capacity*width + s*width + h*hw, scores[s]/den, hw); } }
+            if (layer == 0 && getenv("MYNAH_DUMP_GPU_QKV") != NULL) {
+                if (mynah_backend_sync(bk, error, error_capacity) != 0 ||
+                    mynah_backend_d2h(bk, dqkv, qkv, width * 3u, error, error_capacity) != 0) {
+                    failed = 1;
+                    break;
+                }
+                FILE *dump = fopen(getenv("MYNAH_DUMP_GPU_QKV"), "w");
+                if (dump != NULL) {
+                    for (size_t d = 0; d < width * 3u; ++d) fprintf(dump, "%.9g\n", (double)qkv[d]);
+                    fclose(dump);
+                }
+                if (mynah_backend_h2d(bk, qkv, dqkv, width * 3u, error, error_capacity) != 0) {
+                    failed = 1;
+                    break;
+                }
+            }
+            /* QKV → resident Metal self-attention + KV append. */
+            if (mynah_backend_self_attention_dev(
+                    bk, dqkv,
+                    dself_k + layer * cache->capacity * width,
+                    dself_v + layer * cache->capacity * width,
+                    start, width, start + 1u, heads, hw, self_scale, dattn,
+                    error, error_capacity) != 0) { failed=1; break; }
+            if (layer == 0 && getenv("MYNAH_DUMP_GPU_SELF_ATTN") != NULL) {
+                if (mynah_backend_sync(bk, error, error_capacity) != 0 ||
+                    mynah_backend_d2h(bk, dattn, attn, width, error, error_capacity) != 0) {
+                    failed = 1;
+                    break;
+                }
+                FILE *dump = fopen(getenv("MYNAH_DUMP_GPU_SELF_ATTN"), "w");
+                if (dump != NULL) {
+                    for (size_t d = 0; d < width; ++d) fprintf(dump, "%.9g\n", (double)attn[d]);
+                    fclose(dump);
+                }
+                if (mynah_backend_h2d(bk, attn, dattn, width, error, error_capacity) != 0) {
+                    failed = 1;
+                    break;
+                }
+            }
             /* attn → output d2d(GPU) → residual(GPU) → ln(GPU) → cross-Q d2d(GPU) */
-            if (mynah_backend_h2d(bk, attn, dattn, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_batch_begin(bk, error, error_capacity) != 0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dattn, dproj, 1u, width, width, r->o_self_w, NULL, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_residual_inplace(bk, dx, dproj, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_layer_norm_inplace(bk, dx, dnrm, r->norm_xattn_query, 1u, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dnrm, dqx, 1u, width, xw, r->q_cross_w, NULL, error, error_capacity)!=0) { failed=1; break; }
-            /* SYNC → CPU cross-attention */
-            mynah_backend_sync(bk, error, error_capacity);
-            mynah_backend_d2h(bk, dqx, q_x, xw, error, error_capacity);
-            { const float *ck = cache->cross_k + layer*cache->memory_length*xw;
-              const float *cv = cache->cross_v + layer*cache->memory_length*xw;
-              float maxv = -FLT_MAX;
-              for (size_t s = 0; s < cache->memory_length; ++s) {
-                float sc = 0.0f; for (size_t d = 0; d < xw; ++d) sc += q_x[d]*ck[s*xw+d];
-                sc *= cross_scale; scores[s] = sc; if (sc > maxv) maxv = sc; }
-              float den = 0.0f;
-              for (size_t s = 0; s < cache->memory_length; ++s) { scores[s] = expf(scores[s]-maxv); den += scores[s]; }
-              memset(xctx, 0, xw*sizeof(float));
-              for (size_t s = 0; s < cache->memory_length; ++s) axpy_f32(xctx, cv+s*xw, scores[s]/den, xw); }
+            /* Q → resident Metal cross-attention over the cached text KV. */
+            if (mynah_backend_cross_attention_dev(
+                    bk, dqx,
+                    dcross_k + layer * cache->memory_length * xw,
+                    dcross_v + layer * cache->memory_length * xw,
+                    cache->memory_length, xw, 1u, xw, cross_scale,
+                    dxctx, error, error_capacity) != 0) { failed=1; break; }
             /* xctx → cross-output d2d(GPU) → residual(GPU) → ln(GPU) → FFN d2d(GPU) */
-            if (mynah_backend_h2d(bk, xctx, dxctx, xw, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_batch_begin(bk, error, error_capacity) != 0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dxctx, dproj, 1u, xw, width, r->o_cross_w, NULL, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_residual_inplace(bk, dx, dproj, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_layer_norm_inplace(bk, dx, dnrm, r->norm_pos_ff, 1u, width, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_matmul_d2d(bk, dnrm, dhidden, 1u, width, ffn, r->ffn_up_w, NULL, error, error_capacity)!=0) { failed=1; break; }
-            if (mynah_backend_gelu_inplace(bk, dhidden, ffn, error, error_capacity)!=0) { failed=1; break; }
+            if (getenv("MYNAH_METAL_GPU_GELU") != NULL &&
+                strcmp(getenv("MYNAH_METAL_GPU_GELU"), "0") == 0) {
+                if (mynah_backend_sync(bk, error, error_capacity) != 0 ||
+                    mynah_backend_d2h(bk, dhidden, hidden, ffn,
+                                       error, error_capacity) != 0) {
+                    failed = 1;
+                    break;
+                }
+                gelu_tanh_array(hidden, ffn, gelu_scratch);
+                if (mynah_backend_h2d(bk, hidden, dhidden, ffn,
+                                       error, error_capacity) != 0) {
+                    failed = 1;
+                    break;
+                }
+            } else if (mynah_backend_gelu_inplace(bk, dhidden, ffn,
+                                                   error, error_capacity) != 0) {
+                failed=1;
+                break;
+            }
             if (mynah_backend_matmul_d2d(bk, dhidden, dproj, 1u, ffn, width, r->ffn_down_w, NULL, error, error_capacity)!=0) { failed=1; break; }
             if (mynah_backend_residual_inplace(bk, dx, dproj, width, error, error_capacity)!=0) { failed=1; break; }
         }
-        mynah_backend_sync(bk, error, error_capacity);
-        mynah_backend_d2h(bk, dx, x, width, error, error_capacity);
+        if (!failed && mynah_backend_layer_norm_inplace(
+                bk, dx, dnrm, cache->norm_out, 1u, width,
+                error, error_capacity) != 0) failed = 1;
+        if (!failed && mynah_backend_sync(bk, error, error_capacity) != 0) failed=1;
+        if (!failed && dev_out != NULL) *dev_out = dnrm;
+        if (!failed && dev_out == NULL &&
+            mynah_backend_d2h(bk, dnrm, out_last, width,
+                              error, error_capacity) != 0) failed=1;
         if (!failed) {
-            layer_norm(x, out_last, 1u, width, cache->norm_out);
             cache->length += count;
             return 0;
         }
@@ -2583,6 +3151,13 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         if (profile_prefill) {
             self_projection_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
+        }
+        if (layer == 0 && getenv("MYNAH_DUMP_CPU_QKV") != NULL) {
+            FILE *dump = fopen(getenv("MYNAH_DUMP_CPU_QKV"), "w");
+            if (dump != NULL) {
+                for (size_t d = 0; d < width * 3u; ++d) fprintf(dump, "%.9g\n", (double)qkv[d]);
+                fclose(dump);
+            }
         }
         float *kbase = cache->self_k + layer * cache->capacity * width;
         float *vbase = cache->self_v + layer * cache->capacity * width;
@@ -2630,6 +3205,13 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         if (profile_prefill) {
             self_attention_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
+        }
+        if (layer == 0 && getenv("MYNAH_DUMP_CPU_SELF_ATTN") != NULL) {
+            FILE *dump = fopen(getenv("MYNAH_DUMP_CPU_SELF_ATTN"), "w");
+            if (dump != NULL) {
+                for (size_t d = 0; d < width; ++d) fprintf(dump, "%.9g\n", (double)attn[d]);
+                fclose(dump);
+            }
         }
         if (mynah_backend_matmul(model->backend, attn, proj,
                               count, width, width,
@@ -2818,7 +3400,9 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
         prep_cross_cache_seconds = phase_seconds() - prep_stage_start;
         prep_stage_start = phase_seconds();
     }
+    float *decoder_dev_last = NULL;
     if (decoder_run(model, &cache, context, context_length, out_last,
+                    request->use_local_transformer ? &decoder_dev_last : NULL,
                     error, error_capacity) != 0) {
         decoder_cache_free(&cache);
         free(memory);
@@ -2830,6 +3414,9 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
     if (getenv("MYNAH_DUMP_PREFILL") != NULL) {
         FILE *pf = fopen(getenv("MYNAH_DUMP_PREFILL"), "w");
         if (pf != NULL) {
+            if (decoder_dev_last != NULL)
+                mynah_backend_d2h(model->backend, decoder_dev_last, out_last, width,
+                                  error, error_capacity);
             for (size_t d = 0; d < width; ++d)
                 fprintf(pf, "%.9g\n", (double)out_last[d]);
             fclose(pf);
@@ -2847,10 +3434,16 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
             ar_embed_seconds += now - stage_start;
             stage_start = now;
         }
-        if (decoder_run(model, &cache, audio_row, 1u, out_last, error, error_capacity) != 0) break;
+        decoder_dev_last = NULL;
+        if (decoder_run(model, &cache, audio_row, 1u, out_last,
+                        request->use_local_transformer ? &decoder_dev_last : NULL,
+                        error, error_capacity) != 0) break;
         if (stacked_length == 1u && getenv("MYNAH_DUMP_HIDDEN") != NULL) {
             FILE *hf = fopen(getenv("MYNAH_DUMP_HIDDEN"), "w");
             if (hf != NULL) {
+                if (decoder_dev_last != NULL)
+                    mynah_backend_d2h(model->backend, decoder_dev_last, out_last, width,
+                                      error, error_capacity);
                 for (size_t d = 0; d < model->info.hidden_dim; ++d)
                     fprintf(hf, "%.9g\n", (double)out_last[d]);
                 fclose(hf);
@@ -2864,7 +3457,7 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
         int saw_eos = 0;
         size_t step_eos_frame = SIZE_MAX;
         if (request->use_local_transformer) {
-            if (sample_local_frame(model, out_last,
+            if (sample_local_frame(model, out_last, decoder_dev_last,
                                    codes, raw_length, max_raw_length,
                                    predicted_stacks * model->info.frame_stacking_factor,
                                    min_raw_length, temperature, topk, &rng_state,
