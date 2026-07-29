@@ -3,6 +3,7 @@
 #include "threads.h"
 
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -232,6 +233,9 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
                           strcmp(matvec_env, "parallel") == 0;
 #if defined(MYNAH_USE_OPENBLAS) && defined(__AVX2__)
     if (matvec_env == NULL) matvec_parallel = 1;
+#endif
+#if defined(MYNAH_USE_ACCELERATE) && (defined(__ARM_NEON) || defined(__aarch64__))
+    if (matvec_env == NULL && mynah_num_threads() > 1) matvec_parallel = 1;
 #endif
     const int matvec_shape_small = input_width != 0u &&
         output_width <= SIZE_MAX / input_width &&

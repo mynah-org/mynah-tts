@@ -1,6 +1,8 @@
 #include "qmat.h"
 #include "kernels.h"
+#include "threads.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -292,6 +294,69 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
     }
 }
 
+/* Quantized decode is memory bound on the packed weights exactly like the f32
+ * path, and one core only reaches a fraction of DRAM bandwidth.  Every output
+ * row is an independent dot product, so splitting the row range over the pool
+ * reorders no reduction and stays bit-exact.  Blocks are multiples of the
+ * four-row unroll so each worker still runs the row4 kernel, and the last block
+ * absorbs the remainder exactly as the serial call did. */
+#define QMAT_ROW_BLOCK 32u
+/* Below this many weight bytes the pool dispatch costs more than it saves. */
+#define QMAT_THREAD_MIN_BYTES 262144u
+
+typedef struct {
+    float *out;
+    const int8_t *qx;
+    float sx;
+    const void *weights;
+    const float *scales;
+    const float *bias;
+    size_t rows;
+    size_t cols;
+    int qtype;
+} qmat_rows_job;
+
+static void qmat_rows_block(void *opaque, int block_index) {
+    const qmat_rows_job *j = (const qmat_rows_job *)opaque;
+    const size_t row0 = (size_t)block_index * QMAT_ROW_BLOCK;
+    if (row0 >= j->rows) return;
+    size_t count = j->rows - row0;
+    if (count > QMAT_ROW_BLOCK) count = QMAT_ROW_BLOCK;
+    const float *bias = j->bias == NULL ? NULL : j->bias + row0;
+    if (j->qtype == QMAT_INT8) {
+        matvec_q8(j->out + row0, j->qx, j->sx,
+                  (const int8_t *)j->weights + row0 * j->cols,
+                  j->scales + row0, bias, count, j->cols);
+    } else {
+        matvec_q4(j->out + row0, j->qx, j->sx,
+                  (const uint8_t *)j->weights + row0 * (j->cols / 2u),
+                  j->scales + row0 * (j->cols / QMAT_Q4_GROUP),
+                  bias, count, j->cols);
+    }
+}
+
+static void matvec_q_rows(float *out, const int8_t *qx, float sx,
+                          const void *weights, const float *scales,
+                          const float *bias, size_t rows, size_t cols,
+                          int qtype) {
+    const size_t weight_bytes = qtype == QMAT_INT8 ? rows * cols : rows * cols / 2u;
+    if (mynah_num_threads() > 1 && weight_bytes >= QMAT_THREAD_MIN_BYTES &&
+        rows > QMAT_ROW_BLOCK) {
+        const qmat_rows_job job = {out, qx, sx, weights, scales, bias,
+                                   rows, cols, qtype};
+        const size_t blocks = (rows + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK;
+        if (blocks <= (size_t)INT_MAX) {
+            mynah_parallel_for((int)blocks, qmat_rows_block, (void *)&job);
+            return;
+        }
+    }
+    if (qtype == QMAT_INT8) {
+        matvec_q8(out, qx, sx, (const int8_t *)weights, scales, bias, rows, cols);
+    } else {
+        matvec_q4(out, qx, sx, (const uint8_t *)weights, scales, bias, rows, cols);
+    }
+}
+
 /* --------------------------------------------------------------- weight cache */
 typedef struct {
     char *name;
@@ -457,9 +522,9 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
                 orow[row] = value;
             }
         } else if (e->qtype == QMAT_INT8) {
-            matvec_q8(orow, qx, sx, e->q8, e->scales, bias, n, k);
+            matvec_q_rows(orow, qx, sx, e->q8, e->scales, bias, n, k, QMAT_INT8);
         } else {
-            matvec_q4(orow, qx, sx, e->q4, e->scales, bias, n, k);
+            matvec_q_rows(orow, qx, sx, e->q4, e->scales, bias, n, k, QMAT_INT4);
         }
     }
     return 0;
@@ -542,8 +607,75 @@ static int self_test_one(int qtype, char *error, size_t error_capacity) {
     return 0;
 }
 
+/* The row-blocked dispatch must be bit-exact against a single serial call:
+ * same kernel, same four-row unroll inside every block, no reduction split
+ * across a block boundary.  The blocks are walked directly rather than through
+ * the pool so the partition arithmetic (offsets into weights/scales/bias and
+ * the short trailing block) is checked at any thread count.  N is deliberately
+ * not a multiple of QMAT_ROW_BLOCK so the remainder path is exercised. */
+static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity) {
+    enum { N = 200, K = 256 };
+    int status = -1;
+    float *w = malloc((size_t)N * K * sizeof(float));
+    float *x = malloc((size_t)K * sizeof(float));
+    float *bias = malloc((size_t)N * sizeof(float));
+    float *serial = malloc((size_t)N * sizeof(float));
+    float *blocked = malloc((size_t)N * sizeof(float));
+    int8_t *qx = malloc((size_t)K);
+    int8_t *q8 = malloc((size_t)N * K);
+    uint8_t *q4 = malloc((size_t)N * K / 2u);
+    float *scales8 = malloc((size_t)N * sizeof(float));
+    float *scales4 = malloc((size_t)N * (K / QMAT_Q4_GROUP) * sizeof(float));
+    if (w == NULL || x == NULL || bias == NULL || serial == NULL || blocked == NULL ||
+        qx == NULL || q8 == NULL || q4 == NULL || scales8 == NULL || scales4 == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat blocked self-test out of memory");
+        goto done;
+    }
+    for (size_t i = 0; i < (size_t)N * K; ++i)
+        w[i] = sinf(0.013f * (float)i) * (0.5f + 0.5f * cosf(0.0007f * (float)i));
+    for (size_t j = 0; j < (size_t)K; ++j) x[j] = cosf(0.011f * (float)j) - 0.3f;
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = (float)i * 0.03125f - 0.5f;
+    const float sx = quantize_act_int8(qx, x, K);
+    const void *weights;
+    const float *scales;
+    if (qtype == QMAT_INT8) {
+        quantize_weight_int8(w, N, K, q8, scales8);
+        weights = q8;
+        scales = scales8;
+        matvec_q8(serial, qx, sx, q8, scales8, bias, N, K);
+    } else {
+        quantize_weight_int4(w, N, K, q4, scales4);
+        weights = q4;
+        scales = scales4;
+        matvec_q4(serial, qx, sx, q4, scales4, bias, N, K);
+    }
+    for (size_t i = 0; i < (size_t)N; ++i) blocked[i] = 0.0f;
+    const qmat_rows_job job = {blocked, qx, sx, weights, scales, bias,
+                               (size_t)N, (size_t)K, qtype};
+    const int blocks = (int)(((size_t)N + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK);
+    for (int b = 0; b < blocks; ++b) qmat_rows_block((void *)&job, b);
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        if (memcmp(&serial[i], &blocked[i], sizeof(float)) != 0) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat %s blocked matvec differs from serial at row %zu",
+                         qtype == QMAT_INT8 ? "int8" : "int4", i);
+            }
+            goto done;
+        }
+    }
+    status = 0;
+done:
+    free(w); free(x); free(bias); free(serial); free(blocked);
+    free(qx); free(q8); free(q4); free(scales8); free(scales4);
+    return status;
+}
+
 int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_one(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_one(QMAT_INT4, error, error_capacity) != 0) return -1;
+    if (self_test_rows_blocked(QMAT_INT8, error, error_capacity) != 0) return -1;
+    if (self_test_rows_blocked(QMAT_INT4, error, error_capacity) != 0) return -1;
     return 0;
 }
