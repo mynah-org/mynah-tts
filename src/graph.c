@@ -199,6 +199,27 @@ static int linear(const mynah_backend *backend, const float *input, float *outpu
                                 output_width, weight, bias, error, error_capacity);
 }
 
+/* Unfold a causal convolution window into rows: col[t][i * kernel + k] is the
+ * channel i of the input at t - (kernel - 1) + k, zero before the start.  The
+ * (i, k) ordering matches the [out][in][kernel] weight layout, so the unfolded
+ * activation multiplies the stored weight directly. */
+static void unfold_causal(const float *input, float *col, size_t length,
+                          size_t channels, size_t kernel) {
+    const size_t unfolded = channels * kernel;
+    for (size_t t = 0; t < length; ++t) {
+        float *row = col + t * unfolded;
+        for (size_t k = 0; k < kernel; ++k) {
+            const long source_t = (long)t - (long)(kernel - 1u) + (long)k;
+            if (source_t < 0) {
+                for (size_t i = 0; i < channels; ++i) row[i * kernel + k] = 0.0f;
+            } else {
+                const float *in = input + (size_t)source_t * channels;
+                for (size_t i = 0; i < channels; ++i) row[i * kernel + k] = in[i];
+            }
+        }
+    }
+}
+
 static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *backend,
                            const char *prefix,
                            size_t layer, const float *input, float *output,
@@ -228,50 +249,43 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
         free(hidden);
         return result;
     }
-    if (length <= (size_t)INT_MAX && width <= (size_t)INT_MAX && ffn_width <= (size_t)INT_MAX) {
-        /* A causal conv-FFN is a sum of `kernel` shifted matmuls (weight tap k),
-         * the same trick as conv1d_causal but with time-major rows.  This is the
-         * encoder's dominant cost, so accumulate the taps with sgemm instead of
-         * the scalar quadruple loop. */
-        float *wk = (float *)malloc(ffn_width * width * kernel * sizeof(float));
-        if (wk == NULL) {
+    const size_t wide = ffn_width > width ? ffn_width : width;
+    if (length <= (size_t)INT_MAX && width <= (size_t)INT_MAX &&
+        ffn_width <= (size_t)INT_MAX && kernel > 0u &&
+        wide <= SIZE_MAX / kernel && wide * kernel <= (size_t)INT_MAX &&
+        length <= SIZE_MAX / (wide * kernel)) {
+        /* A causal conv-FFN is a single matmul once the input is unfolded over
+         * the kernel.  The stored weight is [out][in][kernel] row-major, so an
+         * output row is already contiguous in (in * kernel + k): building the
+         * matching im2col of the *input* lets sgemm read the weight straight
+         * from the mapping.
+         *
+         * The previous form ran `kernel` shifted matmuls against transposed tap
+         * copies, which rebuilt and re-read every conv weight on every call --
+         * 340 MB per request on this model, in a stride-`kernel` gather.  The
+         * unfolded activation is length * width * kernel instead, which is
+         * three orders of magnitude smaller and stays in cache. */
+        float *col = allocate_floats(length * wide * kernel, error, error_capacity);
+        if (col == NULL) {
             free(hidden);
-            graph_error(error, error_capacity, "out of memory in causal conv-ffn");
             return -1;
         }
-        /* Extract all taps at once: wk[k][o][i] = proj[(o*width+i)*kernel+k].
-         * Inner loop over k has stride=1 (sequential reads). */
-        for (size_t o = 0; o < ffn_width; ++o) {
-            for (size_t i = 0; i < width; ++i) {
-                const float *src = proj.data + (o * width + i) * kernel;
-                for (size_t k = 0; k < kernel; ++k)
-                    wk[k * ffn_width * width + o * width + i] = src[k];
-            }
+        unfold_causal(input, col, length, width, kernel);
+        int failed = graph_sgemm(backend, 0, 1, length, ffn_width, width * kernel,
+                                 1.0f, col, width * kernel,
+                                 proj.data, width * kernel, 0.0f,
+                                 hidden, ffn_width, error, error_capacity) != 0;
+        if (!failed) {
+            mynah_gelu_f32_scalar(hidden, length * ffn_width);
+            unfold_causal(hidden, col, length, ffn_width, kernel);
+            failed = graph_sgemm(backend, 0, 1, length, width, ffn_width * kernel,
+                                 1.0f, col, ffn_width * kernel,
+                                 out_net.data, ffn_width * kernel, 0.0f,
+                                 output, width, error, error_capacity) != 0;
         }
-        memset(hidden, 0, length * ffn_width * sizeof(float));
-        for (size_t k = 0; k < kernel; ++k) {
-            const size_t shift = kernel - 1u - k;
-            if (shift >= length) continue;
-            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)ffn_width, (int)width, 1.0f, input, (int)width, wk + k * ffn_width * width, (int)width, 1.0f, hidden + shift * ffn_width, (int)ffn_width, error, error_capacity);
-        }
-        mynah_gelu_f32_scalar(hidden, length * ffn_width);
-        /* Extract out_net taps with same optimized pattern. */
-        for (size_t o = 0; o < width; ++o) {
-            for (size_t i = 0; i < ffn_width; ++i) {
-                const float *src = out_net.data + (o * ffn_width + i) * kernel;
-                for (size_t k = 0; k < kernel; ++k)
-                    wk[k * width * ffn_width + o * ffn_width + i] = src[k];
-            }
-        }
-        memset(output, 0, length * width * sizeof(float));
-        for (size_t k = 0; k < kernel; ++k) {
-            const size_t shift = kernel - 1u - k;
-            if (shift >= length) continue;
-            graph_sgemm(backend, 0, 1, (int)(length - shift), (int)width, (int)ffn_width, 1.0f, hidden, (int)ffn_width, wk + k * width * ffn_width, (int)ffn_width, 1.0f, output + shift * width, (int)width, error, error_capacity);
-        }
-        free(wk);
+        free(col);
         free(hidden);
-        return 0;
+        return failed ? -1 : 0;
     }
     for (size_t t = 0; t < length; ++t) {
         for (size_t o = 0; o < ffn_width; ++o) {
@@ -1158,9 +1172,78 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
     return failed ? -1 : 0;
 }
 
-/* The local AR helper emits one stacked frame (two raw codec frames). */
+/* Per-request state for the local autoregressive helper.
+ *
+ * The local transformer restarts at position 0 for every stacked frame, but
+ * its KV cache, workspace and sampler scratch are shape-constant for the whole
+ * request.  Allocating them once and resetting `length` keeps the decode loop
+ * allocation-free -- previously every frame paid two KV allocations plus the
+ * workspace, the sampler scratch and, under Metal, ten device allocations. */
+typedef struct {
+    local_cache cache;
+    local_workspace workspace;
+    float *row_in;
+    float *row_out;
+    float *logits;        /* audio_vocab_size */
+    size_t *top_indices;  /* top_count, sampling only */
+    float *top_logits;    /* top_count, sampling only */
+    size_t top_count;
+} local_frame_state;
+
+static void local_frame_state_free(local_frame_state *state) {
+    if (state == NULL) return;
+    free(state->row_in);
+    free(state->row_out);
+    free(state->logits);
+    free(state->top_indices);
+    free(state->top_logits);
+    local_workspace_free(&state->workspace);
+    local_cache_free(&state->cache);
+    memset(state, 0, sizeof(*state));
+}
+
+/* `top_count` is 0 when the request is greedy, so the sampler scratch is only
+ * allocated for requests that actually sample. */
+static int local_frame_state_init(const mynah_tts_model *model,
+                                  local_frame_state *state, size_t top_count,
+                                  char *error, size_t error_capacity) {
+    memset(state, 0, sizeof(*state));
+    const size_t width = model->info.hidden_dim;
+    const size_t stream_count = stacked_stream_count(model);
+    if (local_cache_init(model, &state->cache, stream_count + 1u,
+                         error, error_capacity) != 0) {
+        return -1;
+    }
+    if (local_workspace_init(&state->workspace, &state->cache,
+                             error, error_capacity) != 0) {
+        local_cache_free(&state->cache);
+        graph_error(error, error_capacity, "out of memory allocating local workspace");
+        return -1;
+    }
+    state->top_count = top_count;
+    state->row_in = allocate_floats(width, error, error_capacity);
+    state->row_out = allocate_floats(width, error, error_capacity);
+    state->logits = allocate_floats(model->info.audio_vocab_size, error, error_capacity);
+    if (top_count > 0u) {
+        state->top_indices = (size_t *)malloc(top_count * sizeof(*state->top_indices));
+        state->top_logits = (float *)malloc(top_count * sizeof(*state->top_logits));
+    }
+    if (state->row_in == NULL || state->row_out == NULL || state->logits == NULL ||
+        (top_count > 0u && (state->top_indices == NULL || state->top_logits == NULL))) {
+        local_frame_state_free(state);
+        graph_error(error, error_capacity, "out of memory allocating local frame state");
+        return -1;
+    }
+    return 0;
+}
+
+/* The local AR helper emits one stacked frame (two raw codec frames).
+ *
+ * All scratch lives in `state` and is reused across frames; the only per-frame
+ * reset is the KV length, because positions [0, length) are always written
+ * before they are read. */
 static int sample_local_frame(const mynah_tts_model *model, const float *decoder_last,
-                              const float *decoder_dev_last,
+                              const float *decoder_dev_last, local_frame_state *state,
                               unsigned *codes, size_t raw_offset, size_t code_stride,
                               size_t generated_raw_length, size_t min_raw_length,
                               float temperature, unsigned topk,
@@ -1170,92 +1253,47 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
     const size_t stream_count = stacked_stream_count(model);
     const local_projection_cache *projection_cache =
         (const local_projection_cache *)model->local_projection_cache;
-    const int reuse_workspace = getenv("MYNAH_LOCAL_STEP_ALLOCS") == NULL;
-    local_cache lc;
-    local_workspace workspace;
-    memset(&lc, 0, sizeof(lc));
-    memset(&workspace, 0, sizeof(workspace));
-    float *row_in = allocate_floats(width, error, error_capacity);
-    float *row_out = allocate_floats(width, error, error_capacity);
-    if (row_in == NULL || row_out == NULL ||
-        local_cache_init(model, &lc, stream_count + 1u, error, error_capacity) != 0 ||
-        (reuse_workspace &&
-         local_workspace_init(&workspace, &lc, error, error_capacity) != 0)) {
-        free(row_in);
-        free(row_out);
-        local_workspace_free(&workspace);
-        local_cache_free(&lc);
-        return -1;
-    }
+    local_cache *lc = &state->cache;
+    local_workspace *workspace = &state->workspace;
+    float *row_in = state->row_in;
+    float *row_out = state->row_out;
+    lc->length = 0u;
     const size_t vocab = model->info.audio_vocab_size;
     const int sampling = temperature > 0.0f && topk > 1u && rng_state != NULL;
     const char *metal_local_env = getenv("MYNAH_METAL_GPU_LOCAL");
     const char *metal_attention_local_env = getenv("MYNAH_METAL_GPU_ATTENTION");
-    const int gpu_local = lc.gpu_ready && lc.dev_backend != NULL &&
+    const int gpu_local = lc->gpu_ready && lc->dev_backend != NULL &&
         (metal_local_env == NULL || strcmp(metal_local_env, "0") != 0) &&
-        (strcmp(mynah_backend_name(lc.dev_backend), "metal") != 0 ||
+        (strcmp(mynah_backend_name(lc->dev_backend), "metal") != 0 ||
          (metal_attention_local_env != NULL &&
           strcmp(metal_attention_local_env, "1") == 0));
     const size_t top_count = topk < vocab ? topk : vocab;
-    const int reuse_sampler = getenv("MYNAH_LOCAL_SAMPLER_ALLOCS") == NULL;
-    float *shared_logits = reuse_sampler
-        ? allocate_floats(vocab, error, error_capacity) : NULL;
-    size_t *shared_top_indices = reuse_sampler && sampling
-        ? (size_t *)malloc(top_count * sizeof(*shared_top_indices)) : NULL;
-    float *shared_top_logits = reuse_sampler && sampling
-        ? (float *)malloc(top_count * sizeof(*shared_top_logits)) : NULL;
-    if ((reuse_sampler && shared_logits == NULL) ||
-        (reuse_sampler && sampling &&
-         (shared_top_indices == NULL || shared_top_logits == NULL))) {
-        free(shared_logits);
-        free(shared_top_indices);
-        free(shared_top_logits);
-        free(row_in);
-        free(row_out);
-        local_workspace_free(&workspace);
-        local_cache_free(&lc);
-        graph_error(error, error_capacity, "out of memory allocating local sampler scratch");
+    if (sampling && top_count > state->top_count) {
+        graph_error(error, error_capacity, "local sampler scratch too small");
         return -1;
     }
     if (!gpu_local || decoder_dev_last == NULL)
         memcpy(row_in, decoder_last, width * sizeof(float));
     if (gpu_local && ((decoder_dev_last != NULL
-                           ? mynah_backend_copy_dev(lc.dev_backend, lc.dev_input,
+                           ? mynah_backend_copy_dev(lc->dev_backend, lc->dev_input,
                                                     decoder_dev_last, width,
                                                     error, error_capacity)
-                           : mynah_backend_h2d(lc.dev_backend, decoder_last,
-                                               lc.dev_input, width,
+                           : mynah_backend_h2d(lc->dev_backend, decoder_last,
+                                               lc->dev_input, width,
                                                error, error_capacity)) != 0)) {
-        free(shared_logits);
-        free(shared_top_indices);
-        free(shared_top_logits);
-        free(row_in);
-        free(row_out);
-        local_workspace_free(&workspace);
-        local_cache_free(&lc);
         return -1;
     }
     *saw_eos = 0;
     *eos_frame = SIZE_MAX;
     char name[160];
     for (size_t stream = 0; stream < stream_count; ++stream) {
-        local_workspace *step_workspace = reuse_workspace ? &workspace : NULL;
         float *dev_row_out = NULL;
         const int step_failed = gpu_local
-            ? local_step_device(model, &lc, lc.dev_input, &dev_row_out,
+            ? local_step_device(model, lc, lc->dev_input, &dev_row_out,
                                 error, error_capacity)
-            : local_step(model, &lc, step_workspace, row_in, row_out,
+            : local_step(model, lc, workspace, row_in, row_out,
                          error, error_capacity);
-        if (step_failed != 0) {
-            free(shared_logits);
-            free(shared_top_indices);
-            free(shared_top_logits);
-            free(row_in);
-            free(row_out);
-            local_workspace_free(&workspace);
-            local_cache_free(&lc);
-            return -1;
-        }
+        if (step_failed != 0) return -1;
         const float *bias_data = NULL;
         if (projection_cache != NULL && stream < projection_cache->stream_count) {
             bias_data = projection_cache->projection_biases[stream];
@@ -1263,16 +1301,7 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
             snprintf(name, sizeof(name),
                      "local_transformer_out_projections.%zu.bias", stream);
             mynah_tensor bias;
-            if (tensor(model->tts, name, &bias, error, error_capacity) != 0) {
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
-                return -1;
-            }
+            if (tensor(model->tts, name, &bias, error, error_capacity) != 0) return -1;
             bias_data = bias.data;
         }
         const int forbid_eos = generated_raw_length < min_raw_length;
@@ -1284,62 +1313,29 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
             projection_weight = projection_cache->projection_weights[stream];
         } else {
             mynah_tensor projection;
-            if (tensor(model->tts, name, &projection, error, error_capacity) != 0) {
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
-                return -1;
-            }
+            if (tensor(model->tts, name, &projection, error, error_capacity) != 0) return -1;
             projection_weight = projection.data;
         }
         float *logits = NULL;
         int fused = 1;
         if (gpu_local) {
-            if (mynah_backend_matmul_d2d(lc.dev_backend, dev_row_out, lc.dev_logits,
+            if (mynah_backend_matmul_d2d(lc->dev_backend, dev_row_out, lc->dev_logits,
                                           1u, width, vocab, projection_weight,
                                           bias_data, error, error_capacity) != 0) {
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
                 return -1;
             }
             if (!sampling) {
                 fused = 0;
-                if (mynah_backend_argmax_dev(lc.dev_backend, lc.dev_logits, vocab,
+                if (mynah_backend_argmax_dev(lc->dev_backend, lc->dev_logits, vocab,
                                               model->info.codebook_size, eos_id,
                                               !forbid_eos, &argmax, error,
                                               error_capacity) != 0) {
-                    free(shared_logits);
-                    free(shared_top_indices);
-                    free(shared_top_logits);
-                    free(row_in);
-                    free(row_out);
-                    local_workspace_free(&workspace);
-                    local_cache_free(&lc);
                     return -1;
                 }
             } else {
-                logits = shared_logits != NULL
-                    ? shared_logits : allocate_floats(vocab, error, error_capacity);
-                if (logits == NULL ||
-                    mynah_backend_d2h(lc.dev_backend, lc.dev_logits, logits, vocab,
+                logits = state->logits;
+                if (mynah_backend_d2h(lc->dev_backend, lc->dev_logits, logits, vocab,
                                       error, error_capacity) != 0) {
-                    if (logits != shared_logits) free(logits);
-                    free(shared_logits);
-                    free(shared_top_indices);
-                    free(shared_top_logits);
-                    free(row_in);
-                    free(row_out);
-                    local_workspace_free(&workspace);
-                    local_cache_free(&lc);
                     return -1;
                 }
             }
@@ -1350,33 +1346,14 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                 model->qcache, name, projection_weight, row_out, width, vocab,
                 bias_data, model->info.codebook_size, eos_id, !forbid_eos,
                 &argmax, error, error_capacity);
-            if (fused < 0) {
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
-                return -1;
-            }
+            if (fused < 0) return -1;
         }
         if (!gpu_local && fused != 0) {
-            logits = shared_logits != NULL
-                ? shared_logits : allocate_floats(vocab, error, error_capacity);
-            if (logits == NULL ||
-                mynah_qmat_linear_resolved(model->qcache, model->backend, name,
+            logits = state->logits;
+            if (mynah_qmat_linear_resolved(model->qcache, model->backend, name,
                                            projection_weight, row_out, logits,
                                            1u, width, vocab, bias_data,
                                            error, error_capacity) != 0) {
-                if (logits != shared_logits) free(logits);
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
                 return -1;
             }
         }
@@ -1400,24 +1377,8 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
          * token is AUDIO_EOS in any codebook of this frame. */
         int stream_eos = (argmax == eos_id);
         if (sampling) {
-            size_t *top_indices = shared_top_indices != NULL
-                ? shared_top_indices : (size_t *)malloc(top_count * sizeof(*top_indices));
-            float *top_logits = shared_top_logits != NULL
-                ? shared_top_logits : (float *)malloc(top_count * sizeof(*top_logits));
-            if (top_indices == NULL || top_logits == NULL) {
-                if (top_indices != shared_top_indices) free(top_indices);
-                if (top_logits != shared_top_logits) free(top_logits);
-                if (logits != shared_logits) free(logits);
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
-                graph_error(error, error_capacity, "out of memory in audio sampler");
-                return -1;
-            }
+            size_t *top_indices = state->top_indices;
+            float *top_logits = state->top_logits;
             size_t used = 0;
             for (size_t candidate = 0; candidate < vocab; ++candidate) {
                 size_t insert = used;
@@ -1445,11 +1406,11 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                 top_logits[j] = expf((top_logits[j] - maximum) / temperature);
                 total += top_logits[j];
             }
-            uint64_t state = *rng_state;
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *rng_state = state == 0 ? UINT64_C(0x9e3779b97f4a7c15) : state;
+            uint64_t state_bits = *rng_state;
+            state_bits ^= state_bits << 13;
+            state_bits ^= state_bits >> 7;
+            state_bits ^= state_bits << 17;
+            *rng_state = state_bits == 0 ? UINT64_C(0x9e3779b97f4a7c15) : state_bits;
             const float draw = ((float)((*rng_state >> 40) & UINT64_C(0xffffff)) /
                                 (float)UINT64_C(0x1000000)) * total;
             float cumulative = 0.0f;
@@ -1460,10 +1421,7 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                     break;
                 }
             }
-            if (top_indices != shared_top_indices) free(top_indices);
-            if (top_logits != shared_top_logits) free(top_logits);
         }
-        if (logits != shared_logits) free(logits);
         if (value == eos_id) stream_eos = 1;
         if (stream_eos) {
             *saw_eos = 1;
@@ -1484,31 +1442,15 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
         } else {
             snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
             mynah_tensor audio_table;
-            if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0) {
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
-                return -1;
-            }
+            if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0) return -1;
             audio_table_data = audio_table.data;
         }
         /* The embedding of this stream's token becomes the input row for the
          * next local-transformer position. */
         if (gpu_local) {
-            if (mynah_backend_h2d(lc.dev_backend,
+            if (mynah_backend_h2d(lc->dev_backend,
                                   audio_table_data + (size_t)emit * width,
-                                  lc.dev_input, width, error, error_capacity) != 0) {
-                free(shared_logits);
-                free(shared_top_indices);
-                free(shared_top_logits);
-                free(row_in);
-                free(row_out);
-                local_workspace_free(&workspace);
-                local_cache_free(&lc);
+                                  lc->dev_input, width, error, error_capacity) != 0) {
                 return -1;
             }
         } else {
@@ -1516,13 +1458,6 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                    width * sizeof(float));
         }
     }
-    free(shared_logits);
-    free(shared_top_indices);
-    free(shared_top_logits);
-    free(row_in);
-    free(row_out);
-    local_workspace_free(&workspace);
-    local_cache_free(&lc);
     return 0;
 }
 
@@ -3418,6 +3353,8 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
     float *audio_row = allocate_floats(width, error, error_capacity);
     decoder_cache cache;
     memset(&cache, 0, sizeof(cache));
+    local_frame_state local_state;
+    memset(&local_state, 0, sizeof(local_state));
     if (codes == NULL || out_last == NULL || audio_row == NULL) {
         free(memory);
         free(codes);
@@ -3477,6 +3414,23 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
         }
     }
     if (timing) prep_context_seconds = phase_seconds() - prep_stage_start;
+    /* The local helper's KV cache, workspace and sampler scratch are shape
+     * constant for the request, so they are built once here rather than per
+     * frame inside the decode loop. */
+    if (request->use_local_transformer) {
+        const size_t vocab = model->info.audio_vocab_size;
+        const size_t top_count = temperature > 0.0f && topk > 1u
+            ? (topk < vocab ? topk : vocab) : 0u;
+        if (local_frame_state_init(model, &local_state, top_count,
+                                   error, error_capacity) != 0) {
+            decoder_cache_free(&cache);
+            free(memory);
+            free(codes);
+            free(out_last);
+            free(audio_row);
+            return -1;
+        }
+    }
     if (timing) t_prep = phase_seconds();
     for (size_t stacked_length = 1u; stacked_length <= max_steps; ++stacked_length) {
         const size_t raw_length = stacked_length * model->info.frame_stacking_factor;
@@ -3511,7 +3465,7 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
         int saw_eos = 0;
         size_t step_eos_frame = SIZE_MAX;
         if (request->use_local_transformer) {
-            if (sample_local_frame(model, out_last, decoder_dev_last,
+            if (sample_local_frame(model, out_last, decoder_dev_last, &local_state,
                                    codes, raw_length, max_raw_length,
                                    predicted_stacks * model->info.frame_stacking_factor,
                                    min_raw_length, temperature, topk, &rng_state,
@@ -3674,6 +3628,7 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
                 t_ar - t_prep, ar_embed_seconds, ar_decoder_seconds,
                 ar_local_seconds, t_codec - t_ar, generated_stacks);
     }
+    local_frame_state_free(&local_state);
     decoder_cache_free(&cache);
     free(memory);
     free(codes);
