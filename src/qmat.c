@@ -2,6 +2,8 @@
 #include "kernels.h"
 #include "threads.h"
 
+#include <pthread.h>
+
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -462,12 +464,19 @@ typedef struct {
     size_t k;
 } qmat_entry;
 
+/* Entries are held by pointer, not by value.  A value array would be moved by
+ * realloc on growth, and another thread is meanwhile reading an entry for the
+ * whole duration of its matvec -- the pointer it holds would dangle.  Indirect
+ * storage keeps every entry at a fixed address for its lifetime, so a lock
+ * around get-or-create is enough and readers need no lock at all: an entry is
+ * fully built before it is published and never mutated afterwards. */
 struct mynah_qmat_cache {
     int qtype; /* QMAT_F32 (off) / QMAT_INT8 / QMAT_INT4 / QMAT_F16 */
     int use_row4;
-    qmat_entry *entries;
+    qmat_entry **entries;
     size_t count;
     size_t capacity;
+    pthread_mutex_t mutex;
 };
 
 mynah_qmat_cache *mynah_qmat_cache_new(int enabled) {
@@ -489,6 +498,10 @@ mynah_qmat_cache *mynah_qmat_cache_new(int enabled) {
 #endif
     c->qtype = qtype;
     c->use_row4 = getenv("MYNAH_QMAT_SINGLE_ROW") == NULL;
+    if (pthread_mutex_init(&c->mutex, NULL) != 0) {
+        free(c);
+        return NULL;
+    }
     return c;
 }
 
@@ -499,21 +512,26 @@ int mynah_qmat_cache_enabled(const mynah_qmat_cache *cache) {
 void mynah_qmat_cache_free(mynah_qmat_cache *cache) {
     if (cache == NULL) return;
     for (size_t i = 0; i < cache->count; ++i) {
-        free(cache->entries[i].name);
-        free(cache->entries[i].q8);
-        free(cache->entries[i].q4);
+        qmat_entry *e = cache->entries[i];
+        if (e == NULL) continue;
+        free(e->name);
+        free(e->q8);
+        free(e->q4);
 #if defined(MYNAH_QMAT_F16)
-        free(cache->entries[i].f16);
+        free(e->f16);
 #endif
-        free(cache->entries[i].scales);
+        free(e->scales);
+        free(e);
     }
     free(cache->entries);
+    pthread_mutex_destroy(&cache->mutex);
     free(cache);
 }
 
+/* Caller holds cache->mutex. */
 static const qmat_entry *cache_lookup(const mynah_qmat_cache *cache, const char *name) {
     for (size_t i = 0; i < cache->count; ++i) {
-        if (strcmp(cache->entries[i].name, name) == 0) return &cache->entries[i];
+        if (strcmp(cache->entries[i]->name, name) == 0) return cache->entries[i];
     }
     return NULL;
 }
@@ -527,13 +545,13 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
     if (cache->qtype == QMAT_INT4 && (k % QMAT_Q4_GROUP) != 0) return NULL;
     if (cache->count == cache->capacity) {
         const size_t next = cache->capacity == 0 ? 16u : cache->capacity * 2u;
-        qmat_entry *grown = (qmat_entry *)realloc(cache->entries, next * sizeof(*grown));
+        qmat_entry **grown = (qmat_entry **)realloc(cache->entries, next * sizeof(*grown));
         if (grown == NULL) return NULL;
         cache->entries = grown;
         cache->capacity = next;
     }
-    qmat_entry *e = &cache->entries[cache->count];
-    memset(e, 0, sizeof(*e));
+    qmat_entry *e = (qmat_entry *)calloc(1, sizeof(*e));
+    if (e == NULL) return NULL;
     e->qtype = cache->qtype;
     e->n = n;
     e->k = k;
@@ -559,7 +577,9 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
         quantize_weight_int4(w, n, k, e->q4, e->scales);
     }
     memcpy(e->name, name, strlen(name) + 1u);
-    ++cache->count;
+    /* Published only once fully built: a reader that finds it can use it
+     * without a lock, because nothing mutates an entry after this point. */
+    cache->entries[cache->count++] = e;
     return e;
 fail:
     free(e->name);
@@ -569,6 +589,7 @@ fail:
     free(e->f16);
 #endif
     free(e->scales);
+    free(e);
     return NULL;
 }
 
@@ -612,8 +633,12 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
                       count <= QMAT_SMALL_COUNT && k <= QMAT_K_MAX;
     const qmat_entry *e = NULL;
     if (use_q) {
+        /* Get-or-create is one critical section; the returned entry then stays
+         * valid and immutable, so the matvec below runs outside the lock. */
+        pthread_mutex_lock(&cache->mutex);
         e = cache_lookup(cache, name);
         if (e == NULL) e = cache_insert(cache, name, weight_data, n, k);
+        pthread_mutex_unlock(&cache->mutex);
     }
     if (e == NULL) {
         /* Disabled, too large, unrepresentable, or OOM: exact f32 matmul. */
