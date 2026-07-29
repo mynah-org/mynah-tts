@@ -278,7 +278,13 @@ make oracle \
   OUTPUT=build/magpie-oracle.wav
 ```
 
-The downloaded Magpie model is under the NVIDIA Open Model License. Keep its
-license and the runtime license separate when distributing model packs.
+## License
 
-See [PLAN.md](PLAN.md) for the full v1/v2/v3 architecture and roadmap.
+This runtime is MIT licensed — see [LICENSE](LICENSE).
+
+That covers the C runtime and tooling in this repository only. **Model weights
+are licensed separately and are not distributed here**: the Magpie checkpoint is
+under the NVIDIA Open Model License and NanoCodec under its own terms. Converting
+a checkpoint into a model pack does not relicense it, and redistributing a pack
+is a separate question from redistributing this code. `models/` is gitignored for
+that reason.
