@@ -3,6 +3,30 @@
 > Session 2026-07-24. NeMo 3.1.0 vs native C, greedy decoding, speaker 4,
 > token IDs `[55,79,90,59,62,87,93,27,39,36,34]` ("hello from", en).
 
+## Running the oracle
+
+The oracle uses the official NeMo package, offline only. Its inference
+environment is intentionally gitignored and is never needed to run the C
+runtime:
+
+```bash
+uv venv --python 3.10 .venv
+uv pip install --python .venv/bin/python \
+  'nemo_toolkit[tts] @ git+https://github.com/NVIDIA/NeMo.git@main'
+
+make oracle \
+  MODEL=models/magpie-v2607/magpie_tts_multilingual_357m.nemo \
+  CODEC=models/nano-codec-22khz/nemo-nano-codec-22khz-1.89kbps-21.5fps.nemo \
+  BYT5=models/byt5-small-tokenizer \
+  OUTPUT=build/magpie-oracle.wav
+```
+
+Inspect an archive without converting it:
+
+```bash
+make inspect MODEL=models/magpie-v2607/magpie_tts_multilingual_357m.nemo
+```
+
 ## Setup
 
 Oracle parameters forced to greedy for deterministic comparison:
