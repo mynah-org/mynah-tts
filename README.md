@@ -107,29 +107,35 @@ comparing absolute numbers taken minutes apart.
 
 ## Performance
 
-Only Apple M1 has been measured for this model. CUDA and x86 have never been
-benchmarked here — the CUDA backend is still an unvalidated milestone and the
-x86 kernels have no cross-ISA golden test yet — so those rows are left empty
-rather than filled from a sibling project's numbers. Do not transplant RTF from
-another engine: `qwen-tts` figures are for a different model and do not describe
-Magpie.
+Magpie 357M + NanoCodec, standard bench prompt (`make bench`, 20 steps,
+speaker 4, seed 42, two warmups, five serial runs, median). RTF is
+synthesis-only; below 1.0 is faster than real time.
 
-**Apple M1** (8-core, 16 GB, 4 performance threads), Magpie 357M + NanoCodec,
-one 6.0 s utterance, AC power, one warmup and three serial runs:
+| Device | ISA / backend | Precision | RTF | Measured |
+|---|---|---|---|---|
+| NVIDIA GB10 (Grace Blackwell) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** ⚡ | 2026-07-25 |
+| Apple M1 | ARM64 + Accelerate | **int8** | **0.361** ⚡ | 2026-07-29 |
+| Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
+| Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
+| Apple M1 | Metal | f32 | 0.723 | 2026-07-29 |
+| x86-64 | AVX2 / VNNI | — | not measured | kernels exist, never run |
+| ARM64 server (Grace, Graviton) | NEON/SVE | — | not measured | — |
 
-| Backend / precision | RTF | note |
-|---|---|---|
-| CPU **int8** | **0.243** ⚡ | ~4.1× faster than real time |
-| CPU **f16** | 0.376 | most accurate quantized mode |
-| CPU f32 | 0.532 | default, bit-exact |
-| Metal (f32) | 0.625 | slower than CPU — see above |
+The GB10 figure is the correct-output result of that session (RTF 14.2 → 0.257,
+−98.2%). A 0.209 was reached with a GPU GELU but reverted: CPU `tanhf` is not
+reproducible on CUDA and every variant shifted EOS in the autoregressive loop,
+so 0.209 is not a valid result. That blocker is still open — closing it is worth
+roughly 0.257 → 0.20.
 
-| ISA / device | RTF | status |
-|---|---|---|
-| ARM64 + Accelerate (Apple M1) | 0.243–0.532 | measured |
-| x86-64 AVX2 / VNNI | — | kernels exist, never benchmarked |
-| ARM64 server (Graviton and similar) | — | never benchmarked |
-| CUDA (NVIDIA) | — | backend unvalidated, milestone M9 |
+On a longer 6.0 s utterance the M1 numbers improve (fixed prep/codec cost
+amortizes): int8 **0.243**, f16 0.376, f32 0.532. Compare only within one
+benchmark — absolute RTF also drifts a few percent between batches on this
+machine.
+
+The two empty rows are deliberately empty. The x86 kernels compile but have
+never been benchmarked or checked against a cross-ISA golden test, and no ARM
+server run exists. Do not fill them from a sibling project: `qwen-tts` figures
+describe a different model and say nothing about Magpie.
 
 ### Speedups from this work
 
@@ -143,6 +149,11 @@ only interleaved numbers are meaningful:
 | threaded CPU Snake | 0.285 | 0.254 | −11% | byte-identical |
 | route decode through qmat (int8) | 0.517 | 0.279 | −46% | quantized, see below |
 | **overall: f32 baseline → int8** | **0.625** | **0.243** | **−61% (2.6×)** | quantized |
+
+The CUDA campaign (2026-07-25) moved GB10 from RTF 14.2 to 0.257 over a separate
+series: cuBLAS backend, FP16 weight cache, GPU Snake, fused im2col+SGEMM conv1d
+(codec −53%), mapped-buffer zero-copy output and a `k_bias_add` kernel replacing
+`cublasSger`. It also fixed a critical out-of-bounds in `k_layer_norm`.
 
 ### Benchmark your own box
 
