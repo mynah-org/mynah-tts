@@ -76,17 +76,24 @@ Decode projections are single-row, and Accelerate never threads an `M=1` sgemm,
 so each one used to run on one core's share of memory bandwidth — a thread sweep
 moved total synthesis from 0.602 s to 0.593 s, i.e. not at all.
 
-Splitting the output rows over the pool is **bit-exact**: every output row is an
-independent dot product, so no reduction is reordered. It is the default
+Splitting the output rows over the pool **reorders no arithmetic**: every output
+row is an independent dot product, so no reduction is split. It is the default
 whenever the pool has more than one worker; serial Accelerate still wins at one
 thread.
+
+Output was verified **byte-identical** (same WAV md5 at 1/2/4/8 threads) on
+macOS/Accelerate. That is a property of the build as much as the algorithm:
+`-ffast-math`, and `-mfma` on x86, let a compiler contract or reassociate the
+per-row scaling differently depending on how it shapes the loop, so last-bit
+identity is not guaranteed across every compiler. The self-tests assert
+equivalence to a tight tolerance for that reason.
 
 The pool defaults to the **performance-core count** on Apple Silicon. On M1
 (4P+4E) four threads measure 0.482 s against 0.507 s for all eight: the
 efficiency cores add no bandwidth but lengthen every barrier.
 
-Snake in the codec is threaded the same way, one channel per worker, also
-bit-exact: 0.358 s → 0.099 s.
+Snake in the codec is threaded the same way, one channel per worker, with the
+same caveat: 0.358 s → 0.099 s, byte-identical on macOS.
 
 | variable | effect |
 |---|---|

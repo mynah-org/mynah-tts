@@ -64,7 +64,9 @@ keeps four output rows in flight so the activation is read once per four weight
 rows.
 
 The row range is split across the thread pool on blocks aligned to that four-row
-unroll, which is bit-exact against a single serial call — a self-test checks
-exactly that, for every type. Targets without NEON half converts refuse the f16
+unroll, so a block boundary never splits a row's reduction. A self-test checks
+every type against a single serial call, to a tight tolerance rather than
+bit-for-bit: under `-ffast-math` the compiler may render the same per-row
+arithmetic with different rounding for a 32-row block than for one 200-row call. Targets without NEON half converts refuse the f16
 tensor and fall back to exact f32, the same contract int4 uses for a shape it
 cannot represent.

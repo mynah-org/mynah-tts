@@ -791,13 +791,24 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
                                (size_t)N, (size_t)K, qtype};
     const int blocks = (int)(((size_t)N + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK);
     for (int b = 0; b < blocks; ++b) qmat_rows_block((void *)&job, b);
+    /* Compare with a tight tolerance rather than memcmp.  The split performs
+     * the same arithmetic per row -- a wrong partition would offset weights or
+     * scales and be off by a wide margin, which this still catches -- but the
+     * build uses -ffast-math (and -mfma on x86), so the compiler may contract
+     * or reassociate the final scale/bias differently for a block of 32 rows
+     * than for one call of 200, giving last-bit differences.  Bit-identical
+     * output was verified end-to-end on macOS/Accelerate; it is not something
+     * these flags guarantee across compilers. */
     for (size_t i = 0; i < (size_t)N; ++i) {
-        if (memcmp(&serial[i], &blocked[i], sizeof(float)) != 0) {
+        const float denom = fabsf(serial[i]) > 1.0e-3f ? fabsf(serial[i]) : 1.0e-3f;
+        if (fabsf(serial[i] - blocked[i]) / denom > 1.0e-6f) {
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
-                         "qmat %s blocked matvec differs from serial at row %zu",
+                         "qmat %s blocked matvec differs from serial at row %zu"
+                         " (%.9g vs %.9g)",
                          qtype == QMAT_INT8 ? "int8"
-                             : (qtype == QMAT_F16 ? "f16" : "int4"), i);
+                             : (qtype == QMAT_F16 ? "f16" : "int4"), i,
+                         (double)serial[i], (double)blocked[i]);
             }
             goto done;
         }
