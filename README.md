@@ -1,5 +1,10 @@
 # Mynah TTS
 
+[![Build & Test](https://github.com/mynah-org/mynah-tts/actions/workflows/build.yml/badge.svg)](https://github.com/mynah-org/mynah-tts/actions/workflows/build.yml)
+[![Code Quality](https://github.com/mynah-org/mynah-tts/actions/workflows/codeql.yml/badge.svg)](https://github.com/mynah-org/mynah-tts/actions/workflows/codeql.yml)
+[![Memory Safety](https://github.com/mynah-org/mynah-tts/actions/workflows/safety.yml/badge.svg)](https://github.com/mynah-org/mynah-tts/actions/workflows/safety.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 Fast native C11 inference engine for text-to-speech — llama.cpp-style, no Python
 at runtime. Today it runs NVIDIA MagpieTTS v2607 with NanoCodec; the engine seam
 is built to host more models tomorrow.
@@ -68,7 +73,16 @@ Run quantized with `MYNAH_QUANT=int8` (or `f16` / `int4`) — see
 
 ## Model pack
 
-The runtime never downloads weights and never loads a raw `.nemo`. Convert once:
+The checkpoints are public and ungated — **no HuggingFace account or token
+needed**:
+
+```bash
+./download_model.sh                # Magpie + NanoCodec + ByT5 tokenizer assets
+./download_model.sh --what tts     # or fetch one at a time
+```
+
+The runtime never downloads weights implicitly and never loads a raw `.nemo`.
+Convert once into a model pack:
 
 ```bash
 make convert \

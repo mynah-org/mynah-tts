@@ -1,0 +1,44 @@
+name: Memory Safety
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  ubsan:
+    name: UBSan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
+      # make ubsan builds into its own directory and runs the test target, so
+      # the kernels are actually exercised rather than only compiled.
+      - name: Build and run with UBSan
+        run: make ubsan
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  asan:
+    name: ASan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
+      - name: Build and run with ASan
+        run: make asan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1

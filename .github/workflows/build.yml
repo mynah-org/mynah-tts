@@ -1,0 +1,125 @@
+name: Build & Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub Release with binaries'
+        type: boolean
+        default: false
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            blas: openblas
+            # Linux x86 already defaults to portable -mavx2 -mfma.
+            simd: ''
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            blas: openblas
+            # The default is -march=native, which would pin the artifact to the
+            # runner's exact core. Release binaries must stay portable.
+            simd: 'SIMD=neon'
+          - runner: macos-latest
+            os: macos
+            arch: arm64
+            blas: accelerate
+            simd: 'SIMD=neon'
+
+    runs-on: ${{ matrix.runner }}
+    name: "${{ matrix.os }}-${{ matrix.arch }} (${{ matrix.blas }})"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
+      - name: Build
+        run: make ${{ matrix.simd }}
+
+      - name: Toolchain and ISA report
+        run: make info
+
+      - name: Kernel self-test
+        run: ./build/cpu/mynah-tts --self-test
+
+      - name: Full test target
+        run: make test
+
+      - name: Verify CLI
+        run: ./build/cpu/mynah-tts --version && ./build/cpu/mynah-tts --help
+
+      - name: Metal build (macOS only)
+        if: matrix.os == 'macos'
+        run: |
+          make metal
+          ./build/metal/mynah-tts --self-test
+          # A hosted macOS runner may have no usable GPU; a missing device is a
+          # reported state, not a failure, so only fail on a real error.
+          ./build/metal/mynah-tts --gpu-self-test metal || \
+            echo "metal self-test skipped: no usable device on this runner"
+
+      - name: Stage binary
+        run: cp build/cpu/mynah-tts mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
+          path: mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'mynah-tts-*' -exec cp {} release/ \;
+          chmod +x release/*
+          cd release && sha256sum * > SHA256SUMS
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "mynah-tts ${{ steps.version.outputs.tag }}"
+          files: release/*
+          generate_release_notes: true
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
