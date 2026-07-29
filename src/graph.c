@@ -1540,6 +1540,12 @@ typedef struct {
 } codec_conv_profile;
 
 #if defined(MYNAH_USE_ACCELERATE)
+/* One filter per (shape, owning thread).  BNNSFilterApply's behaviour with the
+ * same filter on two threads is undocumented, and a convolution filter may hold
+ * internal workspace sized for its shape, so filters are not shared across
+ * threads.  Giving each thread its own also lets the apply run outside the
+ * cache lock: with a shared filter the whole convolution had to sit inside the
+ * critical section, which serialized every codec call process-wide. */
 typedef struct {
     const float *weight;
     const float *bias;
@@ -1548,6 +1554,7 @@ typedef struct {
     size_t length;
     size_t kernel;
     size_t dilation;
+    pthread_t owner;
     BNNSFilter filter;
 } codec_bnns_entry;
 
@@ -1711,18 +1718,25 @@ static int conv1d_causal_bnns(const float *weight, const float *bias,
     }
     BNNSFilter filter = NULL;
     int retained = 0;
+    const pthread_t self = pthread_self();
+    /* The lookup must hold the lock: the insert path below grows this array
+     * with realloc, which moves it, so scanning it unlocked races with another
+     * thread's growth. */
     if (cache != NULL) {
+        pthread_mutex_lock(&cache->mutex);
         for (size_t i = 0; i < cache->count; ++i) {
             codec_bnns_entry *entry = &cache->entries[i];
             if (entry->weight == weight && entry->bias == bias &&
                 entry->in_channels == in_channels && entry->out_channels == out_channels &&
                 entry->length == length && entry->kernel == kernel &&
-                entry->dilation == dilation) {
+                entry->dilation == dilation &&
+                pthread_equal(entry->owner, self)) {
                 filter = entry->filter;
                 retained = 1;
                 break;
             }
         }
+        pthread_mutex_unlock(&cache->mutex);
     }
     BNNSLayerParametersConvolution parameters;
     memset(&parameters, 0, sizeof(parameters));
@@ -1777,11 +1791,17 @@ static int conv1d_causal_bnns(const float *weight, const float *bias,
             }
             if (cache->count < cache->capacity) {
                 cache->entries[cache->count++] = (codec_bnns_entry){
-                    weight, bias, in_channels, out_channels, length, kernel, dilation, filter};
+                    weight, bias, in_channels, out_channels, length, kernel,
+                    dilation, self, filter};
                 retained = 1;
             }
         }
     }
+    if (cache != NULL) pthread_mutex_unlock(&cache->mutex);
+
+    /* Outside the lock: this filter belongs to this thread, either because it
+     * was found under our own owner key or because we just created it and no
+     * one else can reach it. */
     const int result = BNNSFilterApply(filter, input, output);
     if (profile != NULL) {
         profile->bnns_apply_seconds += phase_seconds() - operation_start;
@@ -1793,7 +1813,6 @@ static int conv1d_causal_bnns(const float *weight, const float *bias,
             profile->bnns_destroy_seconds += phase_seconds() - operation_start;
         }
     }
-    if (cache != NULL) pthread_mutex_unlock(&cache->mutex);
     return result;
 }
 #if defined(__clang__)
