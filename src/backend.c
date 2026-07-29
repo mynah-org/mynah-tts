@@ -630,6 +630,33 @@ int mynah_backend_residual_add_dev(const mynah_backend *backend,
     return 0;
 }
 
+typedef struct {
+    float *data;
+    const float *alpha;
+    size_t length;
+    size_t snake_channels;
+} snake_rows_job;
+
+/* One channel of Snake: x + sin(ax)^2/a on the first half, leaky ReLU on the
+ * rest.  Kept scalar so it stays the numerical reference; the win here is the
+ * pool, not the inner loop. */
+static void snake_row(void *opaque, int channel) {
+    const snake_rows_job *job = (const snake_rows_job *)opaque;
+    float *row = job->data + (size_t)channel * job->length;
+    if ((size_t)channel < job->snake_channels) {
+        const float a = job->alpha[channel];
+        const float inv_a = 1.0f / (a + 1e-9f);
+        for (size_t t = 0; t < job->length; ++t) {
+            const float v = row[t];
+            const float sn = sinf(a * v);
+            row[t] = v + sn * sn * inv_a;
+        }
+    } else {
+        for (size_t t = 0; t < job->length; ++t)
+            if (row[t] < 0.0f) row[t] *= 0.01f;
+    }
+}
+
 int mynah_backend_snake_dev(const mynah_backend *backend,
                             float *dev_data, const float *alpha,
                             size_t channels, size_t length,
@@ -640,22 +667,14 @@ int mynah_backend_snake_dev(const mynah_backend *backend,
         return backend->snake_dev(backend->state, dev_data, alpha,
                                   channels, length, snake_channels,
                                   error, error_capacity);
-    /* CPU fallback. */
-    for (size_t ch = 0; ch < channels; ++ch) {
-        float *row = dev_data + ch * length;
-        if (ch < snake_channels) {
-            float a = alpha[ch];
-            float inv_a = 1.0f / (a + 1e-9f);
-            for (size_t t = 0; t < length; ++t) {
-                float v = row[t];
-                float sn = sinf(a * v);
-                row[t] = v + sn * sn * inv_a;
-            }
-        } else {
-            for (size_t t = 0; t < length; ++t)
-                if (row[t] < 0.0f) row[t] *= 0.01f;
-        }
-    }
+    /* CPU fallback.  This is the path every CPU synthesis actually takes: the
+     * codec always has a backend object, so the vDSP variant in graph.c is only
+     * reachable when one is absent.  Each channel is an independent row and
+     * every step is elementwise, so splitting over the pool reorders nothing
+     * and is bit-exact against the serial loop. */
+    if (channels > (size_t)INT_MAX) return -1;
+    snake_rows_job job = {dev_data, alpha, length, snake_channels};
+    mynah_parallel_for((int)channels, snake_row, &job);
     return 0;
 }
 

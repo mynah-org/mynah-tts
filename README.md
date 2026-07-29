@@ -123,7 +123,9 @@ Measured on M1, 6.0 s utterance, default threads, one warmup and three runs:
 | --- | --- | --- | --- |
 | f32 | 0.532 | 5.99 s | 1.000 |
 | f16 | 0.376 | 6.22 s | 0.979 |
-| int8 | 0.279 | 6.13 s | 0.973 |
+| int8 | **0.256** | 6.13 s | 0.973 |
+
+(int8 includes the threaded Snake below; the f32/f16 figures predate it.)
 
 **None of the quantized modes is a transparent replacement for f32.** All of
 them perturb the greedy argmax enough to flip a near-tie token, and over ~65
