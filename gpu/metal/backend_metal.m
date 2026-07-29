@@ -153,47 +153,6 @@ static void set_error(char *error, size_t capacity, NSString *message) {
              message.UTF8String);
 }
 
-static NSString *metal_shader_source(void) {
-    return
-@"#include <metal_stdlib>\n"
-"using namespace metal;\n"
-"struct MatmulParams { uint rows; uint input_width; uint output_width; };\n"
-"\n"
-"kernel void mynah_matmul_tiled(device const float *input   [[buffer(0)]],\n"
-"                               device const float *weight  [[buffer(1)]],\n"
-"                               device const float *bias    [[buffer(2)]],\n"
-"                               device float       *output  [[buffer(3)]],\n"
-"                               constant MatmulParams &p    [[buffer(4)]],\n"
-"                               uint2 gid [[threadgroup_position_in_grid]],\n"
-"                               uint2 lid [[thread_position_in_threadgroup]],\n"
-"                               uint2 tgs [[threads_per_threadgroup]]) {\n"
-"    const uint TILE_M = 4; const uint TILE_N = 64;\n"
-"    const uint row_start = gid.y * TILE_M;\n"
-"    const uint col_start = gid.x * TILE_N;\n"
-"    const uint col = col_start + lid.x;\n"
-"    const uint row = row_start + lid.y;\n"
-"    float acc = 0.0f;\n"
-"    if (row < p.rows && col < p.output_width) {\n"
-"        for (uint k = 0; k < p.input_width; ++k)\n"
-"            acc += input[row * p.input_width + k] * weight[col * p.input_width + k];\n"
-"        if (bias != nullptr) acc += bias[col];\n"
-"        output[row * p.output_width + col] = acc;\n"
-"    }\n"
-"}\n"
-"\n"
-"kernel void mynah_matmul(device const float *input [[buffer(0)]],\n"
-" device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]],\n"
-" device float *output [[buffer(3)]], constant MatmulParams &p [[buffer(4)]],\n"
-" uint index [[thread_position_in_grid]]) {\n"
-" uint total = p.rows * p.output_width; if (index >= total) return;\n"
-" uint row = index / p.output_width; uint column = index - row * p.output_width;\n"
-" device const float *in = input + row * p.input_width;\n"
-" device const float *w = weight + column * p.input_width;\n"
-" float value = bias == nullptr ? 0.0f : bias[column];\n"
-" for (uint i = 0; i < p.input_width; ++i) value += in[i] * w[i];\n"
-" output[index] = value; }\n";
-}
-
 /* Keep the runtime shader in sync with gpu/metal/matmul.metal.  This version
  * uses cooperative threadgroup tiles instead of rereading global memory for
  * every output element. */
