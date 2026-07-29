@@ -105,6 +105,45 @@ interleaved so both arms see the same machine state — gives median RTF 0.691 �
 **0.579 (−16%)**, with byte-identical output. Prefer this interleaved form over
 comparing absolute numbers taken minutes apart.
 
+## Quantized decode
+
+`MYNAH_QUANT=f16|int8|int4` converts the decode weights once at load and keeps
+them in a name-keyed cache. Prefill is untouched: above 16 rows the call falls
+back to the exact f32 BLAS path, so only the single-row autoregressive
+projections are quantized.
+
+The decoder and the local transformer both route their projections through this
+cache. Until they did, only the local output projection was quantized -- roughly
+a tenth of the decode weight traffic -- which is why `int8` used to be no faster
+than `f32`.
+
+Measured on M1, 6.0 s utterance, default threads, one warmup and three runs:
+
+| mode | RTF | duration | LTAS corr vs f32 |
+| --- | --- | --- | --- |
+| f32 | 0.532 | 5.99 s | 1.000 |
+| f16 | 0.376 | 6.22 s | 0.979 |
+| int8 | 0.279 | 6.13 s | 0.973 |
+
+**None of the quantized modes is a transparent replacement for f32.** All of
+them perturb the greedy argmax enough to flip a near-tie token, and over ~65
+autoregressive frames that shifts EOS: the duration moves by a few percent. The
+output stays valid speech in the same voice -- long-term average spectrum
+correlates at 0.97-0.98, RMS and peak match -- but it is a different realization
+of the utterance, not the same waveform computed faster. Sample-wise correlation
+is meaningless once the trajectory diverges and should not be used as the gate;
+compare duration, finiteness, peak/RMS and a time-alignment-insensitive spectral
+measure instead.
+
+f16 is the most accurate of the three by a wide margin: on Magpie weights its
+mean relative error is 1.8e-4 against 1.7e-2 for int8, about 96x tighter, and
+the largest weight is ~6 against the 65504 f16 limit, so overflow is not a
+concern. It keeps the activation in f32 and needs no scales. Prefer f16 when
+duration drift matters and int8 when speed does.
+
+`f32` remains the default and is bit-exact: routing it through the cache is a
+no-op, verified by an unchanged WAV md5.
+
 ## Convert the downloaded checkpoints
 
 ```bash

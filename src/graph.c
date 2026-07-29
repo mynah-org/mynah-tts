@@ -746,6 +746,14 @@ typedef struct {
     const float *norm_ff[4];
     const float *ffn_up_w[4];
     const float *ffn_down_w[4];
+    /* The tensor names are kept beside the pointers so the quantized path can
+     * key its converted-weight cache without re-formatting a name per step.
+     * These four matmuls are the hot loop: 16 sequential streams per stacked
+     * frame re-read every local-transformer weight, so they dominate decode. */
+    char qkv_name[4][96];
+    char o_name[4][96];
+    char ffn_up_name[4][96];
+    char ffn_down_name[4][96];
     /* Metal resident local-transformer state.  Host K/V and scratch remain
      * for the scalar path; the GPU path never downloads its hidden row. */
     float *dev_k;
@@ -942,18 +950,22 @@ static int local_cache_init(const mynah_tts_model *model, local_cache *cache,
         snprintf(nm, sizeof(nm), "local_transformer.layers.%zu.self_attention.qkv_net.weight", l);
         if (tensor(model->tts, nm, &t, error, error_capacity)!=0) return -1;
         cache->qkv_w[l] = t.data;
+        snprintf(cache->qkv_name[l], sizeof(cache->qkv_name[l]), "%s", nm);
         snprintf(nm, sizeof(nm), "local_transformer.layers.%zu.self_attention.o_net.weight", l);
         if (tensor(model->tts, nm, &t, error, error_capacity)!=0) return -1;
         cache->o_w[l] = t.data;
+        snprintf(cache->o_name[l], sizeof(cache->o_name[l]), "%s", nm);
         snprintf(nm, sizeof(nm), "local_transformer.layers.%zu.norm_pos_ff.weight", l);
         if (tensor(model->tts, nm, &t, error, error_capacity)!=0) return -1;
         cache->norm_ff[l] = t.data;
         snprintf(nm, sizeof(nm), "local_transformer.layers.%zu.pos_ff.proj.conv.weight", l);
         if (tensor(model->tts, nm, &t, error, error_capacity)!=0) return -1;
         cache->ffn_up_w[l] = t.data;
+        snprintf(cache->ffn_up_name[l], sizeof(cache->ffn_up_name[l]), "%s", nm);
         snprintf(nm, sizeof(nm), "local_transformer.layers.%zu.pos_ff.o_net.conv.weight", l);
         if (tensor(model->tts, nm, &t, error, error_capacity)!=0) return -1;
         cache->ffn_down_w[l] = t.data;
+        snprintf(cache->ffn_down_name[l], sizeof(cache->ffn_down_name[l]), "%s", nm);
     }
     if (mynah_backend_has_dev_ops(model->backend) &&
         mynah_backend_has_attention_dev(model->backend) &&
@@ -1088,8 +1100,10 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
     int failed = 0;
     for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
         layer_norm(x, nrm, 1u, width, cache->norm_self[layer]);
-        if (mynah_backend_matmul(model->backend, nrm, qkv, 1u, width, width * 3u,
-                                 cache->qkv_w[layer], NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       cache->qkv_name[layer], cache->qkv_w[layer],
+                                       nrm, qkv, 1u, width, width * 3u, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         float *kb = cache->k + layer * cache->capacity * width;
         float *vb = cache->v + layer * cache->capacity * width;
         memcpy(kb + p * width, qkv + width, width * sizeof(float));
@@ -1112,15 +1126,21 @@ static int local_step(const mynah_tts_model *model, local_cache *cache,
             for (size_t s = 0; s <= p; ++s)
                 axpy_f32(outh, vb + s * width + h * hw, scores[s] / denom, hw);
         }
-        if (mynah_backend_matmul(model->backend, attn, proj, 1u, width, width,
-                                 cache->o_w[layer], NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       cache->o_name[layer], cache->o_w[layer],
+                                       attn, proj, 1u, width, width, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         for (size_t d = 0; d < width; ++d) x[d] += proj[d];
         layer_norm(x, nrm, 1u, width, cache->norm_ff[layer]);
-        if (mynah_backend_matmul(model->backend, nrm, hidden, 1u, width, ffn,
-                                 cache->ffn_up_w[layer], NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       cache->ffn_up_name[layer], cache->ffn_up_w[layer],
+                                       nrm, hidden, 1u, width, ffn, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         gelu_tanh_array(hidden, ffn, workspace->gelu_scratch);
-        if (mynah_backend_matmul(model->backend, hidden, proj, 1u, ffn, width,
-                                 cache->ffn_down_w[layer], NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       cache->ffn_down_name[layer], cache->ffn_down_w[layer],
+                                       hidden, proj, 1u, ffn, width, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         for (size_t d = 0; d < width; ++d) x[d] += proj[d];
     }
     if (!failed) memcpy(out_row, x, width * sizeof(float));
@@ -3145,9 +3165,10 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         double operation_start = profile_prefill ? phase_seconds() : 0.0;
         /* self-attention */
         layer_norm(x, nrm, count, width, r->norm_self);
-        if (mynah_backend_matmul(model->backend, nrm, qkv,
-                              count, width, width * 3u,
-                              r->qkv_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       r->qkv, r->qkv_w,
+                                       nrm, qkv, count, width, width * 3u, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         if (profile_prefill) {
             self_projection_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
@@ -3213,15 +3234,17 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
                 fclose(dump);
             }
         }
-        if (mynah_backend_matmul(model->backend, attn, proj,
-                              count, width, width,
-                              r->o_self_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       r->o_self, r->o_self_w,
+                                       attn, proj, count, width, width, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* cross-attention over cached text memory */
         layer_norm(x, nrm, count, width, r->norm_xattn_query);
-        if (mynah_backend_matmul(model->backend, nrm, q_x,
-                              count, width, xw,
-                              r->q_cross_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       r->q_cross, r->q_cross_w,
+                                       nrm, q_x, count, width, xw, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         if (profile_prefill) {
             cross_projection_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
@@ -3250,23 +3273,26 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
             cross_attention_seconds += phase_seconds() - operation_start;
             operation_start = phase_seconds();
         }
-        if (mynah_backend_matmul(model->backend, xctx, proj,
-                              count, xw, width,
-                              r->o_cross_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       r->o_cross, r->o_cross_w,
+                                       xctx, proj, count, xw, width, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         /* position-wise FFN (kernel size 1) */
         layer_norm(x, nrm, count, width, r->norm_pos_ff);
-        if (mynah_backend_matmul(model->backend, nrm, hidden,
-                              count, width, ffn,
-                              r->ffn_up_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       r->ffn_up, r->ffn_up_w,
+                                       nrm, hidden, count, width, ffn, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         if (getenv("MYNAH_GELU_SCALAR") == NULL && count > 1u) {
             mynah_gelu_f32(hidden, hidden_elements);
         } else {
             mynah_gelu_f32_scalar(hidden, hidden_elements);
         }
-        if (mynah_backend_matmul(model->backend, hidden, proj,
-                              count, ffn, width,
-                              r->ffn_down_w, NULL, error, error_capacity) != 0) { failed = 1; break; }
+        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
+                                       r->ffn_down, r->ffn_down_w,
+                                       hidden, proj, count, ffn, width, NULL,
+                                       error, error_capacity) != 0) { failed = 1; break; }
         for (size_t k = 0; k < count * width; ++k) x[k] += proj[k];
         if (profile_prefill) ffn_seconds += phase_seconds() - operation_start;
     }

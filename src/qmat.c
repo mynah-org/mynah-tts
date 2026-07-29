@@ -17,6 +17,13 @@
 #include <immintrin.h>
 #define MYNAH_QMAT_AVX2 1
 #endif
+/* IEEE half weights need NEON's f16<->f32 converts.  Where they are missing the
+ * F16 cache simply refuses the tensor and the caller falls back to exact f32,
+ * the same contract INT4 uses for a shape it cannot represent. */
+#if !defined(MYNAH_DISABLE_SIMD) && defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define MYNAH_QMAT_F16 1
+#endif
 
 /* count at/below this uses the native int dot; above it falls back to the f32
  * BLAS matmul (the prefill, already fast and kept bit-exact). */
@@ -24,7 +31,7 @@
 #define QMAT_K_MAX 8192
 #define QMAT_Q4_GROUP 32
 
-enum { QMAT_F32 = 0, QMAT_INT8 = 1, QMAT_INT4 = 2 };
+enum { QMAT_F32 = 0, QMAT_INT8 = 1, QMAT_INT4 = 2, QMAT_F16 = 3 };
 
 /* ------------------------------------------------------------- quantizers */
 static void quantize_weight_int8(const float *w, size_t n, size_t k,
@@ -294,6 +301,80 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
     }
 }
 
+#if defined(MYNAH_QMAT_F16)
+/* Weights as IEEE half; activation and accumulation stay f32.  Decode is bound
+ * by weight bytes, so halving them is close to halving the time -- measured
+ * 2.4-2.8x against Accelerate sgemv on a working set too large to cache.
+ *
+ * Unlike INT8/INT4 this does not quantize the activation, and it needs no
+ * scales: f16 carries its own exponent.  On Magpie weights the mean relative
+ * error is 1.8e-4 against 1.7e-2 for INT8 (~96x more accurate), and the largest
+ * weight is about 6 against the 65504 f16 limit, so overflow is not a concern.
+ *
+ * Four rows in flight so the activation is read once per four weight rows,
+ * matching matvec_q8.  Each row accumulates into its own pair of vectors, so a
+ * row's reduction order never depends on how the rows are partitioned. */
+static void matvec_f16(float *out, const float *x, const __fp16 *weights,
+                       const float *bias, size_t rows, size_t cols) {
+    size_t row = 0;
+    for (; row + 4u <= rows; row += 4u) {
+        const __fp16 *w0 = weights + row * cols;
+        const __fp16 *w1 = w0 + cols;
+        const __fp16 *w2 = w1 + cols;
+        const __fp16 *w3 = w2 + cols;
+        float32x4_t a0 = vdupq_n_f32(0.0f), b0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = vdupq_n_f32(0.0f), b1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), b2 = vdupq_n_f32(0.0f);
+        float32x4_t a3 = vdupq_n_f32(0.0f), b3 = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const float32x4_t xl = vld1q_f32(x + j);
+            const float32x4_t xh = vld1q_f32(x + j + 4u);
+            const float16x8_t v0 = vld1q_f16(w0 + j);
+            const float16x8_t v1 = vld1q_f16(w1 + j);
+            const float16x8_t v2 = vld1q_f16(w2 + j);
+            const float16x8_t v3 = vld1q_f16(w3 + j);
+            a0 = vfmaq_f32(a0, vcvt_f32_f16(vget_low_f16(v0)), xl);
+            b0 = vfmaq_f32(b0, vcvt_f32_f16(vget_high_f16(v0)), xh);
+            a1 = vfmaq_f32(a1, vcvt_f32_f16(vget_low_f16(v1)), xl);
+            b1 = vfmaq_f32(b1, vcvt_f32_f16(vget_high_f16(v1)), xh);
+            a2 = vfmaq_f32(a2, vcvt_f32_f16(vget_low_f16(v2)), xl);
+            b2 = vfmaq_f32(b2, vcvt_f32_f16(vget_high_f16(v2)), xh);
+            a3 = vfmaq_f32(a3, vcvt_f32_f16(vget_low_f16(v3)), xl);
+            b3 = vfmaq_f32(b3, vcvt_f32_f16(vget_high_f16(v3)), xh);
+        }
+        float s0 = vaddvq_f32(vaddq_f32(a0, b0));
+        float s1 = vaddvq_f32(vaddq_f32(a1, b1));
+        float s2 = vaddvq_f32(vaddq_f32(a2, b2));
+        float s3 = vaddvq_f32(vaddq_f32(a3, b3));
+        for (; j < cols; ++j) {
+            const float xv = x[j];
+            s0 += (float)w0[j] * xv;
+            s1 += (float)w1[j] * xv;
+            s2 += (float)w2[j] * xv;
+            s3 += (float)w3[j] * xv;
+        }
+        out[row] = s0 + (bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = s1 + (bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = s2 + (bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = s3 + (bias == NULL ? 0.0f : bias[row + 3u]);
+    }
+    for (; row < rows; ++row) {
+        const __fp16 *w = weights + row * cols;
+        float32x4_t a = vdupq_n_f32(0.0f), b = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const float16x8_t v = vld1q_f16(w + j);
+            a = vfmaq_f32(a, vcvt_f32_f16(vget_low_f16(v)), vld1q_f32(x + j));
+            b = vfmaq_f32(b, vcvt_f32_f16(vget_high_f16(v)), vld1q_f32(x + j + 4u));
+        }
+        float s = vaddvq_f32(vaddq_f32(a, b));
+        for (; j < cols; ++j) s += (float)w[j] * x[j];
+        out[row] = s + (bias == NULL ? 0.0f : bias[row]);
+    }
+}
+#endif
+
 /* Quantized decode is memory bound on the packed weights exactly like the f32
  * path, and one core only reaches a fraction of DRAM bandwidth.  Every output
  * row is an independent dot product, so splitting the row range over the pool
@@ -306,7 +387,8 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
 
 typedef struct {
     float *out;
-    const int8_t *qx;
+    const int8_t *qx;   /* INT8/INT4: quantized activation */
+    const float *x;     /* F16: the activation is not quantized */
     float sx;
     const void *weights;
     const float *scales;
@@ -316,17 +398,18 @@ typedef struct {
     int qtype;
 } qmat_rows_job;
 
-static void qmat_rows_block(void *opaque, int block_index) {
-    const qmat_rows_job *j = (const qmat_rows_job *)opaque;
-    const size_t row0 = (size_t)block_index * QMAT_ROW_BLOCK;
-    if (row0 >= j->rows) return;
-    size_t count = j->rows - row0;
-    if (count > QMAT_ROW_BLOCK) count = QMAT_ROW_BLOCK;
+static void qmat_rows_dispatch(const qmat_rows_job *j, size_t row0, size_t count) {
     const float *bias = j->bias == NULL ? NULL : j->bias + row0;
     if (j->qtype == QMAT_INT8) {
         matvec_q8(j->out + row0, j->qx, j->sx,
                   (const int8_t *)j->weights + row0 * j->cols,
                   j->scales + row0, bias, count, j->cols);
+#if defined(MYNAH_QMAT_F16)
+    } else if (j->qtype == QMAT_F16) {
+        matvec_f16(j->out + row0, j->x,
+                   (const __fp16 *)j->weights + row0 * j->cols,
+                   bias, count, j->cols);
+#endif
     } else {
         matvec_q4(j->out + row0, j->qx, j->sx,
                   (const uint8_t *)j->weights + row0 * (j->cols / 2u),
@@ -335,26 +418,34 @@ static void qmat_rows_block(void *opaque, int block_index) {
     }
 }
 
-static void matvec_q_rows(float *out, const int8_t *qx, float sx,
+static void qmat_rows_block(void *opaque, int block_index) {
+    const qmat_rows_job *j = (const qmat_rows_job *)opaque;
+    const size_t row0 = (size_t)block_index * QMAT_ROW_BLOCK;
+    if (row0 >= j->rows) return;
+    size_t count = j->rows - row0;
+    if (count > QMAT_ROW_BLOCK) count = QMAT_ROW_BLOCK;
+    qmat_rows_dispatch(j, row0, count);
+}
+
+static void matvec_q_rows(float *out, const int8_t *qx, const float *x, float sx,
                           const void *weights, const float *scales,
                           const float *bias, size_t rows, size_t cols,
                           int qtype) {
-    const size_t weight_bytes = qtype == QMAT_INT8 ? rows * cols : rows * cols / 2u;
+    size_t weight_bytes;
+    if (qtype == QMAT_INT8) weight_bytes = rows * cols;
+    else if (qtype == QMAT_F16) weight_bytes = rows * cols * 2u;
+    else weight_bytes = rows * cols / 2u;
+    const qmat_rows_job job = {out, qx, x, sx, weights, scales, bias,
+                               rows, cols, qtype};
     if (mynah_num_threads() > 1 && weight_bytes >= QMAT_THREAD_MIN_BYTES &&
         rows > QMAT_ROW_BLOCK) {
-        const qmat_rows_job job = {out, qx, sx, weights, scales, bias,
-                                   rows, cols, qtype};
         const size_t blocks = (rows + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK;
         if (blocks <= (size_t)INT_MAX) {
             mynah_parallel_for((int)blocks, qmat_rows_block, (void *)&job);
             return;
         }
     }
-    if (qtype == QMAT_INT8) {
-        matvec_q8(out, qx, sx, (const int8_t *)weights, scales, bias, rows, cols);
-    } else {
-        matvec_q4(out, qx, sx, (const uint8_t *)weights, scales, bias, rows, cols);
-    }
+    qmat_rows_dispatch(&job, 0u, rows);
 }
 
 /* --------------------------------------------------------------- weight cache */
@@ -363,13 +454,16 @@ typedef struct {
     int qtype;
     int8_t *q8;      /* INT8 */
     uint8_t *q4;     /* INT4 packed */
+#if defined(MYNAH_QMAT_F16)
+    __fp16 *f16;     /* F16: [n * k], no scales */
+#endif
     float *scales;   /* INT8: [n]; INT4: [n * k/32] */
     size_t n;
     size_t k;
 } qmat_entry;
 
 struct mynah_qmat_cache {
-    int qtype; /* QMAT_F32 (off) / QMAT_INT8 / QMAT_INT4 */
+    int qtype; /* QMAT_F32 (off) / QMAT_INT8 / QMAT_INT4 / QMAT_F16 */
     int use_row4;
     qmat_entry *entries;
     size_t count;
@@ -384,9 +478,15 @@ mynah_qmat_cache *mynah_qmat_cache_new(int enabled) {
         const char *env = getenv("MYNAH_QUANT");
         if (env != NULL && strcmp(env, "int8") == 0) qtype = QMAT_INT8;
         else if (env != NULL && strcmp(env, "int4") == 0) qtype = QMAT_INT4;
-    } else if (enabled == QMAT_INT8 || enabled == QMAT_INT4) {
+        else if (env != NULL && strcmp(env, "f16") == 0) qtype = QMAT_F16;
+    } else if (enabled == QMAT_INT8 || enabled == QMAT_INT4 ||
+               enabled == QMAT_F16) {
         qtype = enabled;
     }
+#if !defined(MYNAH_QMAT_F16)
+    /* No half converts on this target: stay on the exact f32 path. */
+    if (qtype == QMAT_F16) qtype = QMAT_F32;
+#endif
     c->qtype = qtype;
     c->use_row4 = getenv("MYNAH_QMAT_SINGLE_ROW") == NULL;
     return c;
@@ -402,6 +502,9 @@ void mynah_qmat_cache_free(mynah_qmat_cache *cache) {
         free(cache->entries[i].name);
         free(cache->entries[i].q8);
         free(cache->entries[i].q4);
+#if defined(MYNAH_QMAT_F16)
+        free(cache->entries[i].f16);
+#endif
         free(cache->entries[i].scales);
     }
     free(cache->entries);
@@ -441,6 +544,13 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
         e->scales = (float *)malloc(n * sizeof(float));
         if (e->q8 == NULL || e->scales == NULL) goto fail;
         quantize_weight_int8(w, n, k, e->q8, e->scales);
+#if defined(MYNAH_QMAT_F16)
+    } else if (cache->qtype == QMAT_F16) {
+        if (n > SIZE_MAX / k / sizeof(__fp16)) goto fail;
+        e->f16 = (__fp16 *)malloc(n * k * sizeof(__fp16));
+        if (e->f16 == NULL) goto fail;
+        for (size_t i = 0; i < n * k; ++i) e->f16[i] = (__fp16)w[i];
+#endif
     } else {
         const size_t groups = k / QMAT_Q4_GROUP;
         e->q4 = (uint8_t *)malloc(n * (k / 2u));
@@ -455,6 +565,9 @@ fail:
     free(e->name);
     free(e->q8);
     free(e->q4);
+#if defined(MYNAH_QMAT_F16)
+    free(e->f16);
+#endif
     free(e->scales);
     return NULL;
 }
@@ -511,6 +624,14 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
     for (size_t t = 0; t < count; ++t) {
         const float *xr = in + t * k;
         float *orow = out + t * n;
+#if defined(MYNAH_QMAT_F16)
+        /* F16 carries its own exponent, so the activation stays f32 and there
+         * is no activation-quantization pass at all. */
+        if (e->qtype == QMAT_F16) {
+            matvec_q_rows(orow, NULL, xr, 0.0f, e->f16, NULL, bias, n, k, QMAT_F16);
+            continue;
+        }
+#endif
         const float sx = quantize_act_int8(qx, xr, k);
         if (!cache->use_row4) {
             for (size_t row = 0; row < n; ++row) {
@@ -522,9 +643,9 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
                 orow[row] = value;
             }
         } else if (e->qtype == QMAT_INT8) {
-            matvec_q_rows(orow, qx, sx, e->q8, e->scales, bias, n, k, QMAT_INT8);
+            matvec_q_rows(orow, qx, xr, sx, e->q8, e->scales, bias, n, k, QMAT_INT8);
         } else {
-            matvec_q_rows(orow, qx, sx, e->q4, e->scales, bias, n, k, QMAT_INT4);
+            matvec_q_rows(orow, qx, xr, sx, e->q4, e->scales, bias, n, k, QMAT_INT4);
         }
     }
     return 0;
@@ -626,8 +747,16 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
     uint8_t *q4 = malloc((size_t)N * K / 2u);
     float *scales8 = malloc((size_t)N * sizeof(float));
     float *scales4 = malloc((size_t)N * (K / QMAT_Q4_GROUP) * sizeof(float));
+#if defined(MYNAH_QMAT_F16)
+    __fp16 *h16 = malloc((size_t)N * K * sizeof(__fp16));
+    const int h16_ok = h16 != NULL;
+#else
+    void *h16 = NULL;
+    const int h16_ok = 1;   /* unused on targets without half converts */
+#endif
     if (w == NULL || x == NULL || bias == NULL || serial == NULL || blocked == NULL ||
-        qx == NULL || q8 == NULL || q4 == NULL || scales8 == NULL || scales4 == NULL) {
+        qx == NULL || q8 == NULL || q4 == NULL || scales8 == NULL || scales4 == NULL ||
+        !h16_ok) {
         if (error != NULL && error_capacity > 0)
             snprintf(error, error_capacity, "qmat blocked self-test out of memory");
         goto done;
@@ -644,6 +773,13 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
         weights = q8;
         scales = scales8;
         matvec_q8(serial, qx, sx, q8, scales8, bias, N, K);
+#if defined(MYNAH_QMAT_F16)
+    } else if (qtype == QMAT_F16) {
+        for (size_t i = 0; i < (size_t)N * K; ++i) h16[i] = (__fp16)w[i];
+        weights = h16;
+        scales = NULL;
+        matvec_f16(serial, x, h16, bias, N, K);
+#endif
     } else {
         quantize_weight_int4(w, N, K, q4, scales4);
         weights = q4;
@@ -651,7 +787,7 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
         matvec_q4(serial, qx, sx, q4, scales4, bias, N, K);
     }
     for (size_t i = 0; i < (size_t)N; ++i) blocked[i] = 0.0f;
-    const qmat_rows_job job = {blocked, qx, sx, weights, scales, bias,
+    const qmat_rows_job job = {blocked, qx, x, sx, weights, scales, bias,
                                (size_t)N, (size_t)K, qtype};
     const int blocks = (int)(((size_t)N + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK);
     for (int b = 0; b < blocks; ++b) qmat_rows_block((void *)&job, b);
@@ -660,7 +796,8 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
                          "qmat %s blocked matvec differs from serial at row %zu",
-                         qtype == QMAT_INT8 ? "int8" : "int4", i);
+                         qtype == QMAT_INT8 ? "int8"
+                             : (qtype == QMAT_F16 ? "f16" : "int4"), i);
             }
             goto done;
         }
@@ -668,14 +805,66 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
     status = 0;
 done:
     free(w); free(x); free(bias); free(serial); free(blocked);
-    free(qx); free(q8); free(q4); free(scales8); free(scales4);
+    free(qx); free(q8); free(q4); free(scales8); free(scales4); free(h16);
     return status;
 }
+
+#if defined(MYNAH_QMAT_F16)
+/* F16 keeps the activation exact and only rounds the weights, so it must land
+ * far closer to the f32 reference than INT8 does.  The bound below is ~50x
+ * tighter than the INT8 one; if a change loosens it, the accuracy argument for
+ * preferring F16 over INT8 no longer holds. */
+static int self_test_f16(char *error, size_t error_capacity) {
+    enum { N = 64, K = 512 };
+    int status = -1;
+    float *w = malloc((size_t)N * K * sizeof(float));
+    float *x = malloc((size_t)K * sizeof(float));
+    float *bias = malloc((size_t)N * sizeof(float));
+    float *got = malloc((size_t)N * sizeof(float));
+    __fp16 *h = malloc((size_t)N * K * sizeof(__fp16));
+    if (w == NULL || x == NULL || bias == NULL || got == NULL || h == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat f16 self-test out of memory");
+        goto done;
+    }
+    for (size_t i = 0; i < (size_t)N * K; ++i) {
+        w[i] = sinf(0.017f * (float)i) * (0.5f + 0.5f * cosf(0.003f * (float)i));
+        h[i] = (__fp16)w[i];
+    }
+    for (size_t j = 0; j < (size_t)K; ++j) x[j] = cosf(0.011f * (float)j) - 0.3f;
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = (float)i * 0.125f - 0.25f;
+    matvec_f16(got, x, h, bias, N, K);
+    float max_rel = 0.0f;
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        double ref = 0.0;
+        for (size_t j = 0; j < (size_t)K; ++j) ref += (double)w[i * K + j] * x[j];
+        ref += bias[i];
+        const double denom = fabs(ref) > 1.0e-3 ? fabs(ref) : 1.0e-3;
+        const float rel = (float)(fabs(got[i] - ref) / denom);
+        if (rel > max_rel) max_rel = rel;
+    }
+    if (!(max_rel <= 1.0e-3f)) {
+        if (error != NULL && error_capacity > 0) {
+            snprintf(error, error_capacity,
+                     "qmat f16 relative error too large: %.5f", (double)max_rel);
+        }
+        goto done;
+    }
+    status = 0;
+done:
+    free(w); free(x); free(bias); free(got); free(h);
+    return status;
+}
+#endif
 
 int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_one(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_one(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_INT4, error, error_capacity) != 0) return -1;
+#if defined(MYNAH_QMAT_F16)
+    if (self_test_f16(error, error_capacity) != 0) return -1;
+    if (self_test_rows_blocked(QMAT_F16, error, error_capacity) != 0) return -1;
+#endif
     return 0;
 }
