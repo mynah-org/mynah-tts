@@ -221,6 +221,33 @@ path is `mynah_backend_snake_dev`'s fallback in `backend.c`; the vDSP code in
 `graph.c` is only reachable when no backend is present, and
 `MYNAH_SNAKE_SCALAR=1` toggles a branch a normal CPU synthesis never takes.
 
+### The codec is not the next batching lever
+
+Worth recording because the phase table makes it look like one: the codec is
+~29% of wall time, the largest single remaining block. Two things were measured
+before building anything, and both say leave it alone.
+
+**Batching it across requests buys ~1%.** The AR step is bandwidth-bound because
+one activation row touches the entire weight set. The codec is not: its 405 MB
+of weights are read once per call and applied to every frame in the sequence, so
+they are already amortized ~320x. Codec time scales linearly with length (0.229 s
+at 50 frames, 0.432 s at 100), and 405 MB in 0.43 s is 940 MB/s against the
+~59 GB/s the machine sustains — it is compute-bound. Batching B requests would
+save (B-1) x 405 MB of reads: about 0.05 s at B=8, against 3.4 s of arithmetic.
+
+**Threading its convolutions ourselves makes it slower.** Codec conv time is
+flat against `MYNAH_THREADS` (0.350 s at one thread, 0.353 s at four) while the
+snake and transpose around it scale 3.4x, which looks exactly like three idle
+cores. It is not: `MYNAH_THREADS` sizes *our* pool, which BNNS ignores — BNNS
+already parallelizes internally. Splitting the convolution over output-channel
+blocks and dispatching those on our pool was implemented, produced byte-identical
+audio, and ran **slower**: codec 0.430 s to 0.536 s, with the middle stages worst
+(stage 2 from 0.118 s to 0.194 s) because smaller per-call channel counts cost
+BNNS more efficiency than the split returns. Reverted.
+
+A real codec win would have to come from the kernels themselves, not from
+scheduling.
+
 ## Benchmark your own box
 
 ```bash
