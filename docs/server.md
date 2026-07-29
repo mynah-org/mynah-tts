@@ -248,8 +248,9 @@ Errors are OpenAI-shaped:
 `make server-test MODEL_DIR=...` covers every route plus three properties worth
 stating: streamed audio equals batch audio byte for byte, three identical
 requests return identical audio (guarding against state leaking through the
-model's mutable caches), and two concurrent clients both complete without
-perturbing each other.
+model's mutable caches), two concurrent clients both complete without
+perturbing each other, and four concurrent requests are byte-identical to the
+same four run one at a time while not being slower.
 
 CORS is open (`Access-Control-Allow-Origin: *`) and `OPTIONS` preflight is
 answered, so a browser page can call it directly.

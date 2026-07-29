@@ -140,8 +140,10 @@ curl http://localhost:8080/v1/voices          # ids and names
 Add `"stream": true` to get chunked PCM as it is generated, sample-identical to
 the batch response. Plain sockets in C, no framework, one binary. It binds to
 loopback and has no auth or TLS — put a proxy in front of anything public.
-Synthesis is serialized behind one mutex, which is a correctness bound rather
-than a tuning choice. Details: **[docs/server.md](docs/server.md)**.
+Queued requests are synthesized together — one pass over the decode weights
+serves everything in flight, measured 1.63x aggregate throughput at eight
+concurrent, with each request receiving byte-identical audio to what it would
+have received alone. Details: **[docs/server.md](docs/server.md)**.
 
 ## Streaming (C API)
 
@@ -165,8 +167,8 @@ diverge from the streaming one.
   threading, the Metal verdict, benchmarking your own machine
 - **[Quantization](docs/quantization.md)** — f16/int8/int4 trade-offs and how to
   judge quantized audio
-- **[Server](docs/server.md)** — the OpenAI-compatible HTTP API, streaming, and
-  why synthesis is serialized
+- **[Server](docs/server.md)** — the OpenAI-compatible HTTP API, streaming,
+  request batching and its memory cost
 - **[Voices and languages](docs/voices-and-languages.md)** — speaker IDs and
   their names, the 12 language codes, and the three ways to pass text
 - **[Oracle parity](docs/oracle-parity.md)** — validation against the official
