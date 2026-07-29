@@ -5,6 +5,12 @@
 
 #include <float.h>
 #include <limits.h>
+
+/* Upper bound on requests stepped together.  Slots are cheap in state but each
+ * one holds a full KV cache, so this bounds memory as much as it bounds the
+ * pointer arrays kept on the stack in the batched step. */
+#define MYNAH_MAX_BATCH 16u
+
 #include <math.h>
 #include <stdint.h>
 #include <time.h>
@@ -77,6 +83,44 @@ static float *allocate_floats(size_t count, char *error, size_t error_capacity) 
     float *value = (float *)calloc(count, sizeof(*value));
     if (value == NULL) graph_error(error, error_capacity, "out of memory in native graph");
     return value;
+}
+
+/* Scratch for the weight-stationary batched projections.  Owned by the caller
+ * and sized once for the widest k in the graph, so the step stays
+ * allocation-free.  Unused at batch 1, where every projection takes the exact
+ * single-row path. */
+typedef struct {
+    int8_t *qx;   /* MYNAH_MAX_BATCH * k_max */
+    float *sx;    /* MYNAH_MAX_BATCH */
+    size_t k_max;
+    size_t capacity;
+} batch_scratch;
+
+static void batch_scratch_free(batch_scratch *scratch) {
+    if (scratch == NULL) return;
+    free(scratch->qx);
+    free(scratch->sx);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+static int batch_scratch_init(batch_scratch *scratch, size_t batch, size_t k_max,
+                              char *error, size_t error_capacity) {
+    memset(scratch, 0, sizeof(*scratch));
+    if (batch <= 1u) return 0;   /* single-row path never quantizes in bulk */
+    if (k_max == 0u || batch > SIZE_MAX / k_max) {
+        graph_error(error, error_capacity, "batch scratch dimensions overflow");
+        return -1;
+    }
+    scratch->qx = (int8_t *)malloc(batch * k_max);
+    scratch->sx = (float *)malloc(batch * sizeof(float));
+    if (scratch->qx == NULL || scratch->sx == NULL) {
+        batch_scratch_free(scratch);
+        graph_error(error, error_capacity, "out of memory allocating batch scratch");
+        return -1;
+    }
+    scratch->k_max = k_max;
+    scratch->capacity = batch;
+    return 0;
 }
 
 static void layer_norm(const float *input, float *output, size_t length,
@@ -1093,84 +1137,6 @@ static int local_step_device(const mynah_tts_model *model, local_cache *cache,
     return 0;
 }
 
-/* Append one position to the local transformer and return its output row. */
-static int local_step(const mynah_tts_model *model, local_cache *cache,
-                      local_workspace *workspace, const float *input_row, float *out_row,
-                      char *error, size_t error_capacity) {
-    const size_t width = cache->width;
-    const size_t heads = cache->heads;
-    const size_t hw = cache->head_width;
-    const size_t ffn = cache->ffn_width;
-    const size_t p = cache->length;
-    if (p >= cache->capacity) {
-        graph_error(error, error_capacity, "local transformer cache overflow");
-        return -1;
-    }
-    local_workspace owned;
-    if (workspace == NULL) {
-        if (local_workspace_init(&owned, cache, error, error_capacity) != 0) return -1;
-        workspace = &owned;
-    }
-    float *x = workspace->x;
-    float *nrm = workspace->nrm;
-    float *qkv = workspace->qkv;
-    float *attn = workspace->attn;
-    float *proj = workspace->proj;
-    float *hidden = workspace->hidden;
-    float *scores = workspace->scores;
-    for (size_t d = 0; d < width; ++d) x[d] = input_row[d] + cache->position[p * width + d];
-    const float scale = 1.0f / sqrtf((float)hw);
-    int failed = 0;
-    for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
-        layer_norm(x, nrm, 1u, width, cache->norm_self[layer]);
-        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
-                                       cache->qkv_name[layer], cache->qkv_w[layer],
-                                       nrm, qkv, 1u, width, width * 3u, NULL,
-                                       error, error_capacity) != 0) { failed = 1; break; }
-        float *kb = cache->k + layer * cache->capacity * width;
-        float *vb = cache->v + layer * cache->capacity * width;
-        memcpy(kb + p * width, qkv + width, width * sizeof(float));
-        memcpy(vb + p * width, qkv + width * 2u, width * sizeof(float));
-        for (size_t h = 0; h < heads; ++h) {
-            const float *qh = qkv + h * hw;
-            float maxv = -FLT_MAX;
-            for (size_t s = 0; s <= p; ++s) {
-                const float *k = kb + s * width + h * hw;
-                float sc = 0.0f;
-                    for (size_t d = 0; d < hw; ++d) sc += qh[d] * k[d];
-                    sc *= scale;
-                scores[s] = sc;
-                if (sc > maxv) maxv = sc;
-            }
-            float denom = 0.0f;
-            for (size_t s = 0; s <= p; ++s) { scores[s] = expf(scores[s] - maxv); denom += scores[s]; }
-            float *outh = attn + h * hw;
-            memset(outh, 0, hw * sizeof(float));
-            for (size_t s = 0; s <= p; ++s)
-                axpy_f32(outh, vb + s * width + h * hw, scores[s] / denom, hw);
-        }
-        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
-                                       cache->o_name[layer], cache->o_w[layer],
-                                       attn, proj, 1u, width, width, NULL,
-                                       error, error_capacity) != 0) { failed = 1; break; }
-        for (size_t d = 0; d < width; ++d) x[d] += proj[d];
-        layer_norm(x, nrm, 1u, width, cache->norm_ff[layer]);
-        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
-                                       cache->ffn_up_name[layer], cache->ffn_up_w[layer],
-                                       nrm, hidden, 1u, width, ffn, NULL,
-                                       error, error_capacity) != 0) { failed = 1; break; }
-        gelu_tanh_array(hidden, ffn, workspace->gelu_scratch);
-        if (mynah_qmat_linear_resolved(model->qcache, model->backend,
-                                       cache->ffn_down_name[layer], cache->ffn_down_w[layer],
-                                       hidden, proj, 1u, ffn, width, NULL,
-                                       error, error_capacity) != 0) { failed = 1; break; }
-        for (size_t d = 0; d < width; ++d) x[d] += proj[d];
-    }
-    if (!failed) memcpy(out_row, x, width * sizeof(float));
-    if (workspace == &owned) local_workspace_free(&owned);
-    if (!failed) cache->length += 1u;
-    return failed ? -1 : 0;
-}
 
 /* Per-request state for the local autoregressive helper.
  *
@@ -1237,229 +1203,437 @@ static int local_frame_state_init(const mynah_tts_model *model,
     return 0;
 }
 
-/* The local AR helper emits one stacked frame (two raw codec frames).
+/* One local-transformer position for `batch` independent requests.
  *
- * All scratch lives in `state` and is reused across frames; the only per-frame
- * reset is the KV length, because positions [0, length) are always written
- * before they are read. */
-static int sample_local_frame(const mynah_tts_model *model, const float *decoder_last,
-                              const float *decoder_dev_last, local_frame_state *state,
-                              unsigned *codes, size_t raw_offset, size_t code_stride,
-                              size_t generated_raw_length, size_t min_raw_length,
-                              float temperature, unsigned topk,
-                              uint64_t *rng_state, int *saw_eos,
-                              size_t *eos_frame, char *error, size_t error_capacity) {
+ * The local transformer is read far more than the decoder is: it runs once per
+ * stacked stream, so a single decode step walks its weights sixteen times.
+ * That makes it the larger of the two batching prizes even though it is the
+ * smaller network.  Same shape as decoder_step_batch -- projections batched,
+ * attention per slot over each slot's own KV -- and likewise exact at batch 1. */
+static int local_step_batch(const mynah_tts_model *model, local_cache *const *caches,
+                            local_workspace *const *workspaces,
+                            const float *const *inputs, float *const *outs,
+                            size_t batch, const batch_scratch *scratch,
+                            char *error, size_t error_capacity) {
+    if (batch == 0u) return 0;
+    if (batch > MYNAH_MAX_BATCH) {
+        graph_error(error, error_capacity, "local batch exceeds MYNAH_MAX_BATCH");
+        return -1;
+    }
+    const local_cache *c0 = caches[0];
+    const size_t width = c0->width;
+    const size_t heads = c0->heads;
+    const size_t hw = c0->head_width;
+    const size_t ffn = c0->ffn_width;
+    const float scale = 1.0f / sqrtf((float)hw);
+    int8_t *qx = scratch == NULL ? NULL : scratch->qx;
+    float *sx = scratch == NULL ? NULL : scratch->sx;
+    const float *in_ptrs[MYNAH_MAX_BATCH];
+    float *out_ptrs[MYNAH_MAX_BATCH];
+
+    for (size_t b = 0; b < batch; ++b) {
+        local_cache *c = caches[b];
+        if (c->length >= c->capacity) {
+            graph_error(error, error_capacity, "local transformer cache overflow");
+            return -1;
+        }
+        float *x = workspaces[b]->x;
+        const float *pe = c->position + c->length * width;
+        for (size_t d = 0; d < width; ++d) x[d] = inputs[b][d] + pe[d];
+    }
+    for (size_t layer = 0; layer < c0->layers; ++layer) {
+        for (size_t b = 0; b < batch; ++b) {
+            layer_norm(workspaces[b]->x, workspaces[b]->nrm, 1u, width,
+                       caches[b]->norm_self[layer]);
+            in_ptrs[b] = workspaces[b]->nrm;
+            out_ptrs[b] = workspaces[b]->qkv;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend,
+                                      c0->qkv_name[layer], c0->qkv_w[layer],
+                                      in_ptrs, out_ptrs, batch, width, width * 3u,
+                                      NULL, qx, sx, error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            local_cache *c = caches[b];
+            local_workspace *w = workspaces[b];
+            const size_t p = c->length;
+            float *kb = c->k + layer * c->capacity * width;
+            float *vb = c->v + layer * c->capacity * width;
+            memcpy(kb + p * width, w->qkv + width, width * sizeof(float));
+            memcpy(vb + p * width, w->qkv + width * 2u, width * sizeof(float));
+            for (size_t h = 0; h < heads; ++h) {
+                const float *qh = w->qkv + h * hw;
+                float maxv = -FLT_MAX;
+                for (size_t s = 0; s <= p; ++s) {
+                    const float *k = kb + s * width + h * hw;
+                    float sc = 0.0f;
+                    for (size_t d = 0; d < hw; ++d) sc += qh[d] * k[d];
+                    sc *= scale;
+                    w->scores[s] = sc;
+                    if (sc > maxv) maxv = sc;
+                }
+                float denom = 0.0f;
+                for (size_t s = 0; s <= p; ++s) {
+                    w->scores[s] = expf(w->scores[s] - maxv);
+                    denom += w->scores[s];
+                }
+                float *outh = w->attn + h * hw;
+                memset(outh, 0, hw * sizeof(float));
+                for (size_t s = 0; s <= p; ++s)
+                    axpy_f32(outh, vb + s * width + h * hw, w->scores[s] / denom, hw);
+            }
+            in_ptrs[b] = w->attn;
+            out_ptrs[b] = w->proj;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend,
+                                      c0->o_name[layer], c0->o_w[layer],
+                                      in_ptrs, out_ptrs, batch, width, width,
+                                      NULL, qx, sx, error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            local_workspace *w = workspaces[b];
+            for (size_t d = 0; d < width; ++d) w->x[d] += w->proj[d];
+            layer_norm(w->x, w->nrm, 1u, width, caches[b]->norm_ff[layer]);
+            in_ptrs[b] = w->nrm;
+            out_ptrs[b] = w->hidden;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend,
+                                      c0->ffn_up_name[layer], c0->ffn_up_w[layer],
+                                      in_ptrs, out_ptrs, batch, width, ffn,
+                                      NULL, qx, sx, error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            local_workspace *w = workspaces[b];
+            gelu_tanh_array(w->hidden, ffn, w->gelu_scratch);
+            in_ptrs[b] = w->hidden;
+            out_ptrs[b] = w->proj;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend,
+                                      c0->ffn_down_name[layer], c0->ffn_down_w[layer],
+                                      in_ptrs, out_ptrs, batch, ffn, width,
+                                      NULL, qx, sx, error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            local_workspace *w = workspaces[b];
+            for (size_t d = 0; d < width; ++d) w->x[d] += w->proj[d];
+        }
+    }
+    for (size_t b = 0; b < batch; ++b) {
+        memcpy(outs[b], workspaces[b]->x, width * sizeof(float));
+        caches[b]->length += 1u;
+    }
+    return 0;
+}
+
+/* One request's slice of a batched local frame. */
+typedef struct {
+    local_frame_state *state;
+    const float *decoder_last;
+    const float *decoder_dev_last;
+    unsigned *codes;
+    size_t raw_offset;
+    size_t code_stride;
+    size_t generated_raw_length;
+    size_t min_raw_length;
+    float temperature;
+    unsigned topk;
+    uint64_t *rng_state;
+    /* filled in */
+    int saw_eos;
+    size_t eos_frame;
+    int failed;
+} local_batch_item;
+
+/* Emit one stacked frame (two raw codec frames) for every item.
+ *
+ * The stacked streams are autoregressive within a request -- stream n+1 is fed
+ * the token sampled at stream n -- so they cannot be batched against each
+ * other.  Across requests they can: at any given stream index every item needs
+ * the same weights, so the loop runs stream by stream with all items in step.
+ *
+ * All scratch lives in each item's state and is reused across frames; the only
+ * per-frame reset is the KV length, because positions [0, length) are always
+ * written before they are read. */
+static int sample_local_frame_batch(const mynah_tts_model *model,
+                                    local_batch_item *items, size_t count,
+                                    const batch_scratch *scratch,
+                                    char *error, size_t error_capacity) {
+    if (count == 0u) return 0;
+    if (count > MYNAH_MAX_BATCH) {
+        graph_error(error, error_capacity, "local frame batch exceeds MYNAH_MAX_BATCH");
+        return -1;
+    }
     const size_t width = model->info.hidden_dim;
     const size_t stream_count = stacked_stream_count(model);
+    const size_t vocab = model->info.audio_vocab_size;
+    const unsigned eos_id = model->info.audio_eos_id;
     const local_projection_cache *projection_cache =
         (const local_projection_cache *)model->local_projection_cache;
-    local_cache *lc = &state->cache;
-    local_workspace *workspace = &state->workspace;
-    float *row_in = state->row_in;
-    float *row_out = state->row_out;
-    lc->length = 0u;
-    const size_t vocab = model->info.audio_vocab_size;
-    const int sampling = temperature > 0.0f && topk > 1u && rng_state != NULL;
     const char *metal_local_env = getenv("MYNAH_METAL_GPU_LOCAL");
     const char *metal_attention_local_env = getenv("MYNAH_METAL_GPU_ATTENTION");
-    const int gpu_local = lc->gpu_ready && lc->dev_backend != NULL &&
+
+    local_cache *caches[MYNAH_MAX_BATCH];
+    local_workspace *workspaces[MYNAH_MAX_BATCH];
+    const float *step_in[MYNAH_MAX_BATCH];
+    float *step_out[MYNAH_MAX_BATCH];
+    const float *proj_in[MYNAH_MAX_BATCH];
+    float *proj_out[MYNAH_MAX_BATCH];
+    size_t live_index[MYNAH_MAX_BATCH];
+
+    /* The resident-GPU local step is a single-request path; a batch of one may
+     * still take it. */
+    local_cache *c0 = &items[0].state->cache;
+    const int gpu_local = count == 1u && c0->gpu_ready && c0->dev_backend != NULL &&
         (metal_local_env == NULL || strcmp(metal_local_env, "0") != 0) &&
-        (strcmp(mynah_backend_name(lc->dev_backend), "metal") != 0 ||
+        (strcmp(mynah_backend_name(c0->dev_backend), "metal") != 0 ||
          (metal_attention_local_env != NULL &&
           strcmp(metal_attention_local_env, "1") == 0));
-    const size_t top_count = topk < vocab ? topk : vocab;
-    if (sampling && top_count > state->top_count) {
-        graph_error(error, error_capacity, "local sampler scratch too small");
-        return -1;
+
+    for (size_t i = 0; i < count; ++i) {
+        local_batch_item *it = &items[i];
+        it->saw_eos = 0;
+        it->eos_frame = SIZE_MAX;
+        it->failed = 0;
+        it->state->cache.length = 0u;
+        const size_t top_count = it->topk < vocab ? it->topk : vocab;
+        const int sampling = it->temperature > 0.0f && it->topk > 1u &&
+                             it->rng_state != NULL;
+        if (sampling && top_count > it->state->top_count) {
+            graph_error(error, error_capacity, "local sampler scratch too small");
+            return -1;
+        }
+        if (!gpu_local || it->decoder_dev_last == NULL) {
+            memcpy(it->state->row_in, it->decoder_last, width * sizeof(float));
+        }
+        if (gpu_local) {
+            local_cache *lc = &it->state->cache;
+            if (((it->decoder_dev_last != NULL
+                      ? mynah_backend_copy_dev(lc->dev_backend, lc->dev_input,
+                                               it->decoder_dev_last, width,
+                                               error, error_capacity)
+                      : mynah_backend_h2d(lc->dev_backend, it->decoder_last,
+                                          lc->dev_input, width,
+                                          error, error_capacity)) != 0)) {
+                return -1;
+            }
+        }
     }
-    if (!gpu_local || decoder_dev_last == NULL)
-        memcpy(row_in, decoder_last, width * sizeof(float));
-    if (gpu_local && ((decoder_dev_last != NULL
-                           ? mynah_backend_copy_dev(lc->dev_backend, lc->dev_input,
-                                                    decoder_dev_last, width,
-                                                    error, error_capacity)
-                           : mynah_backend_h2d(lc->dev_backend, decoder_last,
-                                               lc->dev_input, width,
-                                               error, error_capacity)) != 0)) {
-        return -1;
-    }
-    *saw_eos = 0;
-    *eos_frame = SIZE_MAX;
     char name[160];
     for (size_t stream = 0; stream < stream_count; ++stream) {
+        size_t live = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (items[i].failed) continue;
+            live_index[live] = i;
+            caches[live] = &items[i].state->cache;
+            workspaces[live] = &items[i].state->workspace;
+            step_in[live] = items[i].state->row_in;
+            step_out[live] = items[i].state->row_out;
+            ++live;
+        }
+        if (live == 0u) break;
         float *dev_row_out = NULL;
-        const int step_failed = gpu_local
-            ? local_step_device(model, lc, lc->dev_input, &dev_row_out,
-                                error, error_capacity)
-            : local_step(model, lc, workspace, row_in, row_out,
-                         error, error_capacity);
-        if (step_failed != 0) return -1;
+        if (gpu_local) {
+            if (local_step_device(model, c0, c0->dev_input, &dev_row_out,
+                                  error, error_capacity) != 0) return -1;
+        } else if (local_step_batch(model, caches, workspaces, step_in, step_out,
+                                    live, scratch, error, error_capacity) != 0) {
+            return -1;
+        }
+        /* Output projection: same weight for every item at this stream. */
         const float *bias_data = NULL;
+        const float *projection_weight = NULL;
         if (projection_cache != NULL && stream < projection_cache->stream_count) {
             bias_data = projection_cache->projection_biases[stream];
+            projection_weight = projection_cache->projection_weights[stream];
         } else {
             snprintf(name, sizeof(name),
                      "local_transformer_out_projections.%zu.bias", stream);
             mynah_tensor bias;
             if (tensor(model->tts, name, &bias, error, error_capacity) != 0) return -1;
             bias_data = bias.data;
-        }
-        const int forbid_eos = generated_raw_length < min_raw_length;
-        const unsigned eos_id = model->info.audio_eos_id;
-        snprintf(name, sizeof(name), "local_transformer_out_projections.%zu.weight", stream);
-        unsigned argmax = 0;
-        const float *projection_weight = NULL;
-        if (projection_cache != NULL && stream < projection_cache->stream_count) {
-            projection_weight = projection_cache->projection_weights[stream];
-        } else {
+            snprintf(name, sizeof(name),
+                     "local_transformer_out_projections.%zu.weight", stream);
             mynah_tensor projection;
             if (tensor(model->tts, name, &projection, error, error_capacity) != 0) return -1;
             projection_weight = projection.data;
         }
-        float *logits = NULL;
+        snprintf(name, sizeof(name),
+                 "local_transformer_out_projections.%zu.weight", stream);
+
+        /* Greedy items can fuse projection and argmax; sampling items need the
+         * logits.  Fusing is only worth it alone -- in a batch the shared pass
+         * over the projection weight is the bigger win. */
+        int need_logits = 0;
+        for (size_t j = 0; j < live; ++j) {
+            local_batch_item *it = &items[live_index[j]];
+            const int sampling = it->temperature > 0.0f && it->topk > 1u &&
+                                 it->rng_state != NULL;
+            if (sampling) need_logits = 1;
+        }
+        const int fuse_greedy = live == 1u && !need_logits && !gpu_local &&
+            (getenv("MYNAH_FUSED_GREEDY") == NULL ||
+             strcmp(getenv("MYNAH_FUSED_GREEDY"), "0") != 0);
+        unsigned fused_argmax = 0;
         int fused = 1;
         if (gpu_local) {
-            if (mynah_backend_matmul_d2d(lc->dev_backend, dev_row_out, lc->dev_logits,
+            local_batch_item *it = &items[live_index[0]];
+            const int sampling = it->temperature > 0.0f && it->topk > 1u &&
+                                 it->rng_state != NULL;
+            if (mynah_backend_matmul_d2d(c0->dev_backend, dev_row_out, c0->dev_logits,
                                           1u, width, vocab, projection_weight,
                                           bias_data, error, error_capacity) != 0) {
                 return -1;
             }
+            const int forbid_eos = it->generated_raw_length < it->min_raw_length;
             if (!sampling) {
                 fused = 0;
-                if (mynah_backend_argmax_dev(lc->dev_backend, lc->dev_logits, vocab,
+                if (mynah_backend_argmax_dev(c0->dev_backend, c0->dev_logits, vocab,
                                               model->info.codebook_size, eos_id,
-                                              !forbid_eos, &argmax, error,
+                                              !forbid_eos, &fused_argmax, error,
                                               error_capacity) != 0) {
                     return -1;
                 }
-            } else {
-                logits = state->logits;
-                if (mynah_backend_d2h(lc->dev_backend, lc->dev_logits, logits, vocab,
-                                      error, error_capacity) != 0) {
-                    return -1;
-                }
+            } else if (mynah_backend_d2h(c0->dev_backend, c0->dev_logits,
+                                          it->state->logits, vocab,
+                                          error, error_capacity) != 0) {
+                return -1;
             }
-        } else if (!sampling &&
-                   (getenv("MYNAH_FUSED_GREEDY") == NULL ||
-                    strcmp(getenv("MYNAH_FUSED_GREEDY"), "0") != 0)) {
-            fused = mynah_qmat_greedy_argmax_resolved(
-                model->qcache, name, projection_weight, row_out, width, vocab,
-                bias_data, model->info.codebook_size, eos_id, !forbid_eos,
-                &argmax, error, error_capacity);
-            if (fused < 0) return -1;
+        } else if (fuse_greedy) {
+            local_batch_item *it = &items[live_index[0]];
+            const int forbid_eos = it->generated_raw_length < it->min_raw_length;
+            const int outcome = mynah_qmat_greedy_argmax_resolved(
+                model->qcache, name, projection_weight, it->state->row_out, width,
+                vocab, bias_data, model->info.codebook_size, eos_id, !forbid_eos,
+                &fused_argmax, error, error_capacity);
+            if (outcome < 0) return -1;
+            fused = outcome;
         }
         if (!gpu_local && fused != 0) {
-            logits = state->logits;
-            if (mynah_qmat_linear_resolved(model->qcache, model->backend, name,
-                                           projection_weight, row_out, logits,
-                                           1u, width, vocab, bias_data,
-                                           error, error_capacity) != 0) {
+            for (size_t j = 0; j < live; ++j) {
+                local_batch_item *it = &items[live_index[j]];
+                proj_in[j] = it->state->row_out;
+                proj_out[j] = it->state->logits;
+            }
+            if (mynah_qmat_linear_batched(model->qcache, model->backend, name,
+                                          projection_weight, proj_in, proj_out,
+                                          live, width, vocab, bias_data,
+                                          scratch == NULL ? NULL : scratch->qx,
+                                          scratch == NULL ? NULL : scratch->sx,
+                                          error, error_capacity) != 0) {
                 return -1;
             }
         }
-        if (fused != 0) {
-            float best = -FLT_MAX;
-            for (size_t candidate = 0; candidate < vocab; ++candidate) {
-                const int is_code = candidate < model->info.codebook_size;
-                const int is_eos = candidate == eos_id;
-                if (!is_code && !(is_eos && !forbid_eos)) {
-                    logits[candidate] = -FLT_MAX;
-                    continue;
-                }
-                if (logits[candidate] > best) {
-                    best = logits[candidate];
-                    argmax = (unsigned)candidate;
-                }
-            }
-        }
-        unsigned value = argmax;
-        /* argmax_or_multinomial: EOS fires if either the greedy or the sampled
-         * token is AUDIO_EOS in any codebook of this frame. */
-        int stream_eos = (argmax == eos_id);
-        if (sampling) {
-            size_t *top_indices = state->top_indices;
-            float *top_logits = state->top_logits;
-            size_t used = 0;
-            for (size_t candidate = 0; candidate < vocab; ++candidate) {
-                size_t insert = used;
-                while (insert > 0 && logits[candidate] > top_logits[insert - 1u]) --insert;
-                if (used < top_count) {
-                    for (size_t j = used; j > insert; --j) {
-                        top_indices[j] = top_indices[j - 1u];
-                        top_logits[j] = top_logits[j - 1u];
+        for (size_t j = 0; j < live; ++j) {
+            local_batch_item *it = &items[live_index[j]];
+            const int sampling = it->temperature > 0.0f && it->topk > 1u &&
+                                 it->rng_state != NULL;
+            const size_t top_count = it->topk < vocab ? it->topk : vocab;
+            const int forbid_eos = it->generated_raw_length < it->min_raw_length;
+            float *logits = it->state->logits;
+            unsigned argmax = fused_argmax;
+            if (fused != 0) {
+                float best = -FLT_MAX;
+                argmax = 0;
+                for (size_t candidate = 0; candidate < vocab; ++candidate) {
+                    const int is_code = candidate < model->info.codebook_size;
+                    const int is_eos = candidate == eos_id;
+                    if (!is_code && !(is_eos && !forbid_eos)) {
+                        logits[candidate] = -FLT_MAX;
+                        continue;
                     }
-                    top_indices[insert] = candidate;
-                    top_logits[insert] = logits[candidate];
-                    ++used;
-                } else if (insert < top_count) {
-                    for (size_t j = top_count - 1u; j > insert; --j) {
-                        top_indices[j] = top_indices[j - 1u];
-                        top_logits[j] = top_logits[j - 1u];
+                    if (logits[candidate] > best) {
+                        best = logits[candidate];
+                        argmax = (unsigned)candidate;
                     }
-                    top_indices[insert] = candidate;
-                    top_logits[insert] = logits[candidate];
                 }
             }
-            float maximum = top_logits[0];
-            float total = 0.0f;
-            for (size_t j = 0; j < used; ++j) {
-                top_logits[j] = expf((top_logits[j] - maximum) / temperature);
-                total += top_logits[j];
-            }
-            uint64_t state_bits = *rng_state;
-            state_bits ^= state_bits << 13;
-            state_bits ^= state_bits >> 7;
-            state_bits ^= state_bits << 17;
-            *rng_state = state_bits == 0 ? UINT64_C(0x9e3779b97f4a7c15) : state_bits;
-            const float draw = ((float)((*rng_state >> 40) & UINT64_C(0xffffff)) /
-                                (float)UINT64_C(0x1000000)) * total;
-            float cumulative = 0.0f;
-            for (size_t j = 0; j < used; ++j) {
-                cumulative += top_logits[j];
-                if (draw <= cumulative || j + 1u == used) {
-                    value = (unsigned)top_indices[j];
-                    break;
+            unsigned value = argmax;
+            /* argmax_or_multinomial: EOS fires if either the greedy or the
+             * sampled token is AUDIO_EOS in any codebook of this frame. */
+            int stream_eos = (argmax == eos_id);
+            if (sampling) {
+                size_t *top_indices = it->state->top_indices;
+                float *top_logits = it->state->top_logits;
+                size_t used = 0;
+                for (size_t candidate = 0; candidate < vocab; ++candidate) {
+                    size_t insert = used;
+                    while (insert > 0 && logits[candidate] > top_logits[insert - 1u]) --insert;
+                    if (used < top_count) {
+                        for (size_t q = used; q > insert; --q) {
+                            top_indices[q] = top_indices[q - 1u];
+                            top_logits[q] = top_logits[q - 1u];
+                        }
+                        top_indices[insert] = candidate;
+                        top_logits[insert] = logits[candidate];
+                        ++used;
+                    } else if (insert < top_count) {
+                        for (size_t q = top_count - 1u; q > insert; --q) {
+                            top_indices[q] = top_indices[q - 1u];
+                            top_logits[q] = top_logits[q - 1u];
+                        }
+                        top_indices[insert] = candidate;
+                        top_logits[insert] = logits[candidate];
+                    }
+                }
+                float maximum = top_logits[0];
+                float total = 0.0f;
+                for (size_t q = 0; q < used; ++q) {
+                    top_logits[q] = expf((top_logits[q] - maximum) / it->temperature);
+                    total += top_logits[q];
+                }
+                uint64_t state_bits = *it->rng_state;
+                state_bits ^= state_bits << 13;
+                state_bits ^= state_bits >> 7;
+                state_bits ^= state_bits << 17;
+                *it->rng_state = state_bits == 0 ? UINT64_C(0x9e3779b97f4a7c15) : state_bits;
+                const float draw = ((float)((*it->rng_state >> 40) & UINT64_C(0xffffff)) /
+                                    (float)UINT64_C(0x1000000)) * total;
+                float cumulative = 0.0f;
+                for (size_t q = 0; q < used; ++q) {
+                    cumulative += top_logits[q];
+                    if (draw <= cumulative || q + 1u == used) {
+                        value = (unsigned)top_indices[q];
+                        break;
+                    }
                 }
             }
-        }
-        if (value == eos_id) stream_eos = 1;
-        if (stream_eos) {
-            *saw_eos = 1;
-            const size_t frame = stream / model->info.codebook_count;
-            if (frame < *eos_frame) *eos_frame = frame;
-        }
-        /* Feed the sampled token (EOS included) back into the local
-         * transformer, but collapse any special token to 0 in the codes we
-         * hand to the codec so it only ever sees real FSQ indices. */
-        const unsigned emit = value < vocab ? value : 0u;
-        const unsigned store = value < model->info.codebook_size ? value : 0u;
-        const size_t fs = stream / model->info.codebook_count;
-        const size_t codebook = stream % model->info.codebook_count;
-        codes[codebook * code_stride + raw_offset + fs] = store;
-        const float *audio_table_data = NULL;
-        if (projection_cache != NULL && stream < projection_cache->stream_count) {
-            audio_table_data = projection_cache->audio_embeddings[stream];
-        } else {
-            snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
-            mynah_tensor audio_table;
-            if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0) return -1;
-            audio_table_data = audio_table.data;
-        }
-        /* The embedding of this stream's token becomes the input row for the
-         * next local-transformer position. */
-        if (gpu_local) {
-            if (mynah_backend_h2d(lc->dev_backend,
-                                  audio_table_data + (size_t)emit * width,
-                                  lc->dev_input, width, error, error_capacity) != 0) {
-                return -1;
+            if (value == eos_id) stream_eos = 1;
+            if (stream_eos) {
+                it->saw_eos = 1;
+                const size_t frame = stream / model->info.codebook_count;
+                if (frame < it->eos_frame) it->eos_frame = frame;
             }
-        } else {
-            memcpy(row_in, audio_table_data + (size_t)emit * width,
-                   width * sizeof(float));
+            /* Feed the sampled token (EOS included) back into the local
+             * transformer, but collapse any special token to 0 in the codes we
+             * hand to the codec so it only ever sees real FSQ indices. */
+            const unsigned emit = value < vocab ? value : 0u;
+            const unsigned store = value < model->info.codebook_size ? value : 0u;
+            const size_t fs = stream / model->info.codebook_count;
+            const size_t codebook = stream % model->info.codebook_count;
+            it->codes[codebook * it->code_stride + it->raw_offset + fs] = store;
+            const float *audio_table_data = NULL;
+            if (projection_cache != NULL && stream < projection_cache->stream_count) {
+                audio_table_data = projection_cache->audio_embeddings[stream];
+            } else {
+                snprintf(name, sizeof(name), "audio_embeddings.%zu.weight", stream);
+                mynah_tensor audio_table;
+                if (tensor(model->tts, name, &audio_table, error, error_capacity) != 0)
+                    return -1;
+                audio_table_data = audio_table.data;
+            }
+            /* The embedding of this stream's token becomes the input row for
+             * the next local-transformer position. */
+            if (gpu_local) {
+                if (mynah_backend_h2d(c0->dev_backend,
+                                      audio_table_data + (size_t)emit * width,
+                                      c0->dev_input, width, error, error_capacity) != 0) {
+                    return -1;
+                }
+            } else {
+                memcpy(it->state->row_in, audio_table_data + (size_t)emit * width,
+                       width * sizeof(float));
+            }
         }
     }
     return 0;
 }
+
 
 typedef struct {
     double pack_seconds;
@@ -2915,6 +3089,179 @@ static int decoder_cache_init(const mynah_tts_model *model, decoder_cache *cache
     return 0;
 }
 
+/* One autoregressive decoder step for `batch` independent requests.
+ *
+ * Every projection is a pass over a weight far larger than any cache, so B
+ * requests stepping one after another pay B trips to DRAM for the same bytes.
+ * Here the projections are batched -- one pass serving all slots -- while
+ * everything that touches a slot's own state stays per slot.
+ *
+ * Attention deliberately does *not* batch: it reads each slot's private KV
+ * cache, which no other slot shares, so there is nothing to amortize.  Keeping
+ * it per slot also means slots at different positions need no ragged masking --
+ * each simply loops over its own length, exactly as a lone request does.
+ *
+ * At batch 1 this reduces to the single-request path bit for bit, which is what
+ * makes it safe to use for both. */
+static int decoder_step_batch(const mynah_tts_model *model,
+                              decoder_cache *const *caches,
+                              const float *const *inputs, float *const *outs,
+                              size_t batch, const batch_scratch *scratch,
+                              char *error, size_t error_capacity) {
+    if (batch == 0u) return 0;
+    if (batch > MYNAH_MAX_BATCH) {
+        graph_error(error, error_capacity, "decoder batch exceeds MYNAH_MAX_BATCH");
+        return -1;
+    }
+    const decoder_cache *c0 = caches[0];
+    const size_t width = c0->width;
+    const size_t heads = c0->heads;
+    const size_t hw = c0->head_width;
+    const size_t ffn = c0->ffn_width;
+    const size_t xw = c0->xattn_width;
+    const float self_scale = 1.0f / sqrtf((float)hw);
+    const float cross_scale = 1.0f / sqrtf((float)xw);
+    int8_t *qx = scratch == NULL ? NULL : scratch->qx;
+    float *sx = scratch == NULL ? NULL : scratch->sx;
+    const float *in_ptrs[MYNAH_MAX_BATCH];
+    float *out_ptrs[MYNAH_MAX_BATCH];
+
+    for (size_t b = 0; b < batch; ++b) {
+        decoder_cache *c = caches[b];
+        if (c->length >= c->capacity) {
+            graph_error(error, error_capacity, "decoder cache capacity exceeded");
+            return -1;
+        }
+        const float *pe = c->position + c->length * width;
+        for (size_t d = 0; d < width; ++d) c->scratch_x[d] = inputs[b][d] + pe[d];
+    }
+    /* All slots run the same model, so the resolved weights of any of them
+     * name the same tensors at the same addresses. */
+    for (size_t layer = 0; layer < c0->layers; ++layer) {
+        const decoder_layer_resolved *r = &c0->resolved[layer];
+        for (size_t b = 0; b < batch; ++b) {
+            layer_norm(caches[b]->scratch_x, caches[b]->scratch_nrm, 1u, width,
+                       r->norm_self);
+            in_ptrs[b] = caches[b]->scratch_nrm;
+            out_ptrs[b] = caches[b]->scratch_qkv;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend, r->qkv, r->qkv_w,
+                                      in_ptrs, out_ptrs, batch, width, width * 3u,
+                                      NULL, qx, sx, error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            decoder_cache *c = caches[b];
+            const size_t start = c->length;
+            const float *qkv = c->scratch_qkv;
+            float *kbase = c->self_k + layer * c->capacity * width;
+            float *vbase = c->self_v + layer * c->capacity * width;
+            float *scores = c->scratch_scores;
+            float *attn = c->scratch_attn;
+            memcpy(kbase + start * width, qkv + width, width * sizeof(float));
+            memcpy(vbase + start * width, qkv + width * 2u, width * sizeof(float));
+            for (size_t h = 0; h < heads; ++h) {
+                const float *qh = qkv + h * hw;
+                float maxv = -FLT_MAX;
+                for (size_t s = 0; s <= start; ++s) {
+                    const float *k = kbase + s * width + h * hw;
+                    float sc = 0.0f;
+                    for (size_t d = 0; d < hw; ++d) sc += qh[d] * k[d];
+                    sc *= self_scale;
+                    scores[s] = sc;
+                    if (sc > maxv) maxv = sc;
+                }
+                float denom = 0.0f;
+                for (size_t s = 0; s <= start; ++s) {
+                    scores[s] = expf(scores[s] - maxv);
+                    denom += scores[s];
+                }
+                float *outh = attn + h * hw;
+                memset(outh, 0, hw * sizeof(float));
+                for (size_t s = 0; s <= start; ++s)
+                    axpy_f32(outh, vbase + s * width + h * hw, scores[s] / denom, hw);
+            }
+            in_ptrs[b] = attn;
+            out_ptrs[b] = c->scratch_proj;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend, r->o_self,
+                                      r->o_self_w, in_ptrs, out_ptrs, batch,
+                                      width, width, NULL, qx, sx,
+                                      error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            decoder_cache *c = caches[b];
+            for (size_t d = 0; d < width; ++d) c->scratch_x[d] += c->scratch_proj[d];
+            layer_norm(c->scratch_x, c->scratch_nrm, 1u, width, r->norm_xattn_query);
+            in_ptrs[b] = c->scratch_nrm;
+            out_ptrs[b] = c->scratch_q_x;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend, r->q_cross,
+                                      r->q_cross_w, in_ptrs, out_ptrs, batch,
+                                      width, xw, NULL, qx, sx,
+                                      error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            decoder_cache *c = caches[b];
+            const float *ck = c->cross_k + layer * c->memory_length * xw;
+            const float *cv = c->cross_v + layer * c->memory_length * xw;
+            const float *qh = c->scratch_q_x;
+            float *scores = c->scratch_scores;
+            float *outh = c->scratch_xctx;
+            float maxv = -FLT_MAX;
+            for (size_t s = 0; s < c->memory_length; ++s) {
+                const float *k = ck + s * xw;
+                float sc = 0.0f;
+                for (size_t d = 0; d < xw; ++d) sc += qh[d] * k[d];
+                sc *= cross_scale;
+                scores[s] = sc;
+                if (sc > maxv) maxv = sc;
+            }
+            float denom = 0.0f;
+            for (size_t s = 0; s < c->memory_length; ++s) {
+                scores[s] = expf(scores[s] - maxv);
+                denom += scores[s];
+            }
+            memset(outh, 0, xw * sizeof(float));
+            for (size_t s = 0; s < c->memory_length; ++s)
+                axpy_f32(outh, cv + s * xw, scores[s] / denom, xw);
+            in_ptrs[b] = outh;
+            out_ptrs[b] = c->scratch_proj;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend, r->o_cross,
+                                      r->o_cross_w, in_ptrs, out_ptrs, batch,
+                                      xw, width, NULL, qx, sx,
+                                      error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            decoder_cache *c = caches[b];
+            for (size_t d = 0; d < width; ++d) c->scratch_x[d] += c->scratch_proj[d];
+            layer_norm(c->scratch_x, c->scratch_nrm, 1u, width, r->norm_pos_ff);
+            in_ptrs[b] = c->scratch_nrm;
+            out_ptrs[b] = c->scratch_hidden;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend, r->ffn_up,
+                                      r->ffn_up_w, in_ptrs, out_ptrs, batch,
+                                      width, ffn, NULL, qx, sx,
+                                      error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            decoder_cache *c = caches[b];
+            mynah_gelu_f32_scalar(c->scratch_hidden, ffn);
+            in_ptrs[b] = c->scratch_hidden;
+            out_ptrs[b] = c->scratch_proj;
+        }
+        if (mynah_qmat_linear_batched(model->qcache, model->backend, r->ffn_down,
+                                      r->ffn_down_w, in_ptrs, out_ptrs, batch,
+                                      ffn, width, NULL, qx, sx,
+                                      error, error_capacity) != 0) return -1;
+        for (size_t b = 0; b < batch; ++b) {
+            decoder_cache *c = caches[b];
+            for (size_t d = 0; d < width; ++d) c->scratch_x[d] += c->scratch_proj[d];
+        }
+    }
+    for (size_t b = 0; b < batch; ++b) {
+        decoder_cache *c = caches[b];
+        layer_norm(c->scratch_x, outs[b], 1u, width, c->norm_out);
+        c->length += 1u;
+    }
+    return 0;
+}
+
 /* Push `count` new decoder rows through the stack, appending their self K/V to
  * the cache and attending over all cached positions.  `out_last` receives the
  * final-norm output of the last new row (the one used for sampling).
@@ -3122,6 +3469,18 @@ static int decoder_run(const mynah_tts_model *model, decoder_cache *cache,
         /* GPU path failed — fall through to CPU path. */
     }
 
+    /* A single decode row is the batched step with one slot.  Routing it here
+     * rather than duplicating the body means the batched path is exercised by
+     * every existing test, and any drift between the two would show up as an
+     * audio change at batch 1. */
+    if (count == 1u) {
+        decoder_cache *one_cache[1] = { cache };
+        const float *one_in[1] = { input_rows };
+        float *one_out[1] = { out_last };
+        return decoder_step_batch(model, one_cache, one_in, one_out, 1u, NULL,
+                                  error, error_capacity);
+    }
+
 
     for (size_t layer = 0; layer < cache->layers && !failed; ++layer) {
         const decoder_layer_resolved *r = &cache->resolved[layer];
@@ -3291,6 +3650,533 @@ static int emit_stream_samples(mynah_tts_audio_callback callback, void *user_dat
     return 0;
 }
 
+/* One request in flight.
+ *
+ * Everything a request needs to advance one step lives here, so the driver can
+ * hold several and step them together.  Nothing is shared between slots except
+ * the read-only model, which is what makes the batched projections safe. */
+typedef struct {
+    /* request and sinks */
+    const mynah_tts_request *request;
+    float **samples;
+    size_t *sample_count;
+    mynah_tts_audio_callback callback;
+    void *user_data;
+    size_t chunk_samples;
+    char *error;
+    size_t error_capacity;
+    /* owned state */
+    float *memory;
+    unsigned *codes;
+    float *out_last;
+    float *audio_row;
+    decoder_cache cache;
+    local_frame_state local_state;
+    float *decoder_dev_last;
+    /* derived constants */
+    const float *context;
+    size_t context_length;
+    size_t max_steps;
+    size_t max_raw_length;
+    size_t min_raw_length;
+    float temperature;
+    unsigned topk;
+    /* progress */
+    uint64_t rng_state;
+    size_t step;              /* 1-based stacked position of the next step */
+    size_t predicted_stacks;
+    size_t eos_frame;
+    size_t streamed_samples;
+    int active;
+    int failed;
+} synth_slot;
+
+static void slot_release(synth_slot *slot) {
+    if (slot == NULL) return;
+    local_frame_state_free(&slot->local_state);
+    decoder_cache_free(&slot->cache);
+    free(slot->memory);
+    free(slot->codes);
+    free(slot->out_last);
+    free(slot->audio_row);
+    slot->memory = NULL;
+    slot->codes = NULL;
+    slot->out_last = NULL;
+    slot->audio_row = NULL;
+}
+
+static int slot_fail(synth_slot *slot, const char *message) {
+    if (message != NULL) graph_error(slot->error, slot->error_capacity, message);
+    slot->failed = 1;
+    slot->active = 0;
+    return -1;
+}
+
+/* Everything before the first autoregressive step: text encoding, the constant
+ * cross-attention cache, and the baked speaker context prefill.  These are
+ * multi-row matmuls that BLAS already runs efficiently and that share nothing
+ * between requests, so they stay per slot. */
+static int slot_prepare(const mynah_tts_model *model, synth_slot *slot, int dump) {
+    const mynah_tts_request *request = slot->request;
+    char *error = slot->error;
+    const size_t error_capacity = slot->error_capacity;
+    const size_t width = model->info.hidden_dim;
+
+    if (slot->samples != NULL) *slot->samples = NULL;
+    if (slot->sample_count != NULL) *slot->sample_count = 0;
+    if (request == NULL ||
+        ((slot->samples == NULL || slot->sample_count == NULL) && slot->callback == NULL) ||
+        error == NULL || error_capacity == 0 || request->text_ids == NULL ||
+        request->text_length == 0 || (slot->callback != NULL && slot->chunk_samples == 0)) {
+        return slot_fail(slot, "invalid synthesis request");
+    }
+    if (request->speaker >= model->info.speaker_count) {
+        return slot_fail(slot, "speaker index is outside the model");
+    }
+    if (encode_text(model, request->text_ids, request->text_length, &slot->memory,
+                    error, error_capacity) != 0) {
+        return slot_fail(slot, NULL);
+    }
+    if (dump && getenv("MYNAH_DUMP_ENCODER") != NULL) {
+        FILE *ef = fopen(getenv("MYNAH_DUMP_ENCODER"), "w");
+        if (ef != NULL) {
+            for (size_t t = 0; t < request->text_length; ++t)
+                for (size_t d = 0; d < width; ++d)
+                    fprintf(ef, "%.9g\n", (double)slot->memory[t * width + d]);
+            fclose(ef);
+        }
+    }
+    mynah_tensor context_tensor;
+    if (tensor(model->tts, "baked_context_embedding.weight", &context_tensor,
+               error, error_capacity) != 0 || context_tensor.rank != 2 ||
+        context_tensor.shape[1] % width != 0 ||
+        request->speaker >= context_tensor.shape[0]) {
+        return slot_fail(slot, "baked speaker context is invalid");
+    }
+    slot->context_length = context_tensor.shape[1] / width;
+    slot->context = context_tensor.data +
+                    (size_t)request->speaker * context_tensor.shape[1];
+    slot->max_steps = request->max_steps == 0
+        ? (model->info.max_decoder_steps + model->info.frame_stacking_factor - 1u) /
+          model->info.frame_stacking_factor
+        : request->max_steps;
+    slot->max_raw_length = (slot->max_steps + 1u) * model->info.frame_stacking_factor;
+    slot->min_raw_length = model->info.min_generated_frames;
+    slot->codes = (unsigned *)calloc(model->info.codebook_count * slot->max_raw_length,
+                                     sizeof(*slot->codes));
+    slot->out_last = allocate_floats(width, error, error_capacity);
+    slot->audio_row = allocate_floats(width, error, error_capacity);
+    if (slot->codes == NULL || slot->out_last == NULL || slot->audio_row == NULL) {
+        return slot_fail(slot, "out of memory preparing the request");
+    }
+    for (size_t c = 0; c < model->info.codebook_count; ++c) {
+        for (size_t t = 0; t < model->info.frame_stacking_factor; ++t) {
+            slot->codes[c * slot->max_raw_length + t] = model->info.codebook_size;
+        }
+    }
+    slot->temperature = request->temperature;
+    if (!(slot->temperature >= 0.0f)) slot->temperature = model->info.default_temperature;
+    slot->topk = request->topk == 0 ? model->info.default_topk : request->topk;
+    slot->rng_state = request->seed == 0 ? UINT64_C(0x9e3779b97f4a7c15) : request->seed;
+    slot->eos_frame = SIZE_MAX;
+    if (decoder_cache_init(model, &slot->cache, slot->memory, request->text_length,
+                           slot->context_length + slot->max_steps + 2u,
+                           error, error_capacity) != 0) {
+        return slot_fail(slot, NULL);
+    }
+    slot->decoder_dev_last = NULL;
+    if (decoder_run(model, &slot->cache, slot->context, slot->context_length,
+                    slot->out_last,
+                    request->use_local_transformer ? &slot->decoder_dev_last : NULL,
+                    error, error_capacity) != 0) {
+        return slot_fail(slot, NULL);
+    }
+    if (dump && getenv("MYNAH_DUMP_PREFILL") != NULL) {
+        FILE *pf = fopen(getenv("MYNAH_DUMP_PREFILL"), "w");
+        if (pf != NULL) {
+            if (slot->decoder_dev_last != NULL)
+                mynah_backend_d2h(model->backend, slot->decoder_dev_last, slot->out_last,
+                                  width, error, error_capacity);
+            for (size_t d = 0; d < width; ++d)
+                fprintf(pf, "%.9g\n", (double)slot->out_last[d]);
+            fclose(pf);
+        }
+    }
+    if (request->use_local_transformer) {
+        const size_t vocab = model->info.audio_vocab_size;
+        const size_t top_count = slot->temperature > 0.0f && slot->topk > 1u
+            ? (slot->topk < vocab ? slot->topk : vocab) : 0u;
+        if (local_frame_state_init(model, &slot->local_state, top_count,
+                                   error, error_capacity) != 0) {
+            return slot_fail(slot, NULL);
+        }
+    }
+    slot->step = 1u;
+    slot->active = 1;
+    return 0;
+}
+
+/* The decoder row is produced; dump it if asked. */
+static void slot_dump_hidden(const mynah_tts_model *model, synth_slot *slot, int dump) {
+    const size_t width = model->info.hidden_dim;
+    if (!dump || slot->step != 1u || getenv("MYNAH_DUMP_HIDDEN") == NULL) return;
+    FILE *hf = fopen(getenv("MYNAH_DUMP_HIDDEN"), "w");
+    if (hf == NULL) return;
+    if (slot->decoder_dev_last != NULL)
+        mynah_backend_d2h(model->backend, slot->decoder_dev_last, slot->out_last,
+                          width, slot->error, slot->error_capacity);
+    for (size_t d = 0; d < width; ++d)
+        fprintf(hf, "%.9g\n", (double)slot->out_last[d]);
+    fclose(hf);
+}
+
+/* Streaming, the EOS decision and the step counter for one slot, once its
+ * frame has been sampled.  Clears `active` when the request is finished. */
+static int slot_advance(const mynah_tts_model *model, synth_slot *slot,
+                        int saw_eos, size_t step_eos_frame) {
+    const mynah_tts_request *request = slot->request;
+    char *error = slot->error;
+    const size_t error_capacity = slot->error_capacity;
+    const size_t width = model->info.hidden_dim;
+    const size_t raw_length = slot->step * model->info.frame_stacking_factor;
+    if (!request->use_local_transformer) {
+        mynah_tensor projection;
+        mynah_tensor bias;
+        if (tensor(model->tts, "final_proj.weight", &projection, error, error_capacity) != 0 ||
+            tensor(model->tts, "final_proj.bias", &bias, error, error_capacity) != 0) {
+            return slot_fail(slot, NULL);
+        }
+        const size_t streams = stacked_stream_count(model);
+        const int forbid_eos =
+            slot->predicted_stacks * model->info.frame_stacking_factor < slot->min_raw_length;
+        const unsigned eos_id = model->info.audio_eos_id;
+        const size_t vocab = model->info.audio_vocab_size;
+        const float *last = slot->out_last;
+        for (size_t stream = 0; stream < streams; ++stream) {
+            unsigned value = 0;
+            float best = -FLT_MAX;
+            for (size_t candidate = 0; candidate < vocab; ++candidate) {
+                /* Same forbidden-token rule as the local path: real codes
+                 * always, AUDIO_EOS unless too early, nothing else. */
+                const int is_code = candidate < model->info.codebook_size;
+                const int is_eos = candidate == eos_id;
+                if (!is_code && !(is_eos && !forbid_eos)) continue;
+                float score = bias.data[stream * model->info.audio_vocab_size + candidate];
+                const float *row = projection.data +
+                    (stream * model->info.audio_vocab_size + candidate) * width;
+                for (size_t d = 0; d < width; ++d) score += row[d] * last[d];
+                if (score > best) {
+                    best = score;
+                    value = (unsigned)candidate;
+                }
+            }
+            if (value == eos_id) {
+                saw_eos = 1;
+                const size_t frame = stream / model->info.codebook_count;
+                if (frame < step_eos_frame) step_eos_frame = frame;
+            }
+            const unsigned store = value < model->info.codebook_size ? value : 0u;
+            const size_t fs = stream / model->info.codebook_count;
+            const size_t codebook = stream % model->info.codebook_count;
+            slot->codes[codebook * slot->max_raw_length + raw_length + fs] = store;
+        }
+    }
+    ++slot->predicted_stacks;
+    if (slot->callback != NULL) {
+        size_t stream_raw = slot->predicted_stacks * model->info.frame_stacking_factor;
+        if (step_eos_frame != SIZE_MAX) {
+            stream_raw = (slot->predicted_stacks - 1u) * model->info.frame_stacking_factor +
+                         step_eos_frame;
+        }
+        if (stream_raw > 0) {
+            unsigned *stream_codes = (unsigned *)calloc(
+                model->info.codebook_count * stream_raw, sizeof(*stream_codes));
+            if (stream_codes == NULL) {
+                return slot_fail(slot, "out of memory preparing streamed codes");
+            }
+            for (size_t c = 0; c < model->info.codebook_count; ++c) {
+                memcpy(stream_codes + c * stream_raw,
+                       slot->codes + c * slot->max_raw_length +
+                           model->info.frame_stacking_factor,
+                       stream_raw * sizeof(*stream_codes));
+            }
+            float *stream_audio = NULL;
+            size_t stream_count = 0;
+            if (decode_codec(model, stream_codes, stream_raw, &stream_audio,
+                             &stream_count, error, error_capacity) != 0) {
+                free(stream_codes);
+                return slot_fail(slot, NULL);
+            }
+            if (stream_count < slot->streamed_samples ||
+                emit_stream_samples(slot->callback, slot->user_data,
+                                    stream_audio + slot->streamed_samples,
+                                    stream_count - slot->streamed_samples,
+                                    slot->chunk_samples, error, error_capacity) != 0) {
+                const int regressed = stream_count < slot->streamed_samples;
+                free(stream_audio);
+                free(stream_codes);
+                return slot_fail(slot, regressed ? "streamed codec output regressed" : NULL);
+            }
+            slot->streamed_samples = stream_count;
+            free(stream_audio);
+            free(stream_codes);
+        }
+    }
+    if (step_eos_frame != SIZE_MAX) slot->eos_frame = step_eos_frame;
+    if (saw_eos && slot->predicted_stacks >= 4u) {
+        slot->active = 0;
+        return 0;
+    }
+    ++slot->step;
+    if (slot->step > slot->max_steps) slot->active = 0;
+    return 0;
+}
+
+/* Turn the accumulated codes into audio for the offline sink. */
+static int slot_finalize(const mynah_tts_model *model, synth_slot *slot, int dump) {
+    char *error = slot->error;
+    const size_t error_capacity = slot->error_capacity;
+    const size_t generated_stacks = slot->predicted_stacks;
+    size_t generated_raw = generated_stacks * model->info.frame_stacking_factor;
+    if (slot->eos_frame != SIZE_MAX && generated_stacks > 0) {
+        generated_raw = (generated_stacks - 1u) * model->info.frame_stacking_factor +
+                        slot->eos_frame;
+    }
+    if (dump && getenv("MYNAH_DUMP_CODES") != NULL && generated_stacks > 0) {
+        FILE *dumpf = fopen(getenv("MYNAH_DUMP_CODES"), "w");
+        if (dumpf != NULL) {
+            const size_t cb = model->info.codebook_count;
+            const size_t fs = model->info.frame_stacking_factor;
+            fprintf(dumpf, "[");
+            for (size_t step = 0; step < generated_stacks; ++step) {
+                if (step > 0) fprintf(dumpf, ",");
+                fprintf(dumpf, "[[");
+                for (size_t c = 0; c < cb; ++c) {
+                    if (c > 0) fprintf(dumpf, "],[");
+                    for (size_t f = 0; f < fs; ++f) {
+                        if (f > 0) fprintf(dumpf, ",");
+                        fprintf(dumpf, "%u",
+                                slot->codes[c * slot->max_raw_length + (step + 1u) * fs + f]);
+                    }
+                }
+                fprintf(dumpf, "]]");
+            }
+            fprintf(dumpf, "]\n");
+            fclose(dumpf);
+        }
+    }
+    if (slot->failed) return -1;
+    if (generated_raw == 0) {
+        return slot_fail(slot, "decoder generated no audio frames");
+    }
+    if (slot->callback != NULL) {
+        if (slot->streamed_samples == 0) {
+            return slot_fail(slot, "stream produced no audio frames");
+        }
+        return 0;
+    }
+    unsigned *predicted_codes = (unsigned *)calloc(
+        model->info.codebook_count * generated_raw, sizeof(*predicted_codes));
+    if (predicted_codes == NULL) {
+        return slot_fail(slot, "out of memory copying generated codes");
+    }
+    for (size_t c = 0; c < model->info.codebook_count; ++c) {
+        memcpy(predicted_codes + c * generated_raw,
+               slot->codes + c * slot->max_raw_length + model->info.frame_stacking_factor,
+               generated_raw * sizeof(*predicted_codes));
+    }
+    const int result = decode_codec(model, predicted_codes, generated_raw,
+                                    slot->samples, slot->sample_count,
+                                    error, error_capacity);
+    free(predicted_codes);
+    if (result != 0) return slot_fail(slot, NULL);
+    return 0;
+}
+
+/* Step every live slot together.
+ *
+ * This is continuous in the sense that matters here: a slot that reaches EOS
+ * drops out of the batch immediately and the rest keep going at the smaller
+ * width, rather than the whole group waiting for the longest request. */
+static int synthesize_slots(const mynah_tts_model *model, synth_slot *slots,
+                            size_t count) {
+    if (count == 0u) return 0;
+    if (count > MYNAH_MAX_BATCH) return -1;
+    const int dump_all = count == 1u;
+    const int timing = getenv("MYNAH_TIMING") != NULL;
+    const double t_start = timing ? phase_seconds() : 0.0;
+    double t_prep = t_start, t_ar = t_start;
+
+    for (size_t i = 0; i < count; ++i) {
+        slot_prepare(model, &slots[i], dump_all);
+    }
+    if (timing) t_prep = phase_seconds();
+
+    /* One quantized activation buffer for the widest projection in the graph. */
+    batch_scratch scratch;
+    size_t k_max = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!slots[i].active) continue;
+        const decoder_cache *c = &slots[i].cache;
+        if (c->width > k_max) k_max = c->width;
+        if (c->ffn_width > k_max) k_max = c->ffn_width;
+        if (c->xattn_width > k_max) k_max = c->xattn_width;
+    }
+    char scratch_error[256];
+    scratch_error[0] = '\0';
+    if (batch_scratch_init(&scratch, count, k_max, scratch_error,
+                           sizeof(scratch_error)) != 0) {
+        for (size_t i = 0; i < count; ++i) {
+            if (slots[i].active) slot_fail(&slots[i], scratch_error);
+        }
+    }
+
+    decoder_cache *step_caches[MYNAH_MAX_BATCH];
+    const float *step_inputs[MYNAH_MAX_BATCH];
+    float *step_outs[MYNAH_MAX_BATCH];
+    size_t step_slot[MYNAH_MAX_BATCH];
+    local_batch_item local_items[MYNAH_MAX_BATCH];
+    size_t local_slot[MYNAH_MAX_BATCH];
+    for (;;) {
+        size_t live = 0;
+        for (size_t i = 0; i < count; ++i) {
+            synth_slot *slot = &slots[i];
+            if (!slot->active) continue;
+            if (embed_audio_frame(model, slot->codes, slot->max_raw_length,
+                                  slot->step - 1u, slot->audio_row,
+                                  slot->error, slot->error_capacity) != 0) {
+                slot_fail(slot, NULL);
+                continue;
+            }
+            slot->decoder_dev_last = NULL;
+            step_slot[live] = i;
+            step_caches[live] = &slot->cache;
+            step_inputs[live] = slot->audio_row;
+            step_outs[live] = slot->out_last;
+            ++live;
+        }
+        if (live == 0u) break;
+        if (live == 1u) {
+            /* Alone: go through decoder_run so a resident GPU step is still
+             * available.  It reduces to the same batched step on CPU. */
+            synth_slot *slot = &slots[step_slot[0]];
+            if (decoder_run(model, &slot->cache, slot->audio_row, 1u, slot->out_last,
+                            slot->request->use_local_transformer ? &slot->decoder_dev_last
+                                                                 : NULL,
+                            slot->error, slot->error_capacity) != 0) {
+                slot_fail(slot, NULL);
+                continue;
+            }
+        } else if (decoder_step_batch(model, step_caches, step_inputs, step_outs,
+                                      live, &scratch, slots[step_slot[0]].error,
+                                      slots[step_slot[0]].error_capacity) != 0) {
+            /* A batched step fails for all its slots or none: the failure is in
+             * shared code, not in one request's data. */
+            for (size_t j = 0; j < live; ++j) {
+                synth_slot *slot = &slots[step_slot[j]];
+                if (j > 0) {
+                    graph_error(slot->error, slot->error_capacity,
+                                "batched decoder step failed");
+                }
+                slot_fail(slot, NULL);
+            }
+            continue;
+        }
+        /* Sample the frame.  The local transformer is read once per stacked
+         * stream, so a decode step walks its weights sixteen times: batching it
+         * across slots matters more than batching the decoder itself. */
+        size_t local_count = 0;
+        for (size_t j = 0; j < live; ++j) {
+            synth_slot *slot = &slots[step_slot[j]];
+            if (!slot->active) continue;
+            slot_dump_hidden(model, slot, dump_all);
+            if (!slot->request->use_local_transformer) continue;
+            local_batch_item *item = &local_items[local_count];
+            memset(item, 0, sizeof(*item));
+            item->state = &slot->local_state;
+            item->decoder_last = slot->out_last;
+            item->decoder_dev_last = slot->decoder_dev_last;
+            item->codes = slot->codes;
+            item->raw_offset = slot->step * model->info.frame_stacking_factor;
+            item->code_stride = slot->max_raw_length;
+            item->generated_raw_length =
+                slot->predicted_stacks * model->info.frame_stacking_factor;
+            item->min_raw_length = slot->min_raw_length;
+            item->temperature = slot->temperature;
+            item->topk = slot->topk;
+            item->rng_state = &slot->rng_state;
+            local_slot[local_count] = step_slot[j];
+            ++local_count;
+        }
+        if (local_count > 0u) {
+            char local_error[256];
+            local_error[0] = '\0';
+            if (sample_local_frame_batch(model, local_items, local_count, &scratch,
+                                         local_error, sizeof(local_error)) != 0) {
+                for (size_t j = 0; j < local_count; ++j) {
+                    slot_fail(&slots[local_slot[j]], local_error);
+                }
+                continue;
+            }
+        }
+        for (size_t j = 0; j < live; ++j) {
+            synth_slot *slot = &slots[step_slot[j]];
+            if (!slot->active) continue;
+            int saw_eos = 0;
+            size_t step_eos_frame = SIZE_MAX;
+            if (slot->request->use_local_transformer) {
+                for (size_t q = 0; q < local_count; ++q) {
+                    if (local_slot[q] != step_slot[j]) continue;
+                    saw_eos = local_items[q].saw_eos;
+                    step_eos_frame = local_items[q].eos_frame;
+                    break;
+                }
+            }
+            slot_advance(model, slot, saw_eos, step_eos_frame);
+        }
+    }
+    if (timing) t_ar = phase_seconds();
+
+    int result = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (slot_finalize(model, &slots[i], dump_all) != 0) result = -1;
+    }
+    if (timing) {
+        fprintf(stderr, "phase: prep=%.3fs ar=%.3fs codec=%.3fs (requests=%zu)\n",
+                t_prep - t_start, t_ar - t_prep, phase_seconds() - t_ar, count);
+    }
+    batch_scratch_free(&scratch);
+    for (size_t i = 0; i < count; ++i) {
+        slot_release(&slots[i]);
+        if (!slots[i].failed && slots[i].error != NULL && slots[i].error_capacity > 0)
+            slots[i].error[0] = '\0';
+    }
+    return result;
+}
+
+int mynah_graph_synthesize_jobs(const mynah_tts_model *model,
+                                mynah_graph_job *jobs, size_t count) {
+    if (model == NULL || jobs == NULL) return -1;
+    if (count == 0u) return 0;
+    if (count > MYNAH_MAX_BATCH) return -1;
+    synth_slot slots[MYNAH_MAX_BATCH];
+    memset(slots, 0, sizeof(slots));
+    for (size_t i = 0; i < count; ++i) {
+        slots[i].request = jobs[i].request;
+        slots[i].samples = jobs[i].samples;
+        slots[i].sample_count = jobs[i].sample_count;
+        slots[i].callback = jobs[i].callback;
+        slots[i].user_data = jobs[i].user_data;
+        slots[i].chunk_samples = jobs[i].chunk_samples;
+        slots[i].error = jobs[i].error;
+        slots[i].error_capacity = jobs[i].error_capacity;
+        slots[i].eos_frame = SIZE_MAX;
+    }
+    const int result = synthesize_slots(model, slots, count);
+    for (size_t i = 0; i < count; ++i) jobs[i].result = slots[i].failed ? -1 : 0;
+    return result;
+}
+
 int mynah_graph_synthesize_stream(const mynah_tts_model *model,
                                   const mynah_tts_request *request,
                                   float **samples, size_t *sample_count,
@@ -3299,342 +4185,43 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
                                   char *error, size_t error_capacity) {
     if (samples != NULL) *samples = NULL;
     if (sample_count != NULL) *sample_count = 0;
-    if (model == NULL || request == NULL ||
-        ((samples == NULL || sample_count == NULL) && callback == NULL) ||
-        error == NULL || error_capacity == 0 || request->text_ids == NULL ||
-        request->text_length == 0 || (callback != NULL && chunk_samples == 0)) {
+    if (model == NULL || error == NULL || error_capacity == 0) {
         graph_error(error, error_capacity, "invalid synthesis request");
         return -1;
     }
-    size_t streamed_samples = 0;
-    if (request->speaker >= model->info.speaker_count) {
-        graph_error(error, error_capacity, "speaker index is outside the model");
-        return -1;
+    mynah_graph_job job;
+    memset(&job, 0, sizeof(job));
+    job.request = request;
+    job.samples = samples;
+    job.sample_count = sample_count;
+    job.callback = callback;
+    job.user_data = user_data;
+    job.chunk_samples = chunk_samples;
+    job.error = error;
+    job.error_capacity = error_capacity;
+    return mynah_graph_synthesize_jobs(model, &job, 1u);
+}
+
+size_t mynah_tts_max_batch(void) {
+    return MYNAH_GRAPH_MAX_JOBS;
+}
+
+int mynah_tts_synthesize_batch(const mynah_tts_model *model,
+                               mynah_tts_batch_job *jobs, size_t count) {
+    if (model == NULL || jobs == NULL) return -1;
+    if (count == 0u) return 0;
+    if (count > MYNAH_GRAPH_MAX_JOBS) return -1;
+    mynah_graph_job graph_jobs[MYNAH_GRAPH_MAX_JOBS];
+    memset(graph_jobs, 0, sizeof(graph_jobs));
+    for (size_t i = 0; i < count; ++i) {
+        graph_jobs[i].request = jobs[i].request;
+        graph_jobs[i].samples = jobs[i].samples;
+        graph_jobs[i].sample_count = jobs[i].sample_count;
+        graph_jobs[i].error = jobs[i].error;
+        graph_jobs[i].error_capacity = jobs[i].error_capacity;
     }
-    const size_t width = model->info.hidden_dim;
-    const int timing = getenv("MYNAH_TIMING") != NULL;
-    const double t_start = timing ? phase_seconds() : 0.0;
-    double t_prep = t_start, t_ar = t_start;
-    double prep_encode_seconds = 0.0;
-    double prep_cross_cache_seconds = 0.0;
-    double prep_context_seconds = 0.0;
-    double ar_embed_seconds = 0.0;
-    double ar_decoder_seconds = 0.0;
-    double ar_local_seconds = 0.0;
-    float *memory = NULL;
-    if (encode_text(model, request->text_ids, request->text_length, &memory,
-                    error, error_capacity) != 0) return -1;
-    if (getenv("MYNAH_DUMP_ENCODER") != NULL) {
-        FILE *ef = fopen(getenv("MYNAH_DUMP_ENCODER"), "w");
-        if (ef != NULL) {
-            for (size_t t = 0; t < request->text_length; ++t)
-                for (size_t d = 0; d < width; ++d)
-                    fprintf(ef, "%.9g\n", (double)memory[t * width + d]);
-            fclose(ef);
-        }
-    }
-    if (timing) prep_encode_seconds = phase_seconds() - t_start;
-    mynah_tensor context_tensor;
-    if (tensor(model->tts, "baked_context_embedding.weight", &context_tensor,
-               error, error_capacity) != 0 || context_tensor.rank != 2 ||
-        context_tensor.shape[1] % width != 0 || request->speaker >= context_tensor.shape[0]) {
-        free(memory);
-        graph_error(error, error_capacity, "baked speaker context is invalid");
-        return -1;
-    }
-    const size_t context_length = context_tensor.shape[1] / width;
-    const size_t max_steps = request->max_steps == 0
-        ? (model->info.max_decoder_steps + model->info.frame_stacking_factor - 1u) /
-          model->info.frame_stacking_factor
-        : request->max_steps;
-    const size_t max_raw_length = (max_steps + 1u) * model->info.frame_stacking_factor;
-    unsigned *codes = (unsigned *)calloc(model->info.codebook_count * max_raw_length, sizeof(*codes));
-    float *out_last = allocate_floats(width, error, error_capacity);
-    float *audio_row = allocate_floats(width, error, error_capacity);
-    decoder_cache cache;
-    memset(&cache, 0, sizeof(cache));
-    local_frame_state local_state;
-    memset(&local_state, 0, sizeof(local_state));
-    if (codes == NULL || out_last == NULL || audio_row == NULL) {
-        free(memory);
-        free(codes);
-        free(out_last);
-        free(audio_row);
-        return -1;
-    }
-    for (size_t c = 0; c < model->info.codebook_count; ++c) {
-        for (size_t t = 0; t < model->info.frame_stacking_factor; ++t) {
-            codes[c * max_raw_length + t] = model->info.codebook_size;
-        }
-    }
-    const float *context = context_tensor.data + (size_t)request->speaker * context_tensor.shape[1];
-    const size_t min_raw_length = model->info.min_generated_frames;
-    size_t predicted_stacks = 0u;
-    float temperature = request->temperature;
-    if (!(temperature >= 0.0f)) temperature = model->info.default_temperature;
-    unsigned topk = request->topk == 0 ? model->info.default_topk : request->topk;
-    uint64_t rng_state = request->seed == 0 ? UINT64_C(0x9e3779b97f4a7c15) : request->seed;
-    size_t eos_frame = SIZE_MAX;
-    /* Cache the constant text cross-attention and prefill the baked speaker
-     * context once, so every autoregressive step is a single-row decoder pass. */
-    double prep_stage_start = timing ? phase_seconds() : 0.0;
-    if (decoder_cache_init(model, &cache, memory, request->text_length,
-                           context_length + max_steps + 2u, error, error_capacity) != 0) {
-        decoder_cache_free(&cache);
-        free(memory);
-        free(codes);
-        free(out_last);
-        free(audio_row);
-        return -1;
-    }
-    if (timing) {
-        prep_cross_cache_seconds = phase_seconds() - prep_stage_start;
-        prep_stage_start = phase_seconds();
-    }
-    float *decoder_dev_last = NULL;
-    if (decoder_run(model, &cache, context, context_length, out_last,
-                    request->use_local_transformer ? &decoder_dev_last : NULL,
-                    error, error_capacity) != 0) {
-        decoder_cache_free(&cache);
-        free(memory);
-        free(codes);
-        free(out_last);
-        free(audio_row);
-        return -1;
-    }
-    if (getenv("MYNAH_DUMP_PREFILL") != NULL) {
-        FILE *pf = fopen(getenv("MYNAH_DUMP_PREFILL"), "w");
-        if (pf != NULL) {
-            if (decoder_dev_last != NULL)
-                mynah_backend_d2h(model->backend, decoder_dev_last, out_last, width,
-                                  error, error_capacity);
-            for (size_t d = 0; d < width; ++d)
-                fprintf(pf, "%.9g\n", (double)out_last[d]);
-            fclose(pf);
-        }
-    }
-    if (timing) prep_context_seconds = phase_seconds() - prep_stage_start;
-    /* The local helper's KV cache, workspace and sampler scratch are shape
-     * constant for the request, so they are built once here rather than per
-     * frame inside the decode loop. */
-    if (request->use_local_transformer) {
-        const size_t vocab = model->info.audio_vocab_size;
-        const size_t top_count = temperature > 0.0f && topk > 1u
-            ? (topk < vocab ? topk : vocab) : 0u;
-        if (local_frame_state_init(model, &local_state, top_count,
-                                   error, error_capacity) != 0) {
-            decoder_cache_free(&cache);
-            free(memory);
-            free(codes);
-            free(out_last);
-            free(audio_row);
-            return -1;
-        }
-    }
-    if (timing) t_prep = phase_seconds();
-    for (size_t stacked_length = 1u; stacked_length <= max_steps; ++stacked_length) {
-        const size_t raw_length = stacked_length * model->info.frame_stacking_factor;
-        double stage_start = timing ? phase_seconds() : 0.0;
-        if (embed_audio_frame(model, codes, max_raw_length, stacked_length - 1u,
-                              audio_row, error, error_capacity) != 0) break;
-        if (timing) {
-            const double now = phase_seconds();
-            ar_embed_seconds += now - stage_start;
-            stage_start = now;
-        }
-        decoder_dev_last = NULL;
-        if (decoder_run(model, &cache, audio_row, 1u, out_last,
-                        request->use_local_transformer ? &decoder_dev_last : NULL,
-                        error, error_capacity) != 0) break;
-        if (stacked_length == 1u && getenv("MYNAH_DUMP_HIDDEN") != NULL) {
-            FILE *hf = fopen(getenv("MYNAH_DUMP_HIDDEN"), "w");
-            if (hf != NULL) {
-                if (decoder_dev_last != NULL)
-                    mynah_backend_d2h(model->backend, decoder_dev_last, out_last, width,
-                                      error, error_capacity);
-                for (size_t d = 0; d < model->info.hidden_dim; ++d)
-                    fprintf(hf, "%.9g\n", (double)out_last[d]);
-                fclose(hf);
-            }
-        }
-        if (timing) {
-            const double now = phase_seconds();
-            ar_decoder_seconds += now - stage_start;
-            stage_start = now;
-        }
-        int saw_eos = 0;
-        size_t step_eos_frame = SIZE_MAX;
-        if (request->use_local_transformer) {
-            if (sample_local_frame(model, out_last, decoder_dev_last, &local_state,
-                                   codes, raw_length, max_raw_length,
-                                   predicted_stacks * model->info.frame_stacking_factor,
-                                   min_raw_length, temperature, topk, &rng_state,
-                                   &saw_eos, &step_eos_frame, error, error_capacity) != 0) break;
-        } else {
-            mynah_tensor projection;
-            mynah_tensor bias;
-            if (tensor(model->tts, "final_proj.weight", &projection, error, error_capacity) != 0 ||
-                tensor(model->tts, "final_proj.bias", &bias, error, error_capacity) != 0) break;
-            const size_t streams = stacked_stream_count(model);
-            const int forbid_eos = predicted_stacks * model->info.frame_stacking_factor < min_raw_length;
-            const unsigned eos_id = model->info.audio_eos_id;
-            const size_t vocab = model->info.audio_vocab_size;
-            const float *last = out_last;
-            for (size_t stream = 0; stream < streams; ++stream) {
-                unsigned value = 0;
-                float best = -FLT_MAX;
-                for (size_t candidate = 0; candidate < vocab; ++candidate) {
-                    /* Same forbidden-token rule as the local path: real codes
-                     * always, AUDIO_EOS unless too early, nothing else. */
-                    const int is_code = candidate < model->info.codebook_size;
-                    const int is_eos = candidate == eos_id;
-                    if (!is_code && !(is_eos && !forbid_eos)) continue;
-                    float score = bias.data[stream * model->info.audio_vocab_size + candidate];
-                    const float *row = projection.data + (stream * model->info.audio_vocab_size + candidate) * width;
-                    for (size_t d = 0; d < width; ++d) score += row[d] * last[d];
-                    if (score > best) {
-                        best = score;
-                        value = (unsigned)candidate;
-                    }
-                }
-                if (value == eos_id) {
-                    saw_eos = 1;
-                    const size_t frame = stream / model->info.codebook_count;
-                    if (frame < step_eos_frame) step_eos_frame = frame;
-                }
-                const unsigned store = value < model->info.codebook_size ? value : 0u;
-                const size_t fs = stream / model->info.codebook_count;
-                const size_t codebook = stream % model->info.codebook_count;
-                codes[codebook * max_raw_length + raw_length + fs] = store;
-            }
-        }
-        if (timing) ar_local_seconds += phase_seconds() - stage_start;
-        ++predicted_stacks;
-        if (callback != NULL) {
-            size_t stream_raw = predicted_stacks * model->info.frame_stacking_factor;
-            if (step_eos_frame != SIZE_MAX) {
-                stream_raw = (predicted_stacks - 1u) * model->info.frame_stacking_factor +
-                             step_eos_frame;
-            }
-            if (stream_raw > 0) {
-                unsigned *stream_codes = (unsigned *)calloc(
-                    model->info.codebook_count * stream_raw, sizeof(*stream_codes));
-                if (stream_codes == NULL) {
-                    graph_error(error, error_capacity, "out of memory preparing streamed codes");
-                    break;
-                }
-                for (size_t c = 0; c < model->info.codebook_count; ++c) {
-                    memcpy(stream_codes + c * stream_raw,
-                           codes + c * max_raw_length + model->info.frame_stacking_factor,
-                           stream_raw * sizeof(*stream_codes));
-                }
-                float *stream_audio = NULL;
-                size_t stream_count = 0;
-                if (decode_codec(model, stream_codes, stream_raw, &stream_audio,
-                                 &stream_count, error, error_capacity) != 0) {
-                    free(stream_codes);
-                    break;
-                }
-                if (stream_count < streamed_samples ||
-                    emit_stream_samples(callback, user_data,
-                                        stream_audio + streamed_samples,
-                                        stream_count - streamed_samples, chunk_samples,
-                                        error, error_capacity) != 0) {
-                    free(stream_audio);
-                    free(stream_codes);
-                    if (stream_count < streamed_samples) {
-                        graph_error(error, error_capacity, "streamed codec output regressed");
-                    }
-                    break;
-                }
-                streamed_samples = stream_count;
-                free(stream_audio);
-                free(stream_codes);
-            }
-        }
- if (step_eos_frame != SIZE_MAX) {
-            eos_frame = step_eos_frame;
-        }
-        if (saw_eos && predicted_stacks >= 4u) {
-            break;
-        }
-    }
-    if (timing) t_ar = phase_seconds();
-    const size_t generated_stacks = predicted_stacks;
-    size_t generated_raw = generated_stacks * model->info.frame_stacking_factor;
-    if (eos_frame != SIZE_MAX && generated_stacks > 0) {
-        generated_raw = (generated_stacks - 1u) * model->info.frame_stacking_factor + eos_frame;
-    }
-    if (getenv("MYNAH_DUMP_CODES") != NULL && generated_stacks > 0) {
-        FILE *dump = fopen(getenv("MYNAH_DUMP_CODES"), "w");
-        if (dump != NULL) {
-            const size_t cb = model->info.codebook_count;
-            const size_t fs = model->info.frame_stacking_factor;
-            fprintf(dump, "[");
-            for (size_t step = 0; step < generated_stacks; ++step) {
-                if (step > 0) fprintf(dump, ",");
-                fprintf(dump, "[[");
-                for (size_t c = 0; c < cb; ++c) {
-                    if (c > 0) fprintf(dump, "],[");
-                    for (size_t f = 0; f < fs; ++f) {
-                        if (f > 0) fprintf(dump, ",");
-                        fprintf(dump, "%u", codes[c * max_raw_length + (step + 1u) * fs + f]);
-                    }
-                }
-                fprintf(dump, "]]");
-            }
-            fprintf(dump, "]\n");
-            fclose(dump);
-        }
-    }
-    int result = 0;
-    if (error[0] != '\0') {
-        result = -1;
-    } else if (generated_raw == 0) {
-        if (error[0] == '\0') graph_error(error, error_capacity, "decoder generated no audio frames");
-        result = -1;
-    } else if (callback != NULL) {
-        if (streamed_samples == 0) {
-            graph_error(error, error_capacity, "stream produced no audio frames");
-            result = -1;
-        }
-    } else {
-        unsigned *predicted_codes = (unsigned *)calloc(
-            model->info.codebook_count * generated_raw, sizeof(*predicted_codes));
-        if (predicted_codes == NULL) {
-            graph_error(error, error_capacity, "out of memory copying generated codes");
-            result = -1;
-        } else {
-            for (size_t c = 0; c < model->info.codebook_count; ++c) {
-                memcpy(predicted_codes + c * generated_raw,
-                       codes + c * max_raw_length + model->info.frame_stacking_factor,
-                       generated_raw * sizeof(*predicted_codes));
-            }
-            result = decode_codec(model, predicted_codes, generated_raw, samples, sample_count,
-                                  error, error_capacity);
-            free(predicted_codes);
-        }
-    }
-    if (timing) {
-        const double t_codec = phase_seconds();
-        fprintf(stderr,
-                "phase: prep=%.3fs [encode=%.3fs cross_cache=%.3fs context=%.3fs setup=%.3fs] "
-                "ar=%.3fs [embed=%.3fs decoder=%.3fs local=%.3fs] "
-                "codec=%.3fs (stacks=%zu)\n",
-                t_prep - t_start, prep_encode_seconds, prep_cross_cache_seconds,
-                prep_context_seconds,
-                t_prep - t_start - prep_encode_seconds - prep_cross_cache_seconds -
-                    prep_context_seconds,
-                t_ar - t_prep, ar_embed_seconds, ar_decoder_seconds,
-                ar_local_seconds, t_codec - t_ar, generated_stacks);
-    }
-    local_frame_state_free(&local_state);
-    decoder_cache_free(&cache);
-    free(memory);
-    free(codes);
-    free(out_last);
-    free(audio_row);
-    if (result == 0) error[0] = '\0';
+    const int result = mynah_graph_synthesize_jobs(model, graph_jobs, count);
+    for (size_t i = 0; i < count; ++i) jobs[i].result = graph_jobs[i].result;
     return result;
 }
 

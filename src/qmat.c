@@ -593,6 +593,62 @@ fail:
     return NULL;
 }
 
+/* ------------------------------------------------- weight-stationary batching
+ *
+ * Decode is bound by the weight bytes, not by the arithmetic: one activation
+ * row touches the whole matrix, so B concurrent requests that each walk it in
+ * turn pay B trips to DRAM for the same bytes.  Inverting the loops -- outer
+ * over row blocks, inner over the batch -- reads each block once and serves
+ * every row from cache.  A block is QMAT_ROW_BLOCK * cols bytes (24 KB for a
+ * 768-wide int8 weight), so it stays resident in L1 across the batch.
+ *
+ * This must be bit-exact against the unbatched path, or the audio a request
+ * gets would depend on which other requests it happened to batch with.  It is:
+ * every (weight row, activation) pair runs the same kernel over the same k in
+ * the same order, and only the order of independent pairs changes.  The f32
+ * path has no such guarantee -- sgemm may accumulate differently for M=B than
+ * for M=1 -- so it stays one call per row. */
+typedef struct {
+    const qmat_entry *entry;
+    const int8_t *qx;       /* batch * cols, INT8/INT4 */
+    const float *const *x;  /* batch pointers, F16 */
+    const float *sx;        /* batch */
+    float *const *out;      /* batch pointers */
+    const float *bias;
+    size_t batch;
+    size_t rows;
+    size_t cols;
+} qmat_batch_job;
+
+static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) {
+    const qmat_entry *e = j->entry;
+    const void *weights;
+    if (e->qtype == QMAT_INT8) weights = (const void *)e->q8;
+#if defined(MYNAH_QMAT_F16)
+    else if (e->qtype == QMAT_F16) weights = (const void *)e->f16;
+#endif
+    else weights = (const void *)e->q4;
+    for (size_t b = 0; b < j->batch; ++b) {
+        const qmat_rows_job rj = {
+            j->out[b],
+            j->qx == NULL ? NULL : j->qx + b * j->cols,
+            j->x == NULL ? NULL : j->x[b],
+            j->sx == NULL ? 0.0f : j->sx[b],
+            weights, e->scales, j->bias, j->rows, j->cols, e->qtype
+        };
+        qmat_rows_dispatch(&rj, row0, count);
+    }
+}
+
+static void qmat_batch_block(void *opaque, int block_index) {
+    const qmat_batch_job *j = (const qmat_batch_job *)opaque;
+    const size_t row0 = (size_t)block_index * QMAT_ROW_BLOCK;
+    if (row0 >= j->rows) return;
+    size_t count = j->rows - row0;
+    if (count > QMAT_ROW_BLOCK) count = QMAT_ROW_BLOCK;
+    qmat_batch_rows(j, row0, count);
+}
+
 /* --------------------------------------------------------------- public API */
 int mynah_qmat_greedy_argmax_resolved(mynah_qmat_cache *cache, const char *name,
                              const float *weight_data, const float *in, size_t k, size_t n,
@@ -672,6 +728,76 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
         } else {
             matvec_q_rows(orow, qx, xr, sx, e->q4, e->scales, bias, n, k, QMAT_INT4);
         }
+    }
+    return 0;
+}
+
+int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *backend,
+                              const char *name, const float *weight_data,
+                              const float *const *in_rows, float *const *out_rows,
+                              size_t batch, size_t k, size_t n, const float *bias,
+                              int8_t *qx_scratch, float *sx_scratch,
+                              char *error, size_t error_capacity) {
+    if (batch == 0u) return 0;
+    if (batch == 1u) {
+        return mynah_qmat_linear_resolved(cache, backend, name, weight_data,
+                                          in_rows[0], out_rows[0], 1u, k, n, bias,
+                                          error, error_capacity);
+    }
+    const int use_q = cache != NULL && cache->qtype != QMAT_F32 && k <= QMAT_K_MAX &&
+                      cache->use_row4 && qx_scratch != NULL && sx_scratch != NULL;
+    const qmat_entry *e = NULL;
+    if (use_q) {
+        pthread_mutex_lock(&cache->mutex);
+        e = cache_lookup(cache, name);
+        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k);
+        pthread_mutex_unlock(&cache->mutex);
+    }
+    if (e == NULL) {
+        /* No bit-exact batching available here: keep every row on the exact
+         * path it would have taken alone. */
+        for (size_t b = 0; b < batch; ++b) {
+            if (mynah_qmat_linear_resolved(cache, backend, name, weight_data,
+                                           in_rows[b], out_rows[b], 1u, k, n, bias,
+                                           error, error_capacity) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+#if defined(MYNAH_QMAT_F16)
+    const int is_f16 = e->qtype == QMAT_F16;
+#else
+    const int is_f16 = 0;
+#endif
+    if (!is_f16) {
+        /* F16 keeps the activation in f32 and needs no quantization pass. */
+        for (size_t b = 0; b < batch; ++b) {
+            sx_scratch[b] = quantize_act_int8(qx_scratch + b * k, in_rows[b], k);
+        }
+    }
+    const qmat_batch_job job = {
+        e, is_f16 ? NULL : qx_scratch, is_f16 ? in_rows : NULL,
+        is_f16 ? NULL : sx_scratch, out_rows, bias, batch, n, k
+    };
+    size_t weight_bytes;
+    if (e->qtype == QMAT_INT8) weight_bytes = n * k;
+    else if (is_f16) weight_bytes = n * k * 2u;
+    else weight_bytes = n * k / 2u;
+    if (mynah_num_threads() > 1 && weight_bytes >= QMAT_THREAD_MIN_BYTES &&
+        n > QMAT_ROW_BLOCK) {
+        const size_t blocks = (n + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK;
+        if (blocks <= (size_t)INT_MAX) {
+            mynah_parallel_for((int)blocks, qmat_batch_block, (void *)&job);
+            return 0;
+        }
+    }
+    /* Serial, but still blocked: walking the whole matrix once per row would
+     * defeat the point of batching. */
+    for (size_t row0 = 0; row0 < n; row0 += QMAT_ROW_BLOCK) {
+        size_t count = n - row0;
+        if (count > QMAT_ROW_BLOCK) count = QMAT_ROW_BLOCK;
+        qmat_batch_rows(&job, row0, count);
     }
     return 0;
 }
@@ -893,14 +1019,91 @@ done:
 }
 #endif
 
+/* The batching contract: batching must not change a row's result.  If it did,
+ * a request's audio would depend on which other requests happened to be in
+ * flight with it, which is a nondeterminism regression no tolerance can excuse.
+ * So this asserts bit-equality, not closeness, against the same rows computed
+ * one at a time. */
+static int self_test_batched(int qtype, char *error, size_t error_capacity) {
+    enum { N = 96, K = 256, B = 5 };
+    int status = -1;
+    mynah_qmat_cache *cache = mynah_qmat_cache_new(qtype);
+    if (cache == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat batched self-test out of memory");
+        return -1;
+    }
+    if (cache->qtype != qtype) {
+        /* Unsupported on this target (no half converts): nothing to check. */
+        mynah_qmat_cache_free(cache);
+        return 0;
+    }
+    float *w = (float *)malloc((size_t)N * K * sizeof(float));
+    float *x = (float *)malloc((size_t)B * K * sizeof(float));
+    float *bias = (float *)malloc((size_t)N * sizeof(float));
+    float *ref = (float *)malloc((size_t)B * N * sizeof(float));
+    float *got = (float *)malloc((size_t)B * N * sizeof(float));
+    int8_t *qx = (int8_t *)malloc((size_t)B * K);
+    float *sx = (float *)malloc((size_t)B * sizeof(float));
+    if (w == NULL || x == NULL || bias == NULL || ref == NULL || got == NULL ||
+        qx == NULL || sx == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat batched self-test out of memory");
+        goto done;
+    }
+    for (size_t i = 0; i < (size_t)N * K; ++i)
+        w[i] = sinf(0.017f * (float)i) * (0.5f + 0.5f * cosf(0.0011f * (float)i));
+    for (size_t i = 0; i < (size_t)B * K; ++i) x[i] = cosf(0.019f * (float)i) - 0.25f;
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = (float)i * 0.015625f - 0.75f;
+    const float *in_rows[B];
+    float *out_rows[B];
+    for (size_t b = 0; b < (size_t)B; ++b) {
+        in_rows[b] = x + b * K;
+        out_rows[b] = got + b * N;
+    }
+    for (size_t b = 0; b < (size_t)B; ++b) {
+        if (mynah_qmat_linear_resolved(cache, NULL, "batched.self.test", w,
+                                       x + b * K, ref + b * N, 1u, K, N, bias,
+                                       error, error_capacity) != 0) {
+            goto done;
+        }
+    }
+    if (mynah_qmat_linear_batched(cache, NULL, "batched.self.test", w,
+                                  in_rows, out_rows, B, K, N, bias, qx, sx,
+                                  error, error_capacity) != 0) {
+        goto done;
+    }
+    for (size_t b = 0; b < (size_t)B; ++b) {
+        for (size_t i = 0; i < (size_t)N; ++i) {
+            const size_t at = b * N + i;
+            if (memcmp(&ref[at], &got[at], sizeof(float)) != 0) {
+                if (error != NULL && error_capacity > 0)
+                    snprintf(error, error_capacity,
+                             "qmat batched qtype=%d differs at row %zu col %zu: "
+                             "%.9g vs %.9g", qtype, b, i,
+                             (double)ref[at], (double)got[at]);
+                goto done;
+            }
+        }
+    }
+    status = 0;
+done:
+    free(w); free(x); free(bias); free(ref); free(got); free(qx); free(sx);
+    mynah_qmat_cache_free(cache);
+    return status;
+}
+
 int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_one(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_one(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_INT4, error, error_capacity) != 0) return -1;
+    if (self_test_batched(QMAT_INT8, error, error_capacity) != 0) return -1;
+    if (self_test_batched(QMAT_INT4, error, error_capacity) != 0) return -1;
 #if defined(MYNAH_QMAT_F16)
     if (self_test_f16(error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_F16, error, error_capacity) != 0) return -1;
+    if (self_test_batched(QMAT_F16, error, error_capacity) != 0) return -1;
 #endif
     return 0;
 }

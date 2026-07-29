@@ -141,6 +141,53 @@ reproducible on CUDA and every variant shifted EOS in the autoregressive loop,
 so 0.209 is not a valid result. Closing that blocker is worth roughly
 0.257 → 0.20.
 
+## Throughput: batching concurrent requests
+
+Single-request latency and batched throughput are different metrics; this
+section is the second one.
+
+Decode reads far more weight bytes than it does arithmetic, so N requests taking
+turns pay N trips to DRAM for the same weights. Stepping them together reads
+each weight once and serves every request from cache.
+`mynah_tts_synthesize_batch` (and the server, automatically) does this.
+
+M1, int8, warm, same text with one seed per request:
+
+| in flight | serial | batched | speedup | per request |
+|---|---|---|---|---|
+| 2 | 3.26 s | 2.52 s | 1.30x | 1.26 s |
+| 4 | 6.48 s | 4.62 s | 1.40x | 1.16 s |
+| 8 | 12.94 s | 7.94 s | **1.63x** | **0.99 s** |
+
+All outputs byte-identical to the same request run alone.
+
+**Single-request latency is unchanged** — batch 1 takes the same path and
+produces the same bytes. This buys throughput, not latency.
+
+### Why 1.6x and not 4x
+
+A microbenchmark of one batched matvec shows 4.46x at B=8, and quoting that as
+the end-to-end number would be wrong. The phase split says where the time
+actually is:
+
+| phase | share |
+|---|---|
+| prep (text encode + context prefill) | ~20% |
+| AR decoder step | ~20% |
+| AR local transformer | ~31% |
+| codec | ~29% |
+
+Batching covers the decoder and the local transformer — about half of wall
+time — so Amdahl caps the gain near 1.6x, which is what was measured. Note the
+local transformer is the larger of the two: it runs once per stacked stream, so
+one decode step walks its weights sixteen times (252 MB against the decoder's
+99 MB at int8). Going beyond 1.6x means batching the codec as well.
+
+Beware `MYNAH_TIMING` when sizing any of this: instrumented runs inflate the
+total by roughly 48% and attribute far too much to the encode phase. Use it for
+proportions, never for a speedup estimate, and A/B at a fixed `--max-steps` so
+both arms generate the same amount of audio.
+
 ## Codec
 
 With Snake threaded, what remains is causal convolution (~0.45 s of a 0.55 s

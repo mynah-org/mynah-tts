@@ -28,6 +28,7 @@ static void usage(const char *program) {
     printf("  %s --synthesize MODEL_DIR --text \"hello world\" --lang en --output OUTPUT.wav [options]\n", program);
     printf("      options: --speaker N --max-steps N --temperature F --topk N --seed N\n");
     printf("               --parallel --device cpu|metal|cuda --warmup N --runs N\n");
+    printf("               --batch N (step N requests together, seeds N..N+batch-1)\n");
     printf("  %s --gpu-self-test metal|cuda\n", program);
     printf("\nNative Magpie inference is CPU-first; Metal/CUDA are explicit build variants.\n");
 }
@@ -217,6 +218,7 @@ static int synthesize(int argc, char **argv) {
     float temperature = -1.0f;
     unsigned topk = 0;
     uint64_t seed = UINT64_C(42);
+    unsigned batch = 1u;
     unsigned warmups = 0;
     unsigned runs = 1;
     int use_local = 1;
@@ -234,6 +236,7 @@ static int synthesize(int argc, char **argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc && parse_seed(argv[++i], &seed) == 0) {}
         else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &warmups) == 0) {}
         else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &runs) == 0) {}
+        else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &batch) == 0) {}
         else if (strcmp(argv[i], "--parallel") == 0) use_local = 0;
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc &&
                  parse_device(argv[++i], &device) == 0) {}
@@ -308,6 +311,68 @@ static int synthesize(int argc, char **argv) {
         .seed = seed,
         .use_local_transformer = use_local,
     };
+    if (batch > 1u) {
+        /* Throughput mode: `batch` requests stepped together, one per seed so
+         * they take different trajectories and retire at different steps, which
+         * is what a server actually sees.  Each output is written next to
+         * --output so it can be diffed against the same request run alone. */
+        if ((size_t)batch > mynah_tts_max_batch()) {
+            fprintf(stderr, "--batch is limited to %zu\n", mynah_tts_max_batch());
+            mynah_tts_model_close(model);
+            free(tokens);
+            return 1;
+        }
+        mynah_tts_request requests[64];
+        mynah_tts_batch_job jobs[64];
+        float *outs[64];
+        size_t counts[64];
+        char errors[64][256];
+        for (unsigned b = 0; b < batch; ++b) {
+            requests[b] = request;
+            requests[b].seed = seed + b;
+            outs[b] = NULL;
+            counts[b] = 0;
+            errors[b][0] = '\0';
+            jobs[b].request = &requests[b];
+            jobs[b].samples = &outs[b];
+            jobs[b].sample_count = &counts[b];
+            jobs[b].error = errors[b];
+            jobs[b].error_capacity = sizeof(errors[b]);
+            jobs[b].result = 0;
+        }
+        const double batch_start = now_seconds();
+        const int batch_result = mynah_tts_synthesize_batch(model, jobs, batch);
+        const double batch_seconds = now_seconds() - batch_start;
+        double audio_total = 0.0;
+        int failures = 0;
+        for (unsigned b = 0; b < batch; ++b) {
+            if (jobs[b].result != 0) {
+                fprintf(stderr, "batch job %u failed: %s\n", b, errors[b]);
+                ++failures;
+                continue;
+            }
+            char path[1024];
+            if (b == 0) snprintf(path, sizeof(path), "%s", output_path);
+            else snprintf(path, sizeof(path), "%s.%u", output_path, b);
+            if (mynah_wav_write_f32(path, outs[b], counts[b], info.sample_rate,
+                                    error, sizeof(error)) != 0) {
+                fprintf(stderr, "batch job %u write failed: %s\n", b, error);
+                ++failures;
+                continue;
+            }
+            audio_total += info.sample_rate > 0
+                ? (double)counts[b] / (double)info.sample_rate : 0.0;
+            printf("batch job %u: seed=%llu %zu samples -> %s\n", b,
+                   (unsigned long long)requests[b].seed, counts[b], path);
+        }
+        printf("batch: requests=%u synth=%.3fs audio=%.3fs aggregate_RTF=%.3f\n",
+               batch, batch_seconds, audio_total,
+               audio_total > 0.0 ? batch_seconds / audio_total : 0.0);
+        for (unsigned b = 0; b < batch; ++b) mynah_tts_free_samples(outs[b]);
+        mynah_tts_model_close(model);
+        free(tokens);
+        return (batch_result == 0 && failures == 0) ? 0 : 1;
+    }
     float *samples = NULL;
     size_t sample_count = 0;
     double *timings = (size_t)runs > SIZE_MAX / sizeof(*timings)

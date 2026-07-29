@@ -139,35 +139,46 @@ process dies. When the queue is full the server answers **503 with
 Accepted sockets carry a 30 s send/receive timeout, so a client that connects
 and never sends cannot pin a worker forever.
 
-**Synthesis is serialized.** Connections are accepted and parsed concurrently,
-but one mutex guards the synthesis itself.
+**Synthesis runs on one thread — and batches.** Connections are accepted and
+parsed concurrently, but only the scheduler thread ever touches the model.
 
-That is a correctness bound, not a tuning decision. A `mynah_tts_model` carries
-mutable caches — quantized weight cache, codec filters, the local projection
-cache — that synthesis populates and reuses. Two threads synthesizing on one
-model would race on them. Serving concurrent requests in parallel means moving
-that scratch into a per-request context first; until then, extra threads would
-corrupt output rather than speed it up.
+The single thread is a correctness bound, not a tuning decision. A
+`mynah_tts_model` carries mutable caches — quantized weight cache, codec
+filters, the local projection cache — that synthesis populates and reuses. Two
+threads synthesizing on one model would race on them.
 
-Measured on M1 (int8, warm, 4 workers, same request):
+What changed is that one thread no longer means one request at a time. A decode
+step is bound by the weight bytes it reads, not by arithmetic, so requests
+taking turns each paid their own trip to memory for the same weights. The
+scheduler hands everything queued to `mynah_tts_synthesize_batch`, which reads
+those weights once and serves every waiting request from cache. Requests that
+arrive while a batch is running are grouped into the next one, so queue depth
+does the batching; `--max-batch` caps the group (default 8, hard limit 16).
 
-| | wall time |
-|---|---|
-| one request | 1.32 s |
-| two concurrent | 2.52 s |
-| ratio | **1.91** (2.0 would be fully serialized) |
+Measured on M1 (int8, warm, same text, one request per seed):
 
-Both concurrent responses were byte-identical to each other and to the
-sequential one, so the serialization is correct — it is simply not concurrent.
+| in flight | serial | batched | speedup |
+|---|---|---|---|
+| 2 | 3.26 s | 2.52 s | 1.30x |
+| 4 | 6.48 s | 4.62 s | 1.40x |
+| 8 | 12.94 s | 7.94 s | **1.63x** |
 
-Removing the mutex today would buy nothing: `mynah_parallel_for` runs a region
-inline when the pool is already busy, so a second synthesis would lose its inner
-parallelism and cost about what queueing costs. Real gain needs a per-context
-thread pool or continuous batching, not a smaller lock.
+**Every batched request received byte-identical audio to the same request run
+alone.** That is the property that makes batching safe to enable by default: an
+identical request cannot get different audio depending on who it shared a batch
+with. It holds because batching reorders independent work and never a reduction
+— see `docs/quantization.md` for how the kernels keep each row's accumulation
+order fixed, and `mynah_qmat_self_test` for the check that asserts it.
 
-Practically: throughput is one stream at a time. With RTF ~0.36 on an M1 at
-int8, a single process still generates faster than real time, so a small number
-of queued clients stay ahead of playback.
+The ceiling is what the phase split predicts rather than what the microbenchmark
+promised: batching covers the decoder and the local transformer, roughly half of
+wall time, so the gain tops out near 1.6x rather than the ~4x that batching a
+single matvec shows in isolation. Raising it further means batching the codec
+too.
+
+**Streaming still runs alone.** It needs its callback interleaved with
+generation, so a streaming request takes the same lock the scheduler does and
+never overlaps a batch.
 
 Set decode precision with the same environment variable the CLI uses:
 

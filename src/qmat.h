@@ -14,6 +14,7 @@
 #define MYNAH_TTS_QMAT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "backend.h"
 #include "safetensors.h"
@@ -38,6 +39,23 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache, const mynah_backend *bac
                                const float *in, float *out, size_t count, size_t k,
                                size_t n, const float *bias,
                                char *error, size_t error_capacity);
+
+/* Weight-stationary batched linear: `batch` single-row activations that belong
+ * to different requests, computed with one pass over the weight instead of one
+ * pass each.  `in_rows[b]` and `out_rows[b]` need not be contiguous with one
+ * another, so slots keep their own scratch.
+ *
+ * Bit-exact against `batch` separate mynah_qmat_linear_resolved calls: without
+ * that, a request's audio would depend on which requests it batched with.
+ *
+ * The caller owns the scratch (`batch * k` int8 and `batch` floats) so the
+ * decode loop stays allocation-free.  0 = ok, -1 = error. */
+int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *backend,
+                              const char *name, const float *weight,
+                              const float *const *in_rows, float *const *out_rows,
+                              size_t batch, size_t k, size_t n, const float *bias,
+                              int8_t *qx_scratch, float *sx_scratch,
+                              char *error, size_t error_capacity);
 
 /* Greedy f32 projection fused with the constrained argmax.  Returns 0 when
  * fused, 1 when the cache/backend is not eligible and the caller should use

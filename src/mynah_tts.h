@@ -74,6 +74,34 @@ int mynah_tts_synthesize(const mynah_tts_model *model,
                          char *error, size_t error_capacity);
 void mynah_tts_free_samples(float *samples);
 
+/* Synthesize several requests together.
+ *
+ * A decode step reads far more weight bytes than it does arithmetic, so
+ * requests run one after another each pay their own trip to memory for the same
+ * weights.  Stepping them together reads those weights once and serves every
+ * request from cache, which raises throughput without touching single-request
+ * latency.  Requests are independent: they may differ in text, speaker, seed
+ * and length, and one finishing early frees its slot immediately.
+ *
+ * The audio a request receives is identical to what it would have received
+ * alone -- batching reorders independent work, never a reduction.
+ *
+ * Returns 0 when every job succeeded and -1 when any failed; each job's
+ * `result` and `error` say which.  `count` must not exceed
+ * mynah_tts_max_batch(). */
+typedef struct {
+    const mynah_tts_request *request;
+    float **samples;
+    size_t *sample_count;
+    char *error;
+    size_t error_capacity;
+    int result;
+} mynah_tts_batch_job;
+
+size_t mynah_tts_max_batch(void);
+int mynah_tts_synthesize_batch(const mynah_tts_model *model,
+                               mynah_tts_batch_job *jobs, size_t count);
+
 /* Incremental causal-prefix sink. Push accepts token chunks; flush runs the
  * shared AR graph and emits stable PCM prefixes through the callback. */
 int mynah_tts_stream_open(const mynah_tts_model *model,

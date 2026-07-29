@@ -125,4 +125,46 @@ curl -s --max-time 600 -X POST "$BASE/v1/tts" \
 cmp -s "$TMP/native.wav" "$TMP/repro1.wav" || fail "/v1/tts differs from /v1/audio/speech"
 echo "native /tts ok (same audio as the OpenAI route)"
 
+# --- Batching under load ---------------------------------------------------
+# Four clients at once must each get exactly the audio they would have got
+# alone, and the batch must not be slower than the same four one after another.
+# The identity check is the one that matters: batching reorders independent
+# work, so a difference here means a slot leaked state into its neighbour.
+#
+# Every wait names its PIDs: the server itself is a background child of this
+# script, so a bare `wait` would block on it forever.
+serial_start=$(date +%s)
+for i in 1 2 3 4; do
+    curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+        -H 'Content-Type: application/json' \
+        -d "{\"input\":\"batching under load check\",\"voice\":\"Sofia\",\"seed\":$i}" \
+        -o "$TMP/serial$i.wav" || fail "serial client $i failed"
+done
+serial_end=$(date +%s)
+
+pids=""
+batch_start=$(date +%s)
+for i in 1 2 3 4; do
+    curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+        -H 'Content-Type: application/json' \
+        -d "{\"input\":\"batching under load check\",\"voice\":\"Sofia\",\"seed\":$i}" \
+        -o "$TMP/p$i.wav" &
+    pids="$pids $!"
+done
+for p in $pids; do
+    wait "$p" || fail "concurrent batching client failed"
+done
+batch_end=$(date +%s)
+
+for i in 1 2 3 4; do
+    [ -s "$TMP/p$i.wav" ] || fail "batched client $i got no audio"
+    cmp -s "$TMP/p$i.wav" "$TMP/serial$i.wav" ||
+        fail "batched client $i differs from the same request run alone"
+done
+serial_s=$((serial_end - serial_start))
+batch_s=$((batch_end - batch_start))
+[ "$batch_s" -le "$serial_s" ] ||
+    fail "four concurrent requests ($batch_s s) were slower than four serial ($serial_s s)"
+echo "batching    ok (4 concurrent ${batch_s}s vs 4 serial ${serial_s}s, all byte-identical)"
+
 echo "server test: PASS"
