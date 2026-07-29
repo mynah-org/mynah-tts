@@ -15,13 +15,32 @@ BASE="http://127.0.0.1:$PORT"
 TMP="$(mktemp -d)"
 PID=""
 
+# A server holds the whole model resident (~2 GB once it has synthesized
+# anything), so a leaked one is expensive on a small-memory machine. SIGTERM
+# first, then make sure: a server killed mid-synthesis can take a moment, and
+# an escaped one would still be holding those 2 GB an hour later.
 cleanup() {
-    [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+    if [ -n "$PID" ]; then
+        kill "$PID" 2>/dev/null || true
+        i=0
+        while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 20 ]; do
+            i=$((i + 1))
+            sleep 0.25
+        done
+        kill -9 "$PID" 2>/dev/null || true
+        wait "$PID" 2>/dev/null || true
+    fi
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# Refuse to pile a second 2 GB server on top of one left behind by an earlier
+# run: two of these is most of a small machine's memory.
+if curl -sf --max-time 2 "$BASE/health" > /dev/null 2>&1; then
+    fail "something is already serving on port $PORT; stop it first (each server holds ~2 GB)"
+fi
 
 "$SERVER" -m "$MODEL_DIR" -p "$PORT" > "$TMP/server.log" 2>&1 &
 PID=$!

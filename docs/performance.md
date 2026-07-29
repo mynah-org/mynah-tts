@@ -188,6 +188,24 @@ total by roughly 48% and attribute far too much to the encode phase. Use it for
 proportions, never for a speedup estimate, and A/B at a fixed `--max-steps` so
 both arms generate the same amount of audio.
 
+## Streaming
+
+Streaming decodes each chunk with a bounded window of history instead of
+re-running the codec over the whole prefix. Measured on M1 (int8, 60 steps, the
+`make stream-test` workload, which includes one offline pass):
+
+| | wall time |
+|---|---|
+| re-decode the whole prefix | 7.91 s |
+| bounded suffix, 32-frame window | 4.08 s |
+
+The streaming portion alone goes from ~6.4 s to ~2.6 s. The gain grows with
+utterance length because the cost changes from quadratic to linear: at ~160
+steps the old path decoded about 26k frames instead of 320.
+
+Output is byte-identical to offline; see `docs/server.md` for why 32 frames is
+the right window and how it was verified.
+
 ## Codec
 
 With Snake threaded, what remains is causal convolution (~0.45 s of a 0.55 s

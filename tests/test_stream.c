@@ -60,7 +60,10 @@ int main(int argc, char **argv) {
         .text_ids = tokens,
         .text_length = sizeof(tokens) / sizeof(tokens[0]),
         .speaker = 4,
-        .max_steps = 20,
+        /* Long enough that streaming re-decodes a bounded suffix with a
+         * non-zero start: below ~2x STREAM_CONTEXT_FRAMES every chunk still
+         * starts at frame 0 and the suffix path is never exercised. */
+        .max_steps = 60,
         .temperature = 0.0f,
         .topk = 1,
         .use_local_transformer = 1,

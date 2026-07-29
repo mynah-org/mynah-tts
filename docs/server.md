@@ -180,6 +180,39 @@ too.
 generation, so a streaming request takes the same lock the scheduler does and
 never overlaps a batch.
 
+### Streaming cost
+
+A streamed chunk is decoded with a bounded window of history rather than by
+re-running the codec over everything generated so far. The audio decoder is
+causal end to end, so an output depends only on inputs at or before it: decoding
+from 32 frames before the first unsent frame reproduces the sent frames exactly.
+That bound is the receptive field walked through the decoder stack (~25 frames;
+32 leaves margin), and `make stream-test` fails at 24 and passes at 32, which is
+where the derivation puts it.
+
+Re-decoding the whole prefix every step was quadratic — a 15 s utterance
+decoded about 26k frames instead of 320, and streaming ran roughly 30x slower
+than the same request offline. Chunks are also emitted every 16 frames rather
+than every step, so the fixed window cost is paid once per chunk instead of
+sixteen times for the same audio; the added latency to the first chunk is well
+under a second and the total is unchanged.
+
+Streamed audio remains byte-identical to the offline result for the same
+request — asserted by `make stream-test` and by the server's `stream==batch`
+check.
+
+### Memory
+
+A server holds the whole model resident: about 180 MB before its first request
+and ~2 GB after, once the weight pages are touched and the quantized copies are
+built. That is per process, not per request — batching adds roughly 30 MB per
+slot in flight.
+
+The practical consequence is that **leaked servers are what runs a machine out
+of memory**, not load. `tests/test_server.sh` refuses to start when something is
+already serving on its port, and kills its own server on any exit path
+including SIGINT.
+
 Set decode precision with the same environment variable the CLI uses:
 
 ```bash

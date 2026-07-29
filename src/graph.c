@@ -11,6 +11,27 @@
  * pointer arrays kept on the stack in the batched step. */
 #define MYNAH_MAX_BATCH 16u
 
+/* Left context, in codec frames, that a streamed chunk must be decoded with.
+ *
+ * The audio decoder is causal end to end, so an output only ever depends on
+ * inputs at or before it, and a chunk decoded with at least its receptive field
+ * of history is bit-identical to the same frames decoded from the start.
+ *
+ * The receptive field, walked backwards through the stack with upsampling rates
+ * {8, 8, 4, 2, 2}: the final sample-rate conv contributes 6/1024 frames, each
+ * stage's residual layer at most 120 positions at its own rate (kernel 11 over
+ * dilations 1, 3, 5, each block being an input conv plus a skip conv), every
+ * transposed conv one input position, and the frame-rate pre_conv 6 frames.
+ * That sums to under 25 frames; 32 leaves margin without costing anything
+ * measurable. */
+#define STREAM_CONTEXT_FRAMES 32u
+
+/* Frames to accumulate before emitting. The decode cost per chunk is dominated
+ * by the fixed context above, so emitting every single step would pay it 16
+ * times over for the same audio. At ~21.5 frames/s this is well under 1 s of
+ * added latency to the first chunk, and none to the total. */
+#define STREAM_EMIT_FRAMES 16u
+
 #include <math.h>
 #include <stdint.h>
 #include <time.h>
@@ -3687,6 +3708,7 @@ typedef struct {
     size_t predicted_stacks;
     size_t eos_frame;
     size_t streamed_samples;
+    size_t streamed_frames;
     int active;
     int failed;
 } synth_slot;
@@ -3888,36 +3910,59 @@ static int slot_advance(const mynah_tts_model *model, synth_slot *slot,
             stream_raw = (slot->predicted_stacks - 1u) * model->info.frame_stacking_factor +
                          step_eos_frame;
         }
-        if (stream_raw > 0) {
+        const int finishing = saw_eos || slot->step >= slot->max_steps;
+        const size_t fresh = stream_raw > slot->streamed_frames
+            ? stream_raw - slot->streamed_frames : 0u;
+        if (fresh > 0u && (finishing || fresh >= STREAM_EMIT_FRAMES)) {
+            /* Decode a bounded suffix, not the whole prefix.
+             *
+             * The codec decoder is causal throughout, so an output depends only
+             * on inputs at or before it.  Restarting the sequence
+             * STREAM_CONTEXT_FRAMES before the first unsent frame therefore
+             * reproduces those frames exactly -- only the outputs inside the
+             * receptive field are affected by the missing history, and those
+             * have already been sent.
+             *
+             * Re-decoding the whole prefix every step, as this did, is
+             * quadratic: a 15 s utterance decoded 26k frames instead of 320 and
+             * streaming ran 30x slower than the same request offline. */
+            const size_t start = slot->streamed_frames > STREAM_CONTEXT_FRAMES
+                ? slot->streamed_frames - STREAM_CONTEXT_FRAMES : 0u;
+            const size_t span = stream_raw - start;
             unsigned *stream_codes = (unsigned *)calloc(
-                model->info.codebook_count * stream_raw, sizeof(*stream_codes));
+                model->info.codebook_count * span, sizeof(*stream_codes));
             if (stream_codes == NULL) {
                 return slot_fail(slot, "out of memory preparing streamed codes");
             }
             for (size_t c = 0; c < model->info.codebook_count; ++c) {
-                memcpy(stream_codes + c * stream_raw,
+                memcpy(stream_codes + c * span,
                        slot->codes + c * slot->max_raw_length +
-                           model->info.frame_stacking_factor,
-                       stream_raw * sizeof(*stream_codes));
+                           model->info.frame_stacking_factor + start,
+                       span * sizeof(*stream_codes));
             }
             float *stream_audio = NULL;
             size_t stream_count = 0;
-            if (decode_codec(model, stream_codes, stream_raw, &stream_audio,
+            if (decode_codec(model, stream_codes, span, &stream_audio,
                              &stream_count, error, error_capacity) != 0) {
                 free(stream_codes);
                 return slot_fail(slot, NULL);
             }
-            if (stream_count < slot->streamed_samples ||
+            /* The codec's samples-per-frame is a property of the pack, so take
+             * it from what it produced rather than assuming a rate. */
+            const size_t skip_frames = slot->streamed_frames - start;
+            const size_t per_frame = span > 0u ? stream_count / span : 0u;
+            const size_t skip = skip_frames * per_frame;
+            if (stream_count < skip ||
                 emit_stream_samples(slot->callback, slot->user_data,
-                                    stream_audio + slot->streamed_samples,
-                                    stream_count - slot->streamed_samples,
+                                    stream_audio + skip, stream_count - skip,
                                     slot->chunk_samples, error, error_capacity) != 0) {
-                const int regressed = stream_count < slot->streamed_samples;
+                const int regressed = stream_count < skip;
                 free(stream_audio);
                 free(stream_codes);
                 return slot_fail(slot, regressed ? "streamed codec output regressed" : NULL);
             }
-            slot->streamed_samples = stream_count;
+            slot->streamed_samples += stream_count - skip;
+            slot->streamed_frames = stream_raw;
             free(stream_audio);
             free(stream_codes);
         }
