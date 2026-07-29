@@ -146,6 +146,22 @@ duration drift matters and int8 when speed does.
 `f32` remains the default and is bit-exact: routing it through the cache is a
 no-op, verified by an unchanged WAV md5.
 
+## Codec
+
+Snake runs one channel per pool worker. Each channel is an independent row and
+every step is elementwise, so the split is bit-exact; on M1 it takes Snake from
+0.358 s to 0.099 s and the codec from 0.939 s to 0.584 s with the same WAV md5.
+
+Note that `half_snake` in `graph.c` has a device branch guarded by `backend !=
+NULL`, and the CPU codec always has a backend object — so the CPU path is
+`mynah_backend_snake_dev`'s fallback in `backend.c`, and the vDSP code in
+`graph.c` is only reachable when no backend is present. `MYNAH_SNAKE_SCALAR=1`
+toggles a branch that a normal CPU synthesis never takes.
+
+Causal convolutions use BNNS and are what remains of codec time (~0.45 s).
+`MYNAH_CODEC_SGEMM=1` selects the im2col+SGEMM path, which is much slower here
+(codec 1.238 s against 0.593 s) and is kept for A/B only.
+
 ## Convert the downloaded checkpoints
 
 ```bash
