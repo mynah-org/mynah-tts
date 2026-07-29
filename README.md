@@ -113,7 +113,7 @@ synthesis-only; below 1.0 is faster than real time.
 
 | Device | ISA / backend | Precision | RTF | Measured |
 |---|---|---|---|---|
-| NVIDIA GB10 (Grace Blackwell) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** ⚡ | 2026-07-25 |
+| NVIDIA RTX 4060-class (~270 GB/s) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** ⚡ | 2026-07-25 |
 | Apple M1 | ARM64 + Accelerate | **int8** | **0.361** ⚡ | 2026-07-29 |
 | Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
 | Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
@@ -121,7 +121,14 @@ synthesis-only; below 1.0 is faster than real time.
 | x86-64 | AVX2 / VNNI | — | not measured | kernels exist, never run |
 | ARM64 server (Grace, Graviton) | NEON/SVE | — | not measured | — |
 
-The GB10 figure is the correct-output result of that session (RTF 14.2 → 0.257,
+The CUDA row was measured on a **mainstream ~270 GB/s NVIDIA GPU (RTX
+4060-class)**, the same reference class `qwen-tts` reports against. Decode is
+memory-bandwidth-bound on weight reads — the finding this whole section rests on
+— so to first order the figure scales with a card's memory bandwidth; a wider
+card should land proportionally lower, but no second CUDA device has been
+measured, so no other GPU row is claimed here.
+
+That 0.257 is the correct-output result of the session (RTF 14.2 → 0.257,
 −98.2%). A 0.209 was reached with a GPU GELU but reverted: CPU `tanhf` is not
 reproducible on CUDA and every variant shifted EOS in the autoregressive loop,
 so 0.209 is not a valid result. That blocker is still open — closing it is worth
@@ -150,7 +157,7 @@ only interleaved numbers are meaningful:
 | route decode through qmat (int8) | 0.517 | 0.279 | −46% | quantized, see below |
 | **overall: f32 baseline → int8** | **0.625** | **0.243** | **−61% (2.6×)** | quantized |
 
-The CUDA campaign (2026-07-25) moved GB10 from RTF 14.2 to 0.257 over a separate
+The CUDA campaign (2026-07-25) moved the reference GPU from RTF 14.2 to 0.257 over a separate
 series: cuBLAS backend, FP16 weight cache, GPU Snake, fused im2col+SGEMM conv1d
 (codec −53%), mapped-buffer zero-copy output and a `k_bias_add` kernel replacing
 `cublasSger`. It also fixed a critical out-of-bounds in `k_layer_norm`.
