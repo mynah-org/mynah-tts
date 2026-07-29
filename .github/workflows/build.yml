@@ -65,6 +65,9 @@ jobs:
       - name: Verify CLI
         run: ./build/cpu/mynah-tts --version && ./build/cpu/mynah-tts --help
 
+      - name: Build the server
+        run: make server ${{ matrix.simd }}
+
       - name: Metal build (macOS only)
         if: matrix.os == 'macos'
         run: |

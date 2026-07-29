@@ -29,8 +29,8 @@ needed.
   f32 stays the bit-exact default.
 - **Faster than real time.** RTF 0.257 on a mainstream NVIDIA GPU, 0.361 on an
   M1 CPU. See [performance](docs/performance.md).
-- **Offline and streaming** from one autoregressive state machine, with a
-  callback API that is sample-identical to offline synthesis.
+- **Offline, streaming and an OpenAI-compatible server** over one autoregressive
+  state machine — the streamed audio is sample-identical to the batch output.
 - **Memory-mapped weights**, reused scratch, no allocation in the decode loop.
 - **Verified against the official NeMo oracle**, with per-stage parity tests and
   model-free kernel self-tests on every ISA.
@@ -121,16 +121,33 @@ A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
 local `.venv` are all gitignored.
 
-## Streaming
+## Server (OpenAI-compatible)
 
-Streaming is a **C API, not a CLI flag** — there is no `--stream` and no HTTP
-server yet.
+```bash
+make server
+./build/cpu/mynah-tts-server -m models/magpie-v2607-pack -p 8080
+
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"hello from mynah","voice":"Sofia"}' -o speech.wav
+
+curl http://localhost:8080/v1/voices          # ids and names
+```
+
+Add `"stream": true` to get chunked PCM as it is generated, sample-identical to
+the batch response. Plain sockets in C, no framework, one binary. It binds to
+loopback and has no auth or TLS — put a proxy in front of anything public.
+Synthesis is serialized behind one mutex, which is a correctness bound rather
+than a tuning choice. Details: **[docs/server.md](docs/server.md)**.
+
+## Streaming (C API)
 
 `mynah_tts_stream_open/push/flush/close` accept token chunks for long-form
-input. `flush` drives the same autoregressive graph offline synthesis uses and
-emits causal, already-stable PCM prefixes through fixed-size callback chunks.
-The stream is sample-identical to offline synthesis for the same request, which
-is what `make stream-test` checks:
+input — this is what the server's streaming mode is built on. `flush` drives the
+same autoregressive graph offline synthesis uses and emits causal, already-stable
+PCM prefixes through fixed-size callback chunks. The stream is sample-identical
+to offline synthesis for the same request, which is what `make stream-test`
+checks:
 
 ```bash
 make stream-test MODEL_DIR=models/magpie-v2607-pack
@@ -145,6 +162,8 @@ diverge from the streaming one.
   threading, the Metal verdict, benchmarking your own machine
 - **[Quantization](docs/quantization.md)** — f16/int8/int4 trade-offs and how to
   judge quantized audio
+- **[Server](docs/server.md)** — the OpenAI-compatible HTTP API, streaming, and
+  why synthesis is serialized
 - **[Voices and languages](docs/voices-and-languages.md)** — speaker IDs and
   their names, the 12 language codes, and the three ways to pass text
 - **[Oracle parity](docs/oracle-parity.md)** — validation against the official

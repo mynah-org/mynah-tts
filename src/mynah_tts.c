@@ -78,15 +78,21 @@ static int regular_file(const char *path) {
 
 static char *read_file(const char *path, size_t *length, char *error,
                        size_t error_capacity) {
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
-        (uintmax_t)st.st_size > 16u * 1024u * 1024u) {
-        snprintf(error, error_capacity, "cannot read manifest: %s", path);
-        return NULL;
-    }
+    /* Open first, then stat the descriptor.  Checking the path with stat() and
+     * opening it afterwards leaves a window in which the path can be swapped
+     * for something else -- a symlink to a device or a much larger file -- so
+     * the checks would describe one file while the read consumed another.
+     * fstat() inspects exactly the object this handle refers to. */
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
         snprintf(error, error_capacity, "cannot open manifest: %s", path);
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fileno(file), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uintmax_t)st.st_size > 16u * 1024u * 1024u) {
+        fclose(file);
+        snprintf(error, error_capacity, "cannot read manifest: %s", path);
         return NULL;
     }
     const size_t size = (size_t)st.st_size;

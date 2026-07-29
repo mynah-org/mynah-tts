@@ -83,7 +83,7 @@ LIBRARY := $(BUILD_DIR)/libmynah_tts.a
 STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
-.PHONY: all cpu info caps self-test test stream-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+.PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist
 
 all: $(TARGET)
@@ -108,6 +108,25 @@ $(STREAM_TEST_TARGET): $(CORE_OBJECTS) $(STREAM_TEST_OBJECT)
 stream-test: $(STREAM_TEST_TARGET)
 	@test -n "$(MODEL_DIR)" || (echo "usage: make stream-test MODEL_DIR=pack" >&2; exit 2)
 	@$(STREAM_TEST_TARGET) "$(MODEL_DIR)"
+
+SERVER_SOURCES := server/main.c server/http_util.c
+SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)
+SERVER_TARGET := $(BUILD_DIR)/mynah-tts-server
+
+$(SERVER_OBJECTS): $(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Iserver $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(SERVER_TARGET): $(CORE_OBJECTS) $(SERVER_OBJECTS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+server: $(SERVER_TARGET)
+	@echo "server ready: $(SERVER_TARGET)"
+
+server-test: $(SERVER_TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make server-test MODEL_DIR=pack" >&2; exit 2)
+	@MODEL_DIR="$(MODEL_DIR)" SERVER="$(SERVER_TARGET)" sh tests/test_server.sh
 
 lib: $(LIBRARY)
 shared: $(TARGET)

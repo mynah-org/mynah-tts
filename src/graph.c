@@ -779,14 +779,23 @@ static void local_projection_cache_free_impl(local_projection_cache *cache) {
     free(cache);
 }
 
+/* Number of audio streams in one stacked frame.
+ *
+ * codebook_count and frame_stacking_factor are `unsigned` fields read from the
+ * pack's model.json, so `a * b` is evaluated in 32-bit unsigned arithmetic and
+ * only widened afterwards: a malformed pack could wrap the product before it
+ * ever reaches size_t, and a guard written as `a > SIZE_MAX / b` does not stop
+ * that because the guard promotes while the multiplication does not.  Widen
+ * both operands first so the arithmetic happens in size_t. */
+static size_t stacked_stream_count(const mynah_tts_model *model) {
+    return (size_t)model->info.codebook_count *
+           (size_t)model->info.frame_stacking_factor;
+}
+
 void *mynah_graph_local_projection_cache_new(const mynah_tts_model *model) {
     if (model == NULL) return NULL;
-    if (model->info.frame_stacking_factor == 0 ||
-        model->info.codebook_count > SIZE_MAX / model->info.frame_stacking_factor) {
-        return NULL;
-    }
-    const size_t streams = model->info.codebook_count *
-                           model->info.frame_stacking_factor;
+    if (model->info.frame_stacking_factor == 0) return NULL;
+    const size_t streams = stacked_stream_count(model);
     if (streams == 0 || streams > SIZE_MAX / sizeof(float *)) return NULL;
     local_projection_cache *cache = (local_projection_cache *)calloc(1, sizeof(*cache));
     if (cache == NULL) return NULL;
@@ -1158,7 +1167,7 @@ static int sample_local_frame(const mynah_tts_model *model, const float *decoder
                               uint64_t *rng_state, int *saw_eos,
                               size_t *eos_frame, char *error, size_t error_capacity) {
     const size_t width = model->info.hidden_dim;
-    const size_t stream_count = model->info.codebook_count * model->info.frame_stacking_factor;
+    const size_t stream_count = stacked_stream_count(model);
     const local_projection_cache *projection_cache =
         (const local_projection_cache *)model->local_projection_cache;
     const int reuse_workspace = getenv("MYNAH_LOCAL_STEP_ALLOCS") == NULL;
@@ -3493,7 +3502,7 @@ int mynah_graph_synthesize_stream(const mynah_tts_model *model,
             mynah_tensor bias;
             if (tensor(model->tts, "final_proj.weight", &projection, error, error_capacity) != 0 ||
                 tensor(model->tts, "final_proj.bias", &bias, error, error_capacity) != 0) break;
-            const size_t streams = model->info.codebook_count * model->info.frame_stacking_factor;
+            const size_t streams = stacked_stream_count(model);
             const int forbid_eos = predicted_stacks * model->info.frame_stacking_factor < min_raw_length;
             const unsigned eos_id = model->info.audio_eos_id;
             const size_t vocab = model->info.audio_vocab_size;
