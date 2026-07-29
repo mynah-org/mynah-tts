@@ -45,44 +45,27 @@ is the big lever and why, on Apple Silicon's unified memory, the GPU is *slower*
 than four CPU threads. The full analysis, the measured improvements and how to
 benchmark your own box are in **[docs/performance.md](docs/performance.md)**.
 
-## Build
+## Quick start
+
+Four steps from a clean checkout to a WAV. No HuggingFace account, no token, no
+Python at runtime.
+
+**1. Build**
 
 ```bash
 make                 # CPU build, never needs a GPU SDK
 make self-test       # kernel correctness on this ISA
-make info            # compiler, OS, arch, BLAS, SIMD
 ```
+
+**2. Download the checkpoints** — all three repos are public and ungated:
 
 ```bash
-./build/cpu/mynah-tts --inspect models/magpie-v2607-pack
-./build/cpu/mynah-tts --synthesize models/magpie-v2607-pack \
-  --text "hello from mynah" --lang en \
-  --output build/native.wav --speaker 4 --seed 42
+./download_model.sh              # Magpie + NanoCodec + ByT5 tokenizer assets
+./download_model.sh --what tts   # or fetch one at a time
 ```
 
-Optional GPU builds use separate object directories, so CPU/Metal/CUDA objects
-can never be mixed:
-
-```bash
-make metal && build/metal/mynah-tts --gpu-self-test metal   # macOS
-make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
-```
-
-Run quantized with `MYNAH_QUANT=int8` (or `f16` / `int4`) — see
-**[docs/quantization.md](docs/quantization.md)** for the accuracy trade-offs.
-
-## Model pack
-
-The checkpoints are public and ungated — **no HuggingFace account or token
-needed**:
-
-```bash
-./download_model.sh                # Magpie + NanoCodec + ByT5 tokenizer assets
-./download_model.sh --what tts     # or fetch one at a time
-```
-
-The runtime never downloads weights implicitly and never loads a raw `.nemo`.
-Convert once into a model pack:
+**3. Convert them into a model pack** — done once. The runtime never downloads
+weights implicitly and never loads a raw `.nemo`:
 
 ```bash
 make convert \
@@ -97,7 +80,33 @@ make tokenizer \
   OUTPUT=models/magpie-v2607-pack/tokenizer/english_phoneme.tsv
 ```
 
-A pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
+**4. Synthesize**
+
+```bash
+./build/cpu/mynah-tts --synthesize models/magpie-v2607-pack \
+  --text "hello from mynah" --lang en \
+  --output build/native.wav --speaker 4 --seed 42
+```
+
+Run quantized with `MYNAH_QUANT=int8` (or `f16` / `int4`) — see
+**[docs/quantization.md](docs/quantization.md)** for the accuracy trade-offs.
+
+## More build options
+
+```bash
+make info                                   # compiler, OS, arch, BLAS, SIMD
+./build/cpu/mynah-tts --inspect models/magpie-v2607-pack
+```
+
+Optional GPU builds use separate object directories, so CPU/Metal/CUDA objects
+can never be mixed:
+
+```bash
+make metal && build/metal/mynah-tts --gpu-self-test metal   # macOS
+make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
+```
+
+A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
 local `.venv` are all gitignored.
 
