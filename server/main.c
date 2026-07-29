@@ -314,6 +314,8 @@ static int16_t to_pcm16(float v) {
 typedef struct {
     int fd;
     int failed;
+    int failure_errno;   /* why the write failed, for the log */
+    size_t sent_bytes;   /* how far the stream got before it stopped */
 } stream_sink;
 
 /* One HTTP chunk per callback: the caller already emits stable causal
@@ -323,7 +325,11 @@ static int stream_callback(const float *samples, size_t count, void *user_data) 
     if (sink->failed || count == 0) return sink->failed ? -1 : 0;
 
     int16_t *pcm = (int16_t *)malloc(count * sizeof(*pcm));
-    if (pcm == NULL) { sink->failed = 1; return -1; }
+    if (pcm == NULL) {
+        sink->failed = 1;
+        sink->failure_errno = ENOMEM;
+        return -1;
+    }
     for (size_t i = 0; i < count; ++i) pcm[i] = to_pcm16(samples[i]);
 
     char size_line[32];
@@ -334,9 +340,11 @@ static int stream_callback(const float *samples, size_t count, void *user_data) 
         write_all(sink->fd, pcm, count * sizeof(*pcm)) != 0 ||
         write_all(sink->fd, "\r\n", 2) != 0) {
         sink->failed = 1;
+        sink->failure_errno = errno;
         free(pcm);
         return -1;
     }
+    sink->sent_bytes += count * sizeof(*pcm);
     free(pcm);
     return 0;
 }
@@ -432,7 +440,7 @@ static void handle_speech(int fd, const char *body) {
                                 g.info.sample_rate);
         if (hn <= 0 || write_all(fd, head, (size_t)hn) != 0) { free(ids); return; }
 
-        stream_sink sink = {fd, 0};
+        stream_sink sink = {fd, 0, 0, 0};
         mynah_tts_stream *st = NULL;
         /* The stream takes its text through push(), not through the request:
          * leaving text_ids set here would feed the same tokens twice and
@@ -455,7 +463,18 @@ static void handle_speech(int fd, const char *body) {
         /* Terminate the chunked body either way; a mid-stream failure cannot
          * become an HTTP status because the header is long gone. */
         write_all(fd, "0\r\n\r\n", 5);
-        if (rc != 0 && !sink.failed) fprintf(stderr, "stream failed: %s\n", err);
+        /* A stream that stops early must never be silent: this used to return
+         * without a word when the socket write was what failed, which makes a
+         * truncated response indistinguishable from a short utterance. */
+        if (sink.failed) {
+            fprintf(stderr, "stream aborted after %zu bytes: %s\n",
+                    sink.sent_bytes,
+                    sink.failure_errno != 0 ? strerror(sink.failure_errno)
+                                            : "client write failed");
+        } else if (rc != 0) {
+            fprintf(stderr, "stream failed after %zu bytes: %s\n",
+                    sink.sent_bytes, err);
+        }
         return;
     }
 

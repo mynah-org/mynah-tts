@@ -201,6 +201,16 @@ Streamed audio remains byte-identical to the offline result for the same
 request — asserted by `make stream-test` and by the server's `stream==batch`
 check.
 
+A stream that stops early is logged with how far it got and why:
+
+```
+stream aborted after 196608 bytes: Broken pipe
+```
+
+This used to be silent when the socket write was what failed, which made a
+truncated response indistinguishable from a short utterance — worth knowing if
+you ever see a stream come back shorter than the same request offline.
+
 ### Memory
 
 A server holds the whole model resident: about 180 MB before its first request
