@@ -1,9 +1,16 @@
+<p align="center">
+  <img src="assets/mynah-logo3-generic.png" alt="Mynah TTS" width="320">
+</p>
+
 # Mynah TTS
 
 [![Build & Test](https://github.com/mynah-org/mynah-tts/actions/workflows/build.yml/badge.svg)](https://github.com/mynah-org/mynah-tts/actions/workflows/build.yml)
 [![Code Quality](https://github.com/mynah-org/mynah-tts/actions/workflows/codeql.yml/badge.svg)](https://github.com/mynah-org/mynah-tts/actions/workflows/codeql.yml)
 [![Memory Safety](https://github.com/mynah-org/mynah-tts/actions/workflows/safety.yml/badge.svg)](https://github.com/mynah-org/mynah-tts/actions/workflows/safety.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/mynah-org/mynah-tts?color=blueviolet)](https://github.com/mynah-org/mynah-tts/releases/latest)
+[![Voices](https://img.shields.io/badge/voices-5-blue)](docs/voices-and-languages.md)
+[![Languages](https://img.shields.io/badge/languages-12-brightgreen)](docs/voices-and-languages.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Fast native C11 inference engine for text-to-speech — llama.cpp-style, no Python
 at runtime. Today it runs NVIDIA MagpieTTS v2607 with NanoCodec; the engine seam
@@ -88,6 +95,10 @@ make tokenizer \
   --output build/native.wav --speaker 4 --seed 42
 ```
 
+`--speaker 4` is **Sofia**; the pack ships 5 voices and 12 languages. The IDs,
+the language codes and the other ways to pass text are in
+**[docs/voices-and-languages.md](docs/voices-and-languages.md)**.
+
 Run quantized with `MYNAH_QUANT=int8` (or `f16` / `int4`) — see
 **[docs/quantization.md](docs/quantization.md)** for the accuracy trade-offs.
 
@@ -112,10 +123,21 @@ local `.venv` are all gitignored.
 
 ## Streaming
 
+Streaming is a **C API, not a CLI flag** — there is no `--stream` and no HTTP
+server yet.
+
 `mynah_tts_stream_open/push/flush/close` accept token chunks for long-form
-input. `flush` drives the shared autoregressive graph and emits causal,
-already-stable PCM prefixes through fixed-size callback chunks. The stream is
-sample-identical to offline synthesis for the same request.
+input. `flush` drives the same autoregressive graph offline synthesis uses and
+emits causal, already-stable PCM prefixes through fixed-size callback chunks.
+The stream is sample-identical to offline synthesis for the same request, which
+is what `make stream-test` checks:
+
+```bash
+make stream-test MODEL_DIR=models/magpie-v2607-pack
+```
+
+There is one state machine behind both paths, so an offline fix cannot silently
+diverge from the streaming one.
 
 ## Docs
 
@@ -123,6 +145,8 @@ sample-identical to offline synthesis for the same request.
   threading, the Metal verdict, benchmarking your own machine
 - **[Quantization](docs/quantization.md)** — f16/int8/int4 trade-offs and how to
   judge quantized audio
+- **[Voices and languages](docs/voices-and-languages.md)** — speaker IDs and
+  their names, the 12 language codes, and the three ways to pass text
 - **[Oracle parity](docs/oracle-parity.md)** — validation against the official
   NeMo implementation
 
