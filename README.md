@@ -105,6 +105,57 @@ interleaved so both arms see the same machine state — gives median RTF 0.691 �
 **0.579 (−16%)**, with byte-identical output. Prefer this interleaved form over
 comparing absolute numbers taken minutes apart.
 
+## Performance
+
+Only Apple M1 has been measured for this model. CUDA and x86 have never been
+benchmarked here — the CUDA backend is still an unvalidated milestone and the
+x86 kernels have no cross-ISA golden test yet — so those rows are left empty
+rather than filled from a sibling project's numbers. Do not transplant RTF from
+another engine: `qwen-tts` figures are for a different model and do not describe
+Magpie.
+
+**Apple M1** (8-core, 16 GB, 4 performance threads), Magpie 357M + NanoCodec,
+one 6.0 s utterance, AC power, one warmup and three serial runs:
+
+| Backend / precision | RTF | note |
+|---|---|---|
+| CPU **int8** | **0.243** ⚡ | ~4.1× faster than real time |
+| CPU **f16** | 0.376 | most accurate quantized mode |
+| CPU f32 | 0.532 | default, bit-exact |
+| Metal (f32) | 0.625 | slower than CPU — see above |
+
+| ISA / device | RTF | status |
+|---|---|---|
+| ARM64 + Accelerate (Apple M1) | 0.243–0.532 | measured |
+| x86-64 AVX2 / VNNI | — | kernels exist, never benchmarked |
+| ARM64 server (Graviton and similar) | — | never benchmarked |
+| CUDA (NVIDIA) | — | backend unvalidated, milestone M9 |
+
+### Speedups from this work
+
+Interleaved A/B on the same binary, three repetitions alternating within one
+batch — absolute RTF drifts several percent between batches on this machine, so
+only interleaved numbers are meaningful:
+
+| change | before | after | delta | output |
+|---|---|---|---|---|
+| threaded single-row matvec + P-core pool | 0.691 | 0.579 | −16% | byte-identical |
+| threaded CPU Snake | 0.285 | 0.254 | −11% | byte-identical |
+| route decode through qmat (int8) | 0.517 | 0.279 | −46% | quantized, see below |
+| **overall: f32 baseline → int8** | **0.625** | **0.243** | **−61% (2.6×)** | quantized |
+
+### Benchmark your own box
+
+```bash
+make bench MODEL_DIR=models/magpie-v2607-pack            # RTF, TTFA, RSS
+make bench-matrix MODEL_DIR=models/magpie-v2607-pack     # f32 / int8 / int4
+make info                                                # compiler, BLAS, SIMD
+make self-test                                           # are the kernels correct on this ISA?
+```
+
+Report the ISA, thread count, backend and model revision with any number; single
+-request latency and batched throughput are different metrics.
+
 ## Quantized decode
 
 `MYNAH_QUANT=f16|int8|int4` converts the decode weights once at load and keeps
