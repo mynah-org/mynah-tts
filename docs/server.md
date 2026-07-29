@@ -149,6 +149,22 @@ model would race on them. Serving concurrent requests in parallel means moving
 that scratch into a per-request context first; until then, extra threads would
 corrupt output rather than speed it up.
 
+Measured on M1 (int8, warm, 4 workers, same request):
+
+| | wall time |
+|---|---|
+| one request | 1.32 s |
+| two concurrent | 2.52 s |
+| ratio | **1.91** (2.0 would be fully serialized) |
+
+Both concurrent responses were byte-identical to each other and to the
+sequential one, so the serialization is correct — it is simply not concurrent.
+
+Removing the mutex today would buy nothing: `mynah_parallel_for` runs a region
+inline when the pool is already busy, so a second synthesis would lose its inner
+parallelism and cost about what queueing costs. Real gain needs a per-context
+thread pool or continuous batching, not a smaller lock.
+
 Practically: throughput is one stream at a time. With RTF ~0.36 on an M1 at
 int8, a single process still generates faster than real time, so a small number
 of queued clients stay ahead of playback.

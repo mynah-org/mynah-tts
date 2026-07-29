@@ -13,8 +13,8 @@ on the standard bench prompt (`make bench`, 20 steps, speaker 4, seed 42).
 | Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
 | Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
 | Apple M1 | Metal | f32 | 0.723 | 2026-07-29 |
-| x86-64 | AVX2 / VNNI | — | not measured | kernels exist, never run |
-| ARM64 server (Grace, Graviton) | NEON/SVE | — | not measured | — |
+| x86-64 | AVX2 / FMA | — | not measured | kernels exist, never run |
+| ARM64 server (Grace, Graviton) | NEON / SVE | — | not measured | server-class ARM only |
 
 On a longer 6.0 s utterance the M1 numbers improve, because the fixed prep and
 codec cost amortizes: int8 **0.243**, f16 0.376, f32 0.532.
@@ -23,10 +23,27 @@ Compare only within one benchmark. Absolute RTF drifts a few percent between
 batches on the same machine, so a difference under ~3% taken minutes apart is
 noise, not a result.
 
-The two empty rows are deliberately empty. The x86 kernels compile but have
-never been benchmarked or checked against a cross-ISA golden test, and no ARM
-server run exists. Do not fill them from a sibling project: `qwen-tts` figures
-describe a different model and say nothing about Magpie.
+**ARM64 is measured** — the Apple M1 rows above are ARM64/NEON. What is missing
+is *server-class* ARM (Grace, Graviton), which has different cache and bandwidth
+behaviour and would need its own run.
+
+The x86 row is empty for a specific reason worth recording, because it looks
+like it should be fillable. The x86 kernels exist and have been optimized
+(`perf: vectorize x86 GELU`, `perf: batch x86 matvec rows`, `perf: optimize x86
+codec and matvec paths`) — but **those commits carry no measurements**, and no
+x86 RTF for this model exists anywhere: not in the commit bodies, not in the
+docs, not in any session log. The optimizations were written and reasoned about,
+never benchmarked.
+
+The box to run them on is known: an **AMD Ryzen 7 6800H** (Zen 3+, 8C/16T,
+AVX2 + FMA3 + BMI2, **no** AVX-512, no AVX-VNNI) reachable on the LAN, building
+under WSL2 for the Linux/OpenBLAS path. `qwen-tts` was benchmarked there; this
+runtime never has. Note this also means the AVX2 path's *correctness* is
+unverified on real hardware — run `make self-test` and read it before reading
+any RTF.
+
+Do not fill these rows from a sibling project: `qwen-tts` figures describe a
+different model and say nothing about Magpie.
 
 ## Why decode is bandwidth-bound
 

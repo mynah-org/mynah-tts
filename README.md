@@ -47,6 +47,9 @@ RTF = synthesis time ÷ audio duration; **below 1.0 is faster than real time**.
 | Apple M1 | CPU (Accelerate) | f32 | 0.662 |
 | Apple M1 | Metal | f32 | 0.723 |
 
+ARM64 is covered by the M1 rows above. x86-64 and server-class ARM have never
+been benchmarked for this model — see [docs/performance.md](docs/performance.md).
+
 Decode is bound by memory bandwidth, not arithmetic — which is why quantization
 is the big lever and why, on Apple Silicon's unified memory, the GPU is *slower*
 than four CPU threads. The full analysis, the measured improvements and how to
