@@ -31,6 +31,9 @@ needed.
   M1 CPU. See [performance](docs/performance.md).
 - **Offline, streaming and an OpenAI-compatible server** over one autoregressive
   state machine — the streamed audio is sample-identical to the batch output.
+- **Continuous request batching** in the server, vLLM-style: concurrent requests
+  share one pass over the decode weights (1.63x aggregate at 8 in flight), each
+  still byte-identical to the same request run alone.
 - **Memory-mapped weights**, reused scratch, no allocation in the decode loop.
 - **Verified against the official NeMo oracle**, with per-stage parity tests and
   model-free kernel self-tests on every ISA.
@@ -124,35 +127,64 @@ A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
 local `.venv` are all gitignored.
 
-## Server (OpenAI-compatible)
+## Server (OpenAI-compatible, with continuous batching)
+
+A real production-shaped HTTP server in plain C sockets — no framework, one
+binary:
 
 ```bash
 make server
 ./build/cpu/mynah-tts-server -m models/magpie-v2607-pack -p 8080
 
+# OpenAI shape
 curl -X POST http://localhost:8080/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"input":"hello from mynah","voice":"Sofia"}' -o speech.wav
 
+# native shape, same audio, honest field names
+curl -X POST http://localhost:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"hello from mynah","speaker":"Sofia"}' -o speech.wav
+
 curl http://localhost:8080/v1/voices          # ids and names
+curl http://localhost:8080/v1/models          # OpenAI-shaped listing
+curl http://localhost:8080/health             # liveness
 ```
 
-Add `"stream": true` to get chunked PCM as it is generated, sample-identical to
-the batch response. Plain sockets in C, no framework, one binary. It binds to
-loopback and has no auth or TLS — put a proxy in front of anything public.
-Queued requests are synthesized together — one pass over the decode weights
-serves everything in flight, measured 1.63x aggregate throughput at eight
-concurrent, with each request receiving byte-identical audio to what it would
-have received alone. Details: **[docs/server.md](docs/server.md)**.
+Requests accept `seed`, `temperature`, `top_k`, `max_steps`, `language` and
+`"stream": true` for chunked PCM as it is generated, sample-identical to the
+batch response.
+
+**Concurrent requests are batched, vLLM-style.** Offline requests are not
+serialized behind a lock: a scheduler admits everything queued into one
+weight-stationary decode — per-request KV, RNG and EOS, one pass over the
+decode weights for all of them (up to 16 in flight). Measured 1.63x aggregate
+throughput at eight concurrent, and stronger than vLLM on one axis: each
+request's audio is **byte-identical** to the same request run alone, whatever
+it happened to batch with. Streaming requests run one at a time by design —
+their callback interleaves with generation.
+
+The plumbing is what you would expect of a real server: a fixed worker pool
+(`-w`, default 4) drains a bounded connection queue, sheds load with `503` +
+`Retry-After` when full, and puts 30 s timeouts on every accepted socket so a
+silent client cannot pin a worker. It binds to loopback and has no auth or
+TLS — put a proxy in front of anything public.
+
+`make server-test MODEL_DIR=...` runs the 15-check suite: every route, three
+identical requests returning byte-identical audio, stream/batch parity, four
+concurrent clients matching their solo runs, a request arriving mid-synthesis,
+and mixed streaming+batch load. Details: **[docs/server.md](docs/server.md)**.
 
 ## Streaming (C API)
 
 `mynah_tts_stream_open/push/flush/close` accept token chunks for long-form
 input — this is what the server's streaming mode is built on. `flush` drives the
 same autoregressive graph offline synthesis uses and emits causal, already-stable
-PCM prefixes through fixed-size callback chunks. The stream is sample-identical
-to offline synthesis for the same request, which is what `make stream-test`
-checks:
+PCM prefixes through fixed-size callback chunks; each chunk decodes only a
+bounded suffix of the codec state rather than the whole prefix, so cost stays
+flat as the utterance grows, and a stream that stops early is reported as an
+error instead of ending silently. The stream is sample-identical to offline
+synthesis for the same request, which is what `make stream-test` checks:
 
 ```bash
 make stream-test MODEL_DIR=models/magpie-v2607-pack
