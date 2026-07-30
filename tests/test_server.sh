@@ -186,4 +186,60 @@ batch_s=$((batch_end - batch_start))
     fail "four concurrent requests ($batch_s s) were slower than four serial ($serial_s s)"
 echo "batching    ok (4 concurrent ${batch_s}s vs 4 serial ${serial_s}s, all byte-identical)"
 
+# --- Continuous admission --------------------------------------------------
+# A request that arrives while another is mid-synthesis must be parked by the
+# scheduler, admitted into the next batch, and still return exactly the audio
+# it would get alone. The batching test above cannot see this path: there every
+# client arrives on an idle server, so nothing is running when they queue.
+LONG='{"input":"this deliberately longer sentence keeps the decoder busy for a while so that a later request truly arrives in the middle of a running synthesis","voice":"Sofia","seed":21}'
+SHORT='{"input":"late arrival","voice":"Leo","seed":22}'
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$LONG" -o "$TMP/adm_long_solo.wav"
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$SHORT" -o "$TMP/adm_short_solo.wav"
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$LONG" -o "$TMP/adm_long.wav" &
+pa=$!
+sleep 1
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$SHORT" -o "$TMP/adm_short.wav" &
+pb=$!
+wait $pa || fail "the running request failed when a late one arrived"
+wait $pb || fail "the late-arriving request failed"
+cmp -s "$TMP/adm_long.wav" "$TMP/adm_long_solo.wav" ||
+    fail "mid-flight arrival perturbed the running request"
+cmp -s "$TMP/adm_short.wav" "$TMP/adm_short_solo.wav" ||
+    fail "late-arriving request differs from the same request run alone"
+echo "admission   ok (request arriving mid-synthesis is served and byte-identical)"
+
+# --- Mixed streaming + batch ----------------------------------------------
+# Streaming runs alone behind the synthesis lock by design; this asserts that
+# streams and batches interleaved under load neither deadlock nor perturb each
+# other: every client must get exactly the audio of the same request run alone.
+SREQ='{"input":"streaming under load","voice":"Leo","seed":31,"stream":true}'
+BREQ='{"input":"mixed load check","voice":"Sofia","seed":32}'
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$BREQ" -o "$TMP/mix_b_solo.wav"
+curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$SREQ" -o "$TMP/mix_s_solo.pcm"
+pids=""
+for i in 1 2; do
+    curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+        -H 'Content-Type: application/json' -d "$BREQ" -o "$TMP/mix_b$i.wav" &
+    pids="$pids $!"
+    curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+        -H 'Content-Type: application/json' -d "$SREQ" -o "$TMP/mix_s$i.pcm" &
+    pids="$pids $!"
+done
+for p in $pids; do
+    wait "$p" || fail "a mixed stream+batch client failed"
+done
+for i in 1 2; do
+    cmp -s "$TMP/mix_b$i.wav" "$TMP/mix_b_solo.wav" ||
+        fail "batch client $i under mixed load differs from solo"
+    cmp -s "$TMP/mix_s$i.pcm" "$TMP/mix_s_solo.pcm" ||
+        fail "stream client $i under mixed load differs from solo"
+done
+echo "mixed       ok (2 streams + 2 batches concurrent, all byte-identical to solo)"
+
 echo "server test: PASS"
