@@ -42,13 +42,18 @@ needed.
 
 RTF = synthesis time ÷ audio duration; **below 1.0 is faster than real time**.
 
-| Device | Backend | Precision | RTF |
-|---|---|---|---|
-| NVIDIA RTX 4060-class (~270 GB/s) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** |
-| Apple M1 | CPU (Accelerate) | **int8** | **0.361** |
-| Apple M1 | CPU (Accelerate) | f16 | 0.495 |
-| Apple M1 | CPU (Accelerate) | f32 | 0.662 |
-| Apple M1 | Metal | f32 | 0.723 |
+| Model | Device | Backend | Precision | RTF |
+|---|---|---|---|---|
+| Magpie 357M v2607 | NVIDIA RTX 4060-class (~270 GB/s) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** |
+| Magpie 357M v2607 | Apple M1 | CPU (Accelerate) | **int8** | **0.361** |
+| Magpie 357M v2607 | Apple M1 | CPU (Accelerate) | f16 | 0.495 |
+| Magpie 357M v2607 | Apple M1 | CPU (Accelerate) | f32 | 0.662 |
+| Magpie 357M v2607 | Apple M1 | Metal | f32 | 0.723 |
+
+"Magpie 357M v2607" is `nvidia/magpie_tts_multilingual_357m` at revision v2607
+with `nemo-nano-codec-22khz`, the one model shipping today — the column is there
+because RTF means nothing without it, and the next engine will not match these
+numbers.
 
 ARM64 is covered by the M1 rows above. x86-64 and server-class ARM have never
 been benchmarked for this model — see [docs/performance.md](docs/performance.md).

@@ -4,17 +4,23 @@ RTF = synthesis time ÷ audio duration; **below 1.0 is faster than real time**.
 All figures are synthesis-only, median of five serial runs after two warmups,
 on the standard bench prompt (`make bench`, 20 steps, speaker 4, seed 42).
 
+Every number below is for **`nvidia/magpie_tts_multilingual_357m` revision
+v2607** paired with `nemo-nano-codec-22khz-1.89kbps-21.5fps` — 357M parameters,
+22050 Hz, 21.5 frames/s. That is the only model shipping today, but RTF is a
+property of the model as much as of the machine: quote the pair, never the
+number alone, and do not carry these figures over to a future engine.
+
 ## Reference numbers
 
-| Device | ISA / backend | Precision | RTF | Measured |
-|---|---|---|---|---|
-| NVIDIA RTX 4060-class (~270 GB/s) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** | 2026-07-25 |
-| Apple M1 | ARM64 + Accelerate | **int8** | **0.361** | 2026-07-29 |
-| Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
-| Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
-| Apple M1 | Metal | f32 | 0.723 | 2026-07-29 |
-| x86-64 | AVX2 / FMA | — | not measured | kernels exist, never run |
-| ARM64 server (Grace, Graviton) | NEON / SVE | — | not measured | server-class ARM only |
+| Model | Device | ISA / backend | Precision | RTF | Measured |
+|---|---|---|---|---|---|
+| Magpie 357M v2607 | NVIDIA RTX 4060-class (~270 GB/s) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** | 2026-07-25 |
+| Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | **int8** | **0.361** | 2026-07-29 |
+| Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
+| Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
+| Magpie 357M v2607 | Apple M1 | Metal | f32 | 0.723 | 2026-07-29 |
+| Magpie 357M v2607 | x86-64 | AVX2 / FMA | — | not measured | kernels exist, never run |
+| Magpie 357M v2607 | ARM64 server (Grace, Graviton) | NEON / SVE | — | not measured | server-class ARM only |
 
 On a longer 6.0 s utterance the M1 numbers improve, because the fixed prep and
 codec cost amortizes: int8 **0.243**, f16 0.376, f32 0.532.
