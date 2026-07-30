@@ -248,6 +248,32 @@ BNNS more efficiency than the split returns. Reverted.
 A real codec win would have to come from the kernels themselves, not from
 scheduling.
 
+### Threaded fused greedy argmax (f32) — accepted 2026-07-30
+
+The fused local-transformer output projection (`mynah_qmat_greedy_argmax`) was
+the last single-threaded consumer of decode weight bandwidth on the f32 greedy
+path: ~6.2 MB of f32 projection weights per stream, sixteen streams per stacked
+frame. It now splits the candidate rows into 32-row blocks over the worker
+pool; each block keeps a private best and the reduction visits blocks in
+ascending row order with a strict `>`, so the serial loop's first-on-ties
+winner — and therefore the token trajectory — is preserved exactly.
+
+M1 (T8103), AC power, f32 greedy (`--temperature 0 --topk 1`), 6.4 s utterance,
+one process per arm, 2 warmups + 5 measured runs, three interleaved
+repetitions, old arm via `MYNAH_ARGMAX_MT=0` from the same binary:
+
+| rep | old median RTF | new median RTF |
+| --- | --- | --- |
+| 1 | 0.565 | 0.544 |
+| 2 | 0.580 | 0.532 |
+| 3 | 0.555 | 0.524 |
+| median | 0.565 | **0.532** |
+
+−5.8%, WAV byte-identical (same md5) in every pair. The change only affects
+f32 greedy synthesis: sampling requests need the full logits and already used
+the threaded batched projection, and quantized modes route through the
+threaded qmat row split.
+
 ## Benchmark your own box
 
 ```bash

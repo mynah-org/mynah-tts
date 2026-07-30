@@ -450,6 +450,91 @@ static void matvec_q_rows(float *out, const int8_t *qx, const float *x, float sx
     qmat_rows_dispatch(&job, 0u, rows);
 }
 
+/* ------------------------------------------------ threaded greedy argmax (f32)
+ *
+ * The fused local-transformer output projection walks the full f32 projection
+ * matrix per stream, and one core only reaches a fraction of DRAM bandwidth
+ * (see the row split above).  Every candidate row is an independent dot
+ * product, so each block computes a private best and the reduction visits
+ * blocks in ascending row order with a strict >, which preserves the serial
+ * loop's first-on-ties winner exactly.  A block whose rows are all masked or
+ * all -inf keeps -inf and never wins, matching the serial kernel's behavior. */
+#define QMAT_ARGMAX_MAX_BLOCKS 512u
+
+typedef struct {
+    const float *weights;
+    const float *in;
+    const float *bias;
+    size_t rows;
+    size_t cols;
+    size_t block;
+    size_t allowed_rows;
+    size_t extra_row;
+    int allow_extra;
+    float *best_value;   /* per block */
+    unsigned *best_row;  /* per block */
+} argmax_rows_job;
+
+static void argmax_rows_block(void *opaque, int block_index) {
+    const argmax_rows_job *j = (const argmax_rows_job *)opaque;
+    const size_t row0 = (size_t)block_index * j->block;
+    size_t end = row0 + j->block;
+    if (end > j->rows) end = j->rows;
+    float best = -INFINITY;
+    size_t winner = 0;
+    for (size_t row = row0; row < end; ++row) {
+        const int allowed = row < j->allowed_rows ||
+                            (j->allow_extra && row == j->extra_row);
+        if (!allowed) continue;
+        float value = mynah_dot_f32(j->weights + row * j->cols, j->in, j->cols);
+        if (j->bias != NULL) value += j->bias[row];
+        if (value > best) {
+            best = value;
+            winner = row;
+        }
+    }
+    j->best_value[block_index] = best;
+    j->best_row[block_index] = (unsigned)winner;
+}
+
+static int matvec_argmax_f32_mt(const float *weights, const float *in,
+                                const float *bias, size_t rows, size_t cols,
+                                size_t allowed_rows, size_t extra_row,
+                                int allow_extra, unsigned *argmax) {
+    const char *env = getenv("MYNAH_ARGMAX_MT");
+    if ((env != NULL && strcmp(env, "0") == 0) || mynah_num_threads() <= 1 ||
+        rows <= 2u * QMAT_ROW_BLOCK || cols == 0u || rows > SIZE_MAX / cols ||
+        rows * cols * sizeof(float) < (size_t)QMAT_THREAD_MIN_BYTES) {
+        return mynah_matvec_argmax_f32(weights, in, bias, rows, cols,
+                                       allowed_rows, extra_row, allow_extra,
+                                       argmax);
+    }
+    if (weights == NULL || in == NULL || argmax == NULL ||
+        allowed_rows > rows || (allow_extra && extra_row >= rows)) {
+        return -1;
+    }
+    size_t blocks = (rows + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK;
+    if (blocks > QMAT_ARGMAX_MAX_BLOCKS) blocks = QMAT_ARGMAX_MAX_BLOCKS;
+    const size_t block = (rows + blocks - 1u) / blocks;
+    blocks = (rows + block - 1u) / block;
+    float best_value[QMAT_ARGMAX_MAX_BLOCKS];
+    unsigned best_row[QMAT_ARGMAX_MAX_BLOCKS];
+    argmax_rows_job job = {weights, in, bias, rows, cols, block,
+                           allowed_rows, extra_row, allow_extra,
+                           best_value, best_row};
+    mynah_parallel_for((int)blocks, argmax_rows_block, &job);
+    float best = -INFINITY;
+    size_t winner = 0;
+    for (size_t i = 0; i < blocks; ++i) {
+        if (best_value[i] > best) {
+            best = best_value[i];
+            winner = best_row[i];
+        }
+    }
+    *argmax = (unsigned)winner;
+    return 0;
+}
+
 /* --------------------------------------------------------------- weight cache */
 typedef struct {
     char *name;
@@ -656,9 +741,9 @@ int mynah_qmat_greedy_argmax_resolved(mynah_qmat_cache *cache, const char *name,
                              unsigned extra_row, int allow_extra, unsigned *argmax,
                              char *error, size_t error_capacity) {
     if (cache == NULL || cache->qtype != QMAT_F32) return 1;
-    if (mynah_matvec_argmax_f32(weight_data, in, bias, n, k,
-                                allowed_rows, (size_t)extra_row,
-                                allow_extra, argmax) != 0) {
+    if (matvec_argmax_f32_mt(weight_data, in, bias, n, k,
+                             allowed_rows, (size_t)extra_row,
+                             allow_extra, argmax) != 0) {
         snprintf(error, error_capacity, "invalid greedy projection shape: %s", name);
         return -1;
     }
