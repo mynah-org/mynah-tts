@@ -750,13 +750,13 @@ int mynah_qmat_greedy_argmax_resolved(mynah_qmat_cache *cache, const char *name,
     return 0;
 }
 
-int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_safetensors *file,
+int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_weights *file,
                              const char *name, const float *in, size_t k, size_t n,
                              const float *bias, size_t allowed_rows,
                              unsigned extra_row, int allow_extra, unsigned *argmax,
                              char *error, size_t error_capacity) {
     mynah_tensor weight;
-    if (mynah_safetensors_get(file, name, &weight) != 0) {
+    if (mynah_weights_get(file, name, &weight) != 0) {
         snprintf(error, error_capacity, "model tensor is missing: %s", name);
         return -1;
     }
@@ -887,12 +887,12 @@ int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *back
     return 0;
 }
 
-int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_safetensors *file,
+int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_weights *file,
                       const mynah_backend *backend, const char *name,
                       const float *in, float *out, size_t count, size_t k, size_t n,
                       const float *bias, char *error, size_t error_capacity) {
     mynah_tensor weight;
-    if (mynah_safetensors_get(file, name, &weight) != 0) {
+    if (mynah_weights_get(file, name, &weight) != 0) {
         snprintf(error, error_capacity, "model tensor is missing: %s", name);
         return -1;
     }

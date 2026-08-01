@@ -87,9 +87,9 @@ static double phase_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static int tensor(const mynah_safetensors *file, const char *name,
+static int tensor(const mynah_weights *file, const char *name,
                   mynah_tensor *out, char *error, size_t error_capacity) {
-    if (mynah_safetensors_get(file, name, out) != 0) {
+    if (mynah_weights_get(file, name, out) != 0) {
         snprintf(error, error_capacity, "model tensor is missing: %s", name);
         return -1;
     }
@@ -285,7 +285,7 @@ static void unfold_causal(const float *input, float *col, size_t length,
     }
 }
 
-static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *backend,
+static int causal_conv_ffn(const mynah_weights *file, const mynah_backend *backend,
                            const char *prefix,
                            size_t layer, const float *input, float *output,
                            size_t length, size_t width, size_t ffn_width,
@@ -384,7 +384,7 @@ static int causal_conv_ffn(const mynah_safetensors *file, const mynah_backend *b
     return 0;
 }
 
-static int self_attention(const mynah_safetensors *file, const mynah_backend *backend,
+static int self_attention(const mynah_weights *file, const mynah_backend *backend,
                           const char *prefix,
                           size_t layer, const float *input, float *output,
                           size_t length, size_t width, size_t heads,
@@ -512,7 +512,7 @@ static int self_attention(const mynah_safetensors *file, const mynah_backend *ba
     return 0;
 }
 
-static int cross_attention(const mynah_safetensors *file, const mynah_backend *backend,
+static int cross_attention(const mynah_weights *file, const mynah_backend *backend,
                            const char *prefix,
                            size_t layer, const float *input, float *output,
                            size_t length, const float *memory, size_t memory_length,
@@ -631,7 +631,7 @@ static int cross_attention(const mynah_safetensors *file, const mynah_backend *b
     return 0;
 }
 
-static int transformer_stack(const mynah_safetensors *file, const mynah_backend *backend,
+static int transformer_stack(const mynah_weights *file, const mynah_backend *backend,
                              const char *prefix,
                              size_t layers, size_t length, size_t width,
                              size_t ffn_width, size_t heads, size_t kernel,
@@ -2007,7 +2007,7 @@ int mynah_graph_bnns_self_test(char *error, size_t error_capacity) {
     return 0;
 }
 
-static int conv1d_causal(const mynah_safetensors *file, const mynah_backend *backend,
+static int conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
                          codec_bnns_cache *bnns_cache,
                          const char *weight_name,
                          const char *bias_name, const float *input, float *output,
@@ -2197,7 +2197,7 @@ static void convt_channel(void *ctx, int oi) {
     }
 }
 
-static int conv_transpose_causal(const mynah_safetensors *file, const char *weight_name,
+static int conv_transpose_causal(const mynah_weights *file, const char *weight_name,
                                  const char *bias_name, const float *input, float *output,
                                  size_t in_channels, size_t out_channels, size_t length,
                                  size_t kernel, size_t stride, size_t groups,
@@ -2247,7 +2247,7 @@ static void snake_channel(void *ctx, int c) {
     }
 }
 
-static int half_snake(const mynah_safetensors *file, const mynah_backend *backend,
+static int half_snake(const mynah_weights *file, const mynah_backend *backend,
                       const char *alpha_name,
                       float *signal, size_t channels, size_t length,
                       codec_conv_profile *profile,
@@ -2322,7 +2322,7 @@ static int half_snake(const mynah_safetensors *file, const mynah_backend *backen
     return 0;
 }
 
-static int res_layer(const mynah_safetensors *file, const mynah_backend *backend,
+static int res_layer(const mynah_weights *file, const mynah_backend *backend,
                      codec_bnns_cache *bnns_cache,
                      size_t stage, const float *input,
                      float *output, size_t channels, size_t length,
@@ -2420,7 +2420,7 @@ static int res_layer(const mynah_safetensors *file, const mynah_backend *backend
 
 /* Metal-resident residual stack.  The three branches and three dilated blocks
  * reuse four device workspaces; no intermediate activation crosses back to C. */
-static int res_layer_device(const mynah_safetensors *file, const mynah_backend *backend,
+static int res_layer_device(const mynah_weights *file, const mynah_backend *backend,
                             size_t stage, const float *dev_input, float *dev_output,
                             size_t channels, size_t length, char *error,
                             size_t error_capacity) {

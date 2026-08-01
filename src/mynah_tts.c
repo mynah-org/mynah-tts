@@ -273,10 +273,10 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
     const int codec_path_length = snprintf(codec_path, sizeof(codec_path), "%s/codec.safetensors", model_dir);
     if (tts_path_length <= 0 || (size_t)tts_path_length >= sizeof(tts_path) ||
         codec_path_length <= 0 || (size_t)codec_path_length >= sizeof(codec_path) ||
-        mynah_safetensors_open(tts_path, &model->tts, tensor_error, sizeof(tensor_error)) != 0 ||
-        mynah_safetensors_open(codec_path, &model->codec, tensor_error, sizeof(tensor_error)) != 0) {
-        mynah_safetensors_close(model->tts);
-        mynah_safetensors_close(model->codec);
+        mynah_weights_open(tts_path, &model->tts, tensor_error, sizeof(tensor_error)) != 0 ||
+        mynah_weights_open(codec_path, &model->codec, tensor_error, sizeof(tensor_error)) != 0) {
+        mynah_weights_close(model->tts);
+        mynah_weights_close(model->codec);
         free(model->model_dir);
         free(model);
         free(manifest);
@@ -284,8 +284,8 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
         return -1;
     }
     if (mynah_backend_open(device, &model->backend, error, error_capacity) != 0) {
-        mynah_safetensors_close(model->tts);
-        mynah_safetensors_close(model->codec);
+        mynah_weights_close(model->tts);
+        mynah_weights_close(model->codec);
         free(model->model_dir);
         free(model);
         free(manifest);
@@ -295,8 +295,8 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
     model->qcache = mynah_qmat_cache_new(-1);
     if (model->qcache == NULL) {
         mynah_backend_close(model->backend);
-        mynah_safetensors_close(model->tts);
-        mynah_safetensors_close(model->codec);
+        mynah_weights_close(model->tts);
+        mynah_weights_close(model->codec);
         free(model->model_dir);
         free(model);
         free(manifest);
@@ -325,8 +325,8 @@ void mynah_tts_model_close(mynah_tts_model *model) {
     mynah_graph_codec_cache_free(model->codec_cache);
     mynah_qmat_cache_free(model->qcache);
     mynah_backend_close(model->backend);
-    mynah_safetensors_close(model->tts);
-    mynah_safetensors_close(model->codec);
+    mynah_weights_close(model->tts);
+    mynah_weights_close(model->codec);
     free(model->model_dir);
     free(model);
 }

@@ -1,4 +1,4 @@
-#include "safetensors.h"
+#include "legacy_safetensors.h"
 
 #include <errno.h>
 #include <fcntl.h>
