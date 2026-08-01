@@ -139,7 +139,7 @@ $(PARITY_TEST_TARGET): $(PARITY_TEST_OBJECT) $(LEGACY_TEST_OBJECT) $(INGOT_LIB)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(PARITY_TEST_OBJECT) $(LEGACY_TEST_OBJECT) $(LDLIBS) -o $@
 
 parity-test: $(PARITY_TEST_TARGET)
-	@$(PARITY_TEST_TARGET)
+	@$(PARITY_TEST_TARGET) $(if $(MODEL_DIR),"$(MODEL_DIR)/tts.safetensors" "$(MODEL_DIR)/codec.safetensors",)
 
 SERVER_SOURCES := server/main.c server/http_util.c
 SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)

@@ -221,7 +221,95 @@ static void gate_bf16_is_the_gain(const char *path) {
     ingot_st_close(new_file);
 }
 
-int main(void) {
+/* The same gate against a real checkpoint: every tensor in the file, not a
+ * fixture. ingot enumerates, the old reader is asked for each name, and the
+ * payload is compared head AND tail — the head catches a wrong offset, the tail
+ * a wrong length. Whole-tensor memcmp for anything up to 1 MiB. */
+static void gate_real_file(const char *path) {
+    char old_err[256] = {0};
+    char new_err[256] = {0};
+
+    mynah_safetensors *old_file = NULL;
+    ingot_st *new_file = NULL;
+    const int old_rc = mynah_safetensors_open(path, &old_file, old_err, sizeof old_err);
+    const int new_rc = ingot_st_open(&new_file, path, new_err, sizeof new_err);
+    CHECK(old_rc == 0 && old_file != NULL, "%s: the old reader opens it (%s)", path, old_err);
+    CHECK(new_rc == 0 && new_file != NULL, "%s: ingot opens it (%s)", path, new_err);
+    if (old_rc != 0 || new_rc != 0) {
+        if (old_file != NULL) mynah_safetensors_close(old_file);
+        if (new_file != NULL) ingot_st_close(new_file);
+        return;
+    }
+
+    const size_t total = ingot_st_count(new_file);
+    size_t missing = 0, mismatched_shape = 0, mismatched_bytes = 0, compared = 0;
+    unsigned long long compared_bytes = 0;
+
+    for (size_t i = 0; i < total; i++) {
+        const ingot_st_tensor *t = ingot_st_at(new_file, i);
+        if (t == NULL) continue;
+
+        mynah_tensor old_t;
+        if (mynah_safetensors_get(old_file, t->name, &old_t) != 0) {
+            if (missing == 0) printf("        first missing name: %s\n", t->name);
+            missing++;
+            continue;
+        }
+
+        int ok = old_t.rank == (size_t)t->rank && old_t.count == (size_t)t->nelem;
+        for (size_t d = 0; ok && d < old_t.rank && d < 4u; d++)
+            if (old_t.shape[d] != (size_t)t->shape[d]) ok = 0;
+        if (!ok) {
+            if (mismatched_shape == 0) printf("        first shape mismatch: %s\n", t->name);
+            mismatched_shape++;
+            continue;
+        }
+
+        const unsigned char *old_bytes = (const unsigned char *)old_t.data;
+        const unsigned char *new_bytes = ingot_st_data(new_file, t);
+        const size_t nbytes = (size_t)t->nbytes;
+        if (old_bytes == NULL || new_bytes == NULL) {
+            mismatched_bytes++;
+            continue;
+        }
+        int same = 1;
+        if (nbytes <= 1024u * 1024u) {
+            same = memcmp(old_bytes, new_bytes, nbytes) == 0;
+            compared_bytes += nbytes;
+        } else {
+            const size_t edge = 4096;
+            same = memcmp(old_bytes, new_bytes, edge) == 0 &&
+                   memcmp(old_bytes + nbytes - edge, new_bytes + nbytes - edge, edge) == 0;
+            compared_bytes += 2u * edge;
+        }
+        if (!same) {
+            if (mismatched_bytes == 0) printf("        first payload mismatch: %s\n", t->name);
+            mismatched_bytes++;
+            continue;
+        }
+        compared++;
+    }
+
+    CHECK(missing == 0, "%zu tensors: the old reader finds every name ingot lists (%zu missing)",
+          total, missing);
+    CHECK(mismatched_shape == 0, "rank, shape and element count agree on all %zu (%zu differ)",
+          total, mismatched_shape);
+    CHECK(mismatched_bytes == 0, "payloads agree on all %zu (%zu differ, %llu bytes compared)",
+          total, mismatched_bytes, compared_bytes);
+    CHECK(compared == total, "every tensor was actually compared (%zu / %zu)", compared, total);
+
+    mynah_safetensors_close(old_file);
+    ingot_st_close(new_file);
+}
+
+int main(int argc, char **argv) {
+    /* Any argument is a real .safetensors (or a model pack directory's file) to
+     * run the gate against, on top of the synthetic fixtures. */
+    for (int a = 1; a < argc; a++) {
+        printf("real checkpoint: %s\n", argv[a]);
+        gate_real_file(argv[a]);
+    }
+
     char dir[] = "/tmp/mynah_parity_XXXXXX";
     if (mkdtemp(dir) == NULL) {
         fprintf(stderr, "cannot create a temp directory\n");
