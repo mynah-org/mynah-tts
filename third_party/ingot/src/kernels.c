@@ -719,7 +719,7 @@ int ingot_q4_k_matvec(const void *weights, size_t rows, size_t cols,
         return ingot_q4_k_matvec_dual_neon(weights, rows, cols, input, output);
 #endif
 #if defined(INGOT_HAVE_Q4_K_AVX2)
-    if (caps.runtime_avx2)
+    if (caps.avx2)
         return ingot_q4_k_matvec_avx2(weights, rows, cols, input, output);
 #endif
     return ingot_q4_k_matvec_scalar(weights, rows, cols, input, output);

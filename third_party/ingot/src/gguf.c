@@ -278,7 +278,13 @@ static int shard_parse(ingot_gguf *g, uint32_t index, int first,
         ingot_err(err, errsz, "'%s' is not a GGUF file (bad magic)", s->path);
         return -1;
     }
-    if (cur_u32(&c, &version) != 0 || version < 2 || version > 3) {
+    /* Split, because the message reads `version`: folding the two together
+     * printed a variable the failed read had never written. */
+    if (cur_u32(&c, &version) != 0) {
+        ingot_err(err, errsz, "'%s' ends inside the GGUF header", s->path);
+        return -1;
+    }
+    if (version < 2 || version > 3) {
         ingot_err(err, errsz, "unsupported GGUF version %u in '%s' (need 2 or 3)",
                   version, s->path);
         return -1;
@@ -356,7 +362,12 @@ static int shard_parse(ingot_gguf *g, uint32_t index, int first,
         t->name = g->names[base + (size_t)i];
         t->shard = index;
 
-        if (cur_u32(&c, &rank) != 0 || rank > INGOT_MAX_RANK) {
+        if (cur_u32(&c, &rank) != 0) {
+            ingot_err(err, errsz, "'%s' ends inside the entry for tensor '%s'",
+                      s->path, t->name);
+            return -1;
+        }
+        if (rank > INGOT_MAX_RANK) {
             ingot_err(err, errsz, "tensor '%s' has rank %u (max %d)",
                       t->name, rank, INGOT_MAX_RANK);
             return -1;

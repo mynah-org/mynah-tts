@@ -190,7 +190,7 @@ The default runs inline.
 
 ## Testing
 
-`make test` runs 235 checks. It builds synthetic containers in a temp directory and checks that
+`make test` runs 283 checks. It builds synthetic containers in a temp directory and checks that
 valid ones parse *and* that malformed ones are rejected cleanly, with a message
 and without a crash: bad magic, v1, truncated headers, payloads past EOF,
 absurd string lengths, alignments that are not powers of two, unknown tensor

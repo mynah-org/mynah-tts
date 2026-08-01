@@ -794,7 +794,13 @@ static int shard_parse(ingot_gguf *g, uint32_t index, int first,
         ingot_err(err, errsz, "'%s' is not a GGUF file (bad magic)", s->path);
         return -1;
     }
-    if (cur_u32(&c, &version) != 0 || version < 2 || version > 3) {
+    /* Split, because the message reads `version`: folding the two together
+     * printed a variable the failed read had never written. */
+    if (cur_u32(&c, &version) != 0) {
+        ingot_err(err, errsz, "'%s' ends inside the GGUF header", s->path);
+        return -1;
+    }
+    if (version < 2 || version > 3) {
         ingot_err(err, errsz, "unsupported GGUF version %u in '%s' (need 2 or 3)",
                   version, s->path);
         return -1;
@@ -872,7 +878,12 @@ static int shard_parse(ingot_gguf *g, uint32_t index, int first,
         t->name = g->names[base + (size_t)i];
         t->shard = index;
 
-        if (cur_u32(&c, &rank) != 0 || rank > INGOT_MAX_RANK) {
+        if (cur_u32(&c, &rank) != 0) {
+            ingot_err(err, errsz, "'%s' ends inside the entry for tensor '%s'",
+                      s->path, t->name);
+            return -1;
+        }
+        if (rank > INGOT_MAX_RANK) {
             ingot_err(err, errsz, "tensor '%s' has rank %u (max %d)",
                       t->name, rank, INGOT_MAX_RANK);
             return -1;
@@ -1913,7 +1924,11 @@ int ingot_st_open_dir(ingot_st **out, const char *dir, char *err, size_t errsz) 
         struct stat sb;
         if (single != NULL && stat(single, &sb) == 0 && S_ISREG(sb.st_mode)) {
             free(single);
-            if (strlist_push(&names, ingot_strdup("model.safetensors")) != 0) {
+            /* Held in a local so a failed push frees it — the other three call
+             * sites already do this. */
+            char *only = ingot_strdup("model.safetensors");
+            if (only == NULL || strlist_push(&names, only) != 0) {
+                free(only);
                 ingot_err(err, errsz, "out of memory");
                 goto out;
             }
@@ -2757,8 +2772,18 @@ int ingot_st_writer_save(ingot_st_writer *w, const char *path,
  * forget — and the "runtime" half is checked on every platform.
  *
  * SPDX-License-Identifier: MIT */
+/* posix_memalign, below. glibc hides it under -std=c11 without this, and an
+ * implicitly declared function is an error on current compilers and undefined
+ * behaviour on the ones that let it through. macOS declares it either way,
+ * which is why only Linux ever complained. */
+#if defined(__APPLE__)
+/* And <sys/sysctl.h> is outside the strict POSIX namespace on Darwin, so the
+ * line above alone breaks the SDK headers. Same pair as in safetensors.c. */
+#endif
+
 
 #include <pthread.h>
+#include <stdlib.h>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -2795,6 +2820,33 @@ int ingot_st_writer_save(ingot_st_writer *w, const char *path,
 static ingot_cpu_caps cached;
 static int cap_level_cap = -1;          /* -1 = auto */
 static pthread_once_t caps_once = PTHREAD_ONCE_INIT;
+
+/* Name to cap level, with no locking of any kind: init_caps runs INSIDE
+ * pthread_once and must never re-enter it. -2 means the name is not one we
+ * know. */
+#define INGOT_LEVEL_UNKNOWN (-2)
+static int level_from_name(const char *name) {
+    if (name == NULL || strcmp(name, "auto") == 0) return -1;
+    if (strcmp(name, "scalar") == 0) return 0;
+    if (strcmp(name, "avx2") == 0 || strcmp(name, "neon") == 0) return 1;
+    if (strcmp(name, "vnni") == 0 || strcmp(name, "dotprod") == 0) return 2;
+    return INGOT_LEVEL_UNKNOWN;
+}
+
+/* The effective level of `caps` once `cap_level_cap` is applied. */
+static int level_of(ingot_cpu_caps caps) {
+    if (caps.avx512_vnni || caps.dotprod) return 2;
+    if (caps.avx2 || caps.neon) return 1;
+    return 0;
+}
+
+static ingot_cpu_caps capped(ingot_cpu_caps caps) {
+    if (cap_level_cap >= 0) {
+        if (cap_level_cap < 2) { caps.avx512_vnni = 0; caps.i8mm = 0; caps.dotprod = 0; }
+        if (cap_level_cap < 1) { caps.avx2 = 0; caps.avx512 = 0; caps.neon = 0; }
+    }
+    return caps;
+}
 
 #if defined(__APPLE__) && defined(__aarch64__)
 static int sysctl_flag(const char *name) {
@@ -2846,6 +2898,9 @@ static void init_caps(void) {
             os_ymm = (xcr0 & 0x6) == 0x6;                          /* XMM|YMM  */
             os_zmm = os_ymm && (xcr0 & 0xe0) == 0xe0;              /* + ZMM    */
         }
+#if !defined(INGOT_COMPILED_AVX512) && !defined(INGOT_COMPILED_AVX512_VNNI)
+        (void)os_zmm;   /* only the AVX-512 checks below read it */
+#endif
         if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) {
 #if defined(INGOT_COMPILED_AVX2)
             cached.avx2 = os_ymm && ((b >> 5) & 1);
@@ -2861,32 +2916,29 @@ static void init_caps(void) {
 #endif
 
     /* INGOT_CAPS caps the level without a rebuild, which is how you bisect a
-     * bug that only shows up on one SIMD path. */
+     * bug that only shows up on one SIMD path. Parsed inline, NOT through
+     * ingot_cpu_set_level(): we are inside pthread_once here, and that function
+     * enters it again — recursing on the same pthread_once_t is undefined and
+     * killed the process outright. An unknown name is ignored rather than
+     * fatal: an environment variable must not be able to stop a library. */
     const char *env = getenv("INGOT_CAPS");
-    if (env != NULL) ingot_cpu_set_level(env);
+    if (env != NULL) {
+        const int level = level_from_name(env);
+        if (level != INGOT_LEVEL_UNKNOWN) cap_level_cap = level;
+    }
 }
 
 ingot_cpu_caps ingot_cpu(void) {
     pthread_once(&caps_once, init_caps);
-    ingot_cpu_caps caps = cached;
-    if (cap_level_cap >= 0) {
-        if (cap_level_cap < 2) { caps.avx512_vnni = 0; caps.i8mm = 0; caps.dotprod = 0; }
-        if (cap_level_cap < 1) { caps.avx2 = 0; caps.avx512 = 0; caps.neon = 0; }
-    }
-    return caps;
+    return capped(cached);
 }
 
 int ingot_cpu_set_level(const char *name) {
     pthread_once(&caps_once, init_caps);
-    if (name == NULL || strcmp(name, "auto") == 0) cap_level_cap = -1;
-    else if (strcmp(name, "scalar") == 0) cap_level_cap = 0;
-    else if (strcmp(name, "avx2") == 0 || strcmp(name, "neon") == 0) cap_level_cap = 1;
-    else if (strcmp(name, "vnni") == 0 || strcmp(name, "dotprod") == 0) cap_level_cap = 2;
-    else return -1;
-    const ingot_cpu_caps caps = ingot_cpu();
-    if (caps.avx512_vnni || caps.dotprod) return 2;
-    if (caps.avx2 || caps.neon) return 1;
-    return 0;
+    const int level = level_from_name(name);
+    if (level == INGOT_LEVEL_UNKNOWN) return -1;
+    cap_level_cap = level;
+    return level_of(capped(cached));
 }
 
 /* ── thread injection ───────────────────────────────────────────────────── */
@@ -6795,7 +6847,7 @@ int ingot_q4_k_matvec(const void *weights, size_t rows, size_t cols,
         return ingot_q4_k_matvec_dual_neon(weights, rows, cols, input, output);
 #endif
 #if defined(INGOT_HAVE_Q4_K_AVX2)
-    if (caps.runtime_avx2)
+    if (caps.avx2)
         return ingot_q4_k_matvec_avx2(weights, rows, cols, input, output);
 #endif
     return ingot_q4_k_matvec_scalar(weights, rows, cols, input, output);
