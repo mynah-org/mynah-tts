@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYNAH_TTS_VERSION "1.1.0"
+#define MYNAH_TTS_VERSION "1.2.0"
 
 typedef struct mynah_tts_model mynah_tts_model;
 
