@@ -239,9 +239,13 @@ oracle:
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
 
 METAL_BUILD_DIR := build/metal
-METAL_CPPFLAGS := -Isrc -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+# The GPU variants define their own flags rather than inheriting CPPFLAGS, so
+# the ingot include path has to be repeated here. The library itself arrives
+# through LDLIBS, which they do share.
+METAL_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
 METAL_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -ffast-math -fno-finite-math-only -DMYNAH_ENABLE_METAL
 METAL_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o)
+$(METAL_CORE_OBJECTS): | $(INGOT_LIB)
 METAL_CLI_OBJECT := $(METAL_BUILD_DIR)/cli/main.o
 METAL_HOST_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal.o
 METAL_OPS_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal_ops.o
@@ -273,12 +277,13 @@ metal:
 endif
 
 CUDA_BUILD_DIR := build/cuda
-CUDA_CPPFLAGS := -Isrc
+CUDA_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include
 CUDA_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -DMYNAH_ENABLE_CUDA
 ifneq ($(UNAME_S),Darwin)
 CUDA_CPPFLAGS += -D_DEFAULT_SOURCE
 endif
 CUDA_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o)
+$(CUDA_CORE_OBJECTS): | $(INGOT_LIB)
 CUDA_CLI_OBJECT := $(CUDA_BUILD_DIR)/cli/main.o
 CUDA_HOST_OBJECT := $(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o
 CUDA_TARGET := $(CUDA_BUILD_DIR)/mynah-tts
