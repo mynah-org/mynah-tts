@@ -89,10 +89,8 @@ TARGET := $(BUILD_DIR)/mynah-tts
 LIBRARY := $(BUILD_DIR)/libmynah_tts.a
 STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
-PARITY_TEST_OBJECT := $(BUILD_DIR)/tests/test_ingot_parity.o
-PARITY_TEST_TARGET := $(BUILD_DIR)/tests/test_ingot_parity
 
-.PHONY: all cpu info caps self-test test stream-test parity-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+.PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist
 
 all: $(TARGET)
@@ -122,24 +120,6 @@ $(STREAM_TEST_TARGET): $(CORE_OBJECTS) $(STREAM_TEST_OBJECT)
 stream-test: $(STREAM_TEST_TARGET)
 	@test -n "$(MODEL_DIR)" || (echo "usage: make stream-test MODEL_DIR=pack" >&2; exit 2)
 	@$(STREAM_TEST_TARGET) "$(MODEL_DIR)"
-
-# A/B gate for the ingot migration: the reader this branch replaces and ingot,
-# in one binary, asked the same questions about the same file. Needs no model on
-# disk. tests/legacy_safetensors.c is the pre-migration parser kept as a test
-# fixture — it is not built into the product. All three go away when this branch
-# is merged.
-LEGACY_TEST_OBJECT := $(BUILD_DIR)/tests/legacy_safetensors.o
-
-$(PARITY_TEST_OBJECT) $(LEGACY_TEST_OBJECT): $(BUILD_DIR)/tests/%.o: tests/%.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) -MMD -MP -c $< -o $@
-
-$(PARITY_TEST_TARGET): $(PARITY_TEST_OBJECT) $(LEGACY_TEST_OBJECT) $(INGOT_LIB)
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(LDFLAGS) $(PARITY_TEST_OBJECT) $(LEGACY_TEST_OBJECT) $(LDLIBS) -o $@
-
-parity-test: $(PARITY_TEST_TARGET)
-	@$(PARITY_TEST_TARGET) $(if $(MODEL_DIR),"$(MODEL_DIR)/tts.safetensors" "$(MODEL_DIR)/codec.safetensors",)
 
 SERVER_SOURCES := server/main.c server/http_util.c
 SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)
