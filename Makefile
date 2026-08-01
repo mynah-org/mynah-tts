@@ -343,5 +343,8 @@ dist:
 
 clean:
 	rm -rf build
+	@# Without this, libingot.a survives a clean: update the subtree and the
+	@# next build silently links the previous library.
+	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
 
 -include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d)
