@@ -645,7 +645,11 @@ int ingot_st_open_dir(ingot_st **out, const char *dir, char *err, size_t errsz) 
         struct stat sb;
         if (single != NULL && stat(single, &sb) == 0 && S_ISREG(sb.st_mode)) {
             free(single);
-            if (strlist_push(&names, ingot_strdup("model.safetensors")) != 0) {
+            /* Held in a local so a failed push frees it — the other three call
+             * sites already do this. */
+            char *only = ingot_strdup("model.safetensors");
+            if (only == NULL || strlist_push(&names, only) != 0) {
+                free(only);
                 ingot_err(err, errsz, "out of memory");
                 goto out;
             }

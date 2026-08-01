@@ -217,7 +217,28 @@ static void test_guards(void) {
           "dequant refuses a partial block");
 }
 
+/* INGOT_CAPS is the documented way to bisect a bug that only shows on one SIMD
+ * path, so it has to survive being set. It is read once, lazily, on the first
+ * call into the library — which is why this runs FIRST, before anything else
+ * has touched ingot_cpu(): setting it afterwards would test nothing.
+ *
+ * It used to kill the process. init_caps() runs inside pthread_once and called
+ * ingot_cpu_set_level(), which enters the same pthread_once again. */
+static void test_caps_env(void) {
+    printf("INGOT_CAPS, the SIMD kill-switch\n");
+    setenv("INGOT_CAPS", "scalar", 1);
+    const ingot_cpu_caps caps = ingot_cpu();      /* must not hang or die */
+    CHECK(caps.neon == 0 && caps.avx2 == 0 && caps.dotprod == 0 && caps.i8mm == 0,
+          "INGOT_CAPS=scalar turns every SIMD path off");
+
+    CHECK(ingot_cpu_set_level("auto") >= 0, "set_level(\"auto\") restores the real caps");
+    CHECK(ingot_cpu_set_level("nonsense") == -1, "an unknown level is refused, not fatal");
+    ingot_cpu_set_level("auto");
+    unsetenv("INGOT_CAPS");
+}
+
 int main(void) {
+    test_caps_env();
     test_quantize();
     test_formats();
     test_matmat();
