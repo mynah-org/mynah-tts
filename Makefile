@@ -74,7 +74,14 @@ endif
 endif
 endif
 
-CORE_SOURCES := src/mynah_tts.c src/safetensors.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c
+# ingot: the GGUF/safetensors reader, vendored as a subtree. Built by its own
+# Makefile so this one never learns how it is compiled.
+INGOT_DIR := third_party/ingot
+INGOT_LIB := $(INGOT_DIR)/libingot.a
+CPPFLAGS += -I$(INGOT_DIR)/include
+LDLIBS += $(INGOT_LIB)
+
+CORE_SOURCES := src/mynah_tts.c src/weights.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
@@ -92,6 +99,11 @@ cpu: all
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(INGOT_LIB):
+	$(MAKE) -C $(INGOT_DIR) lib
+
+$(CORE_OBJECTS): | $(INGOT_LIB)
 
 $(TARGET): $(CORE_OBJECTS) $(CLI_OBJECT)
 	@mkdir -p $(@D)
@@ -207,9 +219,13 @@ oracle:
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
 
 METAL_BUILD_DIR := build/metal
-METAL_CPPFLAGS := -Isrc -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+# The GPU variants define their own flags rather than inheriting CPPFLAGS, so
+# the ingot include path has to be repeated here. The library itself arrives
+# through LDLIBS, which they do share.
+METAL_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
 METAL_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -ffast-math -fno-finite-math-only -DMYNAH_ENABLE_METAL
 METAL_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o)
+$(METAL_CORE_OBJECTS): | $(INGOT_LIB)
 METAL_CLI_OBJECT := $(METAL_BUILD_DIR)/cli/main.o
 METAL_HOST_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal.o
 METAL_OPS_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal_ops.o
@@ -241,12 +257,13 @@ metal:
 endif
 
 CUDA_BUILD_DIR := build/cuda
-CUDA_CPPFLAGS := -Isrc
+CUDA_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include
 CUDA_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -DMYNAH_ENABLE_CUDA
 ifneq ($(UNAME_S),Darwin)
 CUDA_CPPFLAGS += -D_DEFAULT_SOURCE
 endif
 CUDA_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o)
+$(CUDA_CORE_OBJECTS): | $(INGOT_LIB)
 CUDA_CLI_OBJECT := $(CUDA_BUILD_DIR)/cli/main.o
 CUDA_HOST_OBJECT := $(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o
 CUDA_TARGET := $(CUDA_BUILD_DIR)/mynah-tts
@@ -306,5 +323,8 @@ dist:
 
 clean:
 	rm -rf build
+	@# Without this, libingot.a survives a clean: update the subtree and the
+	@# next build silently links the previous library.
+	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
 
 -include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d)

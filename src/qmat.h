@@ -17,7 +17,7 @@
 #include <stdint.h>
 
 #include "backend.h"
-#include "safetensors.h"
+#include "weights.h"
 
 typedef struct mynah_qmat_cache mynah_qmat_cache;
 
@@ -30,7 +30,7 @@ int mynah_qmat_cache_enabled(const mynah_qmat_cache *cache);
 /* out[count, n] = in[count, k] @ W[n, k]^T (+ bias), where W is the tensor
  * `name` in `file`.  Uses the cached int8 weight when the cache is enabled and
  * count is small; otherwise the f32 backend matmul.  0 = ok, -1 = error. */
-int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_safetensors *file,
+int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_weights *file,
                       const mynah_backend *backend, const char *name,
                       const float *in, float *out, size_t count, size_t k, size_t n,
                       const float *bias, char *error, size_t error_capacity);
@@ -60,7 +60,7 @@ int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *back
 /* Greedy f32 projection fused with the constrained argmax.  Returns 0 when
  * fused, 1 when the cache/backend is not eligible and the caller should use
  * mynah_qmat_linear, or -1 on a model/input error. */
-int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_safetensors *file,
+int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_weights *file,
                              const char *name, const float *in, size_t k, size_t n,
                              const float *bias, size_t allowed_rows,
                              unsigned extra_row, int allow_extra, unsigned *argmax,

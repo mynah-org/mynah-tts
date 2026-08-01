@@ -111,6 +111,11 @@ typedef struct {
     return cached;
 }
 
+/* CONTRACT: `pointer` must be resident and immutable for the life of this
+ * state — a mapped model tensor, or static storage. The device copy is made
+ * once and keyed on the ADDRESS: it is never refreshed, so passing memory whose
+ * contents change, or whose address can be reused (anything on the stack),
+ * makes the GPU silently read whatever was cached first. */
 - (id<MTLBuffer>)bufferForHostPointer:(const void *)pointer length:(NSUInteger)length {
     for (MynahMetalCachedBuffer *cached in self.weight_cache) {
         if (cached.host_pointer == pointer && cached.length == length) return cached.buffer;
@@ -361,15 +366,18 @@ static int metal_matmul(void *opaque, const float *input, float *output, size_t 
 }
 
 static int metal_self_test(void *opaque, char *error, size_t error_capacity) {
-    const float input[6] = {1.0f, 2.0f, 3.0f, -1.0f, 0.5f, 2.0f};
-    const float weight[12] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
-                              0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-    const float bias[4] = {0.5f, -0.5f, 1.0f, 2.0f};
-    const float expected[8] = {1.5f, 1.5f, 4.0f, 8.0f, -0.5f, 0.0f, 3.0f, 3.5f};
-    float output[8] = {0};
-    float tiled_weight[128] = {0};
-    float tiled_bias[64] = {0};
-    float tiled_output[64] = {0};
+    /* Static for the same reason as in mynah_metal_ops_self_test: the device
+     * buffer cache is keyed on the host address and assumes that address keeps
+     * its contents, which a stack frame does not. */
+    static const float input[6] = {1.0f, 2.0f, 3.0f, -1.0f, 0.5f, 2.0f};
+    static const float weight[12] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+                                     0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    static const float bias[4] = {0.5f, -0.5f, 1.0f, 2.0f};
+    static const float expected[8] = {1.5f, 1.5f, 4.0f, 8.0f, -0.5f, 0.0f, 3.0f, 3.5f};
+    static float output[8] = {0};
+    static float tiled_weight[128] = {0};
+    static float tiled_bias[64] = {0};
+    static float tiled_output[64] = {0};
     if (metal_matmul(opaque, input, output, 2u, 3u, 4u, weight, bias,
                      error, error_capacity) != 0) return -1;
     for (size_t i = 0; i < 8u; ++i) {

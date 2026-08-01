@@ -3,14 +3,14 @@
 
 #include "mynah_tts.h"
 #include "backend.h"
-#include "safetensors.h"
+#include "weights.h"
 #include "qmat.h"
 
 struct mynah_tts_model {
     char *model_dir;
     mynah_tts_model_info info;
-    mynah_safetensors *tts;
-    mynah_safetensors *codec;
+    mynah_weights *tts;
+    mynah_weights *codec;
     mynah_backend *backend;
     mynah_qmat_cache *qcache;
     void *codec_cache;

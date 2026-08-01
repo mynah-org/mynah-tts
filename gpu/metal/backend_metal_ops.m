@@ -1007,19 +1007,27 @@ int mynah_metal_ops_self_test(void *opaque, char *error, size_t capacity) {
     float *dqkv = NULL;
     float *dsk = NULL;
     float *dsv = NULL;
-    float input[] = {1.0f, 2.0f};
-    float weight[] = {1.0f, 0.0f, 0.0f, 1.0f};
-    float bias[] = {0.5f, -0.5f};
-    float zeros[] = {0.0f, 0.0f};
-    float output[2] = {0.0f, 0.0f};
-    float attention_qkv[] = {1.0f, 0.0f, 1.0f, 0.0f, 2.0f, 3.0f};
-    float attention_qkv_2[] = {1.0f, 0.0f, 0.0f, 1.0f, 4.0f, 5.0f};
-    float attention_out[2] = {0.0f, 0.0f};
-    float conv_input[] = {1.0f, 2.0f, 3.0f};
-    float conv_weight[] = {1.0f, 2.0f};
-    float conv_output[3] = {0.0f, 0.0f, 0.0f};
-    float norm_gain[] = {1.0f, 1.0f};
-    float alpha[] = {1.0f, 1.0f};
+    /* Static, not stack. metal_ops_buffer keeps one device copy per host
+     * ADDRESS and never refreshes it, on the contract that the host memory is a
+     * resident, immutable weight that outlives the cache — true for the mmapped
+     * model tensors it exists for. Stack frames recycle addresses, so as locals
+     * these arrays landed on the previous self-test's frame and the GPU read
+     * that one's numbers: the matmul saw a weight row of {1, 2} and returned
+     * 4.5 instead of 1.5. Static storage gives each array its own address for
+     * the life of the process, so the cached copy always matches. */
+    static float input[] = {1.0f, 2.0f};
+    static float weight[] = {1.0f, 0.0f, 0.0f, 1.0f};
+    static float bias[] = {0.5f, -0.5f};
+    static float zeros[] = {0.0f, 0.0f};
+    static float output[2] = {0.0f, 0.0f};
+    static float attention_qkv[] = {1.0f, 0.0f, 1.0f, 0.0f, 2.0f, 3.0f};
+    static float attention_qkv_2[] = {1.0f, 0.0f, 0.0f, 1.0f, 4.0f, 5.0f};
+    static float attention_out[2] = {0.0f, 0.0f};
+    static float conv_input[] = {1.0f, 2.0f, 3.0f};
+    static float conv_weight[] = {1.0f, 2.0f};
+    static float conv_output[3] = {0.0f, 0.0f, 0.0f};
+    static float norm_gain[] = {1.0f, 1.0f};
+    static float alpha[] = {1.0f, 1.0f};
     MynahMetalState *state = (__bridge MynahMetalState *)opaque;
     if (metal_ops_alloc(state, 2u, &din, error, capacity) != 0 ||
         metal_ops_alloc(state, 2u, &dout, error, capacity) != 0 ||
@@ -1032,15 +1040,22 @@ int mynah_metal_ops_self_test(void *opaque, char *error, size_t capacity) {
         mynah_metal_matmul_d2d(opaque, din, dout, 1u, 2u, 2u, weight, bias,
                                error, capacity) != 0 ||
         mynah_metal_sync(opaque, error, capacity) != 0 ||
-        mynah_metal_d2h(opaque, dout, output, 2u, error, capacity) != 0 ||
-        fabsf(output[0] - 1.5f) > 1e-5f || fabsf(output[1] - 1.5f) > 1e-5f) goto fail;
+        mynah_metal_d2h(opaque, dout, output, 2u, error, capacity) != 0) goto fail;
+    if (fabsf(output[0] - 1.5f) > 1e-5f || fabsf(output[1] - 1.5f) > 1e-5f) {
+        snprintf(error, capacity, "Metal matmul mismatch: %.8g %.8g (want 1.5 1.5)",
+                 (double)output[0], (double)output[1]);
+        goto fail;
+    }
     if (mynah_metal_h2d(opaque, attention_qkv, dqkv, 6u, error, capacity) != 0 ||
         mynah_metal_self_attention_dev(opaque, dqkv, dsk, dsv, 0u, 2u, 1u,
                                        1u, 2u, 1.0f, dout, error, capacity) != 0 ||
         mynah_metal_sync(opaque, error, capacity) != 0 ||
-        mynah_metal_d2h(opaque, dout, attention_out, 2u, error, capacity) != 0 ||
-        fabsf(attention_out[0] - 2.0f) > 1e-5f ||
-        fabsf(attention_out[1] - 3.0f) > 1e-5f) goto fail;
+        mynah_metal_d2h(opaque, dout, attention_out, 2u, error, capacity) != 0) goto fail;
+    if (fabsf(attention_out[0] - 2.0f) > 1e-5f || fabsf(attention_out[1] - 3.0f) > 1e-5f) {
+        snprintf(error, capacity, "Metal 1-token attention mismatch: %.8g %.8g (want 2 3)",
+                 (double)attention_out[0], (double)attention_out[1]);
+        goto fail;
+    }
     if (mynah_metal_h2d(opaque, attention_qkv_2, dqkv, 6u, error, capacity) != 0 ||
         mynah_metal_self_attention_dev(opaque, dqkv, dsk, dsv, 1u, 2u, 2u,
                                        1u, 2u, 1.0f, dout, error, capacity) != 0 ||
@@ -1074,14 +1089,22 @@ int mynah_metal_ops_self_test(void *opaque, char *error, size_t capacity) {
         if (mynah_metal_h2d(opaque, clip_values, dtmp, 2u, error, capacity) != 0 ||
             mynah_metal_clip_dev(opaque, dtmp, 2u, error, capacity) != 0 ||
             mynah_metal_sync(opaque, error, capacity) != 0 ||
-            mynah_metal_d2h(opaque, dtmp, output, 2u, error, capacity) != 0 ||
-            output[0] != -1.0f || output[1] != 0.0f) goto fail;
+            mynah_metal_d2h(opaque, dtmp, output, 2u, error, capacity) != 0) goto fail;
+        if (output[0] != -1.0f || output[1] != 0.0f) {
+            snprintf(error, capacity, "Metal clip mismatch: %.8g %.8g (want -1 0)",
+                     (double)output[0], (double)output[1]);
+            goto fail;
+        }
     }
     if (mynah_metal_conv1d(opaque, conv_input, conv_output, 1, 1, 3, 2, 1,
-                           conv_weight, NULL, error, capacity) != 0 ||
-        fabsf(conv_output[0] - 2.0f) > 1e-5f ||
+                           conv_weight, NULL, error, capacity) != 0) goto fail;
+    if (fabsf(conv_output[0] - 2.0f) > 1e-5f ||
         fabsf(conv_output[1] - 5.0f) > 1e-5f ||
-        fabsf(conv_output[2] - 8.0f) > 1e-5f) goto fail;
+        fabsf(conv_output[2] - 8.0f) > 1e-5f) {
+        snprintf(error, capacity, "Metal conv1d mismatch: %.8g %.8g %.8g (want 2 5 8)",
+                 (double)conv_output[0], (double)conv_output[1], (double)conv_output[2]);
+        goto fail;
+    }
     mynah_metal_dev_free(opaque, din);
     mynah_metal_dev_free(opaque, dout);
     mynah_metal_dev_free(opaque, dtmp);
