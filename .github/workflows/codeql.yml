@@ -50,7 +50,7 @@ jobs:
             -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone,-bugprone-integer-division' \
             -warnings-as-errors='' \
             src/*.c cli/main.c server/*.c \
-            -- -std=c11 -Isrc -Iserver -D_DEFAULT_SOURCE -DMYNAH_USE_OPENBLAS -I/usr/include/openblas
+            -- -std=c11 -Isrc -Iserver -Ithird_party/ingot/include -D_DEFAULT_SOURCE -DMYNAH_USE_OPENBLAS -I/usr/include/openblas
 
   python:
     name: Python tooling
