@@ -132,6 +132,12 @@ A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
 local `.venv` are all gitignored.
 
+Weights are read through [ingot](https://github.com/mynah-org/ingot), vendored
+as a **git subtree** in `third_party/ingot`: a plain `git clone` already
+contains it — no submodule init, nothing extra to fetch. When upstream ingot
+gains something you want, `make update-ingot` (on a clean working tree) pulls
+it in as a single squashed commit.
+
 ## Server (OpenAI-compatible, with continuous batching)
 
 A real production-shaped HTTP server in plain C sockets — no framework, one

@@ -91,7 +91,7 @@ STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
 .PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
-        metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist
+        metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
 cpu: all
@@ -326,5 +326,12 @@ clean:
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
+
+# Refresh the vendored ingot subtree from upstream. A plain clone already
+# contains ingot (subtree = real files in-tree, nothing to init); this is only
+# needed to pick up new upstream commits. Requires a clean working tree.
+update-ingot:
+	git subtree pull --prefix $(INGOT_DIR) https://github.com/mynah-org/ingot.git main --squash
+	@$(MAKE) -C $(INGOT_DIR) clean
 
 -include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d)
