@@ -26,3 +26,7 @@ compile_commands.json
 
 # internal migration playbooks — local work, not part of the library
 docs/migration/
+
+# make -MMD dependency files + build tree
+src/*.d
+build/

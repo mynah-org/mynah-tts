@@ -55,6 +55,15 @@
 #if defined(__AVX512VNNI__)
 #define INGOT_COMPILED_AVX512_VNNI 1
 #endif
+#if defined(__F16C__)
+#define INGOT_COMPILED_F16C 1
+#endif
+#if defined(__AVX512BF16__)
+#define INGOT_COMPILED_AVX512_BF16 1
+#endif
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) || defined(__ARM_FEATURE_BF16)
+#define INGOT_COMPILED_ARM_BF16 1
+#endif
 
 static ingot_cpu_caps cached;
 static int cap_level_cap = -1;          /* -1 = auto */
@@ -81,8 +90,14 @@ static int level_of(ingot_cpu_caps caps) {
 
 static ingot_cpu_caps capped(ingot_cpu_caps caps) {
     if (cap_level_cap >= 0) {
-        if (cap_level_cap < 2) { caps.avx512_vnni = 0; caps.i8mm = 0; caps.dotprod = 0; }
-        if (cap_level_cap < 1) { caps.avx2 = 0; caps.avx512 = 0; caps.neon = 0; }
+        if (cap_level_cap < 2) {
+            caps.avx512_vnni = 0; caps.i8mm = 0; caps.dotprod = 0;
+            caps.bf16 = 0; caps.avx512_bf16 = 0;
+        }
+        if (cap_level_cap < 1) {
+            caps.avx2 = 0; caps.avx512 = 0; caps.neon = 0;
+            caps.f16c = 0;
+        }
     }
     return caps;
 }
@@ -127,6 +142,15 @@ static void init_caps(void) {
     cached.i8mm = 1;
 #endif
 #endif
+#if defined(INGOT_COMPILED_ARM_BF16)
+#if defined(__APPLE__)
+    cached.bf16 = sysctl_flag("hw.optional.arm.FEAT_BF16");
+#elif defined(__linux__) && defined(__aarch64__) && defined(HWCAP2_BF16)
+    cached.bf16 = (getauxval(AT_HWCAP2) & HWCAP2_BF16) != 0;
+#else
+    cached.bf16 = 1;
+#endif
+#endif
 
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
     {
@@ -136,8 +160,12 @@ static void init_caps(void) {
             const unsigned long long xcr0 = xgetbv0();
             os_ymm = (xcr0 & 0x6) == 0x6;                          /* XMM|YMM  */
             os_zmm = os_ymm && (xcr0 & 0xe0) == 0xe0;              /* + ZMM    */
+#if defined(INGOT_COMPILED_F16C)
+            cached.f16c = os_ymm && ((c >> 29) & 1);               /* leaf 1 ECX */
+#endif
         }
-#if !defined(INGOT_COMPILED_AVX512) && !defined(INGOT_COMPILED_AVX512_VNNI)
+#if !defined(INGOT_COMPILED_AVX512) && !defined(INGOT_COMPILED_AVX512_VNNI) && \
+    !defined(INGOT_COMPILED_AVX512_BF16)
         (void)os_zmm;   /* only the AVX-512 checks below read it */
 #endif
         if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) {
@@ -151,6 +179,11 @@ static void init_caps(void) {
             cached.avx512_vnni = os_zmm && ((c >> 11) & 1);
 #endif
         }
+#if defined(INGOT_COMPILED_AVX512_BF16)
+        /* AVX512-BF16 lives in leaf 7 SUBLEAF 1 (EAX bit 5), not subleaf 0. */
+        if (__get_cpuid_count(7, 1, &a, &b, &c, &d))
+            cached.avx512_bf16 = os_zmm && ((a >> 5) & 1);
+#endif
     }
 #endif
 

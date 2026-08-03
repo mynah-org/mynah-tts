@@ -21,7 +21,7 @@ CORE_OBJ   = $(CORE_SRC:.c=.o)
 
 LIB      = libingot.a
 TESTS    = build/test_gguf build/test_safetensors build/test_quant build/test_formats \
-           build/test_oracle build/test_wfile build/test_write
+           build/test_oracle build/test_wfile build/test_write build/test_convert
 TOOLS    = build/ingot-dump
 
 .PHONY: all lib tools test clean core-only help
@@ -37,8 +37,12 @@ lib: $(LIB)
 $(LIB): $(OBJ)
 	$(AR) rcs $@ $^
 
+# -MMD: header dependency tracking. Without it, editing a public header
+# rearchives only the objects whose .c changed, and the ABI mismatch between
+# fresh and stale objects shows up as a segfault in the tests.
 %.o: %.c
-	$(CC) $(WARN) $(CFLAGS) $(INCLUDE) -c $< -o $@
+	$(CC) $(WARN) $(CFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
+-include $(SRC:.c=.d)
 
 # A build with the container readers alone, to prove the split is real: a
 # consumer that only wants to open files must not have to link the SIMD.
@@ -46,6 +50,22 @@ $(LIB): $(OBJ)
 core-only:
 	$(CC) $(WARN) $(CFLAGS) $(INCLUDE) -DINGOT_NO_KERNELS -c $(CORE_SRC) src/dequant.c
 	@echo "core-only build OK"
+
+# This machine is aarch64, so the x86 paths would otherwise only ever meet a
+# compiler on someone else's box. Compile-only: it catches #ifdef rot and
+# intrinsic misuse, not runtime bugs — those still need real x86 hardware.
+## check-x86: cross-compile everything for x86-64 at AVX2+F16C and AVX-512 F/BW/VL/VNNI/BF16
+X86_TARGET ?= x86_64-apple-macos12
+check-x86:
+	@mkdir -p build/x86
+	@for f in $(SRC); do \
+	  $(CC) -target $(X86_TARGET) $(WARN) $(CFLAGS) $(INCLUDE) -mavx2 -mfma -mf16c \
+	    -c $$f -o build/x86/$$(basename $$f .c).avx2.o || exit 1; \
+	  $(CC) -target $(X86_TARGET) $(WARN) $(CFLAGS) $(INCLUDE) \
+	    -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx512bf16 -mf16c \
+	    -c $$f -o build/x86/$$(basename $$f .c).avx512.o || exit 1; \
+	done
+	@echo "x86-64 cross-compile OK (avx2+f16c; avx512 f/bw/vl/vnni/bf16)"
 
 build:
 	@mkdir -p build
@@ -156,5 +176,5 @@ amalgam-test: amalgam
 
 ## clean: remove build products
 clean:
-	rm -f $(OBJ) $(LIB) src/*.o
+	rm -f $(OBJ) $(LIB) src/*.o src/*.d
 	rm -rf build
