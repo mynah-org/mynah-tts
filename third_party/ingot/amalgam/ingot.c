@@ -50,6 +50,15 @@ static inline int ingot_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return 0;
 }
 
+/* ── bulk dtype conversions (dtype.c) ───────────────────────────────────────
+ * The vectorized bodies behind ingot_dtype_to_f32 and the F16/BF16 cases of
+ * ingot_dequant. `p` is the little-endian file bytes, not necessarily aligned.
+ * Byte-for-byte identical to the per-element scalar functions — widening
+ * float conversions are exact, and the tests hold them to that. */
+void ingot_bf16_block_to_f32(const unsigned char *p, size_t nelem, float *dst);
+void ingot_f16_block_to_f32(const unsigned char *p, size_t nelem, float *dst);
+void ingot_f32_block_to_bf16(const float *src, size_t nelem, unsigned char *dst);
+
 /* ── little-endian loads ────────────────────────────────────────────────────
  * Explicit, byte by byte: both container formats are defined little-endian and
  * a memcpy would silently do the wrong thing on a big-endian host. */
@@ -158,6 +167,31 @@ static inline char *ingot_strndup(const char *s, size_t n) {
 /* SPDX-License-Identifier: MIT */
 
 #include <string.h>
+
+/* ── SIMD for the bulk conversions ──────────────────────────────────────────
+ * dtype.c is container-half code, so there is no ingot_cpu() here: runtime
+ * dispatch lives in the quant half and core-only links must stay clean. The
+ * rule is compile-time instead — a TU built with -mavx2/-mf16c may use them
+ * unconditionally, exactly as the compiler itself already does for its own
+ * codegen, and on aarch64 NEON is baseline. The SIMD bodies read the file
+ * bytes as host-endian words, so they are little-endian-host only; a
+ * big-endian build falls back to the byte-by-byte scalar loops. */
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(INGOT_DISABLE_NEON)
+#include <arm_neon.h>
+#define INGOT_DTYPE_NEON 1
+#endif
+#if defined(__AVX2__) && !defined(INGOT_DISABLE_AVX2)
+#include <immintrin.h>
+#define INGOT_DTYPE_AVX2 1
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#define INGOT_DTYPE_AVX512 1
+#endif
+#if defined(__F16C__)
+#define INGOT_DTYPE_F16C 1
+#endif
+#endif
+#endif
 
 /* ── ggml block geometry ────────────────────────────────────────────────────
  * The numbers are the sizeof() of ggml's block_* structs. They are listed here
@@ -359,7 +393,12 @@ float ingot_f16_to_f32(uint16_t value) {
             bits = sign | ((uint32_t)(exponent + 112) << 23) | ((frac & 0x03ffu) << 13);
         }
     } else if (exponent == 31) {
-        bits = sign | 0x7f800000u | (frac << 13);   /* inf / nan */
+        /* Inf passes through; NaN gets the quiet bit, payload preserved.
+         * That is what FCVTL and VCVTPH2PS both do (IEEE: converting a
+         * signaling NaN signals and returns it quieted), and the SIMD lanes
+         * of ingot_f16_block_to_f32 are exactly those instructions — the
+         * scalar tail has to agree with them bit for bit. */
+        bits = sign | 0x7f800000u | (frac << 13) | (frac != 0 ? 0x00400000u : 0u);
     } else {
         bits = sign | ((uint32_t)(exponent + 112) << 23) | (frac << 13);
     }
@@ -439,6 +478,112 @@ float ingot_f8_e5m2_to_f32(uint8_t value) {
     return ingot_f16_to_f32((uint16_t)((uint16_t)value << 8));
 }
 
+/* ── bulk conversions ───────────────────────────────────────────────────────
+ * BF16→F32 is a 16-bit shift into the high half of the word; F16→F32 is what
+ * FCVTL / VCVTPH2PS do in hardware, IEEE-exact including subnormals. Both are
+ * widening, so the SIMD result is bit-identical to the scalar loop — the
+ * conversion parity test enforces that, subnormals and NaNs included. */
+
+void ingot_bf16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
+    size_t i = 0;
+#if defined(INGOT_DTYPE_AVX512)
+    for (; i + 16 <= nelem; i += 16) {
+        const __m256i h = _mm256_loadu_si256((const __m256i *)(p + 2 * i));
+        const __m512i w = _mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16);
+        _mm512_storeu_ps(dst + i, _mm512_castsi512_ps(w));
+    }
+#elif defined(INGOT_DTYPE_AVX2)
+    for (; i + 8 <= nelem; i += 8) {
+        const __m128i h = _mm_loadu_si128((const __m128i *)(p + 2 * i));
+        const __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+    }
+#elif defined(INGOT_DTYPE_NEON)
+    for (; i + 8 <= nelem; i += 8) {
+        const uint16x8_t h = vld1q_u16((const uint16_t *)(const void *)(p + 2 * i));
+        vst1q_f32(dst + i,     vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16)));
+        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16)));
+    }
+#endif
+    for (; i < nelem; i++)
+        dst[i] = ingot_bf16_to_f32(ingot_ld_u16(p + 2 * i));
+}
+
+void ingot_f16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
+    size_t i = 0;
+#if defined(INGOT_DTYPE_AVX512)
+    for (; i + 16 <= nelem; i += 16)
+        _mm512_storeu_ps(dst + i,
+            _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(p + 2 * i))));
+#elif defined(INGOT_DTYPE_F16C)
+    for (; i + 8 <= nelem; i += 8)
+        _mm256_storeu_ps(dst + i,
+            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 2 * i))));
+#elif defined(INGOT_DTYPE_NEON) && defined(__aarch64__)
+    for (; i + 4 <= nelem; i += 4) {
+        const float16x4_t h = vld1_f16((const float16_t *)(const void *)(p + 2 * i));
+        vst1q_f32(dst + i, vcvt_f32_f16(h));
+    }
+#endif
+    for (; i < nelem; i++)
+        dst[i] = ingot_f16_to_f32(ingot_ld_u16(p + 2 * i));
+}
+
+/* F32→BF16 is the write-side twin (quantize/convert tooling). Narrowing, so
+ * the vector body re-implements the exact scalar semantics: round to nearest
+ * even via bits + 0x7fff + lsb, NaN kept NaN by forcing the quiet bit. The
+ * AVX-512BF16 native instruction is deliberately NOT used here: VCVTNEPS2BF16
+ * flushes subnormal inputs to zero no matter what MXCSR says, which breaks
+ * byte-parity with the scalar path. */
+void ingot_f32_block_to_bf16(const float *src, size_t nelem, unsigned char *dst) {
+    size_t i = 0;
+#if defined(INGOT_DTYPE_AVX2)
+    const __m256i c7fff = _mm256_set1_epi32(0x7fff);
+    const __m256i one   = _mm256_set1_epi32(1);
+    const __m256i expm  = _mm256_set1_epi32(0x7f800000);
+    const __m256i quiet = _mm256_set1_epi32(0x0040);
+    for (; i + 8 <= nelem; i += 8) {
+        const __m256i bits = _mm256_castps_si256(_mm256_loadu_ps(src + i));
+        const __m256i lsb  = _mm256_and_si256(_mm256_srli_epi32(bits, 16), one);
+        __m256i h = _mm256_srli_epi32(
+            _mm256_add_epi32(_mm256_add_epi32(bits, c7fff), lsb), 16);
+        /* NaN: exponent all ones and mantissa non-zero -> (bits>>16)|quiet */
+        const __m256i isexp = _mm256_cmpeq_epi32(_mm256_and_si256(bits, expm), expm);
+        const __m256i isman = _mm256_cmpeq_epi32(
+            _mm256_andnot_si256(expm, _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff))),
+            _mm256_setzero_si256());
+        const __m256i isnan = _mm256_andnot_si256(isman, isexp);
+        const __m256i nanh  = _mm256_or_si256(_mm256_srli_epi32(bits, 16), quiet);
+        h = _mm256_blendv_epi8(h, nanh, isnan);
+        /* 32-bit lanes hold 16-bit values: pack and undo the lane interleave */
+        const __m256i packed = _mm256_packus_epi32(h, h);
+        const __m256i lanes  = _mm256_permute4x64_epi64(packed, 0xd8);
+        _mm_storeu_si128((__m128i *)(dst + 2 * i), _mm256_castsi256_si128(lanes));
+    }
+#elif defined(INGOT_DTYPE_NEON)
+    const uint32x4_t c7fff = vdupq_n_u32(0x7fff);
+    const uint32x4_t expm  = vdupq_n_u32(0x7f800000);
+    const uint32x4_t manm  = vdupq_n_u32(0x007fffff);
+    for (; i + 4 <= nelem; i += 4) {
+        const uint32x4_t bits = vreinterpretq_u32_f32(vld1q_f32(src + i));
+        const uint32x4_t lsb  = vandq_u32(vshrq_n_u32(bits, 16), vdupq_n_u32(1));
+        const uint32x4_t rnd  = vaddq_u32(vaddq_u32(bits, c7fff), lsb);
+        uint16x4_t h = vshrn_n_u32(rnd, 16);
+        const uint32x4_t isnan = vandq_u32(
+            vceqq_u32(vandq_u32(bits, expm), expm),
+            vcgtq_u32(vandq_u32(bits, manm), vdupq_n_u32(0)));
+        const uint16x4_t nanh = vorr_u16(vshrn_n_u32(bits, 16), vdup_n_u16(0x0040));
+        h = vbsl_u16(vmovn_u32(isnan), nanh, h);
+        vst1_u16((uint16_t *)(void *)(dst + 2 * i), h);
+    }
+#endif
+    for (; i < nelem; i++) {
+        const uint16_t h = ingot_f32_to_bf16(src[i]);
+        dst[2 * i]     = (unsigned char)(h & 0xff);
+        dst[2 * i + 1] = (unsigned char)(h >> 8);
+    }
+}
+
 int ingot_dtype_to_f32(ingot_dtype dtype, const void *src, size_t nelem, float *dst) {
     if (src == NULL || dst == NULL) return -1;
     const unsigned char *p = (const unsigned char *)src;
@@ -454,12 +599,10 @@ int ingot_dtype_to_f32(ingot_dtype dtype, const void *src, size_t nelem, float *
         }
         return 0;
     case INGOT_DT_F16:
-        for (size_t i = 0; i < nelem; i++)
-            dst[i] = ingot_f16_to_f32((uint16_t)p[2 * i] | ((uint16_t)p[2 * i + 1] << 8));
+        ingot_f16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_DT_BF16:
-        for (size_t i = 0; i < nelem; i++)
-            dst[i] = ingot_bf16_to_f32((uint16_t)p[2 * i] | ((uint16_t)p[2 * i + 1] << 8));
+        ingot_bf16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_DT_F8_E4M3:
         for (size_t i = 0; i < nelem; i++) dst[i] = ingot_f8_e4m3_to_f32(p[i]);
@@ -2816,6 +2959,15 @@ int ingot_st_writer_save(ingot_st_writer *w, const char *path,
 #if defined(__AVX512VNNI__)
 #define INGOT_COMPILED_AVX512_VNNI 1
 #endif
+#if defined(__F16C__)
+#define INGOT_COMPILED_F16C 1
+#endif
+#if defined(__AVX512BF16__)
+#define INGOT_COMPILED_AVX512_BF16 1
+#endif
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) || defined(__ARM_FEATURE_BF16)
+#define INGOT_COMPILED_ARM_BF16 1
+#endif
 
 static ingot_cpu_caps cached;
 static int cap_level_cap = -1;          /* -1 = auto */
@@ -2842,8 +2994,14 @@ static int level_of(ingot_cpu_caps caps) {
 
 static ingot_cpu_caps capped(ingot_cpu_caps caps) {
     if (cap_level_cap >= 0) {
-        if (cap_level_cap < 2) { caps.avx512_vnni = 0; caps.i8mm = 0; caps.dotprod = 0; }
-        if (cap_level_cap < 1) { caps.avx2 = 0; caps.avx512 = 0; caps.neon = 0; }
+        if (cap_level_cap < 2) {
+            caps.avx512_vnni = 0; caps.i8mm = 0; caps.dotprod = 0;
+            caps.bf16 = 0; caps.avx512_bf16 = 0;
+        }
+        if (cap_level_cap < 1) {
+            caps.avx2 = 0; caps.avx512 = 0; caps.neon = 0;
+            caps.f16c = 0;
+        }
     }
     return caps;
 }
@@ -2888,6 +3046,15 @@ static void init_caps(void) {
     cached.i8mm = 1;
 #endif
 #endif
+#if defined(INGOT_COMPILED_ARM_BF16)
+#if defined(__APPLE__)
+    cached.bf16 = sysctl_flag("hw.optional.arm.FEAT_BF16");
+#elif defined(__linux__) && defined(__aarch64__) && defined(HWCAP2_BF16)
+    cached.bf16 = (getauxval(AT_HWCAP2) & HWCAP2_BF16) != 0;
+#else
+    cached.bf16 = 1;
+#endif
+#endif
 
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
     {
@@ -2897,8 +3064,12 @@ static void init_caps(void) {
             const unsigned long long xcr0 = xgetbv0();
             os_ymm = (xcr0 & 0x6) == 0x6;                          /* XMM|YMM  */
             os_zmm = os_ymm && (xcr0 & 0xe0) == 0xe0;              /* + ZMM    */
+#if defined(INGOT_COMPILED_F16C)
+            cached.f16c = os_ymm && ((c >> 29) & 1);               /* leaf 1 ECX */
+#endif
         }
-#if !defined(INGOT_COMPILED_AVX512) && !defined(INGOT_COMPILED_AVX512_VNNI)
+#if !defined(INGOT_COMPILED_AVX512) && !defined(INGOT_COMPILED_AVX512_VNNI) && \
+    !defined(INGOT_COMPILED_AVX512_BF16)
         (void)os_zmm;   /* only the AVX-512 checks below read it */
 #endif
         if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) {
@@ -2912,6 +3083,11 @@ static void init_caps(void) {
             cached.avx512_vnni = os_zmm && ((c >> 11) & 1);
 #endif
         }
+#if defined(INGOT_COMPILED_AVX512_BF16)
+        /* AVX512-BF16 lives in leaf 7 SUBLEAF 1 (EAX bit 5), not subleaf 0. */
+        if (__get_cpuid_count(7, 1, &a, &b, &c, &d))
+            cached.avx512_bf16 = os_zmm && ((a >> 5) & 1);
+#endif
     }
 #endif
 
@@ -2988,6 +3164,40 @@ void ingot_aligned_free(void *ptr) { free(ptr); }
 int ingot_dequant_codebook(int type, const void *src, size_t nelem, float *dst);
 
 #define QK_K 256
+
+/* ── SIMD lanes for the hot decoders ────────────────────────────────────────
+ * Compile-time dispatch, same rule as dtype.c: dequant.c is linked by
+ * core-only consumers, so it cannot call ingot_cpu(), and a TU built with
+ * -mavx2 may assume AVX2 exactly as the compiler does for its own codegen.
+ *
+ * Bit-parity with the scalar loops is structural, not lucky: every float
+ * product below is exact in f32 — an f16 value carries 11 significand bits
+ * and the integer factors at most 8 more, so no product ever rounds — which
+ * makes the operation order irrelevant. The oracle test holds whichever body
+ * is compiled to llama.cpp's reference values, bit for bit. */
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(INGOT_DISABLE_NEON)
+#include <arm_neon.h>
+#define INGOT_DEQ_NEON 1
+#elif defined(__AVX2__) && !defined(INGOT_DISABLE_AVX2)
+#include <immintrin.h>
+#define INGOT_DEQ_AVX2 1
+#endif
+#endif
+
+#if defined(INGOT_DEQ_NEON)
+/* 8 bytes -> two f32x4, unsigned and signed flavours. */
+static inline void u8x8_f32(uint8x8_t v, float32x4_t *lo, float32x4_t *hi) {
+    const uint16x8_t w = vmovl_u8(v);
+    *lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w)));
+    *hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w)));
+}
+static inline void s8x8_f32(int8x8_t v, float32x4_t *lo, float32x4_t *hi) {
+    const int16x8_t w = vmovl_s8(v);
+    *lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w)));
+    *hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w)));
+}
+#endif
 
 static float f16(const unsigned char *p) { return ingot_f16_to_f32(ingot_ld_u16(p)); }
 
@@ -3073,7 +3283,24 @@ static void dq_q8_0(const unsigned char *src, size_t nelem, float *dst) {
         const unsigned char *blk = src + b * 34;
         const float d = f16(blk);
         const signed char *q = (const signed char *)(blk + 2);
-        for (int i = 0; i < 32; i++) dst[b * 32 + i] = d * (float)q[i];
+        float *out = dst + b * 32;
+#if defined(INGOT_DEQ_NEON)
+        for (int i = 0; i < 32; i += 8) {
+            float32x4_t lo, hi;
+            s8x8_f32(vld1_s8(q + i), &lo, &hi);
+            vst1q_f32(out + i,     vmulq_n_f32(lo, d));
+            vst1q_f32(out + i + 4, vmulq_n_f32(hi, d));
+        }
+#elif defined(INGOT_DEQ_AVX2)
+        const __m256 dv = _mm256_set1_ps(d);
+        for (int i = 0; i < 32; i += 8) {
+            const __m128i v = _mm_loadl_epi64((const __m128i *)(q + i));
+            const __m256 f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v));
+            _mm256_storeu_ps(out + i, _mm256_mul_ps(f, dv));
+        }
+#else
+        for (int i = 0; i < 32; i++) out[i] = d * (float)q[i];
+#endif
     }
 }
 
@@ -3156,10 +3383,39 @@ static void dq_q4_k(const unsigned char *src, size_t nelem, float *dst) {
             k4_scale_min(scales, si + 1, &sc1, &mn1);
             const float d0 = d * sc0, m0 = dmin * mn0;
             const float d1 = d * sc1, m1 = dmin * mn1;
+#if defined(INGOT_DEQ_NEON)
+            const float32x4_t m0v = vdupq_n_f32(m0), m1v = vdupq_n_f32(m1);
+            for (int i = 0; i < 32; i += 8) {
+                const uint8x8_t byte = vld1_u8(q + i);
+                float32x4_t a, c;
+                u8x8_f32(vand_u8(byte, vdup_n_u8(0x0f)), &a, &c);
+                vst1q_f32(out + base + i,     vsubq_f32(vmulq_n_f32(a, d0), m0v));
+                vst1q_f32(out + base + i + 4, vsubq_f32(vmulq_n_f32(c, d0), m0v));
+                u8x8_f32(vshr_n_u8(byte, 4), &a, &c);
+                vst1q_f32(out + base + i + 32, vsubq_f32(vmulq_n_f32(a, d1), m1v));
+                vst1q_f32(out + base + i + 36, vsubq_f32(vmulq_n_f32(c, d1), m1v));
+            }
+#elif defined(INGOT_DEQ_AVX2)
+            const __m256 d0v = _mm256_set1_ps(d0), m0v = _mm256_set1_ps(m0);
+            const __m256 d1v = _mm256_set1_ps(d1), m1v = _mm256_set1_ps(m1);
+            const __m128i nib = _mm_set1_epi8(0x0f);
+            for (int i = 0; i < 32; i += 8) {
+                const __m128i byte = _mm_loadl_epi64((const __m128i *)(q + i));
+                const __m128i lo = _mm_and_si128(byte, nib);
+                const __m128i hi = _mm_and_si128(_mm_srli_epi16(byte, 4), nib);
+                const __m256 a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo));
+                const __m256 c = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi));
+                _mm256_storeu_ps(out + base + i,
+                                 _mm256_sub_ps(_mm256_mul_ps(a, d0v), m0v));
+                _mm256_storeu_ps(out + base + i + 32,
+                                 _mm256_sub_ps(_mm256_mul_ps(c, d1v), m1v));
+            }
+#else
             for (int i = 0; i < 32; i++) {
                 out[base + i]      = d0 * (float)(q[i] & 0x0f) - m0;
                 out[base + i + 32] = d1 * (float)(q[i] >> 4) - m1;
             }
+#endif
             q += 32;
         }
     }
@@ -3183,12 +3439,58 @@ static void dq_q5_k(const unsigned char *src, size_t nelem, float *dst) {
             k4_scale_min(scales, si + 1, &sc1, &mn1);
             const float d0 = d * sc0, m0 = dmin * mn0;
             const float d1 = d * sc1, m1 = dmin * mn1;
+#if defined(INGOT_DEQ_NEON)
+            const float32x4_t m0v = vdupq_n_f32(m0), m1v = vdupq_n_f32(m1);
+            const uint8x8_t u1v = vdup_n_u8((uint8_t)u1);
+            const uint8x8_t u2v = vdup_n_u8((uint8_t)u2);
+            const uint8x8_t sixteen = vdup_n_u8(16);
+            for (int i = 0; i < 32; i += 8) {
+                const uint8x8_t byte = vld1_u8(q + i);
+                const uint8x8_t hbit = vld1_u8(qh + i);
+                const uint8x8_t hi0 = vand_u8(vtst_u8(hbit, u1v), sixteen);
+                const uint8x8_t hi1 = vand_u8(vtst_u8(hbit, u2v), sixteen);
+                float32x4_t a, c;
+                u8x8_f32(vadd_u8(vand_u8(byte, vdup_n_u8(0x0f)), hi0), &a, &c);
+                vst1q_f32(out + base + i,     vsubq_f32(vmulq_n_f32(a, d0), m0v));
+                vst1q_f32(out + base + i + 4, vsubq_f32(vmulq_n_f32(c, d0), m0v));
+                u8x8_f32(vadd_u8(vshr_n_u8(byte, 4), hi1), &a, &c);
+                vst1q_f32(out + base + i + 32, vsubq_f32(vmulq_n_f32(a, d1), m1v));
+                vst1q_f32(out + base + i + 36, vsubq_f32(vmulq_n_f32(c, d1), m1v));
+            }
+#elif defined(INGOT_DEQ_AVX2)
+            const __m256 d0v = _mm256_set1_ps(d0), m0v = _mm256_set1_ps(m0);
+            const __m256 d1v = _mm256_set1_ps(d1), m1v = _mm256_set1_ps(m1);
+            const __m128i nib = _mm_set1_epi8(0x0f);
+            const __m128i u1v = _mm_set1_epi8((char)u1);
+            const __m128i u2v = _mm_set1_epi8((char)u2);
+            const __m128i sixteen = _mm_set1_epi8(16);
+            const __m128i zero = _mm_setzero_si128();
+            for (int i = 0; i < 32; i += 8) {
+                const __m128i byte = _mm_loadl_epi64((const __m128i *)(q + i));
+                const __m128i hbit = _mm_loadl_epi64((const __m128i *)(qh + i));
+                /* cmpeq-with-zero is the inverted test: andnot re-inverts it */
+                const __m128i no0 = _mm_cmpeq_epi8(_mm_and_si128(hbit, u1v), zero);
+                const __m128i no1 = _mm_cmpeq_epi8(_mm_and_si128(hbit, u2v), zero);
+                const __m128i hi0 = _mm_andnot_si128(no0, sixteen);
+                const __m128i hi1 = _mm_andnot_si128(no1, sixteen);
+                const __m128i lo = _mm_add_epi8(_mm_and_si128(byte, nib), hi0);
+                const __m128i hi = _mm_add_epi8(
+                    _mm_and_si128(_mm_srli_epi16(byte, 4), nib), hi1);
+                const __m256 a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo));
+                const __m256 c = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi));
+                _mm256_storeu_ps(out + base + i,
+                                 _mm256_sub_ps(_mm256_mul_ps(a, d0v), m0v));
+                _mm256_storeu_ps(out + base + i + 32,
+                                 _mm256_sub_ps(_mm256_mul_ps(c, d1v), m1v));
+            }
+#else
             for (int i = 0; i < 32; i++) {
                 const int hi0 = (qh[i] & u1) ? 16 : 0;
                 const int hi1 = (qh[i] & u2) ? 16 : 0;
                 out[base + i]      = d0 * (float)((q[i] & 0x0f) + hi0) - m0;
                 out[base + i + 32] = d1 * (float)((q[i] >> 4) + hi1) - m1;
             }
+#endif
             q += 32;
             u1 <<= 2;
             u2 <<= 2;
@@ -3207,6 +3509,70 @@ static void dq_q6_k(const unsigned char *src, size_t nelem, float *dst) {
         const float d = f16(blk + 208);
         float *out = dst + b * QK_K;
         for (int half = 0; half < 2; half++) {
+#if defined(INGOT_DEQ_NEON)
+            const int8x8_t bias = vdup_n_s8(32);
+            const uint8x8_t nib = vdup_n_u8(0x0f), two = vdup_n_u8(3);
+            for (int i = 0; i < 32; i += 8) {
+                const int is = i / 16;
+                const float f1 = d * (float)sc[is],     f2 = d * (float)sc[is + 2];
+                const float f3 = d * (float)sc[is + 4], f4 = d * (float)sc[is + 6];
+                const uint8x8_t l0 = vld1_u8(ql + i);
+                const uint8x8_t l1 = vld1_u8(ql + i + 32);
+                const uint8x8_t h  = vld1_u8(qh + i);
+                const int8x8_t q1 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vand_u8(l0, nib), vshl_n_u8(vand_u8(h, two), 4))), bias);
+                const int8x8_t q2 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vand_u8(l1, nib), vshl_n_u8(vand_u8(vshr_n_u8(h, 2), two), 4))), bias);
+                const int8x8_t q3 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vshr_n_u8(l0, 4), vshl_n_u8(vand_u8(vshr_n_u8(h, 4), two), 4))), bias);
+                const int8x8_t q4 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vshr_n_u8(l1, 4), vshl_n_u8(vshr_n_u8(h, 6), 4))), bias);
+                float32x4_t a, c;
+                s8x8_f32(q1, &a, &c);
+                vst1q_f32(out + i,      vmulq_n_f32(a, f1));
+                vst1q_f32(out + i + 4,  vmulq_n_f32(c, f1));
+                s8x8_f32(q2, &a, &c);
+                vst1q_f32(out + i + 32, vmulq_n_f32(a, f2));
+                vst1q_f32(out + i + 36, vmulq_n_f32(c, f2));
+                s8x8_f32(q3, &a, &c);
+                vst1q_f32(out + i + 64, vmulq_n_f32(a, f3));
+                vst1q_f32(out + i + 68, vmulq_n_f32(c, f3));
+                s8x8_f32(q4, &a, &c);
+                vst1q_f32(out + i + 96, vmulq_n_f32(a, f4));
+                vst1q_f32(out + i + 100, vmulq_n_f32(c, f4));
+            }
+#elif defined(INGOT_DEQ_AVX2)
+            const __m128i bias = _mm_set1_epi8(32);
+            const __m128i nib = _mm_set1_epi8(0x0f), two = _mm_set1_epi8(3);
+            for (int i = 0; i < 32; i += 8) {
+                const int is = i / 16;
+                const float f1 = d * (float)sc[is],     f2 = d * (float)sc[is + 2];
+                const float f3 = d * (float)sc[is + 4], f4 = d * (float)sc[is + 6];
+                const __m128i l0 = _mm_loadl_epi64((const __m128i *)(ql + i));
+                const __m128i l1 = _mm_loadl_epi64((const __m128i *)(ql + i + 32));
+                const __m128i h  = _mm_loadl_epi64((const __m128i *)(qh + i));
+                const __m128i lo0 = _mm_and_si128(l0, nib);
+                const __m128i lo1 = _mm_and_si128(l1, nib);
+                const __m128i hi0 = _mm_and_si128(_mm_srli_epi16(l0, 4), nib);
+                const __m128i hi1 = _mm_and_si128(_mm_srli_epi16(l1, 4), nib);
+                const __m128i b1 = _mm_slli_epi16(_mm_and_si128(h, two), 4);
+                const __m128i b2 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 2), two), 4);
+                const __m128i b3 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 4), two), 4);
+                const __m128i b4 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 6), two), 4);
+                const __m128i q1 = _mm_sub_epi8(_mm_or_si128(lo0, b1), bias);
+                const __m128i q2 = _mm_sub_epi8(_mm_or_si128(lo1, b2), bias);
+                const __m128i q3 = _mm_sub_epi8(_mm_or_si128(hi0, b3), bias);
+                const __m128i q4 = _mm_sub_epi8(_mm_or_si128(hi1, b4), bias);
+                _mm256_storeu_ps(out + i, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1)), _mm256_set1_ps(f1)));
+                _mm256_storeu_ps(out + i + 32, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q2)), _mm256_set1_ps(f2)));
+                _mm256_storeu_ps(out + i + 64, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q3)), _mm256_set1_ps(f3)));
+                _mm256_storeu_ps(out + i + 96, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q4)), _mm256_set1_ps(f4)));
+            }
+#else
             for (int i = 0; i < 32; i++) {
                 const int is = i / 16;
                 const int q1 = (int)((ql[i]      & 0x0f) | (((qh[i] >> 0) & 3) << 4)) - 32;
@@ -3218,6 +3584,7 @@ static void dq_q6_k(const unsigned char *src, size_t nelem, float *dst) {
                 out[i + 64] = d * (float)sc[is + 4] * (float)q3;
                 out[i + 96] = d * (float)sc[is + 6] * (float)q4;
             }
+#endif
             out += 128;
             ql += 64;
             qh += 32;
@@ -3272,10 +3639,10 @@ int ingot_dequant(int type, const void *src, size_t nelem, float *dst) {
     switch (type) {
     case INGOT_TYPE_F32:  memcpy(dst, src, nelem * sizeof(float)); return 0;
     case INGOT_TYPE_F16:
-        for (size_t i = 0; i < nelem; i++) dst[i] = ingot_f16_to_f32(ingot_ld_u16(p + 2 * i));
+        ingot_f16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_TYPE_BF16:
-        for (size_t i = 0; i < nelem; i++) dst[i] = ingot_bf16_to_f32(ingot_ld_u16(p + 2 * i));
+        ingot_bf16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_TYPE_F64:
         for (size_t i = 0; i < nelem; i++) {
@@ -6109,11 +6476,7 @@ int ingot_quantize(int type, const float *values, size_t count, void *out) {
         for (size_t i = 0; i < count; i++) put_f16(dst + 2 * i, values[i]);
         return 0;
     case INGOT_TYPE_BF16:
-        for (size_t i = 0; i < count; i++) {
-            const uint16_t h = ingot_f32_to_bf16(values[i]);
-            dst[2 * i] = (unsigned char)(h & 0xff);
-            dst[2 * i + 1] = (unsigned char)(h >> 8);
-        }
+        ingot_f32_block_to_bf16(values, count, dst);
         return 0;
     case INGOT_TYPE_Q4_K:
         return ingot_q4_k_quantize(values, count, out);
@@ -6155,7 +6518,10 @@ typedef ingot_range_fn ingot_range_fn_t;
 #define INGOT_HAVE_Q4_K_NEON 1
 #endif
 
-#if defined(__AVX2__) && !defined(INGOT_DISABLE_AVX2)
+/* The AVX2 kernels lean on FMA, and -mavx2 alone does not imply -mfma: guard
+ * on both, or a plain -mavx2 build dies on an always_inline mismatch. Every
+ * AVX2 CPU since Haswell has FMA, so the pair costs nothing in practice. */
+#if defined(__AVX2__) && defined(__FMA__) && !defined(INGOT_DISABLE_AVX2)
 #include <immintrin.h>
 #define INGOT_HAVE_Q4_K_AVX2 1
 #endif
@@ -6805,6 +7171,158 @@ static int ingot_q4_k_matvec_sdot(const void *weights, size_t rows,
 }
 #endif
 
+/* ── x86 int8: the VNNI / AVX2 twin of the SDOT path ────────────────────────
+ * Same contract, same flat weight layout, same epilogue math as the ARM
+ * section above. The extractors hand the quants over as UNSIGNED bytes
+ * (0..15 for Q4_K, 0..31 for Q5_K), which is exactly the first operand
+ * VPDPBUSD wants — no +128 bias trick, no sign-sum correction, unlike the
+ * signed-weight kernels this pattern usually appears in. Where AVX-512VNNI
+ * is not compiled the same dot rides VPMADDUBSW+VPMADDWD; the worst pair sum
+ * is 31*127*2 = 7874, far from the i16 saturation edge, so both forms are
+ * exact integer dots. The only approximation in the whole path is the
+ * activation quantization, identical to ARM's (absmax/127, RNE). */
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+#define INGOT_HAVE_QK_X86INT8 1
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define INGOT_HAVE_QK_VNNI 1
+#endif
+
+static inline int32_t qk_hsum_epi32(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
+                              _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_srli_si128(s, 8));
+    s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+    return _mm_cvtsi128_si32(s);
+}
+
+static inline __m256i qk_dot_u8s8(__m256i acc, __m256i w, __m256i x) {
+#if defined(INGOT_HAVE_QK_VNNI)
+    return _mm256_dpbusd_epi32(acc, w, x);
+#else
+    return _mm256_add_epi32(acc,
+        _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), _mm256_set1_epi16(1)));
+#endif
+}
+
+/* The activation quantizer, semantics identical to the NEON one: absmax
+ * scale, round-to-nearest-even (CVTPS2DQ under default MXCSR, matching
+ * vcvtnq), saturating packs, and the eight 32-wide integer sums. */
+static float q4_k_quantize_activation(const float *input, int8_t *quantized,
+                                      int32_t sums[8]) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    __m256 amax8 = _mm256_setzero_ps();
+    for (int i = 0; i < INGOT_QK_K; i += 8)
+        amax8 = _mm256_max_ps(amax8,
+            _mm256_and_ps(_mm256_loadu_ps(input + i), absmask));
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(amax8),
+                          _mm256_extractf128_ps(amax8, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_movehdup_ps(m));
+    const float amax = _mm_cvtss_f32(m);
+    if (!(amax > 0.0f)) {
+        memset(quantized, 0, INGOT_QK_K);
+        memset(sums, 0, 8 * sizeof(*sums));
+        return 0.0f;
+    }
+    const float scale = amax / 127.0f;
+    const __m256 inverse = _mm256_set1_ps(127.0f / amax);
+    for (int group = 0; group < 8; group++) {
+        __m256i sum8 = _mm256_setzero_si256();
+        for (int i = 0; i < 32; i += 8) {
+            const __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(
+                _mm256_loadu_ps(input + group * 32 + i), inverse));
+            sum8 = _mm256_add_epi32(sum8, q);
+            const __m128i p16 = _mm_packs_epi32(_mm256_castsi256_si128(q),
+                                                _mm256_extracti128_si256(q, 1));
+            _mm_storel_epi64((__m128i *)(quantized + group * 32 + i),
+                             _mm_packs_epi16(p16, p16));
+        }
+        sums[group] = qk_hsum_epi32(sum8);
+    }
+    return scale;
+}
+
+/* Dot of one Q4_K super-block against the pre-quantized activation — the
+ * VPDPBUSD rendition of q4_k_dot_block_sdot, same sub-block pairing. */
+static float q4_k_dot_block_x86(const unsigned char *block,
+                                const int8_t *quantized, float activation_scale,
+                                const int32_t sums[8]) {
+    const float d = f16_to_f32(read_u16(block));
+    const float dmin = f16_to_f32(read_u16(block + 2));
+    const unsigned char *scales = block + 4;
+    const unsigned char *packed = block + 16;
+    const __m256i mask = _mm256_set1_epi8(0x0f);
+    float total = 0.0f;
+    for (int group = 0; group < 4; group++) {
+        unsigned char scale_low, scale_high, min_low, min_high;
+        scale_min(scales, group * 2, &scale_low, &min_low);
+        scale_min(scales, group * 2 + 1, &scale_high, &min_high);
+        const __m256i nib =
+            _mm256_loadu_si256((const __m256i *)(packed + group * 32));
+        const __m256i low = _mm256_and_si256(nib, mask);
+        const __m256i high = _mm256_and_si256(_mm256_srli_epi16(nib, 4), mask);
+        const __m256i dot_low = qk_dot_u8s8(_mm256_setzero_si256(), low,
+            _mm256_loadu_si256((const __m256i *)(quantized + group * 64)));
+        const __m256i dot_high = qk_dot_u8s8(_mm256_setzero_si256(), high,
+            _mm256_loadu_si256((const __m256i *)(quantized + group * 64 + 32)));
+        total += d * (float)scale_low * (float)qk_hsum_epi32(dot_low) -
+                 dmin * (float)min_low * (float)sums[group * 2];
+        total += d * (float)scale_high * (float)qk_hsum_epi32(dot_high) -
+                 dmin * (float)min_high * (float)sums[group * 2 + 1];
+    }
+    return total * activation_scale;
+}
+
+static int ingot_q4_k_matvec_x86int8(const void *weights, size_t rows,
+    size_t cols, const float *input, float *output) {
+    if (weights == NULL || input == NULL || output == NULL || rows == 0 ||
+        cols == 0 || cols % INGOT_QK_K != 0) return -1;
+    size_t blocks_per_row = cols / INGOT_QK_K;
+    if (blocks_per_row > SIZE_MAX / INGOT_Q4_K_BYTES) return -1;
+    size_t row_bytes = blocks_per_row * INGOT_Q4_K_BYTES;
+    if (rows > SIZE_MAX / row_bytes) return -1;
+    int8_t *quantized = malloc(cols);
+    float *scales = malloc(blocks_per_row * sizeof(*scales));
+    int32_t *sums = malloc(blocks_per_row * 8 * sizeof(*sums));
+    if (quantized == NULL || scales == NULL || sums == NULL) {
+        free(quantized); free(scales); free(sums);
+        return -1;
+    }
+    for (size_t block = 0; block < blocks_per_row; block++)
+        scales[block] = q4_k_quantize_activation(
+            input + block * INGOT_QK_K, quantized + block * INGOT_QK_K,
+            sums + block * 8);
+    const unsigned char *source = (const unsigned char *)weights;
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        float sum = 0.0f;
+        for (size_t block = 0; block < blocks_per_row; block++)
+            sum += q4_k_dot_block_x86(row_data + block * INGOT_Q4_K_BYTES,
+                                      quantized + block * INGOT_QK_K,
+                                      scales[block], sums + block * 8);
+        output[row] = sum;
+    }
+    free(quantized); free(scales); free(sums);
+    return 0;
+}
+#endif /* x86 int8 */
+
+/* Whether the int8 fast path is real on this machine: compiled in AND the
+ * instruction set is there at runtime. One predicate shared by the matvec
+ * opt-in, the batched default and ingot_matmat_is_exact, so the answer the
+ * library gives is the path it actually takes. */
+#if defined(INGOT_HAVE_Q4_K_SDOT) || defined(INGOT_HAVE_QK_X86INT8)
+static int qk_int8_ready(void) {
+#if defined(INGOT_HAVE_Q4_K_SDOT)
+    return ingot_cpu().dotprod;
+#elif defined(INGOT_HAVE_QK_VNNI)
+    return ingot_cpu().avx512_vnni;
+#else
+    return ingot_cpu().avx2;
+#endif
+}
+#endif
+
 int ingot_q4_k_matvec_sdot_available(void) {
 #if defined(INGOT_HAVE_Q4_K_SDOT)
     return ingot_cpu().dotprod ? 1 : 0;
@@ -6819,6 +7337,9 @@ int ingot_q4_k_matvec_int8(const void *weights, size_t rows, size_t cols,
 #if defined(INGOT_HAVE_Q4_K_SDOT)
     if (ingot_cpu().dotprod)
         return ingot_q4_k_matvec_sdot(weights, rows, cols, input, output);
+#elif defined(INGOT_HAVE_QK_X86INT8)
+    if (qk_int8_ready())
+        return ingot_q4_k_matvec_x86int8(weights, rows, cols, input, output);
 #endif
     return ingot_q4_k_matvec(weights, rows, cols, input, output);
 }
@@ -6828,7 +7349,7 @@ int ingot_q4_k_matvec(const void *weights, size_t rows, size_t cols,
     if (!qk_args_ok(weights, input, output, rows, cols, INGOT_QK_K)) return -1;
     ingot_cpu_caps caps = ingot_cpu();
     (void)caps;
-#if defined(INGOT_HAVE_Q4_K_SDOT)
+#if defined(INGOT_HAVE_Q4_K_SDOT) || defined(INGOT_HAVE_QK_X86INT8)
     /* Opt-in, and it stays opt-in even though the batched path went int8 by
      * default: THIS function is the reference. Parity is measured against it,
      * and the batch gate requires `tokens == 1` to match it bit for bit, so
@@ -6839,8 +7360,12 @@ int ingot_q4_k_matvec(const void *weights, size_t rows, size_t cols,
         const char *value = getenv("INGOT_SDOT");
         sdot_env = value != NULL && value[0] == '1';
     }
-    if (sdot_env && caps.dotprod)
+    if (sdot_env && qk_int8_ready())
+#if defined(INGOT_HAVE_Q4_K_SDOT)
         return ingot_q4_k_matvec_sdot(weights, rows, cols, input, output);
+#else
+        return ingot_q4_k_matvec_x86int8(weights, rows, cols, input, output);
+#endif
 #endif
 #if defined(INGOT_HAVE_Q4_K_NEON)
     if (caps.neon)
@@ -7103,7 +7628,7 @@ static int qk_matmat(const void *weights, size_t rows, size_t cols,
     return 0;
 }
 
-#if defined(INGOT_HAVE_Q4_K_SDOT)
+#if defined(INGOT_HAVE_Q4_K_SDOT) || defined(INGOT_HAVE_QK_X86INT8)
 /* ── The int8 twin of the batched GEMM (opt-in) ──────────────────────────
  *
  * The f32 form above sits at ~52% of the machine's f32 peak, so the
@@ -7128,6 +7653,7 @@ static int qk_matmat(const void *weights, size_t rows, size_t cols,
  * sub-block 2g in its low nibbles and 2g+1 in its high ones). */
 static void q4_k_nibbles(const unsigned char *block, int8_t *out) {
     const unsigned char *packed = block + 16;
+#if defined(INGOT_HAVE_Q4_K_SDOT)
     const uint8x16_t mask = vdupq_n_u8(0x0f);
     for (int group = 0; group < 4; group++)
         for (int i = 0; i < 32; i += 16) {
@@ -7137,6 +7663,18 @@ static void q4_k_nibbles(const unsigned char *block, int8_t *out) {
             vst1q_s8(out + group * 64 + 32 + i,
                      vreinterpretq_s8_u8(vshrq_n_u8(nibbles, 4)));
         }
+#else
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    for (int group = 0; group < 4; group++)
+        for (int i = 0; i < 32; i += 16) {
+            const __m128i nibbles =
+                _mm_loadu_si128((const __m128i *)(packed + group * 32 + i));
+            _mm_storeu_si128((__m128i *)(out + group * 64 + i),
+                             _mm_and_si128(nibbles, mask));
+            _mm_storeu_si128((__m128i *)(out + group * 64 + 32 + i),
+                _mm_and_si128(_mm_srli_epi16(nibbles, 4), mask));
+        }
+#endif
 }
 
 /* Q5_K into the same flat 0..31 array. The scale/min packing is byte for byte
@@ -7147,6 +7685,7 @@ static void q4_k_nibbles(const unsigned char *block, int8_t *out) {
 static void q5_k_quants(const unsigned char *block, int8_t *out) {
     const unsigned char *qh = block + 16;
     const unsigned char *qs = block + 48;
+#if defined(INGOT_HAVE_Q4_K_SDOT)
     const uint8x16_t mask = vdupq_n_u8(0x0f);
     const uint8x16_t sixteen = vdupq_n_u8(16);
     for (int group = 0; group < 4; group++) {
@@ -7163,6 +7702,30 @@ static void q5_k_quants(const unsigned char *block, int8_t *out) {
             vst1q_s8(out + group * 64 + 32 + i, vreinterpretq_s8_u8(hi));
         }
     }
+#else
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    const __m128i sixteen = _mm_set1_epi8(16);
+    const __m128i zero = _mm_setzero_si128();
+    for (int group = 0; group < 4; group++) {
+        const __m128i u1 = _mm_set1_epi8((char)(1u << (2 * group)));
+        const __m128i u2 = _mm_set1_epi8((char)(2u << (2 * group)));
+        for (int i = 0; i < 32; i += 16) {
+            const __m128i packed =
+                _mm_loadu_si128((const __m128i *)(qs + group * 32 + i));
+            const __m128i high = _mm_loadu_si128((const __m128i *)(qh + i));
+            /* cmpeq-with-zero is the inverted vtst: andnot re-inverts it */
+            const __m128i no1 = _mm_cmpeq_epi8(_mm_and_si128(high, u1), zero);
+            const __m128i no2 = _mm_cmpeq_epi8(_mm_and_si128(high, u2), zero);
+            const __m128i lo = _mm_add_epi8(_mm_and_si128(packed, mask),
+                                            _mm_andnot_si128(no1, sixteen));
+            const __m128i hi = _mm_add_epi8(
+                _mm_and_si128(_mm_srli_epi16(packed, 4), mask),
+                _mm_andnot_si128(no2, sixteen));
+            _mm_storeu_si128((__m128i *)(out + group * 64 + i), lo);
+            _mm_storeu_si128((__m128i *)(out + group * 64 + 32 + i), hi);
+        }
+    }
+#endif
 }
 
 typedef void (*qk_quant_fn)(const unsigned char *block, int8_t *out);
@@ -7189,6 +7752,7 @@ typedef struct {
     size_t xint_stride;
 } qk_sdot_job_t;
 
+#if defined(INGOT_HAVE_Q4_K_SDOT)
 static void qk_matmat_rows_sdot(size_t begin, size_t end, void *user) {
     const qk_sdot_job_t *job = user;
     alignas(64) int8_t nibbles[INGOT_QK_ROW_TILE * INGOT_QK_K];
@@ -7273,7 +7837,9 @@ static void qk_matmat_rows_sdot(size_t begin, size_t end, void *user) {
     }
 }
 
-#if defined(__ARM_FEATURE_MATMUL_INT8)
+#endif /* INGOT_HAVE_Q4_K_SDOT: the vdotq worker */
+
+#if defined(INGOT_HAVE_Q4_K_SDOT) && defined(__ARM_FEATURE_MATMUL_INT8)
 #define INGOT_HAVE_Q4_K_SMMLA 1
 
 /* The i8mm twin: vmmlaq_s32 closes a 2-row × 2-token tile in i32 per
@@ -7444,6 +8010,102 @@ static void qk_interleave_pairs(size_t begin, size_t end, void *user) {
 }
 #endif
 
+#if defined(INGOT_HAVE_QK_X86INT8)
+/* The VPDPBUSD worker — the x86 rendition of qk_matmat_rows_sdot. Four
+ * tokens share each extracted weight vector; their four 8-lane accumulators
+ * collapse with three VPHADDD into one vector of four sums, mirroring the
+ * vpaddq collapse on ARM, and the per-sub-block scale/offset then apply to
+ * the whole vector. Without AVX-512VNNI the dot inside qk_dot_u8s8 becomes
+ * VPMADDUBSW+VPMADDWD — same integers, one more instruction. */
+static void qk_matmat_rows_x86(size_t begin, size_t end, void *user) {
+    const qk_sdot_job_t *job = user;
+    alignas(64) int8_t nibbles[INGOT_QK_ROW_TILE * INGOT_QK_K];
+    alignas(64) float scale[INGOT_QK_ROW_TILE * 8];
+    alignas(64) float offset[INGOT_QK_ROW_TILE * 8];
+    alignas(64) float acc[INGOT_QK_ROW_TILE * INGOT_QK_TOKEN_TILE_MAX];
+    for (size_t strip = begin; strip < end; strip++) {
+        size_t row0 = strip * INGOT_QK_ROW_TILE;
+        size_t strip_rows = job->rows - row0 < INGOT_QK_ROW_TILE ?
+                            job->rows - row0 : INGOT_QK_ROW_TILE;
+        memset(acc, 0, strip_rows * job->token_count * sizeof(*acc));
+        for (size_t block = 0; block < job->blocks_per_row; block++) {
+            for (size_t r = 0; r < strip_rows; r++) {
+                const unsigned char *source = job->weights +
+                    (row0 + r) * job->row_bytes + block * job->block_bytes;
+                job->extract(source, nibbles + r * INGOT_QK_K);
+                float d = f16_to_f32(read_u16(source));
+                float dmin = f16_to_f32(read_u16(source + 2));
+                for (int j = 0; j < 8; j++) {
+                    unsigned char s, m;
+                    scale_min(source + 4, j, &s, &m);
+                    scale[r * 8 + j] = d * (float)s;
+                    offset[r * 8 + j] = dmin * (float)m;
+                }
+            }
+            const int8_t *xq = job->xq +
+                job->token_begin * job->xq_stride + block * INGOT_QK_K;
+            const float *xsum = job->xsum +
+                block * 8 * job->tokens + job->token_begin;
+            for (size_t r = 0; r < strip_rows; r++) {
+                const int8_t *w = nibbles + r * INGOT_QK_K;
+                size_t token = 0;
+                for (; token + 4 <= job->token_count; token += 4) {
+                    const int8_t *x = xq + token * job->xq_stride;
+                    __m128 total = _mm_setzero_ps();
+                    for (int j = 0; j < 8; j++) {
+                        const __m256i wv =
+                            _mm256_loadu_si256((const __m256i *)(w + j * 32));
+                        __m256i d0 = qk_dot_u8s8(_mm256_setzero_si256(), wv,
+                            _mm256_loadu_si256((const __m256i *)(x + j * 32)));
+                        __m256i d1 = qk_dot_u8s8(_mm256_setzero_si256(), wv,
+                            _mm256_loadu_si256((const __m256i *)(x + job->xq_stride + j * 32)));
+                        __m256i d2 = qk_dot_u8s8(_mm256_setzero_si256(), wv,
+                            _mm256_loadu_si256((const __m256i *)(x + 2 * job->xq_stride + j * 32)));
+                        __m256i d3 = qk_dot_u8s8(_mm256_setzero_si256(), wv,
+                            _mm256_loadu_si256((const __m256i *)(x + 3 * job->xq_stride + j * 32)));
+                        /* three VPHADDD leave [Σd0, Σd1, Σd2, Σd3] per lane;
+                         * adding the two lanes closes the reduction */
+                        const __m256i s = _mm256_hadd_epi32(
+                            _mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
+                        const __m128i sums4 = _mm_add_epi32(
+                            _mm256_castsi256_si128(s),
+                            _mm256_extracti128_si256(s, 1));
+                        total = _mm_fmadd_ps(_mm_cvtepi32_ps(sums4),
+                                             _mm_set1_ps(scale[r * 8 + j]), total);
+                        total = _mm_fnmadd_ps(
+                            _mm_loadu_ps(xsum + (size_t)j * job->tokens + token),
+                            _mm_set1_ps(offset[r * 8 + j]), total);
+                    }
+                    const __m128 out = _mm_mul_ps(total,
+                        _mm_loadu_ps(job->xscale + block * job->tokens +
+                                     job->token_begin + token));
+                    float *a = acc + r * job->token_count + token;
+                    _mm_storeu_ps(a, _mm_add_ps(_mm_loadu_ps(a), out));
+                }
+                for (; token < job->token_count; token++) {
+                    const int8_t *x = xq + token * job->xq_stride;
+                    float total = 0.0f;
+                    for (int j = 0; j < 8; j++) {
+                        const __m256i dot = qk_dot_u8s8(_mm256_setzero_si256(),
+                            _mm256_loadu_si256((const __m256i *)(w + j * 32)),
+                            _mm256_loadu_si256((const __m256i *)(x + j * 32)));
+                        total += scale[r * 8 + j] * (float)qk_hsum_epi32(dot) -
+                                 offset[r * 8 + j] *
+                                     xsum[(size_t)j * job->tokens + token];
+                    }
+                    acc[r * job->token_count + token] += total *
+                        job->xscale[block * job->tokens + job->token_begin + token];
+                }
+            }
+        }
+        for (size_t r = 0; r < strip_rows; r++)
+            for (size_t t = 0; t < job->token_count; t++)
+                job->output[(job->token_begin + t) * job->rows + row0 + r] =
+                    acc[r * job->token_count + t];
+    }
+}
+#endif /* INGOT_HAVE_QK_X86INT8 */
+
 typedef struct {
     const float *input;
     int8_t *xq;
@@ -7501,7 +8163,11 @@ static int qk_matmat_sdot(const void *weights, size_t rows, size_t cols,
      * SMMLA twin — same numeric contract apart from the order of the sums.
      * INGOT_SMMLA=0 is the kill-switch that puts vdotq back, and it doubles
      * as the A/B for the bench. */
+#if defined(INGOT_HAVE_Q4_K_SDOT)
     ingot_range_fn_t worker = qk_matmat_rows_sdot;
+#else
+    ingot_range_fn_t worker = qk_matmat_rows_x86;
+#endif
     int8_t *xq_int = NULL;
 #if defined(INGOT_HAVE_Q4_K_SMMLA)
     static int smmla_env = -1;
@@ -7559,7 +8225,7 @@ static int qk_matmat_sdot(const void *weights, size_t rows, size_t cols,
  * turns all of it off and `ingot_matmat_is_exact()` says which path a call
  * will take, so whoever is comparing can pick the tolerance instead of
  * guessing it. */
-#if defined(INGOT_HAVE_Q4_K_SDOT)
+#if defined(INGOT_HAVE_Q4_K_SDOT) || defined(INGOT_HAVE_QK_X86INT8)
 static int qk_sdot_batched(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -7572,8 +8238,8 @@ static int qk_sdot_batched(void) {
 
 int ingot_matmat_is_exact(size_t tokens) {
     if (tokens <= 1) return 1;
-#if defined(INGOT_HAVE_Q4_K_SDOT)
-    return !(qk_sdot_batched() && ingot_cpu().dotprod);
+#if defined(INGOT_HAVE_Q4_K_SDOT) || defined(INGOT_HAVE_QK_X86INT8)
+    return !(qk_sdot_batched() && qk_int8_ready());
 #else
     return 1;
 #endif
@@ -7584,8 +8250,8 @@ static int q4_k_matmat_maybe_int8(const void *weights, size_t rows, size_t cols,
                                   size_t tokens, int allow_int8) {
     if (tokens == 1)
         return ingot_q4_k_matvec(weights, rows, cols, input, output);
-#if defined(INGOT_HAVE_Q4_K_SDOT)
-    if (allow_int8 && qk_sdot_batched() && ingot_cpu().dotprod &&
+#if defined(INGOT_HAVE_Q4_K_SDOT) || defined(INGOT_HAVE_QK_X86INT8)
+    if (allow_int8 && qk_sdot_batched() && qk_int8_ready() &&
         weights != NULL && input != NULL && output != NULL &&
         rows != 0 && cols != 0 && cols % INGOT_QK_K == 0 &&
         qk_matmat_sdot(weights, rows, cols, input, output, tokens,
@@ -7776,13 +8442,23 @@ static int ingot_q5_k_matvec_neon(const void *weights, size_t rows, size_t cols,
 }
 #endif
 
+static int kquant_apply(const void *weights, size_t rows, size_t cols,
+                        const float *input, float *output, size_t block_bytes,
+                        void (*dequant)(const unsigned char *, float *), int matvec);
+
 int ingot_q5_k_matvec(const void *weights, size_t rows, size_t cols,
                            const float *input, float *output) {
     if (!qk_args_ok(weights, input, output, rows, cols, INGOT_QK_K)) return -1;
 #if defined(INGOT_HAVE_Q4_K_NEON)
-    ingot_cpu_caps caps = ingot_cpu();
-    if (caps.neon)
+    if (ingot_cpu().neon)
         return ingot_q5_k_matvec_neon(weights, rows, cols, input, output);
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    /* No dedicated AVX2 kernel (yet): decode-then-dot through kquant_apply
+     * still beats the scalar walk, since both halves of it are vectorized. */
+    if (ingot_cpu().avx2)
+        return kquant_apply(weights, rows, cols, input, output,
+                            INGOT_Q5_K_BYTES, q5_dequant_block, 1);
 #endif
     return ingot_q5_k_matvec_scalar(weights, rows, cols, input, output);
 }
@@ -7876,6 +8552,72 @@ static void q2_dequant_block(const unsigned char *block, float *output) {
 
 typedef void (*kquant_dequant_fn)(const unsigned char *, float *);
 
+/* ── the decode-then-dot inner product ──────────────────────────────────────
+ * Four accumulators: enough to hide FMA latency on both ISAs, and a reordered
+ * sum is within the 1e-5 budget the parity test grants the exact path. The
+ * compiler cannot do this on its own — reordering float sums needs
+ * -ffast-math, which this library does not build with. */
+typedef float (*qk_dot_fn)(const float *, const float *, size_t);
+
+static float qk_dot_scalar(const float *a, const float *b, size_t n) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+#if defined(INGOT_HAVE_Q4_K_NEON)
+static float qk_dot_neon(const float *a, const float *b, size_t n) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f), acc3 = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),      vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
+        acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
+        acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1),
+                                     vaddq_f32(acc2, acc3)));
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+#endif
+
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+static float qk_dot_avx2(const float *a, const float *b, size_t n) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), acc3);
+    }
+    const __m256 acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1),
+                                     _mm256_add_ps(acc2, acc3));
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc),
+                          _mm256_extractf128_ps(acc, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    float sum = _mm_cvtss_f32(s);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+#endif
+
+static qk_dot_fn qk_dot_pick(void) {
+    const ingot_cpu_caps caps = ingot_cpu();
+    (void)caps;
+#if defined(INGOT_HAVE_Q4_K_NEON)
+    if (caps.neon) return qk_dot_neon;
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    if (caps.avx2) return qk_dot_avx2;
+#endif
+    return qk_dot_scalar;
+}
+
 static int kquant_apply(const void *weights, size_t rows, size_t cols,
                         const float *input, float *output, size_t block_bytes,
                         kquant_dequant_fn dequant, int matvec) {
@@ -7886,6 +8628,7 @@ static int kquant_apply(const void *weights, size_t rows, size_t cols,
     size_t row_bytes = blocks_per_row * block_bytes;
     if (rows > SIZE_MAX / row_bytes || rows * cols > SIZE_MAX / sizeof(float)) return -1;
     const unsigned char *source = (const unsigned char *)weights;
+    const qk_dot_fn dot = qk_dot_pick();
     float values[INGOT_QK_K];
     for (size_t row = 0; row < rows; row++) {
         const unsigned char *row_data = source + row * row_bytes;
@@ -7893,8 +8636,7 @@ static int kquant_apply(const void *weights, size_t rows, size_t cols,
             float sum = 0.0f;
             for (size_t block = 0; block < blocks_per_row; block++) {
                 dequant(row_data + block * block_bytes, values);
-                const float *x = input + block * INGOT_QK_K;
-                for (size_t i = 0; i < INGOT_QK_K; i++) sum += values[i] * x[i];
+                sum += dot(values, input + block * INGOT_QK_K, INGOT_QK_K);
             }
             output[row] = sum;
         } else {
@@ -8021,15 +8763,14 @@ static int ingot_q8_0_matvec_s(const void *weights, size_t rows, size_t cols,
     size_t row_bytes = blocks * INGOT_Q8_0_BYTES;
     if (rows > SIZE_MAX / row_bytes) return -1;
     const unsigned char *source = (const unsigned char *)weights;
+    const qk_dot_fn dot = qk_dot_pick();
+    float values[INGOT_Q8_0_K];
     for (size_t row = 0; row < rows; row++) {
         const unsigned char *row_data = source + row * row_bytes;
         float sum = 0.0f;
         for (size_t b = 0; b < blocks; b++) {
-            const unsigned char *block = row_data + b * INGOT_Q8_0_BYTES;
-            float d = f16_to_f32(read_u16(block));
-            const signed char *qs = (const signed char *)(block + 2);
-            for (int i = 0; i < INGOT_Q8_0_K; i++)
-                sum += (float)qs[i] * d * input[b * INGOT_Q8_0_K + i];
+            q8_0_dequant_block(row_data + b * INGOT_Q8_0_BYTES, values);
+            sum += dot(values, input + b * INGOT_Q8_0_K, INGOT_Q8_0_K);
         }
         output[row] = sum;
     }
@@ -8067,12 +8808,12 @@ static int q5_k_matmat_maybe_int8(const void *weights, size_t rows, size_t cols,
                                   size_t tokens, int allow_int8) {
     if (tokens == 1)
         return ingot_q5_k_matvec(weights, rows, cols, input, output);
-#if defined(INGOT_HAVE_Q4_K_SDOT)
+#if defined(INGOT_HAVE_Q4_K_SDOT) || defined(INGOT_HAVE_QK_X86INT8)
     /* Worth wiring for this model in particular: a Q4_K_M checkpoint carries
      * 63 Q5_K tensors — the first three blocks whole, all of txtfusion and the
      * final projection — so leaving Q5_K on the f32 path would have left most
      * of the early network out of the int8 route. */
-    if (allow_int8 && qk_sdot_batched() && ingot_cpu().dotprod &&
+    if (allow_int8 && qk_sdot_batched() && qk_int8_ready() &&
         weights != NULL && input != NULL && output != NULL &&
         rows != 0 && cols != 0 && cols % INGOT_QK_K == 0 &&
         qk_matmat_sdot(weights, rows, cols, input, output, tokens,
@@ -8138,6 +8879,288 @@ int ingot_q8_0_matmat(const void *weights, size_t rows, size_t cols,
                      q8_0_decode_super);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Dense F16 / BF16 — the weights exactly as stored, no conversion pass
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The alternative these kernels remove is the load-time f32 blow-up: a BF16
+ * checkpoint converted on open doubles its footprint before the first token.
+ * Multiplying THROUGH the stored bytes keeps the mapping zero-copy and reads
+ * half the memory per dot, which is what a bandwidth-bound matvec actually
+ * pays for. Widening BF16 (a 16-bit shift) and F16 (FCVTL / VCVTPH2PS) is
+ * exact, so the result is ordinary f32 arithmetic on the stored values — a
+ * reordered sum, never an approximation.
+ *
+ * Batched form: four tokens share every widened weight vector, so the widen
+ * cost is divided by the register tile the way the quantized GEMM divides its
+ * decode cost. No BFDOT/BFMMLA here yet: both need the ACTIVATIONS truncated
+ * to bf16 too, which is a precision decision the consumer should opt into,
+ * not inherit — it goes in with a bench when a machine with FEAT_BF16 is on
+ * the desk. */
+
+static inline float dense_at(const unsigned char *p, int f16) {
+    const uint16_t v = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    return f16 ? ingot_f16_to_f32(v) : ingot_bf16_to_f32(v);
+}
+
+typedef struct {
+    const unsigned char *w;
+    const float *input;          /* [tokens][cols] row-major */
+    float *output;               /* [tokens][rows] row-major */
+    size_t rows, cols, tokens;
+    int f16;
+} dense_job_t;
+
+static void dense_rows(size_t begin, size_t end, void *user) {
+    const dense_job_t *job = user;
+    const size_t cols = job->cols, tokens = job->tokens;
+    const int f16 = job->f16;
+
+#if defined(INGOT_HAVE_Q4_K_NEON) && defined(__aarch64__)
+    if (ingot_cpu().neon) {
+        for (size_t row = begin; row < end; row++) {
+            const unsigned char *wrow = job->w + row * cols * 2;
+            size_t t = 0;
+            for (; t + 4 <= tokens; t += 4) {
+                const float *x0 = job->input + t * cols;
+                const float *x1 = x0 + cols, *x2 = x1 + cols, *x3 = x2 + cols;
+                float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+                size_t c = 0;
+                for (; c + 8 <= cols; c += 8) {
+                    float32x4_t wlo, whi;
+                    if (f16) {
+                        const float16x8_t h = vld1q_f16(
+                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vcvt_f32_f16(vget_low_f16(h));
+                        whi = vcvt_f32_f16(vget_high_f16(h));
+                    } else {
+                        const uint16x8_t h = vld1q_u16(
+                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
+                        whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
+                    }
+                    a0 = vfmaq_f32(a0, wlo, vld1q_f32(x0 + c));
+                    a0 = vfmaq_f32(a0, whi, vld1q_f32(x0 + c + 4));
+                    a1 = vfmaq_f32(a1, wlo, vld1q_f32(x1 + c));
+                    a1 = vfmaq_f32(a1, whi, vld1q_f32(x1 + c + 4));
+                    a2 = vfmaq_f32(a2, wlo, vld1q_f32(x2 + c));
+                    a2 = vfmaq_f32(a2, whi, vld1q_f32(x2 + c + 4));
+                    a3 = vfmaq_f32(a3, wlo, vld1q_f32(x3 + c));
+                    a3 = vfmaq_f32(a3, whi, vld1q_f32(x3 + c + 4));
+                }
+                float s0 = vaddvq_f32(a0), s1 = vaddvq_f32(a1);
+                float s2 = vaddvq_f32(a2), s3 = vaddvq_f32(a3);
+                for (; c < cols; c++) {
+                    const float wv = dense_at(wrow + 2 * c, f16);
+                    s0 += wv * x0[c]; s1 += wv * x1[c];
+                    s2 += wv * x2[c]; s3 += wv * x3[c];
+                }
+                job->output[(t + 0) * job->rows + row] = s0;
+                job->output[(t + 1) * job->rows + row] = s1;
+                job->output[(t + 2) * job->rows + row] = s2;
+                job->output[(t + 3) * job->rows + row] = s3;
+            }
+            for (; t < tokens; t++) {
+                const float *x = job->input + t * cols;
+                float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+                size_t c = 0;
+                for (; c + 8 <= cols; c += 8) {
+                    float32x4_t wlo, whi;
+                    if (f16) {
+                        const float16x8_t h = vld1q_f16(
+                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vcvt_f32_f16(vget_low_f16(h));
+                        whi = vcvt_f32_f16(vget_high_f16(h));
+                    } else {
+                        const uint16x8_t h = vld1q_u16(
+                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
+                        whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
+                    }
+                    a0 = vfmaq_f32(a0, wlo, vld1q_f32(x + c));
+                    a1 = vfmaq_f32(a1, whi, vld1q_f32(x + c + 4));
+                }
+                float s = vaddvq_f32(vaddq_f32(a0, a1));
+                for (; c < cols; c++) s += dense_at(wrow + 2 * c, f16) * x[c];
+                job->output[t * job->rows + row] = s;
+            }
+        }
+        return;
+    }
+#endif
+
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    {
+        int simd = ingot_cpu().avx2;
+#if defined(__F16C__)
+        if (f16 && !ingot_cpu().f16c) simd = 0;
+#else
+        if (f16) simd = 0;
+#endif
+        if (simd) {
+            for (size_t row = begin; row < end; row++) {
+                const unsigned char *wrow = job->w + row * cols * 2;
+                size_t t = 0;
+                for (; t + 4 <= tokens; t += 4) {
+                    const float *x0 = job->input + t * cols;
+                    const float *x1 = x0 + cols, *x2 = x1 + cols, *x3 = x2 + cols;
+                    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+                    size_t c = 0;
+                    for (; c + 8 <= cols; c += 8) {
+                        const __m128i h = _mm_loadu_si128(
+                            (const __m128i *)(wrow + 2 * c));
+                        __m256 w8;
+#if defined(__F16C__)
+                        if (f16) w8 = _mm256_cvtph_ps(h); else
+#endif
+                        w8 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                 _mm256_cvtepu16_epi32(h), 16));
+                        a0 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x0 + c), a0);
+                        a1 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x1 + c), a1);
+                        a2 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x2 + c), a2);
+                        a3 = _mm256_fmadd_ps(w8, _mm256_loadu_ps(x3 + c), a3);
+                    }
+                    float s0, s1, s2, s3;
+                    {
+                        __m128 r0 = _mm_add_ps(_mm256_castps256_ps128(a0),
+                                               _mm256_extractf128_ps(a0, 1));
+                        __m128 r1 = _mm_add_ps(_mm256_castps256_ps128(a1),
+                                               _mm256_extractf128_ps(a1, 1));
+                        __m128 r2 = _mm_add_ps(_mm256_castps256_ps128(a2),
+                                               _mm256_extractf128_ps(a2, 1));
+                        __m128 r3 = _mm_add_ps(_mm256_castps256_ps128(a3),
+                                               _mm256_extractf128_ps(a3, 1));
+                        r0 = _mm_add_ps(r0, _mm_movehl_ps(r0, r0));
+                        r1 = _mm_add_ps(r1, _mm_movehl_ps(r1, r1));
+                        r2 = _mm_add_ps(r2, _mm_movehl_ps(r2, r2));
+                        r3 = _mm_add_ps(r3, _mm_movehl_ps(r3, r3));
+                        s0 = _mm_cvtss_f32(_mm_add_ss(r0, _mm_movehdup_ps(r0)));
+                        s1 = _mm_cvtss_f32(_mm_add_ss(r1, _mm_movehdup_ps(r1)));
+                        s2 = _mm_cvtss_f32(_mm_add_ss(r2, _mm_movehdup_ps(r2)));
+                        s3 = _mm_cvtss_f32(_mm_add_ss(r3, _mm_movehdup_ps(r3)));
+                    }
+                    for (; c < cols; c++) {
+                        const float wv = dense_at(wrow + 2 * c, f16);
+                        s0 += wv * x0[c]; s1 += wv * x1[c];
+                        s2 += wv * x2[c]; s3 += wv * x3[c];
+                    }
+                    job->output[(t + 0) * job->rows + row] = s0;
+                    job->output[(t + 1) * job->rows + row] = s1;
+                    job->output[(t + 2) * job->rows + row] = s2;
+                    job->output[(t + 3) * job->rows + row] = s3;
+                }
+                for (; t < tokens; t++) {
+                    const float *x = job->input + t * cols;
+                    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                    size_t c = 0;
+                    for (; c + 16 <= cols; c += 16) {
+                        const __m128i h0 = _mm_loadu_si128(
+                            (const __m128i *)(wrow + 2 * c));
+                        const __m128i h1 = _mm_loadu_si128(
+                            (const __m128i *)(wrow + 2 * c + 16));
+                        __m256 w0, w1;
+#if defined(__F16C__)
+                        if (f16) { w0 = _mm256_cvtph_ps(h0); w1 = _mm256_cvtph_ps(h1); } else
+#endif
+                        {
+                            w0 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                     _mm256_cvtepu16_epi32(h0), 16));
+                            w1 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                                     _mm256_cvtepu16_epi32(h1), 16));
+                        }
+                        a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + c), a0);
+                        a1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x + c + 8), a1);
+                    }
+                    const __m256 acc = _mm256_add_ps(a0, a1);
+                    __m128 r = _mm_add_ps(_mm256_castps256_ps128(acc),
+                                          _mm256_extractf128_ps(acc, 1));
+                    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+                    float s = _mm_cvtss_f32(_mm_add_ss(r, _mm_movehdup_ps(r)));
+                    for (; c < cols; c++) s += dense_at(wrow + 2 * c, f16) * x[c];
+                    job->output[t * job->rows + row] = s;
+                }
+            }
+            return;
+        }
+    }
+#endif
+
+    for (size_t row = begin; row < end; row++) {
+        const unsigned char *wrow = job->w + row * cols * 2;
+        for (size_t t = 0; t < tokens; t++) {
+            const float *x = job->input + t * cols;
+            float s = 0.0f;
+            for (size_t c = 0; c < cols; c++)
+                s += dense_at(wrow + 2 * c, f16) * x[c];
+            job->output[t * job->rows + row] = s;
+        }
+    }
+}
+
+static int dense_args_ok(const void *weights, const float *input, float *output,
+                         size_t rows, size_t cols, size_t tokens) {
+    if (weights == NULL || input == NULL || output == NULL ||
+        rows == 0 || cols == 0 || tokens == 0) return 0;
+    if (cols > SIZE_MAX / 2 || rows > SIZE_MAX / (cols * 2)) return 0;
+    if (tokens > SIZE_MAX / cols) return 0;
+    return 1;
+}
+
+static int dense_matvec(const void *weights, size_t rows, size_t cols,
+                        const float *input, float *output, int f16) {
+    if (!dense_args_ok(weights, input, output, rows, cols, 1)) return -1;
+    dense_job_t job = {(const unsigned char *)weights, input, output,
+                       rows, cols, 1, f16};
+    /* Serial on purpose, like every other matvec here: the consumer splits
+     * rows over its own pool, and a nested parallel_for into that same pool
+     * is a deadlock waiting for a schedule. */
+    dense_rows(0, rows, &job);
+    return 0;
+}
+
+static int dense_matmat(const void *weights, size_t rows, size_t cols,
+                        const float *input, float *output, size_t tokens,
+                        int f16) {
+    if (!dense_args_ok(weights, input, output, rows, cols, tokens)) return -1;
+    dense_job_t job = {(const unsigned char *)weights, input, output,
+                       rows, cols, tokens, f16};
+    ingot_parallel_for(rows, dense_rows, &job);
+    return 0;
+}
+
+int ingot_bf16_matvec(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output) {
+    return dense_matvec(weights, rows, cols, input, output, 0);
+}
+int ingot_bf16_matmat(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output, size_t tokens) {
+    return dense_matmat(weights, rows, cols, input, output, tokens, 0);
+}
+int ingot_f16_matvec(const void *weights, size_t rows, size_t cols,
+                     const float *input, float *output) {
+    return dense_matvec(weights, rows, cols, input, output, 1);
+}
+int ingot_f16_matmat(const void *weights, size_t rows, size_t cols,
+                     const float *input, float *output, size_t tokens) {
+    return dense_matmat(weights, rows, cols, input, output, tokens, 1);
+}
+
+/* The dequant twins ride the bulk converters from dtype.c. */
+int ingot_bf16_dequant(const void *weights, size_t rows, size_t cols,
+                       float *output) {
+    if (weights == NULL || output == NULL || rows == 0 || cols == 0) return -1;
+    if (cols > SIZE_MAX / 2 || rows > SIZE_MAX / (cols * 2)) return -1;
+    ingot_bf16_block_to_f32((const unsigned char *)weights, rows * cols, output);
+    return 0;
+}
+int ingot_f16_dequant(const void *weights, size_t rows, size_t cols,
+                      float *output) {
+    if (weights == NULL || output == NULL || rows == 0 || cols == 0) return -1;
+    if (cols > SIZE_MAX / 2 || rows > SIZE_MAX / (cols * 2)) return -1;
+    ingot_f16_block_to_f32((const unsigned char *)weights, rows * cols, output);
+    return 0;
+}
+
 /* ═══ src/generic.c ═══ */
 /* Type-generic entry points.
  *
@@ -8170,6 +9193,8 @@ static void specialized(int type, matvec_fn *mv, matmat_fn *mm, deqmat_fn *dq) {
     case INGOT_TYPE_Q5_K: *mv = ingot_q5_k_matvec; *mm = ingot_q5_k_matmat; *dq = ingot_q5_k_dequant; break;
     case INGOT_TYPE_Q6_K: *mv = ingot_q6_k_matvec; *mm = ingot_q6_k_matmat; *dq = ingot_q6_k_dequant; break;
     case INGOT_TYPE_Q8_0: *mv = ingot_q8_0_matvec; *mm = ingot_q8_0_matmat; *dq = ingot_q8_0_dequant; break;
+    case INGOT_TYPE_BF16: *mv = ingot_bf16_matvec; *mm = ingot_bf16_matmat; *dq = ingot_bf16_dequant; break;
+    case INGOT_TYPE_F16:  *mv = ingot_f16_matvec;  *mm = ingot_f16_matmat;  *dq = ingot_f16_dequant;  break;
     default: break;
     }
 }

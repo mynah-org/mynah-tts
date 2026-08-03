@@ -31,6 +31,15 @@ static inline int ingot_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return 0;
 }
 
+/* ── bulk dtype conversions (dtype.c) ───────────────────────────────────────
+ * The vectorized bodies behind ingot_dtype_to_f32 and the F16/BF16 cases of
+ * ingot_dequant. `p` is the little-endian file bytes, not necessarily aligned.
+ * Byte-for-byte identical to the per-element scalar functions — widening
+ * float conversions are exact, and the tests hold them to that. */
+void ingot_bf16_block_to_f32(const unsigned char *p, size_t nelem, float *dst);
+void ingot_f16_block_to_f32(const unsigned char *p, size_t nelem, float *dst);
+void ingot_f32_block_to_bf16(const float *src, size_t nelem, unsigned char *dst);
+
 /* ── little-endian loads ────────────────────────────────────────────────────
  * Explicit, byte by byte: both container formats are defined little-endian and
  * a memcpy would silently do the wrong thing on a big-endian host. */

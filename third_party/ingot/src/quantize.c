@@ -201,11 +201,7 @@ int ingot_quantize(int type, const float *values, size_t count, void *out) {
         for (size_t i = 0; i < count; i++) put_f16(dst + 2 * i, values[i]);
         return 0;
     case INGOT_TYPE_BF16:
-        for (size_t i = 0; i < count; i++) {
-            const uint16_t h = ingot_f32_to_bf16(values[i]);
-            dst[2 * i] = (unsigned char)(h & 0xff);
-            dst[2 * i + 1] = (unsigned char)(h >> 8);
-        }
+        ingot_f32_block_to_bf16(values, count, dst);
         return 0;
     case INGOT_TYPE_Q4_K:
         return ingot_q4_k_quantize(values, count, out);

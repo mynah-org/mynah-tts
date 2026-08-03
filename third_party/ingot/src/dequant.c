@@ -16,6 +16,40 @@ int ingot_dequant_codebook(int type, const void *src, size_t nelem, float *dst);
 
 #define QK_K 256
 
+/* ── SIMD lanes for the hot decoders ────────────────────────────────────────
+ * Compile-time dispatch, same rule as dtype.c: dequant.c is linked by
+ * core-only consumers, so it cannot call ingot_cpu(), and a TU built with
+ * -mavx2 may assume AVX2 exactly as the compiler does for its own codegen.
+ *
+ * Bit-parity with the scalar loops is structural, not lucky: every float
+ * product below is exact in f32 — an f16 value carries 11 significand bits
+ * and the integer factors at most 8 more, so no product ever rounds — which
+ * makes the operation order irrelevant. The oracle test holds whichever body
+ * is compiled to llama.cpp's reference values, bit for bit. */
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(INGOT_DISABLE_NEON)
+#include <arm_neon.h>
+#define INGOT_DEQ_NEON 1
+#elif defined(__AVX2__) && !defined(INGOT_DISABLE_AVX2)
+#include <immintrin.h>
+#define INGOT_DEQ_AVX2 1
+#endif
+#endif
+
+#if defined(INGOT_DEQ_NEON)
+/* 8 bytes -> two f32x4, unsigned and signed flavours. */
+static inline void u8x8_f32(uint8x8_t v, float32x4_t *lo, float32x4_t *hi) {
+    const uint16x8_t w = vmovl_u8(v);
+    *lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w)));
+    *hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w)));
+}
+static inline void s8x8_f32(int8x8_t v, float32x4_t *lo, float32x4_t *hi) {
+    const int16x8_t w = vmovl_s8(v);
+    *lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w)));
+    *hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w)));
+}
+#endif
+
 static float f16(const unsigned char *p) { return ingot_f16_to_f32(ingot_ld_u16(p)); }
 
 /* Q4_K / Q5_K pack eight 6-bit scales and eight 6-bit mins into 12 bytes.
@@ -100,7 +134,24 @@ static void dq_q8_0(const unsigned char *src, size_t nelem, float *dst) {
         const unsigned char *blk = src + b * 34;
         const float d = f16(blk);
         const signed char *q = (const signed char *)(blk + 2);
-        for (int i = 0; i < 32; i++) dst[b * 32 + i] = d * (float)q[i];
+        float *out = dst + b * 32;
+#if defined(INGOT_DEQ_NEON)
+        for (int i = 0; i < 32; i += 8) {
+            float32x4_t lo, hi;
+            s8x8_f32(vld1_s8(q + i), &lo, &hi);
+            vst1q_f32(out + i,     vmulq_n_f32(lo, d));
+            vst1q_f32(out + i + 4, vmulq_n_f32(hi, d));
+        }
+#elif defined(INGOT_DEQ_AVX2)
+        const __m256 dv = _mm256_set1_ps(d);
+        for (int i = 0; i < 32; i += 8) {
+            const __m128i v = _mm_loadl_epi64((const __m128i *)(q + i));
+            const __m256 f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v));
+            _mm256_storeu_ps(out + i, _mm256_mul_ps(f, dv));
+        }
+#else
+        for (int i = 0; i < 32; i++) out[i] = d * (float)q[i];
+#endif
     }
 }
 
@@ -183,10 +234,39 @@ static void dq_q4_k(const unsigned char *src, size_t nelem, float *dst) {
             k4_scale_min(scales, si + 1, &sc1, &mn1);
             const float d0 = d * sc0, m0 = dmin * mn0;
             const float d1 = d * sc1, m1 = dmin * mn1;
+#if defined(INGOT_DEQ_NEON)
+            const float32x4_t m0v = vdupq_n_f32(m0), m1v = vdupq_n_f32(m1);
+            for (int i = 0; i < 32; i += 8) {
+                const uint8x8_t byte = vld1_u8(q + i);
+                float32x4_t a, c;
+                u8x8_f32(vand_u8(byte, vdup_n_u8(0x0f)), &a, &c);
+                vst1q_f32(out + base + i,     vsubq_f32(vmulq_n_f32(a, d0), m0v));
+                vst1q_f32(out + base + i + 4, vsubq_f32(vmulq_n_f32(c, d0), m0v));
+                u8x8_f32(vshr_n_u8(byte, 4), &a, &c);
+                vst1q_f32(out + base + i + 32, vsubq_f32(vmulq_n_f32(a, d1), m1v));
+                vst1q_f32(out + base + i + 36, vsubq_f32(vmulq_n_f32(c, d1), m1v));
+            }
+#elif defined(INGOT_DEQ_AVX2)
+            const __m256 d0v = _mm256_set1_ps(d0), m0v = _mm256_set1_ps(m0);
+            const __m256 d1v = _mm256_set1_ps(d1), m1v = _mm256_set1_ps(m1);
+            const __m128i nib = _mm_set1_epi8(0x0f);
+            for (int i = 0; i < 32; i += 8) {
+                const __m128i byte = _mm_loadl_epi64((const __m128i *)(q + i));
+                const __m128i lo = _mm_and_si128(byte, nib);
+                const __m128i hi = _mm_and_si128(_mm_srli_epi16(byte, 4), nib);
+                const __m256 a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo));
+                const __m256 c = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi));
+                _mm256_storeu_ps(out + base + i,
+                                 _mm256_sub_ps(_mm256_mul_ps(a, d0v), m0v));
+                _mm256_storeu_ps(out + base + i + 32,
+                                 _mm256_sub_ps(_mm256_mul_ps(c, d1v), m1v));
+            }
+#else
             for (int i = 0; i < 32; i++) {
                 out[base + i]      = d0 * (float)(q[i] & 0x0f) - m0;
                 out[base + i + 32] = d1 * (float)(q[i] >> 4) - m1;
             }
+#endif
             q += 32;
         }
     }
@@ -210,12 +290,58 @@ static void dq_q5_k(const unsigned char *src, size_t nelem, float *dst) {
             k4_scale_min(scales, si + 1, &sc1, &mn1);
             const float d0 = d * sc0, m0 = dmin * mn0;
             const float d1 = d * sc1, m1 = dmin * mn1;
+#if defined(INGOT_DEQ_NEON)
+            const float32x4_t m0v = vdupq_n_f32(m0), m1v = vdupq_n_f32(m1);
+            const uint8x8_t u1v = vdup_n_u8((uint8_t)u1);
+            const uint8x8_t u2v = vdup_n_u8((uint8_t)u2);
+            const uint8x8_t sixteen = vdup_n_u8(16);
+            for (int i = 0; i < 32; i += 8) {
+                const uint8x8_t byte = vld1_u8(q + i);
+                const uint8x8_t hbit = vld1_u8(qh + i);
+                const uint8x8_t hi0 = vand_u8(vtst_u8(hbit, u1v), sixteen);
+                const uint8x8_t hi1 = vand_u8(vtst_u8(hbit, u2v), sixteen);
+                float32x4_t a, c;
+                u8x8_f32(vadd_u8(vand_u8(byte, vdup_n_u8(0x0f)), hi0), &a, &c);
+                vst1q_f32(out + base + i,     vsubq_f32(vmulq_n_f32(a, d0), m0v));
+                vst1q_f32(out + base + i + 4, vsubq_f32(vmulq_n_f32(c, d0), m0v));
+                u8x8_f32(vadd_u8(vshr_n_u8(byte, 4), hi1), &a, &c);
+                vst1q_f32(out + base + i + 32, vsubq_f32(vmulq_n_f32(a, d1), m1v));
+                vst1q_f32(out + base + i + 36, vsubq_f32(vmulq_n_f32(c, d1), m1v));
+            }
+#elif defined(INGOT_DEQ_AVX2)
+            const __m256 d0v = _mm256_set1_ps(d0), m0v = _mm256_set1_ps(m0);
+            const __m256 d1v = _mm256_set1_ps(d1), m1v = _mm256_set1_ps(m1);
+            const __m128i nib = _mm_set1_epi8(0x0f);
+            const __m128i u1v = _mm_set1_epi8((char)u1);
+            const __m128i u2v = _mm_set1_epi8((char)u2);
+            const __m128i sixteen = _mm_set1_epi8(16);
+            const __m128i zero = _mm_setzero_si128();
+            for (int i = 0; i < 32; i += 8) {
+                const __m128i byte = _mm_loadl_epi64((const __m128i *)(q + i));
+                const __m128i hbit = _mm_loadl_epi64((const __m128i *)(qh + i));
+                /* cmpeq-with-zero is the inverted test: andnot re-inverts it */
+                const __m128i no0 = _mm_cmpeq_epi8(_mm_and_si128(hbit, u1v), zero);
+                const __m128i no1 = _mm_cmpeq_epi8(_mm_and_si128(hbit, u2v), zero);
+                const __m128i hi0 = _mm_andnot_si128(no0, sixteen);
+                const __m128i hi1 = _mm_andnot_si128(no1, sixteen);
+                const __m128i lo = _mm_add_epi8(_mm_and_si128(byte, nib), hi0);
+                const __m128i hi = _mm_add_epi8(
+                    _mm_and_si128(_mm_srli_epi16(byte, 4), nib), hi1);
+                const __m256 a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo));
+                const __m256 c = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi));
+                _mm256_storeu_ps(out + base + i,
+                                 _mm256_sub_ps(_mm256_mul_ps(a, d0v), m0v));
+                _mm256_storeu_ps(out + base + i + 32,
+                                 _mm256_sub_ps(_mm256_mul_ps(c, d1v), m1v));
+            }
+#else
             for (int i = 0; i < 32; i++) {
                 const int hi0 = (qh[i] & u1) ? 16 : 0;
                 const int hi1 = (qh[i] & u2) ? 16 : 0;
                 out[base + i]      = d0 * (float)((q[i] & 0x0f) + hi0) - m0;
                 out[base + i + 32] = d1 * (float)((q[i] >> 4) + hi1) - m1;
             }
+#endif
             q += 32;
             u1 <<= 2;
             u2 <<= 2;
@@ -234,6 +360,70 @@ static void dq_q6_k(const unsigned char *src, size_t nelem, float *dst) {
         const float d = f16(blk + 208);
         float *out = dst + b * QK_K;
         for (int half = 0; half < 2; half++) {
+#if defined(INGOT_DEQ_NEON)
+            const int8x8_t bias = vdup_n_s8(32);
+            const uint8x8_t nib = vdup_n_u8(0x0f), two = vdup_n_u8(3);
+            for (int i = 0; i < 32; i += 8) {
+                const int is = i / 16;
+                const float f1 = d * (float)sc[is],     f2 = d * (float)sc[is + 2];
+                const float f3 = d * (float)sc[is + 4], f4 = d * (float)sc[is + 6];
+                const uint8x8_t l0 = vld1_u8(ql + i);
+                const uint8x8_t l1 = vld1_u8(ql + i + 32);
+                const uint8x8_t h  = vld1_u8(qh + i);
+                const int8x8_t q1 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vand_u8(l0, nib), vshl_n_u8(vand_u8(h, two), 4))), bias);
+                const int8x8_t q2 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vand_u8(l1, nib), vshl_n_u8(vand_u8(vshr_n_u8(h, 2), two), 4))), bias);
+                const int8x8_t q3 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vshr_n_u8(l0, 4), vshl_n_u8(vand_u8(vshr_n_u8(h, 4), two), 4))), bias);
+                const int8x8_t q4 = vsub_s8(vreinterpret_s8_u8(vorr_u8(
+                    vshr_n_u8(l1, 4), vshl_n_u8(vshr_n_u8(h, 6), 4))), bias);
+                float32x4_t a, c;
+                s8x8_f32(q1, &a, &c);
+                vst1q_f32(out + i,      vmulq_n_f32(a, f1));
+                vst1q_f32(out + i + 4,  vmulq_n_f32(c, f1));
+                s8x8_f32(q2, &a, &c);
+                vst1q_f32(out + i + 32, vmulq_n_f32(a, f2));
+                vst1q_f32(out + i + 36, vmulq_n_f32(c, f2));
+                s8x8_f32(q3, &a, &c);
+                vst1q_f32(out + i + 64, vmulq_n_f32(a, f3));
+                vst1q_f32(out + i + 68, vmulq_n_f32(c, f3));
+                s8x8_f32(q4, &a, &c);
+                vst1q_f32(out + i + 96, vmulq_n_f32(a, f4));
+                vst1q_f32(out + i + 100, vmulq_n_f32(c, f4));
+            }
+#elif defined(INGOT_DEQ_AVX2)
+            const __m128i bias = _mm_set1_epi8(32);
+            const __m128i nib = _mm_set1_epi8(0x0f), two = _mm_set1_epi8(3);
+            for (int i = 0; i < 32; i += 8) {
+                const int is = i / 16;
+                const float f1 = d * (float)sc[is],     f2 = d * (float)sc[is + 2];
+                const float f3 = d * (float)sc[is + 4], f4 = d * (float)sc[is + 6];
+                const __m128i l0 = _mm_loadl_epi64((const __m128i *)(ql + i));
+                const __m128i l1 = _mm_loadl_epi64((const __m128i *)(ql + i + 32));
+                const __m128i h  = _mm_loadl_epi64((const __m128i *)(qh + i));
+                const __m128i lo0 = _mm_and_si128(l0, nib);
+                const __m128i lo1 = _mm_and_si128(l1, nib);
+                const __m128i hi0 = _mm_and_si128(_mm_srli_epi16(l0, 4), nib);
+                const __m128i hi1 = _mm_and_si128(_mm_srli_epi16(l1, 4), nib);
+                const __m128i b1 = _mm_slli_epi16(_mm_and_si128(h, two), 4);
+                const __m128i b2 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 2), two), 4);
+                const __m128i b3 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 4), two), 4);
+                const __m128i b4 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 6), two), 4);
+                const __m128i q1 = _mm_sub_epi8(_mm_or_si128(lo0, b1), bias);
+                const __m128i q2 = _mm_sub_epi8(_mm_or_si128(lo1, b2), bias);
+                const __m128i q3 = _mm_sub_epi8(_mm_or_si128(hi0, b3), bias);
+                const __m128i q4 = _mm_sub_epi8(_mm_or_si128(hi1, b4), bias);
+                _mm256_storeu_ps(out + i, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1)), _mm256_set1_ps(f1)));
+                _mm256_storeu_ps(out + i + 32, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q2)), _mm256_set1_ps(f2)));
+                _mm256_storeu_ps(out + i + 64, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q3)), _mm256_set1_ps(f3)));
+                _mm256_storeu_ps(out + i + 96, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q4)), _mm256_set1_ps(f4)));
+            }
+#else
             for (int i = 0; i < 32; i++) {
                 const int is = i / 16;
                 const int q1 = (int)((ql[i]      & 0x0f) | (((qh[i] >> 0) & 3) << 4)) - 32;
@@ -245,6 +435,7 @@ static void dq_q6_k(const unsigned char *src, size_t nelem, float *dst) {
                 out[i + 64] = d * (float)sc[is + 4] * (float)q3;
                 out[i + 96] = d * (float)sc[is + 6] * (float)q4;
             }
+#endif
             out += 128;
             ql += 64;
             qh += 32;
@@ -299,10 +490,10 @@ int ingot_dequant(int type, const void *src, size_t nelem, float *dst) {
     switch (type) {
     case INGOT_TYPE_F32:  memcpy(dst, src, nelem * sizeof(float)); return 0;
     case INGOT_TYPE_F16:
-        for (size_t i = 0; i < nelem; i++) dst[i] = ingot_f16_to_f32(ingot_ld_u16(p + 2 * i));
+        ingot_f16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_TYPE_BF16:
-        for (size_t i = 0; i < nelem; i++) dst[i] = ingot_bf16_to_f32(ingot_ld_u16(p + 2 * i));
+        ingot_bf16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_TYPE_F64:
         for (size_t i = 0; i < nelem; i++) {

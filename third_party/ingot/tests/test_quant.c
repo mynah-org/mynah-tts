@@ -237,11 +237,84 @@ static void test_caps_env(void) {
     unsetenv("INGOT_CAPS");
 }
 
+/* ── dense F16 / BF16 kernels ───────────────────────────────────────────────
+ * The reference is the widened weights dotted in double: the kernels do f32
+ * FMA on exactly those values, so 1e-5 relative is the reorder budget, same
+ * as the quantized exact path. Odd sizes on purpose: cols 133 exercises the
+ * vector tails, rows 37 the strip remainder, tokens 5 the 4-token register
+ * tile plus one. */
+static void test_dense(void) {
+    printf("dense F16/BF16 kernels\n");
+    const size_t rows = 37, cols = 133, tokens = 5;
+    unsigned char *w = malloc(rows * cols * 2);
+    float *wide = malloc(rows * cols * sizeof(float));
+    float *input = malloc(tokens * cols * sizeof(float));
+    float *out = malloc(tokens * rows * sizeof(float));
+    float *single = malloc(tokens * rows * sizeof(float));
+
+    for (int pass = 0; pass < 2; pass++) {
+        const int f16 = pass == 1;
+        rng_state = 0xBEEF01u + (uint32_t)pass;
+        for (size_t i = 0; i < rows * cols; i++) {
+            const uint16_t h = f16 ? ingot_f32_to_f16(rnd_unit())
+                                   : ingot_f32_to_bf16(rnd_unit());
+            w[2 * i] = (unsigned char)(h & 0xff);
+            w[2 * i + 1] = (unsigned char)(h >> 8);
+            wide[i] = f16 ? ingot_f16_to_f32(h) : ingot_bf16_to_f32(h);
+        }
+        for (size_t i = 0; i < tokens * cols; i++) input[i] = rnd_unit();
+
+        const int rc = f16 ? ingot_f16_matvec(w, rows, cols, input, out)
+                           : ingot_bf16_matvec(w, rows, cols, input, out);
+        double worst = 0;
+        for (size_t r = 0; r < rows; r++) {
+            double manual = 0;
+            for (size_t c = 0; c < cols; c++)
+                manual += (double)wide[r * cols + c] * (double)input[c];
+            const double d = fabs((double)out[r] - manual);
+            const double sc = fmax(1.0, fabs(manual));
+            if (d / sc > worst) worst = d / sc;
+        }
+        CHECK(rc == 0 && worst < 1e-5, "%s matvec vs double reference, worst rel %.2e",
+              f16 ? "F16" : "BF16", worst);
+
+        int ok = 1;
+        for (size_t t = 0; t < tokens; t++)
+            ok &= (f16 ? ingot_f16_matvec(w, rows, cols, input + t * cols,
+                                          single + t * rows)
+                       : ingot_bf16_matvec(w, rows, cols, input + t * cols,
+                                           single + t * rows)) == 0;
+        const int rc_mm = f16 ? ingot_f16_matmat(w, rows, cols, input, out, tokens)
+                              : ingot_bf16_matmat(w, rows, cols, input, out, tokens);
+        double drift = 0;
+        for (size_t i = 0; i < tokens * rows; i++) {
+            const double d = fabs((double)out[i] - (double)single[i]);
+            const double sc = fmax(1.0, fabs((double)single[i]));
+            if (d / sc > drift) drift = d / sc;
+        }
+        CHECK(ok && rc_mm == 0 && drift < 1e-5,
+              "%s matmat vs per-token matvec, worst rel %.2e",
+              f16 ? "F16" : "BF16", drift);
+
+        const int rc_dq = f16 ? ingot_f16_dequant(w, rows, cols, wide)
+                              : ingot_bf16_dequant(w, rows, cols, wide);
+        CHECK(rc_dq == 0, "%s dequant runs", f16 ? "F16" : "BF16");
+
+        CHECK(ingot_has_kernel(f16 ? INGOT_TYPE_F16 : INGOT_TYPE_BF16),
+              "%s reports a kernel through the generic dispatch",
+              f16 ? "F16" : "BF16");
+    }
+
+    CHECK(ingot_bf16_matvec(NULL, 1, 8, input, out) != 0, "null weights rejected");
+    free(w); free(wide); free(input); free(out); free(single);
+}
+
 int main(void) {
     test_caps_env();
     test_quantize();
     test_formats();
     test_matmat();
+    test_dense();
     test_guards();
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures != 0;

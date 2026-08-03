@@ -1,7 +1,33 @@
 /* SPDX-License-Identifier: MIT */
 #include "ingot/dtype.h"
+#include "internal.h"
 
 #include <string.h>
+
+/* ── SIMD for the bulk conversions ──────────────────────────────────────────
+ * dtype.c is container-half code, so there is no ingot_cpu() here: runtime
+ * dispatch lives in the quant half and core-only links must stay clean. The
+ * rule is compile-time instead — a TU built with -mavx2/-mf16c may use them
+ * unconditionally, exactly as the compiler itself already does for its own
+ * codegen, and on aarch64 NEON is baseline. The SIMD bodies read the file
+ * bytes as host-endian words, so they are little-endian-host only; a
+ * big-endian build falls back to the byte-by-byte scalar loops. */
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(INGOT_DISABLE_NEON)
+#include <arm_neon.h>
+#define INGOT_DTYPE_NEON 1
+#endif
+#if defined(__AVX2__) && !defined(INGOT_DISABLE_AVX2)
+#include <immintrin.h>
+#define INGOT_DTYPE_AVX2 1
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#define INGOT_DTYPE_AVX512 1
+#endif
+#if defined(__F16C__)
+#define INGOT_DTYPE_F16C 1
+#endif
+#endif
+#endif
 
 /* ── ggml block geometry ────────────────────────────────────────────────────
  * The numbers are the sizeof() of ggml's block_* structs. They are listed here
@@ -203,7 +229,12 @@ float ingot_f16_to_f32(uint16_t value) {
             bits = sign | ((uint32_t)(exponent + 112) << 23) | ((frac & 0x03ffu) << 13);
         }
     } else if (exponent == 31) {
-        bits = sign | 0x7f800000u | (frac << 13);   /* inf / nan */
+        /* Inf passes through; NaN gets the quiet bit, payload preserved.
+         * That is what FCVTL and VCVTPH2PS both do (IEEE: converting a
+         * signaling NaN signals and returns it quieted), and the SIMD lanes
+         * of ingot_f16_block_to_f32 are exactly those instructions — the
+         * scalar tail has to agree with them bit for bit. */
+        bits = sign | 0x7f800000u | (frac << 13) | (frac != 0 ? 0x00400000u : 0u);
     } else {
         bits = sign | ((uint32_t)(exponent + 112) << 23) | (frac << 13);
     }
@@ -283,6 +314,112 @@ float ingot_f8_e5m2_to_f32(uint8_t value) {
     return ingot_f16_to_f32((uint16_t)((uint16_t)value << 8));
 }
 
+/* ── bulk conversions ───────────────────────────────────────────────────────
+ * BF16→F32 is a 16-bit shift into the high half of the word; F16→F32 is what
+ * FCVTL / VCVTPH2PS do in hardware, IEEE-exact including subnormals. Both are
+ * widening, so the SIMD result is bit-identical to the scalar loop — the
+ * conversion parity test enforces that, subnormals and NaNs included. */
+
+void ingot_bf16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
+    size_t i = 0;
+#if defined(INGOT_DTYPE_AVX512)
+    for (; i + 16 <= nelem; i += 16) {
+        const __m256i h = _mm256_loadu_si256((const __m256i *)(p + 2 * i));
+        const __m512i w = _mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16);
+        _mm512_storeu_ps(dst + i, _mm512_castsi512_ps(w));
+    }
+#elif defined(INGOT_DTYPE_AVX2)
+    for (; i + 8 <= nelem; i += 8) {
+        const __m128i h = _mm_loadu_si128((const __m128i *)(p + 2 * i));
+        const __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+    }
+#elif defined(INGOT_DTYPE_NEON)
+    for (; i + 8 <= nelem; i += 8) {
+        const uint16x8_t h = vld1q_u16((const uint16_t *)(const void *)(p + 2 * i));
+        vst1q_f32(dst + i,     vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16)));
+        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16)));
+    }
+#endif
+    for (; i < nelem; i++)
+        dst[i] = ingot_bf16_to_f32(ingot_ld_u16(p + 2 * i));
+}
+
+void ingot_f16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
+    size_t i = 0;
+#if defined(INGOT_DTYPE_AVX512)
+    for (; i + 16 <= nelem; i += 16)
+        _mm512_storeu_ps(dst + i,
+            _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(p + 2 * i))));
+#elif defined(INGOT_DTYPE_F16C)
+    for (; i + 8 <= nelem; i += 8)
+        _mm256_storeu_ps(dst + i,
+            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 2 * i))));
+#elif defined(INGOT_DTYPE_NEON) && defined(__aarch64__)
+    for (; i + 4 <= nelem; i += 4) {
+        const float16x4_t h = vld1_f16((const float16_t *)(const void *)(p + 2 * i));
+        vst1q_f32(dst + i, vcvt_f32_f16(h));
+    }
+#endif
+    for (; i < nelem; i++)
+        dst[i] = ingot_f16_to_f32(ingot_ld_u16(p + 2 * i));
+}
+
+/* F32→BF16 is the write-side twin (quantize/convert tooling). Narrowing, so
+ * the vector body re-implements the exact scalar semantics: round to nearest
+ * even via bits + 0x7fff + lsb, NaN kept NaN by forcing the quiet bit. The
+ * AVX-512BF16 native instruction is deliberately NOT used here: VCVTNEPS2BF16
+ * flushes subnormal inputs to zero no matter what MXCSR says, which breaks
+ * byte-parity with the scalar path. */
+void ingot_f32_block_to_bf16(const float *src, size_t nelem, unsigned char *dst) {
+    size_t i = 0;
+#if defined(INGOT_DTYPE_AVX2)
+    const __m256i c7fff = _mm256_set1_epi32(0x7fff);
+    const __m256i one   = _mm256_set1_epi32(1);
+    const __m256i expm  = _mm256_set1_epi32(0x7f800000);
+    const __m256i quiet = _mm256_set1_epi32(0x0040);
+    for (; i + 8 <= nelem; i += 8) {
+        const __m256i bits = _mm256_castps_si256(_mm256_loadu_ps(src + i));
+        const __m256i lsb  = _mm256_and_si256(_mm256_srli_epi32(bits, 16), one);
+        __m256i h = _mm256_srli_epi32(
+            _mm256_add_epi32(_mm256_add_epi32(bits, c7fff), lsb), 16);
+        /* NaN: exponent all ones and mantissa non-zero -> (bits>>16)|quiet */
+        const __m256i isexp = _mm256_cmpeq_epi32(_mm256_and_si256(bits, expm), expm);
+        const __m256i isman = _mm256_cmpeq_epi32(
+            _mm256_andnot_si256(expm, _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff))),
+            _mm256_setzero_si256());
+        const __m256i isnan = _mm256_andnot_si256(isman, isexp);
+        const __m256i nanh  = _mm256_or_si256(_mm256_srli_epi32(bits, 16), quiet);
+        h = _mm256_blendv_epi8(h, nanh, isnan);
+        /* 32-bit lanes hold 16-bit values: pack and undo the lane interleave */
+        const __m256i packed = _mm256_packus_epi32(h, h);
+        const __m256i lanes  = _mm256_permute4x64_epi64(packed, 0xd8);
+        _mm_storeu_si128((__m128i *)(dst + 2 * i), _mm256_castsi256_si128(lanes));
+    }
+#elif defined(INGOT_DTYPE_NEON)
+    const uint32x4_t c7fff = vdupq_n_u32(0x7fff);
+    const uint32x4_t expm  = vdupq_n_u32(0x7f800000);
+    const uint32x4_t manm  = vdupq_n_u32(0x007fffff);
+    for (; i + 4 <= nelem; i += 4) {
+        const uint32x4_t bits = vreinterpretq_u32_f32(vld1q_f32(src + i));
+        const uint32x4_t lsb  = vandq_u32(vshrq_n_u32(bits, 16), vdupq_n_u32(1));
+        const uint32x4_t rnd  = vaddq_u32(vaddq_u32(bits, c7fff), lsb);
+        uint16x4_t h = vshrn_n_u32(rnd, 16);
+        const uint32x4_t isnan = vandq_u32(
+            vceqq_u32(vandq_u32(bits, expm), expm),
+            vcgtq_u32(vandq_u32(bits, manm), vdupq_n_u32(0)));
+        const uint16x4_t nanh = vorr_u16(vshrn_n_u32(bits, 16), vdup_n_u16(0x0040));
+        h = vbsl_u16(vmovn_u32(isnan), nanh, h);
+        vst1_u16((uint16_t *)(void *)(dst + 2 * i), h);
+    }
+#endif
+    for (; i < nelem; i++) {
+        const uint16_t h = ingot_f32_to_bf16(src[i]);
+        dst[2 * i]     = (unsigned char)(h & 0xff);
+        dst[2 * i + 1] = (unsigned char)(h >> 8);
+    }
+}
+
 int ingot_dtype_to_f32(ingot_dtype dtype, const void *src, size_t nelem, float *dst) {
     if (src == NULL || dst == NULL) return -1;
     const unsigned char *p = (const unsigned char *)src;
@@ -298,12 +435,10 @@ int ingot_dtype_to_f32(ingot_dtype dtype, const void *src, size_t nelem, float *
         }
         return 0;
     case INGOT_DT_F16:
-        for (size_t i = 0; i < nelem; i++)
-            dst[i] = ingot_f16_to_f32((uint16_t)p[2 * i] | ((uint16_t)p[2 * i + 1] << 8));
+        ingot_f16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_DT_BF16:
-        for (size_t i = 0; i < nelem; i++)
-            dst[i] = ingot_bf16_to_f32((uint16_t)p[2 * i] | ((uint16_t)p[2 * i + 1] << 8));
+        ingot_bf16_block_to_f32(p, nelem, dst);
         return 0;
     case INGOT_DT_F8_E4M3:
         for (size_t i = 0; i < nelem; i++) dst[i] = ingot_f8_e4m3_to_f32(p[i]);

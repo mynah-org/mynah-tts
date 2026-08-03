@@ -395,6 +395,8 @@ int ingot_gguf_dequant(const ingot_gguf *g, const ingot_tensor *t, float *dst);
 typedef struct {
     int neon, dotprod, i8mm;      /* ARM: compiled AND present at runtime */
     int avx2, avx512, avx512_vnni;/* x86: same                            */
+    int bf16;                     /* ARM FEAT_BF16 (BFDOT/BFMMLA)         */
+    int f16c, avx512_bf16;        /* x86: VCVTPH2PS / VDPBF16PS           */
 } ingot_cpu_caps;
 
 ingot_cpu_caps ingot_cpu(void);
@@ -460,6 +462,24 @@ int ingot_q8_0_matvec(const void *weights, size_t rows, size_t cols,
 int ingot_q8_0_dequant(const void *weights, size_t rows, size_t cols, float *output);
 int ingot_q8_0_matmat(const void *weights, size_t rows, size_t cols,
                       const float *input, float *output, size_t tokens);
+
+/* ── dense F16 / BF16 kernels ───────────────────────────────────────────────
+ * `weights` is the little-endian 2-byte stream exactly as stored in the file
+ * (zero-copy from the mapping), row-major [rows, cols]; input and output are
+ * f32. The widening is exact, so the result is plain f32 arithmetic on the
+ * stored values — a reordered sum, never an approximation. matvec is
+ * single-threaded like the quantized ones; matmat parallelizes over rows
+ * through ingot_set_parallel_for. */
+int ingot_bf16_matvec(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output);
+int ingot_bf16_matmat(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output, size_t tokens);
+int ingot_bf16_dequant(const void *weights, size_t rows, size_t cols, float *output);
+int ingot_f16_matvec(const void *weights, size_t rows, size_t cols,
+                     const float *input, float *output);
+int ingot_f16_matmat(const void *weights, size_t rows, size_t cols,
+                     const float *input, float *output, size_t tokens);
+int ingot_f16_dequant(const void *weights, size_t rows, size_t cols, float *output);
 
 /* ── the precision contract ─────────────────────────────────────────────────
  * From two tokens up, Q4_K and Q5_K batched matmat quantize the ACTIVATIONS to
