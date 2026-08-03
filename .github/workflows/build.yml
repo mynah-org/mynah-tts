@@ -42,7 +42,7 @@ jobs:
     name: "${{ matrix.os }}-${{ matrix.arch }} (${{ matrix.blas }})"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install dependencies (Linux)
         if: matrix.os == 'linux'
@@ -82,7 +82,7 @@ jobs:
         run: cp build/cpu/mynah-tts mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
           path: mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
@@ -95,10 +95,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -119,7 +119,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: "mynah-tts ${{ steps.version.outputs.tag }}"
