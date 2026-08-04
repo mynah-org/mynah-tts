@@ -19,8 +19,14 @@ number alone, and do not carry these figures over to a future engine.
 | Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
 | Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
 | Magpie 357M v2607 | Apple M1 | Metal | f32 | 0.723 | 2026-07-29 |
-| Magpie 357M v2607 | x86-64 | AVX2 / FMA | — | not measured | kernels exist, never run |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX-512 VNNI | **int8** | 0.427¹ | 2026-08-04 |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX-512 VNNI | f32 | 0.806¹ | 2026-08-04 |
 | Magpie 357M v2607 | ARM64 server (Grace, Graviton) | NEON / SVE | — | not measured | server-class ARM only |
+
+¹ Single warm `--synthesize` run of a short utterance, not the `make bench`
+protocol above — treat the absolute values as indicative. The robust part is
+the ordering: the int8 lane is a **1.9×** speedup over f32 on real AVX-512
+VNNI silicon, consistent with the bandwidth-bound analysis below.
 
 On a longer 6.0 s utterance the M1 numbers improve, because the fixed prep and
 codec cost amortizes: int8 **0.243**, f16 0.376, f32 0.532.
@@ -33,20 +39,13 @@ noise, not a result.
 is *server-class* ARM (Grace, Graviton), which has different cache and bandwidth
 behaviour and would need its own run.
 
-The x86 row is empty for a specific reason worth recording, because it looks
-like it should be fillable. The x86 kernels exist and have been optimized
-(`perf: vectorize x86 GELU`, `perf: batch x86 matvec rows`, `perf: optimize x86
-codec and matvec paths`) — but **those commits carry no measurements**, and no
-x86 RTF for this model exists anywhere: not in the commit bodies, not in the
-docs, not in any session log. The optimizations were written and reasoned about,
-never benchmarked.
-
-The box to run them on is known: an **AMD Ryzen 7 6800H** (Zen 3+, 8C/16T,
-AVX2 + FMA3 + BMI2, **no** AVX-512, no AVX-VNNI) reachable on the LAN, building
-under WSL2 for the Linux/OpenBLAS path. `qwen-tts` was benchmarked there; this
-runtime never has. Note this also means the AVX2 path's *correctness* is
-unverified on real hardware — run `make self-test` and read it before reading
-any RTF.
+The x86 rows were filled on 2026-08-04, on a rented **AMD EPYC 9555P** (Zen 5)
+cloud instance — 4 vCPU, 15 GB RAM, gcc 15.2, Linux/OpenBLAS — with real AVX2,
+AVX-512 F/DQ/BW/VL and **AVX512-VNNI** (until then the x86 kernels had been
+written and optimized but never run on x86 hardware). The same pass verified
+*correctness*, not just speed: `make self-test` green on that ISA, the pack
+converted on the box, and the f32/int8 WAVs validated by ear against the
+Apple-Silicon output. Server-class ARM remains the one unmeasured column.
 
 Do not fill these rows from a sibling project: `qwen-tts` figures describe a
 different model and say nothing about Magpie.

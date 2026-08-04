@@ -49,14 +49,19 @@ RTF = synthesis time ÷ audio duration; **below 1.0 is faster than real time**.
 | Magpie 357M v2607 | Apple M1 | CPU (Accelerate) | f16 | 0.495 |
 | Magpie 357M v2607 | Apple M1 | CPU (Accelerate) | f32 | 0.662 |
 | Magpie 357M v2607 | Apple M1 | Metal | f32 | 0.723 |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | CPU (OpenBLAS, AVX-512 VNNI) | **int8** | 0.427 |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | CPU (OpenBLAS, AVX-512 VNNI) | f32 | 0.806 |
 
 "Magpie 357M v2607" is `nvidia/magpie_tts_multilingual_357m` at revision v2607
 with `nemo-nano-codec-22khz`, the one model shipping today — the column is there
 because RTF means nothing without it, and the next engine will not match these
 numbers.
 
-ARM64 is covered by the M1 rows above. x86-64 and server-class ARM have never
-been benchmarked for this model — see [docs/performance.md](docs/performance.md).
+ARM64 is covered by the M1 rows above, x86-64 by the EPYC rows — a 4 vCPU
+cloud slice with real AVX-512 VNNI, where the int8 lane is a **1.9×** speedup
+over f32 and self-test plus end-to-end synthesis were verified on the box.
+Server-class ARM (Grace, Graviton) has never been benchmarked — see
+[docs/performance.md](docs/performance.md).
 
 Decode is bound by memory bandwidth, not arithmetic — which is why quantization
 is the big lever and why, on Apple Silicon's unified memory, the GPU is *slower*
