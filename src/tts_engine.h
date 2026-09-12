@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "graph.h"       /* mynah_graph_sink, for the explicit-engine entry */
 #include "mynah_tts.h"
 
 /* Per-model engine state: weights resolved once, read-only afterwards. */
@@ -65,6 +66,25 @@ typedef struct {
     int      failed;                /* per request; siblings keep running */
 } mynah_engine_step_result;
 
+/* The vtable below is APPENDABLE, and that is a load-bearing property rather
+ * than a convenience: an optional hook has to be able to land before the
+ * engines that will implement it, or the seam can only ever be widened by
+ * changing every engine in the same commit. C already gives us the semantics --
+ * a member left out of an initializer is zero, which is exactly "this engine
+ * does not have that hook" -- but -Wextra reads a short positional initializer
+ * as a mistake, and both engines' vtables are positional.
+ *
+ * So the diagnostic is turned off for the translation units that build against
+ * this seam, and only for them. It is not a blanket relaxation of -Wextra: it
+ * is the one warning whose advice ("list every member") is the opposite of the
+ * contract this header is asserting. The real protection against a mis-assigned
+ * pointer is that every new member is APPENDED and never inserted, which is
+ * type-checked -- inserting one puts a function of the wrong type in the slot
+ * and the build fails loudly. */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+
 typedef struct {
     const char *name;               /* matched against model.json "engine" */
 
@@ -85,13 +105,32 @@ typedef struct {
     int  (*reset)(mynah_engine_ctx *ctx, char *error, size_t error_capacity);
     void (*ctx_free)(mynah_engine_ctx *ctx);
 
-    /* Advance `count` independent contexts by one AR step. Failure here is
-     * all-or-none: it is a failure of shared code, not of one request's data. */
+    /* Advance `count` independent contexts by one AR step.
+     *
+     * ATOMIC OVER THE BATCH. When this returns non-zero, NO context in the
+     * batch has advanced. The driver depends on it: a batched step has no
+     * per-request result channel, so the only way it can tell whose data was
+     * at fault is to re-step the contexts one at a time and see which one
+     * refuses again. That re-step is legal exactly because of this sentence.
+     *
+     * An engine that advances contexts 0..i-1 and then refuses context i turns
+     * one bad request into a batch-wide corruption -- the survivors would be
+     * double-stepped by the isolation pass, and no driver can detect that from
+     * the outside. Validate every context first, then commit, or keep the
+     * per-request checks in `emit_batch` where there is a place to report
+     * them. At `caps.max_batch == 1` the question does not arise, which is why
+     * an engine can leave it until it widens. */
     int  (*step_batch)(mynah_engine_ctx *const *ctxs, size_t count,
                        mynah_engine_scratch *scratch,
                        char *error, size_t error_capacity);
     /* Turn each context's step output into appended audio frames and an EOS
-     * verdict. Per-request failures go in results[i].failed. */
+     * verdict. Per-request failures go in results[i].failed and the return
+     * value is still non-zero; a non-zero return that marks nobody means the
+     * call failed for reasons that belong to no single request, and the driver
+     * has to retire the whole batch -- there is nothing left it could attribute
+     * and a step that fails while retiring nobody would spin forever. Marking
+     * the guilty request is therefore how an engine keeps its blast radius at
+     * one. */
     int  (*emit_batch)(mynah_engine_ctx *const *ctxs, size_t count,
                        mynah_engine_step_result *results,
                        mynah_engine_scratch *scratch,
@@ -117,9 +156,110 @@ typedef struct {
 
     /* Optional; NULL is legal. Called only when a MYNAH_DUMP_* env is set. */
     void (*debug_dump)(mynah_engine_ctx *ctx, const char *stage);
+
+    /* ---- decode a gang -------------------------------------------------
+     *
+     * WHY IT IS IN THE SEAM AT ALL. `decode_audio` is declared per context,
+     * so the driver can never show an engine two requests' codec work at the
+     * same time, and the codec is not a rounding error: the codec transformer
+     * plus the convolution stack are about 55% of wall time here, and in the
+     * reference implementation the decoder was 72-80% of the marginal cost of
+     * each additional stream (.work/serving-design.md §4). A per-context hook
+     * multiplies that by the number of concurrent streams and batches none of
+     * it. This entry is the one place where the shape of the seam, rather than
+     * any engine's code, decides whether that is possible.
+     *
+     * Each element i names a context and the half-open frame range
+     * [first_frame[i], first_frame[i] + frame_count[i]).
+     *
+     * WHAT THE ENGINE MAY ASSUME
+     *  - Each range obeys exactly the rule `decode_audio` already imposes:
+     *    contiguous with, and monotonically after, everything decoded so far
+     *    FOR THAT CONTEXT. The seam has no other rule, and being in a gang
+     *    adds none: ranges of different contexts are unrelated and routinely
+     *    differ in length, because the driver ramps each slot's quantum
+     *    separately.
+     *  - `count >= 1`, and no context appears twice in one call.
+     *  - Every context comes from the same model and the same engine state,
+     *    and none of them is inside another engine call.
+     *
+     * WHAT THE ENGINE MUST GUARANTEE
+     *  - BIT-IDENTITY PER CONTEXT. out_samples[i] must be exactly what
+     *    `decode_audio(ctxs[i], first_frame[i], frame_count[i], ...)` would
+     *    have produced on its own -- the same promise the batched linear rows
+     *    make, for the same reason. Which contexts share the call, how many
+     *    there are and in what order they appear are a scheduling decision the
+     *    driver makes on timing and remakes every step, so anything that leaked
+     *    across rows would make a request's audio depend on the server's load.
+     *  - PER-CONTEXT FAILURE. A range the engine cannot serve sets failed[i]
+     *    and leaves out_samples[i] NULL without disturbing its neighbours. The
+     *    return value is non-zero only for a failure that belongs to no single
+     *    context, and then every failed[i] is set and `error` explains it.
+     *
+     * WHO OWNS WHAT
+     *  - The driver owns the six parallel arrays, guarantees `count` entries in
+     *    each, and pre-clears out_samples[] to NULL and out_count[]/failed[] to
+     *    zero. The engine writes them and keeps no pointer to them.
+     *  - Each non-NULL out_samples[i] is one malloc'd block per context, freed
+     *    by the driver, exactly as `decode_audio` hands one back. The engine
+     *    never frees a buffer it has already returned, including when a later
+     *    context in the same call fails.
+     *  - `scratch` is the driver's, sized for its widest batch, the same handle
+     *    `step_batch` receives, and lent only for this call. Nothing in it
+     *    survives to the next one.
+     *
+     * OPTIONAL, AND MEANT TO BE. NULL is the correct value for an engine whose
+     * batched codec has not been measured yet, and it is what every engine
+     * starts as. The driver never calls this pointer directly -- it goes
+     * through `mynah_engine_decode_gang` below, which falls back to `count`
+     * calls to `decode_audio`. An engine gaining a batched codec is therefore
+     * one line in its vtable and no change anywhere above it.
+     *
+     * It lives at the END of this struct on purpose: the engine vtables are
+     * positional initializers, so a new member anywhere else would silently
+     * shift every function pointer after it. Append; never insert. */
+    int  (*decode_audio_batch)(mynah_engine_ctx *const *ctxs, size_t count,
+                               const size_t *first_frame, const size_t *frame_count,
+                               float **out_samples, size_t *out_count, int *failed,
+                               mynah_engine_scratch *scratch,
+                               char *error, size_t error_capacity);
 } mynah_tts_engine;
+
+/* The default implementation of `decode_audio_batch`, and the driver's only
+ * door to it: dispatches to the engine's hook when it has one and otherwise
+ * decodes the gang one context at a time. Same arguments, same ownership, same
+ * guarantees -- the fallback satisfies them trivially, which is the point.
+ *
+ * Returns 0 when the call itself ran; inspect failed[i] for per-context
+ * outcomes. Returns non-zero only for a failure that belongs to no context. */
+int mynah_engine_decode_gang(const mynah_tts_engine *engine,
+                             mynah_engine_ctx *const *ctxs, size_t count,
+                             const size_t *first_frame, const size_t *frame_count,
+                             float **out_samples, size_t *out_count, int *failed,
+                             mynah_engine_scratch *scratch,
+                             char *error, size_t error_capacity);
 
 /* Resolve by the `engine` field of model.json. NULL when unknown. */
 const mynah_tts_engine *mynah_engine_lookup(const char *name);
+
+/* Serve a sink with the engine handed in directly instead of resolved from
+ * model.json. `model` is passed through to the engine untouched and may be NULL
+ * for an engine that does not need one. It is the same driver the public entry
+ * points run; they differ only in where the engine came from.
+ *
+ * It exists because of what the driver now decides on its own. The decode gang,
+ * the per-request failure blast radius and the quantum ramp are policies that
+ * hold for every engine by construction, and a test that has to load a model
+ * pack to reach them can only ever check them for the engines that happen to be
+ * installed -- and cannot make one request of sixteen fail on purpose, which is
+ * the case that matters. A synthetic engine can, deterministically, in
+ * milliseconds, with no weights.
+ *
+ * `strict_batch` refuses a batch wider than the engine's `caps.max_batch`
+ * instead of quietly narrowing to it, which is what a fixed array of N jobs
+ * means and what a service does not. */
+int mynah_graph_serve_engine(const mynah_tts_engine *engine,
+                             const mynah_tts_model *model, mynah_graph_sink *sink,
+                             size_t max_batch, int strict_batch);
 
 #endif

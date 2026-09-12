@@ -93,8 +93,13 @@ TARGET := $(BUILD_DIR)/mynah-tts
 LIBRARY := $(BUILD_DIR)/libmynah_tts.a
 STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
+# The driver's own policies -- decode gang, failure blast radius, quantum ramp
+# -- are tested against a synthetic engine, so this one needs no model pack and
+# runs inside `make test` (and therefore inside ubsan/asan).
+DRIVER_TEST_OBJECT := $(BUILD_DIR)/tests/test_driver.o
+DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 
-.PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+.PHONY: all cpu info caps self-test test stream-test driver-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
@@ -126,6 +131,13 @@ $(STREAM_TEST_TARGET): $(CORE_OBJECTS) $(STREAM_TEST_OBJECT)
 stream-test: $(STREAM_TEST_TARGET)
 	@test -n "$(MODEL_DIR)" || (echo "usage: make stream-test MODEL_DIR=pack" >&2; exit 2)
 	@$(STREAM_TEST_TARGET) "$(MODEL_DIR)"
+
+$(DRIVER_TEST_TARGET): $(CORE_OBJECTS) $(DRIVER_TEST_OBJECT)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+driver-test: $(DRIVER_TEST_TARGET)
+	@$(DRIVER_TEST_TARGET)
 
 SERVER_SOURCES := server/main.c server/http_util.c server/stream_out.c server/prefork.c
 SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)
@@ -159,7 +171,7 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 
-test: self-test playback-sim-test
+test: self-test driver-test playback-sim-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
@@ -434,4 +446,4 @@ update-ingot:
 	git subtree pull --prefix $(INGOT_DIR) https://github.com/mynah-org/ingot.git main --squash
 	@$(MAKE) -C $(INGOT_DIR) clean
 
--include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d)
+-include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d)

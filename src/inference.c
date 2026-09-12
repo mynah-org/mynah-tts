@@ -24,6 +24,63 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The default `decode_audio_batch`: one `decode_audio` per context.
+ *
+ * It is deliberately the only door the driver uses. The gang is formed above
+ * this function whether or not the engine can exploit it, so an engine landing
+ * a batched codec later changes exactly one pointer in its vtable and nothing
+ * in the policy that decides who is in the gang -- which is the landing order
+ * this seam was shaped for.
+ *
+ * Per-context failure is kept per context in both paths: the loop below marks
+ * failed[i] and keeps going, so a request asking for a range its engine cannot
+ * serve does not cost its neighbours their audio. The first failure's message
+ * is the one kept, because it is the one that actually describes a failure;
+ * the driver reports it to every context it marked. */
+int mynah_engine_decode_gang(const mynah_tts_engine *engine,
+                             mynah_engine_ctx *const *ctxs, size_t count,
+                             const size_t *first_frame, const size_t *frame_count,
+                             float **out_samples, size_t *out_count, int *failed,
+                             mynah_engine_scratch *scratch,
+                             char *error, size_t error_capacity) {
+    if (engine == NULL || ctxs == NULL || first_frame == NULL ||
+        frame_count == NULL || out_samples == NULL || out_count == NULL ||
+        failed == NULL) {
+        mynah_graph_error(error, error_capacity, "invalid decode gang");
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        out_samples[i] = NULL;
+        out_count[i] = 0u;
+        failed[i] = 0;
+    }
+    if (count == 0u) return 0;
+    if (engine->decode_audio_batch != NULL) {
+        return engine->decode_audio_batch(ctxs, count, first_frame, frame_count,
+                                          out_samples, out_count, failed, scratch,
+                                          error, error_capacity);
+    }
+    char one_error[256];
+    int reported = 0;
+    for (size_t i = 0; i < count; ++i) {
+        one_error[0] = '\0';
+        if (engine->decode_audio(ctxs[i], first_frame[i], frame_count[i],
+                                 &out_samples[i], &out_count[i], one_error,
+                                 sizeof(one_error)) != 0) {
+            out_samples[i] = NULL;
+            out_count[i] = 0u;
+            failed[i] = 1;
+            if (!reported) {
+                mynah_graph_error(error, error_capacity,
+                                  one_error[0] != '\0' ? one_error
+                                                       : "decoding audio failed");
+                reported = 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int emit_stream_samples(mynah_tts_audio_callback callback, void *user_data,
                                const float *samples, size_t count,
                                size_t chunk_samples, char *error,
@@ -112,36 +169,159 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
     return 0;
 }
 
-/* Turn whatever the engine has appended into streamed PCM.
+/* How many frames this slot is waiting to accumulate before it delivers.
  *
- * The frame history is opaque and monotonic, so the driver only tracks how far
- * it has got and asks for the rest. A step that appended less than a full
- * step's worth of frames is a boundary -- the engine cut the window short --
- * and is flushed immediately rather than waiting for the emit threshold. */
-static int slot_stream(const mynah_tts_engine *engine, const mynah_engine_caps *caps,
-                       synth_slot *slot, const mynah_engine_step_result *result) {
-    if (slot->callback == NULL) return 0;
-    const size_t frames = engine->frame_count(slot->ctx);
-    const int finishing = result->eos || result->frames_appended < caps->frames_per_step;
-    const size_t fresh = frames > slot->streamed_frames
-        ? frames - slot->streamed_frames : 0u;
-    if (fresh == 0u || !(finishing || fresh >= caps->audio_emit_frames)) return 0;
+ * The ramp is .work/streaming-cadence.md §3, and the reason it is a ramp and
+ * not a constant is the cadence law: a chunk of C frames can only be delivered
+ * after C steps plus its decode, so the player needs a lead of about C frames
+ * of wall time to absorb it, and that lead does not exist yet at the start of
+ * a stream. So the first chunk is ONE frame -- the first chunk IS the time to
+ * first audio -- and the quantum grows only as the lead that pays for it does.
+ *
+ * We can afford the smallest possible first chunk where the reference could
+ * not: our codec carries state instead of replaying context, and the
+ * chunked-versus-one-shot error stays at 1e-7 down to a one-frame chunk
+ * (E2-3). The knob is free for us in a way it was not for them.
+ *
+ * The steady state is the engine's own `audio_emit_frames`, and the ramp is
+ * clamped to it, never above: this only ever makes early chunks smaller than
+ * the engine asked for, so an engine that declares a one-frame threshold
+ * because its decode is cheap keeps exactly the cadence it declared. */
+static size_t slot_quantum(const mynah_engine_caps *caps, const synth_slot *slot) {
+    const size_t steady = caps->audio_emit_frames > 0u
+        ? (size_t)caps->audio_emit_frames : 1u;
+    const size_t delivered = slot->streamed_frames;
+    size_t quantum;
+    if (delivered == 0u)     quantum = 1u;   /* this one is the TTFA */
+    else if (delivered < 4u) quantum = 2u;
+    else if (delivered < 12u) quantum = 4u;
+    else                      quantum = steady;
+    return quantum < steady ? quantum : steady;
+}
 
-    float *audio = NULL;
-    size_t produced = 0;
-    if (engine->decode_audio(slot->ctx, slot->streamed_frames, fresh, &audio, &produced,
-                             slot->error, slot->error_capacity) != 0) {
-        return slot_fail(slot, NULL);
-    }
+/* Hand one gang member its PCM. */
+static int slot_deliver(synth_slot *slot, float *audio, size_t produced,
+                        size_t frames) {
     if (emit_stream_samples(slot->callback, slot->user_data, audio, produced,
-                            slot->chunk_samples, slot->error, slot->error_capacity) != 0) {
-        free(audio);
+                            slot->chunk_samples, slot->error,
+                            slot->error_capacity) != 0) {
         return slot_fail(slot, NULL);
     }
     slot->streamed_samples += produced;
-    slot->streamed_frames = frames;
-    free(audio);
+    slot->streamed_frames += frames;
     return 0;
+}
+
+/* Form the decode gang for this step and run it.
+ *
+ * This is the reference's decoder gang (.work/serving-design.md §5) and the
+ * reason it exists is arithmetic, not taste: the codec transformer plus the
+ * convolution stack are about 55% of wall time, and while `decode_audio` is
+ * declared per context that 55% is multiplied by the number of concurrent
+ * streams with nothing shared. Batching the decoder was the single change that
+ * moved the reference's capacity, where their decoder was 72-80% of the
+ * marginal cost of each extra stream.
+ *
+ * The policy, in the order the decisions are made:
+ *
+ *  1. A slot that has reached its own target MUST decode. `finishing` -- the
+ *     engine ended the sequence or cut the step window short -- is a target of
+ *     its own, reached at whatever is pending.
+ *
+ *  2. If at least one of those slots is in its steady-state regime, it is a
+ *     leader: the fixed per-call cost of a decode is already being paid, so
+ *     every other slot holding at least MYNAH_GANG_MIN_PENDING frames joins the
+ *     same call. Riding along is close to free and it spends frames that would
+ *     otherwise have needed a call of their own a step or two later.
+ *
+ *  3. NO SLOT IS EVER DELAYED TO MAKE A BIGGER GANG. Step 1 puts every ready
+ *     slot in the gang before step 2 looks at anybody, so the gang can only
+ *     ever grow past what the no-wait policy already requires. This is not a
+ *     tuning choice: the cadence law forbids withholding ready work, and every
+ *     scheduling policy the reference measured that parked ready work lost --
+ *     their lead/credit gate went 0.838 to 0.986 while parking 95.8% of the
+ *     checks it made.
+ *
+ * Delivery granularity stays decoupled from compute granularity: a follower
+ * pulled in with two pending frames is delivered two frames, not the leader's
+ * sixteen. The gang is about how the work is executed, never about how much
+ * audio a client is made to wait for.
+ *
+ * Offline slots have no callback and never appear here; they decode once, in
+ * full, when they retire. */
+#define MYNAH_GANG_MIN_PENDING 1u
+
+static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps *caps,
+                        mynah_engine_scratch *scratch, synth_slot *slots,
+                        const size_t *step_slot,
+                        const mynah_engine_step_result *results, size_t live) {
+    size_t pending[MYNAH_GRAPH_MAX_JOBS];
+    int ready[MYNAH_GRAPH_MAX_JOBS];
+    int leading = 0;
+
+    const size_t steady = caps->audio_emit_frames > 0u
+        ? (size_t)caps->audio_emit_frames : 1u;
+
+    for (size_t j = 0; j < live; ++j) {
+        const synth_slot *slot = &slots[step_slot[j]];
+        pending[j] = 0u;
+        ready[j] = 0;
+        if (slot->callback == NULL || slot->failed || slot->ctx == NULL) continue;
+        const size_t frames = engine->frame_count(slot->ctx);
+        if (frames <= slot->streamed_frames) continue;
+        pending[j] = frames - slot->streamed_frames;
+        const int finishing = results[j].eos ||
+            results[j].frames_appended < caps->frames_per_step;
+        const size_t quantum = slot_quantum(caps, slot);
+        if (finishing || pending[j] >= quantum) {
+            ready[j] = 1;
+            /* A slot still climbing the ramp is not a leader: its decode is
+             * small, the fixed cost it would amortise has not been paid yet,
+             * and pulling neighbours into it buys nothing. A one-frame steady
+             * state means the engine has declared there is no fixed cost to
+             * amortise at all, so nobody leads. */
+            if (steady >= 2u && quantum >= steady) leading = 1;
+        }
+    }
+
+    mynah_engine_ctx *gang[MYNAH_GRAPH_MAX_JOBS];
+    size_t member[MYNAH_GRAPH_MAX_JOBS];
+    size_t first[MYNAH_GRAPH_MAX_JOBS];
+    size_t want[MYNAH_GRAPH_MAX_JOBS];
+    float *pcm[MYNAH_GRAPH_MAX_JOBS];
+    size_t produced[MYNAH_GRAPH_MAX_JOBS];
+    int decode_failed[MYNAH_GRAPH_MAX_JOBS];
+    size_t count = 0;
+
+    for (size_t j = 0; j < live; ++j) {
+        if (pending[j] == 0u) continue;
+        if (!ready[j] && !(leading && pending[j] >= MYNAH_GANG_MIN_PENDING)) continue;
+        const synth_slot *slot = &slots[step_slot[j]];
+        gang[count] = slot->ctx;
+        member[count] = j;
+        first[count] = slot->streamed_frames;
+        want[count] = pending[j];
+        ++count;
+    }
+    if (count == 0u) return;
+
+    char shared_error[256];
+    shared_error[0] = '\0';
+    const int gang_failed =
+        mynah_engine_decode_gang(engine, gang, count, first, want, pcm, produced,
+                                 decode_failed, scratch, shared_error,
+                                 sizeof(shared_error)) != 0;
+    for (size_t g = 0; g < count; ++g) {
+        synth_slot *slot = &slots[step_slot[member[g]]];
+        if (gang_failed || decode_failed[g]) {
+            free(pcm[g]);
+            slot_fail(slot, shared_error[0] != '\0' ? shared_error
+                                                    : "decoding audio failed");
+            continue;
+        }
+        slot_deliver(slot, pcm[g], produced[g], want[g]);
+        free(pcm[g]);
+    }
 }
 
 /* Close the sequence and, for the offline sink, decode all of it. */
@@ -218,6 +398,42 @@ static int refuse_all(mynah_graph_sink *sink, const char *message) {
     return -1;
 }
 
+/* Find out whose data the batched step refused, and retire only that request.
+ *
+ * A batched step has no per-request result channel, so when it fails the driver
+ * has one question it cannot answer from the return value: whose fault was it?
+ * It answers it by asking again, one context at a time. `step_batch` is atomic
+ * over the batch (see tts_engine.h), so nothing advanced on the failed call and
+ * re-stepping a context alone is the same step it would have taken had it been
+ * alone all along -- which is also why the survivors' audio is unchanged.
+ *
+ * Without this a single request that hits its own step budget, or arrives with
+ * data its engine refuses, retires every request sharing the batch with it.
+ * That is invisible at width one and it is the whole server at width sixteen.
+ * One request's failure retires one request.
+ *
+ * Compacts the step arrays in place and returns how many contexts survived. */
+static size_t step_isolate(const mynah_tts_engine *engine,
+                           mynah_engine_scratch *scratch, synth_slot *slots,
+                           mynah_engine_ctx **step_ctxs, size_t *step_slot,
+                           size_t live, const char *shared_error) {
+    size_t kept = 0;
+    for (size_t j = 0; j < live; ++j) {
+        char one_error[256];
+        one_error[0] = '\0';
+        mynah_engine_ctx *one = step_ctxs[j];
+        if (engine->step_batch(&one, 1u, scratch, one_error, sizeof(one_error)) != 0) {
+            slot_fail(&slots[step_slot[j]],
+                      one_error[0] != '\0' ? one_error : shared_error);
+            continue;
+        }
+        step_ctxs[kept] = one;
+        step_slot[kept] = step_slot[j];
+        ++kept;
+    }
+    return kept;
+}
+
 /* One AR step for every live slot, plus whatever audio that made final. */
 static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *caps,
                       mynah_engine_scratch *scratch, synth_slot *slots,
@@ -227,10 +443,15 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     shared_error[0] = '\0';
     if (engine->step_batch(step_ctxs, live, scratch, shared_error,
                            sizeof(shared_error)) != 0) {
-        /* A batched step fails for all its slots or none: the failure is in
-         * shared code, not in one request's data. */
-        for (size_t j = 0; j < live; ++j) slot_fail(&slots[step_slot[j]], shared_error);
-        return;
+        if (live <= 1u) {
+            /* Alone in the batch, the attribution is not in doubt and there is
+             * nothing to isolate it from. */
+            if (live == 1u) slot_fail(&slots[step_slot[0]], shared_error);
+            return;
+        }
+        live = step_isolate(engine, scratch, slots, step_ctxs, step_slot, live,
+                            shared_error);
+        if (live == 0u) return;
     }
     if (dump && engine->debug_dump != NULL) {
         for (size_t j = 0; j < live; ++j) engine->debug_dump(step_ctxs[j], "hidden");
@@ -240,18 +461,31 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     shared_error[0] = '\0';
     if (engine->emit_batch(step_ctxs, live, results, scratch, shared_error,
                            sizeof(shared_error)) != 0) {
+        int attributed = 0;
         for (size_t j = 0; j < live; ++j) {
-            if (results[j].failed) slot_fail(&slots[step_slot[j]], shared_error);
+            if (results[j].failed) {
+                slot_fail(&slots[step_slot[j]], shared_error);
+                attributed = 1;
+            }
+        }
+        /* A failure the engine attributed to nobody is a failure of shared
+         * code, and it has to retire the batch: returning here having failed
+         * no one would leave every slot active, and the service loop would
+         * take the same step again forever. */
+        if (!attributed) {
+            for (size_t j = 0; j < live; ++j) slot_fail(&slots[step_slot[j]], shared_error);
         }
         return;
     }
     for (size_t j = 0; j < live; ++j) {
+        if (results[j].failed) slot_fail(&slots[step_slot[j]], shared_error);
+    }
+    /* Delivery is decided for the whole batch at once, not slot by slot: that
+     * is the only place the driver can see two requests' codec work together. */
+    stream_gang(engine, caps, scratch, slots, step_slot, results, live);
+    for (size_t j = 0; j < live; ++j) {
         synth_slot *slot = &slots[step_slot[j]];
-        if (results[j].failed) {
-            slot_fail(slot, shared_error);
-            continue;
-        }
-        if (slot_stream(engine, caps, slot, &results[j]) != 0) continue;
+        if (slot->failed) continue;
         if (results[j].eos) slot->active = 0;
     }
 }
@@ -264,13 +498,12 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
  * sense that matters: a finished slot is retired and refilled from the sink
  * between steps, so a request arriving mid-flight joins the batch that is
  * already running rather than waiting for it to drain. */
-static int serve(const mynah_tts_model *model, mynah_graph_sink *sink,
-                 size_t want_batch, int strict_batch, int dump_all) {
-    if (model == NULL || sink == NULL || sink->next_job == NULL) return -1;
+static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
+                 mynah_graph_sink *sink, size_t want_batch, int strict_batch,
+                 int dump_all) {
+    if (sink == NULL || sink->next_job == NULL) return -1;
     if (want_batch == 0u) return 0;
     if (want_batch > MYNAH_GRAPH_MAX_JOBS) return -1;
-
-    const mynah_tts_engine *engine = mynah_engine_lookup(model->info.engine);
     if (engine == NULL) {
         return refuse_all(sink, "model.json names an engine this build does not have");
     }
@@ -435,11 +668,20 @@ static void array_on_done(void *ud, void *tag, int result) {
     job->result = result == MYNAH_GRAPH_OK ? 0 : -1;
 }
 
-int mynah_graph_serve_continuous(const mynah_tts_model *model, size_t max_batch,
-                                 mynah_graph_sink *sink) {
+int mynah_graph_serve_engine(const mynah_tts_engine *engine,
+                             const mynah_tts_model *model, mynah_graph_sink *sink,
+                             size_t max_batch, int strict_batch) {
     if (max_batch == 0u) max_batch = 1u;
     if (max_batch > MYNAH_GRAPH_MAX_JOBS) max_batch = MYNAH_GRAPH_MAX_JOBS;
-    return serve(model, sink, max_batch, 0, 0);
+    return serve(engine, model, sink, max_batch, strict_batch, 0);
+}
+
+int mynah_graph_serve_continuous(const mynah_tts_model *model, size_t max_batch,
+                                 mynah_graph_sink *sink) {
+    if (model == NULL) return -1;
+    if (max_batch == 0u) max_batch = 1u;
+    if (max_batch > MYNAH_GRAPH_MAX_JOBS) max_batch = MYNAH_GRAPH_MAX_JOBS;
+    return serve(mynah_engine_lookup(model->info.engine), model, sink, max_batch, 0, 0);
 }
 
 int mynah_graph_synthesize_jobs(const mynah_tts_model *model,
@@ -457,7 +699,8 @@ int mynah_graph_synthesize_jobs(const mynah_tts_model *model,
     sink.ud = &state;
     sink.next_job = array_next_job;
     sink.on_done = array_on_done;
-    return serve(model, &sink, count, 1, count == 1u);
+    return serve(mynah_engine_lookup(model->info.engine), model, &sink, count, 1,
+                 count == 1u);
 }
 
 int mynah_graph_synthesize_stream(const mynah_tts_model *model,
