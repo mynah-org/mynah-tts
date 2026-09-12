@@ -44,6 +44,14 @@ Linux x86 `SIMD=auto` compiles `-mavx2 -mfma` with **no runtime dispatch**, so
 VNNI and AMX would never be selected in production however well they are
 implemented. Closing that gap is E4-9.
 
+**A premise we recorded and then falsified**: "int8 breaks PocketTTS parity" was
+a category error. f32 against f32 with a different seed gives hidden rel_l2
+1.05-1.07 and log-mel 0.378 — the 5.9e-2 we had flagged is **twenty times
+smaller** than the sampler's own variability. What matters is whether a tensor's
+error re-enters the AR loop: outside it the codec takes int8 at log-mel 0.9995
+with zero frame difference, inside it f16 measures 1.2e-06 and moves nothing.
+The default is now mixed per tensor → [`.work/dtype-and-fallbacks.md`](.work/dtype-and-fallbacks.md).
+
 One measured fact shapes several epics: the six PocketTTS language models are
 **independently trained and share nothing**, codec included. One pack per
 language, no deduplication, voices valid only for the model that produced them,
@@ -268,6 +276,29 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       actually runs, and a Linux measurement box. Until this lands, no production
       performance number can be quoted.
 - [ ] E4-8 `Makefile`: `SIMD=` profiles + `ARCH_STAMP` rebuild-on-flag-change
+
+### E8 — The batched vocoder: the structural ceiling
+
+Two lanes reached this independently. `codec.transformer` + `codec.conv_stack` are
+~55% of wall and live inside `decode_audio`, which the vtable declares **per
+context** — so the driver never sees two streams' codec work together and that 55%
+is multiplied by the stream count. The reference implementation had the same shape
+(their decoder was 72-80% of the marginal cost of a stream) and batching it was the
+one change that moved their capacity.
+
+Arithmetic, not a promise: with int8 on the codec and VNNI but **without** this,
+100 streams need ~20 cores of codec alone before anything else is counted — so C100
+wants a 64-core box. With it, a 32-core box returns to the conversation.
+
+- [~] E8-1 `decode_audio_batch` in `src/tts_engine.h` with a default loop, so every
+      engine keeps working and Magpie is untouched; contract is bit-identity per
+      context, same rule as the linear-row hook
+- [~] E8-2 gang former in `src/inference.c` — **no-wait**: a slot at its target must
+      decode, a large target makes it leader and pulls in peers, but no slot is ever
+      delayed to build a bigger gang. The cadence law forbids withholding ready work
+- [~] E8-3 `step_live()` fails **all** live slots when one slot errors. Harmless at
+      width 1, sixteen requests wide once batching is on
+- [ ] E8-4 `engine_pocket` implements the override, after the batching merge lands
 
 ### E5 — Streaming server v2 → [`.work/streaming-server-v2.md`](.work/streaming-server-v2.md)
 Design reference: [`.work/serving-design.md`](.work/serving-design.md) ·
