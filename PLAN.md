@@ -13,6 +13,16 @@ which requires the engine seam that has been outstanding since July.
 
 **Current focus is CPU — ARM and x86 together. GPU work is deferred.**
 
+**Production is Linux server, x86-64 and ARM64.** macOS/M1 is the development
+machine and every number in this repo so far was taken there, which makes them
+development signals rather than product claims. Three concrete reasons they do
+not transfer: the SEANet GEMM fast path that bought 36x goes through BLAS, which
+is Accelerate here and OpenBLAS there; the thread pool defaults to performance
+cores via sysctl, a concept that does not exist on a 64-core NUMA server; and on
+Linux x86 `SIMD=auto` compiles `-mavx2 -mfma` with **no runtime dispatch**, so
+VNNI and AMX would never be selected in production however well they are
+implemented. Closing that gap is E4-9.
+
 One measured fact shapes several epics: the six PocketTTS language models are
 **independently trained and share nothing**, codec included. One pack per
 language, no deduplication, voices valid only for the model that produced them,
@@ -156,6 +166,11 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-5 the kernel the profile names — scalar reference, then NEON/SDOT/i8mm **and** AVX2/AVX-512/VNNI in one change
 - [ ] E4-6 int8 weight prepack with persistent cache, both ISAs
 - [ ] E4-7 AMX-INT8 (Linux/x86 only), last
+- [ ] E4-9 **Linux is the target, so measure there**: runtime ISA dispatch on x86 (a
+      binary that picks VNNI/AMX when the CPU has them and does not SIGILL when it
+      does not), OpenBLAS thread-count coordination with our pool, a CI matrix that
+      actually runs, and a Linux measurement box. Until this lands, no production
+      performance number can be quoted.
 - [ ] E4-8 `Makefile`: `SIMD=` profiles + `ARCH_STAMP` rebuild-on-flag-change
 
 ### E5 — Streaming server v2 → [`.work/streaming-server-v2.md`](.work/streaming-server-v2.md)
