@@ -290,17 +290,23 @@ Arithmetic, not a promise: with int8 on the codec and VNNI but **without** this,
 100 streams need ~20 cores of codec alone before anything else is counted — so C100
 wants a 64-core box. With it, a 32-core box returns to the conversation.
 
-- [~] E8-1 `decode_audio_batch` in `src/tts_engine.h` with a default loop, so every
-      engine keeps working and Magpie is untouched; contract is bit-identity per
-      context, same rule as the linear-row hook
-- [~] E8-2 gang former in `src/inference.c` — **no-wait**: a slot at its target must
-      decode, a large target makes it leader and pulls in peers, but no slot is ever
-      delayed to build a bigger gang. The cadence law forbids withholding ready work
+- [x] E8-1 **done** (`eb8dccc`): `decode_audio_batch` appended to the vtable — appended,
+      not inserted, because both engines use positional initializers — with a default
+      loop, both engines untouched, and bit-identity per context as the contract
+- [x] E8-2 **done** (`eb8dccc`): `stream_gang()` decides the whole batch at once. No-wait
+      is structural, not a check — every ready slot is in the gang before the pull-in
+      looks at anyone. Plus the per-slot quantum ramp 1,2,2,4,4 then steady state,
+      never above what the engine declares
 - [~] E8-3 `step_live()` fails **all** live slots when one slot errors. Harmless at
       width 1, sixteen requests wide once batching is on
 - [x] E8-3 done in the batching merge (`0d944e9`): a request that exhausts its step
       budget retires as EOS instead of failing every live slot
-- [ ] E8-4 `engine_pocket` implements the `decode_audio_batch` override
+- [ ] E8-4 `engine_pocket` implements the `decode_audio_batch` override — and needs its
+      own parity check against `decode_audio`, since bit-identity per context has so far
+      been tested only against the synthetic engine
+- [ ] E8-6 **`pocket_step_batch` is not atomic**: it advances contexts `0..i-1` before
+      refusing `i`. Harmless at its declared `max_batch` of 1, illegal once that widens —
+      the driver's failure isolation depends on the atomicity the header now declares
 - [ ] E8-5 **`mynah_qmat_linear_batched_qt`** — the batched twin of
       `mynah_qmat_linear_resolved_qt`. `mynah_qmat_linear_batched` takes no qtype: it
       gates on the cache's own and creates a first-touch entry there, so a group
