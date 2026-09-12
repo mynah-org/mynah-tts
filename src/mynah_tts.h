@@ -99,6 +99,12 @@ typedef struct {
 } mynah_tts_batch_job;
 
 size_t mynah_tts_max_batch(void);
+
+/* How many requests THIS model's engine can actually step together, which is
+ * what a scheduler must honour. The bound above is only the runtime's ceiling:
+ * an engine may declare less, and handing it more is an error rather than a
+ * slow path. Returns 1 for an unknown model. */
+size_t mynah_tts_model_max_batch(const mynah_tts_model *model);
 int mynah_tts_synthesize_batch(const mynah_tts_model *model,
                                mynah_tts_batch_job *jobs, size_t count);
 

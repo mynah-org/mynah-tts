@@ -46,6 +46,7 @@
 #include "stream_out.h"
 
 #include "mynah_tts.h"
+#include "tokenizer_sentencepiece.h"
 #include "tokenizer.h"
 
 #include <errno.h>
@@ -80,7 +81,8 @@ typedef struct {
 
 static struct {
     mynah_tts_model *model;
-    mynah_tokenizer *tokenizer;
+    mynah_tokenizer *tokenizer;   /* Magpie: per-language G2P + vocabularies */
+    mynah_sp *sp;                 /* PocketTTS: one SentencePiece model per pack */
     mynah_tts_model_info info;
     char model_id[128];
     voice_entry voices[64];
@@ -405,6 +407,34 @@ static void load_voices(const char *model_dir) {
     fclose(f);
     buf[n] = '\0';
 
+    /* Two shapes in the wild: Magpie writes a flat {"Name": id} object, the
+     * PocketTTS converter writes {"voices": [{"name": ..., ...}, ...]} where the
+     * index in the array is the id. Detect rather than assume, because guessing
+     * wrong here silently maps every request to voice 0. */
+    const char *voices_key = strstr(buf, "\"voices\"");
+    if (voices_key != NULL) {
+        const char *p = voices_key;
+        unsigned index = 0;
+        while (g.voice_count < sizeof(g.voices) / sizeof(g.voices[0])) {
+            const char *name_key = strstr(p, "\"name\"");
+            if (name_key == NULL) break;
+            const char *q = strchr(name_key + 6, '"');
+            if (q == NULL) break;
+            const char *end = strchr(q + 1, '"');
+            if (end == NULL) break;
+            const size_t len = (size_t)(end - q - 1);
+            if (len < sizeof(g.voices[0].name)) {
+                memcpy(g.voices[g.voice_count].name, q + 1, len);
+                g.voices[g.voice_count].name[len] = '\0';
+                g.voices[g.voice_count].id = index;
+                ++g.voice_count;
+            }
+            ++index;
+            p = end + 1;
+        }
+        return;
+    }
+
     const char *p = buf;
     while (g.voice_count < sizeof(g.voices) / sizeof(g.voices[0])) {
         const char *q = strchr(p, '"');
@@ -620,8 +650,11 @@ static int handle_speech(int fd, const char *body) {
     int *ids = NULL;
     size_t id_count = 0;
     char err[512];
-    if (mynah_tokenizer_encode(g.tokenizer, language, text, &ids, &id_count,
-                               err, sizeof(err)) != 0) {
+    const int encode_failed = g.sp != NULL
+        ? mynah_sp_encode(g.sp, text, strlen(text), &ids, &id_count, err, sizeof(err))
+        : mynah_tokenizer_encode(g.tokenizer, language, text, &ids, &id_count,
+                                 err, sizeof(err));
+    if (encode_failed != 0) {
         send_error(fd, "400 Bad Request", "invalid_request_error", err);
         return 0;
     }
@@ -1165,7 +1198,13 @@ int main(int argc, char **argv) {
     if (g.worker_count < 1) g.worker_count = 1;
     if (g.worker_count > 64) g.worker_count = 64;
     if (g.max_batch < 1u) g.max_batch = 1u;
-    if (g.max_batch > mynah_tts_max_batch()) g.max_batch = mynah_tts_max_batch();
+    /* The engine's own ceiling, not the runtime's: a continuous-latent engine
+     * declares 1 until its batching is measured, and handing it more is an
+     * error rather than a slower path. */
+    {
+        const size_t engine_max = mynah_tts_model_max_batch(g.model);
+        if (g.max_batch > engine_max) g.max_batch = engine_max;
+    }
     if (g.max_batch > 16u) g.max_batch = 16u;   /* batch_run's job array */
 
     signal(SIGPIPE, SIG_IGN);   /* a client hanging up mid-stream is routine */
@@ -1176,11 +1215,24 @@ int main(int argc, char **argv) {
         return 1;
     }
     mynah_tts_model_get_info(g.model, &g.info);
-    g.tokenizer = mynah_tokenizer_open(model_dir, err, sizeof(err));
-    if (g.tokenizer == NULL) {
-        fprintf(stderr, "cannot open tokenizer: %s\n", err);
-        mynah_tts_model_close(g.model);
-        return 1;
+    /* Which tokenizer applies is a property of the engine, so the pack decides.
+     * Opening Magpie's unconditionally rejected a valid PocketTTS pack for a
+     * missing english_phoneme.tsv it has no reason to carry. */
+    if (strcmp(g.info.engine, "pocket") == 0) {
+        char sp_path[1024];
+        snprintf(sp_path, sizeof(sp_path), "%s/tokenizer.model", model_dir);
+        if (mynah_sp_open(sp_path, &g.sp, err, sizeof(err)) != 0) {
+            fprintf(stderr, "cannot open tokenizer: %s\n", err);
+            mynah_tts_model_close(g.model);
+            return 1;
+        }
+    } else {
+        g.tokenizer = mynah_tokenizer_open(model_dir, err, sizeof(err));
+        if (g.tokenizer == NULL) {
+            fprintf(stderr, "cannot open tokenizer: %s\n", err);
+            mynah_tts_model_close(g.model);
+            return 1;
+        }
     }
     load_voices(model_dir);
     snprintf(g.model_id, sizeof(g.model_id), "%s-%s", g.info.engine, g.info.revision);
@@ -1191,6 +1243,7 @@ int main(int argc, char **argv) {
     if (pthread_create(&g_batch.thread, NULL, batch_scheduler, NULL) != 0) {
         fprintf(stderr, "cannot start the synthesis scheduler\n");
         mynah_tokenizer_close(g.tokenizer);
+    mynah_sp_close(g.sp);
         mynah_tts_model_close(g.model);
         return 1;
     }
@@ -1305,6 +1358,7 @@ int main(int argc, char **argv) {
 
     close(listen_fd);
     mynah_tokenizer_close(g.tokenizer);
+    mynah_sp_close(g.sp);
     mynah_tts_model_close(g.model);
     pthread_cond_destroy(&g_batch.arrived);
     pthread_mutex_destroy(&g_batch.mu);

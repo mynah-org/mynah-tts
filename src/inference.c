@@ -330,6 +330,16 @@ size_t mynah_tts_max_batch(void) {
     return MYNAH_GRAPH_MAX_JOBS;
 }
 
+size_t mynah_tts_model_max_batch(const mynah_tts_model *model) {
+    if (model == NULL) return 1u;
+    const mynah_tts_engine *engine = mynah_engine_lookup(model->info.engine);
+    if (engine == NULL || engine->caps == NULL) return 1u;
+    mynah_engine_caps caps;
+    memset(&caps, 0, sizeof(caps));
+    if (engine->caps(model, NULL, &caps) != 0 || caps.max_batch == 0u) return 1u;
+    return caps.max_batch < MYNAH_GRAPH_MAX_JOBS ? caps.max_batch : MYNAH_GRAPH_MAX_JOBS;
+}
+
 int mynah_tts_synthesize_batch(const mynah_tts_model *model,
                                mynah_tts_batch_job *jobs, size_t count) {
     if (model == NULL || jobs == NULL) return -1;
