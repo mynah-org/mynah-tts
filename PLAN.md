@@ -49,11 +49,21 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` dropped
 
 Blocks E3. Do it *with* PocketTTS in hand, not before.
 
-- [ ] E1-1 `src/tts_engine.h`: vtable `prepare/step/flush/reset/free` + capability block
-- [ ] E1-2 lift the slot driver out of `graph.c:3674-4283` into `src/inference.c`
+**Progress**: `graph.c` (4283 LOC) is gone. Steps 1-4 done, each verified against
+the goldens with byte-identical audio:
+`mynah_util` + kernels → `conv1d` → `codec_nanocodec` → `engine_magpie.c` +
+`inference.c`. `src/` is nine files, largest 2186 lines.
+
+- [ ] E1-1 `src/tts_engine.h`: vtable + capability block. The twelve functions
+      `inference.c` calls on the engine are already the list; abstract them.
+- [x] E1-2 slot driver lifted into `src/inference.c` (650 LOC)
 - [ ] E1-3 lift streaming state into `src/stream.c`; `decode_audio` takes contiguous
       monotonic ranges and the engine owns continuity (E2-3), so left-context stays internal
-- [ ] E1-4 lift transformer/attention/KV/RoPE into `src/transformer.c`
+- [x] E1-4 done differently and deliberately: there is no shared `transformer.c`,
+      because those functions format NeMo tensor names. They stayed in
+      `engine_magpie.c`; the genuinely shared parts became `conv1d` and `kernels`.
+      A shared transformer needs functions taking **resolved weight pointers** —
+      that is E3 work, not a move
 - [ ] E1-5 remove Magpie fields from `src/mynah_tts.h` (breaking API change)
 - [ ] E1-6 real JSON parser with nesting and arrays, replacing `mynah_tts.c:112-163`
 - [ ] E1-7 split the converter into a shared pack writer + per-engine metadata
