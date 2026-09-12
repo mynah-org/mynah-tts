@@ -91,7 +91,7 @@ STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
 .PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
-        oracle-pocket \
+        oracle-pocket fake-pack goldens goldens-capture \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -218,6 +218,19 @@ oracle:
 	@test -n "$(CODEC)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	@test -n "$(OUTPUT)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
+
+# Synthetic Magpie-shaped pack and the refactor goldens it exists for.
+# See .work/engine-seam-refactor.md: models/ is empty and graph.c's self-tests
+# are no-ops off Accelerate, so without this nothing guards the E1 split.
+FAKE_PACK ?= models/fake-magpie
+fake-pack:
+	uv run --with numpy --with safetensors python tools/make_fake_pack.py --output "$(FAKE_PACK)"
+
+goldens-capture: $(TARGET)
+	tests/refactor_goldens.sh capture "$(FAKE_PACK)"
+
+goldens: $(TARGET)
+	tests/refactor_goldens.sh verify "$(FAKE_PACK)"
 
 # PocketTTS oracle. Offline tooling only: `uv` pulls torch into a throwaway
 # environment, nothing here is needed to run the binary. The gated Kyutai weights

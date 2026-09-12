@@ -58,10 +58,9 @@ Blocks E3. Do it *with* PocketTTS in hand, not before.
 - [ ] E1-6 real JSON parser with nesting and arrays, replacing `mynah_tts.c:112-163`
 - [ ] E1-7 split the converter into a shared pack writer + per-engine metadata
 - [ ] E1-8 gate: Magpie stream↔offline output sample-identical to the pre-refactor binary
-- [ ] E1-0 **prerequisite**: `models/` is empty *and* `make self-test` is a no-op for
-      `graph.c` on Linux, so nothing guards the refactor. Write
-      `tools/make_fake_pack.py` (deterministic, few MB) and capture goldens —
-      offline and streaming, f32 and int8 — **then** start E1
+- [x] E1-0 **prerequisite done**: `tools/make_fake_pack.py` + `tests/refactor_goldens.sh`
+      + `make fake-pack | goldens-capture | goldens`. 8 goldens captured;
+      `make stream-test` and the full 15-check `make server-test` both pass against it
 
 ### E2 — PocketTTS oracle → [`.work/pocket-tts-oracle.md`](.work/pocket-tts-oracle.md)
 
@@ -69,6 +68,8 @@ Independent of E1. **Start here** — it tells E1 which state the seam must mode
 
 - [ ] E2-1 `tools/oracle_pocket.py`: dump all 12 stages, tokenizer → waveform
 - [x] E2-1a `tools/oracle_pocket.py` + `make oracle-pocket` written
+- [x] E2-1b `tools/oracle_pocket_tokenizer.py` + `tools/corpus_pocket.py`: ~9000 cases
+      per language, hex-encoded so invalid UTF-8 survives, deterministic by seed
 - [ ] E2-2 `tests/parity_pocket.py` with per-stage tolerances
 - [x] E2-3 streaming decode measured: **carry codec state** (error 1e-7 down to a
       1-frame chunk); replaying context needs 64 frames / 5.12 s for exactness, so
