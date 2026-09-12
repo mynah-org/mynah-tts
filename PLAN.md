@@ -23,8 +23,16 @@ which requires the engine seam that has been outstanding since July.
 
 That is the opposite of the order we have been working in. A 36x on one kernel
 region took us to RTF 0.245 and the serving profile still capped the machine at
-two or three real-time streams, because the limit was never the kernel. His
-estimate for PocketTTS, being 5.5x smaller, is **C40-C66, not C100**.
+two or three real-time streams, because the limit was never the kernel.
+
+**Calibration, corrected by reading their repo** → [`.work/linux-production.md`](.work/linux-production.md):
+their qualified 32-core point is **x86 Zen5 VNNI at C12** (C11 preferred), not
+C20/C22; on 32-core ARM the promoted point is **Graviton5 C4**, and one 32-core
+Neoverse-V2 host promotes **nothing**. Their measured ceiling is also 2-3x below
+their own physics ceiling on every host, always for the same reason: the
+per-slot decoder is **glue-bound, not compute-bound** — ~5% of VNNI peak, with
+50-120 pool dispatches per decoder call per item. Our own thread work measured
+~20 us of wake-up per region independently. **Expect the same wall.**
 
 **Production is Linux server, x86-64 and ARM64.** macOS/M1 is the development
 machine and every number in this repo so far was taken there, which makes them
@@ -190,6 +198,27 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-11 **no silently-chosen scalar BLAS** — a scalar path taken without anyone
       knowing is worse than a slow one that announces itself. `blas.accelerate` is ON
       here and absent on the target, and the 36x conv-stack win goes through BLAS
+- [ ] E4-12 **fatal ISA guard** — a `-mavx2` binary on a CPU without AVX2 gives an
+      opaque SIGILL today. ~15 lines, checked before any allocation
+- [ ] E4-13 **CI `link-only` job** — our x86 CI builds only the default `-mavx2`, which
+      is exactly the configuration in which their tree shipped unlinkable for days.
+      Add `SIMD=scalar`, `SIMD=portable`, `ARCH_FLAGS=-march=armv8-a`
+- [ ] E4-14 **flag stamp file in the Makefile** — eight lines; without it `make` then
+      `make SIMD=...` without `clean` silently yields a mixed binary
+- [ ] E4-15 **`SIMD=auto` must read `/proc/cpuinfo` on x86**, with the kernel-flag +
+      `cc_ok` double test and a printed resolved profile. Value is in VNNI and
+      AVX-512 BF16; AMX costs far more for less (their AMX 8c does C2, VNNI 32c C12)
+- [ ] E4-16 **BLAS: structural ownership, not a weak symbol** — pin OpenBLAS to 1
+      thread and slice on our pool, override a stale `OPENBLAS_NUM_THREADS` and report
+      it, and distinguish claim from fact. Plus `OPENBLAS_THREAD_TIMEOUT=1`: TTFA 108 ms
+      **bimodal** to 66 ms stable, 42.5k to 12k context switches/s. Do **not** partition
+      rigidly — lowering BLAS threads improves RTF and costs 30% of TTFA
+- [ ] E4-17 **plan from `sched_getaffinity`, not `sysconf`** — `sysconf` sees neither an
+      inherited taskset nor a cpuset cgroup, so every containerised deployment plans the
+      whole host. Also read cgroup v2 `cpu.max` and warn (they never closed that one)
+- [ ] E4-18 **arena allocator in the codec before measuring on Linux** — glibc's mmap
+      threshold cost them 78 mmap + 154 munmap and 11,899 allocs per request; a
+      per-stream bump arena took it to 1.3 and 41, bit-identical. Invisible on macOS
 - [ ] E4-9 **Linux is the target, so measure there**: runtime ISA dispatch on x86 (a
       binary that picks VNNI/AMX when the CPU has them and does not SIGILL when it
       does not), OpenBLAS thread-count coordination with our pool, a CI matrix that
@@ -222,6 +251,16 @@ Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
       sustains ~3x real time aggregate, so at C8 each stream gets 0.35x and stalls.
       There is no setting that makes them all GOOD — only the choice between waiting
       and stuttering — so the server has to choose deliberately and say which
+- [ ] E5-13 **prefork preconditions** — costmap mutexes must be *reinitialized* not
+      zeroed (an inherited locked mutex can never be unlocked), and no GPU backend state
+      may exist before the fork: that is their still-open bug, a wrong answer rather
+      than a crash
+- [ ] E5-14 **core-major slices, not contiguous logical ones** — Linux numbers the first
+      thread of each core first, so a contiguous slice gave two workers the same twelve
+      physical cores, one per hyperthread. And print the mask actually set
+- [ ] E5-15 **dispatch gate + host profile that refuses to run**, listing the env vars
+      that must be *absent*. Their proof it is needed: the right config was versioned
+      and three campaigns were still run wrong from memory
 - [ ] E5-12 **prefork with pinned core slices** (E5-6) is the mechanism that turns
       cores into streams; without the topology, more cores are not more streams
 - [ ] E5-8 gate: **N concurrent streams byte-identical to the same request run alone**
