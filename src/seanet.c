@@ -14,6 +14,48 @@
 
 #include "kernels.h"
 
+#if defined(MYNAH_USE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#define MYNAH_SEANET_BLAS 1
+#elif defined(MYNAH_USE_OPENBLAS)
+#include <cblas.h>
+#define MYNAH_SEANET_BLAS 1
+#endif
+
+/* ------------------------------------------------------------- GEMM paths
+ *
+ * Measured on this file, not assumed: with the scalar loops below, the SEANet
+ * decoder was 76% of one PocketTTS synthesis (MYNAH_COST_MAP=2,
+ * codec.conv_stack 8570 ms of 11224 ms) and `sample` put 88% of the wall in
+ * `mynah_dot_f32` + the two conv bodies.  The reason is structural: a decoder
+ * convolution has kernel 1, 3 or 7, so the innermost reduction is 1-7 long and
+ * every output element pays a call and a serial accumulator chain.
+ *
+ * Both fast paths below are the SAME arithmetic expressed as one GEMM per
+ * kernel tap, which is what BLAS is for.  They are NOT bit-identical to the
+ * scalar loops: the reduction over input channels is reassociated, so the two
+ * agree to ~1e-6 relative, not exactly.  CLAUDE.md's numerical rule allows
+ * that ("do not require byte-identical audio across different floating-point
+ * orderings"); the parity gate against the oracle is what checks it, and the
+ * scalar loop stays the reference implementation for every shape or build the
+ * fast path refuses.
+ *
+ * A shape qualifies only when the B operand of the GEMM is a real matrix:
+ *   conv1d          stride == 1 and groups == 1 (any kernel, any dilation)
+ *   convtranspose   groups == 1
+ * plus a BLAS build and a non-NULL tap buffer.  Everything else falls through.
+ */
+
+#if defined(MYNAH_SEANET_BLAS)
+static void sea_sgemm(int trans_a, size_t m, size_t n, size_t k,
+                      const float *a, size_t lda, const float *b, size_t ldb,
+                      float beta, float *c, size_t ldc) {
+    cblas_sgemm(CblasRowMajor, trans_a ? CblasTrans : CblasNoTrans, CblasNoTrans,
+                (int)m, (int)n, (int)k, 1.0f, a, (int)lda, b, (int)ldb, beta, c,
+                (int)ldc);
+}
+#endif
+
 /* ------------------------------------------------------------------ utils */
 
 static void sea_set_error(char *error, size_t capacity, const char *format, ...)
@@ -91,12 +133,25 @@ static int conv_validate(const mynah_conv1d_spec *spec, size_t *effective,
     return 0;
 }
 
+/* Floats the GEMM fast path needs on top of the ring buffers: one kernel tap
+ * of the weight, gathered dense.  Zero when the shape does not qualify, so a
+ * grouped or strided conv costs exactly what it did before. */
+static size_t conv_taps_floats(const mynah_conv1d_spec *spec) {
+    if (spec->stride != 1u || spec->groups != 1u || spec->kernel_size <= 1u) {
+        return 0;
+    }
+    size_t taps = 0;
+    if (sea_mul(spec->out_channels, spec->in_channels, &taps) != 0) return 0;
+    return taps;
+}
+
 size_t mynah_causal_conv1d_scratch(const mynah_conv1d_spec *spec,
                                    size_t max_in_len) {
     size_t effective = 0;
     if (conv_validate(spec, &effective, NULL, 0) != 0) return 0;
     const size_t tail = effective - spec->stride;
-    if (tail == 0) return 0;
+    const size_t taps = conv_taps_floats(spec);
+    if (tail == 0) return taps;
     size_t previous = 0;
     size_t window = 0;
     size_t span = 0;
@@ -105,6 +160,7 @@ size_t mynah_causal_conv1d_scratch(const mynah_conv1d_spec *spec,
     if (sea_mul(spec->in_channels, span, &window) != 0) return 0;
     size_t total = 0;
     if (sea_add(previous, window, &total) != 0) return 0;
+    if (sea_add(total, taps, &total) != 0) return 0;
     return total;
 }
 
@@ -136,6 +192,7 @@ int mynah_causal_conv1d_init(mynah_causal_conv1d *conv,
                       needed);
         return -1;
     }
+    size_t used = 0;
     if (conv->tail > 0) {
         if (scratch == NULL) {
             sea_set_error(error, error_capacity, "conv1d: null scratch");
@@ -143,7 +200,10 @@ int mynah_causal_conv1d_init(mynah_causal_conv1d *conv,
         }
         conv->previous = scratch;
         conv->window = scratch + spec->in_channels * conv->tail;
+        used = spec->in_channels * conv->tail +
+               spec->in_channels * (conv->tail + max_in_len);
     }
+    if (conv_taps_floats(spec) > 0 && scratch != NULL) conv->taps = scratch + used;
     mynah_causal_conv1d_reset(conv);
     return 0;
 }
@@ -206,6 +266,54 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
     const size_t in_per_group = in_channels / groups;
     const size_t out_per_group = spec->out_channels / groups;
     const size_t out_len = in_len / stride;
+
+#if defined(MYNAH_SEANET_BLAS)
+    /* One GEMM per kernel tap, accumulating into the output:
+     *   out[oc][n] = sum_k sum_j W[oc][j][k] * win[j][n + k*dilation]
+     * For a fixed k the right operand is win[0:C][k*d : k*d + out_len], a real
+     * row-major submatrix (ldb = window_len), which is why stride must be 1:
+     * a stride > 1 would space the columns and there would be no matrix to
+     * hand to BLAS.  `taps` gathers W[.][.][k], whose natural layout is
+     * strided by `kernel`; for kernel == 1 the weight already is the dense
+     * matrix and no gather happens at all. */
+    if (spec->stride == 1u && groups == 1u &&
+        (kernel == 1u || conv->taps != NULL)) {
+        const size_t oc_count = spec->out_channels;
+        for (size_t k = 0; k < kernel; ++k) {
+            const float *a;
+            if (kernel == 1u) {
+                a = weights->weight;
+            } else {
+                float *taps = conv->taps;
+                for (size_t oc = 0; oc < oc_count; ++oc) {
+                    const float *src = weights->weight + oc * in_channels * kernel + k;
+                    float *dst = taps + oc * in_channels;
+                    for (size_t j = 0; j < in_channels; ++j) dst[j] = src[j * kernel];
+                }
+                a = taps;
+            }
+            sea_sgemm(0, oc_count, out_len, in_channels, a, in_channels,
+                      win + k * dilation, window_len, (k == 0) ? 0.0f : 1.0f,
+                      output, out_len);
+        }
+        if (weights->bias != NULL) {
+            for (size_t oc = 0; oc < oc_count; ++oc) {
+                float *out_row = output + oc * out_len;
+                const float bias = weights->bias[oc];
+                for (size_t n = 0; n < out_len; ++n) out_row[n] += bias;
+            }
+        }
+        if (tail > 0) {
+            for (size_t c = 0; c < in_channels; ++c) {
+                memcpy(conv->previous + c * tail,
+                       conv->window + c * window_len + (window_len - tail),
+                       tail * sizeof(float));
+            }
+            conv->primed = 1;
+        }
+        return 0;
+    }
+#endif
 
     for (size_t oc = 0; oc < spec->out_channels; ++oc) {
         const size_t group = oc / out_per_group;
@@ -279,6 +387,17 @@ static int convtr_full_len(const mynah_convtr1d_spec *spec, size_t in_len,
     return sea_add(span, spec->kernel_size, out);
 }
 
+/* The GEMM fast path's un-scattered product: [out_channels * kernel][in_len].
+ * Zero floats for a grouped convtranspose, which keeps the scalar path. */
+static int convtr_taps_floats(const mynah_convtr1d_spec *spec,
+                              size_t max_in_len, size_t *out) {
+    *out = 0;
+    if (spec->groups != 1u) return 0;
+    size_t rows = 0;
+    if (sea_mul(spec->out_channels, spec->kernel_size, &rows) != 0) return -1;
+    return sea_mul(rows, max_in_len, out);
+}
+
 size_t mynah_causal_convtr1d_scratch(const mynah_convtr1d_spec *spec,
                                      size_t max_in_len) {
     if (convtr_validate(spec, NULL, 0) != 0 || max_in_len == 0) return 0;
@@ -291,6 +410,9 @@ size_t mynah_causal_convtr1d_scratch(const mynah_convtr1d_spec *spec,
     if (sea_mul(spec->out_channels, full_len, &full) != 0) return 0;
     size_t total = 0;
     if (sea_add(partial, full, &total) != 0) return 0;
+    size_t taps = 0;
+    if (convtr_taps_floats(spec, max_in_len, &taps) != 0) return 0;
+    if (sea_add(total, taps, &total) != 0) return 0;
     return total;
 }
 
@@ -321,6 +443,16 @@ int mynah_causal_convtr1d_init(mynah_causal_convtr1d *convtr,
     convtr->max_in_len = max_in_len;
     convtr->partial = scratch;
     convtr->full = scratch + spec->out_channels * convtr->tail;
+    size_t full_len = 0;
+    size_t taps = 0;
+    if (convtr_full_len(spec, max_in_len, &full_len) != 0 ||
+        convtr_taps_floats(spec, max_in_len, &taps) != 0) {
+        sea_set_error(error, error_capacity, "convtr1d: shape overflow");
+        return -1;
+    }
+    if (taps > 0) {
+        convtr->taps = convtr->full + spec->out_channels * full_len;
+    }
     mynah_causal_convtr1d_reset(convtr);
     return 0;
 }
@@ -330,6 +462,34 @@ void mynah_causal_convtr1d_reset(mynah_causal_convtr1d *convtr) {
     if (convtr->tail > 0) {
         memset(convtr->partial, 0,
                convtr->spec.out_channels * convtr->tail * sizeof(float));
+    }
+}
+
+/* The reference accumulation: input stationary, one kernel-length axpy per
+ * (in channel, out channel, position).  Kept as the fallback for a grouped
+ * convtranspose and for a build with no BLAS. */
+static void convtr_scatter_scalar(const mynah_convtr1d_spec *spec,
+                                  const mynah_conv_weights *weights,
+                                  const float *input, size_t in_len, float *full,
+                                  size_t full_len) {
+    const size_t kernel = spec->kernel_size;
+    const size_t stride = spec->stride;
+    const size_t in_per_group = spec->in_channels / spec->groups;
+    const size_t out_per_group = spec->out_channels / spec->groups;
+    for (size_t ic = 0; ic < spec->in_channels; ++ic) {
+        const size_t group = ic / in_per_group;
+        const float *weight_row = weights->weight + ic * out_per_group * kernel;
+        const float *in_row = input + ic * in_len;
+        for (size_t j = 0; j < out_per_group; ++j) {
+            const float *w = weight_row + j * kernel;
+            float *out_base = full + (group * out_per_group + j) * full_len;
+            for (size_t t = 0; t < in_len; ++t) {
+                const float value = in_row[t];
+                if (value == 0.0f) continue;
+                float *dst = out_base + t * stride;
+                for (size_t k = 0; k < kernel; ++k) dst[k] += w[k] * value;
+            }
+        }
     }
 }
 
@@ -363,23 +523,33 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
 
     const size_t kernel = spec->kernel_size;
     const size_t stride = spec->stride;
-    const size_t in_per_group = spec->in_channels / spec->groups;
-    const size_t out_per_group = spec->out_channels / spec->groups;
 
-    for (size_t ic = 0; ic < spec->in_channels; ++ic) {
-        const size_t group = ic / in_per_group;
-        const float *weight_row = weights->weight + ic * out_per_group * kernel;
-        const float *in_row = input + ic * in_len;
-        for (size_t j = 0; j < out_per_group; ++j) {
-            const float *w = weight_row + j * kernel;
-            float *out_base = full + (group * out_per_group + j) * full_len;
-            for (size_t t = 0; t < in_len; ++t) {
-                const float value = in_row[t];
-                if (value == 0.0f) continue;
-                float *dst = out_base + t * stride;
-                for (size_t k = 0; k < kernel; ++k) dst[k] += w[k] * value;
+    int folded = 0;
+#if defined(MYNAH_SEANET_BLAS)
+    /* PyTorch stores a ConvTranspose1d weight as [in_channels][out_channels][kernel],
+     * so with groups == 1 the trailing two axes are already one dense
+     * [in_channels][out_channels * kernel] matrix.  Then
+     *   taps[oc*kernel + k][t] = sum_ic W[ic][oc*kernel + k] * input[ic][t]
+     * is a single GEMM with A transposed, and the only thing left is the
+     * scatter taps -> full[oc][t*stride + k], which costs out_channels * kernel
+     * * in_len adds against the GEMM's in_channels times that. */
+    if (spec->groups == 1u && convtr->taps != NULL) {
+        const size_t rows = spec->out_channels * kernel;
+        sea_sgemm(1, rows, in_len, spec->in_channels, weights->weight, rows,
+                  input, in_len, 0.0f, convtr->taps, in_len);
+        for (size_t oc = 0; oc < spec->out_channels; ++oc) {
+            float *row = full + oc * full_len;
+            for (size_t k = 0; k < kernel; ++k) {
+                const float *src = convtr->taps + (oc * kernel + k) * in_len;
+                float *dst = row + k;
+                for (size_t t = 0; t < in_len; ++t) dst[t * stride] += src[t];
             }
         }
+        folded = 1;
+    }
+#endif
+    if (!folded) {
+        convtr_scatter_scalar(spec, weights, input, in_len, full, full_len);
     }
 
     if (tail > 0) {
@@ -1339,7 +1509,20 @@ static int sea_test_one_conv(const mynah_conv1d_spec *spec, size_t in_len,
         }
     }
 
-    /* Streaming continuity: chunked decode must equal the one-shot decode. */
+    /* Streaming continuity: chunked decode must equal the one-shot decode.
+     *
+     * This used to be an exact `!=`.  It is a bound now, because the GEMM fast
+     * path hands the reduction over input channels to BLAS and BLAS blocks it
+     * by the number of columns, i.e. by the chunk length -- so a 1-column call
+     * and a 16-column call reassociate differently and land ~1e-8 apart.  What
+     * the check is for is the ring buffer: a conv that carries the wrong left
+     * context is wrong by O(1), not by 1e-8, so the bound catches exactly what
+     * the equality caught.  The scalar path (grouped, strided, or a non-BLAS
+     * build) is still bit-exact here and passes the same bound trivially.
+     *
+     * This costs nothing in the product: PocketTTS decodes one latent frame per
+     * call whether it is streaming or offline, so the real pipeline never varies
+     * the chunk length and stream == offline stays byte-identical. */
     {
         const size_t chunk = spec->stride;
         if (in_len % chunk == 0 &&
@@ -1379,7 +1562,7 @@ static int sea_test_one_conv(const mynah_conv1d_spec *spec, size_t in_len,
             }
             if (!failed) {
                 for (size_t i = 0; i < spec->out_channels * out_len; ++i) {
-                    if (chunked[i] != got[i]) {
+                    if (!sea_close(chunked[i], (double)got[i], 1e-5)) {
                         failed = 2;
                         sea_set_error(error, error_capacity,
                                       "%s: streaming mismatch at %zu: "

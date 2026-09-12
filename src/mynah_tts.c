@@ -342,8 +342,32 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
         free(manifest);
         return -1;
     }
-    /* -1: read MYNAH_QUANT env (int8 opt-in; default f32). */
-    model->qcache = mynah_qmat_cache_new(-1);
+    /* -1 reads MYNAH_QUANT and otherwise stays on f32.
+     *
+     * PocketTTS defaults to f16 instead, and the reason is a property of the
+     * checkpoint rather than a tolerance we decided to accept: the weights are
+     * stored bf16, which has 8 mantissa bits, and f16 has 11, so the conversion
+     * is lossless for these values. Measured against the oracle, f16 hidden
+     * states sit 40-80x inside the 1e-4 tolerance (max abs 2.6e-06) while the
+     * engine runs about twice as fast (RTF 0.245 against 0.52 on an M1).
+     *
+     * int8 is NOT enabled by default for it: parity fails by 600-1400x, it
+     * generates an extra frame, and log-mel correlation against f32 drops to
+     * 0.921. It stays available through MYNAH_QUANT for anyone who wants the
+     * speed and has listened to the result.
+     *
+     * An explicit MYNAH_QUANT always wins, including MYNAH_QUANT=f32. On a
+     * target without half converts the cache downgrades to f32 on its own and
+     * --dispatch-map reports it, so this is a preference, not an assumption. */
+    /* The qtype code src/qmat.c:97 documents. Named rather than written as a
+     * bare 3, following the same precedent as src/dispatch.c; qmat.h should
+     * export the enum so neither of us has to mirror it. */
+    enum { QMAT_QTYPE_F16 = 3 };
+    int qtype_request = -1;
+    if (!is_magpie && getenv("MYNAH_QUANT") == NULL) {
+        qtype_request = QMAT_QTYPE_F16;
+    }
+    model->qcache = mynah_qmat_cache_new(qtype_request);
     if (model->qcache == NULL) {
         mynah_backend_close(model->backend);
         mynah_weights_close(model->tts);

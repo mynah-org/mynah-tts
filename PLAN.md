@@ -109,9 +109,10 @@ Needs E1 and E2.
       so E2-3's carried-state decision holds in C
 - [x] E3-5 `src/engine_pocket.c` **done** — CLI and server both generate audio; full
       utterance parity mel corr 1.000000 with the oracle's noise injected
-- [ ] E3-5a **performance**: RTF 2.03, identical with int8 and with 4 threads, because the
-      engine uses neither `qmat` nor the thread pool. Serving profile says NOT STREAMABLE
-      on a mandatory gate (RTF p95 1.96 > 1.00). This is E4 applied to this engine.
+- [x] E3-5a **performance: RTF 2.03 → 0.245** (f16 default, lossless on a bf16 checkpoint);
+      conv stack 36× via a GEMM fast path. int8 reaches 0.191 but breaks parity, so it stays opt-in
+- [ ] E3-5b next 2×: `codec.transformer` is 43% of the wall, running 16 positions as 16 steps
+      over the same ~29 MB. A batched GEMM prefill estimates f32 ~0.35 / f16 ~0.17
 - [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias** (two different
       epsilons), **variance-based RMSNorm** (`unbiased=True`, *not* `kernels.c:rmsnorm`),
       GELU-tanh, causal conv, adaLN

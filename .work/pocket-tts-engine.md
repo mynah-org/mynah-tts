@@ -310,3 +310,81 @@ engine: route the backbone and flow-head projections through `mynah_qmat_*`,
 parallelize the SEANet conv stack, and use the fused QKV kernel the checkpoint's
 pre-fused `[3072,1024]` was made for. **Do not quote an RTF for PocketTTS until
 that lands.**
+
+## Optimized — 2026-09-12: RTF 2.03 → 0.245
+
+### Where the time actually went
+
+The cost map settled it before anything was touched (M1, 1 thread, 11224 ms):
+
+| region | ms | % |
+|---|---|---|
+| `prep.decoder_prefill` | 477 | 4.3 |
+| `step.backbone` | 888 | 7.9 |
+| flow head | 88 | 0.8 |
+| `codec.transformer` | 1198 | 10.7 |
+| **`codec.conv_stack` (SEANet)** | **8570** | **76.4** |
+
+`sample` agreed: 38% in `mynah_dot_f32`, 33% in `convtr1d_apply`. The structural
+cause is that the decoder's kernels are 1, 3 and 7, so the innermost reduction
+is 1-7 long and every output element pays a call plus a serial accumulation
+chain.
+
+### What was done
+
+A GEMM fast path for the causal conv and transposed conv in `seanet.c` — one
+sgemm per kernel tap, right operand a window with `ldb = window_len`. The scalar
+loops stay as the reference and as the fallback for shapes that do not qualify
+and for builds without BLAS. **Conv stack 8570 → 237 ms, 36×.**
+
+Plus an additive linear hook in `transformer_ar` (NULL keeps the previous f32
+matvec bit for bit) which `engine_pocket` fills with `mynah_qmat_linear_resolved`,
+with cache keys built at load so nothing formats or allocates in the loop.
+
+### Measured, best of three
+
+| quant | before | after |
+|---|---|---|
+| f32 | 2.030 | **0.52** |
+| f16 | 2.286 | **0.245** |
+| int8 | 2.266 | **0.191** |
+
+**Threads do not help and sometimes hurt** (int8 1→4 threads: 0.191 → 0.276).
+That matches what the thread-pool work measured independently: ~20 µs of wake-up
+latency per region means a region has to be worth ≥200 µs to pay for itself, and
+these matvecs are not.
+
+### Parity, and why f16 became the default
+
+- **f32 before and after are identical to every printed digit.** The WAV differs
+  by max abs 3.052e-05 — exactly one LSB of 16-bit PCM — at correlation
+  1.000000000.
+- **f16 holds parity**: hidden states 2.6e-06 against a 1e-4 tolerance, 40-80×
+  inside. The reason is a property of the checkpoint, not a tolerance we chose
+  to accept: the weights are stored **bf16, which has 8 mantissa bits, and f16
+  has 11**, so the conversion is lossless for these values.
+- **int8 does not**: 600-1400× over tolerance, an extra generated frame, log-mel
+  correlation against f32 down to 0.921. int4 is worse (0.27-0.40).
+
+So PocketTTS defaults to **f16** — twice as fast as f32 with parity intact —
+while int8 stays available through `MYNAH_QUANT` for anyone who wants 0.191 and
+has listened to the result. An explicit `MYNAH_QUANT` always wins, and on a
+target without half converts the cache downgrades to f32 by itself and
+`--dispatch-map` says so.
+
+### The next 2×, already located
+
+`codec.transformer` is now **43% of the f32 wall**. It runs 16 positions per
+frame as 16 separate steps, which is 16 full passes over the same ~29 MB of
+weights. A batched GEMM prefill in `transformer_ar` would cut that traffic ~16×;
+the estimate is f32 → ~0.35 and f16 → ~0.17. It is not an additive change, which
+is why it was left.
+
+### One assertion deliberately relaxed
+
+The SEANet self-test required exact equality for streaming continuity; it is now
+bounded at 1e-5, because BLAS blocks by column count and a one-column call
+reassociates differently from a sixteen-column one (~1e-8). PocketTTS always
+decodes one latent frame per call, so **stream == offline stays byte-identical**;
+and the bug that test exists to catch, a wrong ring buffer, is O(1) rather than
+1e-8.

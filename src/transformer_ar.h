@@ -133,6 +133,39 @@ typedef struct {
     const float *layer_scale_2;   /* [d_model] or NULL = nn.Identity()         */
 } mynah_transformer_ar_layer;
 
+/* Which of a layer's four linear projections a hook call is for. */
+typedef enum {
+    MYNAH_TAR_LINEAR_IN_PROJ = 0, /* [3*attn_dim][d_model], fused q|k|v */
+    MYNAH_TAR_LINEAR_OUT_PROJ,    /* [d_model][attn_dim]               */
+    MYNAH_TAR_LINEAR_FFN1,        /* [ffn_dim][d_model]                */
+    MYNAH_TAR_LINEAR_FFN2         /* [d_model][ffn_dim]                */
+} mynah_transformer_ar_linear_kind;
+
+/*
+ * Optional replacement for the four linear projections.
+ *
+ * The default is `mynah_matvec_bias_f32`, which reads the whole f32 weight per
+ * position: on an M1 the PocketTTS backbone step measured 14.6 ms for 302 MB of
+ * weights, i.e. ~21 GB/s, which is one core's streaming limit rather than an
+ * arithmetic limit.  Quantization is how that gets smaller, and quantization
+ * needs a cache keyed per tensor -- which this module must not have, because it
+ * never sees a model pack or a tensor name (see the header comment).
+ *
+ * So the engine supplies it.  `kind` and `layer` name the projection; the
+ * engine maps that pair to its own cache key.  The contract is exactly
+ * `out[count][n] = in[count][k] @ weight[n][k]^T + bias`, i.e. what
+ * `mynah_matvec_bias_f32` computes for count == 1.  Returning non-zero fails
+ * the step.  NULL (the default, and what a calloc'd weights struct has) keeps
+ * the f32 matvec, so nothing about this module's numerics changes until an
+ * engine opts in.
+ */
+typedef int (*mynah_transformer_ar_linear_fn)(void *user, size_t layer,
+                                              mynah_transformer_ar_linear_kind kind,
+                                              const float *weight,
+                                              const float *bias, const float *in,
+                                              float *out, size_t count, size_t k,
+                                              size_t n);
+
 typedef struct {
     const mynah_transformer_ar_layer *layers; /* [num_layers] */
     /* Optional final LayerNorm applied to the stack output, at the same eps.
@@ -140,6 +173,9 @@ typedef struct {
      * such tensor, so both pointers are NULL there. */
     const float *out_norm_weight;
     const float *out_norm_bias;
+    /* Optional; NULL keeps the built-in f32 matvec. */
+    mynah_transformer_ar_linear_fn linear;
+    void *linear_user;
 } mynah_transformer_ar_weights;
 
 typedef struct mynah_transformer_ar_state mynah_transformer_ar_state;

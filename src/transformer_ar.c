@@ -393,6 +393,20 @@ static size_t tar_window_start(size_t position, size_t context) {
     return position + 1u - context;
 }
 
+/* The layer's linear projection: the engine's hook when it installed one, the
+ * f32 matvec otherwise.  One place, so the two can never drift apart. */
+static int tar_linear(const mynah_transformer_ar_weights *weights, size_t layer,
+                      mynah_transformer_ar_linear_kind kind, const float *weight,
+                      const float *bias, const float *in, float *out, size_t k,
+                      size_t n) {
+    if (weights->linear != NULL) {
+        return weights->linear(weights->linear_user, layer, kind, weight, bias, in,
+                               out, 1u, k, n);
+    }
+    mynah_matvec_bias_f32(weight, in, bias, out, n, k);
+    return 0;
+}
+
 /* One position through the whole stack.  `out` may be NULL to discard. */
 static int tar_step_one(mynah_transformer_ar_state *state,
                         const mynah_transformer_ar_weights *weights,
@@ -419,9 +433,11 @@ static int tar_step_one(mynah_transformer_ar_state *state,
         /* --- attention block: x + layer_scale_1(attn(norm1(x))) --- */
         mynah_layernorm_f32(state->x, layer->norm1_weight, layer->norm1_bias,
                             state->norm, 1u, d_model, config->layernorm_eps);
-        mynah_matvec_bias_f32(layer->in_proj_weight, state->norm,
-                              layer->in_proj_bias, state->qkv, 3u * attn_dim,
-                              d_model);
+        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_IN_PROJ, layer->in_proj_weight,
+                       layer->in_proj_bias, state->norm, state->qkv, d_model,
+                       3u * attn_dim) != 0) {
+            return -1;
+        }
         float *q = state->qkv;
         float *k = state->qkv + attn_dim;
         float *v = state->qkv + 2u * attn_dim;
@@ -452,9 +468,11 @@ static int tar_step_one(mynah_transformer_ar_state *state,
                 mynah_axpy_f32(oh, vj, state->scores[j], head_dim);
             }
         }
-        mynah_matvec_bias_f32(layer->out_proj_weight, state->attn,
-                              layer->out_proj_bias, state->upd, d_model,
-                              attn_dim);
+        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_OUT_PROJ, layer->out_proj_weight,
+                       layer->out_proj_bias, state->attn, state->upd, attn_dim,
+                       d_model) != 0) {
+            return -1;
+        }
         if (layer->layer_scale_1 != NULL) {
             for (size_t i = 0; i < d_model; ++i) {
                 state->x[i] += layer->layer_scale_1[i] * state->upd[i];
@@ -466,13 +484,17 @@ static int tar_step_one(mynah_transformer_ar_state *state,
         /* --- feed forward: x + layer_scale_2(linear2(gelu(linear1(norm2)))) */
         mynah_layernorm_f32(state->x, layer->norm2_weight, layer->norm2_bias,
                             state->norm, 1u, d_model, config->layernorm_eps);
-        mynah_matvec_bias_f32(layer->linear1_weight, state->norm,
-                              layer->linear1_bias, state->ffn, config->ffn_dim,
-                              d_model);
+        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_FFN1, layer->linear1_weight,
+                       layer->linear1_bias, state->norm, state->ffn, d_model,
+                       config->ffn_dim) != 0) {
+            return -1;
+        }
         mynah_gelu_tanh_array(state->ffn, config->ffn_dim, state->gelu);
-        mynah_matvec_bias_f32(layer->linear2_weight, state->ffn,
-                              layer->linear2_bias, state->upd, d_model,
-                              config->ffn_dim);
+        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_FFN2, layer->linear2_weight,
+                       layer->linear2_bias, state->ffn, state->upd, config->ffn_dim,
+                       d_model) != 0) {
+            return -1;
+        }
         if (layer->layer_scale_2 != NULL) {
             for (size_t i = 0; i < d_model; ++i) {
                 state->x[i] += layer->layer_scale_2[i] * state->upd[i];

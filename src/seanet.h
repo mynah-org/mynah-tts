@@ -81,6 +81,12 @@ typedef struct {
     float *previous;    /* [in_channels][tail], borrowed     */
     float *window;      /* [in_channels][tail + max_in_len]  */
     int primed;         /* replicate padding: first call seen */
+    /* GEMM fast path (added later, see the "one tap at a time" note in
+     * seanet.c).  `taps` holds one kernel tap of the weight gathered into a
+     * dense [out_channels][in_channels] matrix; it is NULL, and the fast path
+     * off, whenever the shape or the build does not qualify.  The scalar loop
+     * below stays the reference and is what runs then. */
+    float *taps;        /* [out_channels][in_channels] or NULL */
 } mynah_causal_conv1d;
 
 /* Number of floats the caller must provide to `_init`. */
@@ -112,6 +118,10 @@ typedef struct {
     size_t max_in_len;
     float *partial;     /* [out_channels][tail], borrowed */
     float *full;        /* [out_channels][(max_in_len-1)*stride + kernel] */
+    /* GEMM fast path: the un-scattered product [out_channels*kernel][in_len].
+     * NULL when the shape or the build does not qualify; the scalar loop then
+     * runs unchanged. */
+    float *taps;        /* [out_channels * kernel][max_in_len] or NULL */
 } mynah_causal_convtr1d;
 
 size_t mynah_causal_convtr1d_scratch(const mynah_convtr1d_spec *spec,

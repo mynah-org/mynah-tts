@@ -14,10 +14,12 @@
 
 #include "ingot/safetensors.h"
 
+#include "costmap.h"
 #include "flow_head.h"
 #include "kernels.h"
 #include "mynah_tts_internal.h"
 #include "mynah_util.h"
+#include "qmat.h"
 #include "seanet.h"
 #include "tokenizer_sentencepiece.h"
 #include "transformer_ar.h"
@@ -28,6 +30,7 @@
 #define POCKET_NAME_MAX 256u
 #define POCKET_PATH_MAX 4096u
 #define POCKET_MANIFEST_MAX (4u * 1024u * 1024u)
+#define POCKET_QNAME_MAX 48u
 
 /* ------------------------------------------------------------------ errors */
 
@@ -349,6 +352,23 @@ typedef struct {
     char *file; /* relative to the pack directory */
 } pocket_voice;
 
+/* ------------------------------------------------- the linear projection hook
+ *
+ * `transformer_ar` owns no cache and knows no tensor name on purpose, so the
+ * quantized projection path is installed from here: one hook per transformer,
+ * carrying the model's shared int8/int4/f16 cache and a table of cache keys
+ * built once at load.  Nothing is formatted or allocated per call (CLAUDE.md
+ * rule 4): the key is a pointer into a flat table indexed by layer and kind.
+ *
+ * The cache is the model's, not the context's, so N concurrent requests share
+ * one quantized copy of the weights (rule 3: weights are shared read-only). */
+typedef struct {
+    mynah_qmat_cache *qcache;
+    const mynah_backend *backend;
+    char *names; /* [layers * 4][POCKET_QNAME_MAX], flat */
+    size_t layers;
+} pocket_linear_hook;
+
 /* ---------------------------------------------------------- model weights */
 
 struct mynah_engine_state {
@@ -357,6 +377,12 @@ struct mynah_engine_state {
     char *model_dir;
     mynah_weights *weights;
     int owns_weights;
+
+    /* shared, borrowed from the model; NULL disables the hook */
+    mynah_qmat_cache *qcache;
+    const mynah_backend *backend;
+    pocket_linear_hook backbone_hook;
+    pocket_linear_hook codec_hook;
 
     /* backbone */
     mynah_transformer_ar_layer *backbone_layers;
@@ -451,6 +477,13 @@ struct mynah_engine_ctx {
 
     mynah_pocket_noise_fn noise_fn;
     void *noise_user;
+
+    /* The request's wall span. It cannot be bracketed by a region stack: the
+     * lifecycle is spread over ctx_new/prepare/step/emit/decode/free and, in
+     * the server, interleaves with other requests on the same thread. So it is
+     * submitted once, as a duration, exactly like the runtime's own derived
+     * regions. */
+    unsigned long long t_created_ns;
 };
 
 struct mynah_engine_scratch {
@@ -490,6 +523,57 @@ static float pocket_rng_normal(mynah_engine_ctx *ctx) {
     ctx->spare = (float)(radius * sin(angle));
     ctx->have_spare = 1;
     return (float)(radius * cos(angle));
+}
+
+/* ------------------------------------------------------ the linear hook */
+
+static int pocket_linear(void *user, size_t layer,
+                         mynah_transformer_ar_linear_kind kind,
+                         const float *weight, const float *bias, const float *in,
+                         float *out, size_t count, size_t k, size_t n) {
+    pocket_linear_hook *hook = (pocket_linear_hook *)user;
+    if (hook == NULL || layer >= hook->layers) return -1;
+    const char *name =
+        hook->names + (layer * 4u + (size_t)kind) * (size_t)POCKET_QNAME_MAX;
+    return mynah_qmat_linear_resolved(hook->qcache, hook->backend, name, weight, in,
+                                      out, count, k, n, bias, NULL, 0);
+}
+
+/* Builds the cache keys for one transformer.  `tag` keeps the backbone's keys
+ * and the codec transformer's apart in the model-wide cache, which matters
+ * because both have a layer 0. */
+static int pocket_hook_init(pocket_linear_hook *hook, const char *tag,
+                            size_t layers, mynah_qmat_cache *qcache,
+                            const mynah_backend *backend, char *error,
+                            size_t capacity) {
+    static const char *const kinds[4] = {"qkv", "oproj", "ffn1", "ffn2"};
+    size_t slots = 0;
+    size_t bytes = 0;
+    if (pocket_mul(layers, 4u, &slots) != 0 ||
+        pocket_mul(slots, (size_t)POCKET_QNAME_MAX, &bytes) != 0) {
+        pocket_error(error, capacity, "pocket: %s hook table overflow", tag);
+        return -1;
+    }
+    hook->names = (char *)calloc(bytes, 1u);
+    if (hook->names == NULL) {
+        pocket_error(error, capacity, "out of memory building the %s hook", tag);
+        return -1;
+    }
+    for (size_t l = 0; l < layers; ++l) {
+        for (size_t kind = 0; kind < 4u; ++kind) {
+            char *slot = hook->names + (l * 4u + kind) * (size_t)POCKET_QNAME_MAX;
+            const int written = snprintf(slot, POCKET_QNAME_MAX, "pocket.%s.%zu.%s",
+                                         tag, l, kinds[kind]);
+            if (written < 0 || (size_t)written >= POCKET_QNAME_MAX) {
+                pocket_error(error, capacity, "pocket: %s hook key truncated", tag);
+                return -1;
+            }
+        }
+    }
+    hook->layers = layers;
+    hook->qcache = qcache;
+    hook->backend = backend;
+    return 0;
 }
 
 /* ------------------------------------------------------ tensor resolution */
@@ -1354,6 +1438,8 @@ static void pocket_model_free(mynah_engine_state *state) {
     free(state->codec_layers);
     free(state->decoder_convtr);
     free(state->decoder_blocks);
+    free(state->backbone_hook.names);
+    free(state->codec_hook.names);
     if (state->owns_weights) mynah_weights_close(state->weights);
     free(state->model_dir);
     free(state);
@@ -1426,6 +1512,26 @@ static int pocket_model_init(const mynah_tts_model *model,
         return -1;
     }
 
+    /* The quantized projection path.  It is installed only when the model's
+     * cache resolved to something other than f32 (MYNAH_QUANT), so the default
+     * build keeps the exact f32 matvec and int8/int4/f16 stays an explicit
+     * opt-in whose numerics are reported separately. */
+    state->backend = model->backend;
+    state->qcache = model->qcache;
+    if (mynah_qmat_cache_enabled(state->qcache)) {
+        if (pocket_hook_init(&state->backbone_hook, "bb", state->cfg.layers,
+                             state->qcache, state->backend, error, capacity) != 0 ||
+            pocket_hook_init(&state->codec_hook, "codec", state->cfg.codec_tf_layers,
+                             state->qcache, state->backend, error, capacity) != 0) {
+            pocket_model_free(state);
+            return -1;
+        }
+        state->backbone.linear = pocket_linear;
+        state->backbone.linear_user = &state->backbone_hook;
+        state->codec_transformer.linear = pocket_linear;
+        state->codec_transformer.linear_user = &state->codec_hook;
+    }
+
     if (pocket_join(path, sizeof(path), state->model_dir, state->cfg.speakers_file,
                     error, capacity) != 0 ||
         pocket_voices_load(state, path, error, capacity) != 0) {
@@ -1479,6 +1585,11 @@ static int pocket_caps(const mynah_tts_model *model,
 
 static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     if (ctx == NULL) return;
+    if (ctx->t_created_ns != 0u) {
+        mynah_region_add_ns(MYNAH_RGN_REQUEST,
+                            mynah_costmap_now_ns() - ctx->t_created_ns);
+        mynah_costmap_request_done();
+    }
     mynah_transformer_ar_state_free(ctx->backbone);
     mynah_transformer_ar_state_free(ctx->codec_transformer);
     mynah_flow_head_destroy(ctx->flow);
@@ -1775,6 +1886,9 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
 
+    /* Set last, so the failure paths above (which call `_ctx_free`) cannot
+     * submit a span or count a request that never ran. */
+    ctx->t_created_ns = mynah_costmap_level() ? mynah_costmap_now_ns() : 0u;
     *out_ctx = ctx;
     if (error != NULL && capacity > 0) error[0] = '\0';
     return 0;
@@ -1829,8 +1943,12 @@ static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capaci
                state->embed_table + id * cfg->hidden_dim,
                cfg->hidden_dim * sizeof(float));
     }
-    if (mynah_transformer_ar_prefill(ctx->backbone, &state->backbone, ctx->text_embed,
-                                     ctx->text_length, NULL) != 0) {
+    mynah_region_begin(MYNAH_RGN_PREFILL);
+    const int prefill_failed =
+        mynah_transformer_ar_prefill(ctx->backbone, &state->backbone, ctx->text_embed,
+                                     ctx->text_length, NULL) != 0;
+    mynah_region_end(MYNAH_RGN_PREFILL);
+    if (prefill_failed) {
         pocket_error(error, capacity, "pocket: the text prefill failed");
         return -1;
     }
@@ -1843,7 +1961,12 @@ static int pocket_prepare(mynah_engine_ctx *ctx, char *error, size_t capacity) {
         pocket_error(error, capacity, "pocket: null context");
         return -1;
     }
-    return pocket_seed_context(ctx, error, capacity);
+    mynah_region_begin(MYNAH_RGN_PREPARE);
+    const int depth = mynah_region_depth();
+    const int rc = pocket_seed_context(ctx, error, capacity);
+    mynah_region_unwind(depth);
+    mynah_region_end(MYNAH_RGN_PREPARE);
+    return rc;
 }
 
 static int pocket_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
@@ -1888,10 +2011,18 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
             (ctx->frames > 0)
                 ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
                 : state->bos_emb;
+        mynah_region_begin(MYNAH_RGN_STEP);
+        mynah_region_begin2(MYNAH_RGN_STEP_EMBED);
         mynah_matvec_f32(state->input_linear, previous, ctx->step_input,
                          cfg->hidden_dim, cfg->latent_dim);
-        if (mynah_transformer_ar_step(ctx->backbone, &state->backbone, ctx->step_input,
-                                      ctx->hidden) != 0) {
+        mynah_region_end2(MYNAH_RGN_STEP_EMBED);
+        mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
+        const int step_failed =
+            mynah_transformer_ar_step(ctx->backbone, &state->backbone, ctx->step_input,
+                                      ctx->hidden) != 0;
+        mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
+        mynah_region_end(MYNAH_RGN_STEP);
+        if (step_failed) {
             pocket_error(error, capacity, "pocket: backbone step %zu failed for "
                                           "request %zu",
                          ctx->step, i);
@@ -1921,9 +2052,12 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
         const mynah_engine_state *state = ctx->state;
         const pocket_config *cfg = &state->cfg;
 
+        mynah_region_begin(MYNAH_RGN_EMIT);
+        mynah_region_begin(MYNAH_RGN_STEP_HEAD);
         ctx->eos_logit = mynah_dot_f32(state->out_eos_weight, ctx->hidden,
                                        cfg->hidden_dim) +
                          state->out_eos_bias[0];
+        mynah_region_end(MYNAH_RGN_STEP_HEAD);
         if (ctx->eos_step == SIZE_MAX && ctx->eos_logit > cfg->eos_threshold &&
             ctx->frames >= cfg->min_audio_frames) {
             ctx->eos_step = ctx->step;
@@ -1939,6 +2073,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             results[i].eos = 1;
             results[i].eos_frame = 0u;
             results[i].frames_appended = 0u;
+            mynah_region_end(MYNAH_RGN_EMIT);
             continue;
         }
 
@@ -1947,6 +2082,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
                               ctx->step) != 0) {
                 ctx->broken = 1;
                 results[i].failed = 1;
+                mynah_region_end(MYNAH_RGN_EMIT);
                 continue;
             }
         } else {
@@ -1958,10 +2094,15 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
         /* s and t, pinned at the endpoints; the manifest check at load time is
          * what makes this array the right length. */
         static const float times[2] = {0.0f, 1.0f};
-        if (mynah_flow_head_forward(ctx->flow, &state->flow, ctx->hidden, times,
-                                    ctx->noise, ctx->flow_out) != 0) {
+        mynah_region_begin(MYNAH_RGN_LOCAL);
+        const int flow_failed =
+            mynah_flow_head_forward(ctx->flow, &state->flow, ctx->hidden, times,
+                                    ctx->noise, ctx->flow_out) != 0;
+        mynah_region_end(MYNAH_RGN_LOCAL);
+        if (flow_failed) {
             ctx->broken = 1;
             results[i].failed = 1;
+            mynah_region_end(MYNAH_RGN_EMIT);
             continue;
         }
         /* One LSD step from s = 0 to t = 1: the integration is the addition. */
@@ -1974,6 +2115,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
         results[i].eos = 0;
         results[i].eos_frame = 1u;
         results[i].frames_appended = 1u;
+        mynah_region_end(MYNAH_RGN_EMIT);
     }
     return 0;
 }
@@ -2035,8 +2177,11 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
 
     const size_t stride = cfg->upsample_stride;
     const size_t dim = cfg->codec_dim;
+    mynah_region_begin(MYNAH_RGN_CODEC);
+    const int codec_depth = mynah_region_depth();
     for (size_t f = 0; f < frame_count; ++f) {
         const float *latent = ctx->latents + (first_frame + f) * cfg->latent_dim;
+        mynah_region_begin2(MYNAH_RGN_CODEC_EMBED);
         for (size_t d = 0; d < cfg->latent_dim; ++d) {
             ctx->denorm[d] = latent[d] * state->emb_std[d] + state->emb_mean[d];
         }
@@ -2047,13 +2192,17 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
         if (mynah_seanet_upsample(ctx->codec, &state->upsample, ctx->codec_in, 1u,
                                   ctx->codec_up) != 0) {
             free(pcm);
+            mynah_region_unwind(codec_depth);
+            mynah_region_end(MYNAH_RGN_CODEC);
             pocket_error(error, capacity, "pocket: the codec upsample failed");
             return -1;
         }
+        mynah_region_end2(MYNAH_RGN_CODEC_EMBED);
 
         /* The decoder transformer runs at the encoder frame rate and its inner
          * layers see [positions, channels]; the transpose belongs here, at the
          * same place the reference puts it. */
+        mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
         for (size_t c = 0; c < dim; ++c) {
             for (size_t t = 0; t < stride; ++t) {
                 ctx->codec_seq[t * dim + c] = ctx->codec_up[c * stride + t];
@@ -2065,6 +2214,8 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
         if (mynah_seanet_state_position(ctx->codec) !=
             mynah_transformer_ar_state_offset(ctx->codec_transformer)) {
             free(pcm);
+            mynah_region_unwind(codec_depth);
+            mynah_region_end(MYNAH_RGN_CODEC);
             pocket_error(error, capacity,
                          "pocket: codec position %zu != decoder transformer offset %zu",
                          mynah_seanet_state_position(ctx->codec),
@@ -2075,6 +2226,8 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
                                          &state->codec_transformer, ctx->codec_seq,
                                          stride, ctx->codec_out) != 0) {
             free(pcm);
+            mynah_region_unwind(codec_depth);
+            mynah_region_end(MYNAH_RGN_CODEC);
             pocket_error(error, capacity, "pocket: the decoder transformer failed");
             return -1;
         }
@@ -2083,16 +2236,22 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
                 ctx->codec_back[c * stride + t] = ctx->codec_out[t * dim + c];
             }
         }
+        mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+        mynah_region_begin2(MYNAH_RGN_CODEC_CONV);
         if (mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
                                 ctx->pcm) != 0) {
             free(pcm);
+            mynah_region_unwind(codec_depth);
+            mynah_region_end(MYNAH_RGN_CODEC);
             pocket_error(error, capacity, "pocket: the SEANet decoder failed");
             return -1;
         }
+        mynah_region_end2(MYNAH_RGN_CODEC_CONV);
         mynah_seanet_state_advance(ctx->codec, 1u);
         memcpy(pcm + f * cfg->samples_per_frame, ctx->pcm,
                cfg->samples_per_frame * sizeof(float));
     }
+    mynah_region_end(MYNAH_RGN_CODEC);
 
     ctx->decoded_frames += frame_count;
     *out_samples = pcm;
