@@ -181,3 +181,59 @@ size_t mynah_json_escape(const char *in, char *out, size_t capacity) {
     out[n] = '\0';
     return n;
 }
+
+/* A request line is exactly three tokens separated by single spaces. Anything
+ * else -- a missing version, an embedded space, a token that does not fit -- is
+ * rejected rather than guessed at: the caller answers 400 and closes, which is
+ * the only safe reading of a line we do not understand. */
+int mynah_http_request_line(const char *buf, size_t len,
+                            char *method, size_t method_capacity,
+                            char *path, size_t path_capacity) {
+    if (buf == NULL || method == NULL || path == NULL ||
+        method_capacity == 0 || path_capacity == 0) return -1;
+    method[0] = '\0';
+    path[0] = '\0';
+
+    size_t line_end = 0;
+    while (line_end < len && buf[line_end] != '\r' && buf[line_end] != '\n') ++line_end;
+    if (line_end == len) return -1;          /* no terminator inside the buffer */
+
+    size_t i = 0;
+    while (i < line_end && buf[i] != ' ') ++i;
+    if (i == 0 || i == line_end) return -1;
+    if (i >= method_capacity) return -1;
+    memcpy(method, buf, i);
+    method[i] = '\0';
+
+    const size_t target = i + 1u;
+    size_t end = target;
+    while (end < line_end && buf[end] != ' ') ++end;
+    if (end == target) return -1;
+    if (end == line_end) return -1;          /* no HTTP version: not a request we serve */
+
+    /* Require the version token, and require it to be HTTP. A proxy-style
+     * absolute target ("http://host/x") is legal HTTP but this server does not
+     * serve one, so the path must be origin-form. */
+    if (line_end - (end + 1u) < 5u || memcmp(buf + end + 1u, "HTTP/", 5) != 0) return -1;
+
+    size_t stop = target;
+    while (stop < end && buf[stop] != '?' && buf[stop] != '#') ++stop;
+    const size_t path_len = stop - target;
+    if (path_len == 0 || path_len >= path_capacity) return -1;
+    if (buf[target] != '/') return -1;
+    memcpy(path, buf + target, path_len);
+    path[path_len] = '\0';
+    return 0;
+}
+
+int mynah_http_media_type_is(const char *value, const char *media) {
+    if (value == NULL || media == NULL) return 0;
+    while (*value == ' ' || *value == '\t') ++value;
+    size_t i = 0;
+    while (media[i] != '\0') {
+        if (ascii_lower((unsigned char)value[i]) != ascii_lower((unsigned char)media[i])) return 0;
+        ++i;
+    }
+    const char c = value[i];
+    return c == '\0' || c == ';' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}

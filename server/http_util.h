@@ -27,6 +27,23 @@ int mynah_json_number(const char *json, const char *key, double *out);
 /* Read a JSON boolean by key. Returns 0 when found. */
 int mynah_json_bool(const char *json, const char *key, int *out);
 
+/* Splits a request line ("METHOD SP TARGET SP HTTP/1.1") into its method and
+ * its path, with any query string or fragment removed. Returns 0 on success.
+ *
+ * This exists so routing can compare a whole path rather than a prefix of the
+ * request line: a prefix test routes "POST /v1/audio/speechXYZ" to
+ * /v1/audio/speech, and a route that matches by accident is a request nobody
+ * meant to serve -- and, once the descriptor changes owner, one nobody
+ * closes. */
+int mynah_http_request_line(const char *buf, size_t len,
+                            char *method, size_t method_capacity,
+                            char *path, size_t path_capacity);
+
+/* Compares the media type of a header value ("application/json; charset=utf-8")
+ * against `media`, case-insensitively and ignoring parameters. Returns 1 on a
+ * match. */
+int mynah_http_media_type_is(const char *value, const char *media);
+
 /* Escape a UTF-8 string into a JSON string body (no surrounding quotes).
  * Returns the number of bytes written, or (size_t)-1 if it does not fit. */
 size_t mynah_json_escape(const char *in, char *out, size_t capacity);

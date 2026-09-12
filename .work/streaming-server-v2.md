@@ -273,3 +273,50 @@ after, with the identical message ("four concurrent requests (1 s) were slower
 than four serial (0 s)"). That check makes no streaming request at all, so the
 writer cannot affect it; the check needs sub-second timing, not the writer needs
 fixing. Filed here so the next person does not bisect it.
+
+## How this gets measured — what counts as evidence
+
+`tools/serving_profile.py` + `tests/playback_sim.py`, modelled on qwen-tts,
+report **per concurrency level** (C1, C2, C4, C8…): **TTFB** and **TTFA** kept
+separate (admission-and-header versus first usable PCM), **STREAM_RTF**,
+**prebuffer**, **stall rate** at stated thresholds, and **max inter-chunk gap** —
+each as p50 and p95, with a **GOOD / MARGINAL / NOT STREAMABLE** verdict whose
+thresholds are printed beside it so it can be argued with.
+
+Reporting rules, because the failure mode with serving numbers is flattering
+them: give the spread as well as the median, state the sample count, and when a
+level completes fewer requests than it launched, say so instead of averaging
+over the survivors.
+
+**Expect C2 and above to look bad in streaming today** — it is serialized under
+the global mutex. Quantifying that before E5-4 removes it is the point: the
+improvement then has a baseline instead of a claim.
+
+## E5-1 done — 2026-09-12
+
+The job moved off the worker's stack onto the heap with an atomic refcount, and
+the fd leaves exactly once: `job_claim_fd` is an `atomic_exchange`, so the first
+caller gets the descriptor and everyone else gets -1. That is the defence that
+matters, because a second close lands on whatever number `accept()` has since
+handed to another client. If the last reference drops and nobody ever claimed,
+`job_release` closes it **and says so on stderr** — a visible leak rather than a
+silent one. It never fired across 500+ requests.
+
+**A real use-after-free was found and fixed**: the worker freed `text_ids`
+immediately after `batch_submit`, while the scheduler was still reading them.
+They now belong to the job and leave with it.
+
+Routing is by whole path: unknown path 404, wrong method **405** (`GET
+/v1/audio/speech` used to land in 404 by accident), wrong content type 415,
+non-object body 400, and every refusal closes the socket. Per-request deadline
+via `--request-timeout-ms`; a timed-out batch job is **not synthesized at all**
+when the scheduler reaches it. `/health` carries job and stream counters.
+
+**Shutdown**: closing the listening socket from the signal handler does not
+work — a blocking `accept()` is not woken by another thread's close, and
+`signal()` installs a restarting handler, so the call simply resumes. The first
+attempt made the server ignore SIGTERM entirely. It now polls with a 200 ms
+timeout and exits cleanly, which is what makes `leaks --atExit` usable.
+
+Still not done here, on purpose: the global mutex (step 4) and continuous
+admission (step 2).
