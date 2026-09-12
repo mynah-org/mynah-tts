@@ -306,6 +306,7 @@ static void register_module_probes(void) {
     mynah_threads_dispatch_probes();
     mynah_conv1d_dispatch_probes();
     mynah_codec_dispatch_probes();
+    mynah_seanet_dispatch_probes();
 }
 
 /* ======================================================================
@@ -731,6 +732,28 @@ static void collect_backends(row_sink *s) {
     add_unknown(s, "codec.sgemm_conv", "yes", "-", "MYNAH_CODEC_SGEMM",
                 "[UNKNOWN] src/conv1d.c did not register "
                 "mynah_conv1d_sgemm_enabled()");
+
+    /* E4-21: the PocketTTS codec conv stack.  src/seanet.c had twelve fallback
+     * paths and no row here at all -- `grep seanet src/dispatch.c` returned
+     * nothing -- while the build gate behind them decides a 36x difference
+     * (8570 ms of scalar loops against 237 ms of sgemm, .work/no-blas.md §2).
+     * These four are declared as UNKNOWN and then overridden by the predicates
+     * src/seanet.c registers, so if that file ever stops registering they read
+     * UNKNOWN again instead of silently reverting to a compile-time guess. */
+    add_unknown(s, "codec.seanet_blas", "yes", "-", NULL,
+                "[UNKNOWN] src/seanet.c did not register "
+                "mynah_seanet_blas_name()");
+    add_unknown(s, "codec.seanet_gemm", yn(MYNAH_DISPATCH_HAS_ACCELERATE ||
+                                           MYNAH_DISPATCH_HAS_OPENBLAS),
+                "-", "MYNAH_SEANET_GEMM",
+                "[UNKNOWN] src/seanet.c did not register "
+                "mynah_seanet_gemm_enabled()");
+    add_unknown(s, "codec.seanet_conv_path", "yes", "-", NULL,
+                "[UNKNOWN] src/seanet.c did not register its conv1d path "
+                "counters");
+    add_unknown(s, "codec.seanet_convtr_path", "yes", "-", NULL,
+                "[UNKNOWN] src/seanet.c did not register its convtranspose "
+                "path counters");
     add_unknown(s, "codec.snake_vector", "yes", "-", "MYNAH_SNAKE_SCALAR",
                 "[UNKNOWN] src/codec_nanocodec.c did not register "
                 "mynah_snake_vector_enabled()");

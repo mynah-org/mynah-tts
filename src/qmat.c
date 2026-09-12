@@ -2312,7 +2312,51 @@ done:
  * makes the correction provable on a machine with no VNNI unit at all, and
  * additionally runs whichever of QMAT_U8_VEX / QMAT_U8_EVEX this CPU resolves
  * to.  K is chosen so the block, the tail and the row remainder are all
- * exercised: 200 = 3*64 + 8 with 13 rows = 3*4 + 1. */
+ * exercised: 200 = 3*64 + 8 with 13 rows = 3*4 + 1.
+ *
+ * WHAT IS ASSERTED EXACTLY, AND WHAT IS NOT (E4-20).
+ *
+ * The int32 dot products are compared with `==`.  That is the whole of the u8
+ * rewrite -- the +128 correction, the cached row-sum prefix and the signed
+ * tail are integer algebra, every term fits int32, and there is no rounding
+ * anywhere in it.  Both mistakes this test was written to catch live here: a
+ * row sum taken over the whole row instead of the VNNI prefix, and a tail
+ * corrected twice.  Either moves the int32 by a multiple of 128 * a weight
+ * sum, i.e. by ~1e5, so an exact integer comparison cannot be fooled.
+ *
+ * The FLOATS are compared to within 2 ULP, not bit-identically, and the
+ * reason is a property of the build rather than of the kernel.  The epilogue
+ * `(float)s * scales[row] * sx + bias[row]` is a three-factor product, this
+ * file compiles with -ffast-math (hence -fassociative-math), and the
+ * optimizer regroups it as `(s*scale)*sx` or `(s*sx)*scale` independently at
+ * each of the three places the quad epilogue appears -- and, when the three
+ * were merged into one `static inline` helper, independently at each inlined
+ * site as well.  The two groupings round differently.  This test used to
+ * demand bit-identity of the floats and therefore FAILED on x86 at rows 3, 7
+ * and 11 -- lane r == 3 of each quad -- while every integer it compared was
+ * already identical.  The failure was manufactured by the assertion, not by
+ * the kernel.
+ *
+ * 2 ULP is not a tolerance on the quantity being tested: a wrong row sum lands
+ * ~1e5 int32 units away, which is millions of ULP.  It is a bound on
+ * reassociation of a product that the language permits the compiler to
+ * reorder.  CLAUDE.md's numerical rule allows exactly this ("do not require
+ * byte-identical audio across different floating-point orderings"), and no
+ * process ever mixes the two kernels: qmat_u8_level() resolves once and is
+ * immutable for the life of the process. */
+
+/* Distance in representable floats.  The two operands are finite and carry the
+ * same sign -- they are one integer scaled by the same two positive factors --
+ * so their bit patterns are monotone and the difference counts ULP. */
+static long u8_ulp_gap(float a, float b) {
+    int32_t ia = 0, ib = 0;
+    memcpy(&ia, &a, sizeof ia);
+    memcpy(&ib, &b, sizeof ib);
+    if ((ia < 0) != (ib < 0)) return (a == b) ? 0L : LONG_MAX;
+    const long d = (long)ia - (long)ib;
+    return d < 0 ? -d : d;
+}
+
 static int u8_identity_one(size_t n, size_t k, int level,
                            char *error, size_t error_capacity) {
     int status = -1;
@@ -2360,28 +2404,53 @@ static int u8_identity_one(size_t n, size_t k, int level,
         }
     }
 
-    matvec_q8(ref, qs, ss, q8, scales, NULL, bias, n, k, QMAT_U8_OFF);
-    matvec_q8(got, qu, su, q8, scales, rowsum, bias, n, k, level);
+    /* The exact assertion: the integer the two kernels reduce to, row by row.
+     * This is the u8 rewrite in full, and it admits no rounding. */
     for (size_t i = 0; i < n; ++i) {
-        if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+        const int32_t want = dot_q8_i32(qs, q8 + i * k, 0, k, QMAT_U8_OFF);
+        const int32_t have = dot_q8_i32(qu, q8 + i * k, rowsum[i], k, level);
+        if (want != have) {
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
-                         "qmat u8 level=%d not bit-identical at row %zu of %zu "
-                         "(k=%zu): %.9g vs %.9g",
-                         level, i, n, k, (double)ref[i], (double)got[i]);
+                         "qmat u8 level=%d int32 differs at row %zu of %zu "
+                         "(k=%zu, main=%zu): %d vs %d -- the +128 correction, "
+                         "the row-sum prefix or the signed tail is wrong",
+                         level, i, n, k, qmat_u8_main(k), want, have);
             }
             goto done;
         }
     }
-    /* And the single-row entry, which the non-row4 path uses. */
+
+    /* And the assembled matvec, to 2 ULP.  This catches a wrong row index or a
+     * wrong scale in the quad epilogue (either lands far outside 2 ULP) while
+     * tolerating the -ffast-math reassociation documented above. */
+    matvec_q8(ref, qs, ss, q8, scales, NULL, bias, n, k, QMAT_U8_OFF);
+    matvec_q8(got, qu, su, q8, scales, rowsum, bias, n, k, level);
+    for (size_t i = 0; i < n; ++i) {
+        const long gap = u8_ulp_gap(ref[i], got[i]);
+        if (gap > 2) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat u8 level=%d matvec row %zu of %zu (k=%zu) is "
+                         "%ld ULP off, bound is 2: %.9g vs %.9g",
+                         level, i, n, k, gap, (double)ref[i], (double)got[i]);
+            }
+            goto done;
+        }
+    }
+    /* And the single-row entry, which the non-row4 path uses.  Same 2 ULP
+     * bound and for the same reason: dot_q8's `* ws * sx` is the same
+     * three-factor product the optimizer may regroup per call site. */
     for (size_t i = 0; i < n; ++i) {
         const float a = dot_q8(qs, ss, q8 + i * k, scales[i], 0, k, QMAT_U8_OFF);
         const float b = dot_q8(qu, su, q8 + i * k, scales[i], rowsum[i], k, level);
-        if (memcmp(&a, &b, sizeof(float)) != 0) {
+        const long gap = u8_ulp_gap(a, b);
+        if (gap > 2) {
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
-                         "qmat u8 level=%d single-row differs at %zu: %.9g vs %.9g",
-                         level, i, (double)a, (double)b);
+                         "qmat u8 level=%d single-row %zu is %ld ULP off, "
+                         "bound is 2: %.9g vs %.9g",
+                         level, i, gap, (double)a, (double)b);
             }
             goto done;
         }

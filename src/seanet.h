@@ -260,6 +260,49 @@ void mynah_seanet_elu_f32(const float *input, float *output, size_t n,
  * counter.  Returns 0 on success, -1 with a message in `error`. */
 int mynah_seanet_self_test(char *error, size_t error_capacity);
 
+/* ------------------------------------------------------ dispatch reporting
+ *
+ * E4-21.  This file has twelve fallback paths and, until these existed, no
+ * row anywhere in `--dispatch-map`.  The decisive one is not a shape: it is
+ * the BLAS the build linked.  With `BLAS=scalar` neither GEMM fast path is
+ * compiled and the whole codec conv stack runs the hand-written scalar loops
+ * -- 8570 ms against 237 ms, 36x (.work/no-blas.md §2) -- with nothing in the
+ * binary saying so.
+ *
+ * Process totals, not per-request state: they describe what this process has
+ * executed since start, the same contract mynah_parallel_stats() already
+ * uses.  Read once when the report is built. */
+typedef struct {
+    unsigned long long conv_calls;          /* every mynah_causal_conv1d_apply */
+    unsigned long long conv_gemm;           /* ... that took the GEMM path     */
+    unsigned long long conv_scalar_stride;  /* refused: stride != 1            */
+    unsigned long long conv_scalar_groups;  /* refused: grouped                */
+    unsigned long long conv_scalar_taps;    /* refused: no tap buffer          */
+    unsigned long long conv_scalar_narrow;  /* refused: dimension > INT_MAX    */
+    unsigned long long conv_scalar_nogemm;  /* no BLAS compiled, or env forced */
+    unsigned long long convtr_calls;
+    unsigned long long convtr_gemm;
+    unsigned long long convtr_scalar_groups;
+    unsigned long long convtr_scalar_taps;
+    unsigned long long convtr_scalar_narrow;
+    unsigned long long convtr_scalar_nogemm;
+} mynah_seanet_dispatch_stats;
+
+void mynah_seanet_dispatch_stats_get(mynah_seanet_dispatch_stats *out);
+
+/* "Accelerate", "OpenBLAS" or "none" — the BLAS THIS translation unit was
+ * compiled against, which is not necessarily the one `make info` printed if
+ * the object is stale. */
+const char *mynah_seanet_blas_name(void);
+
+/* 1 when the two GEMM fast paths are compiled AND not disabled by
+ * MYNAH_SEANET_GEMM.  This is the predicate the report calls; it never
+ * re-derives the answer from the build flags. */
+int mynah_seanet_gemm_enabled(void);
+
+/* Registers the rows above with src/dispatch.c. */
+void mynah_seanet_dispatch_probes(void);
+
 #ifdef __cplusplus
 }
 #endif

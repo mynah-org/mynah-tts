@@ -566,7 +566,17 @@ int main(int argc, char **argv) {
         printf("%s backend self-test: PASS\n", mynah_tts_device_name(device));
         return 0;
     }
-    if (strcmp(argv[1], "--synthesize") == 0) return synthesize(argc, argv);
+    if (strcmp(argv[1], "--synthesize") == 0) {
+        /* The dispatch rows that count what RAN -- codec.seanet_conv_path and
+         * codec.seanet_convtr_path -- are necessarily empty in a bare
+         * `--dispatch-map`, which loads no model.  This is the only place that
+         * can read them with something behind them.  A no-op unless
+         * MYNAH_DISPATCH_JSON names a file, so the default path is unchanged
+         * and nothing is printed to a pipe that expects audio. */
+        const int rc = synthesize(argc, argv);
+        mynah_dispatch_report_json_path(NULL);
+        return rc;
+    }
     if (strcmp(argv[1], "--write-test-wav") == 0 && argc == 3) {
         return write_test_wav(argv[2]);
     }

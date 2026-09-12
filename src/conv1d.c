@@ -492,9 +492,25 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
                 }
                 if (profile != NULL) profile->pack_seconds += mynah_phase_seconds() - pack_start;
                 const double gemm_start = profile != NULL ? mynah_phase_seconds() : 0.0;
-                mynah_graph_sgemm(backend, 0, 0, (int)out_channels, (int)length, (int)inner, 1.0f, weight.data, (int)inner, columns, (int)length, 1.0f, output, (int)length, error, error_capacity);
+                /* E4-21 item F.  mynah_backend_sgemm() returns -1 without
+                 * touching `c` when the backend is NULL (backend.c:559), and
+                 * `output` was seeded with the bias a few lines up -- so
+                 * dropping this return shipped a bias-only convolution, with
+                 * the right shape, no error, and a return of 0.  A silently
+                 * wrong answer is worse than a slow one. */
+                const int failed = mynah_graph_sgemm(
+                    backend, 0, 0, (int)out_channels, (int)length, (int)inner,
+                    1.0f, weight.data, (int)inner, columns, (int)length, 1.0f,
+                    output, (int)length, error, error_capacity);
                 if (profile != NULL) profile->gemm_seconds += mynah_phase_seconds() - gemm_start;
                 if (owns_columns) free(columns);
+                if (failed != 0) {
+                    mynah_graph_error(error, error_capacity,
+                                      "causal conv1d: im2col sgemm failed "
+                                      "(no usable backend); output would have "
+                                      "been bias only");
+                    return -1;
+                }
                 return 0;
             }
         }
@@ -535,11 +551,21 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
         const float *tap_weights = owns_wk
             ? wk : wk + k * out_channels * in_channels;
         const double gemm_start = profile != NULL ? mynah_phase_seconds() : 0.0;
-        mynah_graph_sgemm(backend, 0, 0, (int)out_channels, (int)n,
-                    (int)in_channels, 1.0f, tap_weights, (int)in_channels,
-                    input, (int)length, 1.0f, output + shift, (int)length,
-                    error, error_capacity);
+        /* Same defect as the im2col site above: every tap accumulates into an
+         * output already seeded with the bias, so a dropped return leaves a
+         * bias-only convolution behind and reports success. */
+        const int failed = mynah_graph_sgemm(
+            backend, 0, 0, (int)out_channels, (int)n, (int)in_channels, 1.0f,
+            tap_weights, (int)in_channels, input, (int)length, 1.0f,
+            output + shift, (int)length, error, error_capacity);
             if (profile != NULL) profile->gemm_seconds += mynah_phase_seconds() - gemm_start;
+            if (failed != 0) {
+                if (owns_wk) free(wk);
+                mynah_graph_error(error, error_capacity,
+                                  "causal conv1d: tap sgemm failed (no usable "
+                                  "backend); output would have been bias only");
+                return -1;
+            }
         }
     if (owns_wk) free(wk);
         return 0;

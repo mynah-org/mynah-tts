@@ -6,20 +6,27 @@
  */
 #include "seanet.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "dispatch.h"
 #include "kernels.h"
 
 #if defined(MYNAH_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 #define MYNAH_SEANET_BLAS 1
+#define MYNAH_SEANET_BLAS_NAME "Accelerate"
 #elif defined(MYNAH_USE_OPENBLAS)
 #include <cblas.h>
 #define MYNAH_SEANET_BLAS 1
+#define MYNAH_SEANET_BLAS_NAME "OpenBLAS"
+#else
+#define MYNAH_SEANET_BLAS_NAME "none"
 #endif
 
 /* ------------------------------------------------------------- GEMM paths
@@ -46,7 +53,87 @@
  * plus a BLAS build and a non-NULL tap buffer.  Everything else falls through.
  */
 
+/* ------------------------------------------------------- dispatch counters
+ *
+ * E4-21.  Before these existed this file had twelve fallback paths and ZERO
+ * rows in `--dispatch-map`: `grep seanet src/dispatch.c` returned nothing.
+ * The one that matters is the build gate right above -- with `BLAS=scalar`
+ * neither GEMM below is even compiled, the whole codec conv stack runs the
+ * hand-written scalar loops, and that is the path that measured 8570 ms
+ * against 237 ms for the GEMM path (.work/no-blas.md §2).  A 36x regression
+ * that nothing in the binary announced.
+ *
+ * They are COUNTERS, not predicates about shapes, because a shape predicate
+ * would have to lie: the report is built before a model is loaded, so at that
+ * moment no SEANet convolution has run and nothing is known about the shapes
+ * this pack will present.  Counting what actually executed lets the row say
+ * "no SEANet conv has run in this process yet" instead of implying health --
+ * .work/engineering-method.md §4, every tool declares a refusal.
+ *
+ * Relaxed atomics: one increment per convolution call (order tens per frame,
+ * against a GEMM each), never per element, and never inside an inner loop. */
+typedef struct {
+    atomic_ullong conv_calls;
+    atomic_ullong conv_gemm;
+    atomic_ullong conv_scalar_stride;
+    atomic_ullong conv_scalar_groups;
+    atomic_ullong conv_scalar_taps;
+    atomic_ullong conv_scalar_narrow;
+    atomic_ullong conv_scalar_nogemm;
+    atomic_ullong convtr_calls;
+    atomic_ullong convtr_gemm;
+    atomic_ullong convtr_scalar_groups;
+    atomic_ullong convtr_scalar_taps;
+    atomic_ullong convtr_scalar_narrow;
+    atomic_ullong convtr_scalar_nogemm;
+} sea_counters;
+
+static sea_counters g_sea;
+
+static void sea_bump(atomic_ullong *c) {
+    atomic_fetch_add_explicit(c, 1ull, memory_order_relaxed);
+}
+
+static unsigned long long sea_read(atomic_ullong *c) {
+    return atomic_load_explicit(c, memory_order_relaxed);
+}
+
+/* MYNAH_SEANET_GEMM: "0"/"off" forces the scalar reference loops on a build
+ * that HAS a BLAS.  It narrows only -- it can never switch a GEMM on in a
+ * build where one was not compiled -- which is the same contract
+ * MYNAH_QMAT_VNNI and MYNAH_QMAT_F16C use in src/qmat.c, and for the same
+ * reason: without it the scalar convolution reference is unreachable on every
+ * machine anybody develops on, so nothing ever executes it. Resolved once and
+ * then immutable: it describes the process, not a request. */
+static int sea_gemm_enabled(void) {
 #if defined(MYNAH_SEANET_BLAS)
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("MYNAH_SEANET_GEMM");
+        cached = (env != NULL && (strcmp(env, "0") == 0 ||
+                                  strcmp(env, "off") == 0)) ? 0 : 1;
+    }
+    return cached;
+#else
+    return 0;
+#endif
+}
+
+#if defined(MYNAH_SEANET_BLAS)
+/* Every argument cblas_sgemm takes is an `int`, and all six of the ones below
+ * come from `size_t` dimensions.  conv1d.c guards its narrowing
+ * (conv1d.c:464); this file did not, and silently truncated six values per
+ * call (E4-21, item H).  The check is made ONCE per convolution rather than
+ * per tap, because every tap of one call has the same shape and because a
+ * fast path must be refused before it starts accumulating, not halfway
+ * through. */
+static int sea_dims_fit(size_t m, size_t n, size_t k, size_t lda, size_t ldb,
+                        size_t ldc) {
+    return m <= (size_t)INT_MAX && n <= (size_t)INT_MAX &&
+           k <= (size_t)INT_MAX && lda <= (size_t)INT_MAX &&
+           ldb <= (size_t)INT_MAX && ldc <= (size_t)INT_MAX;
+}
+
 static void sea_sgemm(int trans_a, size_t m, size_t n, size_t k,
                       const float *a, size_t lda, const float *b, size_t ldb,
                       float beta, float *c, size_t ldc) {
@@ -267,6 +354,32 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
     const size_t out_per_group = spec->out_channels / groups;
     const size_t out_len = in_len / stride;
 
+    /* Which of the conv1d paths this call takes, counted for the dispatch
+     * report.  Exactly one counter fires per call, so the rows add up and a
+     * reader can tell "the fast path never qualified" from "the fast path was
+     * never compiled".  See the sea_counters comment. */
+    sea_bump(&g_sea.conv_calls);
+    int conv_use_gemm = 0;
+#if !defined(MYNAH_SEANET_BLAS)
+    (void)conv_use_gemm;
+    sea_bump(&g_sea.conv_scalar_nogemm);
+#else
+    if (!sea_gemm_enabled()) {
+        sea_bump(&g_sea.conv_scalar_nogemm);
+    } else if (spec->stride != 1u) {
+        sea_bump(&g_sea.conv_scalar_stride);
+    } else if (groups != 1u) {
+        sea_bump(&g_sea.conv_scalar_groups);
+    } else if (kernel != 1u && conv->taps == NULL) {
+        sea_bump(&g_sea.conv_scalar_taps);
+    } else if (!sea_dims_fit(spec->out_channels, out_len, in_channels,
+                             in_channels, window_len, out_len)) {
+        sea_bump(&g_sea.conv_scalar_narrow);
+    } else {
+        conv_use_gemm = 1;
+    }
+#endif
+
 #if defined(MYNAH_SEANET_BLAS)
     /* One GEMM per kernel tap, accumulating into the output:
      *   out[oc][n] = sum_k sum_j W[oc][j][k] * win[j][n + k*dilation]
@@ -276,8 +389,8 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
      * hand to BLAS.  `taps` gathers W[.][.][k], whose natural layout is
      * strided by `kernel`; for kernel == 1 the weight already is the dense
      * matrix and no gather happens at all. */
-    if (spec->stride == 1u && groups == 1u &&
-        (kernel == 1u || conv->taps != NULL)) {
+    if (conv_use_gemm) {
+        sea_bump(&g_sea.conv_gemm);
         const size_t oc_count = spec->out_channels;
         for (size_t k = 0; k < kernel; ++k) {
             const float *a;
@@ -525,6 +638,34 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
     const size_t stride = spec->stride;
 
     int folded = 0;
+
+    /* Same accounting as conv1d above, and this is the one that carries the
+     * finding from .work/dtype-and-fallbacks.md item E: the Mimi depthwise
+     * `upsample` runs with groups == out_channels (512 on the pinned pack), so
+     * it can NEVER qualify -- the trailing two weight axes are not one dense
+     * matrix when the convolution is grouped -- and it has therefore taken
+     * convtr_scatter_scalar silently on every frame since the GEMM work
+     * landed.  Counting it is what turns "always scalar" from a thing someone
+     * had to read the source to learn into a row in the report. */
+    sea_bump(&g_sea.convtr_calls);
+#if !defined(MYNAH_SEANET_BLAS)
+    sea_bump(&g_sea.convtr_scalar_nogemm);
+#else
+    const size_t gemm_rows = spec->out_channels * kernel;
+    if (!sea_gemm_enabled()) {
+        sea_bump(&g_sea.convtr_scalar_nogemm);
+    } else if (spec->groups != 1u) {
+        sea_bump(&g_sea.convtr_scalar_groups);
+    } else if (convtr->taps == NULL) {
+        sea_bump(&g_sea.convtr_scalar_taps);
+    } else if (!sea_dims_fit(gemm_rows, in_len, spec->in_channels, gemm_rows,
+                             in_len, in_len)) {
+        sea_bump(&g_sea.convtr_scalar_narrow);
+    } else {
+        folded = 1;
+    }
+#endif
+
 #if defined(MYNAH_SEANET_BLAS)
     /* PyTorch stores a ConvTranspose1d weight as [in_channels][out_channels][kernel],
      * so with groups == 1 the trailing two axes are already one dense
@@ -533,8 +674,9 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
      * is a single GEMM with A transposed, and the only thing left is the
      * scatter taps -> full[oc][t*stride + k], which costs out_channels * kernel
      * * in_len adds against the GEMM's in_channels times that. */
-    if (spec->groups == 1u && convtr->taps != NULL) {
-        const size_t rows = spec->out_channels * kernel;
+    if (folded) {
+        sea_bump(&g_sea.convtr_gemm);
+        const size_t rows = gemm_rows;
         sea_sgemm(1, rows, in_len, spec->in_channels, weights->weight, rows,
                   input, in_len, 0.0f, convtr->taps, in_len);
         for (size_t oc = 0; oc < spec->out_channels; ++oc) {
@@ -545,7 +687,6 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
                 for (size_t t = 0; t < in_len; ++t) dst[t * stride] += src[t];
             }
         }
-        folded = 1;
     }
 #endif
     if (!folded) {
@@ -2163,4 +2304,137 @@ int mynah_seanet_self_test(char *error, size_t error_capacity) {
     }
 
     return 0;
+}
+
+/* ======================================================================
+ * Dispatch predicates
+ *
+ * E4-21.  Every `resolved` below comes from calling something in this file --
+ * sea_gemm_enabled(), or the counters the two apply functions actually
+ * incremented -- never from re-deriving MYNAH_SEANET_BLAS inside dispatch.c.
+ * That is the central rule in dispatch.h: a report that recomputes the
+ * condition can agree with the source and both be wrong, which is exactly how
+ * "0.427 RTF was VNNI" survived in the README.
+ *
+ * The counters are zero until a model runs, and `--dispatch-map` loads no
+ * model, so these rows say "no SEANet convolution has run in this process"
+ * instead of presenting a clean zero as health.  A refusal, per
+ * .work/engineering-method.md §4.
+ * ====================================================================== */
+
+void mynah_seanet_dispatch_stats_get(mynah_seanet_dispatch_stats *out) {
+    if (out == NULL) return;
+    out->conv_calls         = sea_read(&g_sea.conv_calls);
+    out->conv_gemm          = sea_read(&g_sea.conv_gemm);
+    out->conv_scalar_stride = sea_read(&g_sea.conv_scalar_stride);
+    out->conv_scalar_groups = sea_read(&g_sea.conv_scalar_groups);
+    out->conv_scalar_taps   = sea_read(&g_sea.conv_scalar_taps);
+    out->conv_scalar_narrow = sea_read(&g_sea.conv_scalar_narrow);
+    out->conv_scalar_nogemm = sea_read(&g_sea.conv_scalar_nogemm);
+    out->convtr_calls         = sea_read(&g_sea.convtr_calls);
+    out->convtr_gemm          = sea_read(&g_sea.convtr_gemm);
+    out->convtr_scalar_groups = sea_read(&g_sea.convtr_scalar_groups);
+    out->convtr_scalar_taps   = sea_read(&g_sea.convtr_scalar_taps);
+    out->convtr_scalar_narrow = sea_read(&g_sea.convtr_scalar_narrow);
+    out->convtr_scalar_nogemm = sea_read(&g_sea.convtr_scalar_nogemm);
+}
+
+const char *mynah_seanet_blas_name(void) { return MYNAH_SEANET_BLAS_NAME; }
+
+int mynah_seanet_gemm_enabled(void) { return sea_gemm_enabled(); }
+
+/* codec.seanet_blas -- which BLAS this object linked, and therefore whether
+ * the fast paths exist at all.  A value row, not a boolean: "none" and
+ * "OpenBLAS" are different facts and ON/OFF would erase the difference. */
+static int probe_seanet_blas(char *out, size_t capacity, const char **why) {
+    snprintf(out, capacity, "%s", MYNAH_SEANET_BLAS_NAME);
+#if defined(MYNAH_SEANET_BLAS)
+    *why = "[predicate] src/seanet.c mynah_seanet_blas_name(): sea_sgemm is "
+           "compiled, so conv1d and convtranspose can fold to one GEMM per "
+           "kernel tap. This is the 36x path (8570 ms -> 237 ms)";
+#else
+    *why = "[predicate] src/seanet.c mynah_seanet_blas_name(): NO BLAS here, so "
+           "BOTH SEANet GEMM fast paths are compiled out and the whole codec "
+           "conv stack runs the scalar loops -- 8570 ms vs 237 ms, 36x. "
+           "Rebuild with BLAS=auto or BLAS=openblas";
+#endif
+    return 0;
+}
+
+/* codec.seanet_gemm -- the runtime answer, environment included. */
+static int probe_seanet_gemm(const char **why) {
+    const int on = mynah_seanet_gemm_enabled();
+#if defined(MYNAH_SEANET_BLAS)
+    *why = on ? "[predicate] src/seanet.c sea_gemm_enabled(): ON. A call still "
+                "needs stride==1 and groups==1 (conv1d) or groups==1 "
+                "(convtranspose) plus a tap buffer; codec.seanet_conv_path "
+                "counts how many actually qualified"
+              : "[predicate] src/seanet.c sea_gemm_enabled(): MYNAH_SEANET_GEMM "
+                "turned the GEMM off, so every SEANet convolution takes the "
+                "scalar reference. Deliberate, and 36x slower -- unset it";
+#else
+    *why = "[predicate] src/seanet.c sea_gemm_enabled(): OFF because no BLAS "
+           "was compiled in (BLAS=scalar). Not an env choice; a build choice";
+#endif
+    return on;
+}
+
+/* One row per call site, saying what RAN rather than what could run:
+ * `gemm/total`, plus the reason each refusal fired. */
+static int probe_seanet_conv_path(char *out, size_t capacity, const char **why) {
+    static char text[240];
+    mynah_seanet_dispatch_stats st;
+    mynah_seanet_dispatch_stats_get(&st);
+    if (st.conv_calls == 0) {
+        snprintf(out, capacity, "n/a");
+        *why = "[predicate] src/seanet.c: no causal conv1d has run in this "
+               "process yet, so there is nothing to report. Read this row "
+               "after a synthesis; --dispatch-map alone loads no model";
+        return 0;
+    }
+    snprintf(out, capacity, "%llu/%llu", st.conv_gemm, st.conv_calls);
+    snprintf(text, sizeof text,
+             "[predicate] src/seanet.c mynah_causal_conv1d_apply(): %llu of "
+             "%llu calls folded to sgemm. Scalar: %llu stride!=1, %llu "
+             "grouped, %llu no tap buffer, %llu dim>INT_MAX, %llu no GEMM "
+             "compiled or enabled",
+             st.conv_gemm, st.conv_calls, st.conv_scalar_stride,
+             st.conv_scalar_groups, st.conv_scalar_taps, st.conv_scalar_narrow,
+             st.conv_scalar_nogemm);
+    *why = text;
+    return 0;
+}
+
+static int probe_seanet_convtr_path(char *out, size_t capacity,
+                                    const char **why) {
+    static char text[240];
+    mynah_seanet_dispatch_stats st;
+    mynah_seanet_dispatch_stats_get(&st);
+    if (st.convtr_calls == 0) {
+        snprintf(out, capacity, "n/a");
+        *why = "[predicate] src/seanet.c: no causal convtranspose1d has run in "
+               "this process yet. Read this row after a synthesis";
+        return 0;
+    }
+    snprintf(out, capacity, "%llu/%llu", st.convtr_gemm, st.convtr_calls);
+    snprintf(text, sizeof text,
+             "[predicate] src/seanet.c mynah_causal_convtr1d_apply(): %llu of "
+             "%llu folded to sgemm. Scalar: %llu grouped (a grouped "
+             "convtranspose -- the Mimi depthwise upsample -- can never fold, "
+             "so it scatters every frame), %llu no taps, %llu dim>INT_MAX, "
+             "%llu no GEMM",
+             st.convtr_gemm, st.convtr_calls, st.convtr_scalar_groups,
+             st.convtr_scalar_taps, st.convtr_scalar_narrow,
+             st.convtr_scalar_nogemm);
+    *why = text;
+    return 0;
+}
+
+void mynah_seanet_dispatch_probes(void) {
+    mynah_dispatch_register_value_probe("codec.seanet_blas", probe_seanet_blas);
+    mynah_dispatch_register_probe("codec.seanet_gemm", probe_seanet_gemm);
+    mynah_dispatch_register_value_probe("codec.seanet_conv_path",
+                                        probe_seanet_conv_path);
+    mynah_dispatch_register_value_probe("codec.seanet_convtr_path",
+                                        probe_seanet_convtr_path);
 }
