@@ -38,6 +38,11 @@ our own kernels, our own ISA dispatch, our own pool. Checked:
 > **The entire BLAS dependency of the PocketTTS production path is
 > `sea_sgemm`, two call sites in `seanet.c`.**
 
+**Correction (2026-09-12, from building it):** that holds for the *quantized*
+path. `engine_pocket.c:1166,1237` can still reach `mynah_backend_matmul` for an
+unquantized projection, so `sea_sgemm` is the whole f32-GEMM surface only when the
+groups are doing their job.
+
 Everything else in the table above is Magpie's, and Magpie is not what we are
 optimising for Linux servers.
 
@@ -148,6 +153,40 @@ must be *absent* to be valid.
    only thing that references it.
 
 Steps 3 and 4 are separable from everything else in E4/E5 and do not block them.
+
+---
+
+## 5b. Landed — the kernel, not the default (`fa3df67`)
+
+`src/sgemm.c` exists: four families chosen by one function the runtime and the
+report both call, a scalar reference as the definition of correctness, and a
+narrow/panel boundary **derived** from the register file rather than chosen.
+`BLAS=none` is a first-class build that links neither Accelerate nor OpenBLAS.
+The default is unchanged and byte-identical.
+
+**The numerical result inverted the expected direction.** Isolated against the
+in-tree scalar convolution reference, with two controls proving the GEMM is the
+only thing that changed:
+
+| | max abs | samples differing |
+|---|---|---|
+| **our GEMM**, f32 | **1 LSB** | 0.12% |
+| **our GEMM**, int8 | **1 LSB** | 0.16% |
+| Accelerate, f32 | 8 LSB | 18.5% |
+| Accelerate, int8 | 360 LSB | 94.5% |
+
+Twenty to nine hundred times closer to the reference than the incumbent, which has
+been shipping since E3-4.
+
+**Two things the default flip must not ride along on.** Dropping Accelerate also
+drops vForce's `vvtanhf` in the GELU for libm's `tanhf` — on a continuous-AR model
+that compounds, and it is a separate numerical qualification. And the BNNS filter
+cache in `conv1d.c` goes with it. Neither is a GEMM decision.
+
+**A false gate worth remembering:** `make ubsan` and `make ubsan BLAS=none` wrote
+to the same directory, so the second run re-tested the first one's
+Accelerate-linked binary and printed a green PASS on top. The sanitizer directory
+now carries the BLAS name and the run prints its link count as proof.
 
 ---
 

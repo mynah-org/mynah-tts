@@ -228,13 +228,15 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-15 **`SIMD=auto` must read `/proc/cpuinfo` on x86**, with the kernel-flag +
       `cc_ok` double test and a printed resolved profile. Value is in VNNI and
       AVX-512 BF16; AMX costs far more for less (their AMX 8c does C2, VNNI 32c C12)
-- [ ] E4-16 **write `mynah_sgemm_f32` and drop the BLAS dependency** → [`.work/no-blas.md`](.work/no-blas.md)
+- [~] E4-16 **kernel landed (`fa3df67`), default not flipped** — `mynah_sgemm_f32` and `BLAS=none` → [`.work/no-blas.md`](.work/no-blas.md)
       Decided: we do not want a second thread pool inside our process. The surface is
       one function (`cblas_sgemm`) at three call sites, and **the whole PocketTTS
       production path is two of them, both in `seanet.c`** — the backbone and flow head
       already go through `qmat`. Skinny shapes, `n` large, `k` small. Removal also
       deletes the weak-symbol clamp in `threads.c`, three dispatch rows, and the
-      three-way Makefile split
+      three-way Makefile split. **Flipping the default is blocked on two separate
+      things**: a Linux RTF measurement, and qualifying the loss of vForce's `vvtanhf`
+      in the GELU, which is not a GEMM decision and must not ride along on one
 - [ ] E4-16a **interim, while BLAS is still linked**: `OPENBLAS_THREAD_TIMEOUT=1` —
       TTFA 108 ms **bimodal** to 66 ms stable, 42.5k to 12k context switches/s — and
       report claim vs fact in the dispatch table. Do **not** partition rigidly:
