@@ -91,7 +91,7 @@ STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
 .PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
-        oracle-pocket fake-pack goldens goldens-capture tokenizer-parity \
+        oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -218,6 +218,14 @@ oracle:
 	@test -n "$(CODEC)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	@test -n "$(OUTPUT)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
+
+# PocketTTS model pack. Needs the gated Kyutai weights in the HF cache; see
+# .work/licensing-and-voice-policy.md before redistributing what this produces.
+POCKET_LANG ?= english
+POCKET_OUT ?= models/pocket-$(POCKET_LANG)
+convert-pocket:
+	uv run --with numpy python tools/convert_pocket.py \
+	  --language "$(POCKET_LANG)" --output "$(POCKET_OUT)"
 
 # SentencePiece parity against the Python oracle. Generate the cases first with
 # `uv run --with sentencepiece python tools/oracle_pocket_tokenizer.py`.

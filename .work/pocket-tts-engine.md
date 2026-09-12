@@ -116,11 +116,30 @@ Two more traps found at the same time:
 - `time_embed.*.freqs` are deterministic constants and are the only tensors
   identical across all languages. **Compute at load, do not store.**
 
+## Resolved during the converter work
+
+- **`offset` is the length, not a position vector.** It is `I64[1]` and the
+  converter asserts it equals `T`, failing on a partially filled cache. (It is
+  named `current_end` in the raw file and `offset` once loaded.) The KV loader
+  has nothing to interpret.
+- **`attention_heads` and `head_dim` are not derivable from the weights**,
+  because QKV is pre-fused as `[3072, 1024]`. The only place the split is
+  visible is the voice KV shape `[2, 1, T, 16, 64]`, so the converter reads a
+  voice before deriving the schema and checks `heads * head_dim == hidden_dim`.
+  `codec_transformer_heads` is derived as `codec_dim / head_dim = 8`, which is
+  the only defensible derivation — **confirm it against the oracle before the C
+  relies on it.**
+
 ## Still open
 
-- `current_end [T]` in the voice files: confirm it is a position/length vector
-  and nothing the KV load must interpret. Cheap to settle during E2.
-- Whether F16 voice KV is audibly equivalent to F32 (see "Converter and pack").
+- **Whether F16 voice KV is audibly equivalent to F32.** Measured on conversion:
+  **3.905e-03 absolute, 4.405e-04 relative** (worst voice `paul`). No overflow —
+  peak magnitude is ~6.7, well inside F16 range — but that absolute error is
+  large next to the 1e-4 tolerances used elsewhere, and it perturbs the *voice
+  conditioning*, not an intermediate activation. **Verify against the oracle
+  before accepting F16 as the default**; the number is printed on every
+  conversion so it cannot be forgotten. Falling back to F32 costs 83 MB per
+  pack.
 
 ## Multi-language packing
 

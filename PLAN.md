@@ -92,7 +92,10 @@ Independent of E1. **Start here** — it tells E1 which state the seam must mode
 
 Needs E1 and E2.
 
-- [ ] E3-1 `tools/convert_pocket.py` + per-language model pack; voice KV stored F16
+- [x] E3-1 `tools/convert_pocket.py` **done** — 214/214 tensors, 302 MB pack, 59 scalars
+      top-level for the flat parser, schema verified identical en/it
+- [ ] E3-1a **verify F16 voice KV against the oracle** (measured 3.9e-3 abs) before
+      keeping it as the default; F32 costs +83 MB per pack
 - [x] E3-2 `src/tokenizer_sentencepiece.{c,h}` **done** → [`.work/tokenizer-sentencepiece.md`](.work/tokenizer-sentencepiece.md)
       1734 LOC, in `CORE_SOURCES` and `--self-test`; `make tokenizer-parity` replays
       45,197 oracle cases / 2.1M ids across 5 languages; UBSan, ASan and leaks clean
