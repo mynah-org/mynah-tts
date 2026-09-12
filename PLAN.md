@@ -85,10 +85,15 @@ Independent of E1. **Start here** — it tells E1 which state the seam must mode
 - [x] E2-3 streaming decode measured: **carry codec state** (error 1e-7 down to a
       1-frame chunk); replaying context needs 64 frames / 5.12 s for exactness, so
       the Magpie replay strategy does not transfer
-- [ ] E2-4 dump decoder-transformer behaviour past `context: 250`
+- [ ] E2-4 dump decoder-transformer behaviour past `context: 250` — needed to exercise
+      the sliding window in `transformer_ar`, which no reference data reaches today
 - [ ] E2-5 dump the text-chunk seam at `MAX_TOKEN_PER_CHUNK = 50`, including the known skip bug
 
 ### E3 — `engine_pocket.c` → [`.work/pocket-tts-engine.md`](.work/pocket-tts-engine.md)
+
+**Every part exists and is verified against the oracle.** Tokenizer 45k cases,
+backbone 3.4e-06, flow head 1.07e-06, SEANet 5.7e-07, converter 214/214. What is
+left is composing them (E3-5) and finishing the seam (E1-1).
 
 Needs E1 and E2.
 
@@ -102,7 +107,8 @@ Needs E1 and E2.
 - [x] E3-3 `src/flow_head.{c,h}` **done** — oracle parity 1.07e-06 against a 1e-4 tolerance
 - [x] E3-4 `src/seanet.{c,h}` **done** — SEANet parity 5.7e-07; chunked-vs-one-shot 2.98e-07,
       so E2-3's carried-state decision holds in C
-- [ ] E3-5 `src/engine_pocket.c`: AR step, EOS at `-4.0`, latent denorm
+- [ ] E3-5 `src/engine_pocket.c`: compose backbone + flow head + SEANet; AR step,
+      EOS at `-4.0`, latent denorm. **The only missing piece.**
 - [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias** (two different
       epsilons), **variance-based RMSNorm** (`unbiased=True`, *not* `kernels.c:rmsnorm`),
       GELU-tanh, causal conv, adaLN

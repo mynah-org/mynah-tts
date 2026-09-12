@@ -200,3 +200,58 @@ it resolves weights **by name**, which is exactly the pattern
 modules take resolved pointers. Both cannot be the shared form; the
 pointer-taking one is right, and `conv1d` should be narrowed to match when the
 vtable lands.
+
+## Backbone implemented — 2026-09-12
+
+`src/transformer_ar.{c,h}`, the shared causal AR transformer, taking **resolved
+weight pointers only** — it never formats or looks up a tensor name, which is
+the shape [engine-seam-refactor.md](engine-seam-refactor.md) risk 6 asked for.
+
+Parity against the oracle with the real BF16 weights, the `alba` voice KV loaded
+as the 126-position prefix, 26 text tokens prefilled, then the AR step at
+position 152:
+
+| stage | max abs | rel L2 |
+|---|---|---|
+| layer 0, prefill | 2.61e-07 | 1.10e-06 |
+| layer 5, prefill | 4.05e-06 | 1.25e-06 |
+| 6 layers + `out_norm`, prefill | 6.44e-06 | 2.45e-06 |
+| **6 layers + `out_norm`, step** | **3.40e-06** | 1.33e-06 |
+
+Against a 1e-4 tolerance that is 13-1000× under. Layers 0 and 5 are exercised
+**in isolation**, by configuring a one-layer transformer with that layer's
+weights and feeding it the oracle's own input for that layer — no debug hooks
+in the module. A scalar build with no SIMD and no fast-math stays within
+7.7e-06. UBSan, ASan and zero leaks.
+
+Decisions worth not undoing:
+
+- **`prefill` is a loop of `step`.** For causal attention with a KV cache they
+  are the same function: token *i* writes its own K/V then attends `[0, offset+i]`,
+  which is what a masked batched SDPA computes. One implementation (rule 7); a
+  GEMM prefill is a future optimization, not a second graph. The side effect is
+  that KV continuity is **bit-exact**, not within tolerance.
+- **No NaN sentinel inside the module.** Validity is an integer `offset`,
+  attention reads only `[lo, offset+i]`, and the buffer is `calloc`ed. NaN is
+  *rejected* at three boundaries: loading a KV prefix (where `_expand_kv_cache`
+  padding would arrive), the input to prefill/step, and the softmax scores. The
+  BOS substitution stays with the caller, before `input_linear`.
+- **The KV layout was verified against a real voice file, not assumed.**
+  `alba.safetensors` holds `[2, 1, 126, 16, 64]` F32 and the block layout is
+  `[2][max_seq][heads][head_dim]`, so loading a voice is two `memcpy` per layer
+  with no conversion.
+- **RoPE frequencies are computed in f32, as torch does, not in double.** At
+  position ~150 a 1e-7 relative drift in the frequencies is already visible in
+  `cos()`.
+- `layer_scale == NULL` is **bit-identical** to a vector of ones, and the
+  self-test checks that rather than accepting a tolerance.
+- The RoPE self-test uses a case that **distinguishes interleaved from
+  split-halves**; a split implementation would produce `{0,0,1,1}` instead of
+  `{0,1,0,1}` and fail.
+
+### Not yet exercised
+
+The `context` sliding window is covered only by the model-free self-test. In the
+oracle, Mimi's decoder transformer runs over 16 positions per frame, so
+`context: 250` never bites and no reference data exercises it. Closing that needs
+a dump longer than 250 frames — part of E2-4, still open.

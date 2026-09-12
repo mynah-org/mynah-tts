@@ -7,6 +7,7 @@
 #include "tokenizer_sentencepiece.h"
 #include "flow_head.h"
 #include "seanet.h"
+#include "transformer_ar.h"
 
 #include <math.h>
 #include <errno.h>
@@ -484,6 +485,10 @@ int main(int argc, char **argv) {
         }
         if (mynah_graph_bnns_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "BNNS graph self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_transformer_ar_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "AR transformer self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_flow_head_self_test(error, sizeof(error)) != 0) {
