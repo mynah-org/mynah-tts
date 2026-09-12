@@ -65,22 +65,45 @@ is no other coupling.
 
 ---
 
-## 3. The shapes we have to be good at
+## 3. The shapes we have to be good at — measured, and not what I assumed
 
-Both `seanet.c` sites are **skinny and long**: `k = in_channels` (tens to a few
-hundred), `m = out_channels`, `n = output length` (frames × upsample, large). One
-is `A·B`, the other `Aᵀ·B` for the transposed conv.
+**Correction.** This section previously said the shapes were "skinny and long",
+that `n` large meant the inner loop had plenty of work and the packing would
+amortise, and that this was explicitly not the square-GEMM case where a general
+BLAS earns its keep. The first and third points survive. **The second is wrong**,
+and the histogram says so.
 
-This is a friendly shape. `n` large means the inner loop has plenty of work and
-the panel packing amortises; `k` small means the accumulator chain is short and
-register-blocking over `m×n` is what matters, not clever reduction. It is
-explicitly *not* the square-GEMM case where a general BLAS earns its keep.
+Instrumented over one PocketTTS utterance, 43 frames, **1075 GEMM calls, 11
+distinct shapes** (counts are `43 x kernel_size`; 25 GEMMs per frame, 22 conv1d
+and 3 convtranspose):
 
-**Action before writing a line of kernel: dump the exact `(m, n, k)` histogram for
-one PocketTTS utterance.** Two call sites, a handful of distinct shapes — tune for
-those, not for the general case.
+| calls | site | m | n | k | transA |
+|---|---|---|---|---|---|
+| **301** | conv1d | 512 | **16** | 512 | 0 |
+| 129 | conv1d | 64 | 480 | 128 | 0 |
+| 129 | conv1d | 32 | 1920 | 64 | 0 |
+| 129 | conv1d | 128 | 96 | 256 | 0 |
+| 129 | conv1d | 1 | 1920 | 64 | 0 |
+| 43 | convtr | 512 | 480 | 128 | 1 |
+| 43 | convtr | **3072** | **16** | 512 | 1 |
+| 43 | convtr | 1280 | 96 | 256 | 1 |
+| 43 | conv1d | 64 | 1920 | 32 | 0 |
+| 43 | conv1d | 256 | 96 | 128 | 0 |
+| 43 | conv1d | 128 | 480 | 64 | 0 |
 
----
+The single most frequent shape — **28% of all calls** — is `m=512, n=16, k=512`,
+and the widest is `m=3072, n=16, k=512`. That `n=16` is the **frame batch**, not
+a long axis. These are narrow-RHS matmuls, much closer to a handful of matvecs
+than to a panel GEMM, and no packing cost amortises over sixteen columns.
+
+**Consequence for `mynah_sgemm_f32`: `n=16` and `n=1920` are two different
+kernels, not one tuned shape.** The `n=16` family wants the weights streamed once
+with the sixteen columns held in registers — which is the same weight-stationary
+argument the batching lane makes for the codec transformer, on the same tensors.
+The `n=480/1920` family is an ordinary panel GEMM.
+
+Note also `m=1, n=1920, k=64`: 129 calls of a single output row. That is a matvec
+wearing a GEMM's clothes and should never reach a packed kernel at all.
 
 ## 4. What removal deletes as a bonus
 
