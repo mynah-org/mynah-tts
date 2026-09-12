@@ -1,4 +1,6 @@
 #include "backend.h"
+
+#include "dispatch.h"
 #include "kernels.h"
 #include "threads.h"
 
@@ -196,6 +198,9 @@ typedef struct {
     size_t output_width;
 } matvec_rows_job;
 
+/* Only ever dispatched from the "parallel" arm of mynah_cpu_matvec_mode(),
+ * which does not exist without a SIMD matvec to split. */
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__) || defined(__AVX2__))
 static void matvec_block(void *opaque, int block_index) {
     const matvec_rows_job *job = (const matvec_rows_job *)opaque;
     const size_t row = (size_t)block_index * 4u;
@@ -208,26 +213,30 @@ static void matvec_block(void *opaque, int block_index) {
             job->output[row + i] += job->bias[row + i];
     }
 }
+#endif
 
-static int cpu_matmul(void *state, const float *input, float *output, size_t rows,
-                      size_t input_width, size_t output_width, const float *weight,
-                      const float *bias, char *error, size_t error_capacity) {
-    (void)state;
-    (void)error;
-    (void)error_capacity;
+/* Which of the three CPU matmul paths a given shape takes.
+ *
+ * Decode is dominated by single-row projections.  BLAS is excellent for
+ * prefill, but its SGEMM setup costs more than a resident SIMD matvec for
+ * rows=1.  MYNAH_CPU_MATVEC=1 selects the serial SIMD matvec; `parallel`
+ * splits the output rows over the pool.
+ *
+ * The AR phase is DRAM-bandwidth bound, not compute bound, and Accelerate
+ * never threads an M=1 sgemm, so a single-row projection only ever gets one
+ * core's share of memory bandwidth.  Splitting the output rows across the pool
+ * is byte-exact (every output row is an independent dot product, so no
+ * reduction is reordered) and lifts the whole decode toward the measured
+ * ~59 GB/s ceiling.  Serial Accelerate still wins at one thread, so the
+ * default only switches over when the pool actually has workers.
+ *
+ * This used to be written inline inside cpu_matmul, where nothing outside
+ * could see which way it had gone -- and a rows=1 projection that quietly
+ * stopped taking the matvec path is a large, completely silent regression.
+ * It is one function now, called by cpu_matmul and by the dispatch report. */
+const char *mynah_cpu_matvec_mode(size_t rows, size_t input_width,
+                                  size_t output_width, const char **why) {
 #if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__) || defined(__AVX2__))
-    /* Decode is dominated by single-row projections.  BLAS is excellent for
-     * prefill, but its SGEMM setup costs more than a resident SIMD matvec for
-     * rows=1.  MYNAH_CPU_MATVEC=1 selects the serial SIMD matvec; `parallel`
-     * splits the output rows over the pool.
-     *
-     * The AR phase is DRAM-bandwidth bound, not compute bound, and Accelerate
-     * never threads an M=1 sgemm, so a single-row projection only ever gets one
-     * core's share of memory bandwidth.  Splitting the output rows across the
-     * pool is byte-exact (every output row is an independent dot product, so no
-     * reduction is reordered) and lifts the whole decode toward the measured
-     * ~59 GB/s ceiling.  Serial Accelerate still wins at one thread, so the
-     * default only switches over when the pool actually has workers. */
     const char *matvec_env = getenv("MYNAH_CPU_MATVEC");
     int matvec_parallel = matvec_env != NULL &&
                           strcmp(matvec_env, "parallel") == 0;
@@ -245,16 +254,50 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
          (matvec_env != NULL && strcmp(matvec_env, "1") == 0))) {
         if (matvec_parallel && output_width <= (size_t)INT_MAX &&
             mynah_num_threads() > 1) {
+            if (why != NULL)
+                *why = "rows=1 and the pool has workers: output rows split "
+                       "over the pool, four per block, byte-exact";
+            return "parallel";
+        }
+        if (why != NULL)
+            *why = "rows=1: serial SIMD matvec, no SGEMM setup";
+        return "simd";
+    }
+    if (why != NULL) {
+        *why = rows == 1u
+                 ? "rows=1 but the matvec path was not selected -- BLAS sgemm"
+                 : "rows>1: BLAS sgemm, the prefill path";
+    }
+#else
+    (void)rows; (void)input_width; (void)output_width;
+    if (why != NULL) *why = "no SIMD matvec compiled: BLAS sgemm or the scalar loop";
+#endif
+    return "blas";
+}
+
+static int cpu_matmul(void *state, const float *input, float *output, size_t rows,
+                      size_t input_width, size_t output_width, const float *weight,
+                      const float *bias, char *error, size_t error_capacity) {
+    (void)state;
+    (void)error;
+    (void)error_capacity;
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__) || defined(__AVX2__))
+    {
+        const char *mode = mynah_cpu_matvec_mode(rows, input_width,
+                                                 output_width, NULL);
+        if (strcmp(mode, "parallel") == 0) {
             const matvec_rows_job job = {
                 input, output, weight, bias, input_width, output_width
             };
             const size_t blocks = (output_width + 3u) / 4u;
             mynah_parallel_for((int)blocks, matvec_block, (void *)&job);
-        } else {
+            return 0;
+        }
+        if (strcmp(mode, "simd") == 0) {
             mynah_matvec_bias_f32(weight, input, bias, output,
                                   output_width, input_width);
+            return 0;
         }
-        return 0;
     }
 #endif
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
@@ -950,4 +993,27 @@ int mynah_backend_matmul_graph(const mynah_backend *bk,
     if (bk && bk->matmul_graph)
         return bk->matmul_graph(bk->state, in, out, rows, iw, ow, w, b, e, ec);
     return mynah_backend_matmul(bk, in, out, rows, iw, ow, w, b, e, ec);
+}
+
+/* ======================================================================
+ * Dispatch predicate
+ * ====================================================================== */
+static int probe_matvec_policy(char *out, size_t capacity, const char **why) {
+    static char text[240];
+    const char *clause = NULL;
+    /* A real decode-step projection shape (768 -> 3072 is the PocketTTS FFN
+     * up-projection), asked as one row, because rows=1 is where the policy
+     * actually branches; a prefill shape would answer "blas" for every build
+     * and tell the reader nothing. */
+    const char *mode = mynah_cpu_matvec_mode(1u, 768u, 3072u, &clause);
+    snprintf(out, capacity, "%s", mode);
+    snprintf(text, sizeof text,
+             "[predicate] mynah_cpu_matvec_mode(rows=1, 768x3072): %s -- %s",
+             mode, clause == NULL ? "" : clause);
+    if (why != NULL) *why = text;
+    return 0;
+}
+
+void mynah_backend_dispatch_probes(void) {
+    mynah_dispatch_register_value_probe("cpu.matvec_policy", probe_matvec_policy);
 }

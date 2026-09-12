@@ -27,6 +27,30 @@ mynah_qmat_cache *mynah_qmat_cache_new(int enabled);
 void mynah_qmat_cache_free(mynah_qmat_cache *cache);
 int mynah_qmat_cache_enabled(const mynah_qmat_cache *cache);
 
+/* The cache's own resolution, for the dispatch report and for anyone who needs
+ * to know what actually got selected rather than what was asked for.  The
+ * qtype codes are 0 f32 (off), 1 int8, 2 int4, 3 f16; mynah_qmat_qtype_name
+ * turns one into the string the report prints. */
+int mynah_qmat_cache_qtype(const mynah_qmat_cache *cache);
+const char *mynah_qmat_qtype_name(int qtype);
+/* 1 = the four-row unrolled matvec, 0 = MYNAH_QMAT_SINGLE_ROW rollback. */
+int mynah_qmat_cache_row4(const mynah_qmat_cache *cache);
+
+/* Would a greedy projection of this shape be split over the thread pool?
+ * Shape-dependent on purpose: the same binary threads a big projection and
+ * runs a small one serially.  `why` (optional) receives a static string
+ * naming the clause that decided. */
+int mynah_qmat_argmax_mt_resolved(size_t rows, size_t cols, const char **why);
+
+/* Names the int8 kernel this host resolves to: "avx512vnni", "avxvnni",
+ * "u8-scalar", "neon-sdot", "avx2" or "scalar".  `why` (optional) receives a
+ * static reason string. */
+const char *mynah_qmat_int8_kernel(const char **why);
+/* 1 when the SMMLA path is compiled AND the CPU reports FEAT_I8MM. */
+int mynah_qmat_i8mm_enabled(const char **why);
+/* MYNAH_FUSED_GREEDY: whether the engine may fuse head projection + argmax. */
+int mynah_qmat_fused_greedy_enabled(void);
+
 /* out[count, n] = in[count, k] @ W[n, k]^T (+ bias), where W is the tensor
  * `name` in `file`.  Uses the cached int8 weight when the cache is enabled and
  * count is small; otherwise the f32 backend matmul.  0 = ok, -1 = error. */

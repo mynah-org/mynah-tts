@@ -1,6 +1,7 @@
 #include "codec_nanocodec.h"
 
 #include "conv1d.h"
+#include "dispatch.h"
 #include "kernels.h"
 #include "mynah_util.h"
 #include "threads.h"
@@ -18,6 +19,20 @@
 #elif defined(MYNAH_USE_OPENBLAS)
 #include <cblas.h>
 #endif
+
+/* MYNAH_SNAKE_SCALAR falls back from the vectorised Snake activation
+ * (vDSP_vsmul + vvsinf + vDSP_vsq + vDSP_vsma over whole channel rows) to the
+ * per-sample scalar form.  The vector path exists only on Accelerate builds,
+ * so elsewhere this is 0 by construction rather than by environment. */
+int mynah_snake_vector_enabled(void) {
+#if defined(MYNAH_USE_ACCELERATE)
+    static int cached = -1;
+    if (cached < 0) cached = getenv("MYNAH_SNAKE_SCALAR") == NULL;
+    return cached;
+#else
+    return 0;
+#endif
+}
 
 /* Snake activation on the first half of the channels, leaky-ReLU on the rest.
  * Each channel is an independent row, so this parallelizes bit-identically. */
@@ -75,7 +90,7 @@ static int half_snake(const mynah_weights *file, const mynah_backend *backend,
         /* Fall through to CPU path on failure. */
     }
 #if defined(MYNAH_USE_ACCELERATE)
-    if (getenv("MYNAH_SNAKE_SCALAR") == NULL && snake_channels > 0u &&
+    if (mynah_snake_vector_enabled() && snake_channels > 0u &&
         length <= SIZE_MAX / snake_channels) {
         const size_t count = snake_channels * length;
         if (count <= (size_t)INT_MAX && count <= SIZE_MAX / sizeof(float)) {
@@ -145,9 +160,12 @@ static int res_layer(const mynah_weights *file, const mynah_backend *backend,
     }
     float *columns_workspace = NULL;
     size_t columns_capacity = 0;
+    /* Only the Accelerate branch below reads it; without BNNS there is no
+     * im2col workspace to pre-size at all. */
     int needs_columns_workspace = 1;
+    (void)needs_columns_workspace;
 #if defined(MYNAH_USE_ACCELERATE)
-    if (getenv("MYNAH_CODEC_SGEMM") == NULL &&
+    if (!mynah_conv1d_sgemm_enabled() &&
         getenv("MYNAH_BNNS_IM2COL_WORKSPACE") == NULL) {
         needs_columns_workspace = 0;
     }
@@ -575,4 +593,29 @@ int mynah_nanocodec_decode(const mynah_tts_model *model, const unsigned *codes,
     *samples = audio;
     *sample_count = current_length;
     return 0;
+}
+/* ======================================================================
+ * Dispatch predicate
+ * ====================================================================== */
+static int probe_snake_vector(const char **why) {
+    const int on = mynah_snake_vector_enabled();
+    if (why != NULL) {
+#if defined(MYNAH_USE_ACCELERATE)
+        *why = on ? "[predicate] mynah_snake_vector_enabled(): the SEANet "
+                    "Snake activation runs vDSP_vsmul + vvsinf + vDSP_vsq + "
+                    "vDSP_vsma over whole channel rows"
+                  : "[predicate] mynah_snake_vector_enabled(): "
+                    "MYNAH_SNAKE_SCALAR is set, so Snake runs the per-sample "
+                    "scalar form -- the rollback path, not the default";
+#else
+        *why = "[predicate] mynah_snake_vector_enabled(): the vectorised Snake "
+               "needs vDSP/vForce, which this build does not link; the scalar "
+               "form is the only one compiled";
+#endif
+    }
+    return on;
+}
+
+void mynah_codec_dispatch_probes(void) {
+    mynah_dispatch_register_probe("codec.snake_vector", probe_snake_vector);
 }

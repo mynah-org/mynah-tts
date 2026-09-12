@@ -1208,9 +1208,11 @@ int magpie_sample_local_frame_batch(const mynah_tts_model *model,
                                  it->rng_state != NULL;
             if (sampling) need_logits = 1;
         }
+        /* The switch itself belongs to src/qmat.c, which owns the fused
+         * kernel, so the dispatch report can resolve it from one definition
+         * instead of this engine re-reading the environment privately. */
         const int fuse_greedy = live == 1u && !need_logits && !gpu_local &&
-            (getenv("MYNAH_FUSED_GREEDY") == NULL ||
-             strcmp(getenv("MYNAH_FUSED_GREEDY"), "0") != 0);
+            mynah_qmat_fused_greedy_enabled();
         unsigned fused_argmax = 0;
         int fused = 1;
         if (gpu_local) {

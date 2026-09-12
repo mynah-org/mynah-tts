@@ -23,4 +23,9 @@ int mynah_nanocodec_decode(const mynah_tts_model *model, const unsigned *codes,
                            size_t raw_length, float **samples, size_t *sample_count,
                            char *error, size_t error_capacity);
 
+/* 1 when the SEANet Snake activation runs the vDSP/vForce vector form.
+ * 0 means MYNAH_SNAKE_SCALAR forced the scalar rollback, or this build has no
+ * vector Snake compiled at all. */
+int mynah_snake_vector_enabled(void);
+
 #endif

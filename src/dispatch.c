@@ -10,11 +10,14 @@
  *    so a feature the OS has not enabled for XSAVE reports supported=no rather
  *    than being claimed from a CPUID bit the process cannot use.
  *
- * 2. Several rows exist only to say that something is NOT there.  AVX-512,
- *    VNNI, AMX, i8mm and BF16 all have rows whose `compiled` is "no" and whose
- *    reason names the intrinsic that is missing from src/.  Those rows are the
- *    reason this file was written: the absence has to be as loud as a presence,
- *    or the next benchmark write-up invents the attribution again.
+ * 2. Several rows exist only to say that something is NOT there.  AMX and
+ *    BF16 still have rows whose `compiled` is "no" and whose reason names the
+ *    intrinsic that is missing from src/.  Those rows are the reason this file
+ *    was written: the absence has to be as loud as a presence, or the next
+ *    benchmark write-up invents the attribution again.  VNNI and i8mm have
+ *    since acquired real kernels, and the difference is visible here: their
+ *    rows moved from [gate] "NOT IMPLEMENTED" to [predicate], resolved by
+ *    src/qmat.c's own CPUID / sysctl probe rather than by a build flag.
  *
  * 3. The int8/int4/f16 rows observe src/qmat.c rather than guessing at it.
  *    mynah_qmat_cache_new(qtype) followed by mynah_qmat_cache_enabled() is the
@@ -240,6 +243,14 @@ typedef struct {
 static probe_slot g_probes[MYNAH_DISPATCH_MAX_ROWS];
 static int g_probe_count;
 
+typedef struct {
+    const char *id;
+    mynah_dispatch_value_probe_fn fn;
+} value_probe_slot;
+
+static value_probe_slot g_value_probes[MYNAH_DISPATCH_MAX_ROWS];
+static int g_value_probe_count;
+
 int mynah_dispatch_register_probe(const char *id, mynah_dispatch_probe_fn fn) {
     if (id == NULL || fn == NULL) return -1;
     for (int i = 0; i < g_probe_count; ++i) {
@@ -252,11 +263,49 @@ int mynah_dispatch_register_probe(const char *id, mynah_dispatch_probe_fn fn) {
     return 0;
 }
 
+int mynah_dispatch_register_value_probe(const char *id,
+                                        mynah_dispatch_value_probe_fn fn) {
+    if (id == NULL || fn == NULL) return -1;
+    for (int i = 0; i < g_value_probe_count; ++i) {
+        if (strcmp(g_value_probes[i].id, id) == 0) {
+            g_value_probes[i].fn = fn;
+            return 0;
+        }
+    }
+    if (g_value_probe_count >= MYNAH_DISPATCH_MAX_ROWS) return -1;
+    g_value_probes[g_value_probe_count].id = id;
+    g_value_probes[g_value_probe_count].fn = fn;
+    ++g_value_probe_count;
+    return 0;
+}
+
 static mynah_dispatch_probe_fn probe_for(const char *id) {
     for (int i = 0; i < g_probe_count; ++i) {
         if (strcmp(g_probes[i].id, id) == 0) return g_probes[i].fn;
     }
     return NULL;
+}
+
+static mynah_dispatch_value_probe_fn value_probe_for(const char *id) {
+    for (int i = 0; i < g_value_probe_count; ++i) {
+        if (strcmp(g_value_probes[i].id, id) == 0) return g_value_probes[i].fn;
+    }
+    return NULL;
+}
+
+/* Every module that owns a dispatch decision, asked to register before the
+ * table is built.  An explicit list rather than constructors: these objects go
+ * into libmynah_tts.a, and a linker is entitled to drop an object whose only
+ * contribution is a constructor nobody references -- which would silently turn
+ * [predicate] rows back into UNKNOWN in exactly the builds least likely to be
+ * looked at. */
+static void register_module_probes(void) {
+    mynah_qmat_dispatch_probes();
+    mynah_kernels_dispatch_probes();
+    mynah_backend_dispatch_probes();
+    mynah_threads_dispatch_probes();
+    mynah_conv1d_dispatch_probes();
+    mynah_codec_dispatch_probes();
 }
 
 /* ======================================================================
@@ -299,6 +348,23 @@ static void add_row(row_sink *sink, const char *id, const char *compiled,
     snprintf(r->resolved, sizeof r->resolved, "%s", resolved);
     snprintf(r->reason, sizeof r->reason, "%s", reason);
 
+    const mynah_dispatch_value_probe_fn vfn = value_probe_for(id);
+    if (vfn != NULL) {
+        const char *why = NULL;
+        char value[sizeof r->resolved];
+        value[0] = 0;
+        if (vfn(value, sizeof value, &why) == 0 && value[0] != 0) {
+            snprintf(r->resolved, sizeof r->resolved, "%s", value);
+            r->source = MYNAH_DISPATCH_SRC_PREDICATE;
+        } else {
+            snprintf(r->resolved, sizeof r->resolved, "UNKNOWN");
+            r->source = MYNAH_DISPATCH_SRC_UNKNOWN;
+        }
+        if (why != NULL && why[0] != 0) snprintf(r->reason, sizeof r->reason, "%s", why);
+        ++sink->count;
+        return;
+    }
+
     const mynah_dispatch_probe_fn fn = probe_for(id);
     if (fn != NULL) {
         const char *why = NULL;
@@ -333,8 +399,9 @@ static void add_gate(row_sink *sink, const char *id, int gate, tri supported,
 /* Nobody exports the predicate that decides this.  Name the wrapper that would
  * make the row truthful: the footer turns these into a work list. */
 static void add_unknown(row_sink *sink, const char *id, const char *compiled,
-                        const char *env_name, const char *reason) {
-    add_row(sink, id, compiled, "-", env_name, "UNKNOWN",
+                        const char *supported, const char *env_name,
+                        const char *reason) {
+    add_row(sink, id, compiled, supported, env_name, "UNKNOWN",
             MYNAH_DISPATCH_SRC_UNKNOWN, reason);
 }
 
@@ -348,9 +415,14 @@ const char *mynah_dispatch_isa_class(void) {
     if (MYNAH_DISPATCH_HAS_DOTPROD) return "arm_neon_dotprod";
     return "arm_neon";
 #elif defined(__x86_64__) || defined(__i386__)
+    /* Asked of the kernel, not of CFLAGS: SIMD=avx512 still says nothing about
+     * which int8 kernel runs, and that gap is what produced the false claim. */
+    {
+        const char *k = mynah_qmat_int8_kernel(NULL);
+        if (strcmp(k, "avx512vnni") == 0) return "x86_avx512_vnni";
+        if (strcmp(k, "avxvnni") == 0) return "x86_avx_vnni";
+    }
     if (!MYNAH_DISPATCH_HAS_AVX2) return "x86_scalar";
-    /* Deliberately not "x86_avx512": no kernel under src/ uses AVX-512, so a
-     * binary built with SIMD=avx512 still dispatches AVX2 code. */
     return "x86_avx2";
 #else
     return "portable_scalar";
@@ -404,15 +476,19 @@ static void collect_isa(row_sink *s) {
     add_gate(s, "isa.arm.dotprod", MYNAH_DISPATCH_HAS_DOTPROD, cpu_has_dotprod(),
              "[gate] src/qmat.c int8 dot via vdotq_s32 (SDOT); without it the "
              "int8 matvec runs the scalar int32 accumulation");
-    add_absent(s, "isa.arm.i8mm", cpu_has_i8mm(),
-               "[gate] NOT IMPLEMENTED: no vmmlaq_s32/SMMLA anywhere in src/. "
-               "E4 step 4 owns it; until then an i8mm host gains nothing here");
+    add_unknown(s, "isa.arm.i8mm", yn(MYNAH_DISPATCH_HAS_I8MM_KERNEL),
+                yn3(cpu_has_i8mm()), "MYNAH_QMAT_I8MM",
+                "[UNKNOWN] src/qmat.c did not register "
+                "mynah_qmat_i8mm_enabled() -- the SMMLA row cannot be resolved "
+                "from the compile gate, because the kernel is compiled "
+                "unconditionally and chosen by a runtime CPU probe");
     add_absent(s, "isa.arm.bf16", cpu_has_bf16(),
                "[gate] NOT IMPLEMENTED: no bfdot/bfmmla and no bf16 weight "
                "type in src/qmat.c; every f32 path stays f32");
     add_gate(s, "isa.x86.avx2", MYNAH_DISPATCH_HAS_AVX2, cpu_has_avx2(),
-             "[gate] src/kernels.c AVX2 kernels and src/qmat.c int8 dot "
-             "(_mm256_maddubs_epi16 + _mm256_madd_epi16)");
+             "[gate] src/kernels.c AVX2 kernels and src/qmat.c "
+             "dot_q8_i32_avx2 (_mm256_cvtepi8_epi16 + _mm256_madd_epi16), the "
+             "int8 dot for every x86 CPU without VPDPBUSD");
     add_gate(s, "isa.x86.fma", MYNAH_DISPATCH_HAS_FMA, cpu_has_fma(),
              "[gate] _mm256_fmadd_ps in the AVX2 dot/matvec; Makefile passes "
              "-mfma with -mavx2");
@@ -422,21 +498,25 @@ static void collect_isa(row_sink *s) {
      * dispatches on it.  That gap is the finding, so it is stated twice. */
     add_row(s, "isa.x86.avx512f", yn(MYNAH_DISPATCH_HAS_AVX512F),
             yn3(cpu_has_avx512f()), NULL, "OFF", MYNAH_DISPATCH_SRC_GATE,
-            "[gate] COMPILER FLAG ONLY: no _mm512_* intrinsic exists anywhere "
-            "under src/. SIMD=avx512 widens autovectorization; it does NOT "
-            "select a kernel. Every f32 and int8 path still runs the AVX2 code");
+            "[gate] COMPILER FLAG ONLY. SIMD=avx512 widens autovectorization; "
+            "no f32 kernel dispatches on it. The one _mm512_* kernel in src/ "
+            "is the VNNI int8 dot, which carries its own target attribute and "
+            "needs no build flag -- see isa.x86.avx512vnni, not this row");
     add_row(s, "isa.x86.avx512bw", yn(MYNAH_DISPATCH_HAS_AVX512BW),
             yn3(cpu_has_avx512bw()), NULL, "OFF", MYNAH_DISPATCH_SRC_GATE,
             "[gate] compiler flag only, as isa.x86.avx512f");
     add_row(s, "isa.x86.avx512vl", yn(MYNAH_DISPATCH_HAS_AVX512VL),
             yn3(cpu_has_avx512vl()), NULL, "OFF", MYNAH_DISPATCH_SRC_GATE,
             "[gate] compiler flag only, as isa.x86.avx512f");
-    add_absent(s, "isa.x86.avx512vnni", cpu_has_avx512vnni(),
-               "[gate] NOT IMPLEMENTED: no vpdpbusd (_mm512_dpbusd_epi32) in "
-               "src/qmat.c. The EPYC Zen 5 int8 RTF 0.427 was produced by the "
-               "AVX2 int8 dot, NOT by VNNI -- see docs/performance.md");
-    add_absent(s, "isa.x86.avxvnni", cpu_has_avxvnni(),
-               "[gate] NOT IMPLEMENTED: no _mm256_dpbusd_epi32 in src/qmat.c");
+    add_unknown(s, "isa.x86.avx512vnni", yn(MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL),
+                yn3(cpu_has_avx512vnni()), "MYNAH_QMAT_VNNI",
+                "[UNKNOWN] src/qmat.c did not register the VPDPBUSD predicate. "
+                "Historical note: the EPYC Zen 5 int8 RTF 0.427 predates this "
+                "kernel and was produced by the AVX2 int8 dot, not by VNNI");
+    add_unknown(s, "isa.x86.avxvnni", yn(MYNAH_DISPATCH_HAS_AVXVNNI_KERNEL),
+                yn3(cpu_has_avxvnni()), "MYNAH_QMAT_VNNI",
+                "[UNKNOWN] src/qmat.c did not register the VEX VPDPBUSD "
+                "predicate");
     add_absent(s, "isa.x86.amx_int8", cpu_has_amx_int8(),
                "[gate] NOT IMPLEMENTED: no tile configuration or _tile_* op in "
                "src/; E4 lists AMX last, as the narrowest-platform item");
@@ -485,10 +565,8 @@ static void collect_blas(row_sink *s) {
                 "performance target");
     }
 
-    add_unknown(s, "blas.threads_owned", "-", "OPENBLAS_NUM_THREADS",
-                "[UNKNOWN] src/threads.c:113 decides inline whether the engine "
-                "may clamp BLAS to one thread and exports no getter. Needed: "
-                "mynah_blas_owned() -> int");
+    add_unknown(s, "blas.threads_owned", "-", "-", "OPENBLAS_NUM_THREADS",
+                "[UNKNOWN] src/threads.c did not register mynah_blas_owned()");
 }
 
 static void collect_pool(row_sink *s) {
@@ -514,11 +592,29 @@ static void collect_pool(row_sink *s) {
     }
 #endif
 
-    add_row(s, "pool.parallel_for", "yes", "-", NULL, onoff(threads > 1),
-            MYNAH_DISPATCH_SRC_RUNTIME,
-            "[runtime] derived from mynah_num_threads(): persistent condvar "
-            "pool, one dispatch at a time; a nested dispatch runs inline serial "
-            "rather than oversubscribing");
+    /* This row used to describe the pool as "one dispatch at a time; a nested
+     * dispatch runs inline serial".  That stopped being true when the pool
+     * grew concurrent submit and safe nesting, and a stale reason is worse
+     * than no row: it reads as a measurement.  So the three capabilities are
+     * now ASKED of the pool -- mynah_pool_concurrent_submit_ok() /
+     * _nested_dispatch_ok() / _priority_ok() are the pool's own answers, not a
+     * sentence in this file that has to be remembered. */
+    {
+        static char text[240];
+        const int concurrent = mynah_pool_concurrent_submit_ok();
+        const int nested = mynah_pool_nested_dispatch_ok();
+        const int priority = mynah_pool_priority_ok();
+        snprintf(text, sizeof text,
+                 "[runtime] mynah_num_threads() + the pool's own capability "
+                 "predicates: %d job slot%s, concurrent submit %s, nested "
+                 "dispatch %s, deadline priority %s",
+                 mynah_pool_max_jobs(), mynah_pool_max_jobs() == 1 ? "" : "s",
+                 concurrent ? "OK" : "NO", nested ? "OK" : "NO",
+                 priority ? "OK" : "no-op");
+        add_row(s, "pool.parallel_for", "yes", "-", NULL, onoff(threads > 1),
+                MYNAH_DISPATCH_SRC_RUNTIME, text);
+    }
+
 }
 
 static void collect_quant(row_sink *s) {
@@ -530,9 +626,8 @@ static void collect_quant(row_sink *s) {
     add_row(s, "quant.requested", "yes", "-", "MYNAH_QUANT",
             requested > 0 ? "ON" : (requested == 0 ? "OFF" : "UNKNOWN"),
             requested < 0 ? MYNAH_DISPATCH_SRC_UNKNOWN : MYNAH_DISPATCH_SRC_RUNTIME,
-            "[runtime] mynah_qmat_cache_new(-1) + mynah_qmat_cache_enabled(): "
-            "the module's own answer. It cannot name the resolved type -- add "
-            "mynah_qmat_cache_qtype() to print int8/int4/f16 instead of ON");
+            "[runtime] mynah_qmat_cache_new(-1) + mynah_qmat_cache_enabled(); "
+            "src/qmat.c's value probe replaces this with the resolved type");
 
     add_row(s, "quant.int8", yn(int8_ok > 0), "-", NULL,
             onoff(int8_ok > 0), MYNAH_DISPATCH_SRC_RUNTIME,
@@ -551,13 +646,17 @@ static void collect_quant(row_sink *s) {
               : "[runtime] qmat cache SILENTLY DOWNGRADES f16 to f32 on this "
                 "build: MYNAH_QUANT=f16 would run exact f32 and say nothing");
 
-    add_unknown(s, "quant.row4", "yes", "MYNAH_QMAT_SINGLE_ROW",
-                "[UNKNOWN] src/qmat.c:585 stores use_row4 in the cache and "
-                "exports no getter. Needed: mynah_qmat_cache_row4()");
-    add_unknown(s, "quant.argmax_mt", "yes", "MYNAH_ARGMAX_MT",
-                "[UNKNOWN] src/qmat.c:504 decides inside a static function from "
-                "env + thread count + a byte threshold. Needed: "
-                "mynah_qmat_argmax_mt_resolved(rows, cols, const char **why)");
+    add_unknown(s, "quant.row4", "yes", "-", "MYNAH_QMAT_SINGLE_ROW",
+                "[UNKNOWN] src/qmat.c did not register mynah_qmat_cache_row4()");
+    add_unknown(s, "quant.argmax_mt", "yes", "-", "MYNAH_ARGMAX_MT",
+                "[UNKNOWN] src/qmat.c did not register "
+                "mynah_qmat_argmax_mt_resolved()");
+
+    /* The row the AVX-512 claim needed and did not have: not "is VNNI
+     * compiled" but "which int8 kernel is this process about to run". */
+    add_unknown(s, "quant.int8_kernel", "yes", "-", "MYNAH_QMAT_VNNI",
+                "[UNKNOWN] src/qmat.c did not register "
+                "mynah_qmat_int8_kernel()");
 }
 
 static void collect_backends(row_sink *s) {
@@ -612,24 +711,22 @@ static void collect_backends(row_sink *s) {
                 "OFF", MYNAH_DISPATCH_SRC_RUNTIME, cuda_reason);
     }
 
-    add_unknown(s, "cpu.matvec_policy", "yes", "MYNAH_CPU_MATVEC",
-                "[UNKNOWN] src/backend.c:231 picks serial SIMD matvec vs "
-                "row-split parallel vs BLAS sgemm from env + BLAS + ISA + "
-                "thread count, inline. Needed: mynah_cpu_matvec_mode(const "
-                "char **why). This is the row that hides a rows=1 regression");
-    add_unknown(s, "kernel.gelu_vector", "yes", "MYNAH_GELU_SCALAR",
-                "[UNKNOWN] src/kernels.c:269/323 re-reads the env at every "
-                "call. Needed: mynah_gelu_vector_enabled()");
-    add_unknown(s, "kernel.fused_greedy", "yes", "MYNAH_FUSED_GREEDY",
-                "[UNKNOWN] src/engine_magpie.c:1212 fuses the head projection "
-                "with the constrained argmax. Needed: a predicate on the engine");
-    add_unknown(s, "codec.sgemm_conv", "yes", "MYNAH_CODEC_SGEMM",
-                "[UNKNOWN] src/codec_nanocodec.c:150 and src/conv1d.c:420 pick "
-                "im2col+sgemm vs the direct conv. Needed: "
+    add_unknown(s, "cpu.matvec_policy", "yes", "-", "MYNAH_CPU_MATVEC",
+                "[UNKNOWN] src/backend.c did not register "
+                "mynah_cpu_matvec_mode(). This is the row that hides a rows=1 "
+                "regression");
+    add_unknown(s, "kernel.gelu_vector", "yes", "-", "MYNAH_GELU_SCALAR",
+                "[UNKNOWN] src/kernels.c did not register "
+                "mynah_gelu_vector_enabled()");
+    add_unknown(s, "kernel.fused_greedy", "yes", "-", "MYNAH_FUSED_GREEDY",
+                "[UNKNOWN] src/qmat.c did not register "
+                "mynah_qmat_fused_greedy_enabled()");
+    add_unknown(s, "codec.sgemm_conv", "yes", "-", "MYNAH_CODEC_SGEMM",
+                "[UNKNOWN] src/conv1d.c did not register "
                 "mynah_conv1d_sgemm_enabled()");
-    add_unknown(s, "codec.snake_vector", "yes", "MYNAH_SNAKE_SCALAR",
-                "[UNKNOWN] src/codec_nanocodec.c:78 chooses the vector Snake "
-                "activation. Needed: mynah_snake_vector_enabled()");
+    add_unknown(s, "codec.snake_vector", "yes", "-", "MYNAH_SNAKE_SCALAR",
+                "[UNKNOWN] src/codec_nanocodec.c did not register "
+                "mynah_snake_vector_enabled()");
 }
 
 static void collect_selftests(row_sink *s) {
@@ -664,15 +761,49 @@ static void collect_selftests(row_sink *s) {
             MYNAH_DISPATCH_SRC_RUNTIME, qmat);
 }
 
+
+/* Collected LAST, after the self-tests, because these are process totals: run
+ * from collect_pool() they would all read 0 and say nothing.  Placed here they
+ * at least cover the pool traffic this report itself generated (the qmat
+ * self-test dispatches row blocks), and in a long-lived server process they
+ * cover everything since start. */
+static void collect_pool_stats(row_sink *s) {
+    {
+        static char text[240];
+        char value[24];
+        long long dispatches = 0, serial = 0, inline_fallbacks = 0, joins = 0;
+        mynah_parallel_stats(&dispatches, &serial, &inline_fallbacks, &joins);
+        /* "0" with no dispatches behind it is not a clean bill of health, so
+         * the value says which of the two it is. */
+        if (dispatches == 0) snprintf(value, sizeof value, "n/a");
+        else snprintf(value, sizeof value, "%lld", inline_fallbacks);
+        snprintf(text, sizeof text,
+                 "[runtime] mynah_parallel_stats(): %lld dispatch%s, %lld "
+                 "serial, %lld inline fallback%s (all job slots were busy -- "
+                 "must stay 0), %lld helper join%s. %s",
+                 dispatches, dispatches == 1 ? "" : "es", serial,
+                 inline_fallbacks, inline_fallbacks == 1 ? "" : "s",
+                 joins, joins == 1 ? "" : "s",
+                 dispatches == 0
+                   ? "n/a: this report dispatched nothing, so it has measured "
+                     "nothing. Read it from a synthesis or a server process"
+                   : "Process totals since start");
+        add_row(s, "pool.inline_fallbacks", "yes", "-", NULL, value,
+                MYNAH_DISPATCH_SRC_RUNTIME, text);
+    }
+}
+
 int mynah_dispatch_collect(mynah_dispatch_row *rows, int capacity) {
     if (rows == NULL || capacity <= 0) return -1;
     row_sink sink = { rows, capacity, 0 };
+    register_module_probes();
     collect_isa(&sink);
     collect_blas(&sink);
     collect_pool(&sink);
     collect_quant(&sink);
     collect_backends(&sink);
     collect_selftests(&sink);
+    collect_pool_stats(&sink);
     return sink.count;
 }
 
@@ -870,9 +1001,23 @@ int mynah_dispatch_self_test(char *error, size_t error_capacity) {
         }
     }
 
+    /* No id may carry both kinds of probe: the value probe would win and the
+     * boolean one would be dead code that still reads as authoritative. */
+    for (int i = 0; i < g_value_probe_count; ++i) {
+        for (int j = 0; j < g_probe_count; ++j) {
+            if (strcmp(g_value_probes[i].id, g_probes[j].id) == 0) {
+                return st_fail(error, error_capacity,
+                               "dispatch: id has both a value probe and a "
+                               "boolean probe");
+            }
+        }
+    }
+
     /* A registered predicate must override the gate: that is the mechanism the
-     * whole "never re-derive" rule rests on. */
-    const char *target = "isa.arm.i8mm";   /* compiled=no, so gate says OFF */
+     * whole "never re-derive" rule rests on.  AMX is the target because it is
+     * the one remaining row with no owner -- hijacking a row that a module
+     * really does register would leave the process with the test's probe. */
+    const char *target = "isa.x86.amx_int8";   /* compiled=no, gate says OFF */
     if (mynah_dispatch_register_probe(target, st_probe_on) != 0) {
         return st_fail(error, error_capacity, "dispatch: probe registration failed");
     }

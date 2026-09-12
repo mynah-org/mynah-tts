@@ -1,5 +1,7 @@
 #include "conv1d.h"
 
+#include "dispatch.h"
+
 #include "kernels.h"
 #include "mynah_util.h"
 #include "threads.h"
@@ -65,6 +67,22 @@ struct codec_bnns_cache {
     size_t capacity;
     pthread_mutex_t mutex;
 };
+
+/* MYNAH_CODEC_SGEMM forces the im2col + sgemm tap accumulation instead of the
+ * BNNS causal convolution.  Both src/conv1d.c and src/codec_nanocodec.c branch
+ * on it -- the codec also has to size an im2col workspace it would otherwise
+ * not allocate -- so the switch is read in one place and the two call sites
+ * cannot drift apart.  Where BNNS is not compiled at all, sgemm is not an
+ * option but the only path, and this says so by returning 1. */
+int mynah_conv1d_sgemm_enabled(void) {
+#if defined(MYNAH_USE_ACCELERATE)
+    static int cached = -1;
+    if (cached < 0) cached = getenv("MYNAH_CODEC_SGEMM") != NULL;
+    return cached;
+#else
+    return 1;
+#endif
+}
 
 static void codec_bnns_cache_free(codec_bnns_cache *cache) {
     if (cache == NULL) return;
@@ -387,6 +405,9 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
                          float *columns_workspace, size_t columns_capacity,
                          codec_conv_profile *profile,
                          char *error, size_t error_capacity) {
+    /* Read only by the BNNS branch; a build without Accelerate never
+     * touches it, and -Wunused-parameter is right about that. */
+    (void)bnns_cache;
     (void)columns_workspace;
     (void)columns_capacity;
     mynah_tensor weight;
@@ -417,7 +438,7 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
         /* Fall through to CPU path on failure. */
     }
 #if defined(MYNAH_USE_ACCELERATE)
-    if (getenv("MYNAH_CODEC_SGEMM") == NULL &&
+    if (!mynah_conv1d_sgemm_enabled() &&
         conv1d_causal_bnns(weight.data, bias.data, input, output,
                            in_channels, out_channels, length,
             kernel, dilation, bnns_cache, profile) == 0) {
@@ -590,4 +611,30 @@ int mynah_conv_transpose_causal(const mynah_weights *file, const char *weight_na
         profile->transpose_calls++;
     }
     return 0;
+}
+/* ======================================================================
+ * Dispatch predicate
+ * ====================================================================== */
+static int probe_sgemm_conv(const char **why) {
+    const int on = mynah_conv1d_sgemm_enabled();
+    if (why != NULL) {
+#if defined(MYNAH_USE_ACCELERATE)
+        *why = on ? "[predicate] mynah_conv1d_sgemm_enabled(): "
+                    "MYNAH_CODEC_SGEMM is set, so the causal conv runs im2col + "
+                    "cblas_sgemm per kernel tap and src/codec_nanocodec.c "
+                    "allocates the column workspace"
+                  : "[predicate] mynah_conv1d_sgemm_enabled(): BNNS causal "
+                    "convolution is tried first (Accelerate build, env unset); "
+                    "the sgemm tap accumulation is the fallback when BNNS "
+                    "declines the shape";
+#else
+        *why = "[predicate] mynah_conv1d_sgemm_enabled(): no BNNS on this "
+               "build, so im2col + sgemm (or the scalar conv) is the only path";
+#endif
+    }
+    return on;
+}
+
+void mynah_conv1d_dispatch_probes(void) {
+    mynah_dispatch_register_probe("codec.sgemm_conv", probe_sgemm_conv);
 }

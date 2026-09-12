@@ -69,4 +69,9 @@ void mynah_graph_codec_cache_free(void *cache);
 
 int mynah_graph_bnns_self_test(char *error, size_t error_capacity);
 
+/* 1 when the causal conv1d runs im2col + sgemm rather than BNNS: either
+ * MYNAH_CODEC_SGEMM forced it, or this build has no BNNS at all.  Read by
+ * src/codec_nanocodec.c too, which must size an im2col workspace to match. */
+int mynah_conv1d_sgemm_enabled(void);
+
 #endif

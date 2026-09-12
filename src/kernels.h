@@ -22,6 +22,11 @@ void mynah_residual_add_f32(float *output, const float *input, size_t n);
 void mynah_gelu_f32(float *data, size_t n);
 void mynah_gelu_f32_scalar(float *data, size_t n);
 
+/* Is the vectorized GELU (NEON/AVX2 Pade tanh) the one that will run?
+ * 0 means the libm scalar reference, either because MYNAH_GELU_SCALAR is set
+ * or because no vector kernel is compiled for this target. */
+int mynah_gelu_vector_enabled(void);
+
 /* tanh-approximation GELU, the form the Magpie conv-FFN and the PocketTTS
  * backbone both use. The array form takes optional scratch and uses vForce
  * when Accelerate is present; pass NULL for the scalar loop. */

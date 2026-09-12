@@ -4,11 +4,18 @@
  * WHY THIS EXISTS.  Without it no ISA claim about this runtime is verifiable,
  * and an unverifiable claim eventually becomes a false one.  It already did:
  * `README.md` and commit 724d677 attributed the EPYC Zen 5 int8 result (0.427
- * RTF) to "AVX-512 VNNI", while `src/qmat.c` contains no `_mm512_*` and no
- * `_mm256_dpbusd_epi32` at all — the int8 dot is AVX2 `pmaddubsw`+`pmaddwd`,
- * and the Linux build does not even pass `-mavx512f` unless `SIMD=avx512` is
- * asked for.  The number was real; the attribution was invented.  In qwen-tts
- * the same report was written after a dispatch bug hid ~400 ms of TTFA.
+ * RTF) to "AVX-512 VNNI" at a time when `src/qmat.c` contained no `_mm512_*`
+ * and no `_mm256_dpbusd_epi32` at all — the int8 dot was the AVX2
+ * widen-then-madd pair, and the Linux build did not even pass `-mavx512f`
+ * unless `SIMD=avx512` was asked for.  The number was real; the attribution
+ * was invented.  In qwen-tts the same report was written after a dispatch bug
+ * hid ~400 ms of TTFA.
+ *
+ * src/qmat.c has since grown the real VPDPBUSD kernels, which changes nothing
+ * about the rule: the `quant.int8_kernel` row names the kernel this process
+ * will actually run, so "0.427 was VNNI" is now a checkable sentence rather
+ * than a plausible one.  A number is only ever attributed to the kernel that
+ * row printed in the same run.
  *
  * FIVE COLUMNS, per logical feature:
  *
@@ -116,13 +123,33 @@ extern "C" {
 #define MYNAH_DISPATCH_HAS_AVX512VL 0
 #endif
 
-/* Features whose compiler support may be present but for which this repo has
- * no kernel at all.  They are compiled=no BY CONSTRUCTION, and the report says
- * so in words rather than leaving a blank the reader fills in optimistically. */
-#define MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL 0   /* no vpdpbusd in src/qmat.c  */
-#define MYNAH_DISPATCH_HAS_AVXVNNI_KERNEL    0   /* no _mm256_dpbusd_epi32     */
+/* Kernels that are compiled unconditionally and selected at RUNTIME, plus the
+ * two features this repo still has no kernel for.  The latter are compiled=no
+ * by construction and the report says so in words, rather than leaving a blank
+ * the reader fills in optimistically. */
+/* src/qmat.c carries the VPDPBUSD kernels behind __attribute__((target(...)))
+ * rather than behind a build flag, so on x86 they are compiled into EVERY
+ * build and selected at runtime by CPUID.  "compiled" is therefore a property
+ * of the target and the compiler, not of CFLAGS -- which is the whole reason
+ * SIMD=avx512 could once imply a kernel that did not exist. */
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11))
+#define MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL 1  /* qmat.c dot4_u8_evex */
+#define MYNAH_DISPATCH_HAS_AVXVNNI_KERNEL    1  /* qmat.c dot4_u8_vex  */
+#else
+#define MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL 0
+#define MYNAH_DISPATCH_HAS_AVXVNNI_KERNEL    0
+#endif
+
+/* src/qmat.c matvec_q8_pair_i8mm, likewise target-attributed. */
+#if !defined(MYNAH_DISABLE_SIMD) && defined(__aarch64__) && \
+    (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 10))
+#define MYNAH_DISPATCH_HAS_I8MM_KERNEL 1
+#else
+#define MYNAH_DISPATCH_HAS_I8MM_KERNEL 0
+#endif
+
 #define MYNAH_DISPATCH_HAS_AMX_KERNEL        0   /* no tile ops                */
-#define MYNAH_DISPATCH_HAS_I8MM_KERNEL       0   /* no vmmlaq_s32 / SMMLA      */
 #define MYNAH_DISPATCH_HAS_BF16_KERNEL       0   /* no bfdot / bfmmla          */
 
 #if defined(MYNAH_USE_ACCELERATE)
@@ -188,6 +215,42 @@ typedef struct {
  * ------------------------------------------------------------------------ */
 typedef int (*mynah_dispatch_probe_fn)(const char **reason);
 int mynah_dispatch_register_probe(const char *id, mynah_dispatch_probe_fn fn);
+
+/* Some decisions are not booleans.  "which int8 kernel resolved" and "which
+ * matvec policy fired" have three or more answers, and squashing them into
+ * ON/OFF is the same loss of information that let the AVX-512 claim survive:
+ * a row saying ON next to a reason mentioning VNNI reads as VNNI even when the
+ * kernel was AVX2.  A value probe writes the answer itself.
+ *
+ *   fn(out, capacity, &reason) returns 0 after writing `out`, or -1 when the
+ *   predicate cannot tell (the row stays UNKNOWN).
+ *
+ * A value probe and a boolean probe on the same id is a programming error; the
+ * value probe wins and mynah_dispatch_self_test() reports the collision. */
+typedef int (*mynah_dispatch_value_probe_fn)(char *out, size_t capacity,
+                                             const char **reason);
+int mynah_dispatch_register_value_probe(const char *id,
+                                        mynah_dispatch_value_probe_fn fn);
+
+/* ------------------------------------------------------------------------
+ * Where the predicates come from
+ *
+ * A module that owns a dispatch decision exports one of these and registers
+ * its predicates inside it; mynah_dispatch_collect() calls all of them before
+ * building the table.  An explicit call rather than a constructor, so the
+ * registration cannot be dropped when this code is consumed as a static
+ * library and the linker discards an object nothing else referenced.
+ *
+ * Every entry here is the answer to a row that used to read UNKNOWN.  The
+ * fallback is still UNKNOWN: if a module stops registering, its rows go back
+ * to saying so instead of silently reverting to a compile-time guess.
+ * ------------------------------------------------------------------------ */
+void mynah_qmat_dispatch_probes(void);      /* src/qmat.c    */
+void mynah_kernels_dispatch_probes(void);   /* src/kernels.c */
+void mynah_backend_dispatch_probes(void);   /* src/backend.c */
+void mynah_threads_dispatch_probes(void);   /* src/threads.c */
+void mynah_conv1d_dispatch_probes(void);    /* src/conv1d.c  */
+void mynah_codec_dispatch_probes(void);     /* src/codec_nanocodec.c */
 
 /* ------------------------------------------------------------------------
  * Report

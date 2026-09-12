@@ -1,5 +1,7 @@
 #include "kernels.h"
 
+#include "dispatch.h"
+
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -262,11 +264,25 @@ void mynah_residual_add_f32(float *output, const float *input, size_t n) {
     for (; i < n; ++i) output[i] += input[i];
 }
 
+/* MYNAH_GELU_SCALAR keeps the libm reference GELU for rollback.  Two things
+ * changed when this became a function: the decision is now readable by the
+ * dispatch report, and it is read ONCE instead of on every call -- getenv on
+ * the hot path is a strlen-per-entry walk of environ that the array GELU was
+ * paying for per activation block. */
+int mynah_gelu_vector_enabled(void) {
+#if defined(MYNAH_KERNELS_NEON) || defined(MYNAH_KERNELS_AVX2)
+    static int cached = -1;
+    if (cached < 0) cached = getenv("MYNAH_GELU_SCALAR") == NULL;
+    return cached;
+#else
+    return 0;
+#endif
+}
+
 void mynah_gelu_f32(float *data, size_t n) {
 #if defined(MYNAH_KERNELS_AVX2)
-    /* Padé [5/5] tanh is accurate to about 2e-8 on [-6, 6].
-     * MYNAH_GELU_SCALAR keeps the libm reference path for rollback. */
-    if (getenv("MYNAH_GELU_SCALAR") == NULL) {
+    /* Padé [5/5] tanh is accurate to about 2e-8 on [-6, 6]. */
+    if (mynah_gelu_vector_enabled()) {
         const __m256 half = _mm256_set1_ps(0.5f);
         const __m256 one = _mm256_set1_ps(1.0f);
         const __m256 scale = _mm256_set1_ps(0.7978845608f);
@@ -320,7 +336,7 @@ void mynah_gelu_f32(float *data, size_t n) {
     }
 #endif
 #if defined(MYNAH_KERNELS_NEON)
-    if (getenv("MYNAH_GELU_SCALAR") == NULL) {
+    if (mynah_gelu_vector_enabled()) {
         const float32x4_t half = vdupq_n_f32(0.5f);
         const float32x4_t one = vdupq_n_f32(1.0f);
         const float32x4_t scale = vdupq_n_f32(0.7978845608f);
@@ -620,4 +636,31 @@ int mynah_gelu_self_test(char *error, size_t error_capacity) {
     (void)error_capacity;
 #endif
     return 0;
+}
+
+/* ======================================================================
+ * Dispatch predicates
+ * ====================================================================== */
+static int probe_gelu_vector(const char **why) {
+    const int on = mynah_gelu_vector_enabled();
+#if defined(MYNAH_KERNELS_NEON)
+    const char *impl = "NEON Pade [5/5] tanh";
+#elif defined(MYNAH_KERNELS_AVX2)
+    const char *impl = "AVX2 Pade [5/5] tanh";
+#else
+    const char *impl = "no vector GELU is compiled for this target";
+#endif
+    if (why != NULL) {
+        static char text[240];
+        snprintf(text, sizeof text,
+                 "[predicate] mynah_gelu_vector_enabled(): %s (%s). Resolved "
+                 "once and cached; the env is no longer re-read per call",
+                 on ? "vector" : "scalar libm tanhf reference", impl);
+        *why = text;
+    }
+    return on;
+}
+
+void mynah_kernels_dispatch_probes(void) {
+    mynah_dispatch_register_probe("kernel.gelu_vector", probe_gelu_vector);
 }
