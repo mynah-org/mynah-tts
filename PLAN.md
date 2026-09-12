@@ -107,8 +107,11 @@ Needs E1 and E2.
 - [x] E3-3 `src/flow_head.{c,h}` **done** — oracle parity 1.07e-06 against a 1e-4 tolerance
 - [x] E3-4 `src/seanet.{c,h}` **done** — SEANet parity 5.7e-07; chunked-vs-one-shot 2.98e-07,
       so E2-3's carried-state decision holds in C
-- [ ] E3-5 `src/engine_pocket.c`: compose backbone + flow head + SEANet; AR step,
-      EOS at `-4.0`, latent denorm. **The only missing piece.**
+- [x] E3-5 `src/engine_pocket.c` **done** — CLI and server both generate audio; full
+      utterance parity mel corr 1.000000 with the oracle's noise injected
+- [ ] E3-5a **performance**: RTF 2.03, identical with int8 and with 4 threads, because the
+      engine uses neither `qmat` nor the thread pool. Serving profile says NOT STREAMABLE
+      on a mandatory gate (RTF p95 1.96 > 1.00). This is E4 applied to this engine.
 - [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias** (two different
       epsilons), **variance-based RMSNorm** (`unbiased=True`, *not* `kernels.c:rmsnorm`),
       GELU-tanh, causal conv, adaLN

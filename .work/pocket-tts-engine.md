@@ -255,3 +255,58 @@ The `context` sliding window is covered only by the model-free self-test. In the
 oracle, Mimi's decoder transformer runs over 16 positions per frame, so
 `context: 250` never bites and no reference data exercises it. Closing that needs
 a dump longer than 250 frames — part of E2-4, still open.
+
+## First end-to-end numbers — 2026-09-12
+
+PocketTTS runs from the CLI and from the server. Correctness is there;
+**performance is not, and the profile says so rather than letting it pass.**
+
+### CLI
+
+```
+models/pocket-en  "Hello world. I am Kyutai's Pocket TTS..."  alba, seed 1234
+  4.32 s of audio, synth 8.97 s   -> RTF 2.075
+models/pocket-it  giovanni, seed 1234
+  6.32 s of audio, synth 13.33 s  -> RTF 2.110
+```
+
+Output is speech: the Italian matches the oracle's length **sample for sample**
+(151680, delta 0), its spectral shape correlates at **0.966** with the oracle's,
+and spectral flatness is 0.27 against the oracle's 0.21 (white noise would be
+near 1). The waveforms themselves decorrelate, which is correct — the flow head
+draws its own noise, so it is a different sample from the same distribution.
+Parity with the oracle's noise injected is mel corr 1.000000.
+
+### Server
+
+`stream == batch` byte-identical on this engine too. Six concurrent requests
+complete, staggered linearly at 5.8 / 10.3 / 15.6 / 20.2 / 25.1 / 29.8 s —
+exactly what `max_batch = 1` should look like.
+
+### Serving profile: NOT STREAMABLE, and the reason is not the mutex
+
+```
+  C  done/lnc  TTFA50  TTFA95  RTF50  RTF95  preb95  stall  verdict
+  1       2/2     418     425  1.916  1.959    3285   100%  NOT STREAMABLE
+  2       4/4    7547    7556  1.955  1.963    3299   100%  NOT STREAMABLE
+```
+
+The failing gate is **mandatory**: `STREAM_RTF p95 = 1.96 > 1.00`. The engine
+generates at **half real time**, so a player stalls no matter how it buffers —
+3.3 s of prebuffer and a 100% stall rate. This is a different failure from
+Magpie's, where RTF stayed at 0.3 and only TTFA collapsed under the mutex.
+
+### Why, and what fixes it
+
+**`RTF is 2.03 with f32 and 2.03 with int8, at one thread and at four.** The
+engine goes through neither `qmat` nor the thread pool: it is plain f32 with
+scalar matvecs. That is the correct order — `CLAUDE.md` requires correctness
+against the oracle before SIMD, quantization or GPU — but it means the number
+above measures an unoptimized path, not the design.
+
+For reference, upstream claims ~6× real time on an M4 using two cores, so there
+is roughly an order of magnitude to recover. The work is E4 applied to this
+engine: route the backbone and flow-head projections through `mynah_qmat_*`,
+parallelize the SEANet conv stack, and use the fused QKV kernel the checkpoint's
+pre-fused `[3072,1024]` was made for. **Do not quote an RTF for PocketTTS until
+that lands.**
