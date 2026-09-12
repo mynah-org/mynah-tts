@@ -269,3 +269,63 @@ from-scratch implementation silently diverges.
 - **Backbone FFN activation** is `F.gelu(x, approximate="tanh")`. `src/kernels.c`
   has a Padé approximation — check it against the oracle rather than assuming the
   two agree to tolerance.
+
+## 12. Is the dataflow reusable across languages and versions? — **yes, entirely**
+
+Asked directly: do the cross-language and cross-version differences mean new
+kernels or a different graph? **No. Neither axis costs a single new kernel.**
+
+### Across languages: same graph, different numbers
+
+The tensor schema is identical across all six languages (§2). What varies is
+only: the weight *values*, `emb_mean`/`emb_std`, the `tokenizer.model` file, and
+the voice KV files. All of it is data the converter writes into the pack.
+
+**Cost of adding a language to a working runtime: zero C code.** Run the
+converter, ship a pack. The cost is memory and deployment (§10), not
+implementation.
+
+### Across versions: the difference is confined to the cloning path
+
+The three tensors that differ between `english_2026-01` and the current
+generation — `speaker_proj_weight`, `bos_before_voice`,
+`mimi.downsample.conv.conv.weight` — are used in exactly one place, verified in
+`models/tts_model.py`:
+
+```
+get_state_for_audio_prompt(voice)
+├── predefined voice or .safetensors  -> _import_model_state()   # load KV, done
+└── a .wav                            -> _encode_audio()          # cloning only
+                                          mimi.encode_to_latent   (uses downsample)
+                                          F.linear(.., speaker_proj_weight)
+                                          cat([bos_before_voice, prompt])  if configured
+                                          prefill through flow_lm -> KV
+```
+
+A predefined voice **loads a KV cache straight from the file**: no Mimi encoder,
+no `speaker_proj`, no `bos_before_voice`, no prefill at all.
+
+So for generation with the shipped voices — which is the whole product — the
+**graph is identical between the two generations**. Supporting both revisions is
+free. The version difference only becomes visible if E3-10 (clone from a wav)
+is implemented, and even then it is two config values (`speaker_proj` input dim
+512 vs 32, `insert_bos_before_voice` true/false), not new code paths.
+
+### What is genuinely new work
+
+Not the language axis and not the version axis, but the **architecture** axis:
+continuous latents instead of codebooks, the AdaLN flow head, causal SEANet, the
+variance-RMSNorm, SentencePiece Unigram. Those are E3, and they are written once
+and then serve every language and both revisions.
+
+### Two implementation details this uncovered
+
+- **NaN is a sentinel.** `flow_lm.forward` starts with
+  `sequence = torch.where(torch.isnan(sequence), self.bos_emb, sequence)` — NaN
+  positions mean BOS. `_expand_kv_cache` likewise **fills unused KV positions
+  with NaN**. A C implementation must either reproduce the sentinel or track
+  validity explicitly; it must not let NaN reach a matmul.
+- **A voice KV is bound to the weights that produced it.** Upstream refuses
+  predefined voices on custom weights, saying the model then "typically never
+  emits EOS". This is the §10 point with upstream's own words behind it: never
+  let a voice file cross a model boundary, and make the pack enforce it.

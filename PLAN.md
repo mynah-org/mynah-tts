@@ -18,6 +18,11 @@ One measured fact shapes several epics: the six PocketTTS language models are
 language, no deduplication, voices valid only for the model that produced them,
 and continuous batching cannot mix languages.
 
+The graph, however, is **fully shared**: identical across all six languages, and
+identical across both checkpoint generations for generation with the shipped
+voices. Adding a language costs zero C code; the three tensors that differ
+between revisions live only in the clone-from-wav path (E3-10).
+
 ## How this plan is organised
 
 `PLAN.md` is a **board**: one line per work item, with a link to the note under
@@ -80,6 +85,8 @@ Needs E1 and E2.
 - [ ] E3-9 WAV smoke for all 6 languages with explicit language/voice/seed
 - [ ] E3-10 *(optional, last)* voice cloning from a wav — needs `mimi.encoder`
 - [ ] E3-11 one pack = one language; compute `time_embed.*.freqs` at load instead of storing
+- [ ] E3-12 NaN-as-BOS sentinel: reproduce it or track validity explicitly — never let NaN reach a matmul
+- [ ] E3-13 pack refuses a voice KV from a different model/revision (upstream: it then never emits EOS)
 
 ### E4 — CPU kernels, ARM and x86 in one step → [`.work/cpu-kernels-arm-x86.md`](.work/cpu-kernels-arm-x86.md)
 
