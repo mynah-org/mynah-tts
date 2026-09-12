@@ -96,6 +96,7 @@ STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
 .PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
+        playback-sim-test serving-profile \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -158,7 +159,7 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 
-test: self-test
+test: self-test playback-sim-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
@@ -222,6 +223,23 @@ oracle:
 	@test -n "$(CODEC)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	@test -n "$(OUTPUT)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
+
+# Serving measurement. playback-sim-test needs no model and no network, so it
+# belongs in `make test`; serving-profile starts a real server.
+# NOTE on the synthetic pack: its max_decoder_steps is 8, which is 0.37 s of
+# audio, and a profile of that has no cadence to measure and correctly reports
+# INCONCLUSIVE. --max-steps 64 gives it something to measure.
+LEVELS ?= 1,2,4
+WAVES ?= 3
+PROFILE_ARGS ?= --max-steps 64
+PORT ?= 8123
+playback-sim-test:
+	python3 tests/playback_sim.py
+
+serving-profile:
+	@test -n "$(MODEL_DIR)" || (echo "usage: make serving-profile MODEL_DIR=models/fake-magpie" >&2; exit 2)
+	python3 tools/serving_profile.py --model "$(MODEL_DIR)" --port "$(PORT)" \
+	  --levels "$(LEVELS)" --waves "$(WAVES)" $(PROFILE_ARGS)
 
 # PocketTTS model pack. Needs the gated Kyutai weights in the HF cache; see
 # .work/licensing-and-voice-policy.md before redistributing what this produces.

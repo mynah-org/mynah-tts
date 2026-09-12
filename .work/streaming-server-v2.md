@@ -320,3 +320,54 @@ timeout and exits cleanly, which is what makes `leaks --atExit` usable.
 
 Still not done here, on purpose: the global mutex (step 4) and continuous
 admission (step 2).
+
+## Baseline measured — 2026-09-12, before the mutex comes out
+
+`make serving-profile MODEL_DIR=models/fake-magpie` (C1/C2/C4, 3 waves,
+`--max-steps 64` ≈ 5.9 s of audio per request, M1):
+
+```
+  C  done/lnc  TTFB95  TTFA50  TTFA95  RTF50  RTF95  preb95  gap95  stall  verdict
+  1       3/3     0.2      101     110  0.313  0.316       0    280     0%  GOOD
+  2       6/6     0.3       95    1847  0.300  0.326       0    265     0%  MARGINAL
+  4     12/12     0.4     3713    5596  0.332  0.345       0    309     0%  MARGINAL
+```
+
+**The mutex shows up exactly where the cadence law says it will, and nowhere
+else.** STREAM_RTF does not move (0.30-0.35 — the server generates three times
+faster than real time) and prebuffer and stall stay at zero: once a stream
+*starts*, its cadence is clean. What collapses is the wait to start. TTFA p95
+goes 110 ms → 1847 ms → 5596 ms, and at C4 the standard deviation of TTFA is
+2246 ms against a mean of 2896 ms — the distribution is **bimodal**, 94 ms for
+whoever takes the lock first and 6468 ms for the last.
+
+Looking at RTF alone would have said C4 was fine. That is why every level prints
+p50/p95/mean/**sd**/min/max with the sample count, and why TTFB and TTFA are
+separate columns.
+
+This is the number E5-4 has to beat. It is not an impression.
+
+### Things the profile refuses to do
+
+- **It will not guess a sample rate.** If the server declares neither the audio
+  headers nor a WAV `fmt ` chunk, it refuses to run rather than assume one.
+- **A batch route gets INCONCLUSIVE, not GOOD**: a non-streaming response has no
+  cadence, and calling it GOOD would be a claim about a player that was never
+  simulated.
+- **Incomplete levels are reported, not averaged away**: with a tight timeout at
+  C4 it prints `1/4` completed, lists the errors, and exits non-zero.
+- It reports the **coalesced-read fraction** (~85% on loopback here), so the
+  cadence figures are read as *upper bounds* on the server's real latency rather
+  than as the server's own timing.
+
+### The cadence law, demonstrated rather than asserted
+
+The simulator's own tests include a trace at exactly RTF 1.000 with zero stalls,
+where **moving a single chunk by 1 ms makes it stall**, and a trace at RTF 0.925
+that needs 1.1 s of prebuffer. `make playback-sim-test` runs 79 such checks with
+no model and no network, and is part of `make test`.
+
+Two of the simulator's inherited behaviours were corrected while building it: a
+jitter buffer smaller than the first chunk absorbs nothing (the player starts
+immediately with the same lead), and qwen's `stall_count` counted a
+persistently-late stream as *one* infinite stall instead of one episode per gap.
