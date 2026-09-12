@@ -1,0 +1,164 @@
+/*
+ * SimpleMLPAdaLN — the PocketTTS flow head (E3-3).
+ *
+ * One evaluation maps a conditioning vector, `num_time_conds` scalar times and
+ * a latent-space noise vector to a latent-space sample.  The released
+ * checkpoints are LSD-distilled with two time conditions pinned at s = 0 and
+ * t = 1, so a full decode is a *single* call per frame; there is no
+ * integration loop here on purpose.
+ *
+ * Reference forward (kyutai-labs/pocket-tts, modules/mlp.py):
+ *
+ *     y = cond_embed(c) + (time_embed[0](s) + time_embed[1](t)) / num_time_conds
+ *     x = input_proj(noise)
+ *     per res block:  shift, scale, gate = adaLN(SiLU(y)).chunk(3)
+ *                     h = mlp(in_ln(x) * (1 + scale) + shift)
+ *                     x = x + gate * h
+ *     final:          shift, scale = adaLN(SiLU(y)).chunk(2)
+ *                     out = linear(norm_final(x) * (1 + scale) + shift)
+ *
+ * Three details are load bearing and are the reason this module owns its own
+ * normalisation kernels instead of calling `src/kernels.h`:
+ *
+ *   1. `in_ln` / `norm_final` are LayerNorm with eps = 1e-6 and a *biased*
+ *      variance, and `norm_final` has no affine parameters at all (no such
+ *      tensor exists in the checkpoint).  `mynah_layernorm_f32` requires a
+ *      non-NULL weight.
+ *   2. The time-embedding tail normalisation is **not** RMSNorm.  It is
+ *          y = x * alpha * rsqrt(eps + var(x))
+ *      with `var` mean-subtracted *and* unbiased (dividing by N-1), i.e.
+ *      torch's default.  `mynah_rmsnorm_f32` computes a mean-square norm and
+ *      is numerically a different function.
+ *   3. `freqs` are the deterministic constants
+ *          exp(-log(max_period) * arange(half) / half)
+ *      identical in every released checkpoint.  They are computed here at
+ *      create time and must not be read from the model pack.
+ *
+ * No dimension is baked in: everything comes from `mynah_flow_head_config`.
+ * Weights arrive as already-resolved float pointers; this module never formats
+ * a tensor name.
+ */
+#ifndef MYNAH_TTS_FLOW_HEAD_H
+#define MYNAH_TTS_FLOW_HEAD_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    size_t latent_dim;     /* in and out channels, e.g. 32                  */
+    size_t cond_dim;       /* conditioning width, e.g. 1024                 */
+    size_t hidden_dim;     /* flow width, e.g. 512                          */
+    size_t depth;          /* number of residual blocks, e.g. 6             */
+    size_t num_time_conds; /* 2 for LSD, 1 for flow matching, 0 for none    */
+    size_t freq_embed_dim; /* sinusoidal width, even, e.g. 256              */
+    float max_period;      /* 10000.0f                                      */
+    float layernorm_eps;   /* 1e-6f                                         */
+    float rmsnorm_eps;     /* 1e-5f                                         */
+} mynah_flow_head_config;
+
+/* Fills `config` with the PocketTTS defaults for the given dimensions.  The
+ * caller still has to take latent/cond/hidden/depth from `model.json`. */
+void mynah_flow_head_config_defaults(mynah_flow_head_config *config);
+
+typedef struct {
+    const float *weight; /* [out_features][in_features], row major */
+    const float *bias;   /* [out_features] or NULL                 */
+} mynah_flow_linear;
+
+typedef struct {
+    mynah_flow_linear mlp_in;  /* [hidden_dim][freq_embed_dim] */
+    mynah_flow_linear mlp_out; /* [hidden_dim][hidden_dim]     */
+    const float *alpha;        /* [hidden_dim], variance-RMSNorm gain */
+} mynah_flow_time_embed_weights;
+
+typedef struct {
+    const float *in_ln_weight;  /* [hidden_dim]               */
+    const float *in_ln_bias;    /* [hidden_dim] or NULL       */
+    mynah_flow_linear adaln;    /* [3 * hidden_dim][hidden_dim] */
+    mynah_flow_linear mlp_in;   /* [hidden_dim][hidden_dim]   */
+    mynah_flow_linear mlp_out;  /* [hidden_dim][hidden_dim]   */
+} mynah_flow_res_block_weights;
+
+typedef struct {
+    mynah_flow_linear cond_embed; /* [hidden_dim][cond_dim]   */
+    mynah_flow_linear input_proj; /* [hidden_dim][latent_dim] */
+    const mynah_flow_time_embed_weights *time_embed; /* [num_time_conds] */
+    const mynah_flow_res_block_weights *res_blocks;  /* [depth]          */
+    mynah_flow_linear final_adaln;  /* [2 * hidden_dim][hidden_dim] */
+    mynah_flow_linear final_linear; /* [latent_dim][hidden_dim]     */
+} mynah_flow_head_weights;
+
+typedef struct mynah_flow_head mynah_flow_head;
+
+/* Creates the scratch state for one context.  Weights are *not* captured: they
+ * stay owned read-only by the model and are passed to every forward, so one
+ * weight set can back many concurrent contexts. */
+mynah_flow_head *mynah_flow_head_create(const mynah_flow_head_config *config,
+                                        char *error, size_t error_capacity);
+void mynah_flow_head_destroy(mynah_flow_head *head);
+
+const mynah_flow_head_config *mynah_flow_head_get_config(
+    const mynah_flow_head *head);
+
+/* Validates that every pointer the configuration requires is present.
+ * Returns 0 on success, -1 with a message in `error` otherwise. */
+int mynah_flow_head_check_weights(const mynah_flow_head *head,
+                                  const mynah_flow_head_weights *weights,
+                                  char *error, size_t error_capacity);
+
+/*
+ * One flow-head evaluation.  Allocates nothing.
+ *
+ *   cond  [cond_dim]        conditioning, e.g. the backbone's out_norm result
+ *   times [num_time_conds]  the time conditions, {0, 1} for the released LSD
+ *   noise [latent_dim]      the gaussian draw
+ *   out   [latent_dim]      the sampled latent
+ *
+ * `times` may be NULL when num_time_conds == 0.  The time-embedding branch is
+ * memoised on the exact bit pattern of `times`, which is free in practice
+ * because s and t are constant across a whole utterance.
+ */
+int mynah_flow_head_forward(mynah_flow_head *head,
+                            const mynah_flow_head_weights *weights,
+                            const float *cond, const float *times,
+                            const float *noise, float *out);
+
+/* Drops the memoised time embedding.  Only needed if weights change under a
+ * live head; correctness does not depend on calling it. */
+void mynah_flow_head_reset(mynah_flow_head *head);
+
+/* ---- kernels, exported because they are new and separately testable ---- */
+
+/* LayerNorm over `n` values, biased variance.  `weight` and `bias` may both be
+ * NULL (elementwise_affine=False); `bias` may be NULL on its own. */
+void mynah_flow_layernorm_f32(const float *input, const float *weight,
+                              const float *bias, float *output, size_t n,
+                              float epsilon);
+
+/* y = x * alpha * rsqrt(epsilon + var(x)), var mean-subtracted and unbiased
+ * (divided by n-1).  This is NOT mynah_rmsnorm_f32.  Requires n >= 2. */
+void mynah_flow_var_rmsnorm_f32(const float *input, const float *alpha,
+                                float *output, size_t n, float epsilon);
+
+/* y = x * sigmoid(x), in place when output == input. */
+void mynah_flow_silu_f32(const float *input, float *output, size_t n);
+
+/* y = x * (1 + scale) + shift, in place when output == input. */
+void mynah_flow_modulate_f32(const float *input, const float *shift,
+                             const float *scale, float *output, size_t n);
+
+/* Writes exp(-log(max_period) * i / half) for i in [0, half). */
+void mynah_flow_timestep_freqs_f32(float *freqs, size_t half, float max_period);
+
+/* Model-free self test of every kernel above plus a full tiny forward.
+ * Returns 0 on success, -1 with a message in `error`. */
+int mynah_flow_head_self_test(char *error, size_t error_capacity);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MYNAH_TTS_FLOW_HEAD_H */
