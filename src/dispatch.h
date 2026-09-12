@@ -97,8 +97,12 @@ extern "C" {
 #define MYNAH_DISPATCH_HAS_DOTPROD 0
 #endif
 
-/* src/qmat.c:25 — __fp16 weight cache (needs NEON's half converts) */
-#if !defined(MYNAH_DISABLE_SIMD) && defined(__aarch64__) && defined(__ARM_NEON)
+/* src/qmat.c — half weight cache: NEON converts on aarch64, F16C on x86.
+ * Mirror of MYNAH_QMAT_F16 in src/qmat.c; the drift canary checks it. */
+#if !defined(MYNAH_DISABLE_SIMD) && \
+    ((defined(__aarch64__) && defined(__ARM_NEON)) || \
+     ((defined(__x86_64__) || defined(__i386__)) && \
+      (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11))))
 #define MYNAH_DISPATCH_HAS_QMAT_F16 1
 #else
 #define MYNAH_DISPATCH_HAS_QMAT_F16 0

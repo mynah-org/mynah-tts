@@ -48,6 +48,13 @@ int mynah_qmat_argmax_mt_resolved(size_t rows, size_t cols, const char **why);
 const char *mynah_qmat_int8_kernel(const char **why);
 /* 1 when the SMMLA path is compiled AND the CPU reports FEAT_I8MM. */
 int mynah_qmat_i8mm_enabled(const char **why);
+
+/* Names the f16 kernel this host resolves to: "neon", "f16c", "scalar" or
+ * "off".  "off" is the one that used to be silent: on a build with no half
+ * weight type, mynah_qmat_cache_new() rewrites QMAT_F16 to QMAT_F32 and the
+ * run proceeds at f32 speed with nothing said.  `why` (optional) receives a
+ * static reason string. */
+const char *mynah_qmat_f16_kernel(const char **why);
 /* MYNAH_FUSED_GREEDY: whether the engine may fuse head projection + argmax. */
 int mynah_qmat_fused_greedy_enabled(void);
 

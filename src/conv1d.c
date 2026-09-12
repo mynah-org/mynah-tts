@@ -68,22 +68,6 @@ struct codec_bnns_cache {
     pthread_mutex_t mutex;
 };
 
-/* MYNAH_CODEC_SGEMM forces the im2col + sgemm tap accumulation instead of the
- * BNNS causal convolution.  Both src/conv1d.c and src/codec_nanocodec.c branch
- * on it -- the codec also has to size an im2col workspace it would otherwise
- * not allocate -- so the switch is read in one place and the two call sites
- * cannot drift apart.  Where BNNS is not compiled at all, sgemm is not an
- * option but the only path, and this says so by returning 1. */
-int mynah_conv1d_sgemm_enabled(void) {
-#if defined(MYNAH_USE_ACCELERATE)
-    static int cached = -1;
-    if (cached < 0) cached = getenv("MYNAH_CODEC_SGEMM") != NULL;
-    return cached;
-#else
-    return 1;
-#endif
-}
-
 static void codec_bnns_cache_free(codec_bnns_cache *cache) {
     if (cache == NULL) return;
     pthread_mutex_lock(&cache->mutex);
@@ -97,6 +81,30 @@ static void codec_bnns_cache_free(codec_bnns_cache *cache) {
     free(cache);
 }
 #endif
+
+/* MYNAH_CODEC_SGEMM forces the im2col + sgemm tap accumulation instead of the
+ * BNNS causal convolution.  Both src/conv1d.c and src/codec_nanocodec.c branch
+ * on it -- the codec also has to size an im2col workspace it would otherwise
+ * not allocate -- so the switch is read in one place and the two call sites
+ * cannot drift apart.  Where BNNS is not compiled at all, sgemm is not an
+ * option but the only path, and this says so by returning 1.
+ *
+ * IT MUST LIVE OUTSIDE EVERY BACKEND BLOCK.  It used to sit inside the
+ * `#if defined(MYNAH_USE_ACCELERATE)` section above, which meant its own
+ * `#else` -- the branch that answers for a build with no BNNS -- was never
+ * compiled, and mynah-tts did not LINK for any configuration except macOS
+ * Accelerate: probe_sgemm_conv() and src/codec_nanocodec.c both call it
+ * unconditionally.  Linux (OpenBLAS or BLAS=scalar) is exactly that
+ * configuration, so the production target could not be built. */
+int mynah_conv1d_sgemm_enabled(void) {
+#if defined(MYNAH_USE_ACCELERATE)
+    static int cached = -1;
+    if (cached < 0) cached = getenv("MYNAH_CODEC_SGEMM") != NULL;
+    return cached;
+#else
+    return 1;
+#endif
+}
 
 #if defined(MYNAH_USE_OPENBLAS) && !defined(MYNAH_USE_ACCELERATE)
 typedef struct {
