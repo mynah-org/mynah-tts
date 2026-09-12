@@ -198,7 +198,22 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
                                 error_capacity);
     (void)manifest_length;
     if (manifest == NULL) return -1;
-    if (required_pack_file(model_dir, "tts.safetensors", error, error_capacity) != 0 ||
+    /* The engine decides what a valid pack looks like, so it is read before
+     * anything else is required. Magpie keeps its codec in a second file;
+     * PocketTTS has one continuous-latent decoder that lives with the rest of
+     * the weights, so demanding codec.safetensors would reject a correct pack. */
+    char engine_name[32];
+    if (json_string(manifest, "engine", engine_name, sizeof(engine_name)) != 0) {
+        free(manifest);
+        set_error(error, error_capacity, "model.json has no engine");
+        return -1;
+    }
+    const int is_magpie = strcmp(engine_name, "magpie") == 0;
+    if (required_pack_file(model_dir, "tts.safetensors", error, error_capacity) != 0) {
+        free(manifest);
+        return -1;
+    }
+    if (is_magpie &&
         required_pack_file(model_dir, "codec.safetensors", error, error_capacity) != 0) {
         free(manifest);
         return -1;
@@ -219,27 +234,60 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
                     sizeof(model->info.dtype)) != 0 ||
         json_unsigned(manifest, "sample_rate", &model->info.sample_rate) != 0 ||
         json_double(manifest, "frame_rate", &model->info.frame_rate) != 0 ||
-        json_unsigned(manifest, "frame_stacking_factor",
-                      &model->info.frame_stacking_factor) != 0 ||
-        json_unsigned(manifest, "codebook_count", &model->info.codebook_count) != 0 ||
-        json_unsigned(manifest, "codebook_size", &model->info.codebook_size) != 0 ||
-        json_unsigned(manifest, "audio_vocab_size", &model->info.audio_vocab_size) != 0 ||
         json_unsigned(manifest, "hidden_dim", &model->info.hidden_dim) != 0 ||
-        json_unsigned(manifest, "encoder_layers", &model->info.encoder_layers) != 0 ||
-        json_unsigned(manifest, "decoder_layers", &model->info.decoder_layers) != 0 ||
-        json_unsigned(manifest, "local_transformer_layers",
-                      &model->info.local_transformer_layers) != 0 ||
         json_unsigned(manifest, "speaker_count", &model->info.speaker_count) != 0 ||
-        json_unsigned(manifest, "text_max_length", &model->info.text_max_length) != 0 ||
         json_unsigned(manifest, "text_vocab_size", &model->info.text_vocab_size) != 0 ||
-        json_unsigned(manifest, "max_decoder_steps", &model->info.max_decoder_steps) != 0 ||
-        json_unsigned(manifest, "topk", &model->info.default_topk) != 0 ||
         json_double(manifest, "temperature", &(double){0.0}) != 0) {
         free(model->model_dir);
         free(model);
         free(manifest);
         set_error(error, error_capacity, "model.json is missing v1 metadata");
         return -1;
+    }
+    /* Magpie's discrete-codec metadata. A continuous-latent engine has none of
+     * it, and these fields disappear from the public header with E1-5; until
+     * then they stay zero for anything that is not Magpie. */
+    if (is_magpie &&
+        (json_unsigned(manifest, "frame_stacking_factor",
+                       &model->info.frame_stacking_factor) != 0 ||
+         json_unsigned(manifest, "codebook_count", &model->info.codebook_count) != 0 ||
+         json_unsigned(manifest, "codebook_size", &model->info.codebook_size) != 0 ||
+         json_unsigned(manifest, "audio_vocab_size", &model->info.audio_vocab_size) != 0 ||
+         json_unsigned(manifest, "encoder_layers", &model->info.encoder_layers) != 0 ||
+         json_unsigned(manifest, "decoder_layers", &model->info.decoder_layers) != 0 ||
+         json_unsigned(manifest, "local_transformer_layers",
+                       &model->info.local_transformer_layers) != 0 ||
+         json_unsigned(manifest, "text_max_length", &model->info.text_max_length) != 0 ||
+         json_unsigned(manifest, "topk", &model->info.default_topk) != 0)) {
+        free(model->model_dir);
+        free(model);
+        free(manifest);
+        set_error(error, error_capacity, "model.json is missing Magpie metadata");
+        return -1;
+    }
+    if (is_magpie) {
+        if (json_unsigned(manifest, "max_decoder_steps", &model->info.max_decoder_steps) != 0) {
+            free(model->model_dir);
+            free(model);
+            free(manifest);
+            set_error(error, error_capacity, "model.json is missing max_decoder_steps");
+            return -1;
+        }
+    } else {
+        /* text_max_length bounds the encoder prefill; PocketTTS chunks instead. */
+        if (json_unsigned(manifest, "text_max_length", &model->info.text_max_length) != 0) {
+            model->info.text_max_length = model->info.text_vocab_size;
+        }
+        /* A continuous-latent model has no pack-level step ceiling: upstream
+         * estimates one per request from the token count. This is only the
+         * runaway guard, so it is generous and derived from the frame rate
+         * rather than being a magic constant. */
+        if (json_unsigned(manifest, "max_decoder_steps", &model->info.max_decoder_steps) != 0) {
+            const double seconds = 120.0;
+            const double frames = model->info.frame_rate > 0.0
+                ? model->info.frame_rate * seconds : 1500.0;
+            model->info.max_decoder_steps = (unsigned)frames;
+        }
     }
     {
         double temperature = 0.0;
@@ -258,11 +306,13 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
         /* Magpie special audio tokens follow the codec codebook.  Prefer the
          * explicit ids from model.json; otherwise fall back to the NeMo
          * SpecialAudioToken convention (BOS first, EOS second). */
-        if (json_unsigned(manifest, "audio_bos_id", &model->info.audio_bos_id) != 0) {
-            model->info.audio_bos_id = model->info.codebook_size;
-        }
-        if (json_unsigned(manifest, "audio_eos_id", &model->info.audio_eos_id) != 0) {
-            model->info.audio_eos_id = model->info.codebook_size + 1u;
+        if (is_magpie) {
+            if (json_unsigned(manifest, "audio_bos_id", &model->info.audio_bos_id) != 0) {
+                model->info.audio_bos_id = model->info.codebook_size;
+            }
+            if (json_unsigned(manifest, "audio_eos_id", &model->info.audio_eos_id) != 0) {
+                model->info.audio_eos_id = model->info.codebook_size + 1u;
+            }
         }
     }
     char tensor_error[256];
@@ -274,7 +324,8 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
     if (tts_path_length <= 0 || (size_t)tts_path_length >= sizeof(tts_path) ||
         codec_path_length <= 0 || (size_t)codec_path_length >= sizeof(codec_path) ||
         mynah_weights_open(tts_path, &model->tts, tensor_error, sizeof(tensor_error)) != 0 ||
-        mynah_weights_open(codec_path, &model->codec, tensor_error, sizeof(tensor_error)) != 0) {
+        (is_magpie &&
+         mynah_weights_open(codec_path, &model->codec, tensor_error, sizeof(tensor_error)) != 0)) {
         mynah_weights_close(model->tts);
         mynah_weights_close(model->codec);
         free(model->model_dir);
@@ -303,8 +354,10 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
         set_error(error, error_capacity, "out of memory creating quant cache");
         return -1;
     }
-    model->codec_cache = mynah_graph_codec_cache_new();
-    model->local_projection_cache = mynah_graph_local_projection_cache_new(model);
+    if (is_magpie) {
+        model->codec_cache = mynah_graph_codec_cache_new();
+        model->local_projection_cache = mynah_graph_local_projection_cache_new(model);
+    }
     snprintf(model->info.device, sizeof(model->info.device), "%s",
              mynah_backend_name(model->backend));
     free(manifest);
