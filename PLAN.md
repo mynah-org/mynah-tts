@@ -13,6 +13,11 @@ which requires the engine seam that has been outstanding since July.
 
 **Current focus is CPU — ARM and x86 together. GPU work is deferred.**
 
+One measured fact shapes several epics: the six PocketTTS language models are
+**independently trained and share nothing**, codec included. One pack per
+language, no deduplication, voices valid only for the model that produced them,
+and continuous batching cannot mix languages.
+
 ## How this plan is organised
 
 `PLAN.md` is a **board**: one line per work item, with a link to the note under
@@ -30,7 +35,8 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` dropped
 
 ### Reference — read before starting anything
 
-- [x] PocketTTS facts verified from the weights → [`.work/pocket-tts-model-facts.md`](.work/pocket-tts-model-facts.md)
+- [x] PocketTTS facts verified from the weights, incl. cross-language divergence
+      and the reference-implementation traps → [`.work/pocket-tts-model-facts.md`](.work/pocket-tts-model-facts.md)
 - [x] Architecture diff, mynah-tts as-is vs PocketTTS → [`.work/pocket-tts-vs-mynah.md`](.work/pocket-tts-vs-mynah.md)
 - [x] Magpie-era checkpoints and rejected ideas → [`.work/archive-2026-07-checkpoints.md`](.work/archive-2026-07-checkpoints.md)
 
@@ -66,11 +72,14 @@ Needs E1 and E2.
 - [ ] E3-3 `src/flow_head.c`: time embedding, adaLN, 6 res-blocks, 1 LSD step
 - [ ] E3-4 `src/seanet.c`: causal conv1d / transposed conv + streaming state
 - [ ] E3-5 `src/engine_pocket.c`: AR step, EOS at `-4.0`, latent denorm
-- [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias**, GELU-tanh, causal conv, adaLN
+- [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias** (two different
+      epsilons), **variance-based RMSNorm** (`unbiased=True`, *not* `kernels.c:rmsnorm`),
+      GELU-tanh, causal conv, adaLN
 - [ ] E3-7 offline parity across all 12 oracle stages, both checkpoint generations
 - [ ] E3-8 streaming sample-identical to offline, then batched through the shared driver
 - [ ] E3-9 WAV smoke for all 6 languages with explicit language/voice/seed
 - [ ] E3-10 *(optional, last)* voice cloning from a wav — needs `mimi.encoder`
+- [ ] E3-11 one pack = one language; compute `time_embed.*.freqs` at load instead of storing
 
 ### E4 — CPU kernels, ARM and x86 in one step → [`.work/cpu-kernels-arm-x86.md`](.work/cpu-kernels-arm-x86.md)
 
@@ -96,6 +105,7 @@ Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
 - [ ] E5-5 long-form: incremental push into a running decode, persistent conv state across flushes
 - [ ] E5-6 prefork pinned on Linux (`SCM_RIGHTS`, CoW after weight load) — needs E4-4
 - [ ] E5-7 `playback_sim` + soak; publish p50/p95 TTFA, prebuffer, stall rate
+- [ ] E5-9 **per-language slot groups** — batching cannot mix languages; decide before E5-1
 - [ ] E5-8 gate: **N concurrent streams byte-identical to the same request run alone**
 
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)

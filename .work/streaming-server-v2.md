@@ -60,6 +60,21 @@ chunk 8 → p95 prebuffer 0.45 s; chunk 32 → 1.22-2.55 s, with STREAM_RTF bare
 moving. Port their `playback_sim` idea (stall rate, max gap, safe start) before
 claiming a streaming target.
 
+## Multi-language changes the scheduler
+
+Measured in [pocket-tts-model-facts.md](pocket-tts-model-facts.md) §10: the six
+PocketTTS language models share **nothing** — not the codec, not the latent
+space. Continuous batching is weight-stationary, so **slots batched together must
+share a language**. Two consequences for the scheduler:
+
+- slot groups are per language, not one global pool of 16
+- a process serving N languages holds N weight sets resident (≈110 MB each at
+  int8), so "how many languages per process" becomes a deployment knob worth
+  measuring rather than assuming
+
+This does not change the single-language design; it changes admission. Decide it
+before E5-1, because it affects who owns the slots.
+
 ## Work items
 
 1. Remove the global stream mutex by making the scheduler the sole owner of

@@ -92,11 +92,44 @@ an engine capability rather than a `#define`.
 - ubsan + leaks clean.
 - WAV smoke for all 6 languages with explicit language/voice/seed.
 
-## Open questions
+## Resolved (were open questions)
 
-- `flow_lm.conditioner.embed.weight` is `[4001, 1024]` for a 4000-piece
-  vocabulary. **What is row 4000?** Resolve before writing the lookup.
-- `flow_net.time_embed.*.mlp.*.alpha` — an `alpha` parameter inside the time
-  embedding MLP. Identify the activation it belongs to; do not guess it is Snake.
+All three were closed by reading the reference implementation; details and the
+exact formulas are in
+[pocket-tts-model-facts.md](pocket-tts-model-facts.md) §11.
+
+- `conditioner.embed.weight` is `[4001, 1024]` because `nn.Embedding(n_bins + 1)`
+  reserves **row 4000 as padding**. The tokenizer never emits it, and it adds no
+  BOS/EOS of its own.
+- `flow_net.time_embed.*.mlp.*.alpha` is an **RMSNorm gain**, with a
+  non-standard RMSNorm: variance-based (mean-subtracted) and `unbiased=True`,
+  i.e. `N-1`. Not the `rmsnorm` in `src/kernels.c`. **Write a separate kernel.**
+- The head is **LSD with two time conditions** (`time_embed.0` and `.1`),
+  `y = cond_embed(c) + (t_emb(s) + t_emb(t))/2`.
+
+Two more traps found at the same time:
+
+- **Two LayerNorms with different epsilons**: backbone `eps=1e-5` with bias,
+  flow head `eps=1e-6`, `unbiased=False`. `final_layer.norm_final` has **no
+  affine parameters** — no such tensor exists.
+- `time_embed.*.freqs` are deterministic constants and are the only tensors
+  identical across all languages. **Compute at load, do not store.**
+
+## Still open
+
 - `current_end [T]` in the voice files: confirm it is a position/length vector
-  and not something the KV load must interpret.
+  and nothing the KV load must interpret. Cheap to settle during E2.
+- Whether F16 voice KV is audibly equivalent to F32 (see "Converter and pack").
+
+## Multi-language packing
+
+Measured: the six language models are **independently trained**, codec included
+(relative L2 ≈ √2 on every probed tensor; only the two `freqs` buffers match).
+So there is no shared codec and no shared latent space:
+
+- one pack per language, ≈219 MB BF16 / ≈110 MB int8, nothing deduplicated
+- a voice KV is valid **only** for the language model that produced it
+- a process serving N languages holds N full weight sets resident
+
+`model.json` therefore describes exactly one language. Multi-language is a
+*deployment* concern, not a pack concern.

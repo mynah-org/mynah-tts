@@ -135,8 +135,10 @@ This is a real TTFA advantage over an engine that must encode a reference clip.
 English one is byte-identical across all three English revisions, and every
 other language differs.
 
-Note the embedding table is `[4001, 1024]` — 4000 pieces plus one extra row.
-Resolve what row 4000 is before writing the lookup.
+The embedding table is `[4001, 1024]`: `nn.Embedding(n_bins + 1, dim)` where the
+extra row is **padding** (`text_conditioner.py`, `LUTConditioner.__init__`). It is
+never produced by the tokenizer. Encoding is a plain `sp.encode(text)` — **no BOS
+or EOS token is added** by the conditioner.
 
 No G2P, no text normalization, no espeak: text goes in as a prefix through the
 LUT conditioner. This removes the single most unpleasant part of the Magpie
@@ -184,3 +186,86 @@ All of them depend on ONNX Runtime or ggml; none is dependency-free C.
 `1920`, `16` (up/downsample stride), `4000`/`4001` (vocab), `[6,5,4]` (SEANet
 ratios), `250` (decoder-transformer context), `512` (flow dim), `6` (flow
 depth), `1` (decode steps), `-4.0` (EOS threshold), `0.7`/`0.3` (temperature).
+
+## 10. Version and language divergence — measured
+
+Tensor payloads were sha256'd and compared across all current-generation
+checkpoints, and relative L2 distances measured on representative tensors.
+
+**The six language models are independently trained, not fine-tuned from a
+shared base.** Relative L2 distance from `english_2026-04` is ≈1.4 (that is,
+≈√2, the value for two unrelated vectors of similar norm) on *every* tensor
+probed, in the backbone, in the flow head, in the conditioner embedding **and in
+the Mimi codec**:
+
+| Tensor | de | it | pt | es |
+|---|---|---|---|---|
+| `mimi.decoder.model.0.conv.weight` | 1.372 | 1.391 | 1.464 | 1.526 |
+| `mimi.decoder_transformer...out_proj.weight` | 1.449 | 1.452 | 1.465 | 1.444 |
+| `flow_lm.transformer.layers.0...out_proj.weight` | 1.222 | 1.326 | 1.255 | 1.274 |
+| `flow_lm.flow_net.res_blocks.0.mlp.0.weight` | 1.426 | 1.414 | 1.409 | 1.407 |
+| `flow_lm.conditioner.embed.weight` | 1.561 | 1.564 | 1.553 | 1.555 |
+
+Of 214 tensors, **exactly 2 are bit-identical across all six languages**:
+`flow_lm.flow_net.time_embed.{0,1}.freqs`. Those are the deterministic sinusoidal
+constants `exp(-log(10000) * arange(128) / 128)` — **compute them at load time,
+do not store them in the pack.**
+
+`flow_lm.emb_mean` / `emb_std`, the latent normalization, also differ per
+language.
+
+### Consequences — these are design constraints, not trivia
+
+1. **Nothing is shareable between language packs, not even the codec.** A
+   6-language deployment is 6 × 219 MB BF16, or ≈6 × 110 MB at int8. Budget for
+   it; there is no "one codec, six heads" saving to be had.
+2. **The latent space is per language.** The VAE differs and so do `emb_mean` /
+   `emb_std`, so a latent, a voice KV, or a decoder state from one language is
+   meaningless in another. This is why upstream ships a separate `embeddings/`
+   directory per language for the *same* 26 voice names.
+3. **Continuous batching cannot mix languages.** Slots batched together must
+   share a language, because they share the weights being streamed. The server
+   scheduler needs a per-language slot group — see
+   [streaming-server-v2.md](streaming-server-v2.md).
+4. `english` and `english_2026-04` are **byte-identical** — same blob, not just
+   the same shapes. Ship one.
+
+## 11. Reference-implementation details that the C code must match
+
+Read out of `kyutai-labs/pocket-tts` (MIT), not guessed. These are the places a
+from-scratch implementation silently diverges.
+
+- **Two different LayerNorms, two different epsilons.**
+  The backbone uses `torch.nn.LayerNorm(d_model, eps=1e-5)` (with weight *and*
+  bias). The flow head uses a **custom** `LayerNorm` (`modules/mlp.py`) with
+  `eps=1e-6` and `var(unbiased=False)`.
+- **`FinalLayer.norm_final` has no affine parameters** (`elementwise_affine=False`),
+  which is why no `flow_net.final_layer.norm_final.*` tensor exists. Do not
+  invent one.
+- **`time_embed.*.mlp.*.alpha` is an RMSNorm gain, and the RMSNorm is
+  non-standard**: `y = x * alpha * rsqrt(eps + var(x))` where `var` is
+  `torch.var(dim=-1)` — mean-subtracted **and** with torch's default
+  `unbiased=True`, i.e. dividing by `N-1`. It is *not* mean-square RMSNorm and it
+  is *not* the `rmsnorm` already in `src/kernels.c`. Getting this wrong produces
+  a small, plausible-looking, entirely wrong output.
+- **`num_time_conds = 2`** — the checkpoint has `time_embed.0` and `time_embed.1`,
+  so the head is LSD with a start and a target time, integrated by `lsd_decode`.
+  `flow_matching` (one time condition, `ot_decode`) is the other released option
+  and is not what these weights are.
+- **Flow head forward, exactly:**
+  ```
+  y = cond_embed(c) + (time_embed[0](s) + time_embed[1](t)) / 2
+  x = input_proj(latent_noise)
+  per res block:  shift, scale, gate = Linear(SiLU(y)).chunk(3)
+                  h = mlp(in_ln(x) * (1 + scale) + shift)      # mlp = Lin,SiLU,Lin
+                  x = x + gate * h
+  final:          shift, scale = Linear(SiLU(y)).chunk(2)
+                  out = linear(norm_final(x) * (1 + scale) + shift)
+  ```
+  Note `SiLU` is applied to `y` **before** the adaLN linear, and `modulate` is
+  `x * (1 + scale) + shift`.
+- **TimestepEmbedder:** `args = t * freqs`; `emb = cat([cos(args), sin(args)])`
+  (cos first); then `Linear(256→512)`, `SiLU`, `Linear(512→512)`, `RMSNorm`.
+- **Backbone FFN activation** is `F.gelu(x, approximate="tanh")`. `src/kernels.c`
+  has a Padé approximation — check it against the oracle rather than assuming the
+  two agree to tolerance.
