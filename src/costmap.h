@@ -1,0 +1,302 @@
+/* costmap.h — the region profiler: where the wall time of one synthesis goes.
+ *
+ * The semantics below were fixed BEFORE any number was collected, which is the
+ * only reason numbers from the driver, the engine, the codec and the server can
+ * be put in the same table at all.  Ported from qwen-tts, where the same file
+ * answered "the conv decoder is ~40% of wall" — a fact that redirected a whole
+ * epic away from optimizing the transformer first.
+ *
+ * SEMANTICS
+ *
+ *   INCLUSIVE.  A region's time contains every region entered inside it.
+ *   Exclusive ("self") time is DERIVED at report time as ns - child_ns and is
+ *   never measured separately, so the two can never be silently mixed.
+ *
+ *   NESTING IS DECLARED AND VERIFIED.  Each region declares its parent
+ *   statically in the table in costmap.c.  A begin whose dynamic parent is not
+ *   the declared one increments nest_mismatch for that region and is otherwise
+ *   accepted: the report shows the mismatch instead of quietly attributing the
+ *   time to the wrong place.  MYNAH_RGN_MULTI declares a region that
+ *   legitimately has several parents (the pool dispatch runs under all of them).
+ *
+ *   ACCUMULATION IS THREAD-LOCAL.  No atomic read-modify-write on the hot path
+ *   and no allocation inside a region: each thread's block is calloc'd once, on
+ *   its first marker, and linked into a global list under a mutex that one
+ *   thread touches exactly once.  Merging happens only at dump time.
+ *
+ *   CLOCK_MONOTONIC, nanoseconds, one clock read per begin and one per end.
+ *
+ *   IDS ARE APPEND-ONLY.  A report produced by an older binary must keep its
+ *   meaning.  Never renumber; append, and leave gaps where a family may grow.
+ *
+ * LEVELS (env MYNAH_COST_MAP)
+ *
+ *   0 / unset   off.  One relaxed load of an int and a predictable branch per
+ *               marker; nothing else runs.
+ *   1           macro regions: request, prepare, per-AR-step, codec decode,
+ *               streaming emit, server admission.  Nothing inside a per-layer
+ *               or per-stream loop.
+ *   2           adds the fine regions: the phases inside one AR step, the
+ *               per-stream local-transformer iteration, the codec sub-stages.
+ *               These sit in hot loops (never in an inner kernel) and are
+ *               opt-in precisely so level 1 stays cheap enough to leave on.
+ *
+ * OUTPUT
+ *
+ *   A human table on stderr at exit when MYNAH_COST_MAP is set, and/or JSON to
+ *   MYNAH_COSTMAP_JSON ("%d" in the path becomes the pid, so a forked server
+ *   writes one file per worker).
+ *
+ * INSTRUMENTATION IS NOT IN THIS COMMIT.  This file and costmap.c define the
+ * taxonomy and the API only; src/inference.c, src/engine_magpie.c and
+ * src/codec_nanocodec.c are being refactored in parallel and get their markers
+ * afterwards.  The region list below is already shaped for where those markers
+ * go — the comment on each id names the call site it is waiting for.
+ */
+#ifndef MYNAH_TTS_COSTMAP_H
+#define MYNAH_TTS_COSTMAP_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+enum {
+    MYNAH_RGN_NONE = 0,
+
+    /* ---- one request, driver level (src/inference.c) --------------------- */
+    MYNAH_RGN_REQUEST = 1,       /* synthesize_slots(): whole batch of slots   */
+    MYNAH_RGN_PREPARE,           /* slot_prepare() / engine prepare()          */
+    MYNAH_RGN_TOKENIZE,          /* text -> token ids (tokenizer*.c)           */
+    MYNAH_RGN_ENCODER,           /* text/context encoder stack                 */
+    MYNAH_RGN_PREFILL,           /* decoder KV prefill over the conditioning   */
+    MYNAH_RGN_FINALIZE,          /* slot_finalize(): trailing decode + trim    */
+
+    /* ---- one autoregressive step (engine step_batch/emit_batch) ---------- */
+    MYNAH_RGN_STEP = 10,         /* step_batch(): one AR step, whole batch     */
+    MYNAH_RGN_STEP_EMBED,        /* frame/token embedding + conditioning  (L2) */
+    MYNAH_RGN_STEP_BACKBONE,     /* the decoder transformer stack         (L2) */
+    MYNAH_RGN_STEP_ATTENTION,    /* self + cross attention inside it      (L2) */
+    MYNAH_RGN_STEP_FFN,          /* the feed-forward half of the stack    (L2) */
+    MYNAH_RGN_STEP_HEAD,         /* head projection + argmax / sampling        */
+    MYNAH_RGN_EMIT = 18,         /* emit_batch(): frames appended + EOS        */
+
+    /* ---- local transformer / depth head (src/engine_magpie.c) ------------ */
+    MYNAH_RGN_LOCAL = 20,        /* the whole local transformer for one step   */
+    MYNAH_RGN_LOCAL_STEP,        /* one stacked-stream iteration          (L2) */
+    MYNAH_RGN_LOCAL_PROJ,        /* per-stream out projection + embed     (L2) */
+
+    /* ---- codec (src/codec_nanocodec.c, src/seanet.c, src/conv1d.c) ------- */
+    MYNAH_RGN_CODEC = 28,        /* decode_audio(): frames -> PCM              */
+    MYNAH_RGN_CODEC_EMBED,       /* codebook lookup / latent projection   (L2) */
+    MYNAH_RGN_CODEC_TRANSFORMER, /* the codec's own transformer, if any   (L2) */
+    MYNAH_RGN_CODEC_CONV,        /* SEANet / upsampling conv stack        (L2) */
+    MYNAH_RGN_CODEC_POST,        /* final conv, windowing, overlap trim   (L2) */
+
+    /* ---- streaming (src/inference.c emit_stream_samples, server/) -------- */
+    MYNAH_RGN_STREAM_EMIT = 36,  /* the audio callback: the CONSUMER's time,
+                                  * inside the synthesis loop. It is here so a
+                                  * slow sink stops looking like slow decode.  */
+
+    /* ---- runtime / server ------------------------------------------------ */
+    MYNAH_RGN_RT_REQUEST = 40,   /* accept -> response complete      (derived) */
+    MYNAH_RGN_RT_ADMISSION,      /* enqueue -> admitted into a batch (derived) */
+    MYNAH_RGN_RT_PARALLEL,       /* mynah_parallel_for dispatch        (MULTI) */
+    MYNAH_RGN_RT_PARALLEL_WAIT,  /* caller done, waiting for the workers       */
+    MYNAH_RGN_MODEL_LOAD,        /* mmap + weight resolve, once per process    */
+
+    /* ---- parallel work decomposition (MULTI parents) ---------------------
+     * Wall time alone cannot say a region ran on two of six workers. These
+     * carry the decomposition itself; see mynah_region_units_at below.      */
+    MYNAH_RGN_WORK_MATVEC = 48,  /* qmat row blocks claimed per worker         */
+    MYNAH_RGN_WORK_ARGMAX,       /* argmax row blocks claimed per worker       */
+    MYNAH_RGN_WORK_CONV,         /* codec conv panels claimed per worker       */
+
+    MYNAH_RGN_MAX = 51
+};
+
+/* Declared parent of a region that legitimately has several. */
+#define MYNAH_RGN_MULTI (-1)
+
+/* 0 = off, 1 = macro, 2 = macro + fine.  Read directly by the inline markers,
+ * which is why it is a plain int and not behind a function call. */
+extern int mynah_costmap_level_v;
+
+/* Reads MYNAH_COST_MAP once.  Called from a constructor, so a marker reached
+ * before main() still sees the right level; calling it again is harmless. */
+void mynah_costmap_init(void);
+int  mynah_costmap_level(void);
+
+void mynah_region_begin_(int id);
+void mynah_region_end_(int id);
+
+static inline void mynah_region_begin(int id) {
+    if (mynah_costmap_level_v) mynah_region_begin_(id);
+}
+static inline void mynah_region_end(int id) {
+    if (mynah_costmap_level_v) mynah_region_end_(id);
+}
+/* Fine (level 2) markers are separate entry points so a level-1 run never even
+ * reaches the call: that is what keeps the per-layer sites off level 1's cost. */
+static inline void mynah_region_begin2(int id) {
+    if (mynah_costmap_level_v > 1) mynah_region_begin_(id);
+}
+static inline void mynah_region_end2(int id) {
+    if (mynah_costmap_level_v > 1) mynah_region_end_(id);
+}
+
+/* Open `id` only if it is not already open on this thread; returns 1 when it
+ * opened, and only then must the caller end it.  Needed wherever a public
+ * entry point may delegate to another one that opens the same region — the
+ * total would otherwise be counted twice. */
+int mynah_region_begin_unique_(int id);
+static inline int mynah_region_begin_unique(int id) {
+    return mynah_costmap_level_v ? mynah_region_begin_unique_(id) : 0;
+}
+
+/* Depth of this thread's region stack, and "close everything above `depth`".
+ * An entry point records the depth just after opening its own region and
+ * unwinds to it on every exit path, so the error returns scattered through a
+ * decoder body cannot leave a region open forever.  Whatever is unwound is
+ * counted as `leaked` and appears in the report rather than skewing it. */
+int  mynah_region_depth(void);
+void mynah_region_unwind(int depth);
+
+/* Add a duration that was NOT measured by a begin/end pair on one thread.  The
+ * server's request lifecycle is recorded as timestamps by threads that hand the
+ * job to each other, so no thread-local stack can bracket it.  Those regions
+ * are declared mode="derived" in the table and marked as such in the report, so
+ * nobody reads them as if they had been measured the same way as the rest. */
+void mynah_region_add_ns(int id, unsigned long long ns);
+
+/* The same clock the regions use, for a caller that accumulates a phase itself
+ * and submits it once. */
+unsigned long long mynah_costmap_now_ns(void);
+
+/* ---- pool occupancy ------------------------------------------------------
+ *
+ *   mynah_region_pool_at(id, threads, tasks)  the dispatch: workers asked for,
+ *                                             units offered
+ *   mynah_region_units_at(id, n)              a worker claiming n units
+ *   mynah_region_workers_at(id, entered)      workers that actually entered the
+ *                                             job body, counted by the job
+ *
+ * The id is explicit because a pool worker runs on its own thread with its own
+ * region stack: it is not "inside" the caller's region and cannot infer the
+ * attribution.  Occupancy is derived at report time as (threads that claimed at
+ * least one unit) / (threads the dispatch asked for).  Counting entries rather
+ * than inferring them from which threads happened to touch a marker matters: a
+ * thread that never reaches a marker leaves no record, and turning that silence
+ * into an underfill claim would be a lie. */
+void mynah_region_pool_at_(int id, int threads, long long tasks);
+void mynah_region_units_at_(int id, long long n);
+void mynah_region_workers_at_(int id, int entered);
+/* Count an event WITHOUT reading the clock, where the event is frequent but its
+ * duration already sits inside a coarser region. */
+void mynah_region_tick_at_(int id, long long n);
+
+static inline void mynah_region_pool_at(int id, int threads, long long tasks) {
+    if (mynah_costmap_level_v) mynah_region_pool_at_(id, threads, tasks);
+}
+static inline void mynah_region_units_at(int id, long long n) {
+    if (mynah_costmap_level_v) mynah_region_units_at_(id, n);
+}
+static inline void mynah_region_workers_at(int id, int entered) {
+    if (mynah_costmap_level_v) mynah_region_workers_at_(id, entered);
+}
+static inline void mynah_region_tick_at(int id, long long n) {
+    if (mynah_costmap_level_v) mynah_region_tick_at_(id, n);
+}
+/* Level-2 variants: per-row-block accounting is a micro-event and belongs to
+ * the deep run, while level 1 keeps only the coarse dispatch summary. */
+static inline void mynah_region_units_at2(int id, long long n) {
+    if (mynah_costmap_level_v > 1) mynah_region_units_at_(id, n);
+}
+static inline void mynah_region_pool_at2(int id, int threads, long long tasks) {
+    if (mynah_costmap_level_v > 1) mynah_region_pool_at_(id, threads, tasks);
+}
+
+/* Label the calling thread ("main", "worker", "scheduler", "writer", ...).
+ * Purely descriptive: regions are accumulated per OS thread regardless. */
+void mynah_region_thread_role(const char *role);
+
+/* One completed request, so the report can print ms/request. */
+void mynah_costmap_request_done(void);
+/* Stop counting completed requests for a while — a server pre-warm runs a full
+ * synthesis that nobody asked for, and counting it dilutes every ms/request. */
+void mynah_costmap_count_requests(int on);
+
+/* Drop everything accumulated before a fork: a prefork server loads the model
+ * and pre-warms in the parent, and merging N workers would otherwise count that
+ * work N times. */
+void mynah_costmap_after_fork(void);
+
+/* Reset every counter, including the thread blocks of threads that have exited.
+ * For tests, and for a benchmark that wants the warmup out of its numbers. */
+void mynah_costmap_reset(void);
+
+/* ---- reporting ---------------------------------------------------------- */
+
+/* Human table, merged across threads.  `out_file` is a FILE* (NULL = stderr).
+ * Returns the number of regions printed, or -1. */
+int mynah_costmap_report(void *out_file);
+/* Same data as JSON, one object per thread plus a merged section. */
+int mynah_costmap_report_json(void *out_file);
+/* JSON to `path`; "%d" becomes the pid.  NULL uses MYNAH_COSTMAP_JSON and is a
+ * no-op when that is unset. */
+int mynah_costmap_dump(const char *path);
+
+/* ---- merged read-back, for tests and for a caller that wants the numbers -- */
+typedef struct {
+    int                id;
+    const char        *name;
+    const char        *component;
+    int                parent;
+    int                level;
+    const char        *mode;          /* "stack" or "derived"                 */
+    unsigned long long calls;
+    unsigned long long ns;            /* INCLUSIVE                            */
+    unsigned long long child_ns;      /* self_ns = ns - child_ns              */
+    unsigned long long nest_mismatch;
+    unsigned long long units;
+    unsigned long long tasks;
+    unsigned long long dispatches;
+    unsigned long long entered;
+    unsigned long long ticks;
+    unsigned           pool_threads;  /* widest dispatch seen                 */
+    unsigned           threads_seen;  /* threads that touched this region     */
+} mynah_region_stat;
+
+/* Merge every thread's block into `out`, one entry per region that has any
+ * activity.  Returns the number written, or -1. */
+int mynah_costmap_merge(mynah_region_stat *out, int capacity);
+
+/* Totals that are not per-region: use for a health line. */
+typedef struct {
+    unsigned long long requests;
+    unsigned long long threads;
+    unsigned long long stack_overflow;  /* begins dropped, stack was full     */
+    unsigned long long unbalanced;      /* ends that did not match the top    */
+    unsigned long long leaked;          /* regions closed by an unwind        */
+    unsigned long long nest_mismatch;   /* declared parent != dynamic parent  */
+} mynah_costmap_health;
+void mynah_costmap_health_get(mynah_costmap_health *out);
+
+/* Static taxonomy. */
+const char *mynah_region_name(int id);
+int         mynah_region_parent(int id);
+int         mynah_region_level(int id);
+const char *mynah_region_component(int id);
+
+/* Model-free check: nesting accepted, bad nesting DETECTED, unbalanced end
+ * detected, unwind accounting, and two threads accumulating independently.
+ * 0 = ok, -1 = error.  It needs an empty map to assert exact counts, so it
+ * calls mynah_costmap_reset() on entry and on exit and restores the level:
+ * run it from --self-test, never in the middle of a profiled synthesis. */
+int mynah_costmap_self_test(char *error, size_t error_capacity);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* MYNAH_TTS_COSTMAP_H */

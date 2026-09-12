@@ -95,3 +95,63 @@ Per kernel:
 Machines: M1 (macOS arm64) and EPYC Zen 5 (Linux x86-64) are the two that exist
 today. ARM server (Graviton/Grace) has never been measured — leave it as a gap in
 `docs/performance.md` rather than an assumption.
+
+## E4-2 done — 2026-09-12: the dispatch report
+
+`src/dispatch.{c,h}` and `src/costmap.{c,h}`, wired into `CORE_SOURCES` and
+`mynah-tts --dispatch-map [--json]`.
+
+**The rule was implemented as the rule, not as a convenience**: `resolved` is
+never `compiled && supported`. Every row declares its provenance in the reason —
+`[runtime]` when a real predicate was called (`mynah_num_threads`,
+`mynah_backend_open`, the self-tests, sysctl, CPUID+XGETBV), `[gate]` for
+compile-time dispatch with no fallback, `[predicate]` when a module registers
+its own, and `[UNKNOWN]` when nobody exports one.
+
+The sharpest of those is `mynah_qmat_cache_new(qtype)` +
+`mynah_qmat_cache_enabled()`: that is **qmat's own answer**. Ask for f16 on a
+build without the NEON converts and the cache silently downgrades to f32 — the
+report says so.
+
+**Eight rows resolve to UNKNOWN**, and each names the wrapper that would fix it.
+That is E4's real to-do list, not a gap to paper over:
+`mynah_cpu_matvec_mode()` (the row that would hide a rows=1 regression),
+`mynah_qmat_argmax_mt_resolved()`, `mynah_qmat_cache_row4()`,
+`mynah_qmat_cache_qtype()`, `mynah_blas_owned()`,
+`mynah_gelu_vector_enabled()`, `mynah_conv1d_sgemm_enabled()`,
+`mynah_snake_vector_enabled()`. **UNKNOWN is never replaced by a guess.**
+
+There is also a **drift canary**: the mirrored f16 gate is compared at runtime
+against what `qmat.c` actually does, and prints `DRIFT` if per-TU flags ever
+diverge.
+
+### The false claim can no longer survive
+
+On x86 with `SIMD=avx512`, `isa.x86.avx512f` reports `compiled=yes` but
+`resolved=OFF` with "COMPILER FLAG ONLY: no `_mm512_*` intrinsic exists anywhere
+under src/", and `isa.x86.avx512vnni` reports NOT IMPLEMENTED **and cites the
+EPYC 0.427 figure as AVX2**. A future attribution error has to get past this
+report first.
+
+### Cost map
+
+Regions are declared for *this* runtime with append-only ids and gaps to grow
+into, inclusive semantics with `self = ns - child_ns` derived at report time,
+nesting declared statically **and verified at runtime**, zero malloc (thread-local
+blocks from a static array, one relaxed `fetch_add` to claim a slot), and no
+per-region atomics on the hot path. **No hooks are placed yet** — each id carries
+the call site it is waiting for, because `inference.c` and the engines were being
+refactored in parallel.
+
+It reports its own health: unbalanced regions, leaked regions from an early
+return, nest mismatches and exhausted thread slots, each as a counter plus a
+warning, so a broken measurement announces itself instead of producing a
+plausible number.
+
+### Coverage limit, stated
+
+x86 was verified by **real x86_64 codegen** through the universal SDK (Mach-O
+objects, every `#if defined(__x86_64__)` actually compiled, CPUID and XGETBV
+included) plus a forced compile of the aarch64-Linux branch. A true
+`--target=x86_64-linux-gnu` build is not possible on this machine — there is no
+Linux sysroot — so **Linux coverage needs CI or a sysroot**, and is not claimed.

@@ -143,7 +143,10 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 **No kernel is done until both ISAs exist and self-test. GPU deferred.**
 
 - [ ] E4-1 **correct the AVX-512 VNNI claim** in `README.md` — the code is AVX2 only
-- [ ] E4-2 port `dispatch` (`--dispatch-map`) and `costmap` from qwen-tts
+- [x] E4-2 `--dispatch-map` + costmap **done**; 8 rows resolve UNKNOWN and each names the
+      predicate to add — that is E4's real to-do list
+- [ ] E4-2a add the 8 named predicates so no row resolves UNKNOWN
+- [ ] E4-2b place the costmap hooks (deferred: the engines were being refactored)
 - [ ] E4-3 baseline per-region profile of the PocketTTS path, on M1 and on EPYC
 - [ ] E4-4 thread pool upgrade: lane split, deadline priority, `after_fork` (prereq for E5-6)
 - [ ] E4-5 the kernel the profile names — scalar reference, then NEON/SDOT/i8mm **and** AVX2/AVX-512/VNNI in one change

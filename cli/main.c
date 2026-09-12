@@ -8,6 +8,7 @@
 #include "flow_head.h"
 #include "seanet.h"
 #include "transformer_ar.h"
+#include "dispatch.h"
 
 #include <math.h>
 #include <errno.h>
@@ -467,6 +468,14 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "--version") == 0) {
         puts(MYNAH_TTS_VERSION);
+        return 0;
+    }
+    if (strcmp(argv[1], "--dispatch-map") == 0) {
+        /* Every ISA claim in this repo has to survive this report: it resolves
+         * each feature by calling the runtime predicate, never by re-deriving
+         * compiled && supported. See .work/cpu-kernels-arm-x86.md. */
+        const int as_json = argc == 3 && strcmp(argv[2], "--json") == 0;
+        mynah_dispatch_report(stdout, as_json);
         return 0;
     }
     if (strcmp(argv[1], "--self-test") == 0) {
