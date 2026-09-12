@@ -81,7 +81,7 @@ INGOT_LIB := $(INGOT_DIR)/libingot.a
 CPPFLAGS += -I$(INGOT_DIR)/include
 LDLIBS += $(INGOT_LIB)
 
-CORE_SOURCES := src/mynah_tts.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/engine_magpie.c src/inference.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c
+CORE_SOURCES := src/mynah_tts.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/engine_magpie.c src/inference.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)

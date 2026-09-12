@@ -134,3 +134,50 @@ So there is no shared codec and no shared latent space:
 
 `model.json` therefore describes exactly one language. Multi-language is a
 *deployment* concern, not a pack concern.
+
+## E3-3 and E3-4 implemented — 2026-09-12
+
+`src/flow_head.{c,h}` and `src/seanet.{c,h}`, wired into `CORE_SOURCES` and
+`--self-test`. Parity against the oracle with the real BF16 weights:
+
+| stage | max abs error | tolerance |
+|---|---|---|
+| flow head, calls 0-3 | 5.4e-07 … **1.07e-06** | 1e-4 |
+| `mimi.upsample` | **0.0** (bit-identical) | 1e-4 |
+| SEANet decoder, calls 0-3 | 3.0e-07 … **5.7e-07** | 1e-3 |
+| SEANet 4×1 frame vs 1×4 frames | **2.98e-07** | — |
+
+The last row is the one that matters for streaming: carrying state per frame
+reproduces a four-frame decode, which is E2-3's decision holding in C.
+
+UBSan, ASan and ASan+UBSan clean on both the self-tests and the real-weight
+parity; `leaks` reports zero.
+
+Design points worth keeping:
+
+- **Neither `mynah_layernorm_f32` nor `mynah_rmsnorm_f32` was reusable.** The
+  first requires a non-NULL weight and `norm_final` has no affine parameters;
+  the second is mean-square, not unbiased variance. The self-test **asserts that
+  the two RMSNorms disagree**, so substituting one for the other fails the test
+  instead of silently changing the output.
+- The time-embedding branch is memoized on the bit pattern of the times, since
+  `s=0` and `t=1` are constant for a whole utterance. The self-test checks both
+  that a cache hit does not change the output and that a different time does.
+- The transposed convolution reproduces `StreamingConvTranspose1d` **including
+  the bias handling**: `y[:PT] += partial`, then `partial = y[-PT:] - bias`.
+- The position counter lives in the state, advances by `encoder_stride ×
+  n_latents`, resets with `_reset`, and is reachable only through
+  `mynah_seanet_state_position`/`_advance` — so a caller that ignores it is
+  ignoring it visibly rather than silently, which is the E2-3 failure mode.
+- No tensor name is formatted inside either module; weights arrive as resolved
+  `float *`.
+
+### Open inconsistency to reconcile
+
+`conv1d.h` (from E1 step 2) exposes
+`mynah_conv1d_causal(const mynah_weights *file, ..., const char *weight_name)` —
+it resolves weights **by name**, which is exactly the pattern
+[engine-seam-refactor.md](engine-seam-refactor.md) risk 6 warns against. The new
+modules take resolved pointers. Both cannot be the shared form; the
+pointer-taking one is right, and `conv1d` should be narrowed to match when the
+vtable lands.

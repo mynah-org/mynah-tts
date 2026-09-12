@@ -208,8 +208,21 @@ the Mimi codec**:
 
 Of 214 tensors, **exactly 2 are bit-identical across all six languages**:
 `flow_lm.flow_net.time_embed.{0,1}.freqs`. Those are the deterministic sinusoidal
-constants `exp(-log(10000) * arange(128) / 128)` — **compute them at load time,
-do not store them in the pack.**
+constants `exp(-log(10000) * arange(128) / 128)`.
+
+**Correction, measured 2026-09-12 while implementing `src/flow_head.c`:** an
+earlier version of this note said to compute them at load and not store them.
+Computing them *exactly* is wrong. The checkpoint stores them in **BF16**, and
+the reference implementation uses those rounded values, so an exact computation
+diverges: 1.39e-03 on `freqs` itself, 9.79e-04 on the time embedding, and
+**8.63e-05 on the emitted latent** — inside the 1e-4 tolerance, but consuming
+the entire budget for one constant.
+
+Rounding the computed value to BF16 (round-half-to-even) reproduces the
+checkpoint tensor **bit for bit**, 0 mismatches out of 128, and drops the latent
+error to 1.07e-06 — two orders of magnitude. So: compute at load, **then round
+to BF16**. Either store them or round them; do not compute them in full
+precision and assume that is more correct.
 
 `flow_lm.emb_mean` / `emb_std`, the latent normalization, also differ per
 language.

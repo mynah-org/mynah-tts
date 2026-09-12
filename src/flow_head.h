@@ -32,7 +32,13 @@
  *   3. `freqs` are the deterministic constants
  *          exp(-log(max_period) * arange(half) / half)
  *      identical in every released checkpoint.  They are computed here at
- *      create time and must not be read from the model pack.
+ *      create time and must not be read from the model pack -- but they are
+ *      *stored* in BF16, and the reference runtime uses the rounded values.
+ *      Measured against build/oracle-pocket: computing them exactly costs
+ *      9.8e-4 on the time embedding and 8.6e-5 on the emitted latent, which
+ *      eats almost the whole 1e-4 budget; rounding the computed values to
+ *      BF16 reproduces the checkpoint bit for bit and brings the time
+ *      embedding back to 4.8e-7.  Hence `freqs_bf16_rounded`, on by default.
  *
  * No dimension is baked in: everything comes from `mynah_flow_head_config`.
  * Weights arrive as already-resolved float pointers; this module never formats
@@ -57,6 +63,8 @@ typedef struct {
     float max_period;      /* 10000.0f                                      */
     float layernorm_eps;   /* 1e-6f                                         */
     float rmsnorm_eps;     /* 1e-5f                                         */
+    int freqs_bf16_rounded; /* 1: round the computed freqs to BF16, which is
+                             * what the released checkpoints store.         */
 } mynah_flow_head_config;
 
 /* Fills `config` with the PocketTTS defaults for the given dimensions.  The
@@ -152,6 +160,10 @@ void mynah_flow_modulate_f32(const float *input, const float *shift,
 
 /* Writes exp(-log(max_period) * i / half) for i in [0, half). */
 void mynah_flow_timestep_freqs_f32(float *freqs, size_t half, float max_period);
+
+/* Rounds each value to BF16 precision (round half to even) and widens it back
+ * to f32, i.e. what a BF16 checkpoint round trip does. */
+void mynah_flow_round_bf16_f32(float *values, size_t n);
 
 /* Model-free self test of every kernel above plus a full tiny forward.
  * Returns 0 on success, -1 with a message in `error`. */

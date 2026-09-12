@@ -95,8 +95,9 @@ Needs E1 and E2.
 - [x] E3-2 `src/tokenizer_sentencepiece.{c,h}` **done** → [`.work/tokenizer-sentencepiece.md`](.work/tokenizer-sentencepiece.md)
       1734 LOC, in `CORE_SOURCES` and `--self-test`; `make tokenizer-parity` replays
       45,197 oracle cases / 2.1M ids across 5 languages; UBSan, ASan and leaks clean
-- [ ] E3-3 `src/flow_head.c`: time embedding, adaLN, 6 res-blocks, 1 LSD step
-- [ ] E3-4 `src/seanet.c`: causal conv1d / transposed conv + streaming state
+- [x] E3-3 `src/flow_head.{c,h}` **done** — oracle parity 1.07e-06 against a 1e-4 tolerance
+- [x] E3-4 `src/seanet.{c,h}` **done** — SEANet parity 5.7e-07; chunked-vs-one-shot 2.98e-07,
+      so E2-3's carried-state decision holds in C
 - [ ] E3-5 `src/engine_pocket.c`: AR step, EOS at `-4.0`, latent denorm
 - [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias** (two different
       epsilons), **variance-based RMSNorm** (`unbiased=True`, *not* `kernels.c:rmsnorm`),

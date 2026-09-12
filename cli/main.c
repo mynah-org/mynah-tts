@@ -5,6 +5,8 @@
 #include "qmat.h"
 #include "tokenizer.h"
 #include "tokenizer_sentencepiece.h"
+#include "flow_head.h"
+#include "seanet.h"
 
 #include <math.h>
 #include <errno.h>
@@ -482,6 +484,14 @@ int main(int argc, char **argv) {
         }
         if (mynah_graph_bnns_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "BNNS graph self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_flow_head_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "flow head self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_seanet_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "SEANet self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_sp_self_test(error, sizeof(error)) != 0) {
