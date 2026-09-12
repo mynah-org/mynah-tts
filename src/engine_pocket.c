@@ -31,6 +31,10 @@
 #define POCKET_PATH_MAX 4096u
 #define POCKET_MANIFEST_MAX (4u * 1024u * 1024u)
 #define POCKET_QNAME_MAX 48u
+/* How many requests one backbone pass may serve.  The driver clamps this to its
+ * own MYNAH_GRAPH_MAX_JOBS; the number here is what the engine can actually do
+ * without the batch scratch becoming the dominant per-slot cost. */
+#define POCKET_MAX_BATCH 16u
 
 /* ------------------------------------------------------------------ errors */
 
@@ -365,9 +369,26 @@ typedef struct {
 typedef struct {
     mynah_qmat_cache *qcache;
     const mynah_backend *backend;
-    char *names; /* [layers * 4][POCKET_QNAME_MAX], flat */
-    size_t layers;
+    char *names; /* [groups * kinds][POCKET_QNAME_MAX], flat */
+    size_t groups;
+    size_t kinds;
 } pocket_linear_hook;
+
+/* The hook as one *caller* sees it: the model's shared key table plus the
+ * scratch the weight-stationary kernel needs.  The table is read-only and
+ * shared; the scratch is not, so there is one of these per context (for its own
+ * prefill tiles) and one per driver batch (for the cross-request step).  Wiring
+ * the shared hook straight into `linear_user` would have made two requests share
+ * one activation buffer, which is CLAUDE.md rule 3 with a data race attached. */
+typedef struct {
+    const pocket_linear_hook *hook;
+    size_t rows;   /* widest call this scratch can serve */
+    size_t k_max;  /* widest reduction this scratch can serve */
+    int8_t *qx;    /* [rows][k_max] int8 activations */
+    float *sx;     /* [rows] activation scales */
+    const float **in_ptr;  /* [rows], the row view of a contiguous tile */
+    float **out_ptr;       /* [rows] */
+} pocket_call;
 
 /* ---------------------------------------------------------- model weights */
 
@@ -383,6 +404,7 @@ struct mynah_engine_state {
     const mynah_backend *backend;
     pocket_linear_hook backbone_hook;
     pocket_linear_hook codec_hook;
+    pocket_linear_hook flow_hook;
 
     /* backbone */
     mynah_transformer_ar_layer *backbone_layers;
@@ -438,6 +460,15 @@ struct mynah_engine_ctx {
     mynah_transformer_ar_state *codec_transformer;
     mynah_seanet_state *codec;
 
+    /* The model's weight struct with this context's own projection scratch
+     * bound in.  The layers themselves are still the model's. */
+    pocket_call backbone_call;
+    pocket_call codec_call;
+    pocket_call flow_call;
+    mynah_transformer_ar_weights backbone_w;
+    mynah_transformer_ar_weights codec_w;
+    mynah_flow_head_weights flow_w;
+
     ingot_st *voice_file;
     size_t voice_positions;
     float *voice_kv; /* [2][voice_positions][heads][head_dim] */
@@ -463,6 +494,11 @@ struct mynah_engine_ctx {
     size_t eos_step; /* SIZE_MAX until the logit first crosses the threshold */
     int prepared;
     int eos;
+    /* The step budget was reached before EOS.  Kept as a flag rather than
+     * reported as an error: the driver has no budget check of its own, and a
+     * batched step fails all its slots or none, so raising an error here would
+     * let one request's length cap kill fifteen strangers. */
+    int budget_exhausted;
     /* A per-request failure leaves the backbone one position ahead of the
      * frame history, which no later call can reconcile. The request is over;
      * saying so is the difference between a failed request and a context that
@@ -488,6 +524,25 @@ struct mynah_engine_ctx {
 
 struct mynah_engine_scratch {
     size_t batch;
+    /* The cross-request step: one stacked activation set and one projection
+     * scratch for the whole batch, owned by the driver rather than by any
+     * request in it. */
+    mynah_transformer_ar_batch *backbone_batch;
+    pocket_call backbone_call;
+    mynah_transformer_ar_weights backbone_w;
+    mynah_transformer_ar_state **states; /* [batch] */
+    const float **inputs;                /* [batch] */
+    float **outputs;                     /* [batch] */
+    /* The flow head, same arrangement.  The row set is not the same as the
+     * backbone's: a request whose step was the terminal one draws no latent, so
+     * emit runs over a subset of the slots that stepped. */
+    mynah_flow_head_batch *flow_batch;
+    pocket_call flow_call;
+    mynah_flow_head_weights flow_w;
+    mynah_flow_head **flow_heads; /* [batch] */
+    const float **flow_cond;      /* [batch] */
+    const float **flow_noise;     /* [batch] */
+    float **flow_out;             /* [batch] */
 };
 
 /* --------------------------------------------------------------- the RNG
@@ -527,29 +582,219 @@ static float pocket_rng_normal(mynah_engine_ctx *ctx) {
 
 /* ------------------------------------------------------ the linear hook */
 
+/* Is the model's cache holding a quantized copy of the weights at all?  When it
+ * is not, the projections must stay on exactly the kernels the f32 build used
+ * before any of this existed, or a "no quantization" run would silently change
+ * its numbers. */
+static int pocket_call_quantized(const pocket_call *call) {
+    return call != NULL && call->hook != NULL &&
+           mynah_qmat_cache_qtype(call->hook->qcache) != 0;
+}
+
+static const char *pocket_call_name(const pocket_call *call, size_t group,
+                                    size_t kind) {
+    return call->hook->names +
+           (group * call->hook->kinds + kind) * (size_t)POCKET_QNAME_MAX;
+}
+
+/*
+ * One projection, for `count` contiguous rows that belong to ONE request.
+ *
+ * The row count here is a function of that request alone -- a prefill tile of
+ * positions, or the codec's fixed 16-position stride -- never of who else is in
+ * flight, so this call is free to read the weight once for the whole tile even
+ * when that reassociates the sum differently from a matvec.  That is the entire
+ * point: the decoder transformer was running 16 positions as 16 full passes over
+ * the same weights.
+ */
+static int pocket_call_linear(pocket_call *call, size_t group, size_t kind,
+                              const float *weight, const float *bias,
+                              const float *in, float *out, size_t count, size_t k,
+                              size_t n) {
+    if (call == NULL || call->hook == NULL || group >= call->hook->groups ||
+        kind >= call->hook->kinds) {
+        return -1;
+    }
+    const pocket_linear_hook *hook = call->hook;
+    const char *name = pocket_call_name(call, group, kind);
+    const int quantized = pocket_call_quantized(call);
+    if (count == 1u) {
+        if (!quantized) {
+            /* The f32 build's own kernel, bit for bit. */
+            mynah_matvec_bias_f32(weight, in, bias, out, n, k);
+            return 0;
+        }
+        return mynah_qmat_linear_resolved(hook->qcache, hook->backend, name, weight,
+                                          in, out, 1u, k, n, bias, NULL, 0);
+    }
+    if (quantized) {
+        if (count <= call->rows && k <= call->k_max) {
+            for (size_t b = 0; b < count; ++b) {
+                call->in_ptr[b] = in + b * k;
+                call->out_ptr[b] = out + b * n;
+            }
+            return mynah_qmat_linear_batched(hook->qcache, hook->backend, name,
+                                             weight, call->in_ptr, call->out_ptr,
+                                             count, k, n, bias, call->qx, call->sx,
+                                             NULL, 0);
+        }
+        /* No scratch this wide: keep every row on the quantized path it would
+         * have taken alone rather than silently switching it to f32. */
+        for (size_t b = 0; b < count; ++b) {
+            if (mynah_qmat_linear_resolved(hook->qcache, hook->backend, name, weight,
+                                           in + b * k, out + b * n, 1u, k, n, bias,
+                                           NULL, 0) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+    /* f32: one GEMM over the tile instead of `count` matvecs. */
+    return mynah_backend_matmul(hook->backend, in, out, count, k, n, weight, bias,
+                                NULL, 0);
+}
+
+/*
+ * The same projection for rows that belong to DIFFERENT requests.
+ *
+ * `mynah_qmat_linear_batched` quantizes each activation row on its own, so the
+ * batch width never reaches the arithmetic and row b comes out bit-identical to
+ * row b computed alone.  That is what makes `mynah_tts.h`'s promise true, and it
+ * is why this path never falls through to a GEMM the way the tile path does: a
+ * GEMM's blocking is a function of the row count, and the row count here is
+ * whoever happened to be in flight.
+ */
+static int pocket_call_linear_rows(pocket_call *call, size_t group, size_t kind,
+                                   const float *weight, const float *bias,
+                                   const float *const *in_rows,
+                                   float *const *out_rows, size_t batch, size_t k,
+                                   size_t n) {
+    if (call == NULL || call->hook == NULL || group >= call->hook->groups ||
+        kind >= call->hook->kinds) {
+        return -1;
+    }
+    const pocket_linear_hook *hook = call->hook;
+    if (!pocket_call_quantized(call) || batch > call->rows || k > call->k_max) {
+        /* Exact, and exactly what each row would have done alone. */
+        for (size_t b = 0; b < batch; ++b) {
+            if (pocket_call_linear(call, group, kind, weight, bias, in_rows[b],
+                                   out_rows[b], 1u, k, n) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+    return mynah_qmat_linear_batched(hook->qcache, hook->backend,
+                                     pocket_call_name(call, group, kind), weight,
+                                     in_rows, out_rows, batch, k, n, bias,
+                                     call->qx, call->sx, NULL, 0);
+}
+
 static int pocket_linear(void *user, size_t layer,
                          mynah_transformer_ar_linear_kind kind,
                          const float *weight, const float *bias, const float *in,
                          float *out, size_t count, size_t k, size_t n) {
-    pocket_linear_hook *hook = (pocket_linear_hook *)user;
-    if (hook == NULL || layer >= hook->layers) return -1;
-    const char *name =
-        hook->names + (layer * 4u + (size_t)kind) * (size_t)POCKET_QNAME_MAX;
-    return mynah_qmat_linear_resolved(hook->qcache, hook->backend, name, weight, in,
-                                      out, count, k, n, bias, NULL, 0);
+    return pocket_call_linear((pocket_call *)user, layer, (size_t)kind, weight,
+                              bias, in, out, count, k, n);
 }
 
-/* Builds the cache keys for one transformer.  `tag` keeps the backbone's keys
- * and the codec transformer's apart in the model-wide cache, which matters
- * because both have a layer 0. */
+static int pocket_linear_rows(void *user, size_t layer,
+                              mynah_transformer_ar_linear_kind kind,
+                              const float *weight, const float *bias,
+                              const float *const *in_rows, float *const *out_rows,
+                              size_t batch, size_t k, size_t n) {
+    return pocket_call_linear_rows((pocket_call *)user, layer, (size_t)kind, weight,
+                                   bias, in_rows, out_rows, batch, k, n);
+}
+
+static int pocket_flow_linear(void *user, size_t index,
+                              mynah_flow_linear_kind kind, const float *weight,
+                              const float *bias, const float *in, float *out,
+                              size_t count, size_t k, size_t n) {
+    return pocket_call_linear((pocket_call *)user, index, (size_t)kind, weight,
+                              bias, in, out, count, k, n);
+}
+
+static int pocket_flow_linear_rows(void *user, size_t index,
+                                   mynah_flow_linear_kind kind,
+                                   const float *weight, const float *bias,
+                                   const float *const *in_rows,
+                                   float *const *out_rows, size_t batch, size_t k,
+                                   size_t n) {
+    return pocket_call_linear_rows((pocket_call *)user, index, (size_t)kind, weight,
+                                   bias, in_rows, out_rows, batch, k, n);
+}
+
+static void pocket_call_release(pocket_call *call) {
+    if (call == NULL) return;
+    free(call->qx);
+    free(call->sx);
+    free(call->in_ptr);
+    free((void *)call->out_ptr);
+    memset(call, 0, sizeof(*call));
+}
+
+/* Sizes one caller's scratch.  `k_max` is the widest reduction any of the four
+ * projections performs, which for this family is max(d_model, attn_dim,
+ * ffn_dim); nothing here is allowed to be a constant. */
+static int pocket_call_init(pocket_call *call, const pocket_linear_hook *hook,
+                            size_t rows, size_t k_max, char *error,
+                            size_t capacity) {
+    memset(call, 0, sizeof(*call));
+    if (rows == 0) rows = 1u;
+    size_t qbytes = 0;
+    if (pocket_mul(rows, k_max, &qbytes) != 0) {
+        pocket_error(error, capacity, "pocket: projection scratch overflow");
+        return -1;
+    }
+    call->qx = (int8_t *)calloc(qbytes ? qbytes : 1u, sizeof(int8_t));
+    call->sx = (float *)calloc(rows, sizeof(float));
+    call->in_ptr = (const float **)calloc(rows, sizeof(*call->in_ptr));
+    call->out_ptr = (float **)calloc(rows, sizeof(*call->out_ptr));
+    if (call->qx == NULL || call->sx == NULL || call->in_ptr == NULL ||
+        call->out_ptr == NULL) {
+        pocket_call_release(call);
+        pocket_error(error, capacity, "out of memory sizing a projection scratch");
+        return -1;
+    }
+    call->hook = hook;
+    call->rows = rows;
+    call->k_max = k_max;
+    return 0;
+}
+
+/* Installs the hooks on a private copy of the model's weight struct.  The layer
+ * array stays shared and read-only; only the three hook fields differ, so a
+ * caller gets its own scratch without any weight being duplicated. */
+static void pocket_bind_hooks(mynah_transformer_ar_weights *out,
+                              const mynah_transformer_ar_weights *shared,
+                              pocket_call *call) {
+    *out = *shared;
+    out->linear = pocket_linear;
+    out->linear_rows = pocket_linear_rows;
+    out->linear_user = call;
+}
+
+static void pocket_bind_flow_hooks(mynah_flow_head_weights *out,
+                                   const mynah_flow_head_weights *shared,
+                                   pocket_call *call) {
+    *out = *shared;
+    out->linear = pocket_flow_linear;
+    out->linear_rows = pocket_flow_linear_rows;
+    out->linear_user = call;
+}
+
+/* Builds the cache keys for one weight group.  `tag` keeps the backbone's keys,
+ * the codec transformer's and the flow head's apart in the model-wide cache,
+ * which matters because all three have a group 0. */
 static int pocket_hook_init(pocket_linear_hook *hook, const char *tag,
-                            size_t layers, mynah_qmat_cache *qcache,
+                            size_t groups, const char *const *kind_names,
+                            size_t kinds, mynah_qmat_cache *qcache,
                             const mynah_backend *backend, char *error,
                             size_t capacity) {
-    static const char *const kinds[4] = {"qkv", "oproj", "ffn1", "ffn2"};
     size_t slots = 0;
     size_t bytes = 0;
-    if (pocket_mul(layers, 4u, &slots) != 0 ||
+    if (pocket_mul(groups, kinds, &slots) != 0 ||
         pocket_mul(slots, (size_t)POCKET_QNAME_MAX, &bytes) != 0) {
         pocket_error(error, capacity, "pocket: %s hook table overflow", tag);
         return -1;
@@ -559,18 +804,19 @@ static int pocket_hook_init(pocket_linear_hook *hook, const char *tag,
         pocket_error(error, capacity, "out of memory building the %s hook", tag);
         return -1;
     }
-    for (size_t l = 0; l < layers; ++l) {
-        for (size_t kind = 0; kind < 4u; ++kind) {
-            char *slot = hook->names + (l * 4u + kind) * (size_t)POCKET_QNAME_MAX;
+    for (size_t g = 0; g < groups; ++g) {
+        for (size_t kind = 0; kind < kinds; ++kind) {
+            char *slot = hook->names + (g * kinds + kind) * (size_t)POCKET_QNAME_MAX;
             const int written = snprintf(slot, POCKET_QNAME_MAX, "pocket.%s.%zu.%s",
-                                         tag, l, kinds[kind]);
+                                         tag, g, kind_names[kind]);
             if (written < 0 || (size_t)written >= POCKET_QNAME_MAX) {
                 pocket_error(error, capacity, "pocket: %s hook key truncated", tag);
                 return -1;
             }
         }
     }
-    hook->layers = layers;
+    hook->groups = groups;
+    hook->kinds = kinds;
     hook->qcache = qcache;
     hook->backend = backend;
     return 0;
@@ -1440,6 +1686,7 @@ static void pocket_model_free(mynah_engine_state *state) {
     free(state->decoder_blocks);
     free(state->backbone_hook.names);
     free(state->codec_hook.names);
+    free(state->flow_hook.names);
     if (state->owns_weights) mynah_weights_close(state->weights);
     free(state->model_dir);
     free(state);
@@ -1512,24 +1759,28 @@ static int pocket_model_init(const mynah_tts_model *model,
         return -1;
     }
 
-    /* The quantized projection path.  It is installed only when the model's
-     * cache resolved to something other than f32 (MYNAH_QUANT), so the default
-     * build keeps the exact f32 matvec and int8/int4/f16 stays an explicit
-     * opt-in whose numerics are reported separately. */
+    /* The projection path.  The cache key tables are built here, once, for both
+     * transformers; whether the cache actually holds a quantized copy is the
+     * cache's business (MYNAH_QUANT) and is asked per call, because the hook now
+     * also serves the f32 build: a tile of positions is one GEMM there instead
+     * of one matvec per position, while a single position stays on exactly the
+     * f32 matvec it used before.  The hooks are bound per *caller*, not here:
+     * see `pocket_call`. */
     state->backend = model->backend;
     state->qcache = model->qcache;
-    if (mynah_qmat_cache_enabled(state->qcache)) {
-        if (pocket_hook_init(&state->backbone_hook, "bb", state->cfg.layers,
-                             state->qcache, state->backend, error, capacity) != 0 ||
-            pocket_hook_init(&state->codec_hook, "codec", state->cfg.codec_tf_layers,
-                             state->qcache, state->backend, error, capacity) != 0) {
-            pocket_model_free(state);
-            return -1;
-        }
-        state->backbone.linear = pocket_linear;
-        state->backbone.linear_user = &state->backbone_hook;
-        state->codec_transformer.linear = pocket_linear;
-        state->codec_transformer.linear_user = &state->codec_hook;
+    static const char *const tar_kinds[4] = {"qkv", "oproj", "ffn1", "ffn2"};
+    static const char *const flow_kinds[MYNAH_FLOW_LINEAR_KIND_COUNT] = {
+        "condemb", "inproj", "adaln", "mlpin", "mlpout", "fadaln", "flin"};
+    if (pocket_hook_init(&state->backbone_hook, "bb", state->cfg.layers, tar_kinds,
+                         4u, state->qcache, state->backend, error, capacity) != 0 ||
+        pocket_hook_init(&state->codec_hook, "codec", state->cfg.codec_tf_layers,
+                         tar_kinds, 4u, state->qcache, state->backend, error,
+                         capacity) != 0 ||
+        pocket_hook_init(&state->flow_hook, "flow", state->cfg.flow_depth,
+                         flow_kinds, (size_t)MYNAH_FLOW_LINEAR_KIND_COUNT,
+                         state->qcache, state->backend, error, capacity) != 0) {
+        pocket_model_free(state);
+        return -1;
     }
 
     if (pocket_join(path, sizeof(path), state->model_dir, state->cfg.speakers_file,
@@ -1558,10 +1809,30 @@ static int pocket_model_init(const mynah_tts_model *model,
     return 0;
 }
 
+/* A NULL state is the engine-level question -- "what could this engine do with
+ * this model at all" -- which `mynah_tts_model_max_batch` asks before any state
+ * exists.  Refusing it made the public API answer 1 for an engine that batches
+ * 16, so it is answered from `model->info`, and the fields that only the loaded
+ * pack knows (the streaming emit threshold, the latent width) stay zero rather
+ * than being guessed.  The driver always passes a real state and checks the
+ * fields it needs, so it cannot pick up a half-answer by accident. */
 static int pocket_caps(const mynah_tts_model *model,
                        const mynah_engine_state *state, mynah_engine_caps *out) {
+    if (out == NULL) return -1;
+    if (state == NULL) {
+        if (model == NULL) return -1;
+        memset(out, 0, sizeof(*out));
+        out->sample_rate = model->info.sample_rate;
+        out->frame_rate = model->info.frame_rate;
+        out->frames_per_step = 1u;
+        out->min_audio_frames = model->info.min_generated_frames;
+        out->default_max_steps = model->info.max_decoder_steps;
+        out->max_batch = POCKET_MAX_BATCH;
+        out->voice_count = model->info.speaker_count;
+        out->is_discrete_codec = 0u;
+        return 0;
+    }
     (void)model;
-    if (state == NULL || out == NULL) return -1;
     const pocket_config *cfg = &state->cfg;
     memset(out, 0, sizeof(*out));
     out->sample_rate = cfg->sample_rate;
@@ -1572,8 +1843,7 @@ static int pocket_caps(const mynah_tts_model *model,
     out->audio_emit_frames = (unsigned)cfg->audio_emit_frames;
     out->min_audio_frames = (unsigned)cfg->min_audio_frames;
     out->default_max_steps = (unsigned)cfg->default_max_steps;
-    /* Batching is measured before it is claimed. */
-    out->max_batch = 1u;
+    out->max_batch = POCKET_MAX_BATCH;
     out->voice_count = (unsigned)state->voice_count;
     out->needs_cfg = 0u;
     out->is_discrete_codec = 0u;
@@ -1590,6 +1860,9 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
                             mynah_costmap_now_ns() - ctx->t_created_ns);
         mynah_costmap_request_done();
     }
+    pocket_call_release(&ctx->backbone_call);
+    pocket_call_release(&ctx->codec_call);
+    pocket_call_release(&ctx->flow_call);
     mynah_transformer_ar_state_free(ctx->backbone);
     mynah_transformer_ar_state_free(ctx->codec_transformer);
     mynah_flow_head_destroy(ctx->flow);
@@ -1866,12 +2139,38 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         pocket_ctx_free(ctx);
         return -1;
     }
-    if (mynah_transformer_ar_check_weights(ctx->backbone, &state->backbone, error,
+
+    /* One projection scratch per transformer, wide enough for a whole prefill
+     * tile.  Every number here comes from the manifest. */
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    size_t backbone_k = cfg->hidden_dim;
+    if (attn_dim > backbone_k) backbone_k = attn_dim;
+    if (cfg->ffn_dim > backbone_k) backbone_k = cfg->ffn_dim;
+    size_t codec_k = cfg->codec_tf_dim;
+    if (cfg->codec_tf_ffn > codec_k) codec_k = cfg->codec_tf_ffn;
+    size_t flow_k = cfg->flow_dim;
+    if (cfg->hidden_dim > flow_k) flow_k = cfg->hidden_dim;
+    if (pocket_call_init(&ctx->backbone_call, &state->backbone_hook, tile,
+                         backbone_k, error, capacity) != 0 ||
+        pocket_call_init(&ctx->codec_call, &state->codec_hook, tile, codec_k, error,
+                         capacity) != 0 ||
+        /* The flow head is evaluated one row at a time per request: a tile of
+         * one is all this scratch ever needs. */
+        pocket_call_init(&ctx->flow_call, &state->flow_hook, 1u, flow_k, error,
+                         capacity) != 0) {
+        pocket_ctx_free(ctx);
+        return -1;
+    }
+    pocket_bind_hooks(&ctx->backbone_w, &state->backbone, &ctx->backbone_call);
+    pocket_bind_hooks(&ctx->codec_w, &state->codec_transformer, &ctx->codec_call);
+    pocket_bind_flow_hooks(&ctx->flow_w, &state->flow, &ctx->flow_call);
+
+    if (mynah_transformer_ar_check_weights(ctx->backbone, &ctx->backbone_w, error,
                                            capacity) != 0 ||
         mynah_transformer_ar_check_weights(ctx->codec_transformer,
-                                           &state->codec_transformer, error,
+                                           &ctx->codec_w, error,
                                            capacity) != 0 ||
-        mynah_flow_head_check_weights(ctx->flow, &state->flow, error, capacity) != 0 ||
+        mynah_flow_head_check_weights(ctx->flow, &ctx->flow_w, error, capacity) != 0 ||
         mynah_seanet_check_decoder_weights(ctx->codec, &state->decoder, error,
                                            capacity) != 0) {
         pocket_ctx_free(ctx);
@@ -1910,6 +2209,7 @@ static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capaci
     ctx->eos_step = SIZE_MAX;
     ctx->eos = 0;
     ctx->broken = 0;
+    ctx->budget_exhausted = 0;
     ctx->eos_logit = 0.0f;
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
@@ -1945,7 +2245,7 @@ static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capaci
     }
     mynah_region_begin(MYNAH_RGN_PREFILL);
     const int prefill_failed =
-        mynah_transformer_ar_prefill(ctx->backbone, &state->backbone, ctx->text_embed,
+        mynah_transformer_ar_prefill(ctx->backbone, &ctx->backbone_w, ctx->text_embed,
                                      ctx->text_length, NULL) != 0;
     mynah_region_end(MYNAH_RGN_PREFILL);
     if (prefill_failed) {
@@ -1979,68 +2279,149 @@ static int pocket_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
 
 /* ------------------------------------------------------------------- steps */
 
+/*
+ * One AR step for `count` independent requests.
+ *
+ * The backbone is 302 MB of f32 weights (151 MB as f16) and one position's
+ * worth of arithmetic, so a step run alone is a trip to memory, not a
+ * calculation: N requests stepped one after another pay that trip N times for
+ * the same bytes.  Stepping them together pays it once.  What must not change
+ * is any single request's numbers -- see `pocket_linear_rows`.
+ *
+ * The previous latent's embedding stays per request: `input_linear` is
+ * [1024][32], 128 KB, small enough that stacking it would cost more in
+ * bookkeeping than it saves in traffic.
+ */
 static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                              mynah_engine_scratch *scratch, char *error,
                              size_t capacity) {
-    (void)scratch;
     if (ctxs == NULL) {
         pocket_error(error, capacity, "pocket: null batch");
         return -1;
     }
+    if (count == 0u) return 0;
+
+    /* Every admission check first: a batched step fails for all its slots or
+     * for none, so none of them may have moved when one is refused. */
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         if (ctx == NULL || !ctx->prepared) {
             pocket_error(error, capacity, "pocket: request %zu is not prepared", i);
             return -1;
         }
-        const mynah_engine_state *state = ctx->state;
-        const pocket_config *cfg = &state->cfg;
         if (ctx->eos || ctx->broken) {
             pocket_error(error, capacity,
                          "pocket: request %zu has already finished; reset it first", i);
             return -1;
         }
-        if (ctx->step >= ctx->max_steps) {
+        if (ctx->state != ctxs[0]->state) {
             pocket_error(error, capacity,
-                         "pocket: request %zu is past its %zu step budget", i,
-                         ctx->max_steps);
+                         "pocket: request %zu belongs to a different model", i);
             return -1;
+        }
+    }
+
+    const mynah_engine_state *state = ctxs[0]->state;
+    const pocket_config *cfg = &state->cfg;
+    const size_t batch_capacity =
+        (scratch == NULL) ? 0u
+                          : mynah_transformer_ar_batch_capacity(scratch->backbone_batch);
+    const int can_gather = scratch != NULL && scratch->backbone_batch != NULL &&
+                           scratch->states != NULL && count <= batch_capacity;
+
+    mynah_region_begin(MYNAH_RGN_STEP);
+    mynah_region_begin2(MYNAH_RGN_STEP_EMBED);
+    size_t live = 0;
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        /* A request that has used its whole step budget retires in `emit`; it
+         * must not be stepped, and it must not take the batch down with it. */
+        if (ctx->step >= ctx->max_steps) {
+            ctx->budget_exhausted = 1;
+            continue;
         }
         /* BOS is a tracked fact, not a NaN: no latent yet means bos_emb. */
         const float *previous =
             (ctx->frames > 0)
                 ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
                 : state->bos_emb;
-        mynah_region_begin(MYNAH_RGN_STEP);
-        mynah_region_begin2(MYNAH_RGN_STEP_EMBED);
         mynah_matvec_f32(state->input_linear, previous, ctx->step_input,
                          cfg->hidden_dim, cfg->latent_dim);
-        mynah_region_end2(MYNAH_RGN_STEP_EMBED);
-        mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
-        const int step_failed =
-            mynah_transformer_ar_step(ctx->backbone, &state->backbone, ctx->step_input,
-                                      ctx->hidden) != 0;
-        mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
-        mynah_region_end(MYNAH_RGN_STEP);
-        if (step_failed) {
-            pocket_error(error, capacity, "pocket: backbone step %zu failed for "
-                                          "request %zu",
-                         ctx->step, i);
-            return -1;
+        if (can_gather) {
+            scratch->states[live] = ctx->backbone;
+            scratch->inputs[live] = ctx->step_input;
+            scratch->outputs[live] = ctx->hidden;
         }
+        ++live;
+    }
+    mynah_region_end2(MYNAH_RGN_STEP_EMBED);
+
+    mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
+    int failed = 0;
+    size_t failed_at = 0;
+    if (live > 1u && can_gather) {
+        failed = mynah_transformer_ar_step_batch(scratch->states, live,
+                                                 &scratch->backbone_w,
+                                                 scratch->backbone_batch,
+                                                 scratch->inputs,
+                                                 scratch->outputs) != 0;
+    } else {
+        /* No batch scratch (or a single live request): the same graph, one row
+         * at a time.  Not a second implementation -- `_step_batch` of one row
+         * is `_step` -- just the path with nothing to share. */
+        for (size_t i = 0; i < count && !failed; ++i) {
+            mynah_engine_ctx *ctx = ctxs[i];
+            if (ctx->budget_exhausted) continue;
+            if (mynah_transformer_ar_step(ctx->backbone, &ctx->backbone_w,
+                                          ctx->step_input, ctx->hidden) != 0) {
+                failed = 1;
+                failed_at = i;
+            }
+        }
+    }
+    mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
+    mynah_region_end(MYNAH_RGN_STEP);
+    if (failed) {
+        pocket_error(error, capacity,
+                     "pocket: the backbone step failed for request %zu of %zu",
+                     failed_at, count);
+        return -1;
     }
     return 0;
 }
 
+/*
+ * Turn each stepped context's hidden state into an appended latent frame.
+ *
+ * Three passes rather than one loop, because the flow head is the second
+ * weight-bound stage of the step and batching it needs its rows gathered first:
+ *
+ *   1. EOS, per request, and the noise draw from the request's OWN RNG.  The
+ *      draw happens here, before any batching, so that a request's noise is a
+ *      function of its seed and its step index and of nothing else -- not of
+ *      batch width, not of slot order, not of who its neighbours were.
+ *   2. One pass over the flow-head weights for every request that is still
+ *      drawing a latent.
+ *   3. The LSD addition and the bookkeeping.
+ */
 static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
                              mynah_engine_step_result *results,
                              mynah_engine_scratch *scratch, char *error,
                              size_t capacity) {
-    (void)scratch;
     if (ctxs == NULL || results == NULL) {
         pocket_error(error, capacity, "pocket: null batch");
         return -1;
     }
+    if (count == 0u) return 0;
+
+    /* s and t, pinned at the endpoints; the manifest check at load time is what
+     * makes this array the right length. */
+    static const float times[2] = {0.0f, 1.0f};
+
+    size_t gathered = 0;
+    const size_t flow_capacity =
+        (scratch == NULL) ? 0u : mynah_flow_head_batch_capacity(scratch->flow_batch);
+
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         memset(&results[i], 0, sizeof(results[i]));
@@ -2048,6 +2429,16 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             pocket_error(error, capacity,
                          "pocket: request %zu is not prepared, or has failed", i);
             return -1;
+        }
+        if (ctx->budget_exhausted) {
+            /* No step ran for this request, so `hidden` is last step's and must
+             * not be read.  The budget is a length cap, not a failure: the
+             * frames already generated are the answer. */
+            ctx->eos = 1;
+            results[i].eos = 1;
+            results[i].eos_frame = 0u;
+            results[i].frames_appended = 0u;
+            continue;
         }
         const mynah_engine_state *state = ctx->state;
         const pocket_config *cfg = &state->cfg;
@@ -2090,19 +2481,53 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
                 ctx->noise[d] = ctx->noise_std * pocket_rng_normal(ctx);
             }
         }
+        mynah_region_end(MYNAH_RGN_EMIT);
 
-        /* s and t, pinned at the endpoints; the manifest check at load time is
-         * what makes this array the right length. */
-        static const float times[2] = {0.0f, 1.0f};
-        mynah_region_begin(MYNAH_RGN_LOCAL);
-        const int flow_failed =
-            mynah_flow_head_forward(ctx->flow, &state->flow, ctx->hidden, times,
-                                    ctx->noise, ctx->flow_out) != 0;
-        mynah_region_end(MYNAH_RGN_LOCAL);
+        if (gathered < flow_capacity && scratch != NULL &&
+            scratch->flow_heads != NULL) {
+            scratch->flow_heads[gathered] = ctx->flow;
+            scratch->flow_cond[gathered] = ctx->hidden;
+            scratch->flow_noise[gathered] = ctx->noise;
+            scratch->flow_out[gathered] = ctx->flow_out;
+        }
+        results[i].frames_appended = 1u; /* provisional: marks "wants a latent" */
+        ++gathered;
+    }
+
+    mynah_region_begin(MYNAH_RGN_EMIT);
+    mynah_region_begin(MYNAH_RGN_LOCAL);
+    int flow_failed = 0;
+    if (gathered > 0) {
+        if (gathered <= flow_capacity && scratch != NULL &&
+            scratch->flow_heads != NULL) {
+            flow_failed = mynah_flow_head_forward_batch(
+                              scratch->flow_heads, gathered, &scratch->flow_w,
+                              scratch->flow_cond, times, scratch->flow_noise,
+                              scratch->flow_out, scratch->flow_batch) != 0;
+        } else {
+            for (size_t i = 0; i < count && !flow_failed; ++i) {
+                mynah_engine_ctx *ctx = ctxs[i];
+                if (results[i].frames_appended == 0u) continue;
+                flow_failed = mynah_flow_head_forward(ctx->flow, &ctx->flow_w,
+                                                      ctx->hidden, times,
+                                                      ctx->noise,
+                                                      ctx->flow_out) != 0;
+            }
+        }
+    }
+    mynah_region_end(MYNAH_RGN_LOCAL);
+    mynah_region_end(MYNAH_RGN_EMIT);
+
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (results[i].frames_appended == 0u) continue;
+        const pocket_config *cfg = &ctx->state->cfg;
         if (flow_failed) {
+            /* The pass is shared, so a failure inside it is not attributable to
+             * one request; every request that was in it is over. */
             ctx->broken = 1;
             results[i].failed = 1;
-            mynah_region_end(MYNAH_RGN_EMIT);
+            results[i].frames_appended = 0u;
             continue;
         }
         /* One LSD step from s = 0 to t = 1: the integration is the addition. */
@@ -2115,7 +2540,6 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
         results[i].eos = 0;
         results[i].eos_frame = 1u;
         results[i].frames_appended = 1u;
-        mynah_region_end(MYNAH_RGN_EMIT);
     }
     return 0;
 }
@@ -2222,9 +2646,9 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
                          mynah_transformer_ar_state_offset(ctx->codec_transformer));
             return -1;
         }
-        if (mynah_transformer_ar_prefill(ctx->codec_transformer,
-                                         &state->codec_transformer, ctx->codec_seq,
-                                         stride, ctx->codec_out) != 0) {
+        if (mynah_transformer_ar_prefill(ctx->codec_transformer, &ctx->codec_w,
+                                         ctx->codec_seq, stride,
+                                         ctx->codec_out) != 0) {
             free(pcm);
             mynah_region_unwind(codec_depth);
             mynah_region_end(MYNAH_RGN_CODEC);
@@ -2261,16 +2685,40 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
 
 /* ---------------------------------------------------------------- scratch */
 
+static void pocket_scratch_free(mynah_engine_scratch *scratch) {
+    if (scratch == NULL) return;
+    mynah_transformer_ar_batch_free(scratch->backbone_batch);
+    mynah_flow_head_batch_free(scratch->flow_batch);
+    pocket_call_release(&scratch->backbone_call);
+    pocket_call_release(&scratch->flow_call);
+    free(scratch->states);
+    free(scratch->inputs);
+    free((void *)scratch->outputs);
+    free(scratch->flow_heads);
+    free(scratch->flow_cond);
+    free(scratch->flow_noise);
+    free((void *)scratch->flow_out);
+    free(scratch);
+}
+
+/*
+ * The driver's scratch: everything one batched step needs that belongs to the
+ * batch rather than to a request in it.
+ *
+ * It is sized for the widest batch the driver will ever run, not for the batch
+ * it happens to start with, because admission is continuous: a request that
+ * arrives mid-flight widens the batch, and a scratch that was allocated for the
+ * narrower one would either overflow or -- worse -- be NULL and send every row
+ * back down the per-row path with nothing saying so.
+ */
 static int pocket_scratch_new(const mynah_tts_model *model,
                               mynah_engine_state *state, size_t batch,
                               mynah_engine_scratch **out, char *error,
                               size_t capacity) {
     (void)model;
-    (void)state;
-    if (out == NULL) return -1;
+    if (out == NULL || state == NULL) return -1;
     *out = NULL;
-    /* Every buffer an AR step touches belongs to the context it steps, so the
-     * batched scratch has nothing to hold; it exists to bound the batch. */
+    if (batch == 0u) batch = 1u;
     mynah_engine_scratch *scratch =
         (mynah_engine_scratch *)calloc(1, sizeof(*scratch));
     if (scratch == NULL) {
@@ -2278,11 +2726,95 @@ static int pocket_scratch_new(const mynah_tts_model *model,
         return -1;
     }
     scratch->batch = batch;
+    if (batch == 1u) {
+        /* Nothing to share: a one-slot driver keeps the single-step path. */
+        *out = scratch;
+        return 0;
+    }
+
+    const pocket_config *cfg = &state->cfg;
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    size_t backbone_k = cfg->hidden_dim;
+    if (attn_dim > backbone_k) backbone_k = attn_dim;
+    if (cfg->ffn_dim > backbone_k) backbone_k = cfg->ffn_dim;
+
+    mynah_transformer_ar_config backbone;
+    mynah_transformer_ar_config_defaults(&backbone);
+    backbone.d_model = cfg->hidden_dim;
+    backbone.num_heads = cfg->heads;
+    backbone.head_dim = cfg->head_dim;
+    backbone.num_layers = cfg->layers;
+    backbone.ffn_dim = cfg->ffn_dim;
+    /* A capacity, not a shape: each request brings its own, and the batch
+     * scratch holds no KV. */
+    backbone.max_seq_len = 0u;
+    backbone.context = 0u;
+    backbone.layernorm_eps = cfg->layernorm_eps;
+
+    scratch->states =
+        (mynah_transformer_ar_state **)calloc(batch, sizeof(*scratch->states));
+    scratch->inputs = (const float **)calloc(batch, sizeof(*scratch->inputs));
+    scratch->outputs = (float **)calloc(batch, sizeof(*scratch->outputs));
+    if (scratch->states == NULL || scratch->inputs == NULL ||
+        scratch->outputs == NULL ||
+        pocket_call_init(&scratch->backbone_call, &state->backbone_hook, batch,
+                         backbone_k, error, capacity) != 0) {
+        if (scratch->states != NULL && scratch->inputs != NULL &&
+            scratch->outputs != NULL) {
+            /* pocket_call_init already reported. */
+        } else {
+            pocket_error(error, capacity, "out of memory creating pocket scratch");
+        }
+        pocket_scratch_free(scratch);
+        return -1;
+    }
+    pocket_bind_hooks(&scratch->backbone_w, &state->backbone,
+                      &scratch->backbone_call);
+    scratch->backbone_batch =
+        mynah_transformer_ar_batch_new(&backbone, batch, error, capacity);
+    if (scratch->backbone_batch == NULL) {
+        pocket_scratch_free(scratch);
+        return -1;
+    }
+
+    size_t flow_k = cfg->flow_dim;
+    if (cfg->hidden_dim > flow_k) flow_k = cfg->hidden_dim;
+    mynah_flow_head_config flow;
+    mynah_flow_head_config_defaults(&flow);
+    flow.latent_dim = cfg->latent_dim;
+    flow.cond_dim = cfg->hidden_dim;
+    flow.hidden_dim = cfg->flow_dim;
+    flow.depth = cfg->flow_depth;
+    flow.num_time_conds = cfg->flow_time_conds;
+    flow.freq_embed_dim = 2u * cfg->flow_freqs;
+    flow.layernorm_eps = cfg->flow_layernorm_eps;
+
+    scratch->flow_heads =
+        (mynah_flow_head **)calloc(batch, sizeof(*scratch->flow_heads));
+    scratch->flow_cond = (const float **)calloc(batch, sizeof(*scratch->flow_cond));
+    scratch->flow_noise =
+        (const float **)calloc(batch, sizeof(*scratch->flow_noise));
+    scratch->flow_out = (float **)calloc(batch, sizeof(*scratch->flow_out));
+    if (scratch->flow_heads == NULL || scratch->flow_cond == NULL ||
+        scratch->flow_noise == NULL || scratch->flow_out == NULL) {
+        pocket_error(error, capacity, "out of memory creating pocket scratch");
+        pocket_scratch_free(scratch);
+        return -1;
+    }
+    if (pocket_call_init(&scratch->flow_call, &state->flow_hook, batch, flow_k,
+                         error, capacity) != 0) {
+        pocket_scratch_free(scratch);
+        return -1;
+    }
+    pocket_bind_flow_hooks(&scratch->flow_w, &state->flow, &scratch->flow_call);
+    scratch->flow_batch = mynah_flow_head_batch_new(&flow, batch, error, capacity);
+    if (scratch->flow_batch == NULL) {
+        pocket_scratch_free(scratch);
+        return -1;
+    }
     *out = scratch;
     return 0;
 }
-
-static void pocket_scratch_free(mynah_engine_scratch *scratch) { free(scratch); }
 
 /* ----------------------------------------------------------------- vtable */
 

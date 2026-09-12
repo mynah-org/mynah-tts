@@ -90,6 +90,47 @@ typedef struct {
     mynah_flow_linear mlp_out;  /* [hidden_dim][hidden_dim]   */
 } mynah_flow_res_block_weights;
 
+/* Which projection a hook call is for.  `index` is the residual-block number
+ * for the three BLOCK_* kinds and 0 for the rest. */
+typedef enum {
+    MYNAH_FLOW_LINEAR_COND_EMBED = 0, /* [hidden][cond]       */
+    MYNAH_FLOW_LINEAR_INPUT_PROJ,     /* [hidden][latent]     */
+    MYNAH_FLOW_LINEAR_BLOCK_ADALN,    /* [3*hidden][hidden]   */
+    MYNAH_FLOW_LINEAR_BLOCK_MLP_IN,   /* [hidden][hidden]     */
+    MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT,  /* [hidden][hidden]     */
+    MYNAH_FLOW_LINEAR_FINAL_ADALN,    /* [2*hidden][hidden]   */
+    MYNAH_FLOW_LINEAR_FINAL_LINEAR,   /* [latent][hidden]     */
+    MYNAH_FLOW_LINEAR_KIND_COUNT
+} mynah_flow_linear_kind;
+
+/*
+ * Optional replacement for the projections, exactly the arrangement
+ * `src/transformer_ar.h` documents and for the same reason: this module never
+ * sees a model pack, so it cannot own a cache keyed by tensor name, and the
+ * engine supplies one.  NULL keeps `mynah_matvec_bias_f32`, so nothing about
+ * these numerics changes until an engine opts in.
+ *
+ * The time-embedding branch is deliberately NOT routed through the hook: it is
+ * memoised on the bit pattern of the times, so for a whole utterance it runs
+ * once, and a cache entry for a weight read once is a cache entry that only
+ * costs memory.
+ *
+ * `linear` takes `count` contiguous rows that belong to ONE request; `linear_rows`
+ * takes one row per request and MUST be bit-exact per row -- a request's audio
+ * may not depend on who it was batched with.
+ */
+typedef int (*mynah_flow_linear_fn)(void *user, size_t index,
+                                    mynah_flow_linear_kind kind,
+                                    const float *weight, const float *bias,
+                                    const float *in, float *out, size_t count,
+                                    size_t k, size_t n);
+typedef int (*mynah_flow_linear_rows_fn)(void *user, size_t index,
+                                         mynah_flow_linear_kind kind,
+                                         const float *weight, const float *bias,
+                                         const float *const *in_rows,
+                                         float *const *out_rows, size_t batch,
+                                         size_t k, size_t n);
+
 typedef struct {
     mynah_flow_linear cond_embed; /* [hidden_dim][cond_dim]   */
     mynah_flow_linear input_proj; /* [hidden_dim][latent_dim] */
@@ -97,6 +138,10 @@ typedef struct {
     const mynah_flow_res_block_weights *res_blocks;  /* [depth]          */
     mynah_flow_linear final_adaln;  /* [2 * hidden_dim][hidden_dim] */
     mynah_flow_linear final_linear; /* [latent_dim][hidden_dim]     */
+    /* All optional; NULL keeps the built-in f32 matvec. */
+    mynah_flow_linear_fn linear;
+    mynah_flow_linear_rows_fn linear_rows;
+    void *linear_user;
 } mynah_flow_head_weights;
 
 typedef struct mynah_flow_head mynah_flow_head;
@@ -137,6 +182,48 @@ int mynah_flow_head_forward(mynah_flow_head *head,
 /* Drops the memoised time embedding.  Only needed if weights change under a
  * live head; correctness does not depend on calling it. */
 void mynah_flow_head_reset(mynah_flow_head *head);
+
+/*
+ * Cross-request batching.
+ *
+ * The head is ~8.9 M parameters and one evaluation is ~1.2 MFLOP per frame, so
+ * a single forward is a 36 MB trip to memory for 36 KFLOP of work: N requests
+ * evaluated one after another pay that trip N times for the same bytes.  This
+ * evaluates N of them with one pass over the weights.
+ *
+ * The scratch belongs to the driver, not to a request, and must not be shared
+ * between threads that evaluate concurrently.
+ */
+typedef struct mynah_flow_head_batch mynah_flow_head_batch;
+
+mynah_flow_head_batch *mynah_flow_head_batch_new(
+    const mynah_flow_head_config *config, size_t max_rows, char *error,
+    size_t error_capacity);
+void mynah_flow_head_batch_free(mynah_flow_head_batch *batch);
+size_t mynah_flow_head_batch_capacity(const mynah_flow_head_batch *batch);
+
+/*
+ * `count` evaluations, one per head, with one pass over the weights.
+ *
+ *   heads [count]  distinct heads, all created from the same configuration
+ *   cond  [count]  one `[cond_dim]` row each
+ *   noise [count]  one `[latent_dim]` row each
+ *   out   [count]  one `[latent_dim]` row each
+ *
+ * `times` is ONE vector for the whole batch.  The released LSD checkpoints pin
+ * s = 0 and t = 1 for every request, so this is not a restriction; a caller that
+ * ever needs per-row times must use the single forward, because the time branch
+ * is a memoised per-head computation and batching it would silently make one
+ * request's conditioning depend on another's.
+ *
+ * Every row is computed exactly as `_forward` would have computed it alone.
+ * `count == 0` is a no-op; `count == 1` is `_forward`.  Returns 0, or -1.
+ */
+int mynah_flow_head_forward_batch(mynah_flow_head *const *heads, size_t count,
+                                  const mynah_flow_head_weights *weights,
+                                  const float *const *cond, const float *times,
+                                  const float *const *noise, float *const *out,
+                                  mynah_flow_head_batch *batch);
 
 /* ---- kernels, exported because they are new and separately testable ---- */
 

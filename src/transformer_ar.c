@@ -86,6 +86,44 @@ void mynah_transformer_ar_rope_apply_f32(float *values, size_t num_heads,
 
 /* ------------------------------------------------------------------ state */
 
+/* How many positions one prefill tile covers.
+ *
+ * It is a tile rather than "the whole prefill" because the scratch is sized at
+ * `_state_new` and every live request owns one: an unbounded tile would make
+ * the per-request footprint a function of the longest text the process ever
+ * sees.  Sixteen is the Mimi decoder's own stride, so the codec prefill -- the
+ * one that runs every frame -- is exactly one tile and never splits. */
+#define TAR_PREFILL_TILE 16u
+
+size_t mynah_transformer_ar_prefill_tile(void) { return TAR_PREFILL_TILE; }
+
+/* Scratch for a set of rows pushed through the stack together.  Each state owns
+ * one (the prefill tile, which the single `_step` also uses as a one-row tile),
+ * and each `mynah_transformer_ar_batch` owns one (a cross-request step). */
+typedef struct {
+    size_t rows_cap;
+    float *block; /* one owned allocation backing everything below */
+    float *x;     /* [rows][d_model]    residual stream */
+    float *norm;  /* [rows][d_model]    */
+    float *upd;   /* [rows][d_model]    */
+    float *qkv;   /* [rows][3*attn_dim] */
+    float *attn;  /* [rows][attn_dim]   */
+    float *ffn;   /* [rows][ffn_dim]    */
+    float *gelu;  /* [rows][ffn_dim]    vForce scratch for the GELU */
+    /* Rebuilt per call, never allocated in the loop: the row-pointer view the
+     * cross-request hook takes. */
+    const float **in_ptr;
+    float **out_ptr;
+} tar_rows;
+
+/* One row of a pass: whose KV cache it writes, and at which absolute position.
+ * A prefill tile is `rows` refs to one state at consecutive positions; a
+ * cross-request step is one ref per state, each at its own position. */
+typedef struct {
+    mynah_transformer_ar_state *state;
+    size_t position;
+} tar_row_ref;
+
 struct mynah_transformer_ar_state {
     mynah_transformer_ar_config config;
     size_t attn_dim; /* num_heads * head_dim */
@@ -96,18 +134,71 @@ struct mynah_transformer_ar_state {
     size_t kv_half;  /* max_seq_len * attn_dim                 */
     size_t kv_layer; /* 2 * kv_half                            */
 
-    float *block; /* one owned scratch allocation */
-    float *x;     /* [d_model]      */
-    float *norm;  /* [d_model]      */
-    float *upd;   /* [d_model]      */
-    float *qkv;   /* [3 * attn_dim] */
-    float *attn;  /* [attn_dim]     */
-    float *ffn;   /* [ffn_dim]      */
-    float *gelu;  /* [ffn_dim]      */
-    float *scores;    /* [max_seq_len]        */
+    tar_rows rows;      /* the prefill tile; row 0 is also the single step  */
+    tar_row_ref *refs;  /* [rows.rows_cap]                                  */
+
+    float *block;     /* scores + the two RoPE tables */
+    float *scores;    /* [max_seq_len] */
     float *rope_cos;  /* [max_seq_len][half]  */
     float *rope_sin;  /* [max_seq_len][half]  */
 };
+
+struct mynah_transformer_ar_batch {
+    mynah_transformer_ar_config config;
+    size_t attn_dim;
+    tar_rows rows;
+    tar_row_ref *refs; /* [rows.rows_cap] */
+};
+
+static void tar_rows_release(tar_rows *rows) {
+    if (rows == NULL) return;
+    free(rows->block);
+    free(rows->in_ptr);
+    free((void *)rows->out_ptr);
+    memset(rows, 0, sizeof(*rows));
+}
+
+/* Sizes and carves one row-set scratch.  Everything a pass touches lives in the
+ * single `block`, so a pass allocates nothing (CLAUDE.md rule 4). */
+static int tar_rows_reserve(tar_rows *rows,
+                            const mynah_transformer_ar_config *config,
+                            size_t attn_dim, size_t count, char *error,
+                            size_t error_capacity) {
+    memset(rows, 0, sizeof(*rows));
+    if (count == 0) count = 1u;
+    size_t per = 0, part = 0, total = 0;
+    int overflow = 0;
+    overflow |= tar_mul(config->d_model, 3u, &part); /* x, norm, upd */
+    overflow |= tar_add(per, part, &per);
+    overflow |= tar_mul(attn_dim, 4u, &part);        /* qkv (3) + attn */
+    overflow |= tar_add(per, part, &per);
+    overflow |= tar_mul(config->ffn_dim, 2u, &part); /* ffn + gelu */
+    overflow |= tar_add(per, part, &per);
+    overflow |= tar_mul(per, count, &total);
+    if (overflow != 0) {
+        tar_set_error(error, error_capacity,
+                      "transformer_ar: row scratch size overflow");
+        return -1;
+    }
+    rows->block = calloc(total ? total : 1u, sizeof(float));
+    rows->in_ptr = calloc(count, sizeof(*rows->in_ptr));
+    rows->out_ptr = calloc(count, sizeof(*rows->out_ptr));
+    if (rows->block == NULL || rows->in_ptr == NULL || rows->out_ptr == NULL) {
+        tar_rows_release(rows);
+        tar_set_error(error, error_capacity, "transformer_ar: out of memory");
+        return -1;
+    }
+    float *cursor = rows->block;
+    rows->x = cursor;    cursor += count * config->d_model;
+    rows->norm = cursor; cursor += count * config->d_model;
+    rows->upd = cursor;  cursor += count * config->d_model;
+    rows->qkv = cursor;  cursor += count * 3u * attn_dim;
+    rows->attn = cursor; cursor += count * attn_dim;
+    rows->ffn = cursor;  cursor += count * config->ffn_dim;
+    rows->gelu = cursor;
+    rows->rows_cap = count;
+    return 0;
+}
 
 void mynah_transformer_ar_config_defaults(mynah_transformer_ar_config *config) {
     if (config == NULL) return;
@@ -202,15 +293,25 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
         return NULL;
     }
 
-    /* Scratch: 3 d_model + 3 attn_dim + 2 ffn + max_seq + 2 max_seq*half. */
+    /* The prefill tile, which the single `_step` uses as a one-row tile. */
+    if (tar_rows_reserve(&state->rows, &resolved, attn_dim, TAR_PREFILL_TILE,
+                         error, error_capacity) != 0) {
+        free(state->kv);
+        free(state);
+        return NULL;
+    }
+    state->refs = calloc(state->rows.rows_cap, sizeof(*state->refs));
+    if (state->refs == NULL) {
+        tar_set_error(error, error_capacity, "transformer_ar: out of memory");
+        tar_rows_release(&state->rows);
+        free(state->kv);
+        free(state);
+        return NULL;
+    }
+
+    /* Position-only scratch: the attention scores and the two RoPE tables. */
     size_t total = 0, part = 0;
     int overflow = 0;
-    overflow |= tar_mul(resolved.d_model, 3u, &part);
-    overflow |= tar_add(total, part, &total);
-    overflow |= tar_mul(attn_dim, 4u, &part); /* qkv (3) + attn (1) */
-    overflow |= tar_add(total, part, &total);
-    overflow |= tar_mul(resolved.ffn_dim, 2u, &part);
-    overflow |= tar_add(total, part, &total);
     overflow |= tar_add(total, resolved.max_seq_len, &total);
     overflow |= tar_mul(resolved.max_seq_len, state->half, &part);
     overflow |= tar_mul(part, 2u, &part);
@@ -218,6 +319,8 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
     if (overflow != 0) {
         tar_set_error(error, error_capacity,
                       "transformer_ar: scratch size overflow");
+        free(state->refs);
+        tar_rows_release(&state->rows);
         free(state->kv);
         free(state);
         return NULL;
@@ -225,26 +328,14 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
     state->block = calloc(total ? total : 1u, sizeof(float));
     if (state->block == NULL) {
         tar_set_error(error, error_capacity, "transformer_ar: out of memory");
+        free(state->refs);
+        tar_rows_release(&state->rows);
         free(state->kv);
         free(state);
         return NULL;
     }
 
     float *cursor = state->block;
-    state->x = cursor;
-    cursor += resolved.d_model;
-    state->norm = cursor;
-    cursor += resolved.d_model;
-    state->upd = cursor;
-    cursor += resolved.d_model;
-    state->qkv = cursor;
-    cursor += 3u * attn_dim;
-    state->attn = cursor;
-    cursor += attn_dim;
-    state->ffn = cursor;
-    cursor += resolved.ffn_dim;
-    state->gelu = cursor;
-    cursor += resolved.ffn_dim;
     state->scores = cursor;
     cursor += resolved.max_seq_len;
     state->rope_cos = cursor;
@@ -263,9 +354,71 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
 
 void mynah_transformer_ar_state_free(mynah_transformer_ar_state *state) {
     if (state == NULL) return;
+    tar_rows_release(&state->rows);
+    free(state->refs);
     free(state->kv);
     free(state->block);
     free(state);
+}
+
+/* ---- cross-request batch scratch ---- */
+
+mynah_transformer_ar_batch *mynah_transformer_ar_batch_new(
+    const mynah_transformer_ar_config *config, size_t max_rows, char *error,
+    size_t error_capacity) {
+    if (config == NULL || max_rows == 0) {
+        tar_set_error(error, error_capacity,
+                      "transformer_ar: bad batch arguments");
+        return NULL;
+    }
+    mynah_transformer_ar_config resolved = *config;
+    if (resolved.head_dim == 0 && resolved.num_heads != 0) {
+        resolved.head_dim = resolved.d_model / resolved.num_heads;
+    }
+    if (resolved.d_model == 0 || resolved.num_heads == 0 ||
+        resolved.head_dim == 0 || resolved.num_layers == 0 ||
+        resolved.ffn_dim == 0) {
+        tar_set_error(error, error_capacity,
+                      "transformer_ar: batch built from an incomplete config");
+        return NULL;
+    }
+    size_t attn_dim = 0;
+    if (tar_mul(resolved.num_heads, resolved.head_dim, &attn_dim) != 0) {
+        tar_set_error(error, error_capacity, "transformer_ar: attn_dim overflow");
+        return NULL;
+    }
+    mynah_transformer_ar_batch *batch = calloc(1u, sizeof(*batch));
+    if (batch == NULL) {
+        tar_set_error(error, error_capacity, "transformer_ar: out of memory");
+        return NULL;
+    }
+    batch->config = resolved;
+    batch->attn_dim = attn_dim;
+    if (tar_rows_reserve(&batch->rows, &resolved, attn_dim, max_rows, error,
+                         error_capacity) != 0) {
+        free(batch);
+        return NULL;
+    }
+    batch->refs = calloc(batch->rows.rows_cap, sizeof(*batch->refs));
+    if (batch->refs == NULL) {
+        tar_set_error(error, error_capacity, "transformer_ar: out of memory");
+        tar_rows_release(&batch->rows);
+        free(batch);
+        return NULL;
+    }
+    return batch;
+}
+
+void mynah_transformer_ar_batch_free(mynah_transformer_ar_batch *batch) {
+    if (batch == NULL) return;
+    tar_rows_release(&batch->rows);
+    free(batch->refs);
+    free(batch);
+}
+
+size_t mynah_transformer_ar_batch_capacity(
+    const mynah_transformer_ar_batch *batch) {
+    return (batch == NULL) ? 0u : batch->rows.rows_cap;
 }
 
 void mynah_transformer_ar_state_reset(mynah_transformer_ar_state *state) {
@@ -393,129 +546,209 @@ static size_t tar_window_start(size_t position, size_t context) {
     return position + 1u - context;
 }
 
-/* The layer's linear projection: the engine's hook when it installed one, the
- * f32 matvec otherwise.  One place, so the two can never drift apart. */
-static int tar_linear(const mynah_transformer_ar_weights *weights, size_t layer,
-                      mynah_transformer_ar_linear_kind kind, const float *weight,
-                      const float *bias, const float *in, float *out, size_t k,
-                      size_t n) {
-    if (weights->linear != NULL) {
-        return weights->linear(weights->linear_user, layer, kind, weight, bias, in,
-                               out, 1u, k, n);
+/*
+ * One layer projection for `rows` stacked rows.
+ *
+ * `rows == 1` takes exactly the path the single `_step` takes, so the three
+ * entry points cannot diverge on a one-row call.  Above that the two batch
+ * kinds part ways, and the reason is the whole point of this file:
+ *
+ *   - `cross_request == 0` -- consecutive positions of ONE sequence.  The row
+ *     count is a property of that request alone, so the hook may do whatever a
+ *     GEMM does.
+ *   - `cross_request == 1` -- one position of N DIFFERENT requests.  Only a
+ *     hook that promises bit-exact rows may be used; without one, every row
+ *     falls back to the single-row call it would have made alone.
+ */
+static int tar_linear_rows(const mynah_transformer_ar_weights *weights,
+                           size_t layer,
+                           mynah_transformer_ar_linear_kind kind,
+                           const float *weight, const float *bias, tar_rows *rows,
+                           const float *in, float *out, size_t count, size_t k,
+                           size_t n, int cross_request) {
+    if (count > 1u) {
+        if (cross_request) {
+            if (weights->linear_rows != NULL) {
+                for (size_t b = 0; b < count; ++b) {
+                    rows->in_ptr[b] = in + b * k;
+                    rows->out_ptr[b] = out + b * n;
+                }
+                return weights->linear_rows(weights->linear_user, layer, kind,
+                                            weight, bias, rows->in_ptr,
+                                            rows->out_ptr, count, k, n);
+            }
+        } else if (weights->linear != NULL) {
+            return weights->linear(weights->linear_user, layer, kind, weight, bias,
+                                   in, out, count, k, n);
+        }
     }
-    mynah_matvec_bias_f32(weight, in, bias, out, n, k);
+    for (size_t b = 0; b < count; ++b) {
+        const float *xr = in + b * k;
+        float *orow = out + b * n;
+        if (weights->linear != NULL) {
+            if (weights->linear(weights->linear_user, layer, kind, weight, bias, xr,
+                                orow, 1u, k, n) != 0) {
+                return -1;
+            }
+        } else {
+            mynah_matvec_bias_f32(weight, xr, bias, orow, n, k);
+        }
+    }
     return 0;
 }
 
-/* One position through the whole stack.  `out` may be NULL to discard. */
-static int tar_step_one(mynah_transformer_ar_state *state,
-                        const mynah_transformer_ar_weights *weights,
-                        const float *x, float *out) {
-    const mynah_transformer_ar_config *config = &state->config;
+/*
+ * The stack, over `count` rows already loaded into `rows->x`.
+ *
+ * `refs[b]` says which KV cache row b writes and at which absolute position, so
+ * this one body serves a prefill tile (one state, consecutive positions) and a
+ * cross-request step (N states, one position each) without either becoming a
+ * second graph.  Offsets are NOT advanced here; the caller owns that, because
+ * only the caller knows whether it is moving one state by `count` or `count`
+ * states by one.
+ *
+ * The K/V of every row is written before any row attends, which is what makes
+ * the prefill tile legal: a query at position p reads `[lo, p]` only, so the
+ * later positions of its own tile are present but unreachable.
+ */
+static int tar_forward_rows(const mynah_transformer_ar_weights *weights,
+                            const mynah_transformer_ar_config *config,
+                            size_t attn_dim, size_t half, tar_rows *rows,
+                            const tar_row_ref *refs, size_t count,
+                            int cross_request) {
     const size_t d_model = config->d_model;
     const size_t heads = config->num_heads;
     const size_t head_dim = config->head_dim;
-    const size_t attn_dim = state->attn_dim;
-    const size_t position = state->offset;
-    const size_t lo = tar_window_start(position, config->context);
-    const size_t span = position - lo + 1u;
+    const size_t ffn_dim = config->ffn_dim;
     const float scale = 1.0f / sqrtf((float)head_dim);
-    const float *rope_cos = state->rope_cos + position * state->half;
-    const float *rope_sin = state->rope_sin + position * state->half;
-
-    memcpy(state->x, x, d_model * sizeof(float));
 
     for (size_t l = 0; l < config->num_layers; ++l) {
         const mynah_transformer_ar_layer *layer = &weights->layers[l];
-        float *k_cache = state->kv + l * state->kv_layer;
-        float *v_cache = k_cache + state->kv_half;
 
         /* --- attention block: x + layer_scale_1(attn(norm1(x))) --- */
-        mynah_layernorm_f32(state->x, layer->norm1_weight, layer->norm1_bias,
-                            state->norm, 1u, d_model, config->layernorm_eps);
-        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_IN_PROJ, layer->in_proj_weight,
-                       layer->in_proj_bias, state->norm, state->qkv, d_model,
-                       3u * attn_dim) != 0) {
+        mynah_layernorm_f32(rows->x, layer->norm1_weight, layer->norm1_bias,
+                            rows->norm, count, d_model, config->layernorm_eps);
+        if (tar_linear_rows(weights, l, MYNAH_TAR_LINEAR_IN_PROJ,
+                            layer->in_proj_weight, layer->in_proj_bias, rows,
+                            rows->norm, rows->qkv, count, d_model, 3u * attn_dim,
+                            cross_request) != 0) {
             return -1;
         }
-        float *q = state->qkv;
-        float *k = state->qkv + attn_dim;
-        float *v = state->qkv + 2u * attn_dim;
-        mynah_transformer_ar_rope_apply_f32(q, heads, head_dim, rope_cos,
-                                            rope_sin);
-        mynah_transformer_ar_rope_apply_f32(k, heads, head_dim, rope_cos,
-                                            rope_sin);
-        memcpy(k_cache + position * attn_dim, k, attn_dim * sizeof(float));
-        memcpy(v_cache + position * attn_dim, v, attn_dim * sizeof(float));
-
-        for (size_t h = 0; h < heads; ++h) {
-            const float *qh = q + h * head_dim;
-            for (size_t j = 0; j < span; ++j) {
-                const float *kj =
-                    k_cache + (lo + j) * attn_dim + h * head_dim;
-                state->scores[j] = mynah_dot_f32(qh, kj, head_dim) * scale;
-            }
-            /* Rejects non-finite scores, which is the last line of defence
-             * against a NaN that slipped into the cache. */
-            if (mynah_softmax_f32(state->scores, state->scores, span) != 0) {
-                return -1;
-            }
-            float *oh = state->attn + h * head_dim;
-            memset(oh, 0, head_dim * sizeof(float));
-            for (size_t j = 0; j < span; ++j) {
-                const float *vj =
-                    v_cache + (lo + j) * attn_dim + h * head_dim;
-                mynah_axpy_f32(oh, vj, state->scores[j], head_dim);
+        for (size_t b = 0; b < count; ++b) {
+            mynah_transformer_ar_state *state = refs[b].state;
+            const size_t position = refs[b].position;
+            float *q = rows->qkv + b * 3u * attn_dim;
+            float *k = q + attn_dim;
+            float *v = k + attn_dim;
+            const float *rope_cos = state->rope_cos + position * half;
+            const float *rope_sin = state->rope_sin + position * half;
+            mynah_transformer_ar_rope_apply_f32(q, heads, head_dim, rope_cos,
+                                                rope_sin);
+            mynah_transformer_ar_rope_apply_f32(k, heads, head_dim, rope_cos,
+                                                rope_sin);
+            float *k_cache = state->kv + l * state->kv_layer;
+            float *v_cache = k_cache + state->kv_half;
+            memcpy(k_cache + position * attn_dim, k, attn_dim * sizeof(float));
+            memcpy(v_cache + position * attn_dim, v, attn_dim * sizeof(float));
+        }
+        /* A key-stationary variant of this loop -- key outer, tile positions
+         * inner, so K and V are read once for the whole tile instead of once
+         * per (position, head) -- was written and measured: bit-identical, and
+         * 194 ms -> 211/219 ms on the Mimi decoder.  It is not here because it
+         * lost.  The reason is worth keeping: the per-(position, head) walk
+         * marches K with a constant stride that the prefetcher gets right and
+         * holds one 64-float query in registers, and at a 250-position window
+         * the whole K block is 512 KB, i.e. L2-resident, so the re-reads it
+         * "saves" are L2 hits rather than DRAM traffic.  The codec transformer
+         * at this point is arithmetic-bound (~13 GFLOP for a 5.2 s utterance
+         * against this core's ~100 GFLOP/s f32 roof), not traffic-bound, and
+         * reordering traffic cannot move an arithmetic bound. */
+        for (size_t b = 0; b < count; ++b) {
+            mynah_transformer_ar_state *state = refs[b].state;
+            const size_t position = refs[b].position;
+            const size_t lo = tar_window_start(position, config->context);
+            const size_t span = position - lo + 1u;
+            const float *q = rows->qkv + b * 3u * attn_dim;
+            const float *k_cache = state->kv + l * state->kv_layer;
+            const float *v_cache = k_cache + state->kv_half;
+            float *scores = state->scores;
+            for (size_t h = 0; h < heads; ++h) {
+                const float *qh = q + h * head_dim;
+                for (size_t j = 0; j < span; ++j) {
+                    const float *kj = k_cache + (lo + j) * attn_dim + h * head_dim;
+                    scores[j] = mynah_dot_f32(qh, kj, head_dim) * scale;
+                }
+                /* Rejects non-finite scores, which is the last line of defence
+                 * against a NaN that slipped into the cache. */
+                if (mynah_softmax_f32(scores, scores, span) != 0) return -1;
+                float *oh = rows->attn + b * attn_dim + h * head_dim;
+                memset(oh, 0, head_dim * sizeof(float));
+                for (size_t j = 0; j < span; ++j) {
+                    const float *vj = v_cache + (lo + j) * attn_dim + h * head_dim;
+                    mynah_axpy_f32(oh, vj, scores[j], head_dim);
+                }
             }
         }
-        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_OUT_PROJ, layer->out_proj_weight,
-                       layer->out_proj_bias, state->attn, state->upd, attn_dim,
-                       d_model) != 0) {
+        if (tar_linear_rows(weights, l, MYNAH_TAR_LINEAR_OUT_PROJ,
+                            layer->out_proj_weight, layer->out_proj_bias, rows,
+                            rows->attn, rows->upd, count, attn_dim, d_model,
+                            cross_request) != 0) {
             return -1;
         }
         if (layer->layer_scale_1 != NULL) {
-            for (size_t i = 0; i < d_model; ++i) {
-                state->x[i] += layer->layer_scale_1[i] * state->upd[i];
+            for (size_t b = 0; b < count; ++b) {
+                float *xr = rows->x + b * d_model;
+                const float *ur = rows->upd + b * d_model;
+                for (size_t i = 0; i < d_model; ++i) {
+                    xr[i] += layer->layer_scale_1[i] * ur[i];
+                }
             }
         } else {
-            mynah_residual_add_f32(state->x, state->upd, d_model);
+            mynah_residual_add_f32(rows->x, rows->upd, count * d_model);
         }
 
         /* --- feed forward: x + layer_scale_2(linear2(gelu(linear1(norm2)))) */
-        mynah_layernorm_f32(state->x, layer->norm2_weight, layer->norm2_bias,
-                            state->norm, 1u, d_model, config->layernorm_eps);
-        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_FFN1, layer->linear1_weight,
-                       layer->linear1_bias, state->norm, state->ffn, d_model,
-                       config->ffn_dim) != 0) {
+        mynah_layernorm_f32(rows->x, layer->norm2_weight, layer->norm2_bias,
+                            rows->norm, count, d_model, config->layernorm_eps);
+        if (tar_linear_rows(weights, l, MYNAH_TAR_LINEAR_FFN1,
+                            layer->linear1_weight, layer->linear1_bias, rows,
+                            rows->norm, rows->ffn, count, d_model, ffn_dim,
+                            cross_request) != 0) {
             return -1;
         }
-        mynah_gelu_tanh_array(state->ffn, config->ffn_dim, state->gelu);
-        if (tar_linear(weights, l, MYNAH_TAR_LINEAR_FFN2, layer->linear2_weight,
-                       layer->linear2_bias, state->ffn, state->upd, config->ffn_dim,
-                       d_model) != 0) {
+        mynah_gelu_tanh_array(rows->ffn, count * ffn_dim, rows->gelu);
+        if (tar_linear_rows(weights, l, MYNAH_TAR_LINEAR_FFN2,
+                            layer->linear2_weight, layer->linear2_bias, rows,
+                            rows->ffn, rows->upd, count, ffn_dim, d_model,
+                            cross_request) != 0) {
             return -1;
         }
         if (layer->layer_scale_2 != NULL) {
-            for (size_t i = 0; i < d_model; ++i) {
-                state->x[i] += layer->layer_scale_2[i] * state->upd[i];
+            for (size_t b = 0; b < count; ++b) {
+                float *xr = rows->x + b * d_model;
+                const float *ur = rows->upd + b * d_model;
+                for (size_t i = 0; i < d_model; ++i) {
+                    xr[i] += layer->layer_scale_2[i] * ur[i];
+                }
             }
         } else {
-            mynah_residual_add_f32(state->x, state->upd, d_model);
-        }
-    }
-
-    state->offset = position + 1u;
-
-    if (out != NULL) {
-        if (weights->out_norm_weight != NULL) {
-            mynah_layernorm_f32(state->x, weights->out_norm_weight,
-                                weights->out_norm_bias, out, 1u, d_model,
-                                config->layernorm_eps);
-        } else {
-            memcpy(out, state->x, d_model * sizeof(float));
+            mynah_residual_add_f32(rows->x, rows->upd, count * d_model);
         }
     }
     return 0;
+}
+
+/* The optional final LayerNorm, applied row by row into the caller's rows. */
+static void tar_finish_row(const mynah_transformer_ar_weights *weights,
+                           const mynah_transformer_ar_config *config,
+                           const float *x, float *out) {
+    if (out == NULL) return;
+    if (weights->out_norm_weight != NULL) {
+        mynah_layernorm_f32(x, weights->out_norm_weight, weights->out_norm_bias,
+                            out, 1u, config->d_model, config->layernorm_eps);
+    } else {
+        memcpy(out, x, config->d_model * sizeof(float));
+    }
 }
 
 int mynah_transformer_ar_prefill(mynah_transformer_ar_state *state,
@@ -524,19 +757,39 @@ int mynah_transformer_ar_prefill(mynah_transformer_ar_state *state,
     if (state == NULL || weights == NULL || weights->layers == NULL) return -1;
     if (n_tokens == 0) return 0;
     if (x == NULL) return -1;
-    const size_t d_model = state->config.d_model;
+    const mynah_transformer_ar_config *config = &state->config;
+    const size_t d_model = config->d_model;
     size_t end = 0;
     if (tar_add(state->offset, n_tokens, &end) != 0 ||
-        end > state->config.max_seq_len) {
+        end > config->max_seq_len) {
         return -1;
     }
     /* Fail at the boundary rather than letting a BOS sentinel reach a matmul:
      * the caller substitutes bos_emb before input_linear, so anything
      * non-finite arriving here is a bug, not a sentinel. */
     if (!tar_finite(x, n_tokens * d_model)) return -1;
-    for (size_t t = 0; t < n_tokens; ++t) {
-        float *row = (out == NULL) ? NULL : out + t * d_model;
-        if (tar_step_one(state, weights, x + t * d_model, row) != 0) return -1;
+
+    for (size_t done = 0; done < n_tokens;) {
+        size_t rows = n_tokens - done;
+        if (rows > state->rows.rows_cap) rows = state->rows.rows_cap;
+        const size_t base = state->offset;
+        for (size_t b = 0; b < rows; ++b) {
+            state->refs[b].state = state;
+            state->refs[b].position = base + b;
+        }
+        memcpy(state->rows.x, x + done * d_model, rows * d_model * sizeof(float));
+        if (tar_forward_rows(weights, config, state->attn_dim, state->half,
+                             &state->rows, state->refs, rows, 0) != 0) {
+            return -1;
+        }
+        state->offset = base + rows;
+        if (out != NULL) {
+            for (size_t b = 0; b < rows; ++b) {
+                tar_finish_row(weights, config, state->rows.x + b * d_model,
+                               out + (done + b) * d_model);
+            }
+        }
+        done += rows;
     }
     return 0;
 }
@@ -548,9 +801,73 @@ int mynah_transformer_ar_step(mynah_transformer_ar_state *state,
         x == NULL || out == NULL) {
         return -1;
     }
-    if (state->offset >= state->config.max_seq_len) return -1;
-    if (!tar_finite(x, state->config.d_model)) return -1;
-    return tar_step_one(state, weights, x, out);
+    const mynah_transformer_ar_config *config = &state->config;
+    if (state->offset >= config->max_seq_len) return -1;
+    if (!tar_finite(x, config->d_model)) return -1;
+    state->refs[0].state = state;
+    state->refs[0].position = state->offset;
+    memcpy(state->rows.x, x, config->d_model * sizeof(float));
+    if (tar_forward_rows(weights, config, state->attn_dim, state->half,
+                         &state->rows, state->refs, 1u, 0) != 0) {
+        return -1;
+    }
+    state->offset += 1u;
+    tar_finish_row(weights, config, state->rows.x, out);
+    return 0;
+}
+
+/* Two configurations describe the same graph, i.e. the same weights back both
+ * and their KV caches have the same interior.  `max_seq_len` may differ: it is
+ * a capacity, not a shape. */
+static int tar_config_same(const mynah_transformer_ar_config *a,
+                           const mynah_transformer_ar_config *b) {
+    return a->d_model == b->d_model && a->num_heads == b->num_heads &&
+           a->head_dim == b->head_dim && a->num_layers == b->num_layers &&
+           a->ffn_dim == b->ffn_dim && a->context == b->context &&
+           a->max_period == b->max_period && a->layernorm_eps == b->layernorm_eps;
+}
+
+int mynah_transformer_ar_step_batch(mynah_transformer_ar_state *const *states,
+                                    size_t count,
+                                    const mynah_transformer_ar_weights *weights,
+                                    mynah_transformer_ar_batch *batch,
+                                    const float *const *x, float *const *out) {
+    if (count == 0) return 0;
+    if (states == NULL || weights == NULL || weights->layers == NULL ||
+        x == NULL || out == NULL) {
+        return -1;
+    }
+    if (count == 1u) {
+        return mynah_transformer_ar_step(states[0], weights, x[0], out[0]);
+    }
+    if (batch == NULL || count > batch->rows.rows_cap) return -1;
+    const mynah_transformer_ar_config *config = &batch->config;
+    const size_t d_model = config->d_model;
+    for (size_t b = 0; b < count; ++b) {
+        mynah_transformer_ar_state *state = states[b];
+        if (state == NULL || x[b] == NULL || out[b] == NULL) return -1;
+        if (!tar_config_same(&state->config, config)) return -1;
+        if (state->offset >= state->config.max_seq_len) return -1;
+        if (!tar_finite(x[b], d_model)) return -1;
+        /* Two states appearing twice in one batch would have the second write
+         * of a position silently overwrite the first. */
+        for (size_t c = 0; c < b; ++c) {
+            if (states[c] == state) return -1;
+        }
+        batch->refs[b].state = state;
+        batch->refs[b].position = state->offset;
+        memcpy(batch->rows.x + b * d_model, x[b], d_model * sizeof(float));
+    }
+    if (tar_forward_rows(weights, config, batch->attn_dim,
+                         config->head_dim / 2u, &batch->rows, batch->refs, count,
+                         1) != 0) {
+        return -1;
+    }
+    for (size_t b = 0; b < count; ++b) {
+        states[b]->offset += 1u;
+        tar_finish_row(weights, config, batch->rows.x + b * d_model, out[b]);
+    }
+    return 0;
 }
 
 /* -------------------------------------------------------------- self test */
@@ -783,6 +1100,25 @@ static void tar_test_config(mynah_transformer_ar_config *config,
     config->ffn_dim = TAR_F;
     config->max_seq_len = TAR_T + 2u;
     config->context = context;
+}
+
+/* A row-pointer hook that does exactly what the built-in fallback does.  Its
+ * only job is to make the hooked path's pointer plumbing observable: if
+ * `in_ptr`/`out_ptr` were built wrong, this would produce different numbers
+ * from the unhooked run of the same test. */
+static int tar_test_linear_rows(void *user, size_t layer,
+                                mynah_transformer_ar_linear_kind kind,
+                                const float *weight, const float *bias,
+                                const float *const *in_rows,
+                                float *const *out_rows, size_t batch, size_t k,
+                                size_t n) {
+    (void)user;
+    (void)layer;
+    (void)kind;
+    for (size_t b = 0; b < batch; ++b) {
+        mynah_matvec_bias_f32(weight, in_rows[b], bias, out_rows[b], n, k);
+    }
+    return 0;
 }
 
 #define TAR_FAIL(...)                                       \
@@ -1170,6 +1506,167 @@ int mynah_transformer_ar_self_test(char *error, size_t error_capacity) {
             free(store);
             TAR_FAIL("the loaded voice prefix was not attended to");
         }
+    }
+
+    /* 9. A prefill wider than one tile is the same function as the same
+     *    positions stepped one at a time -- bit for bit.  The tile is a
+     *    scheduling unit and must never become a numerical one, and at
+     *    TAR_T = 6 nothing above ever crosses a tile boundary. */
+    {
+        enum { TAR_WIDE = 35u }; /* 16 + 16 + 3 at the current tile */
+        if (mynah_transformer_ar_prefill_tile() >= (size_t)TAR_WIDE) {
+            free(store);
+            TAR_FAIL("the tile grew past the multi-tile test: raise TAR_WIDE");
+        }
+        for (size_t l = 0; l < TAR_L; ++l) {
+            store->layers[l].layer_scale_1 = NULL;
+            store->layers[l].layer_scale_2 = NULL;
+        }
+        mynah_transformer_ar_config config;
+        tar_test_config(&config, 0);
+        config.max_seq_len = TAR_WIDE;
+        float wide[TAR_WIDE][TAR_D];
+        float tiled[TAR_WIDE][TAR_D];
+        float stepped[TAR_WIDE][TAR_D];
+        for (size_t t = 0; t < (size_t)TAR_WIDE; ++t) {
+            for (size_t i = 0; i < TAR_D; ++i) {
+                wide[t][i] = tar_fake(t * TAR_D + i, 19u) * 4.0f;
+            }
+        }
+        mynah_transformer_ar_state *a =
+            mynah_transformer_ar_state_new(&config, error, error_capacity);
+        mynah_transformer_ar_state *b =
+            mynah_transformer_ar_state_new(&config, error, error_capacity);
+        if (a == NULL || b == NULL) {
+            mynah_transformer_ar_state_free(a);
+            mynah_transformer_ar_state_free(b);
+            free(store);
+            return -1;
+        }
+        int failed = mynah_transformer_ar_prefill(a, &store->weights, &wide[0][0],
+                                                  TAR_WIDE, &tiled[0][0]) != 0;
+        for (size_t t = 0; t < (size_t)TAR_WIDE && !failed; ++t) {
+            failed = mynah_transformer_ar_step(b, &store->weights, wide[t],
+                                               stepped[t]) != 0;
+        }
+        const size_t offset_a = mynah_transformer_ar_state_offset(a);
+        const size_t offset_b = mynah_transformer_ar_state_offset(b);
+        mynah_transformer_ar_state_free(a);
+        mynah_transformer_ar_state_free(b);
+        if (failed) {
+            free(store);
+            TAR_FAIL("multi-tile prefill: a forward failed");
+        }
+        if (offset_a != (size_t)TAR_WIDE || offset_b != (size_t)TAR_WIDE) {
+            free(store);
+            TAR_FAIL("multi-tile prefill left offsets %zu / %zu, want %u",
+                     offset_a, offset_b, TAR_WIDE);
+        }
+        for (size_t t = 0; t < (size_t)TAR_WIDE; ++t) {
+            for (size_t i = 0; i < TAR_D; ++i) {
+                if (tiled[t][i] != stepped[t][i]) {
+                    free(store);
+                    TAR_FAIL("multi-tile prefill [%zu][%zu]: %.9g vs stepped "
+                             "%.9g",
+                             t, i, (double)tiled[t][i], (double)stepped[t][i]);
+                }
+            }
+        }
+    }
+
+    /* 10. `_step_batch` of N states is the same function as those N states
+     *     stepped alone -- bit for bit, at ragged offsets, with a sliding
+     *     window so the per-row `lo` differs, and once more through a
+     *     row-pointer hook so the pointer plumbing is exercised rather than
+     *     only the fallback. */
+    {
+        enum { TAR_NB = 3u };
+        const size_t prefix[TAR_NB] = {1u, 3u, 5u};
+        mynah_transformer_ar_config config;
+        tar_test_config(&config, 2u); /* a window, so `lo` is row-dependent */
+        config.max_seq_len = TAR_T + 2u;
+        for (int hooked = 0; hooked < 2; ++hooked) {
+            store->weights.linear_rows = hooked ? tar_test_linear_rows : NULL;
+            store->weights.linear_user = NULL;
+            mynah_transformer_ar_state *batched[TAR_NB] = {NULL, NULL, NULL};
+            mynah_transformer_ar_state *solo[TAR_NB] = {NULL, NULL, NULL};
+            mynah_transformer_ar_batch *scratch =
+                mynah_transformer_ar_batch_new(&config, TAR_NB, error,
+                                               error_capacity);
+            int failed = scratch == NULL;
+            for (size_t b = 0; b < (size_t)TAR_NB && !failed; ++b) {
+                batched[b] = mynah_transformer_ar_state_new(&config, error,
+                                                            error_capacity);
+                solo[b] = mynah_transformer_ar_state_new(&config, error,
+                                                         error_capacity);
+                failed = batched[b] == NULL || solo[b] == NULL ||
+                         mynah_transformer_ar_prefill(batched[b], &store->weights,
+                                                      &input[0][0], prefix[b],
+                                                      NULL) != 0 ||
+                         mynah_transformer_ar_prefill(solo[b], &store->weights,
+                                                      &input[0][0], prefix[b],
+                                                      NULL) != 0;
+            }
+            float got[TAR_NB][TAR_D], want[TAR_NB][TAR_D];
+            const float *xs[TAR_NB];
+            float *os[TAR_NB];
+            for (size_t b = 0; b < (size_t)TAR_NB; ++b) {
+                xs[b] = input[b % TAR_T];
+                os[b] = got[b];
+            }
+            if (!failed) {
+                failed = mynah_transformer_ar_step_batch(batched, TAR_NB,
+                                                         &store->weights, scratch,
+                                                         xs, os) != 0;
+            }
+            for (size_t b = 0; b < (size_t)TAR_NB && !failed; ++b) {
+                failed = mynah_transformer_ar_step(solo[b], &store->weights, xs[b],
+                                                   want[b]) != 0;
+            }
+            size_t offsets[TAR_NB] = {0, 0, 0};
+            for (size_t b = 0; b < (size_t)TAR_NB; ++b) {
+                offsets[b] = mynah_transformer_ar_state_offset(batched[b]);
+                mynah_transformer_ar_state_free(batched[b]);
+                mynah_transformer_ar_state_free(solo[b]);
+            }
+            mynah_transformer_ar_batch_free(scratch);
+            if (failed) {
+                store->weights.linear_rows = NULL;
+                free(store);
+                TAR_FAIL("step_batch (hooked=%d): a forward failed", hooked);
+            }
+            for (size_t b = 0; b < (size_t)TAR_NB; ++b) {
+                if (offsets[b] != prefix[b] + 1u) {
+                    store->weights.linear_rows = NULL;
+                    free(store);
+                    TAR_FAIL("step_batch left row %zu at offset %zu, want %zu", b,
+                             offsets[b], prefix[b] + 1u);
+                }
+                for (size_t i = 0; i < TAR_D; ++i) {
+                    if (got[b][i] != want[b][i]) {
+                        store->weights.linear_rows = NULL;
+                        free(store);
+                        TAR_FAIL("step_batch (hooked=%d) row %zu dim %zu: %.9g "
+                                 "vs solo %.9g",
+                                 hooked, b, i, (double)got[b][i],
+                                 (double)want[b][i]);
+                    }
+                }
+            }
+            /* If every row came out the same the comparison above could not
+             * have seen one row's state leaking into another. */
+            int distinct = 0;
+            for (size_t i = 0; i < TAR_D; ++i) {
+                if (got[0][i] != got[1][i] || got[1][i] != got[2][i]) distinct = 1;
+            }
+            if (!distinct) {
+                store->weights.linear_rows = NULL;
+                free(store);
+                TAR_FAIL("step_batch produced three identical rows: the test is "
+                         "blind to cross-talk");
+            }
+        }
+        store->weights.linear_rows = NULL;
     }
 
     free(store);
