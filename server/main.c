@@ -47,6 +47,14 @@
  *     last to let go. The descriptor leaves the job exactly once, through an
  *     atomic claim, which is what makes a double close impossible and a leaked
  *     descriptor detectable.
+ *   - A client that goes away takes its slot with it. The peer hangup is
+ *     detected on the socket rather than inferred from a failed write, and it
+ *     is observed at the frame boundary through the same cancellation callback
+ *     a deadline uses, so a slot is freed within one decoder step and never in
+ *     the middle of one. Cancellation is asked before any other policy and
+ *     nothing can overrule it: work with no consumer has nothing to trade off
+ *     against. On by default; --no-cancel-on-disconnect turns it off and
+ *     /health says which is in force.
  *   - Every request has a wall-clock deadline (--request-timeout-ms). A
  *     request past it is answered 504 and its worker is freed; a queued job
  *     past it is never synthesized at all, and one already in the batch is
@@ -68,6 +76,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -107,6 +116,7 @@ static struct {
     size_t max_batch;
     size_t max_pending;
     unsigned request_timeout_ms;
+    int cancel_on_disconnect;   /* default on; --no-cancel-on-disconnect turns it off */
 } g;
 
 /* The synthesis thread, published once by the scheduler before it enters the
@@ -132,6 +142,12 @@ static struct {
     atomic_ulong completed;
     atomic_ulong rejected;      /* queue full, at either queue */
     atomic_ulong timed_out;     /* deadline passed before the audio did */
+    /* Kept apart from timed_out on purpose. A deadline is the server giving
+     * up on a client; a disconnect is the client giving up on the server, and
+     * an operator reading one as the other would tune the wrong number. It is
+     * also the only direct evidence that cancel-on-disconnect is doing
+     * anything, so the disconnect test has something to assert on. */
+    atomic_ulong disconnected;  /* peer hung up; slot freed at a frame boundary */
     atomic_ulong failed;
     atomic_ulong streams_active;
     atomic_ulong streams_total;
@@ -185,6 +201,11 @@ typedef struct {
     stream_out *out;
     double deadline_ms;      /* monotonic, 0 when no deadline was configured */
     int expired;
+    /* Written and read only on the scheduler thread (sink_cancelled and
+     * sink_on_done are both driver callbacks), so it needs no atomic. It
+     * exists so the outcome can say WHY the stream stopped: a client that
+     * hung up and a deadline that expired are different operational events. */
+    int peer_gone;
 } stream_sink;
 
 typedef struct synth_job {
@@ -493,6 +514,14 @@ static void sink_on_done(void *ud, void *tag, int result) {
             atomic_fetch_add(&g_stats.timed_out, 1ul);
             fprintf(stderr, "stream hit the %u ms deadline after %zu bytes; "
                             "slot released\n", g.request_timeout_ms, stats.sent_bytes);
+        } else if (j->sink.peer_gone) {
+            /* The event cancel-on-disconnect exists for, logged as its own
+             * line so a disconnect under load is distinguishable from a
+             * timeout in a log nobody was watching live. */
+            atomic_fetch_add(&g_stats.disconnected, 1ul);
+            fprintf(stderr, "client disconnected after %zu bytes; stream "
+                            "cancelled at the frame boundary and the slot freed\n",
+                    stats.sent_bytes);
         } else if (result == MYNAH_GRAPH_CANCELLED) {
             atomic_fetch_add(&g_stats.timed_out, 1ul);
             fprintf(stderr, "stream cancelled after %zu bytes (queue peak %zu, "
@@ -520,13 +549,45 @@ static void sink_on_done(void *ud, void *tag, int result) {
 
 /* Polled once per request per decoder step. A request nobody is listening for
  * any more leaves the batch within one frame instead of finishing for an empty
- * socket -- and is reported as cancelled, not as a synthesis failure. */
+ * socket -- and is reported as cancelled, not as a synthesis failure.
+ *
+ * This is the ONLY preemption point, and that is deliberate. The driver calls
+ * this between steps, never inside one, so a slot that answers "cancelled" is
+ * retired by slot_retire after the step it is already in has completed. No
+ * state a decoder is mid-way through is ever taken from under it; the cost of
+ * a disconnect is therefore bounded by one frame, and never by a torn buffer.
+ *
+ * Cancellation also WINS over everything else: it is asked first and nothing
+ * downstream can overrule it. A deadline, a queue policy or an admission
+ * decision can only ever delay work, whereas this says the work has no
+ * consumer left -- there is nothing to trade off against. */
 static int sink_cancelled(void *ud, void *tag) {
     (void)ud;
     synth_job *j = (synth_job *)tag;
+    synth_assert_scheduler();
+
+    /* The submitter walked away (batch deadline). Cheapest check, and it
+     * covers both request shapes. */
     if (atomic_load(&j->gave_up) != 0) return 1;
-    if (j->is_stream && j->sink.out != NULL) return stream_out_failed(j->sink.out);
-    return 0;
+    if (!j->is_stream || j->sink.out == NULL) return 0;
+
+    /* Asked BEFORE the generic failed check, because both can be true at once
+     * and only this one knows which. The writer usually beats this poll to the
+     * discovery -- it is the thread with the socket in its hands -- so a
+     * hangup normally arrives here as an already-recorded EPIPE rather than as
+     * a live POLLHUP. Checking "failed" first would collapse the two and
+     * report a disconnect as a timeout. */
+    if (g.cancel_on_disconnect && stream_out_peer_gone(j->sink.out)) {
+        j->sink.peer_gone = 1;
+        return 1;
+    }
+
+    /* Dead for some other reason: a full queue, a send timeout, out of memory.
+     * Still a cancellation, just not a disconnect. Note this is deliberately
+     * NOT behind the flag: --no-cancel-on-disconnect suppresses the proactive
+     * hangup poll, and never the fact that a stream with no working socket has
+     * nowhere left to put its audio. */
+    return stream_out_failed(j->sink.out);
 }
 
 /* Whether to keep admitting. Requests already in flight always finish. */
@@ -540,6 +601,10 @@ static void *scheduler_main(void *arg) {
     (void)arg;
     g_synth_thread = pthread_self();
     atomic_store(&g_synth_thread_set, 1);
+    /* The one thread inside the model. Named so that a `top -H` on a busy
+     * server answers "which thread is hot" without a debugger, which is the
+     * whole point of naming the other three as well. */
+    mynah_thread_set_name("mynah-sched");
 
     mynah_graph_sink sink;
     memset(&sink, 0, sizeof(sink));
@@ -971,15 +1036,25 @@ static void handle_models(int fd) {
  * much is running, and how much the server refused or gave up on. A monitor
  * that only ever sees "ok" cannot tell a busy server from a stuck one. */
 static void handle_health(int fd) {
-    char body[768];
+    /* Grown with the disconnect counter and the cancel-on-disconnect flag.
+     * snprintf would truncate rather than overflow, but a truncated /health is
+     * invalid JSON, which a monitor reads as "the server is broken". */
+    char body[1024];
     const int n = snprintf(body, sizeof(body),
                            "{\"status\":\"ok\",\"model\":\"%s\",\"engine\":\"%s\","
                            "\"sample_rate\":%u,\"voices\":%zu,"
                            "\"jobs\":{\"queued\":%lu,\"active\":%lu,\"completed\":%lu,"
-                           "\"failed\":%lu,\"rejected\":%lu,\"timed_out\":%lu},"
+                           "\"failed\":%lu,\"rejected\":%lu,\"timed_out\":%lu,"
+                           "\"disconnected\":%lu},"
                            "\"streams\":{\"active\":%lu,\"total\":%lu},"
+                           /* A policy that is on by default has to be
+                            * READABLE, or an operator cannot tell a server
+                            * that frees slots on hangup from one that does
+                            * not -- and the two behave identically until a
+                            * client actually goes away. */
                            "\"limits\":{\"max_batch\":%zu,\"queue_capacity\":%zu,"
-                           "\"workers\":%d,\"request_timeout_ms\":%u},"
+                           "\"workers\":%d,\"request_timeout_ms\":%u,"
+                           "\"cancel_on_disconnect\":%s},"
                            /* Which PROCESS answered. Under prefork the counters
                             * above are that worker's, not the machine's, so a
                             * caller polling /health samples a different worker
@@ -996,10 +1071,12 @@ static void handle_health(int fd) {
                            atomic_load(&g_stats.failed),
                            atomic_load(&g_stats.rejected),
                            atomic_load(&g_stats.timed_out),
+                           atomic_load(&g_stats.disconnected),
                            atomic_load(&g_stats.streams_active),
                            atomic_load(&g_stats.streams_total),
                            g.max_batch, g.max_pending, g.worker_count,
                            g.request_timeout_ms,
+                           g.cancel_on_disconnect ? "true" : "false",
                            (int)getpid(), mynah_prefork_worker_index(),
                            mynah_prefork_worker_threads() > 0
                                ? mynah_prefork_worker_threads()
@@ -1252,7 +1329,14 @@ static void handle_connection(int fd) {
 }
 
 static void *worker_main(void *arg) {
-    (void)arg;
+    /* The HTTP workers are interchangeable, so the index is the only thing
+     * that distinguishes them -- and it is exactly what is wanted when three
+     * of four are parked in recv() and one is not. */
+    {
+        char name[16];
+        snprintf(name, sizeof(name), "mynah-http%d", (int)(intptr_t)arg);
+        mynah_thread_set_name(name);
+    }
     for (;;) {
         const int fd = queue_pop(&g_queue);
         if (fd < 0) break;
@@ -1301,11 +1385,12 @@ static void dump_local_stats(void) {
     else snprintf(who, sizeof(who), "server pid %d", (int)getpid());
     fprintf(stderr,
             "[%s] queued=%lu active=%lu completed=%lu failed=%lu rejected=%lu "
-            "timed_out=%lu streams=%lu/%lu · threads=%d max_batch=%zu\n",
+            "timed_out=%lu disconnected=%lu streams=%lu/%lu · threads=%d max_batch=%zu\n",
             who,
             atomic_load(&g_stats.queued), atomic_load(&g_stats.active),
             atomic_load(&g_stats.completed), atomic_load(&g_stats.failed),
             atomic_load(&g_stats.rejected), atomic_load(&g_stats.timed_out),
+            atomic_load(&g_stats.disconnected),
             atomic_load(&g_stats.streams_active), atomic_load(&g_stats.streams_total),
             mynah_prefork_worker_threads() > 0 ? mynah_prefork_worker_threads()
                                                : mynah_num_threads(),
@@ -1317,8 +1402,17 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s -m MODEL_DIR [-p PORT] [--host ADDR] [-w WORKERS]\n"
             "       [--device cpu|metal|cuda] [--max-batch N] [--max-pending N]\n"
-            "       [--request-timeout-ms MS]\n"
+            "       [--request-timeout-ms MS] [--no-cancel-on-disconnect]\n"
             "       [--prefork W] [--prefork-threads T] [--prefork-plan]\n"
+            "\n"
+            "  --no-cancel-on-disconnect\n"
+            "                     stop watching streaming sockets for a peer hangup.\n"
+            "                     By default the scheduler checks each streaming slot\n"
+            "                     once per decoder step and frees it at the next frame\n"
+            "                     boundary when the client has gone. This turns off\n"
+            "                     that check only: a stream whose socket has actually\n"
+            "                     failed still ends, because it has nowhere to write.\n"
+            "                     /health reports which is in force.\n"
             "\n"
             "  --prefork W        serve from W pinned worker processes instead of one\n"
             "                     process. The parent loads the pack, forks W workers\n"
@@ -1347,6 +1441,13 @@ int main(int argc, char **argv) {
     g.max_batch = 8;
     g.max_pending = JOB_QUEUE_CAP;
     g.request_timeout_ms = REQUEST_TIMEOUT_MS;
+    /* Default ON. Synthesizing for a socket whose peer is gone spends a slot
+     * -- the scarcest thing the server has -- on output nobody will ever
+     * hear, and the alternative to freeing it is holding it for the length of
+     * an utterance. The escape hatch exists because the detection is a
+     * judgement about a socket, and an operator who believes it is wrong
+     * needs a way to say so without rebuilding. */
+    g.cancel_on_disconnect = 1;
     int prefork_workers = 0;
     int prefork_threads = 0;
     int prefork_plan_only = 0;
@@ -1375,6 +1476,10 @@ int main(int argc, char **argv) {
             prefork_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prefork-plan") == 0) {
             prefork_plan_only = 1;
+        } else if (strcmp(argv[i], "--no-cancel-on-disconnect") == 0) {
+            g.cancel_on_disconnect = 0;
+        } else if (strcmp(argv[i], "--cancel-on-disconnect") == 0) {
+            g.cancel_on_disconnect = 1;   /* the default, spelled out */
         } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
             const char *d = argv[++i];
             if (strcmp(d, "metal") == 0) device = MYNAH_TTS_DEVICE_METAL;
@@ -1533,6 +1638,22 @@ int main(int argc, char **argv) {
         accept_fd = -1;              /* a worker never accepts; the parent routes */
     }
 
+    /* The main thread's role is decided by the branch just above, so it names
+     * itself here rather than at the top of main(): a prefork worker does not
+     * accept anything, it receives descriptors down a channel, and calling
+     * both of those "accept" would put the wrong answer in `top`.
+     *
+     * One consequence to know about rather than discover: on Linux the main
+     * thread's name IS /proc/<pid>/comm, so `ps -o comm` and a bare `top` will
+     * show this instead of the binary name, and `pkill mynah-tts-server` stops
+     * matching. That is a deliberate trade -- under prefork it is the only
+     * thing that distinguishes a worker from the router in a process list,
+     * since every one of them is the same executable. Match on the full
+     * command line (pkill -f) if you need the old behaviour. On macOS the
+     * process keeps its name and `sample` reports the main thread by its
+     * dispatch-queue label, so the name is visible only to a debugger. */
+    mynah_thread_set_name(chan_fd >= 0 ? "mynah-recv" : "mynah-accept");
+
     pthread_mutex_init(&g_batch.mu, NULL);
     pthread_cond_init(&g_batch.arrived, NULL);
     if (pthread_create(&g_batch.thread, NULL, scheduler_main, NULL) != 0) {
@@ -1550,16 +1671,31 @@ int main(int argc, char **argv) {
             "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu  "
             "workers=%d  max_batch=%zu  queue=%zu  timeout=%ums%s\n"
             "note: one scheduler thread synthesizes; requests join the running\n"
-            "      batch as slots free up, streaming and batch alike\n",
+            "      batch as slots free up, streaming and batch alike\n"
+            "transport: TCP_NODELAY on every accepted socket; threads named\n"
+            "      (mynah-accept/recv, mynah-http*, mynah-sched, mynah-out*)\n"
+            "cancel-on-disconnect: %s\n",
             host, port, g.model_id, mynah_tts_device_name(device), g.voice_count,
             g.worker_count, g.max_batch, g.max_pending, g.request_timeout_ms,
-            chan_fd >= 0 ? "  [prefork worker]" : "");
+            chan_fd >= 0 ? "  [prefork worker]" : "",
+            /* Printed whichever way it is set: a policy visible only when
+             * enabled tells an operator nothing when a stream outlives its
+             * client and they are trying to work out why. */
+            g.cancel_on_disconnect
+                ? "on — each streaming slot is checked for a peer hangup once per\n"
+                  "      decoder step and freed at the next frame boundary\n"
+                  "      (--no-cancel-on-disconnect)"
+                : "OFF — streaming sockets are not watched for a hangup; a stream\n"
+                  "      ends only when a write to it actually fails");
 
     queue_init(&g_queue);
     pthread_t workers[64];
     int worker_count = g.worker_count;
     for (int i = 0; i < worker_count; ++i) {
-        if (pthread_create(&workers[i], NULL, worker_main, NULL) != 0) {
+        /* The index travels as the argument rather than through a shared
+         * counter: the thread names itself, so it must know which one it is
+         * before anything else races it. */
+        if (pthread_create(&workers[i], NULL, worker_main, (void *)(intptr_t)i) != 0) {
             worker_count = i;
             break;
         }
@@ -1619,6 +1755,32 @@ int main(int argc, char **argv) {
         struct timeval tv = {CLIENT_TIMEOUT_S, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        /* Nagle off, on every accepted socket and on every descriptor the
+         * prefork parent passes down -- which is why this sits below the
+         * branch with the timeouts rather than inside either arm.
+         *
+         * The latency argument is the obvious one: a streamed chunk is a small
+         * write followed by nothing, exactly the shape Nagle holds back
+         * waiting for a companion. The measurement argument is the one that
+         * actually forced it. Our cadence metrics are a histogram of when
+         * chunks ARRIVED, and Nagle merges two server emissions into one
+         * client-visible arrival. A run whose coalesced-read share is high is
+         * declared not quotable for cadence percentages
+         * (.work/streaming-cadence.md §5), so without this the transport is
+         * free to invent numbers the scheduler never produced. */
+        const int nodelay = 1;
+        if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
+            /* Not fatal -- the stream is still correct, only burstier -- but
+             * it must not pass unnoticed, because the cadence numbers taken
+             * afterwards would silently be transport artefacts. */
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "warning: TCP_NODELAY refused (%s); cadence "
+                                "measurements from this run are not quotable\n",
+                        strerror(errno));
+            }
+        }
         if (queue_push(&g_queue, fd) != 0) {
             atomic_fetch_add(&g_stats.rejected, 1ul);
             /* Queue full: shed the connection rather than grow without bound. */

@@ -1,8 +1,27 @@
 #include "http_util.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The Linux cap, which is the tighter of the two and the one that fails the
+ * call rather than truncating for us. */
+#define MYNAH_THREAD_NAME_MAX 16u
+
+void mynah_thread_set_name(const char *name) {
+    if (name == NULL || name[0] == '\0') return;
+    char buf[MYNAH_THREAD_NAME_MAX];
+    snprintf(buf, sizeof(buf), "%s", name);
+#if defined(__APPLE__)
+    /* Darwin names the calling thread and takes no handle. */
+    (void)pthread_setname_np(buf);
+#elif defined(__linux__)
+    (void)pthread_setname_np(pthread_self(), buf);
+#else
+    (void)buf;   /* no portable spelling: leave the thread unnamed */
+#endif
+}
 
 const char *mynah_memmem(const char *hay, size_t hay_len,
                          const char *needle, size_t needle_len) {

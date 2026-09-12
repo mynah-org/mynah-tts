@@ -14,7 +14,10 @@
  */
 #include "stream_out.h"
 
+#include "http_util.h"
+
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -31,6 +34,10 @@
 #define STREAM_OUT_DEFAULT_TIMEOUT_MS 5000
 
 struct stream_out {
+    /* Guarded by `mu` for READING from another thread; the writer thread is
+     * the only one that mutates it, and only to -1 when it closes. Anyone
+     * asking about the socket must hold `mu`, which is what keeps the close
+     * and a peer-hangup poll from overlapping. */
     int fd;
     int send_timeout_ms;
 
@@ -151,6 +158,16 @@ static void mark_failed_locked(stream_out *out, int err) {
 static void *stream_out_writer_main(void *arg) {
     stream_out *out = (stream_out *)arg;
 
+    /* One writer per stream, so the descriptor is the only identity available
+     * and also the useful one: it is what `lsof` and the server's own logs
+     * name. Set from this thread because that is the only spelling both
+     * platforms share -- see mynah_thread_set_name(). */
+    {
+        char name[16];
+        snprintf(name, sizeof(name), "mynah-out%d", out->fd);
+        mynah_thread_set_name(name);
+    }
+
     if (out->header_len > 0 &&
         write_all_or_gone(out->fd, out->header, out->header_len) != 0) {
         pthread_mutex_lock(&out->mu);
@@ -198,7 +215,18 @@ static void *stream_out_writer_main(void *arg) {
         failed = 1;
     }
 
-    close(out->fd);
+    /* Closed under the mutex, and the field retired to -1 in the same critical
+     * section. stream_out_peer_gone() may be polling this descriptor from the
+     * scheduler thread; it holds `mu` while it does, so the close either
+     * happens entirely before its poll (and it sees -1 and reports gone) or
+     * entirely after (and its poll ran on a descriptor that was still ours).
+     * Without the lock the number could be reissued by accept() between the
+     * two, and the poll would be asking about a stranger's connection. */
+    pthread_mutex_lock(&out->mu);
+    const int doomed = out->fd;
+    out->fd = -1;
+    if (doomed >= 0) close(doomed);
+    pthread_mutex_unlock(&out->mu);
 
     /* A stream that stops early must never be silent: a truncated response is
      * otherwise indistinguishable from a short utterance. */
@@ -326,6 +354,94 @@ int stream_out_failed(stream_out *out) {
     const int failed = out->failed;
     pthread_mutex_unlock(&out->mu);
     return failed;
+}
+
+/* Which recorded failures mean "the peer went away" as opposed to "the peer is
+ * still there and not keeping up". The distinction is the whole point of the
+ * disconnect counter: a hangup frees a slot nobody wanted, a slow reader is a
+ * capacity problem, and an operator who sees them as one number cannot tell a
+ * flaky client population from an undersized machine.
+ *
+ * Deliberately NOT in this set: errno 0, which is the queue-overflow
+ * cancellation (a reader too slow, socket still open), and EAGAIN, which is an
+ * SO_SNDTIMEO expiry -- same thing, arriving by a different route. */
+static int failure_is_hangup(int err) {
+    switch (err) {
+        case EPIPE:
+        case ECONNRESET:
+        case ENOTCONN:
+#ifdef ESHUTDOWN
+        case ESHUTDOWN:
+#endif
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int stream_out_peer_gone(stream_out *out) {
+    if (out == NULL) return 1;
+
+    pthread_mutex_lock(&out->mu);
+    /* Already failed. The answer comes from WHY, not from the socket: by the
+     * time a write has returned EPIPE the descriptor may already be closed,
+     * and in practice the writer usually discovers the hangup before this poll
+     * does -- it is the thread actually touching the socket. Reporting only
+     * what the poll caught would have credited one disconnect in four and
+     * filed the rest under "timed out", which is how the counter read before
+     * this branch existed. */
+    if (out->failed) {
+        const int gone = failure_is_hangup(out->failure_errno);
+        pthread_mutex_unlock(&out->mu);
+        return gone;
+    }
+    const int fd = out->fd;
+    if (fd < 0) { pthread_mutex_unlock(&out->mu); return 1; }
+
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+#ifdef POLLRDHUP
+    pfd.events |= POLLRDHUP;   /* Linux: the half-close, without a read */
+#endif
+    pfd.revents = 0;
+
+    int gone = 0;
+    const int ready = poll(&pfd, 1, 0);   /* zero timeout: never blocks on mu */
+    if (ready < 0) {
+        /* EINTR and EAGAIN are "ask again"; anything else means this
+         * descriptor can no longer be polled, which is a dead stream. */
+        gone = (errno != EINTR && errno != EAGAIN);
+    } else if (ready > 0) {
+        if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            gone = 1;
+#ifdef POLLRDHUP
+        } else if ((pfd.revents & POLLRDHUP) != 0) {
+            gone = 1;
+#endif
+        } else if ((pfd.revents & POLLIN) != 0) {
+            /* The portable half. Readable means either the peer sent
+             * something (a pipelined byte we will never read) or it closed.
+             * Only a zero-length peek tells the two apart, and it cannot block
+             * because poll() just said the socket is readable. */
+            char probe;
+            const ssize_t n = recv(fd, &probe, 1, MSG_PEEK);
+            if (n == 0) {
+                gone = 1;
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR) {
+                gone = 1;
+            }
+        }
+    }
+
+    /* Failing the stream here is what frees the socket promptly: the writer is
+     * parked on the condvar waiting for PCM nobody will read, and this wakes
+     * it to close and go. The decoder is untouched -- it learns at its own
+     * frame boundary, through the server's cancellation callback. */
+    if (gone) mark_failed_locked(out, EPIPE);
+    pthread_mutex_unlock(&out->mu);
+    return gone;
 }
 
 void stream_out_finish(stream_out *out) {

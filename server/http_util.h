@@ -48,4 +48,18 @@ int mynah_http_media_type_is(const char *value, const char *media);
  * Returns the number of bytes written, or (size_t)-1 if it does not fit. */
 size_t mynah_json_escape(const char *in, char *out, size_t capacity);
 
+/* Names the CALLING thread for the OS, so `top -H`, `ps -M` and /proc/<pid>/task
+ * show the worker's thread-ownership table without a debugger attached.
+ *
+ * It must be called from the thread being named, because the two platform
+ * signatures disagree and only that form is available on both:
+ *
+ *   macOS   int pthread_setname_np(const char *)                self only
+ *   Linux   int pthread_setname_np(pthread_t, const char *)     any thread
+ *
+ * Linux also caps the name at 16 bytes including the terminator and fails the
+ * whole call on a longer one, so `name` is truncated here rather than silently
+ * dropped there. Naming is diagnostic: failure is ignored, never reported. */
+void mynah_thread_set_name(const char *name);
+
 #endif
