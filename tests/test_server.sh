@@ -152,23 +152,32 @@ echo "native /tts ok (same audio as the OpenAI route)"
 
 # --- Batching under load ---------------------------------------------------
 # Four clients at once must each get exactly the audio they would have got
-# alone, and the batch must not be slower than the same four one after another.
-# The identity check is the one that matters: batching reorders independent
-# work, so a difference here means a slot leaked state into its neighbour.
+# alone. Batching reorders independent work, so a difference here means a slot
+# leaked state into its neighbour.
+#
+# E5-10: this check used to ALSO assert that four concurrent requests finish no
+# slower than four serial ones, timed with `date +%s` -- one-second granularity
+# around a workload of roughly 200 ms. Two samples from the same distribution
+# land on either side of a second boundary often enough that the check failed
+# on a correct server, which is worse than no check: a gate that cries wolf
+# gets ignored, and then the identity comparison next to it gets ignored too.
+# It is gone rather than made finer-grained. Throughput is not this file's
+# question -- `make serving-wave` and `make serving-soak` (tools/serving_profile.py)
+# measure it properly, with warm-up discarded and a drift gate, and
+# .work/serving-doctrine.md is explicit that a screen may disqualify a
+# configuration but never promote one. What stays here is the part that is
+# decidable from a single run: the bytes.
 #
 # Every wait names its PIDs: the server itself is a background child of this
 # script, so a bare `wait` would block on it forever.
-serial_start=$(date +%s)
 for i in 1 2 3 4; do
     curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
         -H 'Content-Type: application/json' \
         -d "{\"input\":\"batching under load check\",\"voice\":\"Sofia\",\"seed\":$i}" \
         -o "$TMP/serial$i.wav" || fail "serial client $i failed"
 done
-serial_end=$(date +%s)
 
 pids=""
-batch_start=$(date +%s)
 for i in 1 2 3 4; do
     curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
         -H 'Content-Type: application/json' \
@@ -179,18 +188,19 @@ done
 for p in $pids; do
     wait "$p" || fail "concurrent batching client failed"
 done
-batch_end=$(date +%s)
 
+# The four requests differ only in seed, so if the seed were ignored all four
+# would be identical and every comparison below would be trivially true. Assert
+# they are distinct BEFORE asserting they match their serial twins: this check
+# is what keeps the one after it from being decoration.
+cmp -s "$TMP/serial1.wav" "$TMP/serial2.wav" &&
+    fail "seeds 1 and 2 produced identical audio; the identity check below would be vacuous"
 for i in 1 2 3 4; do
     [ -s "$TMP/p$i.wav" ] || fail "batched client $i got no audio"
     cmp -s "$TMP/p$i.wav" "$TMP/serial$i.wav" ||
         fail "batched client $i differs from the same request run alone"
 done
-serial_s=$((serial_end - serial_start))
-batch_s=$((batch_end - batch_start))
-[ "$batch_s" -le "$serial_s" ] ||
-    fail "four concurrent requests ($batch_s s) were slower than four serial ($serial_s s)"
-echo "batching    ok (4 concurrent ${batch_s}s vs 4 serial ${serial_s}s, all byte-identical)"
+echo "batching    ok (4 concurrent == 4 serial, byte-identical and pairwise distinct)"
 
 # --- Continuous admission --------------------------------------------------
 # A request that arrives while another is mid-synthesis must be parked by the
