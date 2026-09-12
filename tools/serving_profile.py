@@ -1,18 +1,37 @@
 #!/usr/bin/env python3
 """serving_profile.py -- concurrency profile of the mynah-tts HTTP server, with verdicts.
 
-    # start a server on a scratch port, profile C1, C2, C4, tear it down
-    python3 tools/serving_profile.py --model models/fake-magpie --levels 1,2,4 \
-        --waves 2 --max-steps 64
+    # SCREEN: start a server on a scratch port, screen C1, C2, C4, tear it down
+    python3 tools/serving_profile.py --mode wave --model models/pocket-en \
+        --levels 1,2,4 --waves 3
+
+    # QUALIFY: five measured minutes per level, after thirty discarded seconds
+    python3 tools/serving_profile.py --mode soak --model models/pocket-en \
+        --levels 4 --soak-seconds 300 --warmup-seconds 30 --window-seconds 60
 
     # attach to a server someone else is running
     python3 tools/serving_profile.py --url http://127.0.0.1:8973 --levels 1,2,4
 
+WAVE and SOAK are different measurements and this tool refuses to conflate them
+---------------------------------------------------------------------------------
+**WAVE** fires all C requests at t=0, waits for them, repeats ``--waves`` times.  It
+measures a burst arriving at an idle server.  It is a SCREEN: it is cheap, it
+disqualifies fast, and it MAY NOT PROMOTE a configuration.  Every wave report says so.
+
+**SOAK** keeps C requests in flight continuously for ``--soak-seconds`` after
+``--warmup-seconds`` of discarded traffic, and cuts the measured span into windows so a
+metric that WALKS is visible as a trend rather than averaged into a respectable mean.
+A soak whose STREAM_RTF or prebuffer drifts is downgraded however good its aggregate.
+Only a soak may promote.
+
+The gap is not cosmetic: in the reference a configuration passed the wave screen at
+STREAM_RTF 0.919 and failed a 30-minute soak at 1.004 with 596 rejects and 111 broken
+pipes.  "C16 is the hard-capacity boundary, not a product point."
+
 What it answers
 ---------------
 Not "how fast is the server" but "at which concurrency can a real player still play".
-For every concurrency level it launches C requests at once (a wave), repeats that
-``--waves`` times, and reports:
+For every concurrency level it reports:
 
   TTFB            time to the first byte of the response (the header).
   TTFA            time to the first byte of AUDIO.  Different from TTFB by construction:
@@ -34,6 +53,26 @@ For every concurrency level it launches C requests at once (a wave), repeats tha
 and then a VERDICT per level -- GOOD / MARGINAL / NOT STREAMABLE / INCONCLUSIVE -- with
 every threshold printed next to the value that was compared against it, so the verdict
 can be falsified by reading the table instead of trusting it.
+
+Which metric gates
+------------------
+STREAM_RTF is CAPACITY.  It is mandatory (< 1) and preferred (<= 0.90), and it is never
+allowed to promote on its own.  **required_prebuffer p95 and stall_rate@250 are what
+qualify.**  Every quantum sweep on record moved those two while STREAM_RTF sat still --
+in the reference the smallest quantum FAILED on STREAM_RTF while the largest PASSED on
+it and stalled half the time.  Aggregate rate alone selects the wrong serving point.
+
+The refusals (.work/engineering-method.md section 4)
+----------------------------------------------------
+* **Coalesced reads.** A mark is stamped when read() returns; a late reader finds
+  several chunks queued and returns them microseconds apart, so N emissions become N
+  marks in one instant.  Above ``--coalesced-refuse`` the cadence percentiles describe
+  the CLIENT, and this tool exits 3 instead of printing them.  The reference declared a
+  run with 33-37% coalesced reads not quotable.
+* **Dispatch resolution.** ``--compare`` refuses to difference two runs whose engine,
+  ISA, quantization, thread count, backend, build flags or route differ.  A sweep that
+  changes two things has measured their sum.
+* Neither refusal is a warning.  Both exit non-zero.
 
 Engine-agnostic by construction
 -------------------------------
@@ -94,16 +133,23 @@ DEFAULT_BANK = [
              "il server si comporta quando le richieste hanno durate diverse fra loro."),
 ]
 
-# The provisional streaming envelope, ported from qwen-tts
-# .work/professional-streaming-architecture.md E8.  Every one of these is a flag.
+# The streaming envelope lives in tests/playback_sim.py (PB.ENVELOPE) so that the
+# harness and the self-test cannot drift apart.  These are the command-line defaults,
+# and every one of them is a flag.
 DEFAULTS = {
-    "rtf_hard": 1.00,        # mandatory: STREAM_RTF p95 must be below this
-    "rtf_pref": 0.90,        # preferred
-    "ttfb_pref_ms": 100.0,
-    "ttfa_pref_ms": 500.0,
-    "prebuffer_pref_ms": 500.0,
-    "safe_start_pref_ms": 1000.0,
-    "stall_buffer_ms": 500,  # the buffer size whose stall rate must be zero
+    "rtf_hard": PB.ENVELOPE["rtf_hard"],
+    "rtf_pref": PB.ENVELOPE["rtf_pref"],
+    "ttfb_pref_ms": PB.ENVELOPE["ttfb_pref_ms"],
+    "ttfa_pref_ms": PB.ENVELOPE["ttfa_pref_ms"],
+    "prebuffer_pref_ms": PB.ENVELOPE["prebuffer_pref_ms"],
+    "safe_start_pref_ms": PB.ENVELOPE["safe_start_pref_ms"],
+    "stall_gate_ms": PB.ENVELOPE["stall_pref_ms"],           # 250 -- the qualifying gate
+    "stall_mandatory_ms": PB.ENVELOPE["stall_mandatory_ms"],  # 500 -- the hard gate
+    "coalesced_refuse": PB.COALESCED_REFUSE_SHARE,
+    "coalesced_warn": PB.COALESCED_WARN_SHARE,
+    "drift_rtf_tol": 0.05,
+    "drift_prebuffer_tol_ms": 150.0,
+    "drift_min_windows": 3,
 }
 
 
@@ -389,15 +435,82 @@ class Profile:
                 rec["error"] = "audio format changed mid-profile: %r vs %r" % (self.fmt, fmt)
                 return rec
 
-        k = PB.timeline_kpis(marks, r["t_done_s"], fmt, self.args.buffers)
+        # Every playback metric -- TTFB, TTFA, STREAM_RTF, prebuffer, safe_play_start,
+        # the stall rates, max_gap and the coalesced share -- is defined in
+        # tests/playback_sim.py and computed there.  Nothing is recomputed here: a second
+        # definition of a metric is a second product.
+        k = PB.timeline_kpis(marks, r["t_done_s"], fmt, self.args.buffers,
+                             ttfb_s=r["ttfb_s"])
         rec.update(k)
-        rec["ttfa_s"] = k.get("ttfa_s", float("nan"))
-        rec["header_to_audio_s"] = (rec["ttfa_s"] - r["ttfb_s"]
-                                    if r["ttfb_s"] is not None else float("nan"))
         rec["ok"] = True
         if self.args.marks:
             rec["marks"] = marks
         return rec
+
+    # -- SOAK: fixed concurrency for a duration ----------------------------------------
+    def run_soak(self, level):
+        """``level`` workers issuing requests back to back for ``--soak-seconds``.
+
+        This is NOT a wave.  A wave is C requests fired together and then silence, which
+        measures a burst arriving at an idle server.  A soak keeps C requests in flight
+        continuously, so the server is never allowed to catch up between them, caches
+        settle, memory grows if it is going to grow, and thermal and scheduler effects
+        have time to appear.  The first ``--warmup-seconds`` are RUN but DISCARDED, and
+        the remainder is cut into windows so that a metric which walks over time is
+        visible as a trend instead of being averaged into a respectable mean.
+
+        Only a soak may promote a configuration.  The reference had one pass a wave
+        screen at 0.919 and fail a 30-minute soak at 1.004 with 596 rejects.
+        """
+        records = []
+        counter = [0]
+        counter_lock = threading.Lock()
+        t0 = time.perf_counter()
+        t_warm_end = t0 + self.args.warmup_seconds
+        t_end = t_warm_end + self.args.soak_seconds
+        barrier = threading.Barrier(level)
+
+        def worker(slot):
+            barrier.wait()
+            while time.perf_counter() < t_end:
+                with counter_lock:
+                    idx = counter[0]
+                    counter[0] += 1
+                t_send = time.perf_counter()
+                rec = self.run_one(level, -1, idx if self.args.vary_text else slot)
+                rec["t_send_rel"] = t_send - t0
+                # A request is warm-up if it STARTED during warm-up.  Judging by
+                # completion would let a long request started under load be discarded
+                # because it happened to finish late.
+                rec["warmup"] = t_send < t_warm_end
+                rec["slot"] = slot
+                records.append(rec)
+
+        threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+                   for i in range(level)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(self.args.timeout + self.args.warmup_seconds
+                   + self.args.soak_seconds + 60.0)
+        wall = time.perf_counter() - t0
+        measured = [r for r in records if not r.get("warmup")]
+        return records, measured, wall, t_warm_end - t0
+
+    def soak_windows(self, measured):
+        """Cut the measured span into ``--window-seconds`` windows of OK records."""
+        if not measured:
+            return []
+        w = self.args.window_seconds
+        if w <= 0:
+            return []
+        base = min(r["t_send_rel"] for r in measured)
+        buckets = {}
+        for r in measured:
+            if not r.get("ok"):
+                continue
+            buckets.setdefault(int((r["t_send_rel"] - base) // w), []).append(r)
+        return [(i, buckets[i]) for i in sorted(buckets)]
 
     # -- one concurrency level ---------------------------------------------------------
     def run_level(self, level):
@@ -433,11 +546,13 @@ class Profile:
 # --------------------------------------------------------------------------------------
 # aggregation and verdict
 # --------------------------------------------------------------------------------------
-def level_report(level, records, launched, wall, args):
+def level_report(level, records, launched, wall, args, mode="wave", windows=None,
+                 warmup_s=0.0, warmup_n=0):
     ok = [r for r in records if r.get("ok")]
     bad = [r for r in records if not r.get("ok")]
     rep = {"level": level, "launched": launched, "completed": len(ok),
-           "failed": len(bad), "wall_s": wall,
+           "failed": len(bad), "wall_s": wall, "mode": mode,
+           "warmup_s": warmup_s, "warmup_discarded": warmup_n,
            "errors": [r.get("error") for r in bad][:10]}
 
     rep["summary"] = PB.summarize(ok, args.buffers) if ok else {"n_records": 0,
@@ -470,63 +585,75 @@ def level_report(level, records, launched, wall, args):
         mix[r.get("class", "?")] = mix.get(r.get("class", "?"), 0) + 1
     rep["mix"] = mix
     rep["distinct_texts"] = len({r.get("index") for r in records})
-    rep["verdict"], rep["gates"] = verdict(rep, args)
+
+    # -- the refusal: may these cadence percentiles be quoted at all? -------------------
+    status, share, reasons = PB.quotable(rep["summary"], args.coalesced_refuse,
+                                         args.coalesced_warn)
+    rep["quotable"] = status
+    rep["quotable_reasons"] = reasons
+    rep["coalesced_chunk_share"] = share
+
+    # -- the soak drift gate: a screen has none, and that is the difference -------------
+    rep["windows"] = []
+    rep["drift"] = None
+    if mode == "soak" and windows:
+        for i, recs in windows:
+            ws = PB.summarize(recs, args.buffers)
+            rep["windows"].append({
+                "window": i, "n": len(recs),
+                "stream_rtf_p95": ws.get("stream_rtf", {}).get("p95", float("nan")),
+                "prebuffer_p95_ms": ws.get("required_prebuffer_s", {})
+                                      .get("p95", float("nan")) * 1000.0,
+                "ttfa_p95_ms": ws.get("ttfa_s", {}).get("p95", float("nan")) * 1000.0,
+                "stall_rate@%d" % args.stall_gate_ms:
+                    ws.get("stall_rate@%d" % args.stall_gate_ms, float("nan")),
+                "summary": ws})
+        wsums = [w["summary"] for w in rep["windows"]]
+        rep["drift"] = {
+            "stream_rtf": PB.drift_gate(wsums, "stream_rtf", "p95",
+                                        args.drift_rtf_tol, args.drift_min_windows),
+            "required_prebuffer_s": PB.drift_gate(wsums, "required_prebuffer_s", "p95",
+                                                  args.drift_prebuffer_tol_ms / 1000.0,
+                                                  args.drift_min_windows),
+        }
+
+    env = {"rtf_hard": args.rtf_hard, "rtf_pref": args.rtf_pref,
+           "ttfb_pref_ms": args.ttfb_pref_ms, "ttfa_pref_ms": args.ttfa_pref_ms,
+           "prebuffer_pref_ms": args.prebuffer_pref_ms,
+           "safe_start_pref_ms": args.safe_start_pref_ms,
+           "stall_pref_ms": args.stall_gate_ms,
+           "stall_mandatory_ms": args.stall_mandatory_ms}
+    rep["verdict"], rep["gates"] = PB.qualify(rep["summary"], rep["completed"],
+                                              rep["launched"], env)
+
+    # A drifting soak has not qualified anything, whatever its aggregate says.
+    if rep["drift"]:
+        drifted = [k for k, d in rep["drift"].items() if d["pass"] is False]
+        if drifted and rep["verdict"] in ("GOOD", "MARGINAL"):
+            rep["verdict"] = "NOT STREAMABLE"
+            rep["verdict_note"] = ("the soak drifted on %s: the aggregate is not a "
+                                   "steady state" % ", ".join(drifted))
+        elif any(d["pass"] is None for d in rep["drift"].values()) and \
+                rep["verdict"] == "GOOD":
+            rep["verdict"] = "INCONCLUSIVE"
+            rep["verdict_note"] = ("too few soak windows to test drift; a soak that "
+                                   "cannot show a trend has not qualified anything")
+
+    # A run whose cadence cannot be quoted cannot produce a cadence verdict either.
+    if rep["quotable"] == "NOT QUOTABLE":
+        rep["verdict_before_refusal"] = rep["verdict"]
+        rep["verdict"] = "NOT QUOTABLE"
+        rep["verdict_note"] = "; ".join(rep["quotable_reasons"])
+
+    # A WAVE is a screen.  It may disqualify; it may never promote.
+    rep["may_promote"] = (mode == "soak")
     return rep
 
 
-def _g(name, value, op, limit, unit=""):
-    if value != value:                      # NaN: not measured
-        passed = None
-    elif op == "<":
-        passed = value < limit
-    elif op == "<=":
-        passed = value <= limit
-    elif op == "==":
-        passed = value == limit
-    else:
-        raise ValueError(op)
-    return {"name": name, "value": value, "op": op, "limit": limit,
-            "unit": unit, "pass": passed}
-
-
-def verdict(rep, args):
-    """GOOD / MARGINAL / NOT STREAMABLE / INCONCLUSIVE, with every gate carried along.
-
-    * mandatory failed        -> NOT STREAMABLE
-    * mandatory ok, preferred failed -> MARGINAL
-    * everything ok           -> GOOD
-    * nothing to judge (no cadence measured anywhere) -> INCONCLUSIVE, never GOOD by
-      default: a level whose requests each delivered one chunk has no continuity evidence.
-    """
-    s = rep["summary"]
-    mandatory = [
-        _g("completed == launched", float(rep["completed"]), "==", float(rep["launched"])),
-        _g("STREAM_RTF p95", rep["stream_rtf"]["p95"], "<", args.rtf_hard),
-    ]
-    preferred = [
-        _g("TTFB p95", rep["ttfb_ms"]["p95"], "<=", args.ttfb_pref_ms, "ms"),
-        _g("TTFA p95", rep["ttfa_ms"]["p95"], "<=", args.ttfa_pref_ms, "ms"),
-        _g("STREAM_RTF p95", rep["stream_rtf"]["p95"], "<=", args.rtf_pref),
-        _g("prebuffer p95", rep["prebuffer_ms"]["p95"], "<=", args.prebuffer_pref_ms, "ms"),
-        _g("safe_play_start p95", rep["safe_play_start_ms"]["p95"], "<=",
-           args.safe_start_pref_ms, "ms"),
-        _g("stall_rate@%dms" % args.stall_buffer_ms,
-           s.get("stall_rate@%d" % args.stall_buffer_ms, float("nan")), "==", 0.0),
-    ]
-    gates = {"mandatory": mandatory, "preferred": preferred,
-             "n_cadence": s.get("n_cadence", 0), "n_records": s.get("n_records", 0)}
-    if any(g["pass"] is False for g in mandatory):
-        return "NOT STREAMABLE", gates
-    if s.get("n_cadence", 0) == 0:
-        # Mandatory gates that could be evaluated held, but no request delivered two
-        # chunks, so continuity was never observed.  Saying GOOD here would be a claim
-        # about a player that was never simulated.
-        return "INCONCLUSIVE", gates
-    if any(g["pass"] is False for g in preferred):
-        return "MARGINAL", gates
-    if any(g["pass"] is None for g in mandatory + preferred):
-        return "INCONCLUSIVE", gates
-    return "GOOD", gates
+# The verdict, the gates, the refusals and the drift gate all live in
+# tests/playback_sim.py -- see PB.qualify / PB.quotable / PB.comparable / PB.drift_gate.
+# They are NOT reimplemented here: a second copy of an envelope is a second product,
+# and the two would disagree the first time one of them was tuned.
 
 
 # --------------------------------------------------------------------------------------
@@ -536,27 +663,61 @@ def fnum(v, w=7, p=2):
     return ("%*s" % (w, "n/a")) if v != v else ("%*.*f" % (w, p, v))
 
 
+MODE_BANNER = {
+    "wave": ("WAVE  --  SCREEN ONLY, MAY NOT PROMOTE",
+             "%d synchronised wave(s) per level, all C requests fired at t=0, then "
+             "silence.",
+             "A wave measures a burst arriving at an idle server.  It is cheap and it "
+             "disqualifies fast,",
+             "but it may NEVER promote a configuration: the reference had one pass a "
+             "wave screen at 0.919",
+             "and fail a 30-minute soak at 1.004 with 596 rejects and 111 broken "
+             "pipes."),
+    "soak": ("SOAK  --  QUALIFICATION, THE ONLY MODE THAT MAY PROMOTE",
+             "%d s at fixed concurrency after %d s of discarded warm-up, cut into %d s "
+             "windows.",
+             "C requests stay in flight continuously, so the server never catches up "
+             "between them and a",
+             "metric that walks over time shows as a trend instead of a respectable "
+             "mean.  A soak that",
+             "drifts has qualified nothing."),
+}
+
+
 def print_table(reports, args, meta):
     W = 116
+    mode = args.mode
+    title, shape, *why = MODE_BANNER[mode]
+    shape = (shape % (args.waves,) if mode == "wave" else
+             shape % (args.soak_seconds, args.warmup_seconds, args.window_seconds))
     print("=" * W)
     print("SERVING PROFILE  %s" % meta["started"])
+    print("  MODE       %s" % title)
+    print("             %s" % shape)
+    for line in why:
+        print("             %s" % line)
     print("  server     %s  (%s)" % (meta["target"], meta["server_mode"]))
     print("  model      %s   engine %s   sample_rate %s Hz announced by /health"
           % (meta["health"].get("model"), meta["health"].get("engine"),
              meta["health"].get("sample_rate")))
     print("  audio      %s  (source: %s)" % (meta.get("format"), meta.get("format_source")))
-    print("  route      %s   mode %s   waves %d   bank %d texts   max_steps %s"
-          % (args.route, "stream" if args.stream else "batch", args.waves,
+    print("  route      %s   sink %s   bank %d texts   max_steps %s"
+          % (args.route, "stream" if args.stream else "batch",
              len(meta["bank"]), args.max_steps or "-"))
+    print("  dispatch   %s" % meta.get("dispatch_desc", "<unrecorded>"))
     print("  host       %s" % meta["host_desc"])
+    print("  PLATFORM   %s" % meta.get("platform_caveat", ""))
     print("=" * W)
     print()
+    # No column is ever labelled a bare "RTF".  STREAM_RTF is a per-request rate over the
+    # streamed span; WALL/AUD is the level's aggregate wall cost per second of audio.
+    # They are different numbers and have been confused before.
     cols = [("C", 3), ("done/lnc", 9), ("TTFB50", 7), ("TTFB95", 7), ("TTFA50", 7),
-            ("TTFA95", 7), ("RTF50", 6), ("RTF95", 6), ("RTFsd", 6), ("preb50", 7),
-            ("preb95", 7), ("safe95", 7), ("gap95", 7), ("stall", 6), ("aggRTF", 7),
-            ("verdict", 0)]
-    units = ["", "", "ms", "ms", "ms", "ms", "", "", "", "ms", "ms", "ms", "ms",
-             "@%dms" % args.stall_buffer_ms, "wall/aud", ""]
+            ("TTFA95", 7), ("SRTF50", 7), ("SRTF95", 7), ("SRTFsd", 7), ("preb50", 7),
+            ("preb95", 7), ("safe95", 7), ("gap95", 7), ("stall", 6), ("WALL/AUD", 8),
+            ("quote", 6), ("verdict", 0)]
+    units = ["", "", "ms", "ms", "ms", "ms", "STREAM", "STREAM", "STREAM", "ms", "ms",
+             "ms", "ms", "@%dms" % args.stall_gate_ms, "s/s", "coal%", ""]
 
     def row(cells):
         out = []
@@ -569,7 +730,8 @@ def print_table(reports, args, meta):
     print("-" * W)
     for r in reports:
         s = r["summary"]
-        stall = s.get("stall_rate@%d" % args.stall_buffer_ms, float("nan"))
+        stall = s.get("stall_rate@%d" % args.stall_gate_ms, float("nan"))
+        coal = r.get("coalesced_chunk_share", float("nan"))
         print(row([r["level"], "%d/%d" % (r["completed"], r["launched"]),
                    fnum(r["ttfb_ms"]["p50"], 0, 1), fnum(r["ttfb_ms"]["p95"], 0, 1),
                    fnum(r["ttfa_ms"]["p50"], 0, 0), fnum(r["ttfa_ms"]["p95"], 0, 0),
@@ -579,7 +741,9 @@ def print_table(reports, args, meta):
                    fnum(r["safe_play_start_ms"]["p95"], 0, 0),
                    fnum(r["max_gap_ms"]["p95"], 0, 0),
                    ("n/a" if stall != stall else "%.0f%%" % (stall * 100.0)),
-                   fnum(r["aggregate_rtf"], 0, 2), r["verdict"]]))
+                   fnum(r["aggregate_rtf"], 0, 2),
+                   ("n/a" if coal != coal else "%.0f%%" % (coal * 100.0)),
+                   r["verdict"]]))
     print("-" * W)
     print()
 
@@ -588,6 +752,30 @@ def print_table(reports, args, meta):
               "wall %.1f s)"
               % (r["level"], r["verdict"], r["completed"], r["launched"],
                  r["gates"]["n_cadence"], r["wall_s"]))
+        if r.get("verdict_note"):
+            print("       note: %s" % r["verdict_note"])
+        if not r.get("may_promote"):
+            print("       SCREEN ONLY: a wave result may disqualify a configuration, "
+                  "never promote one.")
+        if r.get("warmup_discarded"):
+            print("       warm-up: %d request(s) started in the first %.0f s were "
+                  "discarded" % (r["warmup_discarded"], r["warmup_s"]))
+        if r.get("windows"):
+            print("       SOAK WINDOWS (%d x %.0f s)  -- the trend, not the mean"
+                  % (len(r["windows"]), args.window_seconds))
+            print("         %-4s %5s %11s %13s %11s %11s"
+                  % ("win", "n", "STREAM_RTF", "prebuffer p95", "TTFA p95",
+                     "stall@%d" % args.stall_gate_ms))
+            for w in r["windows"]:
+                st = w.get("stall_rate@%d" % args.stall_gate_ms, float("nan"))
+                print("         %-4d %5d %11s %13s %11s %11s"
+                      % (w["window"], w["n"], fnum(w["stream_rtf_p95"], 11, 3),
+                         fnum(w["prebuffer_p95_ms"], 13, 0),
+                         fnum(w["ttfa_p95_ms"], 11, 0),
+                         "n/a" if st != st else "%.0f%%" % (st * 100.0)))
+            for key, d in sorted(r["drift"].items()):
+                mark = {True: "PASS", False: "FAIL", None: "n/a "}[d["pass"]]
+                print("         %s drift %-22s %s" % (mark, d["key"], d["why"]))
         for kind in ("mandatory", "preferred"):
             for g in r["gates"][kind]:
                 mark = {True: "PASS", False: "FAIL", None: "n/a "}[g["pass"]]
@@ -630,6 +818,9 @@ def print_table(reports, args, meta):
                      fnum(d["min"], 8, digits), fnum(d["max"], 8, digits), d["n"]))
         if r["summary"].get("n_records"):
             print(PB.format_summary(r["summary"], args.buffers, indent="       "))
+        print("       QUOTABLE: %s%s" % (r["quotable"],
+                                         "" if not r["quotable_reasons"] else
+                                         " -- " + "; ".join(r["quotable_reasons"])))
         if r["failed"]:
             print("       !! %d of %d requests did NOT complete; the statistics above "
                   "cover only the %d that did"
@@ -639,16 +830,48 @@ def print_table(reports, args, meta):
         print()
 
     print("THRESHOLDS IN FORCE (all are flags; change them and the verdicts change)")
-    print("  mandatory : completed == launched, STREAM_RTF p95 < %.2f" % args.rtf_hard)
+    print("  mandatory : completed == launched, STREAM_RTF p95 < %.2f, "
+          "stall_rate@%dms == 0" % (args.rtf_hard, args.stall_mandatory_ms))
     print("  preferred : TTFB p95 <= %.0f ms, TTFA p95 <= %.0f ms, STREAM_RTF p95 <= %.2f,"
           % (args.ttfb_pref_ms, args.ttfa_pref_ms, args.rtf_pref))
-    print("              prebuffer p95 <= %.0f ms, safe_play_start p95 <= %.0f ms, "
-          "stall_rate@%dms == 0"
-          % (args.prebuffer_pref_ms, args.safe_start_pref_ms, args.stall_buffer_ms))
+    print("              required_prebuffer p95 <= %.0f ms, safe_play_start p95 <= %.0f "
+          "ms, stall_rate@%dms == 0"
+          % (args.prebuffer_pref_ms, args.safe_start_pref_ms, args.stall_gate_ms))
+    print("  refusal   : cadence percentiles are NOT QUOTABLE above %.0f%% coalesced "
+          "reads (warn above %.0f%%)"
+          % (args.coalesced_refuse * 100.0, args.coalesced_warn * 100.0))
+    if args.mode == "soak":
+        print("  drift     : STREAM_RTF p95 last-vs-best <= %+.3f, prebuffer p95 "
+              "last-vs-best <= %+.0f ms, over >= %d windows"
+              % (args.drift_rtf_tol, args.drift_prebuffer_tol_ms,
+                 args.drift_min_windows))
     print("  GOOD = every preferred gate met - MARGINAL = mandatory met, a preferred one "
           "missed")
     print("  NOT STREAMABLE = a mandatory gate failed - INCONCLUSIVE = nothing to judge "
           "(no request delivered two chunks, so no player was ever simulated)")
+    print("  NOT QUOTABLE = the client's reads coalesced badly enough that the cadence "
+          "percentiles describe the client")
+    print()
+    # Capacity is discovered, not prescribed.
+    verdicts = {r["level"]: r["verdict"] for r in reports}
+    cap = PB.capacity(verdicts)
+    if args.mode == "soak":
+        if cap is None:
+            print("CAPACITY: none of the measured levels qualified as GOOD, so this "
+                  "configuration has no operating point.")
+        else:
+            print("CAPACITY: the operating point is C%d -- the highest GOOD concurrency "
+                  "with no gap below it." % cap)
+            higher = sorted(c for c in verdicts if c > cap)
+            if higher:
+                print("          C%d is %s; a GOOD level above a non-GOOD one is a "
+                      "measurement to explain, not a product point."
+                      % (higher[0], verdicts[higher[0]]))
+    else:
+        print("CAPACITY: NOT DETERMINED. This was a wave screen; capacity is a soak "
+              "result. Levels that")
+        print("          failed here can be dropped, but no level passes on this "
+              "evidence -- rerun --mode soak.")
     print()
     mixes = {tuple(sorted(r["mix"].items())) for r in reports}
     if len(mixes) > 1:
@@ -741,6 +964,103 @@ def load_bank(path):
     return rows
 
 
+# ======================================================================================
+# THE DECODER-QUANTUM SWEEP
+# ======================================================================================
+# WHERE THE QUANTUM IS DECIDED, as of d1ffd01:
+#
+#   src/inference.c:128   slot_stream() emits only when
+#                           fresh >= caps->audio_emit_frames  (or the window ended)
+#   src/engine_pocket.c   cfg_opt_size(manifest, "audio_emit_frames", ..., 1u)
+#   src/tts_engine.h:45   unsigned audio_emit_frames;   /* streaming emit threshold */
+#
+# So the decoder quantum IS a parameter -- but it is a MODEL-PACK parameter, read from
+# model.json at load time.  It is not a CLI flag, not an environment variable and not a
+# request field, so it cannot be varied without restarting the server.  This sweep
+# therefore materialises one pack VARIANT per quantum: every large file is symlinked and
+# only model.json is rewritten, so a variant costs a few kilobytes and no copy of the
+# 219 MB safetensors.
+#
+# THE SECOND GRANULARITY, and what it actually does -- verified by reading the code,
+# because the obvious reading is wrong:
+#
+#   server/main.c:86         #define STREAM_CHUNK 4096u  /* samples per streamed chunk */
+#   src/inference.c:29-40    emit_stream_samples() splits the decoded PCM into pieces of
+#                            at most STREAM_CHUNK samples, one stream_out_enqueue each
+#   server/stream_out.c:169  the writer thread then takes `span = out->queued` -- the
+#                            WHOLE readable span -- and writes it as ONE HTTP chunk
+#
+# So STREAM_CHUNK bounds each enqueue into the ring, and then the writer coalesces
+# whatever is queued back into a single HTTP chunk.  It is NOT a delivery ceiling.  The
+# measurement confirms it: at 40 frames, q1/q4/q16 deliver 40/10/2 client-visible chunks
+# -- exactly ceil(frames/quantum) -- not the ~15 that a 4096-sample ceiling would force.
+# Delivery granularity is therefore set by `audio_emit_frames`, which IS what this sweep
+# varies, plus whatever extra coalescing happens when the writer is behind.
+#
+# What that leaves unreachable: there is no way to make delivery granularity SMALLER
+# than the decode quantum, and no pacing. To decouple compute granularity from delivery
+# granularity -- the principle in .work/streaming-cadence.md section 4, where the server
+# aggregates work internally but still delivers small regular PCM increments -- the
+# writer would have to cap its span (a max bytes per HTTP chunk, or a paced drain) in
+# server/stream_out.c, and STREAM_CHUNK would have to become a runtime parameter rather
+# than a #define.  Both are in server/, owned by another lane.  This sweep reports what
+# is reachable and refuses to pretend the rest was measured.
+QUANTUM_KEY = "audio_emit_frames"
+
+
+def make_quantum_pack(src_dir, dst_dir, quantum):
+    """A pack variant that differs from ``src_dir`` ONLY in the emit quantum.
+
+    Everything except model.json is symlinked, so the variant is kilobytes and the
+    weights are byte-identical to the original by construction -- there is no chance of
+    a sweep accidentally comparing two different sets of weights.
+    """
+    src_dir = os.path.abspath(src_dir)
+    manifest_path = os.path.join(src_dir, "model.json")
+    if not os.path.isfile(manifest_path):
+        raise SystemExit("REFUSING TO SWEEP: %s has no model.json" % src_dir)
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    if os.path.isdir(dst_dir):
+        for name in os.listdir(dst_dir):
+            os.unlink(os.path.join(dst_dir, name))
+    else:
+        os.makedirs(dst_dir)
+    for name in os.listdir(src_dir):
+        if name == "model.json":
+            continue
+        os.symlink(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+    manifest[QUANTUM_KEY] = int(quantum)
+    with open(os.path.join(dst_dir, "model.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return dst_dir
+
+
+def interleave(labels, repeats):
+    """A/B/B/A rather than all-of-A then all-of-B.
+
+    This machine drifts, and the reference measured drift between two IDENTICAL runs
+    larger than the effect under test.  Running every A first and every B second turns
+    that drift into a fake difference between the arms; a palindromic order spreads it
+    across both.  Two arms and two repeats give exactly A B B A.
+    """
+    order = []
+    for r in range(repeats):
+        order.extend(labels if r % 2 == 0 else list(reversed(labels)))
+    return order
+
+
+def platform_caveat():
+    """Say plainly where the number came from.  Production is Linux x86-64 and ARM64."""
+    if sys.platform == "darwin":
+        return ("macOS / Apple Silicon -- a DEVELOPMENT SIGNAL, NOT A PRODUCTION CLAIM. "
+                "Accelerate and the P-core thread-pool default do not exist on Linux; "
+                "production is Linux x86-64 and ARM64.")
+    if sys.platform.startswith("linux"):
+        return "Linux -- the production platform. Record the exact CPU, mask and build."
+    return "%s -- not a production platform." % sys.platform
+
+
 def host_description():
     bits = [sys.platform, os.uname().machine]
     try:
@@ -773,10 +1093,23 @@ def main():
     srv.add_argument("--server-timeout", type=float, default=300.0)
 
     load = ap.add_argument_group("load")
+    load.add_argument("--mode", choices=("wave", "soak"), default="wave",
+                      help="WAVE = a screen: C requests fired at t=0, repeated --waves "
+                           "times. It may disqualify a level, never promote one. "
+                           "SOAK = a qualification: --soak-seconds at fixed C with "
+                           "warm-up and a drift gate across windows. Only a soak may "
+                           "promote a configuration.")
     load.add_argument("--levels", default="1,2,4",
                       help="concurrency levels, e.g. 1,2,4,8")
     load.add_argument("--waves", type=int, default=3,
-                      help="synchronized waves per level (requests = level x waves)")
+                      help="WAVE only: synchronized waves per level "
+                           "(requests = level x waves)")
+    load.add_argument("--soak-seconds", type=float, default=300.0,
+                      help="SOAK only: measured seconds per level, after warm-up")
+    load.add_argument("--warmup-seconds", type=float, default=30.0,
+                      help="SOAK only: seconds run and DISCARDED before measuring")
+    load.add_argument("--window-seconds", type=float, default=60.0,
+                      help="SOAK only: window length for the drift gate")
     load.add_argument("--wave-gap", type=float, default=0.0,
                       help="idle seconds between waves")
     load.add_argument("--route", default="/v1/audio/speech")
@@ -810,10 +1143,46 @@ def main():
                        default=DEFAULTS["prebuffer_pref_ms"])
     gates.add_argument("--safe-start-pref-ms", type=float,
                        default=DEFAULTS["safe_start_pref_ms"])
-    gates.add_argument("--stall-buffer-ms", type=int, default=DEFAULTS["stall_buffer_ms"],
-                       help="the jitter buffer whose stall rate must be zero")
+    gates.add_argument("--stall-gate-ms", type=int, default=DEFAULTS["stall_gate_ms"],
+                       help="the jitter buffer whose stall rate is the QUALIFYING gate "
+                            "(preferred); default 250")
+    gates.add_argument("--stall-mandatory-ms", type=int,
+                       default=DEFAULTS["stall_mandatory_ms"],
+                       help="the jitter buffer whose stall rate is the HARD gate "
+                            "(mandatory); default 500")
     gates.add_argument("--buffers", default="100,250,500,1000",
                        help="jitter buffers to simulate, ms")
+    gates.add_argument("--coalesced-refuse", type=float,
+                       default=DEFAULTS["coalesced_refuse"],
+                       help="refuse to quote cadence percentiles above this share of "
+                            "already-queued reads")
+    gates.add_argument("--coalesced-warn", type=float, default=DEFAULTS["coalesced_warn"])
+    gates.add_argument("--drift-rtf-tol", type=float, default=DEFAULTS["drift_rtf_tol"],
+                       help="SOAK: allowed STREAM_RTF p95 drift, last window vs best")
+    gates.add_argument("--drift-prebuffer-tol-ms", type=float,
+                       default=DEFAULTS["drift_prebuffer_tol_ms"])
+    gates.add_argument("--drift-min-windows", type=int,
+                       default=DEFAULTS["drift_min_windows"])
+
+    sweep = ap.add_argument_group("decoder-quantum sweep")
+    sweep.add_argument("--quantum-sweep", default="",
+                       help="comma list of audio_emit_frames values to sweep, e.g. "
+                            "1,2,4,8. Derives one pack variant per value (model.json "
+                            "rewritten, every other file symlinked) and runs them "
+                            "INTERLEAVED. Needs exactly one --levels value.")
+    sweep.add_argument("--quantum-pack-dir", default="",
+                       help="where to materialise the pack variants")
+    sweep.add_argument("--repeats", type=int, default=2,
+                       help="interleaved repeats; arms run palindromically (A B B A)")
+
+    cmp_ = ap.add_argument_group("compare")
+    cmp_.add_argument("--compare", nargs="+", default=None,
+                      help="difference saved --json runs; REFUSES (exit 4) when their "
+                           "dispatch resolution differs")
+    cmp_.add_argument("--allow-unverified-dispatch", action="store_true",
+                      help="proceed when a dispatch fact is unrecorded in EVERY run. "
+                           "Only correct when sameness is established outside the "
+                           "report (same binary, same environment).")
 
     out = ap.add_argument_group("output")
     out.add_argument("--json", default="", help="write the full report as JSON "
@@ -828,11 +1197,32 @@ def main():
 
     args = ap.parse_args()
     args.buffers = tuple(int(x) for x in args.buffers.split(",") if x.strip())
-    if args.stall_buffer_ms not in args.buffers:
-        args.buffers = tuple(sorted(args.buffers + (args.stall_buffer_ms,)))
+    if args.compare:
+        try:
+            return compare_reports(args.compare, args)
+        except PB.Refusal as exc:
+            print("REFUSING TO COMPARE:", file=sys.stderr)
+            for why in exc.reasons:
+                print("  %s" % why, file=sys.stderr)
+            return 4
+    for b in (args.stall_gate_ms, args.stall_mandatory_ms):
+        if b not in args.buffers:
+            args.buffers = tuple(sorted(args.buffers + (b,)))
     levels = [int(x) for x in args.levels.split(",") if x.strip()]
     if not levels or min(levels) < 1:
         raise SystemExit("--levels must be positive integers, e.g. 1,2,4")
+    if args.mode == "soak":
+        if args.soak_seconds <= 0:
+            raise SystemExit("--soak-seconds must be positive in --mode soak")
+        if args.window_seconds <= 0:
+            raise SystemExit("--window-seconds must be positive in --mode soak")
+        if args.soak_seconds < args.window_seconds * args.drift_min_windows:
+            raise SystemExit(
+                "REFUSING TO RUN: --soak-seconds %.0f cannot contain the %d windows of "
+                "%.0f s the drift gate needs. A soak that cannot show a trend is a wave "
+                "with extra steps; either lengthen the soak or lower "
+                "--drift-min-windows deliberately."
+                % (args.soak_seconds, args.drift_min_windows, args.window_seconds))
 
     if args.url:
         m = re.match(r"http://([^:/]+)(?::(\d+))?", args.url)
@@ -849,9 +1239,68 @@ def main():
     else:
         bank = list(DEFAULT_BANK)
 
+    if args.quantum_sweep:
+        try:
+            run_quantum_sweep(args, bank, levels)
+        except PB.Refusal as exc:
+            print("REFUSING TO REPORT THE SWEEP:", file=sys.stderr)
+            for why in exc.reasons:
+                print("  %s" % why, file=sys.stderr)
+            return 4
+        return 0
+
     proc = None
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     t_profile0 = time.perf_counter()
+    try:
+        reports, prof, health0, health1, proc = run_arm(args, bank, levels)
+    finally:
+        stop_server(proc)
+
+    duration = time.perf_counter() - t_profile0
+    meta = build_meta(args, bank, prof, health0, health1, started, duration)
+
+    if not args.quiet:
+        print()
+        print_table(reports, args, meta)
+        print()
+        print("profile took %.1f s of wall clock (%d levels, %d requests total)"
+              % (duration, len(reports), sum(r["launched"] for r in reports)))
+        print("server counters after the run: %s" % json.dumps(health1.get("jobs", {})))
+
+    if args.json:
+        write_json(args, meta, reports)
+
+    # THE REFUSAL.  A run whose marks were mostly already-queued data has measured the
+    # client's reader, not the server's emission.  Exit non-zero rather than let a
+    # number nobody should trust be scraped out of stdout by the next script.
+    refused = [r for r in reports if r["quotable"] == "NOT QUOTABLE"]
+    if refused:
+        print()
+        print("REFUSING TO REPORT CADENCE PERCENTILES for level(s) %s."
+              % ", ".join("C%d" % r["level"] for r in refused), file=sys.stderr)
+        for r in refused:
+            for why in r["quotable_reasons"]:
+                print("  C%d: %s" % (r["level"], why), file=sys.stderr)
+        print("  Fix the client or the transport (TCP_NODELAY, E5-18) and rerun. "
+              "Nothing here is quotable.", file=sys.stderr)
+        return 3
+
+    worst = {"GOOD": 0, "INCONCLUSIVE": 1, "MARGINAL": 1, "NOT STREAMABLE": 2,
+             "NOT QUOTABLE": 3}
+    return max(worst.get(r["verdict"], 2) for r in reports) if reports else 2
+
+
+def run_arm(args, bank, levels, model_dir=None):
+    """One server lifetime: start, warm up, run every level, read /health, return.
+
+    ``model_dir`` overrides ``args.model`` so the quantum sweep can point successive
+    arms at successive pack variants.  The caller owns stopping the process.
+    """
+    proc = None
+    saved = args.model
+    if model_dir is not None:
+        args.model = model_dir
     try:
         if not args.url:
             proc = start_server(args)
@@ -865,15 +1314,56 @@ def main():
                                  "that cannot serve one request: %s" % w.get("error"))
         reports = []
         for level in levels:
-            if not args.quiet:
-                print("running C%d (%d waves)..." % (level, args.waves), file=sys.stderr)
-            records, launched, wall = prof.run_level(level)
-            reports.append(level_report(level, records, launched, wall, args))
+            if args.mode == "soak":
+                if not args.quiet:
+                    print("soaking C%d (%.0f s warm-up + %.0f s measured)..."
+                          % (level, args.warmup_seconds, args.soak_seconds),
+                          file=sys.stderr)
+                records, measured, wall, warm_s = prof.run_soak(level)
+                windows = prof.soak_windows(measured)
+                reports.append(level_report(
+                    level, measured, len(measured), wall, args, mode="soak",
+                    windows=windows, warmup_s=warm_s,
+                    warmup_n=len(records) - len(measured)))
+            else:
+                if not args.quiet:
+                    print("screening C%d (%d waves)..." % (level, args.waves),
+                          file=sys.stderr)
+                records, launched, wall = prof.run_level(level)
+                reports.append(level_report(level, records, launched, wall, args,
+                                            mode="wave"))
         health1 = http_get_json(args.host, args.port, "/health", timeout=10.0)
-    finally:
+    except BaseException:
         stop_server(proc)
+        raise
+    finally:
+        args.model = saved
+    return reports, prof, health0, health1, proc
 
-    duration = time.perf_counter() - t_profile0
+
+def build_meta(args, bank, prof, health0, health1, started, duration):
+    # The dispatch facts.  Two arms may only be differenced when these match; the set is
+    # PB.COMPARABLE_KEYS and the check is PB.require_comparable.  Anything the server
+    # does not report stays literally "<unrecorded>" -- an unrecorded fact is not an
+    # equal fact, and pretending otherwise is how a sweep attributes a difference to the
+    # wrong variable.
+    #
+    # As of d1ffd01 /health reports model, engine, sample_rate, voices and job counters
+    # -- and NOT isa, simd, backend, quant, threads or build flags.  Those therefore
+    # come from what the harness itself controls (the environment it launched the server
+    # with), and anything neither side knows stays "<unrecorded>" so that
+    # PB.require_comparable can refuse to certify it.
+    arm = {k: health0.get(k, PB.UNRECORDED) for k in
+           ("engine", "isa", "simd", "backend", "sample_rate")}
+    arm["quant"] = health0.get("quant", os.environ.get("MYNAH_QUANT")
+                               or "<pack default>")
+    arm["threads"] = health0.get("threads", os.environ.get("MYNAH_THREADS")
+                                 or "<server default>")
+    arm["build_flags"] = health0.get("build_flags", PB.UNRECORDED)
+    arm["server_bin"] = args.server_bin if not args.url else "<attached>"
+    arm["server_args"] = args.server_args
+    arm["route"] = args.route
+    arm["stream"] = bool(args.stream)
     meta = {"started": started, "duration_s": duration,
             "target": "http://%s:%d" % (args.host, args.port),
             "server_mode": "attached" if args.url else "started by this tool",
@@ -882,31 +1372,223 @@ def main():
             "format": repr(prof.fmt) if prof.fmt else None,
             "format_source": prof.fmt_source,
             "host_desc": host_description(),
+            "arm": arm, "mode": args.mode,
+            "dispatch_desc": "  ".join("%s=%s" % (k, arm[k]) for k in sorted(arm)),
+            "platform_caveat": platform_caveat(),
             "argv": sys.argv[1:]}
+    return meta
 
-    if not args.quiet:
-        print()
-        print_table(reports, args, meta)
-        print()
-        print("profile took %.1f s of wall clock (%d levels, %d requests total)"
-              % (duration, len(reports), sum(r["launched"] for r in reports)))
-        print("server counters after the run: %s" % json.dumps(health1.get("jobs", {})))
 
-    if args.json:
-        doc = {"meta": meta, "levels": reports,
-               "thresholds": {k: getattr(args, k) for k in
-                              ("rtf_hard", "rtf_pref", "ttfb_pref_ms", "ttfa_pref_ms",
-                               "prebuffer_pref_ms", "safe_start_pref_ms",
-                               "stall_buffer_ms")}}
-        text = json.dumps(doc, indent=2, default=str)
-        if args.json == "-":
-            print(text)
+def arm_row(rep, args):
+    """The three numbers a serving point is actually chosen on, plus the one it is not."""
+    s = rep["summary"]
+    return {
+        "verdict": rep["verdict"], "quotable": rep["quotable"],
+        "prebuffer_p95_ms": rep["prebuffer_ms"]["p95"],
+        "stall_gate": s.get("stall_rate@%d" % args.stall_gate_ms, float("nan")),
+        "safe_start_p95_ms": rep["safe_play_start_ms"]["p95"],
+        "ttfa_p95_ms": rep["ttfa_ms"]["p95"],
+        "stream_rtf_p95": rep["stream_rtf"]["p95"],
+        "chunks_mean": rep["chunks"]["mean"],
+        "max_gap_p95_ms": rep["max_gap_ms"]["p95"],
+    }
+
+
+def run_quantum_sweep(args, bank, levels):
+    """Sweep the decoder emit quantum, interleaved, and choose on prebuffer and stall.
+
+    The quantum must be chosen on required_prebuffer and stall_rate, NEVER on
+    STREAM_RTF.  In the reference the smallest quantum FAILED on STREAM_RTF (1.005 p95)
+    while the largest PASSED on it (0.817) and stalled half the time; aggregate rate
+    selected exactly the wrong serving point.  We have an advantage they did not: our
+    codec carries state, so chunked-vs-one-shot error stays at 1e-7 down to a one-frame
+    chunk (.work E2-3).  A small quantum costs us no correctness, so the cadence knob is
+    free for us in a way it was not for them.
+    """
+    if not args.model:
+        raise SystemExit("--quantum-sweep needs --model (a pack to derive variants "
+                         "from); it cannot sweep an attached server, because the "
+                         "quantum is read from model.json at load time")
+    if len(levels) != 1:
+        raise SystemExit("--quantum-sweep takes exactly one concurrency level "
+                         "(--levels C): a sweep that also varies load has measured two "
+                         "things at once")
+    level = levels[0]
+    quanta = [int(x) for x in args.quantum_sweep.split(",") if x.strip()]
+    if not quanta or min(quanta) < 1:
+        raise SystemExit("--quantum-sweep must be positive integers, e.g. 1,2,4,8")
+
+    base = os.path.abspath(args.model)
+    root = args.quantum_pack_dir or os.path.join(
+        os.path.dirname(base), ".quantum-sweep-" + os.path.basename(base))
+    os.makedirs(root, exist_ok=True)
+    packs = {}
+    for q in quanta:
+        packs["q%d" % q] = make_quantum_pack(base, os.path.join(root, "q%d" % q), q)
+
+    labels = ["q%d" % q for q in quanta]
+    order = interleave(labels, args.repeats)
+    print("SWEEP ORDER (interleaved against drift): %s" % " ".join(order),
+          file=sys.stderr)
+
+    runs = []
+    arms_facts = {}
+    started = time.strftime("%Y-%m-%d %H:%M:%S")
+    for n, label in enumerate(order):
+        print("  [%d/%d] %s ..." % (n + 1, len(order), label), file=sys.stderr)
+        proc = None
+        try:
+            reports, prof, h0, h1, proc = run_arm(args, bank, [level], packs[label])
+        finally:
+            stop_server(proc)
+        meta = build_meta(args, bank, prof, h0, h1, started, 0.0)
+        arms_facts.setdefault(label, meta["arm"])
+        runs.append({"label": label, "rep": n, "report": reports[0],
+                     "row": arm_row(reports[0], args)})
+
+    # THE REFUSAL: every arm must have resolved the same dispatch.  The quantum is the
+    # only thing allowed to differ; if the ISA, quantization or thread count moved too,
+    # the difference between the arms is not the variable under test.
+    #
+    # Sameness here IS established by construction -- one binary, one environment, one
+    # process launch per arm, and pack variants that symlink every file except
+    # model.json -- so facts the server does not report are allowed through.  They are
+    # named in the output rather than quietly assumed.
+    unverified = PB.require_comparable(arms_facts, allow_unverified=True)
+
+    print()
+    W = 108
+    print("=" * W)
+    print("DECODER-QUANTUM SWEEP at C%d  --  %s" % (level, args.mode.upper()))
+    print("  quantum = model.json %r (frames accumulated before decode+emit); "
+          "1 frame = %s" % (QUANTUM_KEY, "%.0f ms" % (1000.0 / 12.5)))
+    print("  chosen on required_prebuffer p95 and stall_rate@%dms. NOT on STREAM_RTF."
+          % args.stall_gate_ms)
+    print("  order: %s   (%d repeats, palindromic)" % (" ".join(order), args.repeats))
+    print("  dispatch: %s" % list(arms_facts.values())[0].get("engine"))
+    if unverified:
+        print("  DISPATCH NOT VERIFIED for %s -- /health does not report these. The arms"
+              % ", ".join(unverified))
+        print("    share one binary, one environment and one launch, so they are the "
+              "same by construction,")
+        print("    but that is an argument, not a measurement. Make /health report them "
+              "to close this.")
+    print("  PLATFORM %s" % platform_caveat())
+    print("=" * W)
+    hdr = ("%-6s %4s %9s %11s %10s %11s %11s %10s %9s  %s"
+           % ("arm", "n", "chunks", "preb95 ms", "stall@%d" % args.stall_gate_ms,
+              "safe95 ms", "TTFA95 ms", "gap95 ms", "SRTF95", "verdicts"))
+    print(hdr)
+    print("-" * W)
+    per_arm = {}
+    for label in labels:
+        rows = [r["row"] for r in runs if r["label"] == label]
+        per_arm[label] = rows
+
+        def med(key):
+            return PB.pct([r[key] for r in rows], 50)
+        verdicts = ",".join(r["verdict"] for r in rows)
+        print("%-6s %4d %9.1f %11.0f %10s %11.0f %11.0f %10.0f %9.3f  %s"
+              % (label, len(rows), med("chunks_mean"), med("prebuffer_p95_ms"),
+                 "%.0f%%" % (med("stall_gate") * 100.0)
+                 if med("stall_gate") == med("stall_gate") else "n/a",
+                 med("safe_start_p95_ms"), med("ttfa_p95_ms"), med("max_gap_p95_ms"),
+                 med("stream_rtf_p95"), verdicts))
+    print("-" * W)
+
+    # The choice, made explicitly on the gating metrics.
+    def score(label):
+        rows = per_arm[label]
+        return (PB.pct([r["stall_gate"] for r in rows], 50),
+                PB.pct([r["prebuffer_p95_ms"] for r in rows], 50))
+    ok_arms = [l for l in labels if all(r["verdict"] not in ("NOT QUOTABLE",)
+                                        for r in per_arm[l])]
+    best = min(ok_arms, key=score) if ok_arms else None
+    print()
+    if best is None:
+        print("NO ARM IS QUOTABLE: the sweep decided nothing.")
+    else:
+        srtf_best = min(labels, key=lambda l: PB.pct(
+            [r["stream_rtf_p95"] for r in per_arm[l]], 50))
+        print("CHOSEN ON CADENCE: %s (lowest stall_rate@%dms, then lowest prebuffer p95)"
+              % (best, args.stall_gate_ms))
+        print("BEST STREAM_RTF  : %s" % srtf_best)
+        if srtf_best != best:
+            print("  ^ THESE DISAGREE, which is the entire point of the sweep: choosing "
+                  "the quantum on aggregate")
+            print("    rate would have selected %s, and %s is the serving point."
+                  % (srtf_best, best))
         else:
-            with open(args.json, "w") as f:
-                f.write(text + "\n")
+            print("  (they agree here; that is a fact about this run, not a licence to "
+                  "choose on STREAM_RTF next time)")
+    print()
+    print("WHAT WAS SWEPT: model.json %r, read at load time (src/engine_pocket.c, "
+          "default 1)." % QUANTUM_KEY)
+    print("  It is not a CLI flag, env var or request field, so each arm is a pack "
+          "variant and a")
+    print("  server restart. Chunks/request = ceil(frames / quantum) confirms the "
+          "quantum took effect.")
+    print()
+    print("NOT SWEPT, and what would have to change:")
+    print("  server/main.c STREAM_CHUNK (4096 samples) bounds each enqueue, but")
+    print("  server/stream_out.c:169 drains the WHOLE queued span into one HTTP chunk, "
+          "so it is")
+    print("  not a delivery ceiling -- delivery granularity follows the decode quantum. "
+          "There is")
+    print("  no way to deliver SMALLER increments than the decode quantum, and no "
+          "pacing. Doing")
+    print("  that needs a capped or paced writer span in server/stream_out.c and "
+          "STREAM_CHUNK as a")
+    print("  runtime parameter. Both live in server/, owned by another lane.")
+    return runs, per_arm
 
-    worst = {"GOOD": 0, "INCONCLUSIVE": 1, "MARGINAL": 1, "NOT STREAMABLE": 2}
-    return max(worst.get(r["verdict"], 2) for r in reports) if reports else 2
+
+def compare_reports(paths, args):
+    """Difference two or more saved runs, refusing when the dispatch differs."""
+    docs = []
+    for p in paths:
+        with open(p, encoding="utf-8") as f:
+            docs.append((p, json.load(f)))
+    arms = {p: d["meta"].get("arm", {}) for p, d in docs}
+    unver = PB.require_comparable(arms, allow_unverified=args.allow_unverified_dispatch)
+    print("COMPARABLE: every arm resolved the same dispatch (%s)"
+          % docs[0][1]["meta"].get("dispatch_desc", "<unrecorded>"))
+    if unver:
+        print("  CAVEAT: %s was unrecorded in every run; sameness is assumed, not "
+              "measured." % ", ".join(unver))
+    modes = {d["meta"].get("mode") for _p, d in docs}
+    if len(modes) > 1:
+        raise PB.Refusal(["these runs are not the same KIND of measurement (%s): a wave "
+                          "screen and a soak are not comparable"
+                          % ", ".join(sorted(str(m) for m in modes))])
+    print("%-40s %4s %11s %10s %9s  %s"
+          % ("run", "C", "preb95 ms", "stall", "SRTF95", "verdict"))
+    for p, d in docs:
+        for lv in d["levels"]:
+            s = lv["summary"]
+            st = s.get("stall_rate@%d" % args.stall_gate_ms, float("nan"))
+            print("%-40s %4d %11.0f %10s %9.3f  %s"
+                  % (os.path.basename(p)[:40], lv["level"],
+                     lv["prebuffer_ms"]["p95"],
+                     "n/a" if st != st else "%.0f%%" % (st * 100.0),
+                     lv["stream_rtf"]["p95"], lv["verdict"]))
+    return 0
+
+
+def write_json(args, meta, reports):
+    doc = {"meta": meta, "levels": reports,
+           "thresholds": {k: getattr(args, k) for k in
+                          ("rtf_hard", "rtf_pref", "ttfb_pref_ms", "ttfa_pref_ms",
+                           "prebuffer_pref_ms", "safe_start_pref_ms",
+                           "stall_gate_ms", "stall_mandatory_ms",
+                           "coalesced_refuse", "drift_rtf_tol",
+                           "drift_prebuffer_tol_ms", "drift_min_windows")}}
+    text = json.dumps(doc, indent=2, default=str)
+    if args.json == "-":
+        print(text)
+    else:
+        with open(args.json, "w") as f:
+            f.write(text + "\n")
 
 
 if __name__ == "__main__":

@@ -276,12 +276,20 @@ def fixed_buffer_sim(marks, fmt, buffer_s):
             stall_total, stall_max, stall_count)
 
 
-def timeline_kpis(marks, t_done, fmt, buffers_ms=DEFAULT_BUFFERS_MS):
+def timeline_kpis(marks, t_done, fmt, buffers_ms=DEFAULT_BUFFERS_MS, ttfb_s=None):
     """Every per-request playback metric derived from one arrival timeline.
 
     ``t_done`` is when the response finished (the last byte / the terminating chunk).
     A request with fewer than two chunks HAS NO CADENCE: those keys come back NaN rather
     than 0, so an aggregate can exclude them instead of averaging a fiction.
+
+    ``ttfb_s`` is the only input a timeline cannot contain: the response header arrives
+    before any audio, so the caller stamps it.  It is carried here, rather than kept in
+    the harness, so that TTFB and TTFA have ONE definition and the difference between
+    them (``header_to_audio_s``) is computed once.  This server sends the streaming
+    header from the writer thread before synthesis starts, so TTFB can be milliseconds
+    while TTFA is seconds; quoting TTFB as "latency" is the classic way to publish a
+    number no listener experiences.
     """
     bps = _bps(fmt)
     ms = _norm(marks)
@@ -292,11 +300,14 @@ def timeline_kpis(marks, t_done, fmt, buffers_ms=DEFAULT_BUFFERS_MS):
         "blocked_reads_known": any(m[2] is not None for m in ms),
         "bytes": sum(nb for _t, nb, _b in ms),
     }
+    out["ttfb_s"] = float("nan") if ttfb_s is None else float(ttfb_s)
     if n == 0:
         out.update({"ttfa_s": float("nan"), "delivered_s": 0.0})
     else:
         out["ttfa_s"] = ms[0][0]
         out["delivered_s"] = sum(nb for _t, nb, _b in ms) / bps
+    # TTFB and TTFA are different measurements; the gap between them is the header lead.
+    out["header_to_audio_s"] = out["ttfa_s"] - out["ttfb_s"]
 
     if n < 2:
         for k in ("stream_rtf", "required_prebuffer_s", "safe_play_start_s",
@@ -360,9 +371,9 @@ def summarize(records, buffers_ms=DEFAULT_BUFFERS_MS):
         return [r.get(key) for r in records]
 
     out = {"n_records": len(records)}
-    for key in ("ttfa_s", "ttfb_s", "stream_rtf", "required_prebuffer_s",
-                "safe_play_start_s", "underrun_total_s", "stall_max_s",
-                "max_gap_s", "gap_ratio_max", "delivered_s"):
+    for key in ("ttfa_s", "ttfb_s", "header_to_audio_s", "stream_rtf",
+                "required_prebuffer_s", "safe_play_start_s", "underrun_total_s",
+                "stall_max_s", "max_gap_s", "gap_ratio_max", "delivered_s"):
         vals = col(key)
         if any(v is not None for v in vals):
             out[key] = spread(vals)
@@ -419,6 +430,313 @@ def format_summary(s, buffers_ms=DEFAULT_BUFFERS_MS, indent="  "):
           if coal == coal else
           indent + "RECEIVE FIDELITY: blocked-read times not recorded")
     return "\n".join((l1, l2, l3))
+
+
+# ======================================================================================
+# THE QUALIFICATION ENVELOPE  (.work/streaming-cadence.md section 5)
+# ======================================================================================
+# GOOD = every preferred gate met.  MARGINAL = every mandatory met, a preferred missed.
+# NOT STREAMABLE = a mandatory gate failed.  INCONCLUSIVE = nothing to judge.
+#
+# Which metric GATES is the whole content of the note, so it is stated once, here:
+#
+#   STREAM_RTF is a CAPACITY metric.  It is mandatory (< 1) because a stream slower than
+#   realtime can never be fixed by buffering, and it is preferred (<= 0.90) because
+#   running at the edge leaves no margin.  It is NOT a continuity verdict and it must
+#   never be the metric that promotes a configuration.
+#
+#   required_prebuffer p95 and stall_rate@250 are what QUALIFY.  They are max-lateness
+#   statistics, they are what a listener experiences, and they are the pair that moved
+#   while STREAM_RTF sat still in every quantum sweep on record.
+#
+# Every threshold is data, printed next to the value it judged, so a verdict can be
+# falsified by reading the table instead of trusting it.
+ENVELOPE = {
+    # mandatory -- failing one is NOT STREAMABLE
+    "rtf_hard": 1.00,             # STREAM_RTF p95 <  1.00
+    "stall_mandatory_ms": 500,    # stall_rate@500ms == 0
+    # preferred -- failing one is MARGINAL
+    "ttfb_pref_ms": 100.0,
+    "ttfa_pref_ms": 500.0,
+    "rtf_pref": 0.90,
+    "prebuffer_pref_ms": 500.0,
+    "safe_start_pref_ms": 1000.0,
+    "stall_pref_ms": 250,         # stall_rate@250ms == 0  -- the qualifying gate
+    # strong -- reported, never a verdict on its own
+    "rtf_strong": 0.85,
+    "prebuffer_strong_ms": 300.0,
+    "safe_start_strong_ms": 800.0,
+}
+
+# A run whose marks are mostly already-queued data cannot support a cadence percentile.
+# The reference declared a run with 33-37% coalesced reads NOT QUOTABLE; we refuse at a
+# deliberately stricter 15%, because below that the numbers are still upper bounds and
+# above it they are fiction.
+COALESCED_REFUSE_SHARE = 0.15
+COALESCED_WARN_SHARE = 0.05
+
+
+def gate(name, value, op, limit, unit="", kind="preferred"):
+    """One comparison, carrying everything needed to re-check it by hand.
+
+    ``pass`` is None when the value is NaN -- not measured is not the same as failed,
+    and collapsing the two is how an unmeasured level becomes GOOD.
+    """
+    v = float("nan") if value is None else float(value)
+    if v != v:
+        passed = None
+    elif op == "<":
+        passed = v < limit
+    elif op == "<=":
+        passed = v <= limit
+    elif op == "==":
+        passed = v == limit
+    elif op == ">=":
+        passed = v >= limit
+    else:
+        raise ValueError("unknown comparison %r" % op)
+    return {"name": name, "value": v, "op": op, "limit": float(limit),
+            "unit": unit, "kind": kind, "pass": passed}
+
+
+def qualify(summary, completed, launched, env=None):
+    """The single definition of the streaming verdict.
+
+    Takes an aggregate from :func:`summarize` plus the completed/launched counts, and
+    returns ``(verdict, gates)``.  No harness reimplements this: a second copy of an
+    envelope is a second product.
+    """
+    e = dict(ENVELOPE)
+    if env:
+        e.update(env)
+    s = summary or {}
+
+    def sp(key, field="p95"):
+        d = s.get(key)
+        return d.get(field, float("nan")) if isinstance(d, dict) else float("nan")
+
+    def ms(key, field="p95"):
+        v = sp(key, field)
+        return v * 1000.0 if v == v else v
+
+    mandatory = [
+        gate("completed == launched", float(completed), "==", float(launched),
+             kind="mandatory"),
+        gate("STREAM_RTF p95", sp("stream_rtf"), "<", e["rtf_hard"], kind="mandatory"),
+        gate("stall_rate@%dms" % e["stall_mandatory_ms"],
+             s.get("stall_rate@%d" % e["stall_mandatory_ms"], float("nan")),
+             "==", 0.0, kind="mandatory"),
+    ]
+    preferred = [
+        gate("TTFB p95", ms("ttfb_s"), "<=", e["ttfb_pref_ms"], "ms"),
+        gate("TTFA p95", ms("ttfa_s"), "<=", e["ttfa_pref_ms"], "ms"),
+        gate("STREAM_RTF p95", sp("stream_rtf"), "<=", e["rtf_pref"]),
+        gate("required_prebuffer p95", ms("required_prebuffer_s"), "<=",
+             e["prebuffer_pref_ms"], "ms"),
+        gate("safe_play_start p95", ms("safe_play_start_s"), "<=",
+             e["safe_start_pref_ms"], "ms"),
+        gate("stall_rate@%dms" % e["stall_pref_ms"],
+             s.get("stall_rate@%d" % e["stall_pref_ms"], float("nan")), "==", 0.0),
+    ]
+    strong = [
+        gate("STREAM_RTF p95", sp("stream_rtf"), "<=", e["rtf_strong"], kind="strong"),
+        gate("required_prebuffer p95", ms("required_prebuffer_s"), "<=",
+             e["prebuffer_strong_ms"], "ms", kind="strong"),
+        gate("safe_play_start p95", ms("safe_play_start_s"), "<=",
+             e["safe_start_strong_ms"], "ms", kind="strong"),
+    ]
+    gates = {"mandatory": mandatory, "preferred": preferred, "strong": strong,
+             "envelope": e, "n_cadence": s.get("n_cadence", 0),
+             "n_records": s.get("n_records", 0)}
+
+    if any(g["pass"] is False for g in mandatory):
+        return "NOT STREAMABLE", gates
+    if s.get("n_cadence", 0) == 0:
+        # Mandatory gates that could be evaluated held, but no request delivered two
+        # chunks, so continuity was never observed.  GOOD here would be a claim about a
+        # player that was never simulated.
+        return "INCONCLUSIVE", gates
+    if any(g["pass"] is False for g in preferred):
+        return "MARGINAL", gates
+    if any(g["pass"] is None for g in mandatory + preferred):
+        return "INCONCLUSIVE", gates
+    return "GOOD", gates
+
+
+def capacity(level_verdicts):
+    """The operating point: the highest concurrency that is GOOD with NO gap below it.
+
+    Discovered, not prescribed.  ``level_verdicts`` is ``{concurrency: verdict}``.
+    A GOOD level above a non-GOOD one does not extend capacity -- an island of GOOD at
+    C8 above a MARGINAL C4 is a measurement to explain, not a product point to ship.
+    Returns ``None`` when even the lowest level is not GOOD.
+    """
+    best = None
+    for c in sorted(level_verdicts):
+        if level_verdicts[c] == "GOOD":
+            best = c
+        else:
+            break
+    return best
+
+
+# ======================================================================================
+# REFUSALS  (.work/engineering-method.md section 4: "every tool declares a refusal")
+# ======================================================================================
+class Refusal(Exception):
+    """Raised instead of printing a number nobody should trust."""
+
+    def __init__(self, reasons):
+        self.reasons = list(reasons)
+        Exception.__init__(self, "; ".join(self.reasons))
+
+
+def quotable(summary, refuse_share=COALESCED_REFUSE_SHARE,
+             warn_share=COALESCED_WARN_SHARE):
+    """May this run's CADENCE PERCENTILES be quoted?  ``(status, share, reasons)``.
+
+    ``status`` is ``"QUOTABLE"``, ``"QUOTABLE (warn)"``, ``"NOT QUOTABLE"`` or
+    ``"UNKNOWN"``.
+
+    The client mark is stamped when ``read1()`` returns.  A reader that was late finds
+    several chunks already queued and returns them microseconds apart, so N server
+    emissions appear as N marks in one instant: the earlier marks are stamped LATE and
+    every cadence statistic derived from them is fiction in the tail and an upper bound
+    everywhere else.  When the share of such reads is high the percentiles measure the
+    CLIENT, not the server.
+
+    UNKNOWN when blocked-read times were never recorded -- that is not a pass.  A
+    harness that does not record how long each read blocked cannot know whether its own
+    numbers are real, and must say so rather than assume zero.
+    """
+    share = summary.get("coalesced_chunk_share", float("nan")) if summary else float("nan")
+    if share != share:
+        return ("UNKNOWN", share,
+                ["blocked-read times were not recorded, so the coalesced-read share is "
+                 "unknown and the cadence percentiles cannot be certified"])
+    if share > refuse_share:
+        return ("NOT QUOTABLE", share,
+                ["%.1f%% of reads returned already-queued data (refuse above %.0f%%): "
+                 "the cadence percentiles describe the client's reader, not the "
+                 "server's emission" % (share * 100.0, refuse_share * 100.0)])
+    if share > warn_share:
+        return ("QUOTABLE (warn)", share,
+                ["%.1f%% of reads returned already-queued data (warn above %.0f%%): "
+                 "cadence values are upper bounds on server lateness"
+                 % (share * 100.0, warn_share * 100.0)])
+    return ("QUOTABLE", share, [])
+
+
+# The facts that must be identical before two arms may be differenced.  "Dispatch
+# resolution" is the qwen-tts term: which kernels actually ran.  A sweep that changes
+# the ISA, the quantization, the thread count or the backend along with the variable
+# under test has measured their sum and can attribute it to nothing.
+COMPARABLE_KEYS = ("engine", "isa", "simd", "backend", "quant", "threads",
+                   "sample_rate", "build_flags", "server_bin", "route", "stream")
+
+
+def comparable(arm_a, arm_b, keys=COMPARABLE_KEYS):
+    """``(ok, differences)`` -- may these two arms be differenced?
+
+    Each arm is a dict of resolved facts.  A key missing from BOTH is not a difference
+    (nobody measured it); a key present in one and missing in the other IS, because an
+    unrecorded fact is not an equal fact.
+    """
+    diffs = []
+    for k in keys:
+        if k not in arm_a and k not in arm_b:
+            continue
+        va, vb = arm_a.get(k, "<unrecorded>"), arm_b.get(k, "<unrecorded>")
+        if va != vb:
+            diffs.append("%s: %r vs %r" % (k, va, vb))
+    return (not diffs), diffs
+
+
+UNRECORDED = "<unrecorded>"
+
+
+def unverifiable_keys(arms, keys=COMPARABLE_KEYS):
+    """Keys that are ``<unrecorded>`` in EVERY arm.
+
+    These are the dangerous ones.  Two arms that both say ``<unrecorded>`` compare
+    equal, but nobody measured anything: equality of two unknowns is not sameness.  A
+    sweep whose quantization silently differed would pass a naive check.
+    """
+    return [k for k in keys
+            if all(str(a.get(k, UNRECORDED)) == UNRECORDED for a in arms.values())]
+
+
+def require_comparable(arms, keys=COMPARABLE_KEYS, allow_unverified=False):
+    """Raise :class:`Refusal` unless every arm PROVABLY resolved the same dispatch.
+
+    Two failure modes, and they are different:
+
+    * a key that differs      -> the arms measured different things.  Always refuses.
+    * a key nobody recorded   -> the arms MIGHT have measured different things and
+      there is no evidence either way.  Refuses unless ``allow_unverified``, which the
+      caller may set only when sameness is established by construction (same binary,
+      same environment, same process launch) rather than by the report.
+    """
+    labels = sorted(arms)
+    reasons = []
+    for i in range(1, len(labels)):
+        ok, diffs = comparable(arms[labels[0]], arms[labels[i]], keys)
+        if not ok:
+            reasons.append("arm %r and arm %r did not resolve the same dispatch (%s)"
+                           % (labels[0], labels[i], "; ".join(diffs)))
+    if reasons:
+        raise Refusal(reasons + ["refusing to compare arms whose dispatch resolution "
+                                 "differs: the difference between them is not the "
+                                 "variable under test"])
+    unver = unverifiable_keys(arms, keys)
+    if unver and not allow_unverified:
+        raise Refusal(["no arm recorded %s, so their sameness is an assumption, not a "
+                       "measurement" % ", ".join(unver),
+                       "refusing to certify comparability from unrecorded facts: make "
+                       "the server report them, or pass the flag that says sameness is "
+                       "established by construction"])
+    return unver
+
+
+# ======================================================================================
+# SOAK DRIFT  -- the gate that separates a screen from a qualification
+# ======================================================================================
+def drift_gate(windows, key="stream_rtf", field="p95", tol=0.05, min_windows=3):
+    """Did the metric hold STILL across a soak's windows, or did it walk?
+
+    ``windows`` is a list of :func:`summarize` aggregates, in time order.  A soak that
+    ends worse than it started has not qualified anything, however good its average: a
+    configuration whose STREAM_RTF climbs from 0.88 to 1.02 over thirty minutes has a
+    perfectly respectable mean and is not shippable.
+
+    The gate compares the LAST window against the BEST window rather than first-vs-last,
+    so a single bad warm-up window cannot hide a downward trend behind it.  Returns a
+    dict with ``pass`` True/False/None (None = too few windows to judge).
+    """
+    vals = []
+    for w in windows:
+        d = w.get(key)
+        v = d.get(field, float("nan")) if isinstance(d, dict) else (
+            w.get(key, float("nan")))
+        vals.append(float(v) if v is not None else float("nan"))
+    finite = [v for v in vals if v == v]
+    out = {"key": "%s %s" % (key, field), "values": vals, "n_windows": len(windows),
+           "tol": tol, "min_windows": min_windows}
+    if len(finite) < min_windows:
+        out.update({"pass": None, "drift": float("nan"), "best": float("nan"),
+                    "last": float("nan"),
+                    "why": "only %d window(s) with a value; %d needed to call a trend"
+                           % (len(finite), min_windows)})
+        return out
+    best, last = min(finite), vals[-1]
+    if last != last:
+        last = finite[-1]
+    drift = last - best
+    out.update({"pass": drift <= tol + 1e-12, "drift": drift, "best": best,
+                "last": last,
+                "why": "last window %.4f vs best %.4f = %+.4f (tolerance %+.4f)"
+                       % (last, best, drift, tol)})
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -631,6 +949,146 @@ def _selftest():
     k = timeline_kpis(marks, 1.0, F)
     check("coalesced/counted", k["coalesced_chunks"], 1)
     check("coalesced/share", summarize([k])["coalesced_chunk_share"], 1 / 3.0, 1e-9)
+
+    # --- CASE 11: TTFB is not TTFA ----------------------------------------------------
+    # The header goes out before synthesis starts, so TTFB is milliseconds while TTFA is
+    # seconds.  Both come out of this module so that nothing downstream can quote one
+    # for the other.
+    k = timeline_kpis(synth("smooth", F), 4.0, F, ttfb_s=0.012)
+    check("ttfb/carried", k["ttfb_s"], 0.012)
+    check("ttfb/ttfa is not ttfb", k["ttfa_s"], 0.3)
+    check("ttfb/header lead", k["header_to_audio_s"], 0.288, 1e-9)
+    check("ttfb/absent is NaN not zero",
+          timeline_kpis(synth("smooth", F), 4.0, F)["ttfb_s"], float("nan"))
+
+    # === CASE 12: THE CASE THIS FILE EXISTS FOR =======================================
+    # A stream that is comfortably FASTER than realtime on average and still stalls.
+    # STREAM_RTF passes every RTF gate there is -- mandatory (<1), preferred (<=0.90)
+    # and even strong (<=0.85) -- while a player with a 250 ms jitter buffer runs dry.
+    # If STREAM_RTF were allowed to promote a configuration, this one would ship.
+    m = synth("bursty", F, n=9)              # 0.5 s at 0.3, then 4 chunks at 1.9 and 3.5
+    k = timeline_kpis(m, t_done=m[-1][0], fmt=F, ttfb_s=0.01)
+    check("HEADLINE/stream_rtf", k["stream_rtf"], (3.5 - 0.3) / 4.0, 1e-9)   # 0.800
+    check_true("HEADLINE/stream_rtf passes the MANDATORY gate (<1.00)",
+               k["stream_rtf"] < ENVELOPE["rtf_hard"])
+    check_true("HEADLINE/stream_rtf passes the PREFERRED gate (<=0.90)",
+               k["stream_rtf"] <= ENVELOPE["rtf_pref"])
+    check_true("HEADLINE/stream_rtf passes the STRONG gate (<=0.85)",
+               k["stream_rtf"] <= ENVELOPE["rtf_strong"])
+    check("HEADLINE/required_prebuffer is 1.1 s anyway", k["required_prebuffer_s"],
+          1.1, 1e-6)
+    check("HEADLINE/a 250 ms buffer stalls", k["stalls@250"], 1)
+    v, g = qualify(summarize([k]), completed=1, launched=1)
+    # The verdict is the strongest one available: a 500 ms jitter buffer -- half a second
+    # of latency the listener pays before a word is heard -- still runs dry.
+    check("HEADLINE/verdict is NOT STREAMABLE",
+          1.0 if v == "NOT STREAMABLE" else 0.0, 1.0)
+    check_true("HEADLINE/the MANDATORY gate that failed is stall@500, not RTF",
+               sorted(x["name"] for x in g["mandatory"]
+                      if x["pass"] is False) == ["stall_rate@500ms"])
+    failed = sorted(x["name"] for x in g["preferred"] if x["pass"] is False)
+    check_true("HEADLINE/the PREFERRED gates that failed are prebuffer and stall@250",
+               failed == ["required_prebuffer p95", "safe_play_start p95",
+                          "stall_rate@250ms"])
+    check_true("HEADLINE/NO RTF gate failed anywhere in the envelope",
+               all(x["pass"] is not False
+                   for x in g["mandatory"] + g["preferred"] + g["strong"]
+                   if "STREAM_RTF" in x["name"]))
+
+    # --- CASE 13: the envelope ---------------------------------------------------------
+    smooth = [timeline_kpis(synth("smooth", F, n=9), 3.5, F, ttfb_s=0.01)
+              for _ in range(4)]
+    v, g = qualify(summarize(smooth), 4, 4)
+    check("envelope/clean stream is GOOD", 1.0 if v == "GOOD" else 0.0, 1.0)
+    v, _ = qualify(summarize(smooth), completed=3, launched=4)
+    check("envelope/a lost request is NOT STREAMABLE",
+          1.0 if v == "NOT STREAMABLE" else 0.0, 1.0)
+    slow = [timeline_kpis(synth("slower_than_realtime", F, n=9),
+                          synth("slower_than_realtime", F, n=9)[-1][0], F, ttfb_s=0.01)]
+    v, _ = qualify(summarize(slow), 1, 1)
+    check("envelope/slower than realtime is NOT STREAMABLE",
+          1.0 if v == "NOT STREAMABLE" else 0.0, 1.0)
+    one = [timeline_kpis([(0.5, chunk_bytes(1.0, F))], 0.6, F, ttfb_s=0.01)]
+    v, _ = qualify(summarize(one), 1, 1)
+    check("envelope/no cadence is INCONCLUSIVE, never GOOD",
+          1.0 if v == "INCONCLUSIVE" else 0.0, 1.0)
+    # Every gate carries the threshold it compared against, so the verdict is falsifiable.
+    _, g = qualify(summarize(smooth), 4, 4)
+    check_true("envelope/every gate carries its limit",
+               all("limit" in x and "op" in x
+                   for x in g["mandatory"] + g["preferred"] + g["strong"]))
+    check("envelope/stall@250 is a PREFERRED gate",
+          1.0 if any(x["name"] == "stall_rate@250ms" for x in g["preferred"]) else 0.0, 1.0)
+    check("envelope/stall@500 is a MANDATORY gate",
+          1.0 if any(x["name"] == "stall_rate@500ms" for x in g["mandatory"]) else 0.0, 1.0)
+
+    # --- CASE 14: capacity is discovered, and an island does not count -------------------
+    check("capacity/contiguous", float(capacity({1: "GOOD", 2: "GOOD", 4: "MARGINAL"})), 2.0)
+    check("capacity/island above a gap is not capacity",
+          float(capacity({1: "GOOD", 2: "GOOD", 4: "MARGINAL", 8: "GOOD"})), 2.0)
+    check_true("capacity/none when C1 already fails",
+               capacity({1: "MARGINAL", 2: "GOOD"}) is None)
+
+    # --- CASE 15: the refusals ----------------------------------------------------------
+    st, sh, why = quotable({"coalesced_chunk_share": 0.0})
+    check("refuse/clean run is quotable", 1.0 if st == "QUOTABLE" else 0.0, 1.0)
+    st, _, _ = quotable({"coalesced_chunk_share": 0.08})
+    check("refuse/8% warns", 1.0 if st == "QUOTABLE (warn)" else 0.0, 1.0)
+    st, _, why = quotable({"coalesced_chunk_share": 0.35})
+    check("refuse/35% (the reference's run) is NOT QUOTABLE",
+          1.0 if st == "NOT QUOTABLE" else 0.0, 1.0)
+    check_true("refuse/and says why", bool(why))
+    st, _, _ = quotable({})
+    check("refuse/unrecorded blocked reads is UNKNOWN, not a pass",
+          1.0 if st == "UNKNOWN" else 0.0, 1.0)
+
+    a = {"engine": "pocket", "isa": "neon", "threads": 4, "quant": "int8"}
+    check_true("refuse/identical arms compare", comparable(a, dict(a))[0])
+    same, diffs = comparable(a, dict(a, threads=8))
+    check_true("refuse/different thread count does not compare",
+               (not same) and len(diffs) == 1)
+    same, _ = comparable(a, {"engine": "pocket", "isa": "neon", "threads": 4})
+    check_true("refuse/an unrecorded fact is not an equal fact", not same)
+    check_true("refuse/a key absent from both is not a difference",
+               comparable({"engine": "pocket"}, {"engine": "pocket"})[0])
+    full = {k: "x" for k in COMPARABLE_KEYS}
+    try:
+        require_comparable({"q1": dict(full), "q4": dict(full, quant="f32")})
+        check_true("refuse/require_comparable raises on a difference", False)
+    except Refusal as exc:
+        check_true("refuse/require_comparable raises on a difference",
+                   "quant" in str(exc))
+    check_true("refuse/fully recorded identical arms compare",
+               require_comparable({"q1": dict(full), "q4": dict(full)}) == [])
+    # Equality of two unknowns is NOT sameness: both arms saying "<unrecorded>" must not
+    # certify a comparison.  This is the hole that a naive dict-equality check leaves,
+    # and this server's /health reports none of isa/simd/backend/quant/threads today.
+    blind = {k: "x" for k in COMPARABLE_KEYS}
+    blind["quant"] = UNRECORDED
+    try:
+        require_comparable({"q1": dict(blind), "q4": dict(blind)})
+        check_true("refuse/unrecorded-in-every-arm is not proof of sameness", False)
+    except Refusal as exc:
+        check_true("refuse/unrecorded-in-every-arm is not proof of sameness",
+                   "quant" in str(exc))
+    check_true("refuse/but may be allowed explicitly, and says which keys",
+               require_comparable({"q1": dict(blind), "q4": dict(blind)},
+                                  allow_unverified=True) == ["quant"])
+
+    # --- CASE 16: the soak drift gate ----------------------------------------------------
+    def win(v):
+        return {"stream_rtf": {"p95": v}}
+    d = drift_gate([win(0.88), win(0.89), win(0.90)], tol=0.05)
+    check_true("drift/steady soak passes", d["pass"] is True)
+    check("drift/measured drift", d["drift"], 0.02, 1e-9)
+    d = drift_gate([win(0.88), win(0.95), win(1.02)], tol=0.05)
+    check_true("drift/a soak that walks upward fails", d["pass"] is False)
+    check("drift/against the BEST window, not the first", d["drift"], 0.14, 1e-9)
+    # A bad first window must not hide a downward trend behind it.
+    d = drift_gate([win(1.20), win(0.88), win(0.99)], tol=0.05)
+    check_true("drift/a bad warm-up window cannot mask the trend", d["pass"] is False)
+    d = drift_gate([win(0.88), win(0.90)], tol=0.05)
+    check_true("drift/two windows cannot call a trend", d["pass"] is None)
 
     print()
     print(format_summary(summarize(recs)))

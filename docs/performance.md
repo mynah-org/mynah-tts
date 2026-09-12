@@ -296,6 +296,127 @@ f32 greedy synthesis: sampling requests need the full logits and already used
 the threaded batched projection, and quantized modes route through the
 threaded qmat row split.
 
+## The serving measurement protocol
+
+Serving numbers are not synthesis numbers. A single-request RTF says nothing
+about whether a listener's player stops, and this repo does not let the two be
+confused.
+
+**The metrics are defined once**, in `tests/playback_sim.py`: TTFB, TTFA,
+STREAM_RTF, `required_prebuffer`, `safe_play_start`, `stall_rate` at
+100/250/500/1000 ms, `max_gap` and the coalesced-read share. Every harness
+imports them; nothing recomputes them. `python3 tests/playback_sim.py` (or
+`make playback-sim-test`) runs 122 known-answer checks over synthetic timelines
+in under a second and needs no model, no server and no network.
+
+**Which metric gates.** STREAM_RTF is a *capacity* metric: mandatory `< 1`,
+preferred `<= 0.90`, and never allowed to promote anything on its own.
+`required_prebuffer` p95 and `stall_rate@250ms` are what *qualify*. The
+self-test carries the case that forces the distinction — a timeline whose
+STREAM_RTF is 0.800, passing the mandatory, preferred *and* strong RTF gates,
+on which a player with a 250 ms jitter buffer still runs dry. Its verdict is
+NOT STREAMABLE. If STREAM_RTF could promote, that configuration would ship.
+
+**WAVE and SOAK are different measurements and the tool refuses to conflate
+them.**
+
+| | WAVE | SOAK |
+|---|---|---|
+| shape | C requests fired at t=0, repeated | C in flight continuously for minutes |
+| warm-up | none | `--warmup-seconds`, discarded |
+| drift gate | none | last window vs best, per metric |
+| authority | **screen: may disqualify, never promote** | **qualification: the only mode that may promote** |
+
+The gap is not cosmetic. In the qwen-tts reference a configuration passed the
+wave screen at STREAM_RTF 0.919 and failed a 30-minute soak at 1.004 with 596
+rejects and 111 broken pipes: *"the hard-capacity boundary, not a product
+point."* Capacity is the highest GOOD concurrency with no gap below it —
+discovered, not prescribed, and a GOOD level sitting above a MARGINAL one is a
+measurement to explain rather than a product point.
+
+**The tool declares its refusals and exits non-zero.**
+
+- **Coalesced reads (exit 3).** A client mark is stamped when `read()` returns.
+  A late reader finds several chunks already queued and returns them
+  microseconds apart, so N server emissions become N marks in one instant.
+  Above a 15% coalesced share the cadence percentiles describe the *client*, and
+  the harness refuses to print them. The reference declared a run at 33-37% not
+  quotable.
+- **Dispatch resolution (exit 4).** Two arms may only be differenced when
+  engine, ISA, SIMD, backend, quantization, thread count, build flags, route and
+  sink all match. A fact that is *unrecorded in every arm* also refuses: equality
+  of two unknowns is not sameness. `/health` today reports none of ISA, SIMD,
+  backend or build flags, so that caveat is printed by name on every sweep.
+
+### The decoder quantum
+
+The emit quantum is a first-class serving parameter and is chosen on prebuffer
+and stall, never on RTF. It lives in the **model pack**, not the CLI:
+`model.json: audio_emit_frames`, read at load time
+(`src/engine_pocket.c`, default 1; the gate is `src/inference.c:128`). It is not
+a flag, not an environment variable and not a request field, so
+`--quantum-sweep` materialises one pack variant per value — `model.json`
+rewritten, every other file symlinked — and restarts the server per arm. Arms
+run **interleaved** (`q1 q4 q16 q16 q4 q1`), because drift between two identical
+runs on a shared box can exceed the effect under test.
+
+We pay no correctness penalty for a small quantum: the codec carries state, so
+chunked-vs-one-shot error stays at 1e-7 down to a one-frame chunk (`.work`
+E2-3). The cadence knob is free for us in a way it was not for the reference,
+where the smallest quantum *failed* on RTF and the largest *passed* on RTF while
+stalling half the time.
+
+**What the sweep cannot reach.** `server/main.c` `STREAM_CHUNK` (4096 samples)
+bounds each enqueue, but `server/stream_out.c:169` drains the *whole* queued
+span into one HTTP chunk, so it is not a delivery ceiling — delivery
+granularity follows the decode quantum. Delivering increments *smaller* than the
+decode quantum, or pacing them, would need a capped or paced writer span in
+`server/stream_out.c` and `STREAM_CHUNK` as a runtime parameter. Both are in
+`server/`.
+
+### Running the campaign on Linux
+
+No serving numbers are recorded here yet. **Every number this protocol produces
+on macOS is a development signal, not a production claim** — Accelerate and the
+P-core thread-pool default do not exist on Linux, and `SIMD=auto` on Linux x86
+compiles plain AVX2 with no runtime dispatch. Production is Linux x86-64 and
+ARM64, and the campaign belongs there. The harness prints the platform caveat on
+every report.
+
+Note that the quantization default changed at `d1ffd01`: per-tensor groups,
+codec in int8 and backbone/flow in f16. Any earlier serving number in this repo
+was taken against a different configuration and is not comparable.
+
+```bash
+# 0. build, and prove the metric definitions before trusting any of them
+make server
+make playback-sim-test                     # 122 known-answer checks, no model needed
+
+# 1. SCREEN the levels (minutes). Drops levels that cannot work.
+make serving-wave MODEL_DIR=models/pocket-en LEVELS=1,2,4,8 WAVES=3 \
+  PROFILE_ARGS="--json build/wave.json"
+
+# 2. SWEEP the decoder quantum at the best screened level, interleaved.
+#    Chosen on prebuffer and stall@250, never on STREAM_RTF.
+make serving-quantum-sweep MODEL_DIR=models/pocket-en \
+  QUANTA=1,2,4,8,16 SWEEP_LEVEL=4 SWEEP_REPEATS=2
+
+# 3. QUALIFY with a soak at each surviving level. Only this may promote.
+#    Bake the chosen quantum into the pack's model.json first.
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=1 SOAK_SECONDS=1800
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=2 SOAK_SECONDS=1800
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=4 SOAK_SECONDS=1800 \
+  PROFILE_ARGS="--json build/soak-c4.json"
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=8 SOAK_SECONDS=1800
+
+# 4. A/B two configurations. REFUSES (exit 4) if the dispatch differs.
+python3 tools/serving_profile.py --compare build/soak-c4.json build/soak-c4-b.json
+```
+
+Record with every cell: model revision, thread count (`MYNAH_THREADS`), ISA,
+backend, build flags, quantization, CPU mask, machine, and the exit code. A
+NOT QUOTABLE level is not a slow level — it is a level that was not measured.
+
 ## Benchmark your own box
 
 ```bash

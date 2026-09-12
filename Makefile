@@ -96,7 +96,7 @@ STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
 .PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
-        playback-sim-test serving-profile \
+        playback-sim-test serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -236,10 +236,37 @@ PORT ?= 8123
 playback-sim-test:
 	python3 tests/playback_sim.py
 
-serving-profile:
-	@test -n "$(MODEL_DIR)" || (echo "usage: make serving-profile MODEL_DIR=models/fake-magpie" >&2; exit 2)
-	python3 tools/serving_profile.py --model "$(MODEL_DIR)" --port "$(PORT)" \
+serving-profile: serving-wave
+
+# WAVE is a SCREEN: C requests fired at t=0, repeated. It may disqualify a
+# concurrency level; it may never promote one. Cheap, seconds to minutes.
+serving-wave:
+	@test -n "$(MODEL_DIR)" || (echo "usage: make serving-wave MODEL_DIR=models/pocket-en [LEVELS=1,2,4,8]" >&2; exit 2)
+	python3 tools/serving_profile.py --mode wave --model "$(MODEL_DIR)" --port "$(PORT)" \
 	  --levels "$(LEVELS)" --waves "$(WAVES)" $(PROFILE_ARGS)
+
+# SOAK is a QUALIFICATION: minutes at fixed concurrency, warm-up discarded, a
+# drift gate across windows. The ONLY mode that may promote a configuration.
+SOAK_SECONDS ?= 300
+SOAK_WARMUP ?= 30
+SOAK_WINDOW ?= 60
+serving-soak:
+	@test -n "$(MODEL_DIR)" || (echo "usage: make serving-soak MODEL_DIR=models/pocket-en [LEVELS=4] [SOAK_SECONDS=300]" >&2; exit 2)
+	python3 tools/serving_profile.py --mode soak --model "$(MODEL_DIR)" --port "$(PORT)" \
+	  --levels "$(LEVELS)" --soak-seconds "$(SOAK_SECONDS)" \
+	  --warmup-seconds "$(SOAK_WARMUP)" --window-seconds "$(SOAK_WINDOW)" $(PROFILE_ARGS)
+
+# The decoder emit quantum is a model.json parameter (audio_emit_frames), so each
+# arm is a pack variant and a server restart. Arms run interleaved (A B .. B A)
+# because this machine drifts. Chosen on prebuffer and stall, never on RTF.
+QUANTA ?= 1,2,4,8
+SWEEP_LEVEL ?= 4
+SWEEP_REPEATS ?= 2
+serving-quantum-sweep:
+	@test -n "$(MODEL_DIR)" || (echo "usage: make serving-quantum-sweep MODEL_DIR=models/pocket-en [QUANTA=1,2,4,8] [SWEEP_LEVEL=4]" >&2; exit 2)
+	python3 tools/serving_profile.py --model "$(MODEL_DIR)" --port "$(PORT)" \
+	  --levels "$(SWEEP_LEVEL)" --quantum-sweep "$(QUANTA)" \
+	  --repeats "$(SWEEP_REPEATS)" $(PROFILE_ARGS)
 
 # PocketTTS model pack. Needs the gated Kyutai weights in the HF cache; see
 # .work/licensing-and-voice-policy.md before redistributing what this produces.
