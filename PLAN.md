@@ -134,7 +134,7 @@ Independent of E1. **Start here** — it tells E1 which state the seam must mode
 - [x] E2-3 streaming decode measured: **carry codec state** (error 1e-7 down to a
       1-frame chunk); replaying context needs 64 frames / 5.12 s for exactness, so
       the Magpie replay strategy does not transfer
-- [ ] E2-4 dump decoder-transformer behaviour past `context: 250` — needed to exercise
+- [x] E2-4 **done** `891501b` — and the framing was wrong by 10x: the decoder transformer runs at **200 Hz**, so `context: 250` is **1.25 s of audio**. Every utterance longer than that already takes the windowed path, and the oracle only ever saw the first 20 ms → [`.work/transformer-ar-sliding-window.md`](.work/transformer-ar-sliding-window.md) · dump decoder-transformer behaviour past `context: 250` — needed to exercise
       the sliding window in `transformer_ar`, which no reference data reaches today
 - [ ] E2-5 dump the text-chunk seam at `MAX_TOKEN_PER_CHUNK = 50`, including the known skip bug
 
@@ -355,8 +355,8 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       each p50/p95, and a GOOD/MARGINAL/NOT-STREAMABLE verdict with its thresholds
       printed so the verdict is falsifiable. Must run against the synthetic pack
       *and* a PocketTTS pack without assuming the engine.
-- [ ] E5-10 `tests/test_server.sh` `batching` check needs sub-second timing (flaky, pre-existing)
-- [ ] E5-9 **per-language slot groups** — batching cannot mix languages. Not a
+- [x] E5-10 **done** `89070f8` — the timing assertion is deleted, not tuned; the identity checks gained a must-differ control · `tests/test_server.sh` `batching` check needs sub-second timing (flaky, pre-existing)
+- [x] E5-9 **done** `0fbf374` — one worker process per language → [`.work/multi-language-serving.md`](.work/multi-language-serving.md) · **per-language slot groups** — batching cannot mix languages. Not a
       transport change: `mynah_graph_serve_continuous()` binds one model for the
       scheduler's life and `language` is only a tokenizer argument, never a routing
       key. Needs a model registry in the driver, or one process per language in
@@ -402,7 +402,7 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       their spin sweep moved STREAM p95 0.893 → 0.808 with context switches 38k → 7.6k/s,
       and their 16-thread mask read *slower cache-resident than DRAM* because the working
       set straddled two CCX. Both are ten-minute measurements
-- [ ] E5-8 gate: **N concurrent streams byte-identical to the same request run alone**
+- [x] E5-8 **done** `89070f8` — proven through HTTP at C=2/4/8, both routes, either arrival order, ragged, single-process and across 4 prefork processes, with two injected contamination mutants caught · gate: **N concurrent streams byte-identical to the same request run alone**
 
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)
 
