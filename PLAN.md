@@ -203,7 +203,7 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-1 **correct the AVX-512 VNNI claim** in `README.md` — the code is AVX2 only
 - [x] E4-2 `--dispatch-map` + costmap **done**; 8 rows resolve UNKNOWN and each names the
       predicate to add — that is E4's real to-do list
-- [ ] E4-2a add the 8 named predicates so no row resolves UNKNOWN
+- [x] E4-2a **done** `6ad9ada` — 0 UNKNOWN rows in every configuration · add the 8 named predicates so no row resolves UNKNOWN
 - [ ] E4-2b place the costmap hooks (deferred: the engines were being refactored)
 - [ ] E4-3 baseline per-region profile of the PocketTTS path, on M1 and on EPYC
 - [ ] E4-4 thread pool upgrade: lane split, deadline priority, `after_fork` (prereq for E5-6)
@@ -213,7 +213,7 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-10 **remove useless dtype conversions** — called out by name as one of the two
       profiling wins. `src/qmat.c` holds 15 conversion sites and every other hot-path
       module holds zero; the suspicion is `bf16 -> f32 -> f16` where one step would do
-- [ ] E4-11 **no silently-chosen scalar BLAS** — a scalar path taken without anyone
+- [x] E4-11 **done** `6ad9ada` · **no silently-chosen scalar BLAS** — a scalar path taken without anyone
       knowing is worse than a slow one that announces itself. `blas.accelerate` is ON
       here and absent on the target, and the 36x conv-stack win goes through BLAS
 - [ ] E4-12 **fatal ISA guard** — a `-mavx2` binary on a CPU without AVX2 gives an
@@ -254,10 +254,10 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       by our own E1 split); `MYNAH_QUANT=f16` was a silent no-op on x86, so the 2x we
       measured on ARM did not exist on the target. x86 now has F16C/AVX2 + scalar half
       kernels; ARM output byte-identical
-- [ ] E4-20 **`--self-test` fails on x86**: `qmat u8 level=1 not bit-identical at row 3
+- [x] E4-20 **done** `6ad9ada` · **`--self-test` fails on x86**: `qmat u8 level=1 not bit-identical at row 3
       (k=200)`. Pre-existing, from the VNNI commit — that work was never self-tested on
       x86, which is the whole point of a model-free self-test
-- [ ] E4-21 **`seanet.c` has 12 fallbacks and zero dispatch rows.** With `BLAS=scalar`
+- [x] E4-21 **done** `6ad9ada` · **`seanet.c` has 12 fallbacks and zero dispatch rows.** With `BLAS=scalar`
       the entire codec conv stack drops to the hand-scalar loops — the 8570 ms path,
       **36x slower** — and nothing says so. Also: the depthwise upsample always takes
       `convtr_scatter_scalar` silently; `conv1d.c:487,530` ignore the sgemm return
@@ -332,11 +332,11 @@ prefill helper (TTFA 435 → 2379 ms), utilization-aware admission (stall@250
 0 → 50%), a second submitter on the engine pool (TTFA 167 → 1200 ms), and a wide
 single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 
-- [ ] E5-1 **remove the global stream mutex** (`server/main.c:451-460`) — scheduler owns `ctx`
+- [x] E5-1 **done** `6ed9c63`/earlier — the scheduler owns `ctx`, nothing left to serialize · **remove the global stream mutex** (`server/main.c:451-460`) — scheduler owns `ctx`
 - [ ] E5-2 streaming requests enter the same slot driver as offline; no second path
 - [x] E5-3 async output writer **done** (`server/stream_out.{c,h}`): a slow client blocked
       the whole process for 66.5 s, now 4.81 s; leaks/ASan/UBSan/TSan clean
-- [ ] E5-4 cancel on disconnect (`POLLRDHUP`), slot freed within one frame
+- [x] E5-4 **done** `6ed9c63` · cancel on disconnect (`POLLRDHUP`), slot freed within one frame
 - [ ] E5-5 long-form: incremental push into a running decode, persistent conv state across flushes
 - [x] E5-6 **prefork done** (`85d6380`): `server/prefork.{c,h}`, parent opens the pack
       then forks W workers and hands each accepted fd to the least-loaded one over
@@ -361,15 +361,15 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       scheduler's life and `language` is only a tokenizer argument, never a routing
       key. Needs a model registry in the driver, or one process per language in
       `server/prefork.c` — decide which before building either
-- [ ] E5-11 **admission control against a real-time budget**. Measured: the machine
+- [x] E5-11 **done** `facdc06` · **admission control against a real-time budget**. Measured: the machine
       sustains ~3x real time aggregate, so at C8 each stream gets 0.35x and stalls.
       There is no setting that makes them all GOOD — only the choice between waiting
       and stuttering — so the server has to choose deliberately and say which
-- [ ] E5-13 **prefork preconditions** — costmap mutexes must be *reinitialized* not
+- [x] E5-13 **done** `facdc06` · **prefork preconditions** — costmap mutexes must be *reinitialized* not
       zeroed (an inherited locked mutex can never be unlocked), and no GPU backend state
       may exist before the fork: that is their still-open bug, a wrong answer rather
       than a crash
-- [ ] E5-14 **core-major slices, not contiguous logical ones** — Linux numbers the first
+- [x] E5-14 **done** `85d6380` · **core-major slices, not contiguous logical ones** — Linux numbers the first
       thread of each core first, so a contiguous slice gave two workers the same twelve
       physical cores, one per hyperthread. And print the mask actually set
 - [ ] E5-15 **dispatch gate + host profile that refuses to run**, listing the env vars
@@ -377,18 +377,18 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       and three campaigns were still run wrong from memory
 - [ ] E5-12 **prefork with pinned core slices** (E5-6) is the mechanism that turns
       cores into streams; without the topology, more cores are not more streams
-- [ ] E5-16 **the measurement protocol, before any tuning** → [`.work/serving-design.md`](.work/serving-design.md) §10.
+- [x] E5-16 **done** `18c7578` · **the measurement protocol, before any tuning** → [`.work/serving-design.md`](.work/serving-design.md) §10.
       WAVE (3 synchronised waves) is a *screen*; only a 5-30 min SOAK with a drift gate
       promotes. Their C16 passed the screen at 0.919 and failed the soak at 1.004 with
       596 rejects. Gate on **audio too**: their whole "all-on" ARM profile was faster
       and was rejected at mel-correlation 0.886-0.945 against 0.98
-- [ ] E5-17 **send the response header at admission, not at the first chunk** — otherwise
+- [x] E5-17 **done** `6ed9c63` (verified structurally, no fix needed) · **send the response header at admission, not at the first chunk** — otherwise
       TTFB equals TTFA and the entire prefill cost is invisible to the client metric
       (theirs: TTFB p50/p95 0.4/0.6 ms vs TTFA 82.6/84.2)
-- [ ] E5-18 **`TCP_NODELAY` + `SO_RCVTIMEO` on every accepted socket**; coalesced reads
+- [x] E5-18 **done** `6ed9c63` · **`TCP_NODELAY` + `SO_RCVTIMEO` on every accepted socket**; coalesced reads
       6.7% → 0.0%. And **name every thread** for `/proc`: free, and it makes the
       ownership table readable without a debugger
-- [ ] E5-19 **keep polling the listener while full, and refuse** — a full server that
+- [x] E5-19 **done** `facdc06` · **keep polling the listener while full, and refuse** — a full server that
       stops accepting hides the wait in the kernel backlog where no deadline can see
       it. Theirs measured TTFB/TTFA p95 4470/4635 ms of which >97% was before `accept()`
 - [ ] E5-20 **warm up through the same reset the request path uses** — theirs warmed on
