@@ -360,6 +360,112 @@ static int flow_linear(const mynah_flow_head_weights *weights, size_t index,
 
 /* TimestepEmbedder: args = t * freqs; emb = cat([cos(args), sin(args)]);
  * mlp = Linear, SiLU, Linear, variance-RMSNorm. */
+/* ------------------------------------------------------- the linear hook */
+
+/* The same projection for one row of each of `count` requests.  The rows are
+ * pointers because they live in their own requests' scratch. */
+static int flow_linear_batch(const mynah_flow_head_weights *weights, size_t index,
+                             mynah_flow_linear_kind kind,
+                             const mynah_flow_linear *linear,
+                             const float *const *in_rows, float *const *out_rows,
+                             size_t count, size_t k, size_t n) {
+    if (count > 1u && weights->linear_rows != NULL) {
+        return weights->linear_rows(weights->linear_user, index, kind,
+                                    linear->weight, linear->bias, in_rows,
+                                    out_rows, count, k, n);
+    }
+    for (size_t b = 0; b < count; ++b) {
+        /* flow_linear takes (n, k); flow_linear_batch speaks (k, n) like the
+         * hook typedef, so the swap happens exactly here. */
+        if (flow_linear(weights, index, kind, linear, in_rows[b], out_rows[b], n,
+                        k) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------ batch scratch */
+
+struct mynah_flow_head_batch {
+    mynah_flow_head_config config;
+    size_t rows_cap;
+    float *block;
+    float *y;       /* [rows][hidden]     */
+    float *silu;    /* [rows][hidden]     */
+    float *x;       /* [rows][hidden]     */
+    float *norm;    /* [rows][hidden]     */
+    float *hidden;  /* [rows][hidden]     */
+    float *scratch; /* [rows][hidden]     */
+    float *mod;     /* [rows][3 * hidden] */
+    const float **in_ptr;
+    float **out_ptr;
+};
+
+mynah_flow_head_batch *mynah_flow_head_batch_new(
+    const mynah_flow_head_config *config, size_t max_rows, char *error,
+    size_t error_capacity) {
+    if (config == NULL || max_rows == 0 || config->hidden_dim < 2u ||
+        config->latent_dim == 0 || config->cond_dim == 0 || config->depth == 0) {
+        flow_set_error(error, error_capacity, "flow head: bad batch arguments");
+        return NULL;
+    }
+    mynah_flow_head_batch *batch = calloc(1u, sizeof(*batch));
+    if (batch == NULL) {
+        flow_set_error(error, error_capacity, "flow head: out of memory");
+        return NULL;
+    }
+    batch->config = *config;
+    const size_t hidden = config->hidden_dim;
+    size_t per = 0, total = 0;
+    if (flow_mul(hidden, 9u, &per) != 0 || /* 6 hidden-sized + 3*hidden of mod */
+        flow_mul(per, max_rows, &total) != 0) {
+        flow_set_error(error, error_capacity, "flow head: batch scratch overflow");
+        free(batch);
+        return NULL;
+    }
+    batch->block = calloc(total ? total : 1u, sizeof(float));
+    batch->in_ptr = calloc(max_rows, sizeof(*batch->in_ptr));
+    batch->out_ptr = calloc(max_rows, sizeof(*batch->out_ptr));
+    if (batch->block == NULL || batch->in_ptr == NULL || batch->out_ptr == NULL) {
+        mynah_flow_head_batch_free(batch);
+        flow_set_error(error, error_capacity, "flow head: out of memory");
+        return NULL;
+    }
+    float *cursor = batch->block;
+    batch->y = cursor;       cursor += max_rows * hidden;
+    batch->silu = cursor;    cursor += max_rows * hidden;
+    batch->x = cursor;       cursor += max_rows * hidden;
+    batch->norm = cursor;    cursor += max_rows * hidden;
+    batch->hidden = cursor;  cursor += max_rows * hidden;
+    batch->scratch = cursor; cursor += max_rows * hidden;
+    batch->mod = cursor;
+    batch->rows_cap = max_rows;
+    return batch;
+}
+
+void mynah_flow_head_batch_free(mynah_flow_head_batch *batch) {
+    if (batch == NULL) return;
+    free(batch->block);
+    free(batch->in_ptr);
+    free((void *)batch->out_ptr);
+    free(batch);
+}
+
+size_t mynah_flow_head_batch_capacity(const mynah_flow_head_batch *batch) {
+    return (batch == NULL) ? 0u : batch->rows_cap;
+}
+
+/* Row views onto a contiguous [count][stride] block. */
+static void flow_rows_in(const float **dst, const float *base, size_t count,
+                         size_t stride) {
+    for (size_t b = 0; b < count; ++b) dst[b] = base + b * stride;
+}
+
+static void flow_rows_out(float **dst, float *base, size_t count, size_t stride) {
+    for (size_t b = 0; b < count; ++b) dst[b] = base + b * stride;
+}
+
 static int flow_timestep_embed(mynah_flow_head *head,
                                const mynah_flow_head_weights *all,
                                size_t index, float t, float *out) {
@@ -495,7 +601,180 @@ int mynah_flow_head_forward(mynah_flow_head *head,
     return 0;
 }
 
+int mynah_flow_head_forward_batch(mynah_flow_head *const *heads, size_t count,
+                                  const mynah_flow_head_weights *weights,
+                                  const float *const *cond, const float *times,
+                                  const float *const *noise, float *const *out,
+                                  mynah_flow_head_batch *batch) {
+    if (count == 0u) return 0;
+    if (heads == NULL || weights == NULL || cond == NULL || noise == NULL ||
+        out == NULL) {
+        return -1;
+    }
+    if (count == 1u) {
+        return mynah_flow_head_forward(heads[0], weights, cond[0], times, noise[0],
+                                       out[0]);
+    }
+    if (batch == NULL || count > batch->rows_cap) return -1;
+    const mynah_flow_head_config *config = &batch->config;
+    const size_t hidden = config->hidden_dim;
+    const size_t latent = config->latent_dim;
+    if (config->num_time_conds > 0 && times == NULL) return -1;
+    for (size_t b = 0; b < count; ++b) {
+        const mynah_flow_head *head = heads[b];
+        if (head == NULL || cond[b] == NULL || noise[b] == NULL ||
+            out[b] == NULL) {
+            return -1;
+        }
+        /* One shared weight set means one shared shape.  `freqs_bf16_rounded`
+         * and the epsilons are compared too: they change the numbers. */
+        if (head->config.hidden_dim != hidden ||
+            head->config.latent_dim != latent ||
+            head->config.cond_dim != config->cond_dim ||
+            head->config.depth != config->depth ||
+            head->config.num_time_conds != config->num_time_conds ||
+            head->config.freq_embed_dim != config->freq_embed_dim ||
+            head->config.max_period != config->max_period ||
+            head->config.layernorm_eps != config->layernorm_eps ||
+            head->config.rmsnorm_eps != config->rmsnorm_eps ||
+            head->config.freqs_bf16_rounded != config->freqs_bf16_rounded) {
+            return -1;
+        }
+        for (size_t c = 0; c < b; ++c) {
+            if (heads[c] == head) return -1; /* one head cannot be two rows */
+        }
+    }
+
+    /* y = cond_embed(c) */
+    flow_rows_out(batch->out_ptr, batch->y, count, hidden);
+    if (flow_linear_batch(weights, 0u, MYNAH_FLOW_LINEAR_COND_EMBED,
+                          &weights->cond_embed, cond, batch->out_ptr, count,
+                          config->cond_dim, hidden) != 0) {
+        return -1;
+    }
+
+    /* The time term is the same vector for every row -- `times` is one vector
+     * for the batch -- so it is computed once, on the first head, and added to
+     * each row.  That is bit-identical to each head computing it alone, because
+     * it is a deterministic function of `times` and the weights. */
+    if (config->num_time_conds > 0) {
+        mynah_flow_head *owner = heads[0];
+        if (!flow_time_cache_hit(owner, times)) {
+            memset(owner->y_time, 0, hidden * sizeof(float));
+            for (size_t i = 0; i < config->num_time_conds; ++i) {
+                if (flow_timestep_embed(owner, weights, i, times[i],
+                                        owner->hidden) != 0) {
+                    return -1;
+                }
+                for (size_t j = 0; j < hidden; ++j) {
+                    owner->y_time[j] += owner->hidden[j];
+                }
+            }
+            const float inv = 1.0f / (float)config->num_time_conds;
+            for (size_t j = 0; j < hidden; ++j) owner->y_time[j] *= inv;
+            for (size_t i = 0; i < config->num_time_conds; ++i) {
+                owner->cached_times[i] = times[i];
+            }
+            owner->time_cache_valid = 1;
+        }
+        for (size_t b = 0; b < count; ++b) {
+            float *y = batch->y + b * hidden;
+            for (size_t j = 0; j < hidden; ++j) y[j] += owner->y_time[j];
+        }
+    }
+
+    /* x = input_proj(noise) */
+    flow_rows_out(batch->out_ptr, batch->x, count, hidden);
+    if (flow_linear_batch(weights, 0u, MYNAH_FLOW_LINEAR_INPUT_PROJ,
+                          &weights->input_proj, noise, batch->out_ptr, count,
+                          latent, hidden) != 0) {
+        return -1;
+    }
+
+    mynah_flow_silu_f32(batch->y, batch->silu, count * hidden);
+
+    for (size_t blk = 0; blk < config->depth; ++blk) {
+        const mynah_flow_res_block_weights *block = &weights->res_blocks[blk];
+        flow_rows_in(batch->in_ptr, batch->silu, count, hidden);
+        flow_rows_out(batch->out_ptr, batch->mod, count, 3u * hidden);
+        if (flow_linear_batch(weights, blk, MYNAH_FLOW_LINEAR_BLOCK_ADALN,
+                              &block->adaln, batch->in_ptr, batch->out_ptr, count,
+                              hidden, 3u * hidden) != 0) {
+            return -1;
+        }
+        for (size_t b = 0; b < count; ++b) {
+            const float *mod = batch->mod + b * 3u * hidden;
+            float *norm = batch->norm + b * hidden;
+            mynah_flow_layernorm_f32(batch->x + b * hidden, block->in_ln_weight,
+                                     block->in_ln_bias, norm, hidden,
+                                     config->layernorm_eps);
+            mynah_flow_modulate_f32(norm, mod, mod + hidden, norm, hidden);
+        }
+        flow_rows_in(batch->in_ptr, batch->norm, count, hidden);
+        flow_rows_out(batch->out_ptr, batch->hidden, count, hidden);
+        if (flow_linear_batch(weights, blk, MYNAH_FLOW_LINEAR_BLOCK_MLP_IN,
+                              &block->mlp_in, batch->in_ptr, batch->out_ptr,
+                              count, hidden, hidden) != 0) {
+            return -1;
+        }
+        mynah_flow_silu_f32(batch->hidden, batch->hidden, count * hidden);
+        flow_rows_in(batch->in_ptr, batch->hidden, count, hidden);
+        flow_rows_out(batch->out_ptr, batch->scratch, count, hidden);
+        if (flow_linear_batch(weights, blk, MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT,
+                              &block->mlp_out, batch->in_ptr, batch->out_ptr,
+                              count, hidden, hidden) != 0) {
+            return -1;
+        }
+        for (size_t b = 0; b < count; ++b) {
+            const float *gate = batch->mod + b * 3u * hidden + 2u * hidden;
+            const float *upd = batch->scratch + b * hidden;
+            float *x = batch->x + b * hidden;
+            for (size_t i = 0; i < hidden; ++i) x[i] += gate[i] * upd[i];
+        }
+    }
+
+    flow_rows_in(batch->in_ptr, batch->silu, count, hidden);
+    flow_rows_out(batch->out_ptr, batch->mod, count, 3u * hidden);
+    if (flow_linear_batch(weights, 0u, MYNAH_FLOW_LINEAR_FINAL_ADALN,
+                          &weights->final_adaln, batch->in_ptr, batch->out_ptr,
+                          count, hidden, 2u * hidden) != 0) {
+        return -1;
+    }
+    for (size_t b = 0; b < count; ++b) {
+        const float *mod = batch->mod + b * 3u * hidden;
+        float *norm = batch->norm + b * hidden;
+        mynah_flow_layernorm_f32(batch->x + b * hidden, NULL, NULL, norm, hidden,
+                                 config->layernorm_eps);
+        mynah_flow_modulate_f32(norm, mod, mod + hidden, norm, hidden);
+    }
+    flow_rows_in(batch->in_ptr, batch->norm, count, hidden);
+    if (flow_linear_batch(weights, 0u, MYNAH_FLOW_LINEAR_FINAL_LINEAR,
+                          &weights->final_linear, batch->in_ptr, out, count,
+                          hidden, latent) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /* -------------------------------------------------------------- self test */
+
+/* A row-pointer hook that does exactly what the built-in fallback does, so the
+ * hooked run must agree with the unhooked one to the bit.  Its only job is to
+ * make the pointer plumbing observable. */
+static int flow_test_linear_rows(void *user, size_t index,
+                                 mynah_flow_linear_kind kind,
+                                 const float *weight, const float *bias,
+                                 const float *const *in_rows,
+                                 float *const *out_rows, size_t batch, size_t k,
+                                 size_t n) {
+    (void)user;
+    (void)index;
+    (void)kind;
+    for (size_t b = 0; b < batch; ++b) {
+        mynah_matvec_bias_f32(weight, in_rows[b], bias, out_rows[b], n, k);
+    }
+    return 0;
+}
 
 #define FLOW_CHECK(condition, ...)                             \
     do {                                                       \
@@ -936,6 +1215,86 @@ int mynah_flow_head_self_test(char *error, size_t error_capacity) {
                                "time-embed memoisation ignored a new time");
                 failed = 1;
             }
+        }
+
+        /* `_forward_batch` of N heads is `_forward` of each, bit for bit --
+         * with distinct conditioning and distinct noise per row, so a row's
+         * scratch leaking into its neighbour's would be visible, and once more
+         * through a row-pointer hook so the pointer plumbing is exercised and
+         * not only the per-row fallback. */
+        if (!failed) {
+            enum { FLOW_NB = 3u };
+            mynah_flow_head *heads[FLOW_NB] = {NULL, NULL, NULL};
+            float bcond[FLOW_NB][8], bnoise[FLOW_NB][8];
+            float batched[FLOW_NB][8], alone[FLOW_NB][8];
+            const float *cond_rows[FLOW_NB];
+            const float *noise_rows[FLOW_NB];
+            float *out_rows[FLOW_NB];
+            for (size_t b = 0; b < (size_t)FLOW_NB; ++b) {
+                heads[b] = mynah_flow_head_create(&config, error, error_capacity);
+                for (size_t i = 0; i < cond_dim; ++i) {
+                    bcond[b][i] = flow_fake(b * 31u + i, 501u);
+                }
+                for (size_t i = 0; i < latent; ++i) {
+                    bnoise[b][i] = flow_fake(b * 17u + i, 502u);
+                }
+                cond_rows[b] = bcond[b];
+                noise_rows[b] = bnoise[b];
+                out_rows[b] = batched[b];
+            }
+            mynah_flow_head_batch *scratch =
+                mynah_flow_head_batch_new(&config, FLOW_NB, error, error_capacity);
+            int bad = scratch == NULL;
+            for (size_t b = 0; b < (size_t)FLOW_NB; ++b) {
+                if (heads[b] == NULL) bad = 1;
+            }
+            for (int hooked = 0; hooked < 2 && !bad; ++hooked) {
+                weights.linear_rows = hooked ? flow_test_linear_rows : NULL;
+                weights.linear_user = NULL;
+                bad = mynah_flow_head_forward_batch(heads, FLOW_NB, &weights,
+                                                    cond_rows, times, noise_rows,
+                                                    out_rows, scratch) != 0;
+                for (size_t b = 0; b < (size_t)FLOW_NB && !bad; ++b) {
+                    bad = mynah_flow_head_forward(heads[b], &weights, bcond[b],
+                                                  times, bnoise[b],
+                                                  alone[b]) != 0;
+                }
+                for (size_t b = 0; b < (size_t)FLOW_NB && !bad; ++b) {
+                    for (size_t i = 0; i < latent; ++i) {
+                        if (batched[b][i] != alone[b][i]) {
+                            flow_set_error(error, error_capacity,
+                                           "flow batch (hooked=%d) row %zu dim "
+                                           "%zu: %.9g vs alone %.9g",
+                                           hooked, b, i, (double)batched[b][i],
+                                           (double)alone[b][i]);
+                            bad = 1;
+                            break;
+                        }
+                    }
+                }
+                if (!bad) {
+                    int distinct = 0;
+                    for (size_t i = 0; i < latent; ++i) {
+                        if (batched[0][i] != batched[1][i] ||
+                            batched[1][i] != batched[2][i]) {
+                            distinct = 1;
+                        }
+                    }
+                    if (!distinct) {
+                        flow_set_error(error, error_capacity,
+                                       "flow batch produced three identical "
+                                       "rows: the test is blind to cross-talk");
+                        bad = 1;
+                    }
+                }
+            }
+            weights.linear_rows = NULL;
+            weights.linear_user = NULL;
+            mynah_flow_head_batch_free(scratch);
+            for (size_t b = 0; b < (size_t)FLOW_NB; ++b) {
+                mynah_flow_head_destroy(heads[b]);
+            }
+            failed = bad;
         }
 
         mynah_flow_head_destroy(head);

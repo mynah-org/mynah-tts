@@ -73,17 +73,33 @@
  *      `bos_emb` before `input_linear`, so this module only ever sees a real
  *      `[d_model]` vector.
  *
- * ## Prefill
+ * ## Prefill, and the two kinds of "batch"
  *
- * `_prefill` is `_step` run over n tokens.  For causal attention with a KV
- * cache the two are the same function: token i writes its own K/V and then
- * attends to `[0, offset+i]`, which is what a batched masked SDPA computes.
- * Keeping one implementation is deliberate (CLAUDE.md rule 7); a batched GEMM
- * prefill is a performance change to make later, under the oracle, and it must
- * not become a second graph.
+ * There are two independent axes along which rows can be run together, and
+ * confusing them is how a batched engine ends up producing audio that depends
+ * on its neighbours:
  *
- * Nothing is allocated after `_state_new`: `_step` runs entirely out of the
- * scratch owned by the state.
+ *   1. **Positions of one sequence** (`_prefill`).  Token i writes its own K/V
+ *      and attends to `[0, offset+i]`, which is what a batched masked SDPA
+ *      computes, so the whole tile can be normalised, projected and fed forward
+ *      together as long as every K/V is written before any attention reads it.
+ *      The row count here is a property of the request's own text (or of the
+ *      codec's fixed stride), never of who else is in flight, so a hook may use
+ *      a GEMM whose reassociation differs from a matvec.
+ *   2. **One position of N different requests** (`_step_batch`).  Each row has
+ *      its own KV cache, its own absolute position and its own sliding window;
+ *      only the weights are shared.  Here the arithmetic per row MUST NOT
+ *      change with N — see `mynah_transformer_ar_linear_rows_fn`.
+ *
+ * Both are one graph, not two (CLAUDE.md rule 7): the layer body is written
+ * once, over an array of rows, and the two entry points differ only in where a
+ * row's KV cache and position come from.  With no hook installed both fall back
+ * to the same per-row `mynah_matvec_bias_f32` the single `_step` uses, so the
+ * default numerics of all three paths are bit-identical.
+ *
+ * Nothing is allocated after `_state_new` / `_batch_new`: `_step`, `_prefill`
+ * and `_step_batch` all run out of scratch owned by the state or by the
+ * caller-provided batch object.
  */
 #ifndef MYNAH_TTS_TRANSFORMER_AR_H
 #define MYNAH_TTS_TRANSFORMER_AR_H
@@ -166,6 +182,27 @@ typedef int (*mynah_transformer_ar_linear_fn)(void *user, size_t layer,
                                               float *out, size_t count, size_t k,
                                               size_t n);
 
+/*
+ * The same projection for rows that belong to DIFFERENT sequences.
+ *
+ * `in_rows[b]` and `out_rows[b]` are one `[k]` / `[n]` row each and need not be
+ * contiguous with one another, because each row lives in its own request's
+ * scratch.  The contract is stricter than the one above: row `b`'s result MUST
+ * be identical, bit for bit, to what `linear` would have produced for that row
+ * alone with `count == 1`.  Without that a request's audio would depend on
+ * which requests happened to be in flight beside it, which `mynah_tts.h`
+ * promises never happens.  `mynah_qmat_linear_batched` is the implementation
+ * this exists for: it quantizes each activation row on its own, so the batch
+ * width never enters the arithmetic.
+ *
+ * NULL (the default) makes `_step_batch` fall back to `linear` per row, which
+ * is exact but reads the weight once per row.
+ */
+typedef int (*mynah_transformer_ar_linear_rows_fn)(
+    void *user, size_t layer, mynah_transformer_ar_linear_kind kind,
+    const float *weight, const float *bias, const float *const *in_rows,
+    float *const *out_rows, size_t batch, size_t k, size_t n);
+
 typedef struct {
     const mynah_transformer_ar_layer *layers; /* [num_layers] */
     /* Optional final LayerNorm applied to the stack output, at the same eps.
@@ -175,6 +212,9 @@ typedef struct {
     const float *out_norm_bias;
     /* Optional; NULL keeps the built-in f32 matvec. */
     mynah_transformer_ar_linear_fn linear;
+    /* Optional; NULL makes the cross-request batched step fall back to
+     * `linear` per row.  Must be bit-exact per row (see above). */
+    mynah_transformer_ar_linear_rows_fn linear_rows;
     void *linear_user;
 } mynah_transformer_ar_weights;
 
@@ -241,6 +281,13 @@ int mynah_transformer_ar_check_weights(
  *   x    [n_tokens][d_model]  row-major input
  *   out  [n_tokens][d_model]  row-major output, or NULL to discard
  *
+ * The positions are run as tiles of at most `mynah_transformer_ar_prefill_tile()`
+ * rows: every linear projection in a tile is presented to the hook as ONE call
+ * with `count == rows`, so a hook that is weight-stationary reads the weight
+ * once per tile instead of once per position.  With no hook installed the tile
+ * is still computed one row at a time, so the default numerics are unchanged
+ * and prefill stays bit-identical to the same positions run through `_step`.
+ *
  * `n_tokens == 0` is a no-op.  Returns 0, or -1 on a bad argument, an overflow
  * of `max_seq_len`, or a non-finite value reaching the attention.
  */
@@ -253,6 +300,51 @@ int mynah_transformer_ar_prefill(mynah_transformer_ar_state *state,
 int mynah_transformer_ar_step(mynah_transformer_ar_state *state,
                               const mynah_transformer_ar_weights *weights,
                               const float *x, float *out);
+
+/* How many positions one prefill tile covers.  Exposed so an engine can size
+ * the scratch its hook needs for a tile-wide call. */
+size_t mynah_transformer_ar_prefill_tile(void);
+
+/*
+ * Cross-request batching.
+ *
+ * The scratch for one batched step: the stacked residual stream and the stacked
+ * projection outputs for up to `max_rows` requests.  It is NOT per request --
+ * one belongs to the driver, is lent to `_step_batch` for the call, and must
+ * not be shared between threads that step concurrently.  `config` must be the
+ * configuration every state in the batch was built with.
+ */
+typedef struct mynah_transformer_ar_batch mynah_transformer_ar_batch;
+
+mynah_transformer_ar_batch *mynah_transformer_ar_batch_new(
+    const mynah_transformer_ar_config *config, size_t max_rows, char *error,
+    size_t error_capacity);
+void mynah_transformer_ar_batch_free(mynah_transformer_ar_batch *batch);
+size_t mynah_transformer_ar_batch_capacity(
+    const mynah_transformer_ar_batch *batch);
+
+/*
+ * One autoregressive position for each of `count` independent states, with one
+ * pass over the weights instead of `count` passes.
+ *
+ *   states  [count]  distinct states, all built from the same configuration
+ *   x       [count]  one `[d_model]` input row each
+ *   out     [count]  one `[d_model]` output row each; no entry may be NULL
+ *
+ * Each state advances its own offset by one.  Every row is computed exactly as
+ * `_step` would have computed it alone: the states share no buffer, and the
+ * only shared object is the read-only weight set plus `batch`'s scratch.
+ *
+ * `count == 0` is a no-op; `count == 1` is `_step`.  Returns 0, or -1 on a bad
+ * argument, a state whose configuration differs, an overflow of `max_seq_len`,
+ * or a non-finite value reaching the attention.  A failure leaves the batch
+ * unusable: it is a failure of shared code, not of one request's data.
+ */
+int mynah_transformer_ar_step_batch(mynah_transformer_ar_state *const *states,
+                                    size_t count,
+                                    const mynah_transformer_ar_weights *weights,
+                                    mynah_transformer_ar_batch *batch,
+                                    const float *const *x, float *const *out);
 
 /* ---- kernels, exported because they are new and separately testable ---- */
 
@@ -271,8 +363,12 @@ void mynah_transformer_ar_rope_apply_f32(float *values, size_t num_heads,
 
 /* Model-free self test: RoPE, LayerNorm with bias, GELU-tanh, causal attention
  * with and without a `context` window, KV-cache continuity (prefill of N plus
- * one step equals prefill of N+1), and layer_scale NULL against an explicit
- * unit vector.  Returns 0, or -1 with a message in `error`. */
+ * one step equals prefill of N+1), layer_scale NULL against an explicit unit
+ * vector, a prefill that spans more than one tile against the same positions
+ * stepped one at a time, and `_step_batch` of N states against those same N
+ * states stepped alone -- the last two are bit-equality assertions, because the
+ * whole point of both paths is that the row count must not reach the numbers.
+ * Returns 0, or -1 with a message in `error`. */
 int mynah_transformer_ar_self_test(char *error, size_t error_capacity);
 
 #ifdef __cplusplus
