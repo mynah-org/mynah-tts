@@ -83,10 +83,28 @@ Needs E1 and E2.
 - [ ] E3-7 offline parity across all 12 oracle stages, both checkpoint generations
 - [ ] E3-8 streaming sample-identical to offline, then batched through the shared driver
 - [ ] E3-9 WAV smoke for all 6 languages with explicit language/voice/seed
-- [ ] E3-10 *(optional, last)* voice cloning from a wav — needs `mimi.encoder`
+- [ ] E3-10 **voice cloning from a wav — required, not optional** (see E7)
 - [ ] E3-11 one pack = one language; compute `time_embed.*.freqs` at load instead of storing
 - [ ] E3-12 NaN-as-BOS sentinel: reproduce it or track validity explicitly — never let NaN reach a matmul
 - [ ] E3-13 pack refuses a voice KV from a different model/revision (upstream: it then never emits EOS)
+
+### E7 — Voice cloning → [`.work/voice-cloning.md`](.work/voice-cloning.md)
+
+Zero-shot cloning is a product requirement. The weights are already in the pack
+(`mimi.encoder*` + `downsample` + `speaker_proj`, 9.78M params / 19.6 MB BF16).
+
+- [ ] E7-1 SEANet **encoder** in C — mirrors the decoder, reuses its conv kernels
+- [ ] E7-2 encoder transformer (2L d512) — reuses the shared attention
+- [ ] E7-3 `ConvDownsample1d`: stride 16, kernel 32, `pad_mode="replicate"`
+- [ ] E7-4 `speaker_proj` + optional `bos_before_voice`, config-driven — the only
+      place the two checkpoint generations differ
+- [ ] E7-5 prefill the reference latents through the backbone to produce the voice KV
+- [ ] E7-6 WAV/audio input decode; require 24 kHz mono first
+- [ ] E7-7 polyphase resampler to 24 kHz matching `scipy.signal.resample_poly`
+      within tolerance — needed for arbitrary input files
+- [ ] E7-8 truncate reference audio to 30 s, as upstream does
+- [ ] E7-9 `mynah-tts export-voice`: serialize the KV so reload is instant
+- [ ] E7-10 consent gate and notice before cloning — see E6
 
 ### E4 — CPU kernels, ARM and x86 in one step → [`.work/cpu-kernels-arm-x86.md`](.work/cpu-kernels-arm-x86.md)
 

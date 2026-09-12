@@ -77,8 +77,14 @@ the pack stays traceable if a mirror changes or disappears.
 5. `LICENSES/VOICES.md` — the per-voice table.
 6. `NOTICE` — prohibited-use passed through as a notice.
 7. Verify the `embeddings_v3` voice→dataset mapping and fill the table.
-8. Default to a pack **without** `mimi.encoder*` — no cloning path, no gated
-   weights question, ~20 MB smaller.
+8. **The pack ships `mimi.encoder*`** — cloning is a product requirement (E7), so
+   the 19.6 MB stays and the weights must come from the official **gated** Kyutai
+   repo with a token, never from an ungated mirror.
+9. **Consent gate for cloning.** This is the one prohibited-use clause with real
+   teeth: "voice impersonation or cloning without explicit and lawful consent".
+   With E7 shipped it stops being a licence footnote and becomes a product flow —
+   an explicit affirmation before cloning, recorded, plus a notice in the CLI and
+   the API. Design it with E7, not after.
 
 ## Acceptance gate
 

@@ -26,9 +26,10 @@ Decisions taken here:
 - **Store voice KV in F16.** 6.4 MB/voice F32 → 3.2 MB, 83 MB for 26 voices.
   Verify against the oracle that F16 KV does not move the output audibly; if it
   does, keep F32 and say so in this note.
-- **Omit `mimi.encoder*`, `mimi.downsample*`, `speaker_proj_weight` by default**
-  (~20 MB). They are only needed to clone from a new wav. A pack without them is
-  also a pack with no gated-weights question attached.
+- **Ship `mimi.encoder*`, `mimi.downsample*` and `speaker_proj_weight`** (9.78M
+  params, 19.6 MB BF16). Cloning is required — see
+  [voice-cloning.md](voice-cloning.md) — so the source must be the official
+  gated repo, not an ungated mirror.
 - **Target the current schema** (214 tensors, 109.5M). `english_2026-01` is a
   second parity target only.
 - `*_24l` variants are out of scope; they differ only in `num_layers`.
@@ -80,7 +81,7 @@ an engine capability rather than a `#define`.
 2. quantized weights — re-check parity, record the delta
 3. streaming, single request — sample-identical to offline
 4. streaming, batched through the shared slot driver
-5. voice cloning from a wav (needs `mimi.encoder`) — **last, and optional**
+5. voice cloning from a wav — E7, required; last only in ordering
 
 ## Acceptance gate
 
