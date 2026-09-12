@@ -1651,13 +1651,18 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     size_t latent_floats = 0;
     size_t codec_positions = 0;
     size_t up_floats = 0;
-    if (pocket_add(ctx->voice_positions, ctx->text_length, &backbone_capacity) != 0 ||
-        pocket_add(backbone_capacity, max_steps + 1u, &backbone_capacity) != 0 ||
-        pocket_mul(2u * ctx->voice_positions, attn_dim, &voice_floats) != 0 ||
+    size_t pcm_floats = 0;
+    size_t codec_frames = 0;
+    if (pocket_add(max_steps, 1u, &codec_frames) != 0 ||
+        pocket_add(ctx->voice_positions, ctx->text_length, &backbone_capacity) != 0 ||
+        pocket_add(backbone_capacity, codec_frames, &backbone_capacity) != 0 ||
+        pocket_mul(ctx->voice_positions, attn_dim, &voice_floats) != 0 ||
+        pocket_mul(voice_floats, 2u, &voice_floats) != 0 ||
         pocket_mul(ctx->text_length, cfg->hidden_dim, &text_floats) != 0 ||
         pocket_mul(max_steps, cfg->latent_dim, &latent_floats) != 0 ||
-        pocket_mul(max_steps + 1u, cfg->upsample_stride, &codec_positions) != 0 ||
-        pocket_mul(cfg->codec_dim, cfg->upsample_stride, &up_floats) != 0) {
+        pocket_mul(codec_frames, cfg->upsample_stride, &codec_positions) != 0 ||
+        pocket_mul(cfg->codec_dim, cfg->upsample_stride, &up_floats) != 0 ||
+        pocket_mul(cfg->samples_per_frame, cfg->audio_channels, &pcm_floats) != 0) {
         pocket_ctx_free(ctx);
         pocket_error(error, capacity, "pocket: request size overflow");
         return -1;
@@ -1676,8 +1681,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     ctx->codec_seq = mynah_alloc_floats(up_floats, error, capacity);
     ctx->codec_out = mynah_alloc_floats(up_floats, error, capacity);
     ctx->codec_back = mynah_alloc_floats(up_floats, error, capacity);
-    ctx->pcm = mynah_alloc_floats(cfg->samples_per_frame * cfg->audio_channels,
-                                  error, capacity);
+    ctx->pcm = mynah_alloc_floats(pcm_floats, error, capacity);
     if (ctx->voice_kv == NULL || ctx->text_embed == NULL || ctx->step_input == NULL ||
         ctx->hidden == NULL || ctx->noise == NULL || ctx->flow_out == NULL ||
         ctx->latents == NULL || ctx->denorm == NULL || ctx->codec_in == NULL ||

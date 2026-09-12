@@ -24,7 +24,7 @@
  *     decode:  denorm(latent) -> quantizer.output_proj -> upsample x16
  *              -> decoder transformer (16 positions) -> SEANet -> 1920 samples
  *
- * Five facts in that listing are measurements, not guesses, and each one is a
+ * Six facts in that listing are measurements, not guesses, and each one is a
  * place a from-scratch implementation goes quietly wrong:
  *
  *  1. **The prefill's own head output is discarded.**  Verified against the
@@ -79,6 +79,11 @@
  *   - `max_tokens_per_chunk` from the manifest is **not** applied yet.  Long
  *     inputs are prefilled in one go, where upstream would split them; see
  *     .work/pocket-tts-model-facts.md section 8.
+ *   - Upstream's `prepare_text_prompt` runs before tokenization: it upcases
+ *     the first letter, appends terminal punctuation, and pads inputs under
+ *     five words with eight spaces.  The seam hands this engine token ids, so
+ *     that belongs to whoever holds the text, and skipping it changes what the
+ *     model is asked to say - the same place `frames_after_eos` comes from.
  *   - Voice cloning from a wav is not implemented.  `speaker_proj_weight`,
  *     `bos_before_voice` and `insert_bos_before_voice` are read and validated
  *     so the version difference is visible, but a predefined voice needs none

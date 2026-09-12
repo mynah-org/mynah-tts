@@ -270,21 +270,11 @@ static int synthesize(int argc, char **argv) {
         fprintf(stderr, "invalid token list\n");
         return 2;
     }
-    if (raw_text != NULL) {
-        char tok_err[256];
-        mynah_tokenizer *tok = mynah_tokenizer_open(model_dir, tok_err, sizeof(tok_err));
-        if (tok == NULL) {
-            fprintf(stderr, "tokenizer error: %s\n", tok_err);
-            return 2;
-        }
-        if (mynah_tokenizer_encode(tok, lang, raw_text, &tokens, &token_count,
-                                   tok_err, sizeof(tok_err)) != 0) {
-            fprintf(stderr, "tokenization error: %s\n", tok_err);
-            mynah_tokenizer_close(tok);
-            return 2;
-        }
-        mynah_tokenizer_close(tok);
-    }
+    /* Raw text is tokenized after the model is open, because which tokenizer
+     * applies is a property of the engine: Magpie has per-language G2P and
+     * character vocabularies under tokenizer/, PocketTTS a single SentencePiece
+     * Unigram model per pack. --tokens and --normalized stay before, since they
+     * bypass the tokenizer by definition. */
     mynah_tts_model *model = NULL;
     char error[256];
     const double load_start = now_seconds();
@@ -296,6 +286,43 @@ static int synthesize(int argc, char **argv) {
     const double load_seconds = now_seconds() - load_start;
     mynah_tts_model_info info;
     mynah_tts_model_get_info(model, &info);
+    if (raw_text != NULL) {
+        char tok_err[256];
+        if (strcmp(info.engine, "pocket") == 0) {
+            char sp_path[4096];
+            const int n = snprintf(sp_path, sizeof(sp_path), "%s/tokenizer.model", model_dir);
+            mynah_sp *sp = NULL;
+            if (n <= 0 || (size_t)n >= sizeof(sp_path) ||
+                mynah_sp_open(sp_path, &sp, tok_err, sizeof(tok_err)) != 0) {
+                fprintf(stderr, "tokenizer error: %s\n", tok_err);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            if (mynah_sp_encode(sp, raw_text, strlen(raw_text), &tokens, &token_count,
+                                tok_err, sizeof(tok_err)) != 0) {
+                fprintf(stderr, "tokenization error: %s\n", tok_err);
+                mynah_sp_close(sp);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            mynah_sp_close(sp);
+        } else {
+            mynah_tokenizer *tok = mynah_tokenizer_open(model_dir, tok_err, sizeof(tok_err));
+            if (tok == NULL) {
+                fprintf(stderr, "tokenizer error: %s\n", tok_err);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            if (mynah_tokenizer_encode(tok, lang, raw_text, &tokens, &token_count,
+                                       tok_err, sizeof(tok_err)) != 0) {
+                fprintf(stderr, "tokenization error: %s\n", tok_err);
+                mynah_tokenizer_close(tok);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            mynah_tokenizer_close(tok);
+        }
+    }
     if (normalized_text != NULL) {
         int *next = (int *)realloc(tokens, (token_count + 1u) * sizeof(*tokens));
         if (next == NULL) {

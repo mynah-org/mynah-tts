@@ -718,9 +718,3 @@ static const mynah_tts_engine magpie_engine = {
 const mynah_tts_engine *mynah_engine_magpie(void) {
     return &magpie_engine;
 }
-
-const mynah_tts_engine *mynah_engine_lookup(const char *name) {
-    if (name == NULL) return NULL;
-    if (strcmp(name, magpie_engine.name) == 0) return &magpie_engine;
-    return NULL;
-}
