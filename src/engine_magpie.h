@@ -22,6 +22,7 @@
 #include "kernels.h"
 #include "mynah_tts_internal.h"
 #include "mynah_util.h"
+#include "tts_engine.h"
 #include "weights.h"
 
 /* Upper bound on requests stepped together. Slots are cheap in state but each
@@ -239,5 +240,11 @@ int  magpie_sample_local_frame_batch(const mynah_tts_model *model,
                                      local_batch_item *items, size_t count,
                                      const batch_scratch *scratch,
                                      char *error, size_t error_capacity);
+
+/* ---- the engine seam ----
+ * The vtable that wraps the graph above into the per-request contract in
+ * tts_engine.h.  Implemented in engine_magpie_ctx.c so this file keeps only
+ * the graph. */
+const mynah_tts_engine *mynah_engine_magpie(void);
 
 #endif
