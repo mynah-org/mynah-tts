@@ -256,6 +256,7 @@ void mynah_threads_dispatch_probes(void);   /* src/threads.c */
 void mynah_conv1d_dispatch_probes(void);    /* src/conv1d.c  */
 void mynah_codec_dispatch_probes(void);     /* src/codec_nanocodec.c */
 void mynah_seanet_dispatch_probes(void);    /* src/seanet.c  */
+void mynah_sgemm_dispatch_probes(void);     /* src/sgemm.c   */
 
 /* ------------------------------------------------------------------------
  * Report

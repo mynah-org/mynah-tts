@@ -307,6 +307,7 @@ static void register_module_probes(void) {
     mynah_conv1d_dispatch_probes();
     mynah_codec_dispatch_probes();
     mynah_seanet_dispatch_probes();
+    mynah_sgemm_dispatch_probes();
 }
 
 /* ======================================================================
@@ -568,6 +569,30 @@ static void collect_blas(row_sink *s) {
 
     add_unknown(s, "blas.threads_owned", "-", "-", "OPENBLAS_NUM_THREADS",
                 "[UNKNOWN] src/threads.c did not register mynah_blas_owned()");
+
+    /* E4-16, .work/no-blas.md.  One BLAS function was ever used --
+     * cblas_sgemm, three call sites -- and src/sgemm.c replaces it.  These
+     * four rows are declared UNKNOWN and then overridden by the predicates
+     * src/backend.c and src/sgemm.c register, so if either file stops
+     * registering they read UNKNOWN again instead of reverting to a
+     * compile-time guess.
+     *
+     * `compiled` is "yes" unconditionally and that is not sloppiness:
+     * src/sgemm.c is in CORE_SOURCES for every build, including the
+     * Accelerate and OpenBLAS comparison builds where it is self-tested but
+     * not wired in.  sgemm.provider is the row that says which one runs. */
+    add_unknown(s, "sgemm.provider", "yes", "-", NULL,
+                "[UNKNOWN] src/backend.c did not register "
+                "backend_sgemm_provider(). This is the row that says whether "
+                "an external BLAS is in this process at all");
+    add_unknown(s, "sgemm.kernel", "yes", "-", NULL,
+                "[UNKNOWN] src/sgemm.c did not register "
+                "mynah_sgemm_isa_name()");
+    add_unknown(s, "sgemm.family", "yes", "-", NULL,
+                "[UNKNOWN] src/sgemm.c did not register its family counters");
+    add_unknown(s, "sgemm.selftest", "yes", "-", NULL,
+                "[UNKNOWN] src/sgemm.c did not register "
+                "mynah_sgemm_self_test()");
 }
 
 static void collect_pool(row_sink *s) {

@@ -186,7 +186,8 @@ int mynah_backend_dev_alloc(const mynah_backend *backend, size_t n,
 void mynah_backend_dev_free(const mynah_backend *backend, float *dev_ptr);
 
 /* Which CPU matmul path a shape takes: "parallel" (output rows split over the
- * pool), "simd" (serial in-tree matvec) or "blas" (SGEMM / the scalar loop).
+ * pool), "simd" (serial in-tree matvec) or "sgemm" (one sgemm call -- whose
+ * provider is a separate question, answered by the sgemm.provider row).
  * `why` (optional) receives a static string naming the clause that decided.
  * Exported so the dispatch report can call the real policy -- a rows=1
  * projection that stops taking the matvec path is otherwise silent. */

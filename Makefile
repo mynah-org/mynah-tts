@@ -45,6 +45,29 @@ SIMD_NAME := avx2/fma
 endif
 endif
 
+# BLAS selection. Four values, and only the first one links nothing:
+#
+#   none      our own f32 GEMM (src/sgemm.c) at every call site. NO external
+#             BLAS in the process, which is the whole point: OpenBLAS brings
+#             its own thread pool with its own policies and every one of them
+#             is a trap to recheck on every host forever (.work/no-blas.md).
+#   openblas  Linux vendor BLAS -- a COMPARISON build, kept so the A/B is
+#             always available.
+#   auto      the current default: Accelerate on macOS, OpenBLAS on Linux when
+#             cblas.h is present, scalar otherwise. Also a comparison build.
+#   scalar    no GEMM at all: the naive triple loop and the SEANet scalar conv
+#             reference. The correctness oracle, never the performance target.
+#
+# The default is deliberately NOT `none` yet. Landing the kernel and flipping
+# the default are two decisions, and the second needs an RTF measurement on
+# Linux ARM and x86 that cannot be taken on a development Mac.
+ifeq ($(BLAS),none)
+CPPFLAGS += -DMYNAH_USE_OWN_SGEMM
+BLAS_NAME := none/mynah-sgemm
+ifneq ($(UNAME_S),Darwin)
+CPPFLAGS += -D_DEFAULT_SOURCE
+endif
+else
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(BLAS),scalar)
 BLAS_NAME := scalar
@@ -73,6 +96,7 @@ BLAS_NAME := scalar
 endif
 endif
 endif
+endif
 
 # ingot: the GGUF/safetensors reader, vendored as a subtree. Built by its own
 # Makefile so this one never learns how it is compiled.
@@ -85,7 +109,7 @@ LDLIBS += $(INGOT_LIB)
 # with; without these it honestly says "unset" rather than guessing.
 CPPFLAGS += -DMYNAH_SIMD_PROFILE='"$(SIMD)"' -DMYNAH_GIT_REV='"$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)"'
 
-CORE_SOURCES := src/mynah_tts.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
@@ -410,18 +434,26 @@ gpu-selftest:
 leaks:
 ifeq ($(UNAME_S),Darwin)
 	@command -v leaks >/dev/null 2>&1 || (echo "macOS leaks tool is unavailable" >&2; exit 2)
-	@$(MAKE) BUILD_DIR=build/leaks-native CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g' build/leaks-native/mynah-tts
-	@leaks --atExit -- build/leaks-native/mynah-tts --self-test
+	@$(MAKE) BUILD_DIR=$(SAN_DIR)/leaks-native CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g' $(SAN_DIR)/leaks-native/mynah-tts
+	@leaks --atExit -- $(SAN_DIR)/leaks-native/mynah-tts --self-test
 else
 	@echo "make leaks is macOS-only; use make asan on Linux" >&2
 	@exit 2
 endif
 
+# The sanitizer build directory carries the BLAS name.  It did not, and that
+# was a FALSE GATE: `make ubsan` and `make ubsan BLAS=none` wrote the same
+# build/ubsan, make found the objects up to date, nothing recompiled, and the
+# second run re-tested the first one's binary -- Accelerate still linked, with
+# a green "PASSED" on top. Discovered while qualifying E4-16, on the first run
+# that needed the two configurations to differ.
+SAN_DIR := build/san-$(subst /,-,$(BLAS_NAME))
+
 ubsan:
-	@$(MAKE) BUILD_DIR=build/ubsan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=undefined' LDFLAGS='-fsanitize=undefined' test
+	@$(MAKE) BUILD_DIR=$(SAN_DIR)/ubsan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=undefined' LDFLAGS='-fsanitize=undefined' test
 
 asan:
-	@$(MAKE) BUILD_DIR=build/asan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address' LDFLAGS='-fsanitize=address' test
+	@$(MAKE) BUILD_DIR=$(SAN_DIR)/asan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address' LDFLAGS='-fsanitize=address' test
 
 install: $(TARGET) $(LIBRARY)
 	@test -n "$(PREFIX)" || (echo "usage: make install PREFIX=/path" >&2; exit 2)

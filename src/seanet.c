@@ -16,7 +16,14 @@
 
 #include "dispatch.h"
 #include "kernels.h"
+#include "sgemm.h"
 
+/* Which GEMM the two fast paths below call.  MYNAH_SEANET_BLAS says "a GEMM
+ * exists", not "a vendor BLAS exists": with BLAS=none that GEMM is our own
+ * (src/sgemm.c) and the fast paths are compiled exactly as before.  These two
+ * call sites are the ENTIRE BLAS dependency of the PocketTTS production path
+ * -- the backbone and the flow head already run our quantized kernels
+ * (.work/no-blas.md §1). */
 #if defined(MYNAH_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 #define MYNAH_SEANET_BLAS 1
@@ -25,6 +32,10 @@
 #include <cblas.h>
 #define MYNAH_SEANET_BLAS 1
 #define MYNAH_SEANET_BLAS_NAME "OpenBLAS"
+#elif defined(MYNAH_USE_OWN_SGEMM)
+#define MYNAH_SEANET_BLAS 1
+#define MYNAH_SEANET_OWN_SGEMM 1
+#define MYNAH_SEANET_BLAS_NAME "mynah-sgemm"
 #else
 #define MYNAH_SEANET_BLAS_NAME "none"
 #endif
@@ -129,17 +140,30 @@ static int sea_gemm_enabled(void) {
  * through. */
 static int sea_dims_fit(size_t m, size_t n, size_t k, size_t lda, size_t ldb,
                         size_t ldc) {
+#if defined(MYNAH_SEANET_OWN_SGEMM)
+    /* mynah_sgemm_f32 takes size_t, so there is nothing to narrow.  The check
+     * stays in the dispatch chain (and keeps its counter) so that the report
+     * reads the same on every build instead of a row quietly disappearing. */
+    (void)m; (void)n; (void)k; (void)lda; (void)ldb; (void)ldc;
+    return 1;
+#else
     return m <= (size_t)INT_MAX && n <= (size_t)INT_MAX &&
            k <= (size_t)INT_MAX && lda <= (size_t)INT_MAX &&
            ldb <= (size_t)INT_MAX && ldc <= (size_t)INT_MAX;
+#endif
 }
 
 static void sea_sgemm(int trans_a, size_t m, size_t n, size_t k,
                       const float *a, size_t lda, const float *b, size_t ldb,
                       float beta, float *c, size_t ldc) {
+#if defined(MYNAH_SEANET_OWN_SGEMM)
+    (void)mynah_sgemm_f32(trans_a, 0, m, n, k, 1.0f, a, lda, b, ldb, beta, c,
+                          ldc);
+#else
     cblas_sgemm(CblasRowMajor, trans_a ? CblasTrans : CblasNoTrans, CblasNoTrans,
                 (int)m, (int)n, (int)k, 1.0f, a, (int)lda, b, (int)ldb, beta, c,
                 (int)ldc);
+#endif
 }
 #endif
 
@@ -2347,16 +2371,31 @@ int mynah_seanet_gemm_enabled(void) { return sea_gemm_enabled(); }
  * the fast paths exist at all.  A value row, not a boolean: "none" and
  * "OpenBLAS" are different facts and ON/OFF would erase the difference. */
 static int probe_seanet_blas(char *out, size_t capacity, const char **why) {
-    snprintf(out, capacity, "%s", MYNAH_SEANET_BLAS_NAME);
 #if defined(MYNAH_SEANET_BLAS)
-    *why = "[predicate] src/seanet.c mynah_seanet_blas_name(): sea_sgemm is "
-           "compiled, so conv1d and convtranspose can fold to one GEMM per "
-           "kernel tap. This is the 36x path (8570 ms -> 237 ms)";
+    static char text[240];
+#endif
+    snprintf(out, capacity, "%s", MYNAH_SEANET_BLAS_NAME);
+#if defined(MYNAH_SEANET_OWN_SGEMM)
+    snprintf(text, sizeof text,
+             "[predicate] src/seanet.c mynah_seanet_blas_name(): sea_sgemm is "
+             "mynah_sgemm_f32 (%s kernels, our pool). NO external BLAS is in "
+             "this process, and the two call sites here were its entire "
+             "PocketTTS surface. The GEMM fold is still the 36x path",
+             mynah_sgemm_isa_name());
+    *why = text;
+#elif defined(MYNAH_SEANET_BLAS)
+    snprintf(text, sizeof text,
+             "[predicate] src/seanet.c mynah_seanet_blas_name(): sea_sgemm is "
+             "%s, so conv1d and convtranspose fold to one GEMM per kernel tap. "
+             "This is the 36x path (8570 ms -> 237 ms). A COMPARISON build: "
+             "BLAS=none swaps in mynah_sgemm_f32",
+             MYNAH_SEANET_BLAS_NAME);
+    *why = text;
 #else
-    *why = "[predicate] src/seanet.c mynah_seanet_blas_name(): NO BLAS here, so "
-           "BOTH SEANet GEMM fast paths are compiled out and the whole codec "
-           "conv stack runs the scalar loops -- 8570 ms vs 237 ms, 36x. "
-           "Rebuild with BLAS=auto or BLAS=openblas";
+    *why = "[predicate] src/seanet.c mynah_seanet_blas_name(): NO GEMM here, so "
+           "BOTH SEANet fast paths are compiled out and the whole codec conv "
+           "stack runs the scalar loops -- 8570 ms vs 237 ms, 36x. Rebuild "
+           "with BLAS=none (ours), BLAS=auto or BLAS=openblas";
 #endif
     return 0;
 }

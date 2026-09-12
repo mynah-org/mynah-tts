@@ -2,6 +2,7 @@
 
 #include "dispatch.h"
 #include "kernels.h"
+#include "sgemm.h"
 #include "threads.h"
 
 #include <errno.h>
@@ -149,7 +150,94 @@ static int metal_cpu_path_enabled(const char *cpu_name, const char *gpu_name,
     return default_cpu;
 }
 
+/* ------------------------------------------------------------------ sgemm
+ *
+ * WHICH SGEMM SERVES THIS BUILD, decided once.  Every caller below switches on
+ * this function rather than repeating the #if chain, and so does the dispatch
+ * probe — a report that restates the condition can agree with the source and
+ * both be wrong (dispatch.h, the central rule).  The switch is over a value
+ * the compiler constant-folds, so this costs nothing at run time.
+ *
+ * `mynah` is BLAS=none: src/sgemm.c, our own kernels on our own pool.
+ * `reference` is BLAS=scalar: the naive triple loop, which is the correctness
+ * oracle and explicitly never the performance target (.work/no-blas.md §2). */
+typedef enum {
+    SGEMM_PROVIDER_ACCELERATE = 0,
+    SGEMM_PROVIDER_OPENBLAS   = 1,
+    SGEMM_PROVIDER_MYNAH      = 2,
+    SGEMM_PROVIDER_REFERENCE  = 3
+} sgemm_provider;
+
+static sgemm_provider backend_sgemm_provider(void) {
+#if defined(MYNAH_USE_ACCELERATE)
+    return SGEMM_PROVIDER_ACCELERATE;
+#elif defined(MYNAH_USE_OPENBLAS)
+    return SGEMM_PROVIDER_OPENBLAS;
+#elif defined(MYNAH_USE_OWN_SGEMM)
+    return SGEMM_PROVIDER_MYNAH;
+#else
+    return SGEMM_PROVIDER_REFERENCE;
+#endif
+}
+
+static const char *backend_sgemm_provider_name(void) {
+    switch (backend_sgemm_provider()) {
+    case SGEMM_PROVIDER_ACCELERATE: return "Accelerate";
+    case SGEMM_PROVIDER_OPENBLAS:   return "OpenBLAS";
+    case SGEMM_PROVIDER_MYNAH:      return "mynah";
+    default:                        return "reference";
+    }
+}
+
+/* C[m,n] = alpha * op(A) * op(B) + beta * C, row-major.  The one place in this
+ * file that knows how to multiply two f32 matrices.
+ *
+ * cblas_sgemm takes every dimension as an `int`; ours take size_t.  A shape
+ * that does not fit an int therefore falls through to the reference rather
+ * than being silently truncated. */
+static void backend_sgemm_call(int trans_a, int trans_b,
+                               size_t m, size_t n, size_t k,
+                               float alpha,
+                               const float *a, size_t lda,
+                               const float *b, size_t ldb,
+                               float beta,
+                               float *c, size_t ldc) {
+    switch (backend_sgemm_provider()) {
 #if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
+    case SGEMM_PROVIDER_ACCELERATE:
+    case SGEMM_PROVIDER_OPENBLAS:
+        if (m <= (size_t)INT_MAX && n <= (size_t)INT_MAX &&
+            k <= (size_t)INT_MAX && lda <= (size_t)INT_MAX &&
+            ldb <= (size_t)INT_MAX && ldc <= (size_t)INT_MAX) {
+#if defined(MYNAH_USE_OPENBLAS)
+            /* This path bypasses the pthread pool. Keep direct calls aligned
+             * with MYNAH_THREADS instead of OpenBLAS' process-wide default
+             * team.  Compensation for a thread pool we do not own; it goes
+             * away with the default flip, not with this kernel. */
+            mynah_blas_set_threads(mynah_num_threads());
+#endif
+            cblas_sgemm(CblasRowMajor,
+                        trans_a ? CblasTrans : CblasNoTrans,
+                        trans_b ? CblasTrans : CblasNoTrans,
+                        (int)m, (int)n, (int)k,
+                        alpha, a, (int)lda, b, (int)ldb,
+                        beta, c, (int)ldc);
+            return;
+        }
+        break;
+#endif
+    case SGEMM_PROVIDER_MYNAH:
+        if (mynah_sgemm_f32(trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb,
+                            beta, c, ldc) == 0)
+            return;
+        break;
+    default:
+        break;
+    }
+    mynah_sgemm_f32_reference(trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb,
+                              beta, c, ldc);
+}
+
 /* out[rows, output_width] = input[rows, input_width] @ weight[output_width,
  * input_width]^T (+ bias).  A multi-row call (prefill/encoder) is split across
  * worker threads over disjoint row blocks — each block is one sgemm, so the
@@ -174,11 +262,10 @@ static void matmul_block(void *ctx, int b) {
     size_t r1 = r0 + per;
     if (r1 > j->rows) r1 = j->rows;
     const size_t m = r1 - r0;
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                (int)m, (int)j->output_width, (int)j->input_width,
-                1.0f, j->input + r0 * j->input_width, (int)j->input_width,
-                j->weight, (int)j->input_width,
-                0.0f, j->output + r0 * j->output_width, (int)j->output_width);
+    backend_sgemm_call(0, 1, m, j->output_width, j->input_width,
+                       1.0f, j->input + r0 * j->input_width, j->input_width,
+                       j->weight, j->input_width,
+                       0.0f, j->output + r0 * j->output_width, j->output_width);
     if (j->bias != NULL) {
         for (size_t row = r0; row < r1; ++row) {
             for (size_t column = 0; column < j->output_width; ++column) {
@@ -187,7 +274,6 @@ static void matmul_block(void *ctx, int b) {
         }
     }
 }
-#endif
 
 typedef struct {
     const float *input;
@@ -264,15 +350,22 @@ const char *mynah_cpu_matvec_mode(size_t rows, size_t input_width,
         return "simd";
     }
     if (why != NULL) {
+        /* Not "BLAS sgemm" any more: on a BLAS=none build there is no BLAS in
+         * the process and this path is mynah_sgemm_f32. The row that names it
+         * is sgemm.provider -- this one only says which of the three CPU
+         * matmul shapes fired. */
         *why = rows == 1u
-                 ? "rows=1 but the matvec path was not selected -- BLAS sgemm"
-                 : "rows>1: BLAS sgemm, the prefill path";
+                 ? "rows=1 but the matvec path was not selected -- one sgemm, "
+                   "provider in sgemm.provider"
+                 : "rows>1: one sgemm per row block, the prefill path -- "
+                   "provider in sgemm.provider";
     }
 #else
     (void)rows; (void)input_width; (void)output_width;
-    if (why != NULL) *why = "no SIMD matvec compiled: BLAS sgemm or the scalar loop";
+    if (why != NULL)
+        *why = "no SIMD matvec compiled: one sgemm, provider in sgemm.provider";
 #endif
-    return "blas";
+    return "sgemm";
 }
 
 static int cpu_matmul(void *state, const float *input, float *output, size_t rows,
@@ -300,25 +393,28 @@ static int cpu_matmul(void *state, const float *input, float *output, size_t row
         }
     }
 #endif
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
-    if (rows <= (size_t)INT_MAX && input_width <= (size_t)INT_MAX &&
-        output_width <= (size_t)INT_MAX) {
+    /* BLAS=scalar keeps the in-tree SIMD matvec loop below: it is faster than
+     * the sgemm reference and it is the build whose whole purpose is to be the
+     * simple oracle.  Every other provider -- Accelerate, OpenBLAS, and our own
+     * kernel -- goes through one sgemm per row block. */
+    if (backend_sgemm_provider() != SGEMM_PROVIDER_REFERENCE) {
         int blocks = 1;
-#if defined(MYNAH_USE_OPENBLAS)
-        /* Accelerate (macOS) threads sgemm internally, so splitting there only
+        /* Accelerate (macOS) threads sgemm internally and mynah_sgemm_f32
+         * splits itself over the same pool, so splitting again there only
          * oversubscribes; on OpenBLAS we drive the parallelism ourselves (the
          * pool forces BLAS to one thread per block).  Thread only matmuls big
          * enough to amortize dispatch. */
-        const int threads = mynah_num_threads();
-        if (threads > 1 && rows >= 8u && input_width * output_width >= 65536u) {
-            blocks = (int)rows < threads ? (int)rows : threads;
+        if (backend_sgemm_provider() == SGEMM_PROVIDER_OPENBLAS) {
+            const int threads = mynah_num_threads();
+            if (threads > 1 && rows >= 8u && rows <= (size_t)INT_MAX &&
+                input_width * output_width >= 65536u) {
+                blocks = (int)rows < threads ? (int)rows : threads;
+            }
         }
-#endif
         matmul_job job = {input, output, weight, bias, rows, input_width, output_width, blocks};
         mynah_parallel_for(blocks, matmul_block, &job);
         return 0;
     }
-#endif
     for (size_t row = 0; row < rows; ++row) {
         const float *input_row = input + row * input_width;
         float *output_row = output + row * output_width;
@@ -349,12 +445,27 @@ static int cpu_self_test(void *state, char *error, size_t error_capacity) {
             return -1;
         }
     }
+    /* The f32 GEMM is part of this backend whichever provider serves it, and
+     * src/sgemm.c is compiled into EVERY build -- including the Accelerate and
+     * OpenBLAS comparison builds, where it is not wired in.  Testing it
+     * unconditionally is the point: a kernel that is only exercised on the
+     * build that uses it is a kernel nobody develops on. */
+    if (mynah_sgemm_self_test(error, error_capacity) != 0) return -1;
     return 0;
 }
 
 /* Generic sgemm: C[m,n] = alpha * op(A) * op(B) + beta * C  (row-major).
- * On BLAS builds this delegates to cblas_sgemm; otherwise a scalar
- * triple loop. */
+ *
+ * This used to carry its own i,j,p triple loop as the no-BLAS fallback.  That
+ * loop was a correctness reference wearing an implementation's clothes, and it
+ * was the only reason "no BLAS" meant "unusable" rather than "slightly
+ * slower" (.work/no-blas.md §2).  It now lives in src/sgemm.c as
+ * mynah_sgemm_f32_reference() -- one definition instead of two -- and
+ * BLAS=none reaches the real kernel instead.
+ *
+ * Its old beta handling was also wrong: it read C unconditionally, where
+ * cblas guarantees beta == 0 overwrites without reading.  The reference now
+ * honours that. */
 static int cpu_sgemm(void *state, int trans_a, int trans_b,
                      size_t m, size_t n, size_t k,
                      float alpha,
@@ -366,35 +477,8 @@ static int cpu_sgemm(void *state, int trans_a, int trans_b,
     (void)state;
     (void)error;
     (void)error_capacity;
-#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS)
-    if (m <= (size_t)INT_MAX && n <= (size_t)INT_MAX && k <= (size_t)INT_MAX &&
-        lda <= (size_t)INT_MAX && ldb <= (size_t)INT_MAX && ldc <= (size_t)INT_MAX) {
-#if defined(MYNAH_USE_OPENBLAS)
-        /* Codec SGEMM bypasses the pthread pool. Keep direct calls aligned
-         * with MYNAH_THREADS instead of OpenBLAS' process-wide default team. */
-        mynah_blas_set_threads(mynah_num_threads());
-#endif
-        cblas_sgemm(CblasRowMajor,
-                    trans_a ? CblasTrans : CblasNoTrans,
-                    trans_b ? CblasTrans : CblasNoTrans,
-                    (int)m, (int)n, (int)k,
-                    alpha, a, (int)lda, b, (int)ldb,
-                    beta, c, (int)ldc);
-        return 0;
-    }
-#endif
-    /* Scalar fallback. */
-    for (size_t i = 0; i < m; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            float sum = 0.0f;
-            for (size_t p = 0; p < k; ++p) {
-                const float a_val = trans_a ? a[p * lda + i] : a[i * lda + p];
-                const float b_val = trans_b ? b[j * ldb + p] : b[p * ldb + j];
-                sum += a_val * b_val;
-            }
-            c[i * ldc + j] = alpha * sum + beta * c[i * ldc + j];
-        }
-    }
+    backend_sgemm_call(trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb, beta,
+                       c, ldc);
     return 0;
 }
 
@@ -1014,6 +1098,44 @@ static int probe_matvec_policy(char *out, size_t capacity, const char **why) {
     return 0;
 }
 
+/* sgemm.provider -- which f32 GEMM the backend vtable and the row-blocked
+ * prefill matmul actually call.  A value row, not a boolean: "Accelerate",
+ * "OpenBLAS", "mynah" and "reference" are four different facts and ON/OFF
+ * would erase the difference.  `resolved` comes from calling the same
+ * function the callers switch on, never from re-deriving the #if chain. */
+static int probe_sgemm_provider(char *out, size_t capacity, const char **why) {
+    static char text[240];
+    snprintf(out, capacity, "%s", backend_sgemm_provider_name());
+    switch (backend_sgemm_provider()) {
+    case SGEMM_PROVIDER_ACCELERATE:
+    case SGEMM_PROVIDER_OPENBLAS:
+        snprintf(text, sizeof text,
+                 "[predicate] src/backend.c backend_sgemm_provider(): the "
+                 "vendor BLAS serves cpu_sgemm and matmul_block. This is a "
+                 "COMPARISON build -- src/sgemm.c is compiled and self-tested "
+                 "but not wired in. Build BLAS=none to use ours");
+        break;
+    case SGEMM_PROVIDER_MYNAH:
+        snprintf(text, sizeof text,
+                 "[predicate] src/backend.c backend_sgemm_provider(): "
+                 "mynah_sgemm_f32 (src/sgemm.c, %s kernels) serves cpu_sgemm "
+                 "and matmul_block. No external BLAS is linked into this "
+                 "process",
+                 mynah_sgemm_isa_name());
+        break;
+    default:
+        snprintf(text, sizeof text,
+                 "[predicate] src/backend.c backend_sgemm_provider(): "
+                 "BLAS=scalar. cpu_sgemm runs the naive triple loop, which is "
+                 "the correctness oracle and NEVER the performance target. "
+                 "Build BLAS=none for the real kernel");
+        break;
+    }
+    if (why != NULL) *why = text;
+    return 0;
+}
+
 void mynah_backend_dispatch_probes(void) {
     mynah_dispatch_register_value_probe("cpu.matvec_policy", probe_matvec_policy);
+    mynah_dispatch_register_value_probe("sgemm.provider", probe_sgemm_provider);
 }
