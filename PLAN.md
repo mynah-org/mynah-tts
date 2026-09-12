@@ -290,7 +290,17 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       the whole process for 66.5 s, now 4.81 s; leaks/ASan/UBSan/TSan clean
 - [ ] E5-4 cancel on disconnect (`POLLRDHUP`), slot freed within one frame
 - [ ] E5-5 long-form: incremental push into a running decode, persistent conv state across flushes
-- [ ] E5-6 prefork pinned on Linux (`SCM_RIGHTS`, CoW after weight load) — needs E4-4
+- [x] E5-6 **prefork done** (`85d6380`): `server/prefork.{c,h}`, parent opens the pack
+      then forks W workers and hands each accepted fd to the least-loaded one over
+      `SCM_RIGHTS`. Only `sched_setaffinity` and the sysfs read are Linux-only, so the
+      topology runs unpinned on macOS and says so. `MYNAH_THREADS` is fixed **before**
+      the model opens — the pool caches its width, so a `setenv` in the child would have
+      been a silent no-op that reads as "prefork does not help". 15/15 server tests in
+      prefork mode. **Not verified: real `sched_setaffinity`, a real `/sys` read, any
+      many-core number** — E5-23
+- [ ] E5-23 **verify prefork on real Linux hardware**: `sched_setaffinity` against the
+      kernel, `/sys/devices/system/cpu` topology, and the four-step W/T procedure that
+      `--prefork-plan` already prints. Nothing about capacity is claimed until this runs
 - [x] E5-7 serving profile **done and baselined** (C1 GOOD, C2/C4 MARGINAL — TTFA p95
       110/1847/5596 ms while RTF stays 0.30-0.35; that is the mutex): `tools/serving_profile.py` + `tests/playback_sim.py` —
       C1/C2/C4/C8 with **TTFB, TTFA, STREAM_RTF, prebuffer, stall rate, max gap**,
