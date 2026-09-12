@@ -42,7 +42,13 @@ if curl -sf --max-time 2 "$BASE/health" > /dev/null 2>&1; then
     fail "something is already serving on port $PORT; stop it first (each server holds ~2 GB)"
 fi
 
-"$SERVER" -m "$MODEL_DIR" -p "$PORT" > "$TMP/server.log" 2>&1 &
+# SERVER_ARGS lets the same 15 checks run against a different serving topology
+# without a second copy of the script. The prefork gate is exactly this file
+# with SERVER_ARGS="--prefork 2": every route, the parity check and the
+# concurrency checks must behave identically whether one process serves them or
+# a router hands each connection to a worker. A separate script would drift.
+# shellcheck disable=SC2086
+"$SERVER" -m "$MODEL_DIR" -p "$PORT" ${SERVER_ARGS:-} > "$TMP/server.log" 2>&1 &
 PID=$!
 
 # Wait for readiness rather than sleeping a guessed amount.

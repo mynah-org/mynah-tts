@@ -105,6 +105,95 @@
  * in the parent: the codec's BNNS filter cache is keyed by `pthread_t` and is
  * never pruned, so filters built by the parent's pool threads would be dead
  * entries inherited by every child and freed only at model close.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ADMISSION LADDER -- four refusal points, outermost first.
+ * ---------------------------------------------------------------------------
+ *
+ * The shape is copied from a reference implementation that measured each rung,
+ * so what follows is the mechanism and not a variation on it. The ordering is
+ * the design: each rung refuses a strictly cheaper class of request than the
+ * one below it, and every rung refuses with its OWN reason and its OWN counter.
+ * "The server was full" and "you waited too long" are different events, they
+ * call for different client behaviour, and a stats line that merges them tells
+ * an operator nothing.
+ *
+ *   1. PARENT SLOT CAP. Pick the least-loaded worker with active[w] < cap.
+ *      If none has room the request falls to rung 2, and if that is full too
+ *      it is refused immediately -- `server_at_capacity`.
+ *
+ *      THE CRITICAL DETAIL, and the one that cost the reference a whole
+ *      measurement campaign: the parent KEEPS POLLING THE LISTENING SOCKET
+ *      while every worker is full. The obvious optimisation -- stop watching
+ *      the listener until a slot frees, and let the kernel backlog hold the
+ *      connection -- is wrong, and wrong in a way no metric can see. A client
+ *      parked in the backlog has not been accepted, so it has no queue entry,
+ *      no deadline, and no timestamp: it is invisible to every counter in this
+ *      file and to the child's queue deadline alike. The reference measured
+ *      TTFB/TTFA p95 of 4470/4635 ms with OVER 97% OF THE TAIL LANDING BEFORE
+ *      accept(). After the fix the same load gave eight accepted streams at
+ *      TTFA 423/562 ms plus two immediate 503s.
+ *
+ *      A WAIT YOU CANNOT SEE IS WORSE THAN A REFUSAL YOU CAN. That sentence is
+ *      the whole reason this rung exists, and it is why the poll set below
+ *      always contains cfg->listen_fd -- never conditionally.
+ *
+ *   2. BOUNDED QUEUE. A request that finds every slot busy is parked in the
+ *      parent's admission queue rather than refused outright, because slots
+ *      free on a frame boundary and a request refused a millisecond early is
+ *      a refusal that did not need to happen. The queue is bounded at
+ *      `queue_per_worker` entries per LIVE worker; the reference's default is
+ *      1 and so is ours. Past the bound: `server_at_capacity`, immediately.
+ *
+ *      The bound is not a tuning knob to be raised when refusals appear.
+ *      Admission capacity and sustained capacity are different numbers: the
+ *      reference raised its cap until C32 was admitted with zero rejects and
+ *      then found that nothing above C20 sustained. Disabling the bound is
+ *      possible and produces a warning that is deliberately impossible to
+ *      miss, because an unbounded queue converts a refusal you can see into
+ *      an unbounded wait you cannot -- rung 1's mistake by another route.
+ *
+ *   3. QUEUE DEADLINE, CHECKED AT POP AND NEVER AT PUSH. An entry older than
+ *      `queue_deadline_ms` when it reaches the head is refused with a distinct
+ *      reason -- `queued_too_long` -- and that refusal is REAL: it is the
+ *      moment the parent discovered the wait, not a deadline synthesized at
+ *      push time from a wait that had not happened yet. Checking at push can
+ *      only ever refuse on a prediction; checking at pop refuses on a fact.
+ *
+ *   4. PER-REQUEST SERVICE CAP, stopping at the next frame boundary. A request
+ *      admitted in good faith can still turn out to be unservable, and the
+ *      place to stop it is a frame boundary -- never mid-frame, because a
+ *      truncated frame is a corrupt stream rather than a refusal. The cap
+ *      itself travels to the workers through the fork and is readable with
+ *      mynah_prefork_service_cap_ms(); the parent additionally watches the
+ *      age of each worker's oldest outstanding connection and counts a breach.
+ *      See the SERVICE CAP note on that function for what is enforced here and
+ *      what still needs a call site in the synthesis loop.
+ *
+ * WHERE THE QUEUE LIVES, and why that differs from the reference. The
+ * reference parks rungs 2 and 3 in the CHILD, because in its topology the
+ * parent had nowhere to hold an accepted descriptor. Ours holds them in the
+ * PARENT, for two reasons that are properties of this code and not
+ * preferences: the parent is the only process that knows every worker's load,
+ * so it is the only one that can tell "this worker is busy" from "the machine
+ * is full"; and a descriptor queued in the parent has not yet been charged to
+ * a worker's slot, so a queued request cannot consume the capacity it is
+ * waiting for. The admission arithmetic is the reference's unchanged --
+ * `running + queued >= slots + queue_cap` refuses -- evaluated over the
+ * parent's own per-worker counters. The child keeps its own bounded queue
+ * (server/main.c's `--max-pending`); this ladder sits in front of it.
+ *
+ * WHAT IS DELIBERATELY NOT HERE. Four mechanisms were built, measured and lost
+ * in the reference implementation and must not be reintroduced without new
+ * numbers: utilization-aware admission (admitting a transient extra stream to
+ * a full worker that looks idle -- it broke the four ESTABLISHED streams,
+ * stall@250 0% -> 50%), a fairness or lead/credit gate (withholding ready work
+ * parked 95.8% of checks and moved STREAM p95 0.838 -> 0.986), cross-worker
+ * batching (requests that could batch at B>=3 coincided 1.6% of the time
+ * within +-0.25 ms against a 25% bar -- arrivals are not synchronised), and a
+ * priority-based prefill helper (TTFA 435 -> 2379 ms; priority is not
+ * isolation). The full table is .work/serving-design.md 9. When the machine is
+ * full the answer is to REFUSE, not to get clever.
  */
 #ifndef MYNAH_SERVER_PREFORK_H
 #define MYNAH_SERVER_PREFORK_H
@@ -119,13 +208,73 @@ typedef enum {
     MYNAH_PREFORK_ERROR         /* could not set up: the caller must fail */
 } mynah_prefork_role;
 
+/* Why a request was refused. Every rung of the ladder has its own value, its
+ * own counter and its own `code` in the JSON body, because an operator reading
+ * "503 x 900" cannot act and an operator reading "at_capacity 12,
+ * queued_too_long 888" knows immediately that the queue deadline is the thing
+ * to look at. Never collapse two of these into one. */
+typedef enum {
+    /* Rungs 1+2: no worker had a free slot AND the admission queue was full.
+     * The machine is full right now; a client should back off and retry. */
+    MYNAH_PREFORK_REFUSE_AT_CAPACITY = 0,
+    /* Rung 3: admitted to the queue, then found older than the deadline when
+     * it reached the head. Distinct from at-capacity on purpose -- this one
+     * says the server is not keeping up, not that it is momentarily busy. */
+    MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG,
+    /* Rung 4: the request was admitted and served, and its own service time
+     * ran past the cap. Not a capacity signal at all: retrying it unchanged
+     * will fail the same way. */
+    MYNAH_PREFORK_REFUSE_SERVICE_CAP,
+    /* Not a rung: the SCM_RIGHTS handoff to the chosen worker failed. Counted
+     * apart from at-capacity because it means a worker channel is broken,
+     * which is an incident, not load. */
+    MYNAH_PREFORK_REFUSE_HANDOFF_FAILED,
+    MYNAH_PREFORK_REFUSE__COUNT
+} mynah_prefork_refusal;
+
+/* Sentinel for `queue_per_worker`. Produces an unmissable warning: see the
+ * BOUNDED QUEUE rung above for why an unbounded queue is rung 1's mistake by
+ * another route. */
+#define MYNAH_PREFORK_QUEUE_UNBOUNDED (-1)
+/* And its opposite: no queue at all, refuse the instant no slot is free. A
+ * distinct sentinel because 0 already means "unset, use the default", and an
+ * operator who asks for zero must not silently get one. */
+#define MYNAH_PREFORK_QUEUE_NONE      (-2)
+
 typedef struct {
     int listen_fd;      /* already bound and listening; the parent keeps it */
     int workers;        /* W; <= 0 asks for a plan based on the cpu mask */
     int threads_per;    /* T; <= 0 derives it from W and the cpu mask */
     int slots_per;      /* requests in flight per worker: the child's max_batch */
     int quiet;          /* suppress the banner (tests) */
+
+    /* ---- the admission ladder. Every one of these is "0 = unset", so a
+     * caller that memsets this struct and never hears of the ladder gets the
+     * measured defaults, and so that an explicit 0 can still be expressed
+     * through the environment (see mynah_prefork_apply_env). ---- */
+
+    /* Rung 2. Queued connections allowed per LIVE worker, on top of its slots.
+     * 0 = unset -> MYNAH_PREFORK_QUEUE_DEFAULT (1, the reference's default).
+     * MYNAH_PREFORK_QUEUE_UNBOUNDED = no bound, and a shouted warning. */
+    int queue_per_worker;
+    /* Rung 3. Milliseconds an entry may sit in the queue, measured from accept
+     * and checked when it reaches the head. 0 = unset -> the default below. */
+    int queue_deadline_ms;
+    /* Rung 4. Milliseconds one request may spend in service. 0 = unset -> the
+     * default below; a negative value disables the cap entirely. */
+    int service_cap_ms;
+
+    /* Preconditions (see mynah_prefork_run). Set by a caller that knows it has
+     * opened a GPU backend; prefork then refuses rather than forking a wrong
+     * answer. The check does not rely on this being set -- a resident CUDA
+     * runtime is detected independently -- but a caller that does set it gets
+     * the refusal on every backend rather than only the detectable ones. */
+    int gpu_backend_open;
 } mynah_prefork_config;
+
+#define MYNAH_PREFORK_QUEUE_DEFAULT        1
+#define MYNAH_PREFORK_QUEUE_DEADLINE_MS    2000
+#define MYNAH_PREFORK_SERVICE_CAP_MS       30000
 
 /* Prints the topology this machine offers and the sweep that turns it into a
  * choice of W. Never forks; safe before the model is open. */
@@ -182,5 +331,87 @@ int mynah_prefork_recv_conn(int chan_fd, int timeout_ms);
 /* Non-zero once since the last call if SIGUSR1 asked for a statistics dump.
  * Both the parent's router loop and a worker's accept loop poll this. */
 int mynah_prefork_take_dump_request(void);
+
+/* ------------------------------------------------------- the refusal itself
+ *
+ * REFUSING WITHOUT AN RST. This is the transport bug the reference still has
+ * open, and it turns every fast-fail into a lie: a 503 that is written and
+ * then close()d while the client's request body is still sitting unread in the
+ * socket's receive queue makes the kernel -- Linux and BSD both -- send an RST
+ * instead of a FIN. The RST discards the send buffer, so the client's next
+ * read fails with ECONNRESET and curl reports "Recv failure: Connection reset
+ * by peer". The status line the server carefully assembled is never seen. The
+ * caller ends up debugging a broken pipe while the server's logs happily count
+ * a refusal it believes it delivered.
+ *
+ * The fix is the ordinary lingering close, and all three steps are load
+ * bearing: write the response, shutdown(fd, SHUT_WR) so the peer gets a clean
+ * FIN and knows the response is complete, then DRAIN what the client is still
+ * sending -- bounded by bytes and by time, since a hostile or merely large
+ * body must not become a way to occupy the router -- and only then close().
+ *
+ * Bounded is the word that matters. The parent's routing loop is single
+ * threaded: a blocking drain in it would stall every other client, which is
+ * the same disease as rung 1. So this call never blocks. It does as much as
+ * can be done without blocking and hands whatever is left to the parent's poll
+ * set, which finishes the close in the background.
+ *
+ * server/main.c's own shed path (`queue_push` failing -> write(busy) ->
+ * conn_close) has this exact bug and should call this instead.
+ *
+ * Takes ownership of `fd`: the caller must not close or use it afterwards. */
+void mynah_prefork_refuse_and_close(int fd, mynah_prefork_refusal reason);
+
+/* The stable, machine-readable token for a reason -- "server_at_capacity",
+ * "queued_too_long", "service_cap_exceeded", "handoff_failed". It appears as
+ * `error.code` in the JSON body and as the counter name in the stats line, so
+ * a client matching on it and an operator reading a dump are looking at the
+ * same string. Append-only: never renumber and never rename. */
+const char *mynah_prefork_refusal_code(mynah_prefork_refusal reason);
+
+/* The full HTTP refusal for a reason, including headers and body, written into
+ * `buf`. Returns the length, or 0 if `cap` is too small. Content-Length is
+ * computed from the body rather than written as a literal, so an edit to the
+ * message cannot silently truncate the response. */
+size_t mynah_prefork_refusal_response(mynah_prefork_refusal reason,
+                                      char *buf, size_t cap);
+
+/* SERVICE CAP -- rung 4, and an honest account of what is enforced where.
+ *
+ * Returns the per-request service cap in milliseconds that is in force for
+ * this process, or 0 when there is none. The value is resolved in the parent
+ * before the fork and inherited by every worker, so a worker never has to be
+ * told it and can never disagree with the parent about it.
+ *
+ * What the PARENT enforces: it tracks the age of each worker's oldest
+ * outstanding connection and counts a breach against
+ * MYNAH_PREFORK_REFUSE_SERVICE_CAP, which is what makes the cap visible in the
+ * dump and the final table. It cannot refuse on the client's behalf -- the
+ * descriptor belongs to the worker from the moment it is handed over.
+ *
+ * What the WORKER must do, and what is still missing: the synthesis loop has
+ * to compare elapsed service time against this value AT A FRAME BOUNDARY and
+ * stop there. A frame boundary specifically: stopping mid-frame truncates a
+ * codec frame and yields a corrupt stream, which is a worse outcome than the
+ * overrun. That call site is in the slot driver, not in this file. Until it
+ * exists the cap is observed and reported but not enforced, and this comment
+ * is the record of that gap rather than a claim that it is closed. */
+int mynah_prefork_service_cap_ms(void);
+
+/* Applies the MYNAH_PREFORK_* environment overrides to `cfg` and validates it,
+ * shouting about anything dangerous. Called by mynah_prefork_run() and by
+ * mynah_prefork_print_plan(); exposed so a caller can resolve the ladder
+ * before printing its own banner.
+ *
+ * The environment is the channel because the ladder has no command-line flags
+ * yet: those belong to server/main.c's argument parser.
+ *
+ *   MYNAH_PREFORK_QUEUE       rung 2, queued connections per worker.
+ *                             "0" really means zero -- refuse the instant no
+ *                             slot is free. "unbounded" or a negative number
+ *                             removes the bound and warns loudly.
+ *   MYNAH_PREFORK_QUEUE_MS    rung 3, the queue deadline. 0 disables it.
+ *   MYNAH_PREFORK_SERVICE_MS  rung 4, the service cap. 0 disables it. */
+void mynah_prefork_apply_env(mynah_prefork_config *cfg);
 
 #endif

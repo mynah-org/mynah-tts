@@ -446,4 +446,12 @@ update-ingot:
 	git subtree pull --prefix $(INGOT_DIR) https://github.com/mynah-org/ingot.git main --squash
 	@$(MAKE) -C $(INGOT_DIR) clean
 
--include $(CORE_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d)
+# SERVER_OBJECTS was missing here, and the omission is not cosmetic: the server
+# objects are compiled with -MMD -MP and write their .d files, but nothing read
+# them, so editing server/*.h never rebuilt server/*.o. A widened struct in
+# prefork.h therefore produced a binary in which main.o still used the OLD
+# layout -- it memset the first five fields and left the rest as stack garbage,
+# which reached the admission ladder as nonsense defaults. Same class as the
+# mixed-binary trap in .work/linux-production.md: objects reused across a change
+# that altered their meaning.
+-include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d)

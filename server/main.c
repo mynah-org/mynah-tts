@@ -915,8 +915,23 @@ static int handle_speech(int fd, const char *body) {
     job->request.text_ids = job->text_ids;
     job->want_pcm = want_pcm;
     job->is_stream = stream;
-    job->sink.deadline_ms = g.request_timeout_ms > 0u
-                          ? now_ms() + (double)g.request_timeout_ms : 0.0;
+    /* Rung 4 of the admission ladder, enforced where it is legal to enforce it.
+     * The parent watches each worker's oldest outstanding dispatch and counts a
+     * breach, but only this process can STOP at a frame boundary, and the frame
+     * boundary is the only preemption point the engine has. So the effective
+     * cap is the tighter of the operator's per-request timeout and the prefork
+     * service cap, and sink_cancelled -- which the driver polls between steps --
+     * is what observes it. A cap of 0 from either side means "no cap", so the
+     * minimum has to skip zeros rather than take them literally. */
+    {
+        unsigned cap_ms = g.request_timeout_ms;
+        const int service_cap = mynah_prefork_service_cap_ms();
+        if (service_cap > 0 &&
+            (cap_ms == 0u || (unsigned)service_cap < cap_ms)) {
+            cap_ms = (unsigned)service_cap;
+        }
+        job->sink.deadline_ms = cap_ms > 0u ? now_ms() + (double)cap_ms : 0.0;
+    }
 
     if (stream) {
         /* Chunked PCM: the client gets audio as it is produced. A WAV header
@@ -1619,6 +1634,14 @@ int main(int argc, char **argv) {
     if (prefork_workers > 0) {
         pf.listen_fd = listen_fd;
         pf.slots_per = (int)g.max_batch;
+        /* The authoritative answer to "is a GPU backend resident in this
+         * process?", which prefork refuses to fork across. Its own scan of the
+         * CUDA runtime is a backstop for a library someone else pulled in;
+         * this flag is the one that also catches Metal, where a mapped
+         * framework is not a device and only the caller knows a device was
+         * actually opened. Forking with GPU state alive produces a wrong
+         * answer rather than a crash, which is the worse failure. */
+        pf.gpu_backend_open = (device != MYNAH_TTS_DEVICE_CPU);
         const mynah_prefork_role role = mynah_prefork_run(&pf, &g_shutdown, &chan_fd);
         if (role == MYNAH_PREFORK_ERROR) {
             close(listen_fd);
@@ -1783,18 +1806,23 @@ int main(int argc, char **argv) {
         }
         if (queue_push(&g_queue, fd) != 0) {
             atomic_fetch_add(&g_stats.rejected, 1ul);
-            /* Queue full: shed the connection rather than grow without bound. */
-            const char *busy =
-                "HTTP/1.1 503 Service Unavailable\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: 62\r\n"
-                "Retry-After: 1\r\n"
-                "Connection: close\r\n\r\n"
-                "{\"error\":{\"message\":\"server busy\",\"type\":\"server_error\"}}";
-            (void)!write(fd, busy, strlen(busy));
-            /* conn_close, not close: a shed connection is still a connection
-             * the router charged to this worker, and a slot it must get back. */
-            conn_close(fd);
+            /* Queue full: shed the connection rather than grow without bound.
+             *
+             * This used to write the 503 and close immediately, which is how a
+             * refusal reaches the client as an RST instead of as a status: the
+             * request body is still in flight, so close() on unread data sends
+             * a reset and curl reports a broken pipe rather than the 503 we
+             * carefully wrote. mynah_prefork_refuse_and_close() does the
+             * shutdown-drain-close dance without blocking this thread, and
+             * emits the same machine-readable error.code as every other rung
+             * of the ladder, so a client matching on the code sees one
+             * vocabulary whichever rung refused it.
+             *
+             * It takes ownership of the descriptor, so the slot must be given
+             * back separately -- a shed connection is still one the router
+             * charged to this worker. */
+            mynah_prefork_refuse_and_close(fd, MYNAH_PREFORK_REFUSE_AT_CAPACITY);
+            mynah_prefork_conn_done();
         }
     }
 

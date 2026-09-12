@@ -35,9 +35,12 @@
 
 #include "prefork.h"
 
+#include "costmap.h"
 #include "threads.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -54,6 +57,10 @@
 #if defined(__linux__)
 #include <sched.h>
 #endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach/mach.h>
+#endif
 
 #define PREFORK_MAX_WORKERS 256
 /* Upper bound on the cpu ids we will enumerate. Sized for a large server, not
@@ -68,6 +75,307 @@
 #ifndef MYNAH_CPU_TOPOLOGY_ROOT
 #define MYNAH_CPU_TOPOLOGY_ROOT "/sys/devices/system/cpu"
 #endif
+
+/* Same idea for the cgroup tree. Unlike the topology read, parsing `cpu.max`
+ * is not Linux-only *code* -- it is an ordinary file read and a division, so
+ * it compiles and RUNS everywhere and simply finds nothing where there is no
+ * cgroupfs. Pointing this at a fabricated directory is therefore a real
+ * execution of the parser on any platform, which is the only way the quota
+ * arithmetic gets exercised on a developer machine at all. */
+#ifndef MYNAH_CGROUP_ROOT
+#define MYNAH_CGROUP_ROOT "/sys/fs/cgroup"
+#endif
+
+/* Both roots take an environment override in preference to the compile-time
+ * default, so a test does not need its own build of this translation unit. */
+#if defined(__linux__)   /* the only caller is the sysfs reader below */
+static const char *topology_root(void) {
+    const char *e = getenv("MYNAH_CPU_TOPOLOGY_ROOT");
+    return (e != NULL && e[0] != '\0') ? e : MYNAH_CPU_TOPOLOGY_ROOT;
+}
+#endif
+static const char *cgroup_root(void) {
+    const char *e = getenv("MYNAH_CGROUP_ROOT");
+    return (e != NULL && e[0] != '\0') ? e : MYNAH_CGROUP_ROOT;
+}
+
+/* ------------------------------------------------------------- cpu budget
+ *
+ * The residual the reference names and did not close: sched_getaffinity says
+ * WHICH cpus we may use, the cgroup quota says HOW MUCH of them. They are
+ * different limits and a container routinely sets only the second. A pod with
+ * `cpu: "4"` and no cpuset has an affinity mask covering all 64 cores of its
+ * host and a budget of four: planning W*T from the mask alone builds a server
+ * that is throttled the instant it works, and the throttling appears as
+ * latency with no CPU-bound thread to blame it on.
+ *
+ * We do not silently re-plan on the quota -- it is a rate over a period, not a
+ * set of cpus, and W workers of T threads is still a legitimate shape under
+ * one. We WARN, because "you asked for 16 threads inside a 4-cpu budget" is a
+ * sentence an operator can act on and a 4x RTF regression is not.
+ *
+ * Returns 1 and fills *cpus when a finite quota is in force, 0 otherwise. */
+static int cgroup_cpu_budget(double *cpus, char *detail, size_t detail_cap) {
+    const char *root = cgroup_root();
+    char path[512];
+    if (detail != NULL && detail_cap > 0) detail[0] = '\0';
+
+    /* cgroup v2: one file, "$MAX $PERIOD", MAX either a number or "max". */
+    snprintf(path, sizeof(path), "%s/cpu.max", root);
+    FILE *f = fopen(path, "r");
+    if (f != NULL) {
+        char quota[64];
+        long period = 0;
+        quota[0] = '\0';
+        const int got = fscanf(f, "%63s %ld", quota, &period);
+        fclose(f);
+        if (got == 2 && period > 0 && strcmp(quota, "max") != 0) {
+            const double q = atof(quota);
+            if (q > 0.0) {
+                *cpus = q / (double)period;
+                if (detail != NULL) {
+                    snprintf(detail, detail_cap, "cgroup v2 cpu.max %s %ld",
+                             quota, period);
+                }
+                return 1;
+            }
+        }
+        if (got >= 1 && strcmp(quota, "max") == 0) return 0;   /* explicitly none */
+    }
+
+    /* cgroup v1: two files, and a quota of -1 means unlimited. */
+    long q = -1, period = 0;
+    snprintf(path, sizeof(path), "%s/cpu/cpu.cfs_quota_us", root);
+    f = fopen(path, "r");
+    if (f == NULL) {
+        snprintf(path, sizeof(path), "%s/cpu.cfs_quota_us", root);
+        f = fopen(path, "r");
+    }
+    if (f != NULL) { if (fscanf(f, "%ld", &q) != 1) q = -1; fclose(f); }
+    snprintf(path, sizeof(path), "%s/cpu/cpu.cfs_period_us", root);
+    f = fopen(path, "r");
+    if (f == NULL) {
+        snprintf(path, sizeof(path), "%s/cpu.cfs_period_us", root);
+        f = fopen(path, "r");
+    }
+    if (f != NULL) { if (fscanf(f, "%ld", &period) != 1) period = 0; fclose(f); }
+    if (q > 0 && period > 0) {
+        *cpus = (double)q / (double)period;
+        if (detail != NULL) {
+            snprintf(detail, detail_cap, "cgroup v1 cfs_quota/period %ld/%ld",
+                     q, period);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Warns when the CPU budget contradicts the plan. Separate from the planner on
+ * purpose: the plan is a statement about cpus, this is a statement about time,
+ * and conflating them is how "we planned 32 and measured 4" happens. */
+static void warn_cpu_budget(int workers, int threads, int ncpu, FILE *out) {
+    double budget = 0.0;
+    char detail[128];
+    if (!cgroup_cpu_budget(&budget, detail, sizeof(detail))) return;
+
+    fprintf(out, "prefork: cpu budget    %.2f cpus (%s)\n", budget, detail);
+    const double want = (double)workers * (double)threads;
+    if (want > budget + 0.01) {
+        fprintf(out,
+            "prefork: WARNING the CPU BUDGET CONTRADICTS THE PLAN. W*T = %d threads, "
+            "but this cgroup allows %.2f cpus of runtime. The affinity mask says %d "
+            "cpus and the quota says %.2f: the mask is WHICH cpus, the quota is HOW "
+            "MUCH, and only the quota is enforced -- by throttling every worker at a "
+            "period boundary with no busy thread to blame. Raise the quota, or plan "
+            "W*T <= %.0f.\n",
+            workers * threads, budget, ncpu, budget, budget);
+    } else if ((double)ncpu > budget + 0.01) {
+        fprintf(out,
+            "prefork: note the affinity mask covers %d cpus but the budget is %.2f; "
+            "the plan (W*T = %d) fits it. sysconf-based planning would not have.\n",
+            ncpu, budget, workers * threads);
+    }
+}
+
+/* ---------------------------------------------------- fork preconditions
+ *
+ * Two things must be true at the instant we fork, and neither fails loudly on
+ * its own. They are checked here rather than trusted to the comment in
+ * server/main.c that asserts them, because a comment is not a check and the
+ * ordering it describes is one refactor away from being wrong.
+ *
+ * THE MUTEX QUESTION first, because it is what the audit is really about.
+ * fork() copies the address space but only the calling thread. Every mutex in
+ * the child is a bit-for-bit copy of its state at that instant: one another
+ * thread held is inherited LOCKED, by a thread that does not exist in the
+ * child, and can never be unlocked. Zeroing such a mutex is NOT a repair -- on
+ * glibc a zeroed pthread_mutex_t happens to look unlocked, which is exactly
+ * why the bug survives testing there, and on other implementations it is
+ * simply corrupt. The only correct repair is pthread_mutex_init(); the only
+ * way to not need one is to fork while single-threaded.
+ *
+ * The audit of this tree, recorded here because it is the answer to E5-13:
+ *
+ *   src/threads.c  g_job_mu, g_init_mu, g_job_cv, g_done_cv
+ *                  REINITIALIZED (not zeroed) by mynah_threadpool_after_fork(),
+ *                  registered with pthread_atfork() and also called explicitly
+ *                  by the child below. Correct.
+ *   src/threads.c  g_blas_mu       NOT reinitialized by anything.
+ *   src/qmat.c     g_stats_mutex   NOT reinitialized by anything.
+ *   src/costmap.c  no mutex at all: thread-local blocks indexed by an atomic
+ *                  counter, so there is nothing to inherit. Its CONTENT is
+ *                  still wrong in a child -- it holds the parent's model-load
+ *                  and pre-warm regions, which every worker would then report
+ *                  as its own, counting one load W times.
+ *                  mynah_costmap_after_fork() exists for exactly that and had
+ *                  no caller anywhere in the tree. The child below calls it.
+ *
+ * The two unrepaired mutexes are safe ONLY while the fork is single-threaded,
+ * because a lock no other thread can hold cannot be inherited held. That turns
+ * "we fork from main, early" from a convention into a load-bearing invariant,
+ * so it is checked rather than assumed. */
+
+/* Threads in this process, or -1 where the platform will not say. */
+static int process_thread_count(void) {
+#if defined(__linux__)
+    DIR *d = opendir("/proc/self/task");
+    if (d == NULL) return -1;
+    int n = 0;
+    const struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] != '.') ++n;
+    }
+    closedir(d);
+    return n > 0 ? n : -1;
+#elif defined(__APPLE__)
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) return -1;
+    for (mach_msg_type_number_t i = 0; i < n; ++i) {
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list,
+                  (vm_size_t)n * sizeof(*list));
+    return (int)n;
+#else
+    return -1;
+#endif
+}
+
+/* A resident GPU compute runtime, if one can be seen from inside the process.
+ *
+ * This is the reference's still-open bug and it earns the emphasis: a GPU
+ * context does not survive fork() -- CUDA's own documentation says so. The
+ * child inherits the handles and the device pointers but not the driver's
+ * per-process state behind them, and what follows is not a crash. It is
+ * kernels launched against a context that is no longer valid: WRONG AUDIO,
+ * which nothing downstream of the decoder can tell from right audio. A wrong
+ * answer is a far worse failure than a dead worker. `--backend cuda --prefork
+ * N` must refuse, not try.
+ *
+ * cfg->gpu_backend_open is the authoritative signal and a caller that opens a
+ * backend should set it. This scan is the backstop for a caller that does not:
+ * a CUDA/NVIDIA runtime mapped into the process is unambiguous. Metal is
+ * deliberately NOT grounds for refusal -- Metal.framework is pulled in
+ * transitively by unrelated system frameworks, and a mapped library is not a
+ * created device.
+ *
+ * Returns 1 and names what it found, 0 otherwise. */
+static int gpu_runtime_resident(char *what, size_t cap) {
+    static const char *const markers[] = {
+        "libcuda.so", "libcudart", "libnvidia-ml", "libcuda.dylib", NULL
+    };
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f == NULL) return 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        for (int i = 0; markers[i] != NULL; ++i) {
+            if (strstr(line, markers[i]) != NULL) {
+                snprintf(what, cap, "%s", markers[i]);
+                fclose(f);
+                return 1;
+            }
+        }
+    }
+    fclose(f);
+    return 0;
+#elif defined(__APPLE__)
+    const uint32_t n = _dyld_image_count();
+    for (uint32_t j = 0; j < n; ++j) {
+        const char *name = _dyld_get_image_name(j);
+        if (name == NULL) continue;
+        for (int i = 0; markers[i] != NULL; ++i) {
+            if (strstr(name, markers[i]) != NULL) {
+                snprintf(what, cap, "%s", name);
+                return 1;
+            }
+        }
+    }
+    return 0;
+#else
+    (void)what; (void)cap; (void)markers;
+    return 0;
+#endif
+}
+
+/* Everything that must hold before the first fork(). Returns 0 to proceed, -1
+ * to refuse. Refusing is the point: these produce a WRONG ANSWER rather than a
+ * crash, and a wrong answer that appears only under prefork is the most
+ * expensive kind of bug this file could ship. */
+static int check_fork_preconditions(const mynah_prefork_config *cfg) {
+    int bad = 0;
+
+    char gpu[512];
+    if (cfg->gpu_backend_open) {
+        fprintf(stderr,
+            "prefork: REFUSING TO FORK -- a GPU backend is open in this process.\n"
+            "  A GPU context does not survive fork(): the child inherits the handles\n"
+            "  but not the driver state behind them, so its kernels run against a\n"
+            "  context that no longer exists. That does not crash. It produces wrong\n"
+            "  audio, which nothing downstream can detect. Run prefork on the CPU\n"
+            "  backend, or run the GPU backend without prefork.\n");
+        bad = 1;
+    } else if (gpu_runtime_resident(gpu, sizeof(gpu))) {
+        fprintf(stderr,
+            "prefork: REFUSING TO FORK -- a GPU compute runtime is mapped into this\n"
+            "  process (%s). Even with no context created yet this is not a shape in\n"
+            "  which forked workers can be trusted; see above. Set\n"
+            "  MYNAH_PREFORK_ALLOW_GPU=1 only having established that no device state\n"
+            "  exists.\n", gpu);
+        if (getenv("MYNAH_PREFORK_ALLOW_GPU") == NULL) bad = 1;
+        else fprintf(stderr, "prefork: MYNAH_PREFORK_ALLOW_GPU is set; continuing\n");
+    }
+
+    const int threads = process_thread_count();
+    if (threads > 1) {
+        /* Not fatal by itself: the pool registers a pthread_atfork child handler
+         * that reinitializes its four locks, so the pool survives. But g_blas_mu
+         * (src/threads.c) and g_stats_mutex (src/qmat.c) have no such handler,
+         * and a fork taken while another thread holds either gives every worker
+         * a mutex that can never be unlocked -- a hang with no error message, in
+         * a child, under load. Say exactly that, and let an operator who wants
+         * the invariant enforced rather than reported ask for it. */
+        fprintf(stderr,
+            "prefork: WARNING forking with %d threads in this process, not 1.\n"
+            "  fork() copies one thread and every mutex in whatever state it was in.\n"
+            "  src/threads.c's pool locks are reinitialized by its atfork handler,\n"
+            "  but src/threads.c g_blas_mu and src/qmat.c g_stats_mutex are NOT: if\n"
+            "  any thread held one at this instant, every worker inherits it locked\n"
+            "  and the first worker to take it hangs forever. The fork belongs before\n"
+            "  the pool, the scheduler and the HTTP workers exist.\n"
+            "  Set MYNAH_PREFORK_STRICT=1 to make this a refusal.\n", threads);
+        if (getenv("MYNAH_PREFORK_STRICT") != NULL) {
+            fprintf(stderr, "prefork: MYNAH_PREFORK_STRICT is set; refusing.\n");
+            bad = 1;
+        }
+    } else if (threads < 0) {
+        fprintf(stderr, "prefork: note this platform will not report its thread "
+                        "count; the single-threaded-fork invariant is unchecked\n");
+    }
+
+    return bad ? -1 : 0;
+}
 
 /* ------------------------------------------------------------- cpu topology
  *
@@ -105,7 +413,7 @@ static int cpus_allowed(int *out, int max) {
 static long sysfs_cpu_long(int cpu, const char *leaf) {
     char path[160];
     snprintf(path, sizeof(path), "%s/cpu%d/topology/%s",
-             MYNAH_CPU_TOPOLOGY_ROOT, cpu, leaf);
+             topology_root(), cpu, leaf);
     FILE *f = fopen(path, "r");
     if (f == NULL) return -1;
     long v = -1;
@@ -339,6 +647,122 @@ int mynah_prefork_recv_conn(int chan_fd, int timeout_ms) {
     return recv_fd(chan_fd);
 }
 
+/* ------------------------------------------------------------ the ladder
+ *
+ * Resolving the four rungs. Every knob is "0 = unset" so a caller that memsets
+ * mynah_prefork_config and never hears of admission control still gets the
+ * measured defaults, and every knob has an environment override because the
+ * ladder has no command-line flags yet -- those belong to server/main.c's
+ * argument parser, which this lane does not own. */
+
+static double mono_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+}
+
+/* Inherited by every worker across the fork, which is why a worker never has
+ * to be told the cap and can never disagree with the parent about it. */
+static int g_service_cap_ms = 0;
+
+static int env_int(const char *name, int *out) {
+    const char *e = getenv(name);
+    if (e == NULL || e[0] == '\0') return 0;
+    char *end = NULL;
+    const long v = strtol(e, &end, 10);
+    if (end == e) return 0;
+    *out = (int)v;
+    return 1;
+}
+
+void mynah_prefork_apply_env(mynah_prefork_config *cfg) {
+    const char *e = getenv("MYNAH_PREFORK_QUEUE");
+    if (e != NULL && e[0] != '\0') {
+        if (strcmp(e, "unbounded") == 0) {
+            cfg->queue_per_worker = MYNAH_PREFORK_QUEUE_UNBOUNDED;
+        } else {
+            int v = 0;
+            if (env_int("MYNAH_PREFORK_QUEUE", &v)) {
+                cfg->queue_per_worker = v > 0 ? v
+                                     : (v == 0 ? MYNAH_PREFORK_QUEUE_NONE
+                                               : MYNAH_PREFORK_QUEUE_UNBOUNDED);
+            }
+        }
+    }
+    int v = 0;
+    /* A deadline or a cap of zero means DISABLED, not "use the default": an
+     * operator who types 0 is turning the rung off. Unset is what asks for the
+     * default, and unset is the absence of the variable. */
+    if (env_int("MYNAH_PREFORK_QUEUE_MS", &v)) cfg->queue_deadline_ms = v > 0 ? v : -1;
+    if (env_int("MYNAH_PREFORK_SERVICE_MS", &v)) cfg->service_cap_ms = v > 0 ? v : -1;
+}
+
+/* -1 = unbounded, 0 = no queue, >0 = that many per live worker. */
+static int resolve_queue_per_worker(const mynah_prefork_config *cfg) {
+    if (cfg->queue_per_worker == MYNAH_PREFORK_QUEUE_NONE) return 0;
+    if (cfg->queue_per_worker < 0) return -1;
+    if (cfg->queue_per_worker == 0) return MYNAH_PREFORK_QUEUE_DEFAULT;
+    return cfg->queue_per_worker;
+}
+static int resolve_queue_deadline_ms(const mynah_prefork_config *cfg) {
+    if (cfg->queue_deadline_ms < 0) return 0;              /* disabled */
+    if (cfg->queue_deadline_ms == 0) return MYNAH_PREFORK_QUEUE_DEADLINE_MS;
+    return cfg->queue_deadline_ms;
+}
+static int resolve_service_cap_ms(const mynah_prefork_config *cfg) {
+    if (cfg->service_cap_ms < 0) return 0;                 /* disabled */
+    if (cfg->service_cap_ms == 0) return MYNAH_PREFORK_SERVICE_CAP_MS;
+    return cfg->service_cap_ms;
+}
+
+/* Prints the ladder that is actually in force, and shouts about an unbounded
+ * queue. The shout is deliberately impossible to skim past: an unbounded
+ * admission queue is not a generous setting, it is the listener-backlog
+ * mistake wearing different clothes. The request still waits, the wait is
+ * still unbounded, and the only thing that changed is that the wait now
+ * happens somewhere this process can see and chooses not to act on. */
+static void describe_ladder(int workers, int slots, int q_per, int deadline_ms,
+                            int service_ms, FILE *out) {
+    fprintf(out, "prefork: admission   rung1 slots %d/worker (%d total)",
+            slots, slots * workers);
+    if (q_per < 0)      fprintf(out, " · rung2 queue UNBOUNDED");
+    else if (q_per == 0) fprintf(out, " · rung2 queue disabled (refuse immediately)");
+    else fprintf(out, " · rung2 queue %d/worker (%d total)", q_per, q_per * workers);
+    if (deadline_ms > 0) fprintf(out, " · rung3 deadline %d ms", deadline_ms);
+    else fprintf(out, " · rung3 deadline off");
+    if (service_ms > 0) fprintf(out, " · rung4 service cap %d ms", service_ms);
+    else fprintf(out, " · rung4 service cap off");
+    fprintf(out, "\n");
+
+    if (q_per < 0) {
+        fprintf(out,
+"prefork: ############################################################\n"
+"prefork: ##  THE ADMISSION QUEUE BOUND IS DISABLED.                ##\n"
+"prefork: ##                                                        ##\n"
+"prefork: ##  An unbounded queue does not add capacity. It converts ##\n"
+"prefork: ##  a refusal the client can see into a wait it cannot,   ##\n"
+"prefork: ##  which is precisely the failure this ladder exists to  ##\n"
+"prefork: ##  prevent -- the reference measured p95 TTFB 4470 ms    ##\n"
+"prefork: ##  with over 97%% of the tail invisible before accept().##\n"
+"prefork: ##                                                        ##\n"
+"prefork: ##  Admission capacity and sustained capacity are not the ##\n"
+"prefork: ##  same number. Raising the bound until the rejects stop ##\n"
+"prefork: ##  admitted C32 with zero refusals on the reference and  ##\n"
+"prefork: ##  nothing above C20 sustained. The refusals were the    ##\n"
+"prefork: ##  server telling the truth.                             ##\n"
+"prefork: ##                                                        ##\n"
+"prefork: ##  Memory now grows with arrival rate, and every queued  ##\n"
+"prefork: ##  descriptor is an fd this process must hold.           ##\n"
+"prefork: ############################################################\n");
+    }
+    if (deadline_ms <= 0 && q_per != 0) {
+        fprintf(out,
+            "prefork: WARNING rung 3 is off: a queued request has no deadline and will "
+            "wait for a slot indefinitely. The queue bound is then the only thing "
+            "limiting how long a client waits, and a bound is not a deadline.\n");
+    }
+}
+
 /* ------------------------------------------------------------------ plan */
 
 /* Resolves W and T against the cpu mask. Never invents W: the operator gives
@@ -391,6 +815,7 @@ void mynah_prefork_print_plan(const mynah_prefork_config *cfg, FILE *out) {
     int cpus[CPU_LIST_MAX];
     int workers = 0, threads = 0, per = 0, core_major = 0;
     mynah_prefork_config local = *cfg;
+    mynah_prefork_apply_env(&local);
     if (local.workers < 1) local.workers = 1;
     const int ncpu = plan_topology(&local, cpus, CPU_LIST_MAX, &workers, &threads,
                                    &per, &core_major);
@@ -439,6 +864,12 @@ void mynah_prefork_print_plan(const mynah_prefork_config *cfg, FILE *out) {
      * see what to. On an SMT host this is also the line that shows the sibling
      * ordering working: worker 0 should hold BOTH threads of its cores, not
      * one thread of twice as many. */
+    warn_cpu_budget(workers, threads, ncpu, out);
+    describe_ladder(workers, cfg->slots_per > 0 ? cfg->slots_per : 1,
+                    resolve_queue_per_worker(&local),
+                    resolve_queue_deadline_ms(&local),
+                    resolve_service_cap_ms(&local), out);
+
     for (int i = 0; i < workers; ++i) {
         const int first = i * per;
         const int count = (i + 1) * per <= ncpu ? per : ncpu - first;
@@ -502,7 +933,198 @@ void mynah_prefork_print_plan(const mynah_prefork_config *cfg, FILE *out) {
         ncpu, ncpu, ncpu, ncpu, ncpu, ncpu);
 }
 
+/* ------------------------------------------------------- refusal reasons
+ *
+ * One row per rung. The `code` is the contract: it appears as `error.code` in
+ * the JSON body and as the counter name in every stats line, so a client
+ * matching on it and an operator reading a dump are looking at the same
+ * string. Append-only -- never renumber, never rename.
+ *
+ * Retry-After is per reason and not a constant, because the reasons say
+ * different things about retrying. At-capacity is transient: come back. A
+ * service-cap breach is a property of the request itself, and telling a client
+ * to retry a request that will fail identically is how a refusal becomes a
+ * retry storm. */
+static const struct {
+    const char *code;
+    const char *status;
+    const char *message;
+    int         retry_after;   /* 0 = omit the header entirely */
+} REFUSAL[MYNAH_PREFORK_REFUSE__COUNT] = {
+    { "server_at_capacity", "503 Service Unavailable",
+      "every worker is at its slot cap and the admission queue is full", 1 },
+    { "queued_too_long", "503 Service Unavailable",
+      "waited in the admission queue longer than the deadline", 1 },
+    { "service_cap_exceeded", "503 Service Unavailable",
+      "the request ran past its per-request service cap", 0 },
+    { "handoff_failed", "503 Service Unavailable",
+      "the chosen worker could not be handed the connection", 1 },
+};
+
+const char *mynah_prefork_refusal_code(mynah_prefork_refusal reason) {
+    if (reason < 0 || reason >= MYNAH_PREFORK_REFUSE__COUNT) return "unknown";
+    return REFUSAL[reason].code;
+}
+
+size_t mynah_prefork_refusal_response(mynah_prefork_refusal reason,
+                                      char *buf, size_t cap) {
+    if (reason < 0 || reason >= MYNAH_PREFORK_REFUSE__COUNT) {
+        reason = MYNAH_PREFORK_REFUSE_AT_CAPACITY;
+    }
+    /* Assembled rather than written out as a literal so Content-Length cannot
+     * drift away from the body it describes. A hand-counted length is exactly
+     * the constant that survives an edit to the message and then silently
+     * truncates every refusal. */
+    char body[256];
+    const int blen = snprintf(body, sizeof(body),
+        "{\"error\":{\"message\":\"%s\",\"type\":\"server_error\",\"code\":\"%s\"}}",
+        REFUSAL[reason].message, REFUSAL[reason].code);
+    if (blen <= 0 || (size_t)blen >= sizeof(body)) return 0;
+
+    char retry[40];
+    retry[0] = '\0';
+    if (REFUSAL[reason].retry_after > 0) {
+        snprintf(retry, sizeof(retry), "Retry-After: %d\r\n",
+                 REFUSAL[reason].retry_after);
+    }
+    const int n = snprintf(buf, cap,
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "%s"
+        "Connection: close\r\n"
+        "\r\n%s",
+        REFUSAL[reason].status, blen, retry, body);
+    if (n <= 0 || (size_t)n >= cap) return 0;
+    return (size_t)n;
+}
+
+/* ------------------------------------------------- refusing without an RST
+ *
+ * See the long note on mynah_prefork_refuse_and_close() in prefork.h. The
+ * short version: write, shutdown(SHUT_WR), DRAIN, close -- and a close that
+ * skips the drain sends an RST that destroys the response the client was about
+ * to read. Both halves of that sequence are bounded, by bytes and by time,
+ * because an unbounded drain is a way for one client to occupy the router. */
+
+#define PF_LINGER_MAX   256          /* concurrent lingering closes            */
+#define PF_LINGER_MS    500.0        /* per-fd budget for the whole sequence   */
+#define PF_DRAIN_MAX    (64u * 1024u)/* bytes we will read before giving up    */
+#define PF_QPOLL_MAX    64           /* queued fds watched for a hangup        */
+
+typedef struct {
+    int    fd;
+    double deadline;      /* mono seconds */
+    char   msg[384];
+    size_t msg_len;
+    size_t msg_sent;
+    size_t drained;
+    int    shut;          /* SHUT_WR already done */
+} pf_linger;
+
+static void set_nonblock(int fd) {
+    const int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+static void linger_begin(pf_linger *L, int fd, mynah_prefork_refusal reason,
+                         double now) {
+    memset(L, 0, sizeof(*L));
+    L->fd = fd;
+    L->deadline = now + PF_LINGER_MS / 1000.0;
+    L->msg_len = mynah_prefork_refusal_response(reason, L->msg, sizeof(L->msg));
+    set_nonblock(fd);
+}
+
+/* Which direction this fd is waiting on right now. */
+static short linger_events(const pf_linger *L) {
+    return (L->msg_sent < L->msg_len) ? (short)POLLOUT : (short)POLLIN;
+}
+
+/* Advances one lingering close as far as it can go without blocking.
+ * Returns 1 when the descriptor has been closed and the slot is free. */
+static int linger_step(pf_linger *L, double now) {
+    /* 1. the response itself */
+    while (L->msg_sent < L->msg_len) {
+        const ssize_t n = send(L->fd, L->msg + L->msg_sent,
+                               L->msg_len - L->msg_sent, 0);
+        if (n > 0) { L->msg_sent += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (now >= L->deadline) break;
+            return 0;                      /* wait for POLLOUT */
+        }
+        break;                             /* peer is gone: nothing to deliver */
+    }
+
+    /* 2. the FIN. This is what tells the client the response is complete, and
+     *    it must come BEFORE the drain: a client waiting to send more will not
+     *    finish until it learns we are done talking. */
+    if (L->msg_sent >= L->msg_len && !L->shut) {
+        shutdown(L->fd, SHUT_WR);
+        L->shut = 1;
+    }
+
+    /* 3. the drain. The whole point of the exercise: unread bytes in the
+     *    receive queue at close() time make the kernel send an RST instead of
+     *    a FIN, and the RST discards our response along with it. */
+    if (L->shut) {
+        char scratch[4096];
+        for (;;) {
+            const ssize_t n = recv(L->fd, scratch, sizeof(scratch), 0);
+            if (n > 0) {
+                L->drained += (size_t)n;
+                if (L->drained >= PF_DRAIN_MAX) break;   /* enough; not our body */
+                continue;
+            }
+            if (n == 0) break;                           /* clean: peer closed */
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (now >= L->deadline) break;
+                return 0;                                /* wait for POLLIN */
+            }
+            break;
+        }
+    }
+
+    close(L->fd);
+    L->fd = -1;
+    return 1;
+}
+
+void mynah_prefork_refuse_and_close(int fd, mynah_prefork_refusal reason) {
+    if (fd < 0) return;
+    /* No globals are touched here: this is callable from any thread, which
+     * matters because server/main.c's shed path runs on an HTTP worker. It is
+     * bounded-blocking rather than non-blocking -- a worker thread can afford
+     * half a second on a connection it is refusing, and the router cannot,
+     * which is why the router uses refuse_park() below instead. */
+    pf_linger L;
+    linger_begin(&L, fd, reason, mono_seconds());
+    for (;;) {
+        const double now = mono_seconds();
+        if (linger_step(&L, now)) return;
+        const double left_ms = (L.deadline - now) * 1000.0;
+        if (left_ms <= 0.0) break;
+        struct pollfd pfd;
+        pfd.fd = L.fd;
+        pfd.events = linger_events(&L);
+        pfd.revents = 0;
+        const int r = poll(&pfd, 1, (int)left_ms);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+    }
+    if (L.fd >= 0) close(L.fd);
+}
+
+int mynah_prefork_service_cap_ms(void) { return g_service_cap_ms; }
+
 /* ----------------------------------------------------------------- routing */
+
+typedef struct {
+    int    fd;
+    double enqueued;      /* mono seconds, stamped at accept() */
+} pf_queued;
 
 typedef struct {
     pid_t pid;
@@ -518,43 +1140,35 @@ typedef struct {
     long long window_assigned;
     long long window_completed;
     double area;         /* integral of `active` dt, for the mean in flight */
+    /* Rung 4's watchdog. Dispatch timestamps of the connections this worker
+     * still owes us a completion for, oldest first. Completions do not arrive
+     * in dispatch order, so popping the head on every completion makes this an
+     * approximation -- but it approximates in the safe direction: the head is
+     * always the oldest outstanding dispatch, so "the head is past the cap" is
+     * never a false alarm, it can only be late. */
+    double *disp;
+    int disp_cap, disp_head, disp_n;
+    long long over_cap;  /* outstanding connections seen past the service cap */
 } worker_state;
 
-static double mono_seconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+static void disp_push(worker_state *w, double t) {
+    if (w->disp == NULL || w->disp_n >= w->disp_cap) return;
+    w->disp[(w->disp_head + w->disp_n) % w->disp_cap] = t;
+    ++w->disp_n;
 }
-
-/* The one thing the parent ever writes to a client socket. Assembled rather
- * than written out as a literal so Content-Length cannot drift away from the
- * body it describes -- a hand-counted length is exactly the kind of constant
- * that survives an edit to the message and silently truncates the response. */
-static void reject_busy(int fd) {
-    static const char body[] =
-        "{\"error\":{\"message\":\"all workers at capacity\",\"type\":\"server_error\"}}";
-    char msg[512];
-    const int len = snprintf(msg, sizeof(msg),
-                             "HTTP/1.1 503 Service Unavailable\r\n"
-                             "Content-Type: application/json\r\n"
-                             "Content-Length: %zu\r\n"
-                             "Retry-After: 1\r\n"
-                             "Connection: close\r\n\r\n%s",
-                             sizeof(body) - 1u, body);
-    if (len <= 0) return;
-    const char *p = msg;
-    size_t left = (size_t)len;
-    while (left > 0) {
-        const ssize_t n = send(fd, p, left, 0);
-        if (n <= 0) { if (n < 0 && errno == EINTR) continue; break; }
-        p += (size_t)n;
-        left -= (size_t)n;
+static void disp_pop(worker_state *w, int n) {
+    while (n-- > 0 && w->disp_n > 0) {
+        w->disp_head = (w->disp_head + 1) % w->disp_cap;
+        --w->disp_n;
     }
 }
 
 static void dump_table(const worker_state *w, int workers, long long dispatched,
-                       long long rejected, double window) {
-    fprintf(stderr, "[prefork] dispatched=%lld rejected=%lld", dispatched, rejected);
+                       const long long *refused, int queued, double window) {
+    fprintf(stderr, "[prefork] dispatched=%lld queued=%d", dispatched, queued);
+    for (int r = 0; r < MYNAH_PREFORK_REFUSE__COUNT; ++r) {
+        fprintf(stderr, " %s=%lld", REFUSAL[r].code, refused[r]);
+    }
     for (int i = 0; i < workers; ++i) {
         if (w[i].pid <= 0) { fprintf(stderr, " w%d[dead]", i); continue; }
         fprintf(stderr, " w%d[pid=%d asg=%lld done=%lld inflight=%d mean=%.2f]",
@@ -567,13 +1181,19 @@ static void dump_table(const worker_state *w, int workers, long long dispatched,
 
 mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                                      volatile sig_atomic_t *stop, int *chan_fd) {
+    mynah_prefork_config local = *cfg;
+    mynah_prefork_apply_env(&local);
+
     int cpus[CPU_LIST_MAX];
     int workers = 0, threads = 0, per = 0, core_major = 0;
-    const int ncpu = plan_topology(cfg, cpus, CPU_LIST_MAX, &workers, &threads,
+    const int ncpu = plan_topology(&local, cpus, CPU_LIST_MAX, &workers, &threads,
                                    &per, &core_major);
-    const int slots = cfg->slots_per > 0 ? cfg->slots_per : 1;
+    const int slots = local.slots_per > 0 ? local.slots_per : 1;
+    const int q_per = resolve_queue_per_worker(&local);      /* -1 = unbounded */
+    const int deadline_ms = resolve_queue_deadline_ms(&local);
+    g_service_cap_ms = resolve_service_cap_ms(&local);
 
-    if (!cfg->quiet) {
+    if (!local.quiet) {
         const int cores = count_physical_cores(cpus, ncpu);
         fprintf(stderr, "prefork: %d workers x %d threads over %d allowed cpus "
                         "(%d per worker, %s), %d slots each\n",
@@ -589,6 +1209,8 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             fprintf(stderr, "prefork: WARNING oversubscribed, W*T = %d > %d cpus\n",
                     workers * threads, ncpu);
         }
+        warn_cpu_budget(workers, threads, ncpu, stderr);
+        describe_ladder(workers, slots, q_per, deadline_ms, g_service_cap_ms, stderr);
 #if !defined(__linux__)
         fprintf(stderr, "prefork: WARNING this platform has no cpu affinity API. "
                         "Workers are NOT pinned: they float across every cpu and two "
@@ -597,6 +1219,10 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
 #endif
         fflush(stderr);
     }
+
+    /* Before anything is forked, and before the listening socket is committed
+     * to a topology we cannot undo. */
+    if (check_fork_preconditions(&local) != 0) return MYNAH_PREFORK_ERROR;
 
     worker_state *w = (worker_state *)calloc((size_t)workers, sizeof(*w));
     if (w == NULL) return MYNAH_PREFORK_ERROR;
@@ -632,7 +1258,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                 if (w[j].chan >= 0) close(w[j].chan);
             }
             free(w);
-            close(cfg->listen_fd);   /* a worker must never accept: the parent routes */
+            close(local.listen_fd);  /* a worker must never accept: the parent routes */
 
             g_worker_index = i;
             g_worker_chan = sp[1];
@@ -646,8 +1272,23 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             /* Belt and braces on the pool. src/threads.c registers a
              * pthread_atfork child handler, so this is already done; calling it
              * is idempotent and documented as such, and it keeps the invariant
-             * visible at the one place a reader looks for it. */
+             * visible at the one place a reader looks for it.
+             *
+             * Note what this does NOT cover, because the audit above found it:
+             * src/threads.c's g_blas_mu and src/qmat.c's g_stats_mutex have no
+             * after-fork repair anywhere in the tree. They are safe only while
+             * the fork is single-threaded, which check_fork_preconditions()
+             * above now verifies rather than assumes. */
             mynah_threadpool_after_fork();
+
+            /* The parent opened the pack and may have pre-warmed. Those regions
+             * describe work this worker did not do, and merging W copies of them
+             * would count one model load W times. mynah_costmap_after_fork()
+             * exists for precisely this and had no caller in the tree until
+             * now. It has no lock to repair -- the costmap is thread-local
+             * blocks behind an atomic index -- so this is about correctness of
+             * the numbers, not of the locking. */
+            mynah_costmap_after_fork();
 
             /* The pool resolves its width once and caches it, so MYNAH_THREADS
              * has to have been right BEFORE the model was opened -- which is
@@ -709,20 +1350,68 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, on_usr1);
 
-    struct pollfd *pfd = (struct pollfd *)calloc((size_t)workers + 1u, sizeof(*pfd));
-    if (pfd == NULL) {
+    /* Per-worker watchdog rings, parent-only: allocated after the fork so no
+     * child ever inherits or frees them. */
+    for (int i = 0; i < workers; ++i) {
+        w[i].disp_cap = slots + 1;
+        w[i].disp = (double *)calloc((size_t)w[i].disp_cap, sizeof(double));
+    }
+
+    /* The admission queue (rung 2). Bounded at q_per per LIVE worker; the
+     * allocation follows the bound, and only an explicitly unbounded queue
+     * grows. */
+    int q_alloc = (q_per < 0) ? 16 : (q_per > 0 ? q_per * workers : 1);
+    pf_queued *q = (pf_queued *)calloc((size_t)q_alloc, sizeof(*q));
+    int q_n = 0;
+
+    const size_t pfd_cap = (size_t)workers + 1u + PF_QPOLL_MAX + PF_LINGER_MAX;
+    struct pollfd *pfd = (struct pollfd *)calloc(pfd_cap, sizeof(*pfd));
+    if (pfd == NULL || q == NULL) {
         for (int i = 0; i < workers; ++i) if (w[i].pid > 0) kill(w[i].pid, SIGTERM);
-        free(w);
+        for (int i = 0; i < workers; ++i) free(w[i].disp);
+        free(pfd); free(q); free(w);
         return MYNAH_PREFORK_ERROR;
     }
 
-    long long dispatched = 0, rejected = 0;
-    long long window_dispatched = 0, window_rejected = 0;
+    pf_linger linger[PF_LINGER_MAX];
+    int linger_n = 0;
+    long long linger_forced = 0;
+
+    long long dispatched = 0;
+    long long window_dispatched = 0;
+    long long refused[MYNAH_PREFORK_REFUSE__COUNT];
+    long long window_refused[MYNAH_PREFORK_REFUSE__COUNT];
+    memset(refused, 0, sizeof(refused));
+    memset(window_refused, 0, sizeof(window_refused));
+    long long queued_total = 0, client_gone = 0;
+    int queue_peak = 0;
+
     double window_start = mono_seconds();
     double prev = window_start;
 
+/* Parks a refusal in the lingering-close set. Never blocks, because the router
+ * is single threaded and a blocking refusal would stall every other client --
+ * the same disease as a router that stops polling its listener. */
+#define PF_REFUSE_PARK(FD, REASON, NOW)                                        \
+    do {                                                                       \
+        pf_linger L_;                                                          \
+        linger_begin(&L_, (FD), (REASON), (NOW));                              \
+        if (!linger_step(&L_, (NOW))) {                                        \
+            if (linger_n < PF_LINGER_MAX) {                                    \
+                linger[linger_n++] = L_;                                       \
+            } else {                                                           \
+                /* The set is full. Finish what we can without blocking and    \
+                 * close; this is the only path that can still produce an RST, \
+                 * so it is counted rather than hidden. */                     \
+                ++linger_forced;                                               \
+                L_.deadline = 0.0;                                             \
+                (void)linger_step(&L_, (NOW) + 1.0);                           \
+            }                                                                  \
+        }                                                                      \
+    } while (0)
+
     while (*stop == 0 && live > 0) {
-        int nf = 0, free_slots = 0;
+        int nf = 0, listen_slot = -1;
         int map[PREFORK_MAX_WORKERS];
         for (int i = 0; i < workers; ++i) {
             if (w[i].pid <= 0) continue;
@@ -731,23 +1420,64 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             pfd[nf].events = POLLIN;
             pfd[nf].revents = 0;
             ++nf;
-            if (w[i].active < slots) ++free_slots;
         }
-        /* Stop watching the listener while every worker is full. The kernel
-         * backlog holds the connection; a client waits rather than being told
-         * "busy" by a server that would have had a slot a millisecond later.
-         * When the backlog itself overflows the kernel refuses the connection,
-         * which is the honest signal at that point. */
-        int listen_slot = -1;
-        if (free_slots > 0) {
-            listen_slot = nf;
-            pfd[nf].fd = cfg->listen_fd;
-            pfd[nf].events = POLLIN;
+        const int worker_slots = nf;
+
+        /* RUNG 1, AND THE WHOLE REASON THIS FILE WAS REVISITED. The listener
+         * is in the poll set UNCONDITIONALLY -- not "while a slot is free".
+         * Watching it only when there is room is the optimisation that reads
+         * as free and costs a measurement campaign: a client left in the
+         * kernel backlog has not been accepted, so it has no queue entry, no
+         * deadline and no timestamp, and nothing in this process can see it
+         * waiting. The reference measured p95 TTFB 4470 ms with >97% of the
+         * tail before accept(). Accepting and refusing in 200 microseconds is
+         * strictly better than an invisible four-second wait, and it is the
+         * only way rungs 2 and 3 get to exist at all. */
+        listen_slot = nf;
+        pfd[nf].fd = local.listen_fd;
+        pfd[nf].events = POLLIN;
+        pfd[nf].revents = 0;
+        ++nf;
+
+        /* Queued clients, watched for a HANGUP ONLY. events is deliberately 0:
+         * a queued client has already sent its request, so asking for POLLIN
+         * would make poll() return immediately every single time and spin the
+         * router at 100% CPU. POLLERR/POLLHUP/POLLNVAL are reported in revents
+         * regardless of events (POSIX), which is exactly the subset we want. */
+        const int q_watch = q_n < PF_QPOLL_MAX ? q_n : PF_QPOLL_MAX;
+        const int q_first = nf;
+        for (int i = 0; i < q_watch; ++i) {
+            pfd[nf].fd = q[i].fd;
+            pfd[nf].events = 0;
             pfd[nf].revents = 0;
             ++nf;
         }
 
-        const int ready = poll(pfd, (nfds_t)nf, 200);
+        const int l_first = nf;
+        for (int i = 0; i < linger_n; ++i) {
+            pfd[nf].fd = linger[i].fd;
+            pfd[nf].events = linger_events(&linger[i]);
+            pfd[nf].revents = 0;
+            ++nf;
+        }
+
+        /* Sleep no longer than the next thing that needs attention, so a queue
+         * deadline is honoured even when nothing else happens. */
+        int timeout = 200;
+        {
+            const double now = mono_seconds();
+            if (q_n > 0 && deadline_ms > 0) {
+                const double left = (double)deadline_ms - (now - q[0].enqueued) * 1000.0;
+                if (left < timeout) timeout = left > 0.0 ? (int)left : 0;
+            }
+            for (int i = 0; i < linger_n; ++i) {
+                const double left = (linger[i].deadline - now) * 1000.0;
+                if (left < timeout) timeout = left > 0.0 ? (int)left : 0;
+            }
+            if (timeout < 0) timeout = 0;
+        }
+
+        const int ready = poll(pfd, (nfds_t)nf, timeout);
 
         {   /* Integrate in-flight over wall time whether or not poll returned
              * anything: the mean is only meaningful if idle time counts. */
@@ -760,7 +1490,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
         }
 
         if (mynah_prefork_take_dump_request()) {
-            dump_table(w, workers, window_dispatched, window_rejected,
+            dump_table(w, workers, window_dispatched, window_refused, q_n,
                        prev - window_start);
             /* Forward it: one `kill -USR1 <parent>` should produce the whole
              * machine's view, the routing table from here and each worker's own
@@ -773,7 +1503,9 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                 w[i].window_completed = 0;
                 w[i].area = 0.0;
             }
-            window_dispatched = 0; window_rejected = 0; window_start = prev;
+            window_dispatched = 0;
+            memset(window_refused, 0, sizeof(window_refused));
+            window_start = prev;
         }
 
         if (ready < 0) {
@@ -782,8 +1514,21 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             break;
         }
 
-        for (int k = 0; k < nf; ++k) {
-            if (k == listen_slot) continue;
+        const double now = prev;
+
+        /* ---- lingering closes, first: they free descriptors ---- */
+        for (int i = linger_n - 1; i >= 0; --i) {
+            const int k = l_first + i;
+            const int fired = (k < nf) && (pfd[k].revents != 0);
+            if (!fired && now < linger[i].deadline) continue;
+            if (linger_step(&linger[i], now)) {
+                linger[i] = linger[linger_n - 1];
+                --linger_n;
+            }
+        }
+
+        /* ---- completions ---- */
+        for (int k = 0; k < worker_slots; ++k) {
             if ((pfd[k].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
             const int i = map[k];
             char buf[256];
@@ -793,6 +1538,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                 w[i].completed += n;
                 w[i].window_completed += n;
                 w[i].active -= (int)n;
+                disp_pop(&w[i], (int)n);
                 if (w[i].active < 0) {
                     /* Would mean a worker reported a connection it was never
                      * given. Clamp, but say so: it is an accounting bug and it
@@ -800,6 +1546,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                     fprintf(stderr, "prefork: worker %d reported more completions than "
                                     "dispatches; slot accounting is wrong\n", i);
                     w[i].active = 0;
+                    w[i].disp_n = 0;
                 }
             } else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                 fprintf(stderr, "prefork: worker %d (pid %d) channel closed after "
@@ -813,13 +1560,99 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                 w[i].chan = -1;
                 w[i].pid = -1;
                 w[i].active = 0;
+                w[i].disp_n = 0;
                 --live;
             }
         }
 
-        if (listen_slot < 0 || (pfd[listen_slot].revents & POLLIN) == 0) continue;
+        /* ---- RUNG 4's watchdog: outstanding connections past the cap ----
+         * The parent cannot refuse these; the descriptor has belonged to the
+         * worker since the handoff. What it can do is make the breach VISIBLE,
+         * which is the difference between "the server felt slow" and a counter
+         * an operator can point at. Enforcement -- stopping at the next frame
+         * boundary -- belongs to the synthesis loop; see the note on
+         * mynah_prefork_service_cap_ms(). */
+        if (g_service_cap_ms > 0) {
+            for (int i = 0; i < workers; ++i) {
+                if (w[i].pid <= 0 || w[i].disp_n <= 0 || w[i].disp == NULL) continue;
+                const double age = (now - w[i].disp[w[i].disp_head]) * 1000.0;
+                if (age >= (double)g_service_cap_ms) {
+                    ++w[i].over_cap;
+                    ++refused[MYNAH_PREFORK_REFUSE_SERVICE_CAP];
+                    ++window_refused[MYNAH_PREFORK_REFUSE_SERVICE_CAP];
+                    /* Charge it once: re-stamp the head so the same connection
+                     * is not counted again on every tick until it finishes. */
+                    w[i].disp[w[i].disp_head] = now;
+                    fprintf(stderr, "prefork: worker %d has a connection %.0f ms into "
+                                    "service, past the %d ms cap\n",
+                            i, age, g_service_cap_ms);
+                }
+            }
+        }
 
-        const int cfd = accept(cfg->listen_fd, NULL, NULL);
+        /* ---- queued clients that hung up while waiting ----
+         * Not a refusal: nobody is owed a status. Counted separately so it can
+         * never be mistaken for one. */
+        for (int i = q_watch - 1; i >= 0; --i) {
+            const int k = q_first + i;
+            if (k >= nf) continue;
+            if ((pfd[k].revents & (POLLERR | POLLHUP | POLLNVAL)) == 0) continue;
+            close(q[i].fd);
+            ++client_gone;
+            memmove(&q[i], &q[i + 1], (size_t)(q_n - i - 1) * sizeof(q[0]));
+            --q_n;
+        }
+
+        /* ---- RUNG 3, then RUNG 1: drain the queue ----
+         * The deadline is checked HERE, at the head, at pop time -- never at
+         * push. Checking at push can only refuse on a prediction about a wait
+         * that has not happened; checking at pop refuses on a fact. An entry
+         * that waited and then got a slot anyway is served, which is the whole
+         * reason a queue is better than an immediate refusal. */
+        while (q_n > 0) {
+            if (deadline_ms > 0 &&
+                (now - q[0].enqueued) * 1000.0 >= (double)deadline_ms) {
+                ++refused[MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG];
+                ++window_refused[MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG];
+                PF_REFUSE_PARK(q[0].fd, MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG, now);
+                memmove(&q[0], &q[1], (size_t)(q_n - 1) * sizeof(q[0]));
+                --q_n;
+                continue;
+            }
+            int best = -1;
+            for (int i = 0; i < workers; ++i) {
+                if (w[i].pid <= 0 || w[i].active >= slots) continue;
+                if (best < 0 || w[i].active < w[best].active) best = i;
+            }
+            if (best < 0) break;                 /* no slot: it stays queued */
+
+            const int fd = q[0].fd;
+            memmove(&q[0], &q[1], (size_t)(q_n - 1) * sizeof(q[0]));
+            --q_n;
+            /* The descriptor was made non-blocking by nothing so far, but it
+             * may have been accepted from a non-blocking listener; server/main.c
+             * clears O_NONBLOCK on arrival either way. */
+            if (send_fd(w[best].chan, fd) != 0) {
+                fprintf(stderr, "prefork: handing fd to worker %d failed: %s\n",
+                        best, strerror(errno));
+                ++refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
+                ++window_refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
+                PF_REFUSE_PARK(fd, MYNAH_PREFORK_REFUSE_HANDOFF_FAILED, now);
+                continue;
+            }
+            close(fd);
+            ++w[best].active;
+            ++w[best].assigned;
+            ++w[best].window_assigned;
+            disp_push(&w[best], now);
+            ++dispatched;
+            ++window_dispatched;
+        }
+
+        if (listen_slot < 0 || listen_slot >= nf ||
+            (pfd[listen_slot].revents & POLLIN) == 0) continue;
+
+        const int cfd = accept(local.listen_fd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
                 errno == ECONNABORTED) continue;
@@ -827,39 +1660,109 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             break;
         }
 
+        /* RUNG 1: the least-loaded worker with a free slot. A new arrival may
+         * only go straight through when the queue is EMPTY -- otherwise it
+         * would jump ahead of entries that have already waited, and rung 3's
+         * deadline would start firing on requests that were merely unlucky
+         * rather than late. */
         int best = -1;
-        for (int i = 0; i < workers; ++i) {
-            if (w[i].pid <= 0 || w[i].active >= slots) continue;
-            if (best < 0 || w[i].active < w[best].active) best = i;
+        if (q_n == 0) {
+            for (int i = 0; i < workers; ++i) {
+                if (w[i].pid <= 0 || w[i].active >= slots) continue;
+                if (best < 0 || w[i].active < w[best].active) best = i;
+            }
         }
-        if (best < 0) {
-            /* Raced: the last free slot filled between poll and accept. */
-            ++rejected;
-            ++window_rejected;
-            reject_busy(cfd);
+        if (best >= 0) {
+            if (send_fd(w[best].chan, cfd) != 0) {
+                fprintf(stderr, "prefork: handing fd to worker %d failed: %s\n",
+                        best, strerror(errno));
+                ++refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
+                ++window_refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
+                PF_REFUSE_PARK(cfd, MYNAH_PREFORK_REFUSE_HANDOFF_FAILED, now);
+                continue;
+            }
+            /* Our copy goes now: from here the worker is the only owner, and
+             * the client sees a close only when the worker closes. */
             close(cfd);
+            ++w[best].active;
+            ++w[best].assigned;
+            ++w[best].window_assigned;
+            disp_push(&w[best], now);
+            ++dispatched;
+            ++window_dispatched;
             continue;
         }
-        if (send_fd(w[best].chan, cfd) != 0) {
-            fprintf(stderr, "prefork: handing fd to worker %d failed: %s\n",
-                    best, strerror(errno));
-            ++rejected;
-            ++window_rejected;
-            reject_busy(cfd);
-            close(cfd);
+
+        /* RUNG 2: no slot. Park it if the queue has room. The arithmetic is
+         * the reference's -- running + queued >= slots + queue_cap refuses --
+         * evaluated over the parent's own counters, which is possible here
+         * because a queued descriptor has not been charged to any worker and
+         * therefore cannot consume the capacity it is waiting for. */
+        /* Recomputed from LIVE workers, not from the W we started with. A
+         * fleet that has lost a worker has lost the slots behind those queue
+         * entries too, and a bound that keeps promising capacity the machine
+         * no longer has is how a degraded server turns a refusal into a wait. */
+        const int q_bound = (q_per < 0) ? -1 : q_per * live;
+        if (q_bound != 0 && (q_bound < 0 || q_n < q_bound)) {
+            if (q_n >= q_alloc) {
+                const int grown = q_alloc * 2;
+                pf_queued *bigger = (pf_queued *)realloc(q, (size_t)grown * sizeof(*q));
+                if (bigger == NULL) {
+                    ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+                    ++window_refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+                    PF_REFUSE_PARK(cfd, MYNAH_PREFORK_REFUSE_AT_CAPACITY, now);
+                    continue;
+                }
+                q = bigger;
+                q_alloc = grown;
+            }
+            q[q_n].fd = cfd;
+            q[q_n].enqueued = now;
+            ++q_n;
+            ++queued_total;
+            if (q_n > queue_peak) queue_peak = q_n;
             continue;
         }
-        /* Our copy goes now: from here the worker is the only owner, and the
-         * client sees a close only when the worker closes. */
-        close(cfd);
-        ++w[best].active;
-        ++w[best].assigned;
-        ++w[best].window_assigned;
-        ++dispatched;
-        ++window_dispatched;
+
+        /* RUNGS 1+2 exhausted: every slot busy and the queue full. Refuse now,
+         * with a reason and a counter of its own, and -- this is the part the
+         * reference still has open -- refuse in a way the client can actually
+         * read. See the RST note in prefork.h. */
+        ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+        ++window_refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+        PF_REFUSE_PARK(cfd, MYNAH_PREFORK_REFUSE_AT_CAPACITY, now);
     }
 
     /* ------------------------------------------------------------- shutdown */
+    /* Anything still queued was accepted and never answered. Tell it so rather
+     * than dropping it: a client that gets a 503 at shutdown knows to retry
+     * elsewhere, and one whose socket simply dies does not. */
+    for (int i = 0; i < q_n; ++i) {
+        mynah_prefork_refuse_and_close(q[i].fd, MYNAH_PREFORK_REFUSE_AT_CAPACITY);
+        ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+    }
+    q_n = 0;
+    /* Finish the lingering closes properly: the whole point is that the client
+     * reads the status, and abandoning them here would reintroduce the RST at
+     * exactly the moment an operator is most likely to be watching. */
+    for (int i = 0; i < linger_n; ++i) {
+        const double end = mono_seconds() + PF_LINGER_MS / 1000.0;
+        for (;;) {
+            const double t = mono_seconds();
+            if (linger_step(&linger[i], t)) break;
+            if (t >= end) { if (linger[i].fd >= 0) close(linger[i].fd); break; }
+            struct pollfd one;
+            one.fd = linger[i].fd;
+            one.events = linger_events(&linger[i]);
+            one.revents = 0;
+            if (poll(&one, 1, 20) < 0 && errno != EINTR) {
+                close(linger[i].fd);
+                break;
+            }
+        }
+    }
+    linger_n = 0;
+
     for (int i = 0; i < workers; ++i) {
         if (w[i].pid > 0) kill(w[i].pid, SIGTERM);
     }
@@ -873,17 +1776,41 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
         if (w[i].chan >= 0) close(w[i].chan);
         w[i].chan = -1;
     }
-    /* Totals for the run, not for the window since the last dump. A leftover
-     * `still-in-flight` here is the interesting number: it means a worker was
-     * handed a connection it never reported finished, which is a leaked slot. */
-    fprintf(stderr, "prefork: final  dispatched=%lld rejected=%lld\n",
-            dispatched, rejected);
-    for (int i = 0; i < workers; ++i) {
-        fprintf(stderr, "  worker %d: assigned=%lld completed=%lld still-in-flight=%d\n",
-                i, w[i].assigned, w[i].completed, w[i].active);
+
+    /* Totals for the run, not for the window since the last dump. Each rung
+     * gets its own line: "503 x 900" tells an operator nothing, while
+     * "at_capacity 12, queued_too_long 888" says immediately that the queue
+     * deadline is the thing to look at. */
+    fprintf(stderr, "prefork: final  dispatched=%lld queued_total=%lld "
+                    "queue_peak=%d client_gone=%lld\n",
+            dispatched, queued_total, queue_peak, client_gone);
+    long long refused_all = 0;
+    for (int r = 0; r < MYNAH_PREFORK_REFUSE__COUNT; ++r) refused_all += refused[r];
+    fprintf(stderr, "prefork: refused=%lld", refused_all);
+    for (int r = 0; r < MYNAH_PREFORK_REFUSE__COUNT; ++r) {
+        fprintf(stderr, "  %s=%lld", REFUSAL[r].code, refused[r]);
     }
-    close(cfg->listen_fd);
+    fprintf(stderr, "\n");
+    if (linger_forced > 0) {
+        fprintf(stderr, "prefork: WARNING %lld refusals were closed without a full "
+                        "lingering close (the %d-slot set was full); those clients "
+                        "may have seen a reset instead of the status\n",
+                linger_forced, PF_LINGER_MAX);
+    }
+    /* A leftover `still-in-flight` here is the interesting number: it means a
+     * worker was handed a connection it never reported finished, which is a
+     * leaked slot. */
+    for (int i = 0; i < workers; ++i) {
+        fprintf(stderr, "  worker %d: assigned=%lld completed=%lld still-in-flight=%d"
+                        " over-service-cap=%lld\n",
+                i, w[i].assigned, w[i].completed, w[i].active, w[i].over_cap);
+        free(w[i].disp);
+    }
+    close(local.listen_fd);
     free(pfd);
+    free(q);
     free(w);
     return MYNAH_PREFORK_PARENT_DONE;
 }
+
+#undef PF_REFUSE_PARK
