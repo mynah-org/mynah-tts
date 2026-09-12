@@ -657,6 +657,13 @@ static void collect_quant(row_sink *s) {
     add_unknown(s, "quant.int8_kernel", "yes", "-", "MYNAH_QMAT_VNNI",
                 "[UNKNOWN] src/qmat.c did not register "
                 "mynah_qmat_int8_kernel()");
+    /* WHICH weights the requested encoding is allowed to touch.  The engine
+     * owns the group names; src/qmat.c owns the single reading of the
+     * variable and answers this row, so the report and the engine cannot
+     * disagree about what was asked for. */
+    add_unknown(s, "quant.groups", "yes", "-", "MYNAH_QUANT_GROUPS",
+                "[UNKNOWN] src/qmat.c did not register "
+                "mynah_qmat_groups_spec()");
 }
 
 static void collect_backends(row_sink *s) {

@@ -90,40 +90,46 @@ typedef struct {
     mynah_flow_linear mlp_out;  /* [hidden_dim][hidden_dim]   */
 } mynah_flow_res_block_weights;
 
-/* Which projection a hook call is for.  `index` is the residual-block number
- * for the three BLOCK_* kinds and 0 for the rest. */
+/* ------------------------------------------------- optional linear override
+ *
+ * The same contract `transformer_ar` uses, and for the same reason: this
+ * module owns no weight cache and formats no tensor name, so an engine that
+ * wants a quantized projection installs it from outside.  `index` separates
+ * the repeated kinds -- time condition i, residual block b -- and is 0 for the
+ * singletons.
+ *
+ * The callee must compute exactly what `mynah_matvec_bias_f32` computes:
+ *     out[n] = in[k] @ weight[n][k]^T + (bias ? bias[n] : 0)
+ * Returning non-zero fails the forward.  NULL (what a zeroed weights struct
+ * has) keeps the f32 matvec, so nothing here changes until an engine opts in.
+ *
+ * NOTE on the flow head specifically: `input_proj` reads a latent_dim (32)
+ * activation and `final_linear` writes one.  A per-row absmax int8 over k = 32
+ * is a different numerical proposition from one over k = 1024, which is why
+ * the engine is allowed to quantize these kinds individually rather than as
+ * one block. */
 typedef enum {
-    MYNAH_FLOW_LINEAR_COND_EMBED = 0, /* [hidden][cond]       */
-    MYNAH_FLOW_LINEAR_INPUT_PROJ,     /* [hidden][latent]     */
-    MYNAH_FLOW_LINEAR_BLOCK_ADALN,    /* [3*hidden][hidden]   */
-    MYNAH_FLOW_LINEAR_BLOCK_MLP_IN,   /* [hidden][hidden]     */
-    MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT,  /* [hidden][hidden]     */
-    MYNAH_FLOW_LINEAR_FINAL_ADALN,    /* [2*hidden][hidden]   */
-    MYNAH_FLOW_LINEAR_FINAL_LINEAR,   /* [latent][hidden]     */
+    MYNAH_FLOW_LINEAR_TIME_MLP_IN = 0, /* [hidden][freq_embed], per cond    */
+    MYNAH_FLOW_LINEAR_TIME_MLP_OUT,    /* [hidden][hidden], per cond        */
+    MYNAH_FLOW_LINEAR_COND_EMBED,      /* [hidden][cond_dim]                */
+    MYNAH_FLOW_LINEAR_INPUT_PROJ,      /* [hidden][latent_dim]              */
+    MYNAH_FLOW_LINEAR_BLOCK_ADALN,     /* [3*hidden][hidden], per block     */
+    MYNAH_FLOW_LINEAR_BLOCK_MLP_IN,    /* [hidden][hidden], per block       */
+    MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT,   /* [hidden][hidden], per block       */
+    MYNAH_FLOW_LINEAR_FINAL_ADALN,     /* [2*hidden][hidden]                */
+    MYNAH_FLOW_LINEAR_FINAL_LINEAR,    /* [latent_dim][hidden]              */
     MYNAH_FLOW_LINEAR_KIND_COUNT
 } mynah_flow_linear_kind;
 
-/*
- * Optional replacement for the projections, exactly the arrangement
- * `src/transformer_ar.h` documents and for the same reason: this module never
- * sees a model pack, so it cannot own a cache keyed by tensor name, and the
- * engine supplies one.  NULL keeps `mynah_matvec_bias_f32`, so nothing about
- * these numerics changes until an engine opts in.
- *
- * The time-embedding branch is deliberately NOT routed through the hook: it is
- * memoised on the bit pattern of the times, so for a whole utterance it runs
- * once, and a cache entry for a weight read once is a cache entry that only
- * costs memory.
- *
- * `linear` takes `count` contiguous rows that belong to ONE request; `linear_rows`
- * takes one row per request and MUST be bit-exact per row -- a request's audio
- * may not depend on who it was batched with.
- */
 typedef int (*mynah_flow_linear_fn)(void *user, size_t index,
                                     mynah_flow_linear_kind kind,
                                     const float *weight, const float *bias,
-                                    const float *in, float *out, size_t count,
-                                    size_t k, size_t n);
+                                    const float *in, float *out, size_t k,
+                                    size_t n);
+
+/* `linear` takes one row; `linear_rows` takes one row per request and MUST be
+ * bit-exact per row -- a request's audio may not depend on who it was batched
+ * with, so the callee may not let batch width enter the arithmetic. */
 typedef int (*mynah_flow_linear_rows_fn)(void *user, size_t index,
                                          mynah_flow_linear_kind kind,
                                          const float *weight, const float *bias,
