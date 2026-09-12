@@ -1,6 +1,6 @@
 # E2 — PocketTTS per-stage oracle
 
-Status: **OPEN** · independent of E1 · **do this first**
+Status: **IN PROGRESS** — `tools/oracle_pocket.py` written and running (2026-09-12); `tests/parity_pocket.py` still to do
 
 `CLAUDE.md`: *"Every new stage gets a Python oracle dump before downstream work
 depends on it."* This epic is that dump, and it is cheap: the reference
@@ -68,3 +68,63 @@ These decide the design of `stream.c`, so they are not optional:
 
 All 12 stages dumped and reproducible across two runs with the same seed. The
 SEANet receptive field is a **number written in this note**, not an assumption.
+
+## First run — 2026-09-12
+
+`make oracle-pocket` (english / alba / seed 1234), 132 tensors, 26 tokens,
+52 frames, 4.16 s of audio, `temp=0.3`, `sampler_decode_steps=1`,
+`eos_threshold=-4.0`. Dumps land in `build/oracle-pocket` (gitignored).
+
+### The captured chain, one AR step
+
+```
+conditioner.embed   in [1,0]         out [1,0,1024]   # text only at prefill
+input_linear        in [1,1,32]      out [1,1,1024]   # previous latent
+transformer.layers  in [1,1,1024]    out [1,1,1024]   # 6 layers
+out_norm            in [1,1,1024]    out [1,1,1024]
+out_eos             in [1,1024]      out [1,1]        # scalar logit vs -4.0
+flow_net            in0 cond [1,1024]                 # = out_norm result
+                    in1 s    [1,1]  = 0
+                    in2 t    [1,1]  = 1
+                    in3 x_0  [1,32]                   # the gaussian noise
+                    out      [1,32]                   # the latent
+mimi.quantizer      in [1,32,1]      out [1,512,1]    # after denorm + transpose
+mimi.upsample       in [1,512,1]     out [1,512,16]   # 12.5 Hz -> 200 Hz
+decoder_transformer in [1,512,16]    out [1,512,16]   # inner layers see [1,16,512]
+mimi.decoder        in [1,512,16]    out [1,1,1920]   # exactly one 80 ms frame
+```
+
+### What this confirmed, beyond the shapes
+
+- **`s = 0`, `t = 1`, one call.** The LSD head really is a single evaluation per
+  frame, with the two time conditions pinned at the endpoints. There is no
+  integration loop to write.
+- **The noise is captured** (`flow_net.in3`), which is what makes stage 7
+  comparable at all. Without it the flow head can only be checked
+  distributionally.
+- **The decoder transformer runs at the encoder frame rate**, on 16 positions per
+  12.5 Hz frame, and its inner layers see the tensor transposed to `[1,16,512]`.
+  The C implementation must place the transpose in the same place.
+- Between `flow_net.out` and `mimi.quantizer.in` sit the latent denormalization
+  (`emb_mean`/`emb_std`) and a transpose. Stage 8 is therefore checkable as the
+  delta between two captured tensors rather than needing its own hook.
+
+### Bug found and fixed in the tool itself
+
+The first version dropped **every input tensor** and every module whose output is
+a tuple or list (`ProjectedTransformer` returns one), because `to_numpy`
+recursed over containers and then re-entered with an already-converted
+`ndarray`, which it did not recognise and returned `None` for. 48 tensors
+captured instead of 132. Fixed by an ndarray passthrough, plus `attach()` now
+**fails loudly** when a watched module name no longer exists upstream rather than
+silently recording less.
+
+Worth stating because it is the failure mode this whole epic exists to prevent:
+a dump that looks fine and is quietly incomplete.
+
+### Still to do
+
+Stages 3 (voice KV as loaded) and 11 (per-stage SEANet conv outputs) are not
+individually hooked yet, and none of the streaming-specific measurements
+(receptive field, `context: 250` eviction, chunk seam) have been run. Those are
+E2-3 to E2-5 and they are the ones that feed E1's design.

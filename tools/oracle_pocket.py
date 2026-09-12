@@ -41,6 +41,7 @@ WATCHED = (
     "mimi.quantizer",
     "mimi.upsample",
     "mimi.decoder_transformer",
+    "mimi.decoder_transformer.transformer.layers.0",
     "mimi.decoder",
 )
 
@@ -48,6 +49,13 @@ MAX_CALLS_PER_MODULE = 4  # steps 0..3; enough to catch prefill vs steady state
 
 
 def to_numpy(x):
+    """Tensor -> ndarray. Returns None for anything that is not array-like.
+
+    Note the ndarray passthrough: `_save` recurses over containers and would
+    otherwise re-enter with an already-converted array and drop it on the floor.
+    """
+    if isinstance(x, np.ndarray):
+        return x
     if isinstance(x, torch.Tensor):
         return x.detach().to(torch.float32).cpu().numpy()
     if isinstance(x, (tuple, list)):
@@ -69,8 +77,12 @@ class Recorder:
         if arr is None:
             return
         if isinstance(arr, list):
+            # A module returning a tuple/list (ProjectedTransformer does) or the
+            # positional args of any module. Flatten one level, skipping the
+            # entries that are not tensors at all.
             for i, sub in enumerate(arr):
-                self._save(name, call, kind, sub, slot=i)
+                if sub is not None:
+                    self._save(name, call, kind, sub, slot=i)
             return
         tag = f"{name}.{kind}{'' if slot is None else f'{slot}'}.call{call}"
         path = self.out_dir / f"{tag}.npy"
@@ -104,9 +116,14 @@ class Recorder:
         return fn
 
     def attach(self, model: torch.nn.Module):
-        for name, module in model.named_modules():
-            if name in WATCHED:
-                self.handles.append(module.register_forward_hook(self.hook(name)))
+        available = dict(model.named_modules())
+        missing = [w for w in WATCHED if w not in available]
+        if missing:
+            raise SystemExit(
+                "upstream module names moved; not found: " + ", ".join(missing)
+            )
+        for name in WATCHED:
+            self.handles.append(available[name].register_forward_hook(self.hook(name)))
         return len(self.handles)
 
     def detach(self):
@@ -162,9 +179,7 @@ def main() -> int:
 
     recorder = Recorder(out_dir)
     hooked = recorder.attach(model)
-    if hooked == 0:
-        print("error: no modules matched WATCHED; the upstream module names moved", file=sys.stderr)
-        return 2
+    print(f"hooked {hooked} modules")
 
     torch.manual_seed(args.seed)  # re-seed so the noise is a function of --seed alone
     audio = model.generate_audio(voice_state, args.text)
