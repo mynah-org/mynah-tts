@@ -529,6 +529,12 @@ class Schema:
     codec_transformer_dim: int
     codec_transformer_ffn: int
     codec_transformer_heads: int
+    seanet_n_filters: int
+    seanet_kernel_size: int
+    seanet_residual_kernel_size: int
+    seanet_last_kernel_size: int
+    seanet_n_residual_layers: int
+    seanet_compress: int
     samples_per_frame: int
     generation: str
 
@@ -736,6 +742,50 @@ def derive_schema(refs: dict[str, TensorRef], voice_refs: dict[str, TensorRef],
     if abs(frame_rate - EXPECTED_FRAME_RATE) > 1e-9:
         fail(f"derived frame rate {frame_rate} differs from the recorded "
              f"{EXPECTED_FRAME_RATE}")
+    # SEANet geometry. Needed by the decoder (E3) and by the cloning encoder
+    # (E7), and absent from model.json until now, which forced both to hardcode
+    # it. Every value is read off a tensor and cross-checked; nothing is copied
+    # from the upstream YAML.
+    first_enc = refs.get("mimi.encoder.model.0.conv.weight")
+    if first_enc is None or len(first_enc.shape) != 3 or first_enc.shape[1] != 1:
+        fail("mimi.encoder.model.0.conv.weight missing or not [n_filters, 1, kernel]")
+    seanet_n_filters = first_enc.shape[0]
+    seanet_kernel_size = first_enc.shape[2]
+
+    # A residual unit is block.1 (narrow) then block.3 (back to width); the
+    # compression ratio and the residual kernel both fall out of block.1.
+    res_in = refs.get("mimi.encoder.model.1.block.1.conv.weight")
+    res_out = refs.get("mimi.encoder.model.1.block.3.conv.weight")
+    if res_in is None or res_out is None or len(res_in.shape) != 3:
+        fail("mimi.encoder.model.1.block.{1,3}.conv.weight missing")
+    if res_in.shape[1] != seanet_n_filters:
+        fail(f"residual block input {res_in.shape[1]} != n_filters {seanet_n_filters}")
+    if res_in.shape[0] == 0 or seanet_n_filters % res_in.shape[0] != 0:
+        fail(f"n_filters {seanet_n_filters} is not a multiple of the residual "
+             f"width {res_in.shape[0]}; compress is not an integer")
+    seanet_compress = seanet_n_filters // res_in.shape[0]
+    seanet_residual_kernel_size = res_in.shape[2]
+    if res_out.shape[2] != 1:
+        fail(f"residual output conv kernel is {res_out.shape[2]}, expected 1")
+
+    # One residual unit per stage: blocks are numbered 1 and 3, so a second unit
+    # would add 5 and 7. Count rather than assume.
+    res_indices = sorted({int(m.group(1)) for name in refs
+                          if (m := re.match(r"mimi\.encoder\.model\.1\.block\.(\d+)\.conv\.weight$", name))})
+    if res_indices != [1, 3]:
+        fail(f"unexpected residual block indices {res_indices}; "
+             "n_residual_layers is not 1 and the derivation below is wrong")
+    seanet_n_residual_layers = 1
+
+    last_conv = refs.get("mimi.decoder.model.11.conv.weight")
+    if last_conv is None or len(last_conv.shape) != 3 or last_conv.shape[0] != 1:
+        fail("mimi.decoder.model.11.conv.weight missing or not [1, ch, kernel]")
+    seanet_last_kernel_size = last_conv.shape[2]
+
+    # dilation_base is deliberately NOT emitted: with one residual layer only
+    # base**0 == 1 is ever used, so the checkpoint cannot witness it and any
+    # value here would be a guess. Add it when a model with more layers appears.
+
 
     return Schema(
         tensor_count=len(refs), dtype=dtype,
@@ -755,6 +805,12 @@ def derive_schema(refs: dict[str, TensorRef], voice_refs: dict[str, TensorRef],
         codec_transformer_dim=codec_transformer_dim,
         codec_transformer_ffn=codec_transformer_ffn,
         codec_transformer_heads=codec_transformer_heads,
+        seanet_n_filters=seanet_n_filters,
+        seanet_kernel_size=seanet_kernel_size,
+        seanet_residual_kernel_size=seanet_residual_kernel_size,
+        seanet_last_kernel_size=seanet_last_kernel_size,
+        seanet_n_residual_layers=seanet_n_residual_layers,
+        seanet_compress=seanet_compress,
         samples_per_frame=samples_per_frame, generation=generation)
 
 
@@ -942,6 +998,12 @@ def build_manifest(language: str, revision: str, schema: Schema, voices: list[Vo
         "codec_transformer_ffn": schema.codec_transformer_ffn,
         # derived as codec_transformer_dim / head_dim; confirm against the oracle
         "codec_transformer_heads": schema.codec_transformer_heads,
+        "seanet_n_filters": schema.seanet_n_filters,
+        "seanet_kernel_size": schema.seanet_kernel_size,
+        "seanet_residual_kernel_size": schema.seanet_residual_kernel_size,
+        "seanet_last_kernel_size": schema.seanet_last_kernel_size,
+        "seanet_n_residual_layers": schema.seanet_n_residual_layers,
+        "seanet_compress": schema.seanet_compress,
         "codec_transformer_context": DECODER_TRANSFORMER_CONTEXT,
 
         # --- voices ---

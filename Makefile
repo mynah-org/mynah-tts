@@ -85,7 +85,7 @@ LDLIBS += $(INGOT_LIB)
 # with; without these it honestly says "unset" rather than guessing.
 CPPFLAGS += -DMYNAH_SIMD_PROFILE='"$(SIMD)"' -DMYNAH_GIT_REV='"$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)"'
 
-CORE_SOURCES := src/mynah_tts.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/engine_magpie.c src/engine_magpie_ctx.c src/inference.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/inference.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)

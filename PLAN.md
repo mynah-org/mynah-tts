@@ -125,17 +125,17 @@ Needs E1 and E2.
 Zero-shot cloning is a product requirement. The weights are already in the pack
 (`mimi.encoder*` + `downsample` + `speaker_proj`, 9.78M params / 19.6 MB BF16).
 
-- [ ] E7-1 SEANet **encoder** in C — mirrors the decoder, reuses its conv kernels
-- [ ] E7-2 encoder transformer (2L d512) — reuses the shared attention
-- [ ] E7-3 `ConvDownsample1d`: stride 16, kernel 32, `pad_mode="replicate"`
-- [ ] E7-4 `speaker_proj` + optional `bos_before_voice`, config-driven — the only
+- [x] E7-1 SEANet **encoder** in C (parity 6.4e-06 vs the PyTorch oracle) — mirrors the decoder, reuses its conv kernels
+- [x] E7-2 encoder transformer (2L d512) — reuses the shared attention
+- [x] E7-3 `ConvDownsample1d`: stride 16, kernel 32, `pad_mode="replicate"`
+- [x] E7-4 `speaker_proj` + optional `bos_before_voice`, config-driven — the only
       place the two checkpoint generations differ
-- [ ] E7-5 prefill the reference latents through the backbone to produce the voice KV
-- [ ] E7-6 WAV/audio input decode; require 24 kHz mono first
-- [ ] E7-7 polyphase resampler to 24 kHz matching `scipy.signal.resample_poly`
+- [x] E7-5 prefill the reference latents through the backbone to produce the voice KV
+- [x] E7-6 WAV/audio input decode; require 24 kHz mono first
+- [x] E7-7 polyphase resampler to 24 kHz matching `scipy.signal.resample_poly`
       within tolerance — needed for arbitrary input files
-- [ ] E7-8 truncate reference audio to 30 s, as upstream does
-- [ ] E7-9 `mynah-tts export-voice`: serialize the KV so reload is instant
+- [x] E7-8 truncate reference audio to 30 s, as upstream does
+- [x] E7-9 `mynah-tts export-voice`: serialize the KV so reload is instant
 - [ ] E7-10 consent gate and notice before cloning — see E6
 
 ### E4 — CPU kernels, ARM and x86 in one step → [`.work/cpu-kernels-arm-x86.md`](.work/cpu-kernels-arm-x86.md)

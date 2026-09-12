@@ -9,6 +9,7 @@
 #include "seanet.h"
 #include "transformer_ar.h"
 #include "dispatch.h"
+#include "voice_clone.h"
 
 #include <math.h>
 #include <errno.h>
@@ -494,6 +495,10 @@ int main(int argc, char **argv) {
         }
         if (mynah_graph_bnns_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "BNNS graph self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_voice_clone_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "voice clone self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_transformer_ar_self_test(error, sizeof(error)) != 0) {
