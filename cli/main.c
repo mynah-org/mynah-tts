@@ -4,6 +4,7 @@
 #include "mynah_tts.h"
 #include "qmat.h"
 #include "tokenizer.h"
+#include "tokenizer_sentencepiece.h"
 
 #include <math.h>
 #include <errno.h>
@@ -481,6 +482,10 @@ int main(int argc, char **argv) {
         }
         if (mynah_graph_bnns_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "BNNS graph self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_sp_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "sentencepiece self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_tts_device_self_test(MYNAH_TTS_DEVICE_CPU, error, sizeof(error)) != 0) {

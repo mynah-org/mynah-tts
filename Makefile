@@ -81,7 +81,7 @@ INGOT_LIB := $(INGOT_DIR)/libingot.a
 CPPFLAGS += -I$(INGOT_DIR)/include
 LDLIBS += $(INGOT_LIB)
 
-CORE_SOURCES := src/mynah_tts.c src/weights.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c
+CORE_SOURCES := src/mynah_tts.c src/weights.c src/graph.c src/kernels.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
@@ -91,7 +91,7 @@ STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
 .PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
-        oracle-pocket fake-pack goldens goldens-capture \
+        oracle-pocket fake-pack goldens goldens-capture tokenizer-parity \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -218,6 +218,24 @@ oracle:
 	@test -n "$(CODEC)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	@test -n "$(OUTPUT)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
+
+# SentencePiece parity against the Python oracle. Generate the cases first with
+# `uv run --with sentencepiece python tools/oracle_pocket_tokenizer.py`.
+SP_CASES_DIR ?= build/oracle-tokenizer
+SP_TEST := $(BUILD_DIR)/tests/test_tokenizer_sp
+$(SP_TEST): tests/test_tokenizer_sp.c $(CORE_OBJECTS) | $(INGOT_LIB)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $(BUILD_DIR)/tests/test_tokenizer_sp.o
+	$(CC) $(CFLAGS) $(CORE_OBJECTS) $(BUILD_DIR)/tests/test_tokenizer_sp.o $(LDFLAGS) $(LDLIBS) -o $@
+
+tokenizer-parity: $(SP_TEST)
+	@test -d "$(SP_CASES_DIR)" || (echo "missing $(SP_CASES_DIR); run: uv run --with sentencepiece python tools/oracle_pocket_tokenizer.py" >&2; exit 2)
+	@set -e; for f in $(SP_CASES_DIR)/*.jsonl; do \
+	  lang=$$(basename $$f .jsonl); \
+	  model=$$(ls -d $$HOME/.cache/huggingface/hub/models--kyutai--pocket-tts/snapshots/*/languages/$$lang/tokenizer.model 2>/dev/null | head -1); \
+	  test -n "$$model" || (echo "no tokenizer.model for $$lang" >&2; exit 2); \
+	  $(SP_TEST) "$$model" "$$f"; \
+	done
 
 # Synthetic Magpie-shaped pack and the refactor goldens it exists for.
 # See .work/engine-seam-refactor.md: models/ is empty and graph.c's self-tests

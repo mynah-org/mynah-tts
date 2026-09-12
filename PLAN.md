@@ -82,9 +82,9 @@ Independent of E1. **Start here** — it tells E1 which state the seam must mode
 Needs E1 and E2.
 
 - [ ] E3-1 `tools/convert_pocket.py` + per-language model pack; voice KV stored F16
-- [ ] E3-2 `src/tokenizer_sentencepiece.c`: Unigram + byte fallback → [`.work/tokenizer-sentencepiece.md`](.work/tokenizer-sentencepiece.md)
-      (~710 LOC; normalizer is `identity` with an empty charsmap, so **no NFKC and no
-      darts-clone trie**; algorithm already diffed against sentencepiece, 0/30170)
+- [x] E3-2 `src/tokenizer_sentencepiece.{c,h}` **done** → [`.work/tokenizer-sentencepiece.md`](.work/tokenizer-sentencepiece.md)
+      1734 LOC, in `CORE_SOURCES` and `--self-test`; `make tokenizer-parity` replays
+      45,197 oracle cases / 2.1M ids across 5 languages; UBSan, ASan and leaks clean
 - [ ] E3-3 `src/flow_head.c`: time embedding, adaLN, 6 res-blocks, 1 LSD step
 - [ ] E3-4 `src/seanet.c`: causal conv1d / transposed conv + streaming state
 - [ ] E3-5 `src/engine_pocket.c`: AR step, EOS at `-4.0`, latent denorm

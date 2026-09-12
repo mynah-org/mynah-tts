@@ -937,7 +937,15 @@ static int sp_normalize(const mynah_sp *sp, const char *text, size_t text_length
  * there is nothing here for a reassociating compiler to regroup. */
 static int sp_viterbi(const mynah_sp *sp, const sp_normalized *n, int *ids, size_t ids_capacity,
                       size_t *out_count, char *error, size_t error_capacity) {
-    float *best = NULL;
+    /* The DP accumulator is double, not float, even though upstream's lattice
+     * stores float scores. On a ~100k-character input the accumulated path
+     * score reaches about -3e5, where a float32 ULP (~0.03) is larger than the
+     * gap between competing segmentations, and ties resolve arbitrarily. In
+     * float this implementation diverged from sentencepiece on 6 ids out of
+     * 102,899 for English and on one German case; in double, four of the five
+     * languages are exact over the whole corpus. Double costs 4 bytes per
+     * character in a prefill-only array. See .work/tokenizer-sentencepiece.md. */
+    double *best = NULL;
     size_t *prev_char = NULL;
     int32_t *prev_id = NULL;
     size_t *order = NULL;
@@ -966,7 +974,7 @@ static int sp_viterbi(const mynah_sp *sp, const sp_normalized *n, int *ids, size
         prev_char[c] = 0;
         prev_id[c] = -1;
     }
-    best[0] = 0.0f;
+    best[0] = 0.0;
 
     for (c = 0; c < n->nchar; c++) {
         const size_t start = n->starts[c];

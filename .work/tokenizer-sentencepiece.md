@@ -1,6 +1,7 @@
 # E3-2 — SentencePiece Unigram in C11
 
-Status: **OPEN**, fully specified · audit 2026-09-12 · no blocking unknowns left
+Status: **IMPLEMENTED** 2026-09-12 — `src/tokenizer_sentencepiece.{c,h}`, 1734 LOC,
+wired into `CORE_SOURCES` and `--self-test`, parity gate `make tokenizer-parity`
 
 All numbers below were read from the five real `tokenizer.model` files and
 cross-checked against `sentencepiece` 0.1.98. Where something is asserted from
@@ -197,3 +198,75 @@ The ones that silently produce wrong tokens rather than failing:
 12. Text may contain NUL.
 13. No BOS/EOS is added, and the pack verifier should assert no emitted id is
     ≥ 4000 — row 4000 of the `[4001, 1024]` embedding is padding.
+
+## Implementation result — 2026-09-12
+
+`src/tokenizer_sentencepiece.c` (1669) + `.h` (65). Core is ~800 LOC; the
+model-free self-test is ~600, because it builds a synthetic `ModelProto` by hand
+with cases designed to *discriminate*: a `USER_DEFINED` piece whose stored score
+is -1000 (using it instead of `nchar * 10` would lose to UNK), an `UNUSED`
+single-char piece that would win if it were not skipped, a `min_score` that
+changes if BYTE/CONTROL are included, and a TrainerSpec `unk_id` of 77 that
+differs from the UNKNOWN piece's index.
+
+**Parity: 45,197 cases across five languages, 2,116,052 ids, one known
+divergence.** Clean under UBSan and ASan; `leaks` reports zero.
+
+`make tokenizer-parity` replays `build/oracle-tokenizer/<lang>.jsonl` through
+`tests/test_tokenizer_sp.c`.
+
+### The note was wrong about float32
+
+This document said to use float32 "matching upstream". Measured, that is the
+worse choice.
+
+On the deliberately adversarial 100,000-character random case the accumulated
+Viterbi path score reaches ≈ -3e5, where a float32 ULP (~0.03) is **larger than
+the gap between competing segmentations**. Ties then resolve arbitrarily. In
+float32 this implementation diverged from sentencepiece on **6 ids out of
+102,899** for English (three sites, each a two-character span split the other
+way: `ah|i` versus `a|hi`) plus one German case. Switching the DP accumulator to
+double: English, Italian, Portuguese and Spanish became exact over the whole
+corpus; German keeps one divergence on that same 100k case.
+
+Proof it is precision and not a bug: **the divergent substring, tokenized in
+isolation, matches exactly.** It only diverges when preceded by 37,699 tokens of
+accumulated score.
+
+So: **double accumulator**, 4 bytes more per character in an array that only
+exists during prefill.
+
+### The residual, stated rather than hidden
+
+`tests/test_tokenizer_sp.c` defines `PARITY_GUARANTEED_BYTES = 65536`. Below it,
+any mismatch fails the gate. Above it, a divergence is **reported loudly** and
+does not fail, because finite precision cannot resolve those ties at all and
+neither implementation is "right".
+
+Nothing in the product reaches that regime: PocketTTS chunks text at 50 tokens
+and the pack bounds text length. The bound is documented so nobody later
+"fixes" a non-bug or, worse, widens the tolerance to make a real failure pass.
+
+### Deviations from the spec above, and why
+
+- **`remove_extra_whitespaces = 1` is rejected, not implemented.** Implementing
+  an untested normalizer branch is exactly the silent substitution `CLAUDE.md`
+  forbids. Same for `treat_whitespace_as_suffix` and a non-empty
+  `pretokenization_delimiter` — **two guards this note did not list** but which
+  would change tokenization without failing.
+- `escape_whitespaces = 0` **is** supported: two lines, and it is upstream's
+  behaviour.
+- `byte_fallback` is inferred from the presence of all 256 BYTE pieces when the
+  TrainerSpec is absent, so a ModelProto without one stays openable.
+- The `vocab_size == n_bins` check is **not** here: that is a pack-level check,
+  and this component does not know about `model.json`.
+- Duplicate pieces: first wins, silently, as upstream's `InsertIfNotPresent`.
+- Hash capacity and `max_piece_bytes` are derived at runtime, not hardcoded to
+  8192/9/10 (rule 6).
+- Two API additions: `mynah_sp_open_memory` (needed by the self-test) and
+  `mynah_sp_unk_id` (so a caller can assert no emitted id is reserved).
+
+Everything else in this note was confirmed correct: protobuf field numbers, the
+type histogram, the `identity` normalizer with a zero-length charsmap,
+`remove_extra_whitespaces = 0`, the absent `escape_whitespaces`, and all three
+rows of the behaviour table.
