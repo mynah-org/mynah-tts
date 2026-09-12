@@ -21,6 +21,16 @@ void mynah_layernorm_f32(const float *input, const float *weight,
 void mynah_residual_add_f32(float *output, const float *input, size_t n);
 void mynah_gelu_f32(float *data, size_t n);
 void mynah_gelu_f32_scalar(float *data, size_t n);
+
+/* tanh-approximation GELU, the form the Magpie conv-FFN and the PocketTTS
+ * backbone both use. The array form takes optional scratch and uses vForce
+ * when Accelerate is present; pass NULL for the scalar loop. */
+float mynah_gelu_tanh(float x);
+void  mynah_gelu_tanh_array(float *values, size_t length, float *scratch);
+int   mynah_gelu_self_test(char *error, size_t error_capacity);
+
+/* out[0..n) += weight * src[0..n) */
+void mynah_axpy_f32(float *out, const float *src, float weight, size_t n);
 int mynah_softmax_f32(const float *logits, float *probabilities, size_t n);
 size_t mynah_argmax_f32(const float *values, size_t n);
 int mynah_kernels_self_test(char *error, size_t error_capacity);

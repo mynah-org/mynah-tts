@@ -1,10 +1,16 @@
 #include "kernels.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* vvtanhf, used by the array GELU below. */
+#if defined(MYNAH_USE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
 
 #if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__))
 #include <arm_neon.h>
@@ -513,5 +519,105 @@ int mynah_kernels_self_test(char *error, size_t error_capacity) {
         return -1;
     }
     error[0] = '\0';
+    return 0;
+}
+
+/* ---- moved out of graph.c by the E1 split ---------------------------------
+ * These are kernels, not graph structure: a tanh-approximation GELU with a
+ * vForce-accelerated array form, and the NEON axpy that the single-row
+ * attention weighted sum uses. `mynah_gelu_self_test` checks the vForce path
+ * against the scalar one, including the infinities and NaN that vvtanhf has to
+ * agree on; it is a no-op without Accelerate. */
+
+float mynah_gelu_tanh(float x) {
+    const float cubic = x * x * x;
+    const float inner = 0.7978845608028654f * (x + 0.044715f * cubic);
+    return 0.5f * x * (1.0f + tanhf(inner));
+}
+
+void mynah_gelu_tanh_array(float *values, size_t length, float *scratch) {
+#if defined(MYNAH_USE_ACCELERATE)
+    if (scratch != NULL) {
+        for (size_t i = 0; i < length; ++i) {
+            const float x = values[i];
+            const float cubic = x * x * x;
+            scratch[i] = 0.7978845608028654f *
+                         (x + 0.044715f * cubic);
+        }
+        size_t offset = 0;
+        while (offset < length) {
+            const size_t remaining = length - offset;
+            const int batch = remaining > (size_t)INT_MAX
+                ? INT_MAX : (int)remaining;
+            vvtanhf(scratch + offset, scratch + offset, &batch);
+            offset += (size_t)batch;
+        }
+        for (size_t i = 0; i < length; ++i) {
+            values[i] = 0.5f * values[i] * (1.0f + scratch[i]);
+        }
+        return;
+    }
+#else
+    (void)scratch;
+#endif
+    for (size_t i = 0; i < length; ++i) values[i] = mynah_gelu_tanh(values[i]);
+}
+
+/* ---- NEON-accelerated attention primitives --------------------------------
+ * The single-row decoder attention attn·V weighted sum (hw = 64 elements per
+ * position) is vectorised with 4-wide NEON FMA.  The Q·K dot product stays
+ * scalar to preserve the exact greedy argmax path (NEON lane reordering
+ * changes softmax scores enough to flip tokens).  The axpy accumulation
+ * order change is absorbed by downstream layers without affecting EOS.
+ * A scalar fallback is always compiled for portability. */
+
+/* out[0..n) += weight * src[0..n) */
+void mynah_axpy_f32(float *out, const float *src, float weight, size_t n) {
+#if defined(MYNAH_KERNELS_NEON)
+    const float32x4_t w = vdupq_n_f32(weight);
+    size_t i = 0;
+    for (; i + 4u <= n; i += 4u) {
+        float32x4_t o = vld1q_f32(out + i);
+        o = vfmaq_f32(o, w, vld1q_f32(src + i));
+        vst1q_f32(out + i, o);
+    }
+    for (; i < n; ++i) out[i] += weight * src[i];
+#else
+    for (size_t i = 0; i < n; ++i) out[i] += weight * src[i];
+#endif
+}
+
+int mynah_gelu_self_test(char *error, size_t error_capacity) {
+#if defined(MYNAH_USE_ACCELERATE)
+    float values[] = {
+        -INFINITY, -10.0f, -3.0f, -1.0f, -0.25f, -0.0f, 0.0f,
+        0.125f, 0.5f, 1.0f, 2.0f, 3.0f, 8.0f, INFINITY, NAN,
+        -6.75f, 0.03125f, 4.5f, -2.125f
+    };
+    float expected[sizeof(values) / sizeof(values[0])];
+    float scratch[sizeof(values) / sizeof(values[0])];
+    const size_t count = sizeof(values) / sizeof(values[0]);
+    for (size_t i = 0; i < count; ++i) expected[i] = mynah_gelu_tanh(values[i]);
+    mynah_gelu_tanh_array(values, count, scratch);
+    for (size_t i = 0; i < count; ++i) {
+        if (isnan(expected[i])) {
+            if (isnan(values[i])) continue;
+        } else if (isinf(expected[i])) {
+            if (isinf(values[i]) && signbit(values[i]) == signbit(expected[i])) continue;
+        } else {
+            const float tolerance = 2.0e-6f * (1.0f + fabsf(expected[i]));
+            if (fabsf(values[i] - expected[i]) <= tolerance) continue;
+        }
+        if (error != NULL && error_capacity > 0) {
+            snprintf(error, error_capacity,
+                     "vForce GELU mismatch at %zu: got %.9g expected %.9g",
+                     i, (double)values[i], (double)expected[i]);
+        }
+        return -1;
+    }
+#else
+    (void)error;
+    (void)error_capacity;
+#endif
     return 0;
 }

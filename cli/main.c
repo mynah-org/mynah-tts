@@ -476,8 +476,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "qmat self-test failed: %s\n", error);
             return 1;
         }
-        if (mynah_graph_self_test(error, sizeof(error)) != 0) {
-            fprintf(stderr, "graph self-test failed: %s\n", error);
+        if (mynah_gelu_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "GELU self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_graph_bnns_self_test(error, sizeof(error)) != 0) {
