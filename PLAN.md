@@ -162,7 +162,11 @@ Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
 - [ ] E5-4 cancel on disconnect (`POLLRDHUP`), slot freed within one frame
 - [ ] E5-5 long-form: incremental push into a running decode, persistent conv state across flushes
 - [ ] E5-6 prefork pinned on Linux (`SCM_RIGHTS`, CoW after weight load) — needs E4-4
-- [ ] E5-7 `playback_sim` + soak; publish p50/p95 TTFA, prebuffer, stall rate
+- [~] E5-7 serving profile: `tools/serving_profile.py` + `tests/playback_sim.py` —
+      C1/C2/C4/C8 with **TTFB, TTFA, STREAM_RTF, prebuffer, stall rate, max gap**,
+      each p50/p95, and a GOOD/MARGINAL/NOT-STREAMABLE verdict with its thresholds
+      printed so the verdict is falsifiable. Must run against the synthetic pack
+      *and* a PocketTTS pack without assuming the engine.
 - [ ] E5-10 `tests/test_server.sh` `batching` check needs sub-second timing (flaky, pre-existing)
 - [ ] E5-9 **per-language slot groups** — batching cannot mix languages; decide before E5-1
 - [ ] E5-8 gate: **N concurrent streams byte-identical to the same request run alone**
