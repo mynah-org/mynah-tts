@@ -127,7 +127,7 @@ stream-test: $(STREAM_TEST_TARGET)
 	@test -n "$(MODEL_DIR)" || (echo "usage: make stream-test MODEL_DIR=pack" >&2; exit 2)
 	@$(STREAM_TEST_TARGET) "$(MODEL_DIR)"
 
-SERVER_SOURCES := server/main.c server/http_util.c server/stream_out.c
+SERVER_SOURCES := server/main.c server/http_util.c server/stream_out.c server/prefork.c
 SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)
 SERVER_TARGET := $(BUILD_DIR)/mynah-tts-server
 

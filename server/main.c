@@ -53,12 +53,14 @@
  *     cancelled out of it rather than finishing for nobody.
  */
 #include "http_util.h"
+#include "prefork.h"
 #include "stream_out.h"
 
 #include "graph.h"
 #include "mynah_tts.h"
 #include "tokenizer_sentencepiece.h"
 #include "tokenizer.h"
+#include "threads.h"
 
 #include <assert.h>
 
@@ -277,6 +279,13 @@ static void job_release(synth_job *j) {
         fprintf(stderr, "job freed with an unanswered connection: closing fd %d\n", fd);
         close(fd);
     }
+    /* The connection this job owned is finished with. In a prefork worker
+     * that is the parent's only signal that the slot is free, and it must
+     * happen exactly once per connection: a job is built exactly once per
+     * connection that gets past validation, and this is its last reference, so
+     * this line is that "once". Its counterpart, for a connection that never
+     * became a job, is conn_close(). Outside a prefork worker it is a no-op. */
+    mynah_prefork_conn_done();
     free(j->text_ids);
     mynah_tts_free_samples(j->samples);
     pthread_cond_destroy(&j->done_cv);
@@ -970,7 +979,15 @@ static void handle_health(int fd) {
                            "\"failed\":%lu,\"rejected\":%lu,\"timed_out\":%lu},"
                            "\"streams\":{\"active\":%lu,\"total\":%lu},"
                            "\"limits\":{\"max_batch\":%zu,\"queue_capacity\":%zu,"
-                           "\"workers\":%d,\"request_timeout_ms\":%u}}",
+                           "\"workers\":%d,\"request_timeout_ms\":%u},"
+                           /* Which PROCESS answered. Under prefork the counters
+                            * above are that worker's, not the machine's, so a
+                            * caller polling /health samples a different worker
+                            * each time and needs to be told which one. -1 means
+                            * a single-process server, where they are the whole
+                            * picture. */
+                           "\"process\":{\"pid\":%d,\"prefork_worker\":%d,"
+                           "\"synthesis_threads\":%d}}",
                            g.model_id, g.info.engine, g.info.sample_rate,
                            g.voice_count,
                            atomic_load(&g_stats.queued),
@@ -982,7 +999,11 @@ static void handle_health(int fd) {
                            atomic_load(&g_stats.streams_active),
                            atomic_load(&g_stats.streams_total),
                            g.max_batch, g.max_pending, g.worker_count,
-                           g.request_timeout_ms);
+                           g.request_timeout_ms,
+                           (int)getpid(), mynah_prefork_worker_index(),
+                           mynah_prefork_worker_threads() > 0
+                               ? mynah_prefork_worker_threads()
+                               : mynah_num_threads());
     if (n > 0) send_status(fd, "200 OK", "application/json", body, (size_t)n);
 }
 
@@ -1131,9 +1152,20 @@ static int queue_pop(conn_queue *q) {
 
 /* ------------------------------------------------------------- connection */
 
+/* The end of a connection that never became a synthesis job: a validation
+ * refusal, a malformed request, one of the non-synthesis routes. Pairs with
+ * the notification in job_release(); between the two, every descriptor this
+ * worker was handed is reported finished exactly once, which is what the
+ * prefork parent's slot accounting is. */
+static void conn_close(int fd) {
+    if (fd < 0) return;
+    close(fd);
+    mynah_prefork_conn_done();
+}
+
 static void handle_connection(int fd) {
     char *buf = (char *)malloc(MAX_BODY + 8192u);
-    if (buf == NULL) { close(fd); return; }
+    if (buf == NULL) { conn_close(fd); return; }
 
     size_t len = 0;
     const char *head_end = NULL;
@@ -1145,7 +1177,7 @@ static void handle_connection(int fd) {
         head_end = mynah_memmem(buf, len, "\r\n\r\n", 4);
         if (head_end != NULL) break;
     }
-    if (head_end == NULL) { free(buf); close(fd); return; }
+    if (head_end == NULL) { free(buf); conn_close(fd); return; }
 
     const size_t head_len = (size_t)(head_end - buf);
     char length_header[32] = {0};
@@ -1157,7 +1189,7 @@ static void handle_connection(int fd) {
         else if (v > (long)MAX_BODY) {
             send_error(fd, "413 Payload Too Large", "invalid_request_error",
                        "request body too large");
-            free(buf); close(fd); return;
+            free(buf); conn_close(fd); return;
         }
     }
 
@@ -1183,7 +1215,7 @@ static void handle_connection(int fd) {
         send_error(fd, "400 Bad Request", "invalid_request_error",
                    "malformed request line");
         free(buf);
-        close(fd);
+        conn_close(fd);
         return;
     }
 
@@ -1216,7 +1248,7 @@ static void handle_connection(int fd) {
      * (to a job or to the stream writer) or already closed it after replying;
      * closing here as well would land on whatever connection accept() has
      * since given that number. */
-    if (!handed_off) close(fd);
+    if (!handed_off) conn_close(fd);
 }
 
 static void *worker_main(void *arg) {
@@ -1249,11 +1281,55 @@ static void on_signal(int sig) {
     g_shutdown = 1;
 }
 
+/* SIGUSR1 asks for a statistics dump. In a prefork tree the parent gets the
+ * signal, prints its routing table and forwards it to every worker, so one
+ * `kill -USR1 <parent>` produces the whole machine's view: the parent's line
+ * says how work was distributed, each worker's line says what it did with it.
+ * The handler only sets a flag; the printing happens in the accept loop, which
+ * is where it is allowed to call fprintf. */
+static volatile sig_atomic_t g_dump_stats = 0;
+
+static void on_usr1_dump(int sig) {
+    (void)sig;
+    g_dump_stats = 1;
+}
+
+static void dump_local_stats(void) {
+    const int idx = mynah_prefork_worker_index();
+    char who[48];
+    if (idx >= 0) snprintf(who, sizeof(who), "worker %d pid %d", idx, (int)getpid());
+    else snprintf(who, sizeof(who), "server pid %d", (int)getpid());
+    fprintf(stderr,
+            "[%s] queued=%lu active=%lu completed=%lu failed=%lu rejected=%lu "
+            "timed_out=%lu streams=%lu/%lu · threads=%d max_batch=%zu\n",
+            who,
+            atomic_load(&g_stats.queued), atomic_load(&g_stats.active),
+            atomic_load(&g_stats.completed), atomic_load(&g_stats.failed),
+            atomic_load(&g_stats.rejected), atomic_load(&g_stats.timed_out),
+            atomic_load(&g_stats.streams_active), atomic_load(&g_stats.streams_total),
+            mynah_prefork_worker_threads() > 0 ? mynah_prefork_worker_threads()
+                                               : mynah_num_threads(),
+            g.max_batch);
+    fflush(stderr);
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s -m MODEL_DIR [-p PORT] [--host ADDR] [-w WORKERS]\n"
             "       [--device cpu|metal|cuda] [--max-batch N] [--max-pending N]\n"
             "       [--request-timeout-ms MS]\n"
+            "       [--prefork W] [--prefork-threads T] [--prefork-plan]\n"
+            "\n"
+            "  --prefork W        serve from W pinned worker processes instead of one\n"
+            "                     process. The parent loads the pack, forks W workers\n"
+            "                     that share it, routes each connection to the least\n"
+            "                     loaded one, and never synthesizes. Linux pins each\n"
+            "                     worker to its own core slice; elsewhere it runs\n"
+            "                     unpinned and says so.\n"
+            "  --prefork-threads T  pool width per worker. Default: allowed cpus / W,\n"
+            "                     which subscribes the machine exactly once.\n"
+            "  --prefork-plan     print this machine\'s topology and the measurement\n"
+            "                     procedure for choosing W, then exit. No model needed.\n"
             "\n"
             "  POST /v1/audio/speech   {\"input\":\"...\",\"voice\":\"Sofia\"}\n"
             "  POST /v1/tts            {\"text\":\"...\",\"speaker\":\"Sofia\"}\n"
@@ -1271,6 +1347,9 @@ int main(int argc, char **argv) {
     g.max_batch = 8;
     g.max_pending = JOB_QUEUE_CAP;
     g.request_timeout_ms = REQUEST_TIMEOUT_MS;
+    int prefork_workers = 0;
+    int prefork_threads = 0;
+    int prefork_plan_only = 0;
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
@@ -1290,6 +1369,12 @@ int main(int argc, char **argv) {
             const long v = strtol(argv[++i], NULL, 10);
             /* 0 disables the deadline; negative is a typo, not an intent. */
             g.request_timeout_ms = v >= 0 ? (unsigned)v : REQUEST_TIMEOUT_MS;
+        } else if (strcmp(argv[i], "--prefork") == 0 && i + 1 < argc) {
+            prefork_workers = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--prefork-threads") == 0 && i + 1 < argc) {
+            prefork_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--prefork-plan") == 0) {
+            prefork_plan_only = 1;
         } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
             const char *d = argv[++i];
             if (strcmp(d, "metal") == 0) device = MYNAH_TTS_DEVICE_METAL;
@@ -1299,13 +1384,45 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    if (prefork_plan_only) {
+        /* A plan is about the machine, not about a pack: it must work before
+         * anyone has downloaded 219 MB of weights, because the first question
+         * on a new server is "what shape should this be", not "does it run". */
+        mynah_prefork_config plan;
+        memset(&plan, 0, sizeof(plan));
+        plan.listen_fd = -1;
+        plan.workers = prefork_workers;
+        plan.threads_per = prefork_threads;
+        plan.slots_per = (int)g.max_batch;
+        mynah_prefork_print_plan(&plan, stdout);
+        return 0;
+    }
     if (model_dir == NULL || port <= 0 || port > 65535) { usage(argv[0]); return 2; }
+    if (prefork_workers < 0) { usage(argv[0]); return 2; }
     if (g.worker_count < 1) g.worker_count = 1;
     if (g.worker_count > 64) g.worker_count = 64;
     if (g.max_batch < 1u) g.max_batch = 1u;
     if (g.max_batch > mynah_tts_max_batch()) g.max_batch = mynah_tts_max_batch();
 
     signal(SIGPIPE, SIG_IGN);   /* a client hanging up mid-stream is routine */
+
+    /* The prefork plan is resolved HERE, before the pack is opened, and not at
+     * fork time. The shared thread pool resolves its width once, on first use,
+     * and caches it for the life of the process; opening the pack can be that
+     * first use. A setenv("MYNAH_THREADS") after the fork would then be a
+     * silent no-op and every worker would quietly run at the parent's width --
+     * the kind of failure that reads as "prefork did not help" rather than as
+     * a bug. Doing it before the open costs the parent nothing: it never
+     * synthesizes. */
+    mynah_prefork_config pf;
+    memset(&pf, 0, sizeof(pf));
+    pf.listen_fd = -1;
+    pf.workers = prefork_workers;
+    pf.threads_per = prefork_threads;
+    if (prefork_workers > 0) {
+        mynah_prefork_reserve_threads(&pf);
+        prefork_workers = pf.workers;
+    }
 
     char err[512];
     if (mynah_tts_model_open_device(model_dir, device, &g.model, err, sizeof(err)) != 0) {
@@ -1348,19 +1465,10 @@ int main(int argc, char **argv) {
     load_voices(model_dir);
     snprintf(g.model_id, sizeof(g.model_id), "%s-%s", g.info.engine, g.info.revision);
     g.default_speaker = g.voice_count > 0 ? g.voices[0].id : 0u;
-    pthread_mutex_init(&g_batch.mu, NULL);
-    pthread_cond_init(&g_batch.arrived, NULL);
-    if (pthread_create(&g_batch.thread, NULL, scheduler_main, NULL) != 0) {
-        fprintf(stderr, "cannot start the synthesis scheduler\n");
-        mynah_tokenizer_close(g.tokenizer);
-    mynah_sp_close(g.sp);
-        mynah_tts_model_close(g.model);
-        return 1;
-    }
-    g_batch.thread_started = 1;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGUSR1, on_usr1_dump);
 
     const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("socket"); return 1; }
@@ -1383,13 +1491,69 @@ int main(int argc, char **argv) {
     const int listen_flags = fcntl(listen_fd, F_GETFL, 0);
     if (listen_flags >= 0) fcntl(listen_fd, F_SETFL, listen_flags | O_NONBLOCK);
 
+    /* ------------------------------------------------------------- prefork
+     *
+     * This is the last point at which this process is still single-threaded,
+     * and that is exactly why the fork is here. Two constraints pin it:
+     *
+     *   - AFTER the pack is open, so the mapped weights are one physical copy
+     *     behind every worker rather than W copies of 219 MB;
+     *   - BEFORE the scheduler thread, the HTTP workers and the shared pool's
+     *     own threads exist, and before a single synthesis has run, because
+     *     fork() copies only the calling thread: a child of a multi-threaded
+     *     process inherits every mutex in whatever state it was in, including
+     *     locked by a thread that no longer exists.
+     *
+     * A worker comes back from here with a channel instead of a listening
+     * socket and is, from the next line on, an ordinary single-process server.
+     * The parent does not come back at all: it routes until it is asked to
+     * stop and then returns PARENT_DONE with nothing left to unwind but the
+     * pack it loaded for its children. */
+    int chan_fd = -1;
+    int accept_fd = listen_fd;
+    if (prefork_workers > 0) {
+        pf.listen_fd = listen_fd;
+        pf.slots_per = (int)g.max_batch;
+        const mynah_prefork_role role = mynah_prefork_run(&pf, &g_shutdown, &chan_fd);
+        if (role == MYNAH_PREFORK_ERROR) {
+            close(listen_fd);
+            mynah_tokenizer_close(g.tokenizer);
+            mynah_sp_close(g.sp);
+            mynah_tts_model_close(g.model);
+            return 1;
+        }
+        if (role == MYNAH_PREFORK_PARENT_DONE) {
+            /* The router closed the listening socket itself, has no threads to
+             * join and never entered the model. */
+            mynah_tokenizer_close(g.tokenizer);
+            mynah_sp_close(g.sp);
+            mynah_tts_model_close(g.model);
+            return 0;
+        }
+        accept_fd = -1;              /* a worker never accepts; the parent routes */
+    }
+
+    pthread_mutex_init(&g_batch.mu, NULL);
+    pthread_cond_init(&g_batch.arrived, NULL);
+    if (pthread_create(&g_batch.thread, NULL, scheduler_main, NULL) != 0) {
+        fprintf(stderr, "cannot start the synthesis scheduler\n");
+        if (accept_fd >= 0) close(accept_fd);
+        if (chan_fd >= 0) close(chan_fd);
+        mynah_tokenizer_close(g.tokenizer);
+        mynah_sp_close(g.sp);
+        mynah_tts_model_close(g.model);
+        return 1;
+    }
+    g_batch.thread_started = 1;
+
     fprintf(stderr,
             "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu  "
-            "workers=%d  max_batch=%zu  queue=%zu  timeout=%ums\n"
+            "workers=%d  max_batch=%zu  queue=%zu  timeout=%ums%s\n"
             "note: one scheduler thread synthesizes; requests join the running\n"
             "      batch as slots free up, streaming and batch alike\n",
             host, port, g.model_id, mynah_tts_device_name(device), g.voice_count,
-            g.worker_count, g.max_batch, g.max_pending, g.request_timeout_ms);
+            g.worker_count, g.max_batch, g.max_pending, g.request_timeout_ms,
+            chan_fd >= 0 ? "  [prefork worker]" : "");
 
     queue_init(&g_queue);
     pthread_t workers[64];
@@ -1402,27 +1566,52 @@ int main(int argc, char **argv) {
     }
     if (worker_count == 0) { fprintf(stderr, "cannot start workers\n"); return 1; }
 
+    /* Where a connection comes from is the ONLY difference between a
+     * single-process server and a prefork worker. A worker has no listening
+     * socket: the parent accepted, chose it, and passed the descriptor down a
+     * socketpair. Everything after the handover -- the bounded queue, the HTTP
+     * workers, the scheduler, the writer -- is the same code in both shapes,
+     * which is the point: there is no second server to keep in step. */
     while (!g_shutdown) {
-        struct pollfd pfd;
-        pfd.fd = listen_fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        const int ready = poll(&pfd, 1, 200);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (ready == 0) continue;   /* nothing yet: re-read the shutdown flag */
+        if (g_dump_stats) { g_dump_stats = 0; dump_local_stats(); }
 
-        const int fd = accept(listen_fd, NULL, NULL);
-        if (fd < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
-                errno == ECONNABORTED) continue;
-            break;
+        int fd;
+        if (chan_fd >= 0) {
+            fd = mynah_prefork_recv_conn(chan_fd, 200);
+            if (fd == -2) continue;        /* timeout or signal: re-read the flag */
+            if (fd < 0) {
+                /* The parent is gone. Nothing will ever arrive again, so stop
+                 * rather than spin on a dead channel; the requests already in
+                 * flight are finished by the shutdown path below. */
+                fprintf(stderr, "prefork worker %d: the router closed the channel; "
+                                "shutting down\n", mynah_prefork_worker_index());
+                break;
+            }
+        } else {
+            struct pollfd pfd;
+            pfd.fd = accept_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            const int ready = poll(&pfd, 1, 200);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (ready == 0) continue;   /* nothing yet: re-read the shutdown flag */
+
+            fd = accept(accept_fd, NULL, NULL);
+            if (fd < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
+                    errno == ECONNABORTED) continue;
+                break;
+            }
         }
         /* BSD hands the accepted socket the listener's O_NONBLOCK; Linux does
          * not. Clear it either way, because everything downstream reads and
-         * writes this descriptor blocking, with a timeout. */
+         * writes this descriptor blocking, with a timeout. A descriptor that
+         * arrived over SCM_RIGHTS keeps whatever the parent's listener gave it,
+         * so it needs exactly the same treatment -- which is why this is one
+         * block below the branch rather than two copies inside it. */
         const int cf = fcntl(fd, F_GETFL, 0);
         if (cf >= 0) fcntl(fd, F_SETFL, cf & ~O_NONBLOCK);
         /* A client that connects and never sends must not pin a worker
@@ -1441,7 +1630,9 @@ int main(int argc, char **argv) {
                 "Connection: close\r\n\r\n"
                 "{\"error\":{\"message\":\"server busy\",\"type\":\"server_error\"}}";
             (void)!write(fd, busy, strlen(busy));
-            close(fd);
+            /* conn_close, not close: a shed connection is still a connection
+             * the router charged to this worker, and a slot it must get back. */
+            conn_close(fd);
         }
     }
 
@@ -1469,10 +1660,11 @@ int main(int argc, char **argv) {
     /* Connections parked but never picked up: their descriptors are still
      * ours, and this is the last chance to close them. */
     for (int parked = queue_pop(&g_queue); parked >= 0; parked = queue_pop(&g_queue)) {
-        close(parked);
+        conn_close(parked);
     }
 
-    close(listen_fd);
+    if (accept_fd >= 0) close(accept_fd);
+    if (chan_fd >= 0) close(chan_fd);
     mynah_tokenizer_close(g.tokenizer);
     mynah_sp_close(g.sp);
     mynah_tts_model_close(g.model);
