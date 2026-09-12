@@ -75,6 +75,16 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` dropped
       and the reference-implementation traps → [`.work/pocket-tts-model-facts.md`](.work/pocket-tts-model-facts.md)
 - [x] Architecture diff, mynah-tts as-is vs PocketTTS → [`.work/pocket-tts-vs-mynah.md`](.work/pocket-tts-vs-mynah.md)
 - [x] Magpie-era checkpoints and rejected ideas → [`.work/archive-2026-07-checkpoints.md`](.work/archive-2026-07-checkpoints.md)
+- [x] The reference serving design, and the fourteen approaches already falsified
+      there → [`.work/serving-design.md`](.work/serving-design.md)
+- [x] Why `STREAM_RTF < 1` does not mean the player never stops, and the quantum
+      floor → [`.work/streaming-cadence.md`](.work/streaming-cadence.md)
+- [x] The method: cost model before code, every tool declares a refusal, the
+      completion rule → [`.work/engineering-method.md`](.work/engineering-method.md)
+- [x] The dtype hunt is **closed on ARM**; what it found instead were two
+      production-blocking build defects → [`.work/dtype-and-fallbacks.md`](.work/dtype-and-fallbacks.md)
+- [x] BLAS removal: one function, three call sites, two of them ours →
+      [`.work/no-blas.md`](.work/no-blas.md)
 
 ### E1 — Engine seam and the `graph.c` split → [`.work/engine-seam-refactor.md`](.work/engine-seam-refactor.md)
 
@@ -200,9 +210,11 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       here and absent on the target, and the 36x conv-stack win goes through BLAS
 - [ ] E4-12 **fatal ISA guard** — a `-mavx2` binary on a CPU without AVX2 gives an
       opaque SIGILL today. ~15 lines, checked before any allocation
-- [ ] E4-13 **CI `link-only` job** — our x86 CI builds only the default `-mavx2`, which
-      is exactly the configuration in which their tree shipped unlinkable for days.
-      Add `SIMD=scalar`, `SIMD=portable`, `ARCH_FLAGS=-march=armv8-a`
+- [ ] E4-13 **CI `link-only` job — no longer theoretical.** Our x86 CI builds only the
+      default `-mavx2`, which is exactly the configuration in which their tree shipped
+      unlinkable for days; ours shipped unlinkable too, and we found it by hand
+      (E4-19). Add `SIMD=scalar`, `SIMD=portable`, `ARCH_FLAGS=-march=armv8-a`,
+      `BLAS=scalar`, `BLAS=openblas`
 - [ ] E4-14 **flag stamp file in the Makefile** — eight lines; without it `make` then
       `make SIMD=...` without `clean` silently yields a mixed binary
 - [ ] E4-15 **`SIMD=auto` must read `/proc/cpuinfo` on x86**, with the kernel-flag +
@@ -226,6 +238,30 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-18 **arena allocator in the codec before measuring on Linux** — glibc's mmap
       threshold cost them 78 mmap + 154 munmap and 11,899 allocs per request; a
       per-stream bump arena took it to 1.3 and 41, bit-identical. Invisible on macOS
+- [x] E4-19 **two production-blocking defects found and fixed** (`3892ba6`) →
+      [`.work/dtype-and-fallbacks.md`](.work/dtype-and-fallbacks.md). No Linux build
+      linked at HEAD (`mynah_conv1d_sgemm_enabled` trapped inside the Accelerate block
+      by our own E1 split); `MYNAH_QUANT=f16` was a silent no-op on x86, so the 2x we
+      measured on ARM did not exist on the target. x86 now has F16C/AVX2 + scalar half
+      kernels; ARM output byte-identical
+- [ ] E4-20 **`--self-test` fails on x86**: `qmat u8 level=1 not bit-identical at row 3
+      (k=200)`. Pre-existing, from the VNNI commit — that work was never self-tested on
+      x86, which is the whole point of a model-free self-test
+- [ ] E4-21 **`seanet.c` has 12 fallbacks and zero dispatch rows.** With `BLAS=scalar`
+      the entire codec conv stack drops to the hand-scalar loops — the 8570 ms path,
+      **36x slower** — and nothing says so. Also: the depthwise upsample always takes
+      `convtr_scatter_scalar` silently; `conv1d.c:487,530` ignore the sgemm return
+      (NULL backend gives bias-only output, no error); `seanet.c:53-55` narrows
+      `size_t`→`int` six times per call with no guard, where `conv1d.c` has one
+- [ ] E4-22 **438 MB of dead f32.** RSS f32 626 / f16 805 / int8 724 MB: the f32
+      conversion cache stays resident in full while every hot projection is served from
+      f16. ~82M of 109.5M params could go bf16→f16 direct, ~328 MB per pack. Memory, not
+      RTF — but for a prefork server with N resident languages it is the dominant term.
+      Measure PSS, not RSS: weights are quantised before the fork and shared CoW
+- [ ] E4-23 **the conversion hunt is closed on ARM, do not re-run it** — every hot-path
+      conversion measures under 3% against a 20% bar, f16 runs at 1.96x against a
+      2.00x byte ratio (so the in-loop convert is free), and every memcpy in the process
+      together is 0.4% of samples. The wall is weight bytes. `matvec_f16` alone is 81%
 - [ ] E4-9 **Linux is the target, so measure there**: runtime ISA dispatch on x86 (a
       binary that picks VNNI/AMX when the CPU has them and does not SIGILL when it
       does not), OpenBLAS thread-count coordination with our pool, a CI matrix that
