@@ -208,11 +208,18 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-15 **`SIMD=auto` must read `/proc/cpuinfo` on x86**, with the kernel-flag +
       `cc_ok` double test and a printed resolved profile. Value is in VNNI and
       AVX-512 BF16; AMX costs far more for less (their AMX 8c does C2, VNNI 32c C12)
-- [ ] E4-16 **BLAS: structural ownership, not a weak symbol** — pin OpenBLAS to 1
-      thread and slice on our pool, override a stale `OPENBLAS_NUM_THREADS` and report
-      it, and distinguish claim from fact. Plus `OPENBLAS_THREAD_TIMEOUT=1`: TTFA 108 ms
-      **bimodal** to 66 ms stable, 42.5k to 12k context switches/s. Do **not** partition
-      rigidly — lowering BLAS threads improves RTF and costs 30% of TTFA
+- [ ] E4-16 **write `mynah_sgemm_f32` and drop the BLAS dependency** → [`.work/no-blas.md`](.work/no-blas.md)
+      Decided: we do not want a second thread pool inside our process. The surface is
+      one function (`cblas_sgemm`) at three call sites, and **the whole PocketTTS
+      production path is two of them, both in `seanet.c`** — the backbone and flow head
+      already go through `qmat`. Skinny shapes, `n` large, `k` small. Removal also
+      deletes the weak-symbol clamp in `threads.c`, three dispatch rows, and the
+      three-way Makefile split
+- [ ] E4-16a **interim, while BLAS is still linked**: `OPENBLAS_THREAD_TIMEOUT=1` —
+      TTFA 108 ms **bimodal** to 66 ms stable, 42.5k to 12k context switches/s — and
+      report claim vs fact in the dispatch table. Do **not** partition rigidly:
+      lowering BLAS threads improves RTF and costs 30% of TTFA. This is compensation
+      for a dependency we are removing, not a design
 - [ ] E4-17 **plan from `sched_getaffinity`, not `sysconf`** — `sysconf` sees neither an
       inherited taskset nor a cpuset cgroup, so every containerised deployment plans the
       whole host. Also read cgroup v2 `cpu.max` and warn (they never closed that one)
@@ -231,6 +238,15 @@ Design reference: [`.work/serving-design.md`](.work/serving-design.md) ·
 doctrine: [`.work/serving-doctrine.md`](.work/serving-doctrine.md)
 
 Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
+
+**Do not build these** — each was built, measured and lost in the reference
+implementation; the mechanism of each failure is architectural, not host-specific
+([`.work/serving-design.md`](.work/serving-design.md) §9): global cross-worker
+batching (useful coincidence 1.6% at ±0.25 ms against a 25% bar), any
+fairness/credit gate (parks 95.8% of checks, 0.838 → 0.986), a priority-based
+prefill helper (TTFA 435 → 2379 ms), utilization-aware admission (stall@250
+0 → 50%), a second submitter on the engine pool (TTFA 167 → 1200 ms), and a wide
+single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 
 - [ ] E5-1 **remove the global stream mutex** (`server/main.c:451-460`) — scheduler owns `ctx`
 - [ ] E5-2 streaming requests enter the same slot driver as offline; no second path
@@ -263,6 +279,31 @@ Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
       and three campaigns were still run wrong from memory
 - [ ] E5-12 **prefork with pinned core slices** (E5-6) is the mechanism that turns
       cores into streams; without the topology, more cores are not more streams
+- [ ] E5-16 **the measurement protocol, before any tuning** → [`.work/serving-design.md`](.work/serving-design.md) §10.
+      WAVE (3 synchronised waves) is a *screen*; only a 5-30 min SOAK with a drift gate
+      promotes. Their C16 passed the screen at 0.919 and failed the soak at 1.004 with
+      596 rejects. Gate on **audio too**: their whole "all-on" ARM profile was faster
+      and was rejected at mel-correlation 0.886-0.945 against 0.98
+- [ ] E5-17 **send the response header at admission, not at the first chunk** — otherwise
+      TTFB equals TTFA and the entire prefill cost is invisible to the client metric
+      (theirs: TTFB p50/p95 0.4/0.6 ms vs TTFA 82.6/84.2)
+- [ ] E5-18 **`TCP_NODELAY` + `SO_RCVTIMEO` on every accepted socket**; coalesced reads
+      6.7% → 0.0%. And **name every thread** for `/proc`: free, and it makes the
+      ownership table readable without a debugger
+- [ ] E5-19 **keep polling the listener while full, and refuse** — a full server that
+      stops accepting hides the wait in the kernel backlog where no deadline can see
+      it. Theirs measured TTFB/TTFA p95 4470/4635 ms of which >97% was before `accept()`
+- [ ] E5-20 **warm up through the same reset the request path uses** — theirs warmed on
+      leftover CLI state and the first real request differed from every one after it
+- [ ] E5-21 **decoder lane: a private pinned team on the last N cpus**, own submit lock,
+      bounded one-unit-per-slot mailbox, redirection done inside `parallel()` by a
+      thread-local tag. Only **after** E5-1/E5-6/E5-12: on a narrow lane it is slower
+      than inline (theirs: 6+2 gave 1.364 vs 0.997 at 4+4). Our decoder is 72% of the
+      frame and per-slot — the same position theirs was in
+- [ ] E5-22 **spin budget and per-CCX bandwidth, measured on our host before choosing W** —
+      their spin sweep moved STREAM p95 0.893 → 0.808 with context switches 38k → 7.6k/s,
+      and their 16-thread mask read *slower cache-resident than DRAM* because the working
+      set straddled two CCX. Both are ten-minute measurements
 - [ ] E5-8 gate: **N concurrent streams byte-identical to the same request run alone**
 
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)
