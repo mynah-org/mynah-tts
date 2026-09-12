@@ -298,7 +298,16 @@ wants a 64-core box. With it, a 32-core box returns to the conversation.
       delayed to build a bigger gang. The cadence law forbids withholding ready work
 - [~] E8-3 `step_live()` fails **all** live slots when one slot errors. Harmless at
       width 1, sixteen requests wide once batching is on
-- [ ] E8-4 `engine_pocket` implements the override, after the batching merge lands
+- [x] E8-3 done in the batching merge (`0d944e9`): a request that exhausts its step
+      budget retires as EOS instead of failing every live slot
+- [ ] E8-4 `engine_pocket` implements the `decode_audio_batch` override
+- [ ] E8-5 **`mynah_qmat_linear_batched_qt`** — the batched twin of
+      `mynah_qmat_linear_resolved_qt`. `mynah_qmat_linear_batched` takes no qtype: it
+      gates on the cache's own and creates a first-touch entry there, so a group
+      carrying an explicit encoding is kept off the weight-stationary path to avoid a
+      first-touch race deciding its precision. Consequence today: under
+      `MYNAH_QUANT=int8` the backbone and flow head (`:f16` in the default spec) fall
+      off the batched path. One function removes the restriction
 
 ### E5 — Streaming server v2 → [`.work/streaming-server-v2.md`](.work/streaming-server-v2.md)
 Design reference: [`.work/serving-design.md`](.work/serving-design.md) ·
@@ -339,7 +348,11 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       printed so the verdict is falsifiable. Must run against the synthetic pack
       *and* a PocketTTS pack without assuming the engine.
 - [ ] E5-10 `tests/test_server.sh` `batching` check needs sub-second timing (flaky, pre-existing)
-- [ ] E5-9 **per-language slot groups** — batching cannot mix languages; decide before E5-1
+- [ ] E5-9 **per-language slot groups** — batching cannot mix languages. Not a
+      transport change: `mynah_graph_serve_continuous()` binds one model for the
+      scheduler's life and `language` is only a tokenizer argument, never a routing
+      key. Needs a model registry in the driver, or one process per language in
+      `server/prefork.c` — decide which before building either
 - [ ] E5-11 **admission control against a real-time budget**. Measured: the machine
       sustains ~3x real time aggregate, so at C8 each stream gets 0.35x and stalls.
       There is no setting that makes them all GOOD — only the choice between waiting
