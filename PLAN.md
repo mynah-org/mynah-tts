@@ -148,11 +148,13 @@ Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
 
 - [ ] E5-1 **remove the global stream mutex** (`server/main.c:451-460`) — scheduler owns `ctx`
 - [ ] E5-2 streaming requests enter the same slot driver as offline; no second path
-- [ ] E5-3 async output writer: dedicated thread, bounded queue, send timeout, counters
+- [x] E5-3 async output writer **done** (`server/stream_out.{c,h}`): a slow client blocked
+      the whole process for 66.5 s, now 4.81 s; leaks/ASan/UBSan/TSan clean
 - [ ] E5-4 cancel on disconnect (`POLLRDHUP`), slot freed within one frame
 - [ ] E5-5 long-form: incremental push into a running decode, persistent conv state across flushes
 - [ ] E5-6 prefork pinned on Linux (`SCM_RIGHTS`, CoW after weight load) — needs E4-4
 - [ ] E5-7 `playback_sim` + soak; publish p50/p95 TTFA, prebuffer, stall rate
+- [ ] E5-10 `tests/test_server.sh` `batching` check needs sub-second timing (flaky, pre-existing)
 - [ ] E5-9 **per-language slot groups** — batching cannot mix languages; decide before E5-1
 - [ ] E5-8 gate: **N concurrent streams byte-identical to the same request run alone**
 

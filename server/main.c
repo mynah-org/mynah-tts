@@ -21,8 +21,15 @@
  *
  * Streaming still runs one request at a time (it needs its callback interleaved
  * with generation) and takes the same lock, so it never overlaps a batch.
+ *
+ * Socket I/O for a stream does NOT run on the synthesis thread: the callback
+ * only copies PCM into a bounded queue and a dedicated writer thread owns the
+ * fd from there on (server/stream_out.c). A client that stops reading loses its
+ * own stream and nothing else -- before this, it held the synthesis lock for
+ * the whole SO_SNDTIMEO.
  */
 #include "http_util.h"
+#include "stream_out.h"
 
 #include "mynah_tts.h"
 #include "tokenizer.h"
@@ -311,60 +318,37 @@ static int16_t to_pcm16(float v) {
 
 /* --------------------------------------------------------------- streaming */
 
-typedef struct {
-    int fd;
-    int failed;
-    int failure_errno;   /* why the write failed, for the log */
-    size_t sent_bytes;   /* how far the stream got before it stopped */
-} stream_sink;
-
-/* One HTTP chunk per callback: the caller already emits stable causal
- * prefixes, so a chunk is exactly what has become final. */
+/* The whole streaming sink: hand the samples to the writer thread and return.
+ * The caller already emits stable causal prefixes, so one call is exactly what
+ * has become final; the writer decides how that maps onto HTTP chunks.
+ *
+ * Returning -1 aborts synthesis, which is what a full queue or a dead socket
+ * must do -- backpressure here is cancellation, never a blocking write. */
 static int stream_callback(const float *samples, size_t count, void *user_data) {
-    stream_sink *sink = (stream_sink *)user_data;
-    if (sink->failed || count == 0) return sink->failed ? -1 : 0;
-
-    int16_t *pcm = (int16_t *)malloc(count * sizeof(*pcm));
-    if (pcm == NULL) {
-        sink->failed = 1;
-        sink->failure_errno = ENOMEM;
-        return -1;
-    }
-    for (size_t i = 0; i < count; ++i) pcm[i] = to_pcm16(samples[i]);
-
-    char size_line[32];
-    const int n = snprintf(size_line, sizeof(size_line), "%zx\r\n",
-                           count * sizeof(*pcm));
-    if (n <= 0 ||
-        write_all(sink->fd, size_line, (size_t)n) != 0 ||
-        write_all(sink->fd, pcm, count * sizeof(*pcm)) != 0 ||
-        write_all(sink->fd, "\r\n", 2) != 0) {
-        sink->failed = 1;
-        sink->failure_errno = errno;
-        free(pcm);
-        return -1;
-    }
-    sink->sent_bytes += count * sizeof(*pcm);
-    free(pcm);
-    return 0;
+    stream_out *out = (stream_out *)user_data;
+    if (count == 0) return stream_out_failed(out) ? -1 : 0;
+    return stream_out_enqueue(out, samples, count);
 }
 
 /* ------------------------------------------------------------------ routes */
 
 /* Serves both the OpenAI shape ("input"/"voice") and the native one
- * ("text"/"speaker"), so a caller need not pretend to be OpenAI to be clear. */
-static void handle_speech(int fd, const char *body) {
+ * ("text"/"speaker"), so a caller need not pretend to be OpenAI to be clear.
+ *
+ * Returns 1 when the fd has been handed to the stream writer and the caller
+ * must neither write to it nor close it, 0 when the fd is still the caller's. */
+static int handle_speech(int fd, const char *body) {
     char text[MAX_TEXT];
     if (mynah_json_string(body, "input", text, sizeof(text)) != 0 &&
         mynah_json_string(body, "text", text, sizeof(text)) != 0) {
         send_error(fd, "400 Bad Request", "invalid_request_error",
                    "missing 'input' (or 'text')");
-        return;
+        return 0;
     }
     if (text[0] == '\0') {
         send_error(fd, "400 Bad Request", "invalid_request_error",
                    "empty 'input'");
-        return;
+        return 0;
     }
 
     char voice[64] = {0};
@@ -375,7 +359,7 @@ static void handle_speech(int fd, const char *body) {
     if (resolve_voice(voice, &speaker) != 0) {
         send_error(fd, "400 Bad Request", "invalid_request_error",
                    "unknown 'voice' — GET /v1/voices lists the available ones");
-        return;
+        return 0;
     }
 
     char language[16] = "en";
@@ -389,7 +373,7 @@ static void handle_speech(int fd, const char *body) {
          * mp3/opus/aac/flac would need an encoder this runtime does not embed. */
         send_error(fd, "400 Bad Request", "invalid_request_error",
                    "response_format must be 'wav' or 'pcm'");
-        return;
+        return 0;
     }
 
     int stream = 0;
@@ -410,7 +394,7 @@ static void handle_speech(int fd, const char *body) {
     if (mynah_tokenizer_encode(g.tokenizer, language, text, &ids, &id_count,
                                err, sizeof(err)) != 0) {
         send_error(fd, "400 Bad Request", "invalid_request_error", err);
-        return;
+        return 0;
     }
 
     mynah_tts_request request;
@@ -426,7 +410,8 @@ static void handle_speech(int fd, const char *body) {
 
     if (stream) {
         /* Chunked PCM: the client gets audio as it is produced. A WAV header
-         * needs the total length up front, so streaming is raw PCM only. */
+         * needs the total length up front, so streaming is raw PCM only. The
+         * header itself is sent by the writer thread, not from here. */
         char head[512];
         const int hn = snprintf(head, sizeof(head),
                                 "HTTP/1.1 200 OK\r\n"
@@ -438,9 +423,25 @@ static void handle_speech(int fd, const char *body) {
                                 "Access-Control-Allow-Origin: *\r\n"
                                 "Connection: close\r\n\r\n",
                                 g.info.sample_rate);
-        if (hn <= 0 || write_all(fd, head, (size_t)hn) != 0) { free(ids); return; }
+        if (hn <= 0) {
+            free(ids);
+            send_error(fd, "500 Internal Server Error", "server_error",
+                       "cannot build the response header");
+            return 0;
+        }
 
-        stream_sink sink = {fd, 0, 0, 0};
+        /* From here the fd belongs to the writer thread: it sends the header,
+         * the chunks and the terminator, then closes. Nothing below may write
+         * to it or close it -- that double close is the whole hazard of
+         * handing a descriptor to a detached thread. */
+        stream_out *out = stream_out_start(fd, head);
+        if (out == NULL) {
+            free(ids);
+            send_error(fd, "500 Internal Server Error", "server_error",
+                       "cannot start the stream writer");
+            return 0;
+        }
+
         mynah_tts_stream *st = NULL;
         /* The stream takes its text through push(), not through the request:
          * leaving text_ids set here would feed the same tokens twice and
@@ -450,7 +451,7 @@ static void handle_speech(int fd, const char *body) {
         stream_request.text_length = 0;
         pthread_mutex_lock(&g.synth_lock);
         int rc = mynah_tts_stream_open(g.model, &stream_request, STREAM_CHUNK,
-                                       stream_callback, &sink, &st,
+                                       stream_callback, out, &st,
                                        err, sizeof(err));
         if (rc == 0) {
             rc = mynah_tts_stream_push(st, ids, id_count, err, sizeof(err));
@@ -460,22 +461,19 @@ static void handle_speech(int fd, const char *body) {
         pthread_mutex_unlock(&g.synth_lock);
         free(ids);
 
-        /* Terminate the chunked body either way; a mid-stream failure cannot
-         * become an HTTP status because the header is long gone. */
-        write_all(fd, "0\r\n\r\n", 5);
-        /* A stream that stops early must never be silent: this used to return
-         * without a word when the socket write was what failed, which makes a
-         * truncated response indistinguishable from a short utterance. */
-        if (sink.failed) {
-            fprintf(stderr, "stream aborted after %zu bytes: %s\n",
-                    sink.sent_bytes,
-                    sink.failure_errno != 0 ? strerror(sink.failure_errno)
-                                            : "client write failed");
-        } else if (rc != 0) {
-            fprintf(stderr, "stream failed after %zu bytes: %s\n",
-                    sink.sent_bytes, err);
+        /* Hand the tail of the response to the writer and let go. A mid-stream
+         * failure cannot become an HTTP status because the header is long
+         * gone, so the writer terminates the body or truncates it. */
+        stream_out_finish(out);
+        if (rc != 0 && !stream_out_failed(out)) {
+            /* A synthesis failure, not a client one: the writer logs its own. */
+            stream_out_stats stats;
+            stream_out_get_stats(out, &stats);
+            fprintf(stderr, "stream failed after %lu queued chunks: %s\n",
+                    stats.enqueued_chunks, err);
         }
-        return;
+        stream_out_release(out);
+        return 1;
     }
 
     synth_ticket ticket;
@@ -487,7 +485,7 @@ static void handle_speech(int fd, const char *body) {
     free(ids);
     if (rc != 0) {
         send_error(fd, "500 Internal Server Error", "server_error", ticket.error);
-        return;
+        return 0;
     }
 
     const size_t pcm_bytes = count * sizeof(int16_t);
@@ -495,7 +493,7 @@ static void handle_speech(int fd, const char *body) {
     if (out == NULL) {
         mynah_tts_free_samples(samples);
         send_error(fd, "500 Internal Server Error", "server_error", "out of memory");
-        return;
+        return 0;
     }
     size_t offset = 0;
     if (!want_pcm) {
@@ -509,6 +507,7 @@ static void handle_speech(int fd, const char *body) {
     send_status(fd, "200 OK", want_pcm ? "audio/pcm" : "audio/wav",
                 (const char *)out, offset + pcm_bytes);
     free(out);
+    return 0;
 }
 
 static void handle_voices(int fd) {
@@ -641,6 +640,11 @@ static void handle_connection(int fd) {
     buf[len] = '\0';
     char *body = buf + head_len + 4u;
 
+    /* Set when a route has handed the descriptor to another owner (the stream
+     * writer thread). Closing it here as well would be a double close, and the
+     * number it names may already belong to a different connection. */
+    int handed_off = 0;
+
     if (strncmp(buf, "OPTIONS ", 8) == 0) {
         const char *pre =
             "HTTP/1.1 204 No Content\r\n"
@@ -651,7 +655,7 @@ static void handle_connection(int fd) {
         write_all(fd, pre, strlen(pre));
     } else if (strncmp(buf, "POST /v1/audio/speech", 21) == 0 ||
                strncmp(buf, "POST /v1/tts", 12) == 0) {
-        handle_speech(fd, body);
+        handed_off = handle_speech(fd, body);
     } else if (strncmp(buf, "GET /v1/voices", 14) == 0) {
         handle_voices(fd);
     } else if (strncmp(buf, "GET /v1/models", 14) == 0) {
@@ -663,7 +667,7 @@ static void handle_connection(int fd) {
     }
 
     free(buf);
-    close(fd);
+    if (!handed_off) close(fd);
 }
 
 static void *worker_main(void *arg) {

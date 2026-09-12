@@ -17,13 +17,37 @@ checks that a mid-flight arrival is *served*, in the **next** batch.
 So removing the global mutex is **not** the first step, and on its own would not
 buy concurrency. The first step is giving the driver a sink with `next_job`.
 
-## A defect that exists today
+## The defect that existed, and was worse than stated — fixed 2026-09-12
 
-`stream_callback` (`server/main.c:339-341`) does three **blocking** socket
-writes from the synthesis thread, inside the `g.synth_lock` critical section
-(`:451-460`), on a fd with `SO_SNDTIMEO` of 30 s (`:800`). **A client that stops
-reading blocks the entire process for 30 seconds.** Not a future risk — current
-behaviour, and the strongest argument for doing the async writer early.
+`stream_callback` did three **blocking** socket writes from the synthesis
+thread, inside the `g.synth_lock` critical section, on a fd with `SO_SNDTIMEO`
+of 30 s. This note used to say that blocked the process for 30 seconds. **It was
+unbounded**: the old `write_all` restarted a fresh `SO_SNDTIMEO` on every
+partial send, so a client that reads slowly rather than not at all extends the
+stall indefinitely. Measured at **66.5 s** before anyone gave up.
+
+Fixed by `server/stream_out.{c,h}` (E5 step 3). Same scenario, measured:
+
+| | second client served after |
+|---|---|
+| before (synchronous writes under the lock) | **66.50 s** |
+| after (async writer, 1 MiB queue) | **4.81 s** |
+| after (64 KiB queue, hits the cancel path) | **2.64 s** |
+
+The residual 4.81 s is the synthesis itself: `g.synth_lock` is still there, by
+design, until step 4.
+
+Implementation note worth keeping: the queue is a **single-byte ring**, not a
+list of malloc'd chunks, which is the only way to get "no malloc per chunk"
+honestly — one allocation at start, PCM16 conversion into a reused scratch
+*outside* the lock, then a memcpy into the ring under it. The writer writes
+straight from the ring **without the lock**, which is safe because `queued` only
+shrinks once a write completes, so the producer can never touch the region in
+flight. ThreadSanitizer was run specifically to validate that. A side benefit is
+that the writer coalesces a backlog into one HTTP chunk.
+
+An aborted stream is never silent: the server logs the byte count, the queue
+high-water mark and the refusal count.
 
 ## What to port, and what it depends on
 
@@ -239,3 +263,13 @@ path is a broken path.
 - `make leaks` and `make ubsan` clean.
 
 Out of scope: TLS, auth, HTTP/2, WebSocket, Opus, GPU.
+
+## Pre-existing test flakiness, to not mistake for a regression
+
+`tests/test_server.sh`'s `batching` check compares wall-clock times taken with
+`date +%s` — one-second granularity — on a synthetic workload that runs in about
+200 ms. Over 20 runs per binary it failed 1/20 before the async writer and 3/20
+after, with the identical message ("four concurrent requests (1 s) were slower
+than four serial (0 s)"). That check makes no streaming request at all, so the
+writer cannot affect it; the check needs sub-second timing, not the writer needs
+fixing. Filed here so the next person does not bisect it.
