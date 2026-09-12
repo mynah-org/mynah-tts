@@ -342,11 +342,28 @@ int mynah_flow_head_check_weights(const mynah_flow_head *head,
 
 /* ---------------------------------------------------------------- forward */
 
+/* One projection, routed through the engine's override when there is one.
+ * Identical to mynah_matvec_bias_f32 otherwise -- and identical *numerically*
+ * when the override declines to quantize this kind, which is what makes a
+ * per-group parity measurement mean something. */
+static int flow_linear(const mynah_flow_head_weights *weights, size_t index,
+                       mynah_flow_linear_kind kind,
+                       const mynah_flow_linear *linear, const float *in,
+                       float *out, size_t n, size_t k) {
+    if (weights->linear != NULL) {
+        return weights->linear(weights->linear_user, index, kind, linear->weight,
+                               linear->bias, in, out, k, n);
+    }
+    mynah_matvec_bias_f32(linear->weight, in, linear->bias, out, n, k);
+    return 0;
+}
+
 /* TimestepEmbedder: args = t * freqs; emb = cat([cos(args), sin(args)]);
  * mlp = Linear, SiLU, Linear, variance-RMSNorm. */
-static void flow_timestep_embed(mynah_flow_head *head,
-                                const mynah_flow_time_embed_weights *weights,
-                                float t, float *out) {
+static int flow_timestep_embed(mynah_flow_head *head,
+                               const mynah_flow_head_weights *all,
+                               size_t index, float t, float *out) {
+    const mynah_flow_time_embed_weights *weights = &all->time_embed[index];
     const size_t half = head->half;
     const size_t hidden = head->config.hidden_dim;
     for (size_t i = 0; i < half; ++i) {
@@ -354,14 +371,19 @@ static void flow_timestep_embed(mynah_flow_head *head,
         head->emb[i] = cosf(arg);        /* cos first, then sin */
         head->emb[half + i] = sinf(arg);
     }
-    mynah_matvec_bias_f32(weights->mlp_in.weight, head->emb,
-                          weights->mlp_in.bias, head->scratch, hidden,
-                          head->config.freq_embed_dim);
+    if (flow_linear(all, index, MYNAH_FLOW_LINEAR_TIME_MLP_IN, &weights->mlp_in,
+                    head->emb, head->scratch, hidden,
+                    head->config.freq_embed_dim) != 0) {
+        return -1;
+    }
     mynah_flow_silu_f32(head->scratch, head->scratch, hidden);
-    mynah_matvec_bias_f32(weights->mlp_out.weight, head->scratch,
-                          weights->mlp_out.bias, out, hidden, hidden);
+    if (flow_linear(all, index, MYNAH_FLOW_LINEAR_TIME_MLP_OUT, &weights->mlp_out,
+                    head->scratch, out, hidden, hidden) != 0) {
+        return -1;
+    }
     mynah_flow_var_rmsnorm_f32(out, weights->alpha, out, hidden,
                                head->config.rmsnorm_eps);
+    return 0;
 }
 
 static int flow_time_cache_hit(const mynah_flow_head *head,
@@ -387,15 +409,19 @@ int mynah_flow_head_forward(mynah_flow_head *head,
     if (config->num_time_conds > 0 && times == NULL) return -1;
 
     /* y = cond_embed(c) + sum(time_embed[i](t_i)) / num_time_conds */
-    mynah_matvec_bias_f32(weights->cond_embed.weight, cond,
-                          weights->cond_embed.bias, head->y, hidden,
-                          config->cond_dim);
+    if (flow_linear(weights, 0u, MYNAH_FLOW_LINEAR_COND_EMBED,
+                    &weights->cond_embed, cond, head->y, hidden,
+                    config->cond_dim) != 0) {
+        return -1;
+    }
     if (config->num_time_conds > 0) {
         if (!flow_time_cache_hit(head, times)) {
             memset(head->y_time, 0, hidden * sizeof(float));
             for (size_t i = 0; i < config->num_time_conds; ++i) {
-                flow_timestep_embed(head, &weights->time_embed[i], times[i],
-                                    head->hidden);
+                if (flow_timestep_embed(head, weights, i, times[i],
+                                        head->hidden) != 0) {
+                    return -1;
+                }
                 for (size_t j = 0; j < hidden; ++j) {
                     head->y_time[j] += head->hidden[j];
                 }
@@ -411,17 +437,20 @@ int mynah_flow_head_forward(mynah_flow_head *head,
     }
 
     /* x = input_proj(noise) */
-    mynah_matvec_bias_f32(weights->input_proj.weight, noise,
-                          weights->input_proj.bias, head->x, hidden, latent);
+    if (flow_linear(weights, 0u, MYNAH_FLOW_LINEAR_INPUT_PROJ,
+                    &weights->input_proj, noise, head->x, hidden, latent) != 0) {
+        return -1;
+    }
 
     /* SiLU(y) is shared by every adaLN_modulation. */
     mynah_flow_silu_f32(head->y, head->silu, hidden);
 
     for (size_t b = 0; b < config->depth; ++b) {
         const mynah_flow_res_block_weights *block = &weights->res_blocks[b];
-        mynah_matvec_bias_f32(block->adaln.weight, head->silu,
-                              block->adaln.bias, head->mod, 3u * hidden,
-                              hidden);
+        if (flow_linear(weights, b, MYNAH_FLOW_LINEAR_BLOCK_ADALN, &block->adaln,
+                        head->silu, head->mod, 3u * hidden, hidden) != 0) {
+            return -1;
+        }
         const float *shift = head->mod;
         const float *scale = head->mod + hidden;
         const float *gate = head->mod + 2u * hidden;
@@ -431,12 +460,17 @@ int mynah_flow_head_forward(mynah_flow_head *head,
                                  config->layernorm_eps);
         mynah_flow_modulate_f32(head->norm, shift, scale, head->norm, hidden);
 
-        mynah_matvec_bias_f32(block->mlp_in.weight, head->norm,
-                              block->mlp_in.bias, head->hidden, hidden, hidden);
+        if (flow_linear(weights, b, MYNAH_FLOW_LINEAR_BLOCK_MLP_IN,
+                        &block->mlp_in, head->norm, head->hidden, hidden,
+                        hidden) != 0) {
+            return -1;
+        }
         mynah_flow_silu_f32(head->hidden, head->hidden, hidden);
-        mynah_matvec_bias_f32(block->mlp_out.weight, head->hidden,
-                              block->mlp_out.bias, head->scratch, hidden,
-                              hidden);
+        if (flow_linear(weights, b, MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT,
+                        &block->mlp_out, head->hidden, head->scratch, hidden,
+                        hidden) != 0) {
+            return -1;
+        }
 
         for (size_t i = 0; i < hidden; ++i) {
             head->x[i] += gate[i] * head->scratch[i];
@@ -444,15 +478,20 @@ int mynah_flow_head_forward(mynah_flow_head *head,
     }
 
     /* final: norm_final has no affine parameters. */
-    mynah_matvec_bias_f32(weights->final_adaln.weight, head->silu,
-                          weights->final_adaln.bias, head->mod, 2u * hidden,
-                          hidden);
+    if (flow_linear(weights, 0u, MYNAH_FLOW_LINEAR_FINAL_ADALN,
+                    &weights->final_adaln, head->silu, head->mod, 2u * hidden,
+                    hidden) != 0) {
+        return -1;
+    }
     mynah_flow_layernorm_f32(head->x, NULL, NULL, head->norm, hidden,
                              config->layernorm_eps);
     mynah_flow_modulate_f32(head->norm, head->mod, head->mod + hidden,
                             head->norm, hidden);
-    mynah_matvec_bias_f32(weights->final_linear.weight, head->norm,
-                          weights->final_linear.bias, out, latent, hidden);
+    if (flow_linear(weights, 0u, MYNAH_FLOW_LINEAR_FINAL_LINEAR,
+                    &weights->final_linear, head->norm, out, latent,
+                    hidden) != 0) {
+        return -1;
+    }
     return 0;
 }
 

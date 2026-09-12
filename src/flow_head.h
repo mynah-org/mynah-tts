@@ -90,6 +90,43 @@ typedef struct {
     mynah_flow_linear mlp_out;  /* [hidden_dim][hidden_dim]   */
 } mynah_flow_res_block_weights;
 
+/* ------------------------------------------------- optional linear override
+ *
+ * The same contract `transformer_ar` uses, and for the same reason: this
+ * module owns no weight cache and formats no tensor name, so an engine that
+ * wants a quantized projection installs it from outside.  `index` separates
+ * the repeated kinds -- time condition i, residual block b -- and is 0 for the
+ * singletons.
+ *
+ * The callee must compute exactly what `mynah_matvec_bias_f32` computes:
+ *     out[n] = in[k] @ weight[n][k]^T + (bias ? bias[n] : 0)
+ * Returning non-zero fails the forward.  NULL (what a zeroed weights struct
+ * has) keeps the f32 matvec, so nothing here changes until an engine opts in.
+ *
+ * NOTE on the flow head specifically: `input_proj` reads a latent_dim (32)
+ * activation and `final_linear` writes one.  A per-row absmax int8 over k = 32
+ * is a different numerical proposition from one over k = 1024, which is why
+ * the engine is allowed to quantize these kinds individually rather than as
+ * one block. */
+typedef enum {
+    MYNAH_FLOW_LINEAR_TIME_MLP_IN = 0, /* [hidden][freq_embed], per cond    */
+    MYNAH_FLOW_LINEAR_TIME_MLP_OUT,    /* [hidden][hidden], per cond        */
+    MYNAH_FLOW_LINEAR_COND_EMBED,      /* [hidden][cond_dim]                */
+    MYNAH_FLOW_LINEAR_INPUT_PROJ,      /* [hidden][latent_dim]              */
+    MYNAH_FLOW_LINEAR_BLOCK_ADALN,     /* [3*hidden][hidden], per block     */
+    MYNAH_FLOW_LINEAR_BLOCK_MLP_IN,    /* [hidden][hidden], per block       */
+    MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT,   /* [hidden][hidden], per block       */
+    MYNAH_FLOW_LINEAR_FINAL_ADALN,     /* [2*hidden][hidden]                */
+    MYNAH_FLOW_LINEAR_FINAL_LINEAR,    /* [latent_dim][hidden]              */
+    MYNAH_FLOW_LINEAR_KIND_COUNT
+} mynah_flow_linear_kind;
+
+typedef int (*mynah_flow_linear_fn)(void *user, size_t index,
+                                    mynah_flow_linear_kind kind,
+                                    const float *weight, const float *bias,
+                                    const float *in, float *out, size_t k,
+                                    size_t n);
+
 typedef struct {
     mynah_flow_linear cond_embed; /* [hidden_dim][cond_dim]   */
     mynah_flow_linear input_proj; /* [hidden_dim][latent_dim] */
@@ -97,6 +134,9 @@ typedef struct {
     const mynah_flow_res_block_weights *res_blocks;  /* [depth]          */
     mynah_flow_linear final_adaln;  /* [2 * hidden_dim][hidden_dim] */
     mynah_flow_linear final_linear; /* [latent_dim][hidden_dim]     */
+    /* Optional; NULL keeps the built-in f32 matvec. */
+    mynah_flow_linear_fn linear;
+    void *linear_user;
 } mynah_flow_head_weights;
 
 typedef struct mynah_flow_head mynah_flow_head;

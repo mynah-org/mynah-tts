@@ -1298,6 +1298,30 @@ struct mynah_qmat_cache {
     pthread_mutex_t mutex;
 };
 
+/* The one place a requested qtype becomes a usable one.  F16 has no scalar
+ * fallback -- it needs NEON's half converts -- so asking for it where it is not
+ * compiled resolves to exact f32 rather than to a silent approximation. */
+static int qmat_qtype_available(int qtype) {
+#if !defined(MYNAH_QMAT_F16)
+    if (qtype == QMAT_F16) return QMAT_F32;
+#endif
+    if (qtype != QMAT_INT8 && qtype != QMAT_INT4 && qtype != QMAT_F16) {
+        return QMAT_F32;
+    }
+    return qtype;
+}
+
+int mynah_qmat_qtype_from_name(const char *name) {
+    if (name == NULL) return -1;
+    if (strcmp(name, "f32") == 0 || strcmp(name, "off") == 0) return QMAT_F32;
+    if (strcmp(name, "int8") == 0) return QMAT_INT8;
+    if (strcmp(name, "int4") == 0) return QMAT_INT4;
+    if (strcmp(name, "f16") == 0) return QMAT_F16;
+    return -1;
+}
+
+int mynah_qmat_qtype_resolved(int qtype) { return qmat_qtype_available(qtype); }
+
 mynah_qmat_cache *mynah_qmat_cache_new(int enabled) {
     mynah_qmat_cache *c = (mynah_qmat_cache *)calloc(1, sizeof(*c));
     if (c == NULL) return NULL;
@@ -1377,9 +1401,10 @@ static const qmat_entry *cache_lookup(const mynah_qmat_cache *cache, const char 
  * the entry, or NULL on OOM or an INT4 shape it cannot represent (k not a
  * multiple of 32) so the caller can fall back to f32. */
 static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
-                                      const float *w, size_t n, size_t k) {
+                                      const float *w, size_t n, size_t k,
+                                      int qtype) {
     if (k == 0 || n > SIZE_MAX / k || n > SIZE_MAX / sizeof(float)) return NULL;
-    if (cache->qtype == QMAT_INT4 && (k % QMAT_Q4_GROUP) != 0) return NULL;
+    if (qtype == QMAT_INT4 && (k % QMAT_Q4_GROUP) != 0) return NULL;
     if (cache->count == cache->capacity) {
         const size_t next = cache->capacity == 0 ? 16u : cache->capacity * 2u;
         qmat_entry **grown = (qmat_entry **)realloc(cache->entries, next * sizeof(*grown));
@@ -1389,12 +1414,12 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
     }
     qmat_entry *e = (qmat_entry *)calloc(1, sizeof(*e));
     if (e == NULL) return NULL;
-    e->qtype = cache->qtype;
+    e->qtype = qtype;
     e->n = n;
     e->k = k;
     e->name = (char *)malloc(strlen(name) + 1u);
     if (e->name == NULL) return NULL;
-    if (cache->qtype == QMAT_INT8) {
+    if (qtype == QMAT_INT8) {
         e->q8 = (int8_t *)malloc(n * k);
         e->scales = (float *)malloc(n * sizeof(float));
         e->rowsum = (int32_t *)malloc(n * sizeof(int32_t));
@@ -1406,7 +1431,7 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
          * unsigned kernel be self-tested on a host with no VNNI at all. */
         weight_rowsum_prefix(e->q8, n, k, e->rowsum);
 #if defined(MYNAH_QMAT_F16)
-    } else if (cache->qtype == QMAT_F16) {
+    } else if (qtype == QMAT_F16) {
         if (n > SIZE_MAX / k / sizeof(uint16_t)) goto fail;
         e->f16 = (uint16_t *)malloc(n * k * sizeof(uint16_t));
         if (e->f16 == NULL) goto fail;
@@ -1630,12 +1655,144 @@ int mynah_qmat_greedy_argmax(mynah_qmat_cache *cache, const mynah_weights *file,
                                              allow_extra, argmax, error, error_capacity);
 }
 
-int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
+/* ------------------------------------------------- where the error comes from
+ *
+ * "int8 broke parity" is not actionable; "the activation entering this one
+ * projection loses 4.4% and its weight loses 0.3%" is.  The two sides of a
+ * w8a8 product fail for different reasons and have different fixes -- a weight
+ * outlier wants a finer scale granularity, an activation outlier wants a
+ * different quantizer or an exclusion -- so they are measured separately,
+ * per tensor, instead of being inferred from the end-to-end number.
+ *
+ * OFF unless MYNAH_QMAT_ACT_STATS is set; when off this costs one load of a
+ * static int per call. */
+#define QMAT_STATS_MAX 128u
+
+typedef struct {
+    char name[64]; /* copied: the engine's key table dies before atexit runs */
+    unsigned long long calls;
+    double act_rel_sum;  /* ||x - dequant(quant(x))|| / ||x||, summed         */
+    double act_peak_sum; /* max|x| / rms(x), summed                          */
+    double w_rel;        /* ||W - dequant(W)||_F / ||W||_F, once             */
+    size_t rows, cols;
+} qmat_stats_entry;
+
+static qmat_stats_entry g_stats[QMAT_STATS_MAX];
+static size_t g_stats_count;
+static pthread_mutex_t g_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_stats_on = -1;
+static int g_stats_registered;
+
+static void qmat_stats_report(void) {
+    pthread_mutex_lock(&g_stats_mutex);
+    if (g_stats_count == 0) {
+        pthread_mutex_unlock(&g_stats_mutex);
+        return;
+    }
+    fprintf(stderr,
+            "\nMYNAH_QMAT_ACT_STATS -- per-tensor quantization error, the two "
+            "sides kept apart\n%-26s %8s %8s %10s %10s %10s\n", "tensor", "rows",
+            "cols", "calls", "act_rel", "w_rel");
+    for (size_t i = 0; i < g_stats_count; ++i) {
+        const qmat_stats_entry *e = &g_stats[i];
+        const double n = (double)(e->calls ? e->calls : 1u);
+        fprintf(stderr, "%-26s %8zu %8zu %10llu %10.3e %10.3e   peak/rms %6.2f\n",
+                e->name, e->rows, e->cols, e->calls, e->act_rel_sum / n, e->w_rel,
+                e->act_peak_sum / n);
+    }
+    pthread_mutex_unlock(&g_stats_mutex);
+}
+
+static int qmat_stats_enabled(void) {
+    if (g_stats_on < 0) {
+        const char *env = getenv("MYNAH_QMAT_ACT_STATS");
+        g_stats_on = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0);
+    }
+    return g_stats_on;
+}
+
+/* Relative Frobenius error of the cached weight against the f32 original. */
+static double qmat_weight_rel(const qmat_entry *e, const float *w, size_t n,
+                              size_t k) {
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < k; ++j) {
+            const double ref = (double)w[i * k + j];
+            double got = ref;
+            if (e->qtype == QMAT_INT8) {
+                got = (double)e->q8[i * k + j] * (double)e->scales[i];
+            } else if (e->qtype == QMAT_INT4) {
+                const size_t g = j / QMAT_Q4_GROUP;
+                const uint8_t byte = e->q4[i * (k / 2u) + j / 2u];
+                const int nib = (j % 2u == 0) ? (byte & 0x0fu) : (byte >> 4);
+                got = (double)(nib - 8) *
+                      (double)e->scales[i * (k / QMAT_Q4_GROUP) + g];
+            } else if (e->qtype == QMAT_F16) {
+                got = (double)qmat_f16_to_f32(e->f16[i * k + j]);
+            }
+            num += (ref - got) * (ref - got);
+            den += ref * ref;
+        }
+    }
+    return den > 0.0 ? sqrt(num / den) : 0.0;
+}
+
+static void qmat_stats_record(const char *name, const qmat_entry *e,
+                              const float *weight, const float *x, size_t k,
+                              size_t n) {
+    double amax = 0.0, sq = 0.0;
+    for (size_t j = 0; j < k; ++j) {
+        const double v = fabs((double)x[j]);
+        if (v > amax) amax = v;
+        sq += (double)x[j] * (double)x[j];
+    }
+    const double scale = amax > 0.0 ? amax / 127.0 : 1.0;
+    double num = 0.0;
+    for (size_t j = 0; j < k; ++j) {
+        const double q = (double)(int)lrint((double)x[j] / scale) * scale;
+        num += ((double)x[j] - q) * ((double)x[j] - q);
+    }
+    const double rms = sqrt(sq / (double)k);
+    pthread_mutex_lock(&g_stats_mutex);
+    if (!g_stats_registered) {
+        atexit(qmat_stats_report);
+        g_stats_registered = 1;
+    }
+    qmat_stats_entry *slot = NULL;
+    for (size_t i = 0; i < g_stats_count; ++i) {
+        if (strcmp(g_stats[i].name, name) == 0) {
+            slot = &g_stats[i];
+            break;
+        }
+    }
+    if (slot == NULL && g_stats_count < QMAT_STATS_MAX) {
+        slot = &g_stats[g_stats_count++];
+        snprintf(slot->name, sizeof(slot->name), "%s", name);
+        slot->rows = n;
+        slot->cols = k;
+        slot->w_rel = qmat_weight_rel(e, weight, n, k);
+    }
+    if (slot != NULL) {
+        ++slot->calls;
+        slot->act_rel_sum += (sq > 0.0) ? sqrt(num / sq) : 0.0;
+        slot->act_peak_sum += (rms > 0.0) ? amax / rms : 0.0;
+    }
+    pthread_mutex_unlock(&g_stats_mutex);
+}
+
+int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
                       const mynah_backend *backend, const char *name,
                       const float *weight_data,
                       const float *in, float *out, size_t count, size_t k, size_t n,
-                      const float *bias, char *error, size_t error_capacity) {
-    const int use_q = cache != NULL && cache->qtype != QMAT_F32 &&
+                      const float *bias, int qtype, char *error,
+                      size_t error_capacity) {
+    /* qtype < 0 means "whatever the cache resolved to", which is every caller
+     * that predates per-group precision.  A caller that names one gets exactly
+     * that tensor in that encoding: entries are keyed by name, and a name
+     * belongs to one group, so an entry's encoding never changes under it. */
+    const int want = (qtype < 0) ? (cache == NULL ? QMAT_F32 : cache->qtype)
+                                 : qmat_qtype_available(qtype);
+    const int use_q = cache != NULL && want != QMAT_F32 &&
                       count <= QMAT_SMALL_COUNT && k <= QMAT_K_MAX;
     const qmat_entry *e = NULL;
     if (use_q) {
@@ -1643,7 +1800,7 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
          * valid and immutable, so the matvec below runs outside the lock. */
         pthread_mutex_lock(&cache->mutex);
         e = cache_lookup(cache, name);
-        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k);
+        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k, want);
         pthread_mutex_unlock(&cache->mutex);
     }
     if (e == NULL) {
@@ -1668,6 +1825,9 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
             continue;
         }
 #endif
+        if (qmat_stats_enabled()) {
+            qmat_stats_record(name, e, weight_data, xr, k, n);
+        }
         const float sx = quantize_act(qx, xr, k, level);
         if (!cache->use_row4) {
             for (size_t row = 0; row < n; ++row) {
@@ -1691,6 +1851,16 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
     return 0;
 }
 
+int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
+                      const mynah_backend *backend, const char *name,
+                      const float *weight_data,
+                      const float *in, float *out, size_t count, size_t k, size_t n,
+                      const float *bias, char *error, size_t error_capacity) {
+    return mynah_qmat_linear_resolved_qt(cache, backend, name, weight_data, in, out,
+                                         count, k, n, bias, -1, error,
+                                         error_capacity);
+}
+
 int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *backend,
                               const char *name, const float *weight_data,
                               const float *const *in_rows, float *const *out_rows,
@@ -1709,7 +1879,7 @@ int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *back
     if (use_q) {
         pthread_mutex_lock(&cache->mutex);
         e = cache_lookup(cache, name);
-        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k);
+        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k, cache->qtype);
         pthread_mutex_unlock(&cache->mutex);
     }
     if (e == NULL) {
@@ -2537,6 +2707,34 @@ static int probe_fused_greedy(const char **why) {
     return on;
 }
 
+/* ------------------------------------------------------- quantization groups
+ *
+ * WHICH weights are quantized is an engine decision, not a kernel one, so the
+ * names live with the engine (see src/engine_pocket.c).  What lives here is
+ * the single reading of the environment, so the dispatch report and the engine
+ * cannot disagree about what was asked for -- the same reason quant.requested
+ * is answered by this file rather than re-derived by dispatch.c.
+ *
+ * The string is deliberately NOT parsed here: an unknown group name has to
+ * fail the engine that owns the names, loudly, instead of being silently
+ * dropped by a parser that does not know them. */
+const char *mynah_qmat_groups_spec(void) {
+    const char *env = getenv("MYNAH_QUANT_GROUPS");
+    if (env == NULL || env[0] == '\0') return "default";
+    return env;
+}
+
+static int probe_quant_groups(char *out, size_t capacity, const char **reason) {
+    const char *spec = mynah_qmat_groups_spec();
+    snprintf(out, capacity, "%s", spec);
+    *reason = (getenv("MYNAH_QUANT_GROUPS") == NULL)
+                  ? "[predicate] mynah_qmat_groups_spec(): MYNAH_QUANT_GROUPS "
+                    "unset, the engine's measured default set applies"
+                  : "[predicate] mynah_qmat_groups_spec(): MYNAH_QUANT_GROUPS, "
+                    "parsed and validated by the engine that owns the names";
+    return 0;
+}
+
 void mynah_qmat_dispatch_probes(void) {
     mynah_dispatch_register_probe("quant.row4", probe_row4);
     mynah_dispatch_register_probe("quant.argmax_mt", probe_argmax_mt);
@@ -2550,4 +2748,5 @@ void mynah_qmat_dispatch_probes(void) {
      * whose OFF on x86 was the whole reason f16 was dead there.  A value probe
      * needs no row of its own: dispatch.c already consults one per id. */
     mynah_dispatch_register_value_probe("quant.f16", probe_f16_kernel);
+    mynah_dispatch_register_value_probe("quant.groups", probe_quant_groups);
 }

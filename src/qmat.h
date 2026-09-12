@@ -58,6 +58,13 @@ const char *mynah_qmat_f16_kernel(const char **why);
 /* MYNAH_FUSED_GREEDY: whether the engine may fuse head projection + argmax. */
 int mynah_qmat_fused_greedy_enabled(void);
 
+/* The raw MYNAH_QUANT_GROUPS request, or "default" when it is unset.  WHICH
+ * weight groups exist is the engine's vocabulary, so this file reads the
+ * variable once (so the dispatch report and the engine agree on what was
+ * asked) and leaves parsing -- and rejecting an unknown name -- to the engine.
+ * Never NULL. */
+const char *mynah_qmat_groups_spec(void);
+
 /* out[count, n] = in[count, k] @ W[n, k]^T (+ bias), where W is the tensor
  * `name` in `file`.  Uses the cached int8 weight when the cache is enabled and
  * count is small; otherwise the f32 backend matmul.  0 = ok, -1 = error. */
@@ -70,6 +77,31 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache, const mynah_backend *bac
                                const float *in, float *out, size_t count, size_t k,
                                size_t n, const float *bias,
                                char *error, size_t error_capacity);
+
+/* The same call with the encoding named per tensor instead of per cache.
+ *
+ * WHY: f16 and int8 fail differently.  f16 is numerically exact here (measured
+ * 1.2e-06 per PocketTTS backbone step) at half the weight bytes; int8 is 1-3%
+ * per operand at a quarter, and is the encoding SDOT, VNNI and AMX accelerate.
+ * Which one is right is therefore a property of the *tensor*, not of the
+ * process, and a single MYNAH_QUANT cannot express "f16 where the error feeds
+ * back through an AR loop, int8 where it cannot".
+ *
+ * `qtype`: 0 f32 (exact, no cache entry), 1 int8, 2 int4, 3 f16, or -1 for
+ * "whatever the cache resolved to" -- which is what mynah_qmat_linear_resolved
+ * passes, so every existing caller keeps its exact behaviour.  A qtype this
+ * build cannot honour (f16 off ARM) resolves to f32, never to a substitute. */
+int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
+                                  const mynah_backend *backend, const char *name,
+                                  const float *weight, const float *in, float *out,
+                                  size_t count, size_t k, size_t n,
+                                  const float *bias, int qtype, char *error,
+                                  size_t error_capacity);
+
+/* "int8" -> 1, "int4" -> 2, "f16" -> 3, "f32"/"off" -> 0, anything else -1. */
+int mynah_qmat_qtype_from_name(const char *name);
+/* What this build can actually honour for `qtype` (f16 -> f32 off ARM). */
+int mynah_qmat_qtype_resolved(int qtype);
 
 /* Weight-stationary batched linear: `batch` single-row activations that belong
  * to different requests, computed with one pass over the weight instead of one
