@@ -238,3 +238,37 @@ hung off the model.
 - `grep -c 'codebook\|frame_stacking\|local_transformer' src/mynah_tts.h` → 0.
 - No file in `src/` over ~1200 LOC.
 - `engine_pocket.c` compiles against the header before E1 is called done.
+
+## E1-1: header landed, code movement still to do — 2026-09-12
+
+`src/tts_engine.h` exists and compiles. It is not invented: it is the twelve
+calls `inference.c` already makes on `engine_magpie`, generalized, with the two
+changes that measurement forced — `step_batch` and `emit_batch` stay separate
+(the driver already runs the backbone for the whole batch and *then* the head,
+and PocketTTS fits that split without forcing), and `decode_audio` takes
+contiguous monotonic ranges with no left-context capability (E2-3).
+
+**What still has to move**, and why it is its own step: `inference.c` is still
+Magpie-aware. It reads `codebook_count`, `frame_stacking_factor`,
+`audio_eos_id`, `audio_vocab_size` and `codebook_size` directly, performs the
+`final_proj` argmax over every stream itself, builds the per-codebook code
+buffers with their `max_raw_length` stride, and calls the codec. `synth_slot`
+holds `decoder_cache` and `local_frame_state` **by value**.
+
+The move, concretely:
+
+| From `inference.c` | To |
+|---|---|
+| `slot_prepare` lines ~137-232 (encode text, baked context, code seeding, decoder cache, prefill, local state) | `magpie_ctx_new` + `prepare` |
+| `slot_advance` the `!use_local_transformer` `final_proj` argmax block | `emit_batch` |
+| `slot_advance` code-buffer building and the codec call | `decode_audio` |
+| `slot_finalize` code copy + final decode | `flush` / `decode_audio` |
+| `decoder_cache` + `local_frame_state` fields of `synth_slot` | inside `magpie_ctx` |
+
+What stays in the driver: slot lifetime, the batching loop, the streaming emit
+policy, the sinks, per-request failure, and the RNG *seeding* (the RNG itself is
+sampling and goes with the engine).
+
+**This is the one step where the audio can legitimately change**, so it must be
+isolated from the mechanical moves and verified against the goldens on its own.
+Do not combine it with anything else.

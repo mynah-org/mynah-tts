@@ -54,8 +54,9 @@ the goldens with byte-identical audio:
 `mynah_util` + kernels → `conv1d` → `codec_nanocodec` → `engine_magpie.c` +
 `inference.c`. `src/` is nine files, largest 2186 lines.
 
-- [ ] E1-1 `src/tts_engine.h`: vtable + capability block. The twelve functions
-      `inference.c` calls on the engine are already the list; abstract them.
+- [~] E1-1 `src/tts_engine.h` **written and compiling**; the code movement out of
+      `inference.c` is the remaining half and is the one step where audio can change —
+      the exact table of what moves where is in the note
 - [x] E1-2 slot driver lifted into `src/inference.c` (650 LOC)
 - [ ] E1-3 lift streaming state into `src/stream.c`; `decode_audio` takes contiguous
       monotonic ranges and the engine owns continuity (E2-3), so left-context stays internal
