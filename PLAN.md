@@ -57,13 +57,17 @@ Blocks E3. Do it *with* PocketTTS in hand, not before.
 - [ ] E1-6 real JSON parser with nesting and arrays, replacing `mynah_tts.c:112-163`
 - [ ] E1-7 split the converter into a shared pack writer + per-engine metadata
 - [ ] E1-8 gate: Magpie stream↔offline output sample-identical to the pre-refactor binary
+- [ ] E1-0 **blocker**: `models/` is empty, so no Magpie golden can be captured and
+      E1-8 cannot be verified. Re-download and convert the pinned Magpie/NanoCodec
+      archives, capture goldens, **then** start E1
 
 ### E2 — PocketTTS oracle → [`.work/pocket-tts-oracle.md`](.work/pocket-tts-oracle.md)
 
 Independent of E1. **Start here** — it tells E1 which state the seam must model.
 
 - [ ] E2-1 `tools/oracle_pocket.py`: dump all 12 stages, tokenizer → waveform
-- [ ] E2-2 `tests/parity_pocket.py` with per-stage tolerances + `make oracle-pocket`
+- [x] E2-1a `tools/oracle_pocket.py` + `make oracle-pocket` written
+- [ ] E2-2 `tests/parity_pocket.py` with per-stage tolerances
 - [ ] E2-3 **measure the SEANet streaming receptive field** (the `STREAM_CONTEXT_FRAMES` equivalent)
 - [ ] E2-4 dump decoder-transformer behaviour past `context: 250`
 - [ ] E2-5 dump the text-chunk seam at `MAX_TOKEN_PER_CHUNK = 50`, including the known skip bug

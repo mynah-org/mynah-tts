@@ -91,6 +91,7 @@ STREAM_TEST_OBJECT := $(BUILD_DIR)/tests/test_stream.o
 STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 
 .PHONY: all cpu info caps self-test test stream-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+        oracle-pocket \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -217,6 +218,17 @@ oracle:
 	@test -n "$(CODEC)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	@test -n "$(OUTPUT)" || (echo "usage: make oracle MODEL=magpie.nemo CODEC=codec.nemo OUTPUT=oracle.wav" >&2; exit 2)
 	.venv/bin/python tools/oracle_magpie.py --archive "$(MODEL)" --codec "$(CODEC)" --byt5-tokenizer "$(BYT5)" --output "$(OUTPUT)"
+
+# PocketTTS oracle. Offline tooling only: `uv` pulls torch into a throwaway
+# environment, nothing here is needed to run the binary. The gated Kyutai weights
+# require `hf auth login` first.
+ORACLE_POCKET_OUT ?= build/oracle-pocket
+ORACLE_POCKET_LANG ?= english
+ORACLE_POCKET_VOICE ?= alba
+oracle-pocket:
+	uv run --with pocket-tts --with numpy --with scipy python tools/oracle_pocket.py \
+	  --language "$(ORACLE_POCKET_LANG)" --voice "$(ORACLE_POCKET_VOICE)" \
+	  --out "$(ORACLE_POCKET_OUT)" --wav "$(ORACLE_POCKET_OUT)/reference.wav"
 
 METAL_BUILD_DIR := build/metal
 # The GPU variants define their own flags rather than inheriting CPPFLAGS, so
