@@ -8,8 +8,23 @@
 void *mynah_graph_local_projection_cache_new(const mynah_tts_model *model);
 void mynah_graph_local_projection_cache_free(void *cache);
 
-/* Largest group of requests that can be stepped together. */
+/* Ceiling on the driver's fixed-size slot arrays.
+ *
+ * This is the DRIVER's limit, and it is deliberately not the only one: the
+ * authority on how wide a batch a model can actually take is the engine's
+ * `caps.max_batch` (mynah_engine_caps), which a continuous-latent engine sets
+ * to 1 until its batching has been measured. The driver always steps
+ * min(requested, caps.max_batch, MYNAH_GRAPH_MAX_JOBS) contexts, so the two
+ * numbers cannot drift apart into an out-of-bounds write the way two unlinked
+ * constants would: one sizes the arrays here, the other is asked at run time. */
 #define MYNAH_GRAPH_MAX_JOBS 16u
+
+/* Outcomes reported per request. Cancellation is distinct from failure on
+ * purpose: a client that hung up did not hit a synthesis bug, and reporting it
+ * as one turns every disconnect into a spurious error in the logs. */
+#define MYNAH_GRAPH_OK         0
+#define MYNAH_GRAPH_FAILED   (-1)
+#define MYNAH_GRAPH_CANCELLED (-2)
 
 /* One request handed to the batched driver.  Either the offline sink
  * (`samples` + `sample_count`) or `callback` must be set, exactly as for
@@ -26,6 +41,49 @@ typedef struct {
     size_t error_capacity;
     int result;
 } mynah_graph_job;
+
+/* Where a long-running driver gets its work from, and where it reports it.
+ *
+ * This is the difference between a batch and a service. With an array of jobs
+ * the driver knows its whole workload before the first step and the last slot
+ * to finish decides when the call returns; with a sink it asks for more work
+ * at the top of every step, so a request that arrives mid-flight joins the
+ * batch already running instead of waiting for it to drain.
+ *
+ *   next_job   fills `job` and `tag` and returns 1 when a request was
+ *              admitted, 0 when there is none. `block` is non-zero only when
+ *              the driver has nothing else to do, and a sink that blocks must
+ *              return 0 (rather than block forever) once the service is
+ *              stopping -- that return is what ends mynah_graph_serve_continuous.
+ *              Everything `job` points at -- the request, the error buffer,
+ *              the callback's user data -- must stay alive until on_done.
+ *   on_done    exactly one call per admitted job, with MYNAH_GRAPH_OK,
+ *              MYNAH_GRAPH_FAILED or MYNAH_GRAPH_CANCELLED. The driver has
+ *              released the request by then and never touches `tag` again.
+ *   cancelled  optional; polled once per step per live request. Non-zero
+ *              retires the slot immediately as MYNAH_GRAPH_CANCELLED.
+ *   running    optional; non-zero while the service should keep admitting.
+ *              Requests already in flight always run to completion.
+ */
+typedef struct {
+    void *ud;
+    int  (*next_job)(void *ud, mynah_graph_job *job, void **tag, int block);
+    void (*on_done)(void *ud, void *tag, int result);
+    int  (*cancelled)(void *ud, void *tag);
+    int  (*running)(void *ud);
+} mynah_graph_sink;
+
+/* Serve from `sink` until it stops handing out work, stepping up to
+ * `max_batch` requests together and admitting new ones between steps.
+ *
+ * Runs on the calling thread and owns the engine state for its whole lifetime,
+ * which is the point: one thread enters the model's mutable caches, so the
+ * caller needs no lock around synthesis, and the codec's per-thread filter
+ * cache holds one set rather than one per HTTP worker.
+ *
+ * Returns 0 when every request served succeeded, -1 when any failed. */
+int mynah_graph_serve_continuous(const mynah_tts_model *model, size_t max_batch,
+                                 mynah_graph_sink *sink);
 
 /* Synthesize up to MYNAH_GRAPH_MAX_JOBS requests together, sharing one pass
  * over the decoder weights per step instead of one per request.  Returns 0 when

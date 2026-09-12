@@ -14,25 +14,34 @@
  * That single thread is not a bottleneck the way a mutex was. A decode step is
  * bound by the weight bytes it reads, not by arithmetic, so requests taking
  * turns each paid their own trip to memory for the same weights. The scheduler
- * below instead hands whatever is queued to mynah_tts_synthesize_batch, which
- * reads those weights once and serves every waiting request from cache --
- * measured 1.63x aggregate throughput at eight in flight, with each request
- * receiving byte-identical audio to what it would have received alone.
+ * below instead runs mynah_graph_serve_continuous, which reads those weights
+ * once per step and serves every request in flight from that one read, with
+ * each receiving byte-identical audio to what it would have received alone.
  *
- * Streaming still runs one request at a time (it needs its callback interleaved
- * with generation) and takes the same lock, so it never overlaps a batch.
+ * Continuous means the batch has an admission point: the driver asks this file
+ * for more work at the top of every decoder step, so a request that arrives
+ * while four others are mid-utterance joins them on the next step instead of
+ * waiting for the group to drain. Its cost to the others is the width of the
+ * step, not the length of their request.
+ *
+ * STREAMING IS NOT A SECOND PATH. A streaming request is the same job with a
+ * callback sink instead of a buffer sink, queued in the same queue and stepped
+ * in the same batch (CLAUDE.md rule 7). That is what removed the global
+ * synthesis mutex: there is nothing left to serialize, because nothing but the
+ * scheduler thread ever enters the model. The invariant is asserted rather
+ * than commented -- see synth_assert_scheduler().
  *
  * Socket I/O for a stream does NOT run on the synthesis thread: the callback
  * only copies PCM into a bounded queue and a dedicated writer thread owns the
  * fd from there on (server/stream_out.c). A client that stops reading loses its
- * own stream and nothing else -- before this, it held the synthesis lock for
- * the whole SO_SNDTIMEO.
+ * own stream and nothing else.
  *
  * Three things follow from that split, and they are the shape of this file:
  *
  *   - HTTP parsing and synthesis are separate roles. A worker reads the
  *     request, validates it, tokenizes it and builds a job; the scheduler does
- *     nothing but synthesize.
+ *     nothing but synthesize. A worker never waits on a stream: it hands the
+ *     job over and goes back to parsing.
  *   - A job is a heap object with a refcount, and it owns the client
  *     descriptor. Two threads hold it and, with a deadline, either may be the
  *     last to let go. The descriptor leaves the job exactly once, through an
@@ -40,14 +49,18 @@
  *     descriptor detectable.
  *   - Every request has a wall-clock deadline (--request-timeout-ms). A
  *     request past it is answered 504 and its worker is freed; a queued job
- *     past it is never synthesized at all.
+ *     past it is never synthesized at all, and one already in the batch is
+ *     cancelled out of it rather than finishing for nobody.
  */
 #include "http_util.h"
 #include "stream_out.h"
 
+#include "graph.h"
 #include "mynah_tts.h"
 #include "tokenizer_sentencepiece.h"
 #include "tokenizer.h"
+
+#include <assert.h>
 
 #include <errno.h>
 #include <arpa/inet.h>
@@ -92,8 +105,21 @@ static struct {
     size_t max_batch;
     size_t max_pending;
     unsigned request_timeout_ms;
-    pthread_mutex_t synth_lock;
 } g;
+
+/* The synthesis thread, published once by the scheduler before it enters the
+ * driver. Nothing locks the model any more, so the property that makes that
+ * safe -- exactly one thread inside it -- is checked instead of described:
+ * every callback the driver makes into this file asserts it is running here.
+ * A future change that synthesizes from an HTTP worker again fails loudly on
+ * the first chunk rather than corrupting a cache silently. */
+static pthread_t g_synth_thread;
+static atomic_int g_synth_thread_set;
+
+static void synth_assert_scheduler(void) {
+    assert(atomic_load(&g_synth_thread_set) != 0 &&
+           pthread_equal(pthread_self(), g_synth_thread) != 0);
+}
 
 /* Counters published by /health. Plain relaxed atomics: they are diagnostics,
  * not synchronization, and a reader wants a cheap snapshot rather than a
@@ -142,14 +168,22 @@ static double now_ms(void) {
  *     stderr. That line should never appear; if it does, a path returned
  *     without answering a client.
  *
- * Jobs are drained by one scheduler thread, so requests that arrive while a
- * batch is running are grouped into the next one -- the queue depth does the
- * batching, and BATCH_WINDOW_US only helps requests that land near
- * simultaneously on an idle server. */
-#define BATCH_WINDOW_US 2000
-
+ * Jobs are drained by one scheduler thread, which no longer collects a batch
+ * and then runs it: it hands this queue to the driver as a sink and the driver
+ * takes what it can fit at the top of every step. There is therefore no batch
+ * window to tune and no "next batch" to wait for -- a request waits for a free
+ * slot, and for nothing else. */
 static void send_error(int fd, const char *status, const char *type,
                        const char *message);
+
+/* A stream's sink: the writer it feeds, and the wall clock it must respect.
+ * Lives inside the job, because with the worker gone the job is the only owner
+ * left by the time the first chunk is produced. */
+typedef struct {
+    stream_out *out;
+    double deadline_ms;      /* monotonic, 0 when no deadline was configured */
+    int expired;
+} stream_sink;
 
 typedef struct synth_job {
     /* Filled in before the job is published; read-only from then on. */
@@ -157,8 +191,23 @@ typedef struct synth_job {
     int *text_ids;                 /* owned: the request points into this */
     int want_pcm;
 
+    /* Streaming requests differ from batch ones in their sink and in nothing
+     * else: same queue, same scheduler, same batch. The response header is
+     * built by the worker and sent by the writer the scheduler starts at
+     * admission, so a client learns it has been admitted when it has, rather
+     * than when the first PCM arrives. */
+    int is_stream;
+    char header[512];
+    stream_sink sink;              /* sink.out is set at admission */
+
     int fd;                        /* owned; leaves only through job_claim_fd */
     atomic_int fd_claimed;
+
+    /* Set when the submitter walked away (deadline). Read by the scheduler on
+     * every step to drop the request out of the batch, so it is an atomic
+     * rather than a field behind `mu`: a mutex per slot per decoder step is a
+     * lock in the hot loop, which rule 4 rules out. */
+    atomic_int gave_up;
 
     /* Written by the scheduler, read by the submitter once `done` is set. */
     float *samples;                /* owned: freed by job_release */
@@ -186,6 +235,7 @@ static struct {
     synth_job *tail;
     size_t pending;
     int stop;
+    atomic_int stopping;   /* the same flag, readable without the mutex */
     pthread_t thread;
     int thread_started;
 } g_batch;
@@ -195,6 +245,7 @@ static synth_job *job_new(int fd) {
     if (j == NULL) return NULL;
     j->fd = fd;
     atomic_init(&j->fd_claimed, 0);
+    atomic_init(&j->gave_up, 0);
     atomic_init(&j->refs, 1);
     if (pthread_mutex_init(&j->mu, NULL) != 0) { free(j); return NULL; }
     if (pthread_cond_init(&j->done_cv, NULL) != 0) {
@@ -290,28 +341,15 @@ static int job_wait(synth_job *j, unsigned timeout_ms) {
         }
     }
     /* Set under the same mutex the scheduler takes to publish `done`, so the
-     * two can never both believe they own the outcome. */
-    if (expired) j->abandoned = 1;
+     * two can never both believe they own the outcome. The atomic mirror is
+     * what the scheduler polls per step; it is only ever set, never cleared,
+     * so reading it without the mutex cannot produce a false cancellation. */
+    if (expired) {
+        j->abandoned = 1;
+        atomic_store(&j->gave_up, 1);
+    }
     pthread_mutex_unlock(&j->mu);
     return expired ? -1 : 0;
-}
-
-static void batch_run(synth_job **taken, size_t count) {
-    mynah_tts_batch_job jobs[16];
-    if (count > (sizeof(jobs) / sizeof(jobs[0]))) count = sizeof(jobs) / sizeof(jobs[0]);
-    for (size_t i = 0; i < count; ++i) {
-        jobs[i].request = &taken[i]->request;
-        jobs[i].samples = &taken[i]->samples;
-        jobs[i].sample_count = &taken[i]->count;
-        jobs[i].error = taken[i]->error;
-        jobs[i].error_capacity = sizeof(taken[i]->error);
-        jobs[i].result = 0;
-    }
-    /* Streaming holds the same lock, so a batch never overlaps one. */
-    pthread_mutex_lock(&g.synth_lock);
-    mynah_tts_synthesize_batch(g.model, jobs, count);
-    pthread_mutex_unlock(&g.synth_lock);
-    for (size_t i = 0; i < count; ++i) taken[i]->result = jobs[i].result;
 }
 
 /* Publishes a finished (or discarded) job and drops the queue's reference. */
@@ -327,70 +365,212 @@ static void job_finish(synth_job *j, int abandoned_result, const char *abandoned
     job_release(j);
 }
 
-static void *batch_scheduler(void *arg) {
-    (void)arg;
-    synth_job *taken[16];
+/* --------------------------------------------------------------- streaming */
+
+/* The whole streaming sink: hand the samples to the writer thread and return.
+ * The driver already emits stable causal prefixes, so one call is exactly what
+ * has become final; the writer decides how that maps onto HTTP chunks.
+ *
+ * Returning -1 aborts this request -- and only this request -- which is what a
+ * full queue, a dead socket or an expired deadline must do: backpressure here
+ * is cancellation, never a blocking write. Runs on the scheduler thread, like
+ * everything else the driver calls, and says so. */
+static int stream_callback(const float *samples, size_t count, void *user_data) {
+    stream_sink *sink = (stream_sink *)user_data;
+    synth_assert_scheduler();
+    if (sink->deadline_ms > 0.0 && now_ms() > sink->deadline_ms) {
+        sink->expired = 1;
+        return -1;
+    }
+    if (count == 0) return stream_out_failed(sink->out) ? -1 : 0;
+    return stream_out_enqueue(sink->out, samples, count);
+}
+
+/* ------------------------------------------------------- the driver's sink
+ *
+ * These four calls are the whole interface between the HTTP side of this file
+ * and synthesis. The driver owns the loop; this owns the queue. */
+
+/* Admission. Returns 1 having filled `job` and `tag`, or 0 when there is
+ * nothing to admit -- which, when the driver asked us to block, means the
+ * server is stopping and is what ends the driver.
+ *
+ * Two things happen here rather than earlier, and both are deliberate:
+ * a queued request whose deadline has already passed is dropped without ever
+ * being synthesized, and a streaming request's writer is started now, so its
+ * response header goes out when it is admitted rather than when it was
+ * parsed. A client's first byte therefore means "you have a slot". */
+static int sink_next_job(void *ud, mynah_graph_job *job, void **tag, int block) {
+    (void)ud;
+    synth_assert_scheduler();
     for (;;) {
         pthread_mutex_lock(&g_batch.mu);
-        while (g_batch.pending == 0u && !g_batch.stop) {
+        while (block && g_batch.head == NULL && !g_batch.stop) {
             pthread_cond_wait(&g_batch.arrived, &g_batch.mu);
         }
-        const int stopping = g_batch.stop;
-        if (stopping && g_batch.pending == 0u) {
+        synth_job *j = g_batch.stop ? NULL : g_batch.head;
+        if (j == NULL) {
             pthread_mutex_unlock(&g_batch.mu);
-            break;
+            return 0;
         }
-        /* Give near-simultaneous arrivals a moment to join this batch. */
-        if (!stopping && g_batch.pending < g.max_batch) {
-            pthread_mutex_unlock(&g_batch.mu);
-            usleep(BATCH_WINDOW_US);
-            pthread_mutex_lock(&g_batch.mu);
-        }
-        size_t count = 0;
-        const size_t take = stopping ? (sizeof(taken) / sizeof(taken[0])) : g.max_batch;
-        while (count < take && g_batch.head != NULL) {
-            synth_job *j = g_batch.head;
-            g_batch.head = j->next;
-            if (g_batch.head == NULL) g_batch.tail = NULL;
-            j->next = NULL;
-            taken[count++] = j;
-            --g_batch.pending;
-        }
+        g_batch.head = j->next;
+        if (g_batch.head == NULL) g_batch.tail = NULL;
+        j->next = NULL;
+        --g_batch.pending;
         atomic_store(&g_stats.queued, (unsigned long)g_batch.pending);
         pthread_mutex_unlock(&g_batch.mu);
 
-        if (stopping) {
-            for (size_t i = 0; i < count; ++i) {
-                job_finish(taken[i], -1, "server is shutting down");
-            }
+        /* Nobody is waiting for this any more: the slot it would have taken
+         * goes to a request someone still wants. */
+        if (atomic_load(&j->gave_up) != 0) {
+            job_release(j);
             continue;
         }
 
-        /* A job whose deadline passed while it queued never enters the batch.
-         * This is the part of the deadline that actually frees capacity: the
-         * slot it would have occupied goes to a request someone still wants. */
-        size_t live = 0;
-        for (size_t i = 0; i < count; ++i) {
-            synth_job *j = taken[i];
-            pthread_mutex_lock(&j->mu);
-            const int gone = j->abandoned;
-            pthread_mutex_unlock(&j->mu);
-            if (gone) { job_release(j); continue; }
-            taken[live++] = j;
+        if (j->is_stream) {
+            const int fd = job_claim_fd(j);
+            if (fd < 0) { job_release(j); continue; }
+            j->sink.out = stream_out_start(fd, j->header);
+            if (j->sink.out == NULL) {
+                send_error(fd, "500 Internal Server Error", "server_error",
+                           "cannot start the stream writer");
+                close(fd);
+                atomic_fetch_add(&g_stats.failed, 1ul);
+                job_release(j);
+                continue;
+            }
+            atomic_fetch_add(&g_stats.streams_active, 1ul);
         }
-        if (live == 0u) continue;
 
-        atomic_fetch_add(&g_stats.active, (unsigned long)live);
-        batch_run(taken, live);
-        atomic_fetch_sub(&g_stats.active, (unsigned long)live);
-
-        for (size_t i = 0; i < live; ++i) {
-            if (taken[i]->result == 0) atomic_fetch_add(&g_stats.completed, 1ul);
-            else atomic_fetch_add(&g_stats.failed, 1ul);
-            job_finish(taken[i], 0, NULL);
+        memset(job, 0, sizeof(*job));
+        job->request = &j->request;
+        if (j->is_stream) {
+            job->callback = stream_callback;
+            job->user_data = &j->sink;
+            job->chunk_samples = STREAM_CHUNK;
+        } else {
+            job->samples = &j->samples;
+            job->sample_count = &j->count;
         }
+        job->error = j->error;
+        job->error_capacity = sizeof(j->error);
+        *tag = j;
+        atomic_fetch_add(&g_stats.active, 1ul);
+        return 1;
+    }
+}
+
+/* Completion, exactly once per admitted request. A streaming job has no
+ * submitter left to wake -- its worker went back to parsing the moment the job
+ * was queued -- so this is where its response is finished and its reference
+ * dropped. */
+static void sink_on_done(void *ud, void *tag, int result) {
+    (void)ud;
+    synth_job *j = (synth_job *)tag;
+    synth_assert_scheduler();
+    atomic_fetch_sub(&g_stats.active, 1ul);
+
+    if (j->is_stream) {
+        stream_out *out = j->sink.out;
+        stream_out_finish(out);
+        atomic_fetch_sub(&g_stats.streams_active, 1ul);
+        stream_out_stats stats;
+        memset(&stats, 0, sizeof(stats));   /* the getter is a no-op on NULL */
+        stream_out_get_stats(out, &stats);
+        /* A mid-stream failure cannot become an HTTP status -- the header is
+         * long gone -- so the writer truncates the body and the reason is
+         * logged rather than sent. An aborted stream is never silent. */
+        if (j->sink.expired) {
+            atomic_fetch_add(&g_stats.timed_out, 1ul);
+            fprintf(stderr, "stream hit the %u ms deadline after %zu bytes; "
+                            "slot released\n", g.request_timeout_ms, stats.sent_bytes);
+        } else if (result == MYNAH_GRAPH_CANCELLED) {
+            atomic_fetch_add(&g_stats.timed_out, 1ul);
+            fprintf(stderr, "stream cancelled after %zu bytes (queue peak %zu, "
+                            "%lu refused chunks)\n",
+                    stats.sent_bytes, stats.peak_bytes, stats.failed_enqueues);
+        } else if (result != MYNAH_GRAPH_OK && !stats.failed) {
+            atomic_fetch_add(&g_stats.failed, 1ul);
+            fprintf(stderr, "stream failed after %lu queued chunks: %s\n",
+                    stats.enqueued_chunks, j->error);
+        } else if (result == MYNAH_GRAPH_OK) {
+            atomic_fetch_add(&g_stats.completed, 1ul);
+        }
+        j->sink.out = NULL;
+        stream_out_release(out);
+        job_release(j);
+        return;
+    }
+
+    if (result == MYNAH_GRAPH_OK) atomic_fetch_add(&g_stats.completed, 1ul);
+    else if (result == MYNAH_GRAPH_CANCELLED) atomic_fetch_add(&g_stats.timed_out, 1ul);
+    else atomic_fetch_add(&g_stats.failed, 1ul);
+    /* After this the submitter may free the job: read nothing from it here. */
+    job_finish(j, result == MYNAH_GRAPH_OK ? 0 : -1, NULL);
+}
+
+/* Polled once per request per decoder step. A request nobody is listening for
+ * any more leaves the batch within one frame instead of finishing for an empty
+ * socket -- and is reported as cancelled, not as a synthesis failure. */
+static int sink_cancelled(void *ud, void *tag) {
+    (void)ud;
+    synth_job *j = (synth_job *)tag;
+    if (atomic_load(&j->gave_up) != 0) return 1;
+    if (j->is_stream && j->sink.out != NULL) return stream_out_failed(j->sink.out);
+    return 0;
+}
+
+/* Whether to keep admitting. Requests already in flight always finish. */
+static int sink_running(void *ud) {
+    (void)ud;
+    return atomic_load(&g_batch.stopping) == 0;
+}
+
+/* The one thread that enters the model, for the whole life of the process. */
+static void *scheduler_main(void *arg) {
+    (void)arg;
+    g_synth_thread = pthread_self();
+    atomic_store(&g_synth_thread_set, 1);
+
+    mynah_graph_sink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.next_job = sink_next_job;
+    sink.on_done = sink_on_done;
+    sink.cancelled = sink_cancelled;
+    sink.running = sink_running;
+    /* Returns -1 if any single request failed, which is routine; the only
+     * interesting case is coming back before anyone asked it to stop. */
+    (void)mynah_graph_serve_continuous(g.model, g.max_batch, &sink);
+    if (atomic_load(&g_batch.stopping) == 0) {
+        fprintf(stderr, "the synthesis driver stopped on its own; "
+                        "queued requests will be refused\n");
+        pthread_mutex_lock(&g_batch.mu);
+        g_batch.stop = 1;
+        pthread_mutex_unlock(&g_batch.mu);
+        atomic_store(&g_batch.stopping, 1);
     }
     return NULL;
+}
+
+/* Whatever never reached the driver, answered rather than dropped. Runs after
+ * the scheduler has been joined, so nothing else touches the queue. */
+static void drain_pending_jobs(void) {
+    for (;;) {
+        pthread_mutex_lock(&g_batch.mu);
+        synth_job *j = g_batch.head;
+        if (j != NULL) {
+            g_batch.head = j->next;
+            if (g_batch.head == NULL) g_batch.tail = NULL;
+            j->next = NULL;
+            --g_batch.pending;
+        }
+        pthread_mutex_unlock(&g_batch.mu);
+        if (j == NULL) break;
+        job_respond_error(j, "503 Service Unavailable", "server_error",
+                          "server is shutting down");
+        job_finish(j, -1, "server is shutting down");
+    }
+    atomic_store(&g_stats.queued, 0ul);
 }
 
 /* ------------------------------------------------------------------ voices */
@@ -557,34 +737,6 @@ static int16_t to_pcm16(float v) {
     return (int16_t)(v * 32767.0f);
 }
 
-/* --------------------------------------------------------------- streaming */
-
-/* A stream's sink: the writer it feeds, and the wall clock it must respect. */
-typedef struct {
-    stream_out *out;
-    double deadline_ms;      /* monotonic, 0 when no deadline was configured */
-    int expired;
-} stream_sink;
-
-/* The whole streaming sink: hand the samples to the writer thread and return.
- * The caller already emits stable causal prefixes, so one call is exactly what
- * has become final; the writer decides how that maps onto HTTP chunks.
- *
- * Returning -1 aborts synthesis, which is what a full queue, a dead socket or
- * an expired deadline must do -- backpressure here is cancellation, never a
- * blocking write. The deadline check lives here because this is the only place
- * the streaming path yields between decoder steps: the synthesis runs on this
- * thread, so aborting from here is what releases the synthesis lock. */
-static int stream_callback(const float *samples, size_t count, void *user_data) {
-    stream_sink *sink = (stream_sink *)user_data;
-    if (sink->deadline_ms > 0.0 && now_ms() > sink->deadline_ms) {
-        sink->expired = 1;
-        return -1;
-    }
-    if (count == 0) return stream_out_failed(sink->out) ? -1 : 0;
-    return stream_out_enqueue(sink->out, samples, count);
-}
-
 /* ------------------------------------------------------------------ routes */
 
 /* Serves both the OpenAI shape ("input"/"voice") and the native one
@@ -670,97 +822,13 @@ static int handle_speech(int fd, const char *body) {
     request.use_local_transformer = 1;
     request.seed = (uint64_t)seed;
 
-    if (stream) {
-        /* Chunked PCM: the client gets audio as it is produced. A WAV header
-         * needs the total length up front, so streaming is raw PCM only. The
-         * header itself is sent by the writer thread, not from here. */
-        char head[512];
-        const int hn = snprintf(head, sizeof(head),
-                                "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: audio/pcm\r\n"
-                                "X-Sample-Rate: %u\r\n"
-                                "X-Bits-Per-Sample: 16\r\n"
-                                "X-Channels: 1\r\n"
-                                "Transfer-Encoding: chunked\r\n"
-                                "Access-Control-Allow-Origin: *\r\n"
-                                "Connection: close\r\n\r\n",
-                                g.info.sample_rate);
-        if (hn <= 0) {
-            free(ids);
-            send_error(fd, "500 Internal Server Error", "server_error",
-                       "cannot build the response header");
-            return 0;
-        }
-
-        /* From here the fd belongs to the writer thread: it sends the header,
-         * the chunks and the terminator, then closes. Nothing below may write
-         * to it or close it -- that double close is the whole hazard of
-         * handing a descriptor to a detached thread. */
-        stream_out *out = stream_out_start(fd, head);
-        if (out == NULL) {
-            free(ids);
-            send_error(fd, "500 Internal Server Error", "server_error",
-                       "cannot start the stream writer");
-            return 0;
-        }
-
-        mynah_tts_stream *st = NULL;
-        /* The stream takes its text through push(), not through the request:
-         * leaving text_ids set here would feed the same tokens twice and
-         * produce a longer utterance than the batch path for the same input. */
-        mynah_tts_request stream_request = request;
-        stream_request.text_ids = NULL;
-        stream_request.text_length = 0;
-        stream_sink sink;
-        sink.out = out;
-        sink.deadline_ms = g.request_timeout_ms > 0u
-                         ? now_ms() + (double)g.request_timeout_ms : 0.0;
-        sink.expired = 0;
-        atomic_fetch_add(&g_stats.streams_active, 1ul);
-        atomic_fetch_add(&g_stats.streams_total, 1ul);
-        pthread_mutex_lock(&g.synth_lock);
-        int rc = mynah_tts_stream_open(g.model, &stream_request, STREAM_CHUNK,
-                                       stream_callback, &sink, &st,
-                                       err, sizeof(err));
-        if (rc == 0) {
-            rc = mynah_tts_stream_push(st, ids, id_count, err, sizeof(err));
-            if (rc == 0) rc = mynah_tts_stream_flush(st, err, sizeof(err));
-            mynah_tts_stream_close(st);
-        }
-        pthread_mutex_unlock(&g.synth_lock);
-        atomic_fetch_sub(&g_stats.streams_active, 1ul);
-        free(ids);
-
-        /* Hand the tail of the response to the writer and let go. A mid-stream
-         * failure cannot become an HTTP status because the header is long
-         * gone, so the writer terminates the body or truncates it. */
-        stream_out_finish(out);
-        if (sink.expired) {
-            atomic_fetch_add(&g_stats.timed_out, 1ul);
-            stream_out_stats stats;
-            stream_out_get_stats(out, &stats);
-            fprintf(stderr, "stream hit the %u ms deadline after %zu bytes; "
-                            "slot released\n",
-                    g.request_timeout_ms, stats.sent_bytes);
-        } else if (rc != 0 && !stream_out_failed(out)) {
-            /* A synthesis failure, not a client one: the writer logs its own. */
-            atomic_fetch_add(&g_stats.failed, 1ul);
-            stream_out_stats stats;
-            stream_out_get_stats(out, &stats);
-            fprintf(stderr, "stream failed after %lu queued chunks: %s\n",
-                    stats.enqueued_chunks, err);
-        } else if (rc == 0) {
-            atomic_fetch_add(&g_stats.completed, 1ul);
-        }
-        /* The descriptor is the writer's now: it sends the terminator and
-         * closes. Nothing here may touch it again. */
-        stream_out_release(out);
-        return 1;
-    }
-
     /* From here the descriptor belongs to the job. Every exit below answers
      * through job_claim_fd, so no path can close it twice, and job_release
-     * closes it if somehow none of them ran. */
+     * closes it if somehow none of them ran.
+     *
+     * A streaming request is built exactly like a batch one -- same job, same
+     * queue, same scheduler -- and differs only in carrying the response
+     * header the writer will send and in nobody waiting for it here. */
     synth_job *job = job_new(fd);
     if (job == NULL) {
         free(ids);
@@ -772,6 +840,33 @@ static int handle_speech(int fd, const char *body) {
     job->text_ids = ids;             /* the job owns the ids, and outlives us */
     job->request.text_ids = job->text_ids;
     job->want_pcm = want_pcm;
+    job->is_stream = stream;
+    job->sink.deadline_ms = g.request_timeout_ms > 0u
+                          ? now_ms() + (double)g.request_timeout_ms : 0.0;
+
+    if (stream) {
+        /* Chunked PCM: the client gets audio as it is produced. A WAV header
+         * needs the total length up front, so streaming is raw PCM only. The
+         * header is sent by the writer thread the scheduler starts when this
+         * job is admitted, so the client's first byte means "you have a slot"
+         * rather than "someone parsed your JSON". */
+        const int hn = snprintf(job->header, sizeof(job->header),
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: audio/pcm\r\n"
+                                "X-Sample-Rate: %u\r\n"
+                                "X-Bits-Per-Sample: 16\r\n"
+                                "X-Channels: 1\r\n"
+                                "Transfer-Encoding: chunked\r\n"
+                                "Access-Control-Allow-Origin: *\r\n"
+                                "Connection: close\r\n\r\n",
+                                g.info.sample_rate);
+        if (hn <= 0 || (size_t)hn >= sizeof(job->header)) {
+            job_respond_error(job, "500 Internal Server Error", "server_error",
+                              "cannot build the response header");
+            job_release(job);
+            return 1;
+        }
+    }
 
     if (job_enqueue(job) != 0) {
         atomic_fetch_add(&g_stats.rejected, 1ul);
@@ -781,13 +876,23 @@ static int handle_speech(int fd, const char *body) {
         return 1;
     }
 
+    if (stream) {
+        /* Nothing left to wait for: the scheduler starts the writer, feeds it
+         * and finishes the response. Going straight back to accept()ing is the
+         * point -- a worker blocked here for the length of an utterance is a
+         * server whose parallelism is its worker count, not its batch width. */
+        atomic_fetch_add(&g_stats.streams_total, 1ul);
+        job_release(job);
+        return 1;
+    }
+
     if (job_wait(job, g.request_timeout_ms) != 0) {
         /* The deadline passed. The job is marked abandoned: if it is still
          * queued the scheduler drops it without synthesizing, and if it is
-         * mid-batch the scheduler discards the samples when it finishes. Our
-         * reference goes now, which is the point -- this worker thread is free
-         * to serve someone else instead of waiting on a request nobody is
-         * still listening for. */
+         * already in the batch the scheduler's cancel poll retires it within
+         * one decoder step. Our reference goes now, which is the point -- this
+         * worker thread is free to serve someone else instead of waiting on a
+         * request nobody is still listening for. */
         atomic_fetch_add(&g_stats.timed_out, 1ul);
         char msg[192];
         snprintf(msg, sizeof(msg),
@@ -1198,14 +1303,7 @@ int main(int argc, char **argv) {
     if (g.worker_count < 1) g.worker_count = 1;
     if (g.worker_count > 64) g.worker_count = 64;
     if (g.max_batch < 1u) g.max_batch = 1u;
-    /* The engine's own ceiling, not the runtime's: a continuous-latent engine
-     * declares 1 until its batching is measured, and handing it more is an
-     * error rather than a slower path. */
-    {
-        const size_t engine_max = mynah_tts_model_max_batch(g.model);
-        if (g.max_batch > engine_max) g.max_batch = engine_max;
-    }
-    if (g.max_batch > 16u) g.max_batch = 16u;   /* batch_run's job array */
+    if (g.max_batch > mynah_tts_max_batch()) g.max_batch = mynah_tts_max_batch();
 
     signal(SIGPIPE, SIG_IGN);   /* a client hanging up mid-stream is routine */
 
@@ -1215,6 +1313,19 @@ int main(int argc, char **argv) {
         return 1;
     }
     mynah_tts_model_get_info(g.model, &g.info);
+    /* The engine's own ceiling, not the runtime's: a continuous-latent engine
+     * declares 1 until its batching is measured, and handing it more is an
+     * error rather than a slower path.
+     *
+     * This has to happen HERE and not with the other argument clamping: it
+     * asks the model, and before the open above there is no model to ask.
+     * Asking too early did not fail, it answered 1 -- the conservative default
+     * for "no model" -- so the server silently ran every request alone with a
+     * --max-batch the operator had set and /health cheerfully reported. */
+    {
+        const size_t engine_max = mynah_tts_model_max_batch(g.model);
+        if (g.max_batch > engine_max) g.max_batch = engine_max;
+    }
     /* Which tokenizer applies is a property of the engine, so the pack decides.
      * Opening Magpie's unconditionally rejected a valid PocketTTS pack for a
      * missing english_phoneme.tsv it has no reason to carry. */
@@ -1237,10 +1348,9 @@ int main(int argc, char **argv) {
     load_voices(model_dir);
     snprintf(g.model_id, sizeof(g.model_id), "%s-%s", g.info.engine, g.info.revision);
     g.default_speaker = g.voice_count > 0 ? g.voices[0].id : 0u;
-    pthread_mutex_init(&g.synth_lock, NULL);
     pthread_mutex_init(&g_batch.mu, NULL);
     pthread_cond_init(&g_batch.arrived, NULL);
-    if (pthread_create(&g_batch.thread, NULL, batch_scheduler, NULL) != 0) {
+    if (pthread_create(&g_batch.thread, NULL, scheduler_main, NULL) != 0) {
         fprintf(stderr, "cannot start the synthesis scheduler\n");
         mynah_tokenizer_close(g.tokenizer);
     mynah_sp_close(g.sp);
@@ -1276,7 +1386,8 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu  "
             "workers=%d  max_batch=%zu  queue=%zu  timeout=%ums\n"
-            "note: queued requests are synthesized together; streaming runs alone\n",
+            "note: one scheduler thread synthesizes; requests join the running\n"
+            "      batch as slots free up, streaming and batch alike\n",
             host, port, g.model_id, mynah_tts_device_name(device), g.voice_count,
             g.worker_count, g.max_batch, g.max_pending, g.request_timeout_ms);
 
@@ -1336,8 +1447,9 @@ int main(int argc, char **argv) {
 
     /* Shutdown, in the one order that leaves nothing dangling: stop taking
      * connections, let the workers finish the requests they are already
-     * waiting on (they hold job references), then stop the scheduler, then
-     * close whatever never got served. */
+     * waiting on (they hold job references), then stop the scheduler -- which
+     * finishes what is in the batch and stops admitting -- then answer
+     * whatever never got served. */
     pthread_mutex_lock(&g_queue.mu);
     g_queue.shutdown = 1;
     pthread_cond_broadcast(&g_queue.not_empty);
@@ -1346,9 +1458,13 @@ int main(int argc, char **argv) {
 
     pthread_mutex_lock(&g_batch.mu);
     g_batch.stop = 1;
-    pthread_cond_signal(&g_batch.arrived);
     pthread_mutex_unlock(&g_batch.mu);
+    atomic_store(&g_batch.stopping, 1);
+    pthread_cond_broadcast(&g_batch.arrived);
     if (g_batch.thread_started) pthread_join(g_batch.thread, NULL);
+    /* Streaming jobs have no submitter waiting, so anything still queued is
+     * this thread's to answer. */
+    drain_pending_jobs();
 
     /* Connections parked but never picked up: their descriptors are still
      * ours, and this is the last chance to close them. */
@@ -1364,6 +1480,5 @@ int main(int argc, char **argv) {
     pthread_mutex_destroy(&g_batch.mu);
     pthread_cond_destroy(&g_queue.not_empty);
     pthread_mutex_destroy(&g_queue.mu);
-    pthread_mutex_destroy(&g.synth_lock);
     return 0;
 }
