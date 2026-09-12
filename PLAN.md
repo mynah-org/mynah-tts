@@ -13,6 +13,19 @@ which requires the engine seam that has been outstanding since July.
 
 **Current focus is CPU — ARM and x86 together. GPU work is deferred.**
 
+**Priority order, from the author of the reference implementation** (who reached
+**C20/C22 real-time streams on 32 ARM cores with a 0.6B model**) — see
+[`.work/serving-doctrine.md`](.work/serving-doctrine.md):
+
+1. **server design + pinned core split + batching** — the largest win
+2. **dataflow** — second
+3. **optimized kernels** — third
+
+That is the opposite of the order we have been working in. A 36x on one kernel
+region took us to RTF 0.245 and the serving profile still capped the machine at
+two or three real-time streams, because the limit was never the kernel. His
+estimate for PocketTTS, being 5.5x smaller, is **C40-C66, not C100**.
+
 **Production is Linux server, x86-64 and ARM64.** macOS/M1 is the development
 machine and every number in this repo so far was taken there, which makes them
 development signals rather than product claims. Three concrete reasons they do
@@ -121,6 +134,11 @@ Needs E1 and E2.
       utterance parity mel corr 1.000000 with the oracle's noise injected
 - [x] E3-5a **performance: RTF 2.03 → 0.245** (f16 default, lossless on a bf16 checkpoint);
       conv stack 36× via a GEMM fast path. int8 reaches 0.191 but breaks parity, so it stays opt-in
+- [ ] E3-5c **int8 is the bet, and today it breaks parity on this engine** — hidden
+      `rel_l2` 5.9e-02…1.4e-01 against 1e-4, an extra frame, log-mel 0.921. The
+      reference quantizes attention and FFN only and leaves the flow head and the Mimi
+      decoder in f32, while we quantize every linear the hook sees. Fix what we
+      quantize, then int4. **f16 is a dead end on the target: it is ARM-only**
 - [ ] E3-5b next 2×: `codec.transformer` is 43% of the wall, running 16 positions as 16 steps
       over the same ~29 MB. A batched GEMM prefill estimates f32 ~0.35 / f16 ~0.17
 - [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias** (two different
@@ -166,6 +184,12 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-5 the kernel the profile names — scalar reference, then NEON/SDOT/i8mm **and** AVX2/AVX-512/VNNI in one change
 - [ ] E4-6 int8 weight prepack with persistent cache, both ISAs
 - [ ] E4-7 AMX-INT8 (Linux/x86 only), last
+- [ ] E4-10 **remove useless dtype conversions** — called out by name as one of the two
+      profiling wins. `src/qmat.c` holds 15 conversion sites and every other hot-path
+      module holds zero; the suspicion is `bf16 -> f32 -> f16` where one step would do
+- [ ] E4-11 **no silently-chosen scalar BLAS** — a scalar path taken without anyone
+      knowing is worse than a slow one that announces itself. `blas.accelerate` is ON
+      here and absent on the target, and the 36x conv-stack win goes through BLAS
 - [ ] E4-9 **Linux is the target, so measure there**: runtime ISA dispatch on x86 (a
       binary that picks VNNI/AMX when the CPU has them and does not SIGILL when it
       does not), OpenBLAS thread-count coordination with our pool, a CI matrix that
@@ -174,6 +198,8 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-8 `Makefile`: `SIMD=` profiles + `ARCH_STAMP` rebuild-on-flag-change
 
 ### E5 — Streaming server v2 → [`.work/streaming-server-v2.md`](.work/streaming-server-v2.md)
+Design reference: [`.work/serving-design.md`](.work/serving-design.md) ·
+doctrine: [`.work/serving-doctrine.md`](.work/serving-doctrine.md)
 
 Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
 
@@ -192,6 +218,12 @@ Supersedes §24 (P0-P3, all landed). The limit now is concurrent streaming.
       *and* a PocketTTS pack without assuming the engine.
 - [ ] E5-10 `tests/test_server.sh` `batching` check needs sub-second timing (flaky, pre-existing)
 - [ ] E5-9 **per-language slot groups** — batching cannot mix languages; decide before E5-1
+- [ ] E5-11 **admission control against a real-time budget**. Measured: the machine
+      sustains ~3x real time aggregate, so at C8 each stream gets 0.35x and stalls.
+      There is no setting that makes them all GOOD — only the choice between waiting
+      and stuttering — so the server has to choose deliberately and say which
+- [ ] E5-12 **prefork with pinned core slices** (E5-6) is the mechanism that turns
+      cores into streams; without the topology, more cores are not more streams
 - [ ] E5-8 gate: **N concurrent streams byte-identical to the same request run alone**
 
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)

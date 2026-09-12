@@ -33,5 +33,7 @@ that holds the detail. Nothing in `PLAN.md` should need more than one line.
 | [streaming-server-v2.md](streaming-server-v2.md) | E5 — streaming server v2, ported from qwen-tts |
 | [licensing-and-voice-policy.md](licensing-and-voice-policy.md) | E6 — per-voice licensing in the model pack |
 | [voice-cloning.md](voice-cloning.md) | E7 — zero-shot voice cloning |
+| [serving-doctrine.md](serving-doctrine.md) | Direction from the author of the reference implementation |
+| [serving-design.md](serving-design.md) | The serving mechanisms worth copying from qwen-tts |
 | [tokenizer-sentencepiece.md](tokenizer-sentencepiece.md) | E3-2 — SentencePiece Unigram in C |
 | [archive-2026-07-checkpoints.md](archive-2026-07-checkpoints.md) | Historical `PLAN.md` §17-24, moved verbatim |
