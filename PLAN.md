@@ -51,15 +51,17 @@ Blocks E3. Do it *with* PocketTTS in hand, not before.
 
 - [ ] E1-1 `src/tts_engine.h`: vtable `prepare/step/flush/reset/free` + capability block
 - [ ] E1-2 lift the slot driver out of `graph.c:3674-4283` into `src/inference.c`
-- [ ] E1-3 lift streaming state into `src/stream.c`; left-context becomes a capability, not a `#define`
+- [ ] E1-3 lift streaming state into `src/stream.c`; `decode_audio` takes contiguous
+      monotonic ranges and the engine owns continuity (E2-3), so left-context stays internal
 - [ ] E1-4 lift transformer/attention/KV/RoPE into `src/transformer.c`
 - [ ] E1-5 remove Magpie fields from `src/mynah_tts.h` (breaking API change)
 - [ ] E1-6 real JSON parser with nesting and arrays, replacing `mynah_tts.c:112-163`
 - [ ] E1-7 split the converter into a shared pack writer + per-engine metadata
 - [ ] E1-8 gate: Magpie stream↔offline output sample-identical to the pre-refactor binary
-- [ ] E1-0 **blocker**: `models/` is empty, so no Magpie golden can be captured and
-      E1-8 cannot be verified. Re-download and convert the pinned Magpie/NanoCodec
-      archives, capture goldens, **then** start E1
+- [ ] E1-0 **prerequisite**: `models/` is empty *and* `make self-test` is a no-op for
+      `graph.c` on Linux, so nothing guards the refactor. Write
+      `tools/make_fake_pack.py` (deterministic, few MB) and capture goldens —
+      offline and streaming, f32 and int8 — **then** start E1
 
 ### E2 — PocketTTS oracle → [`.work/pocket-tts-oracle.md`](.work/pocket-tts-oracle.md)
 
@@ -68,7 +70,9 @@ Independent of E1. **Start here** — it tells E1 which state the seam must mode
 - [ ] E2-1 `tools/oracle_pocket.py`: dump all 12 stages, tokenizer → waveform
 - [x] E2-1a `tools/oracle_pocket.py` + `make oracle-pocket` written
 - [ ] E2-2 `tests/parity_pocket.py` with per-stage tolerances
-- [ ] E2-3 **measure the SEANet streaming receptive field** (the `STREAM_CONTEXT_FRAMES` equivalent)
+- [x] E2-3 streaming decode measured: **carry codec state** (error 1e-7 down to a
+      1-frame chunk); replaying context needs 64 frames / 5.12 s for exactness, so
+      the Magpie replay strategy does not transfer
 - [ ] E2-4 dump decoder-transformer behaviour past `context: 250`
 - [ ] E2-5 dump the text-chunk seam at `MAX_TOKEN_PER_CHUNK = 50`, including the known skip bug
 

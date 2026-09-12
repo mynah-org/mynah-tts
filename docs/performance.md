@@ -19,14 +19,14 @@ number alone, and do not carry these figures over to a future engine.
 | Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
 | Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
 | Magpie 357M v2607 | Apple M1 | Metal | f32 | 0.723 | 2026-07-29 |
-| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX-512 VNNI | **int8** | 0.427¹ | 2026-08-04 |
-| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX-512 VNNI | f32 | 0.806¹ | 2026-08-04 |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX2 | **int8** | 0.427¹ | 2026-08-04 |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX2 | f32 | 0.806¹ | 2026-08-04 |
 | Magpie 357M v2607 | ARM64 server (Grace, Graviton) | NEON / SVE | — | not measured | server-class ARM only |
 
 ¹ Single warm `--synthesize` run of a short utterance, not the `make bench`
 protocol above — treat the absolute values as indicative. The robust part is
-the ordering: the int8 lane is a **1.9×** speedup over f32 on real AVX-512
-VNNI silicon, consistent with the bandwidth-bound analysis below.
+the ordering: the int8 lane is a **1.9×** speedup over f32, consistent with the
+bandwidth-bound analysis below.
 
 On a longer 6.0 s utterance the M1 numbers improve, because the fixed prep and
 codec cost amortizes: int8 **0.243**, f16 0.376, f32 0.532.
@@ -40,12 +40,29 @@ is *server-class* ARM (Grace, Graviton), which has different cache and bandwidth
 behaviour and would need its own run.
 
 The x86 rows were filled on 2026-08-04, on a rented **AMD EPYC 9555P** (Zen 5)
-cloud instance — 4 vCPU, 15 GB RAM, gcc 15.2, Linux/OpenBLAS — with real AVX2,
-AVX-512 F/DQ/BW/VL and **AVX512-VNNI** (until then the x86 kernels had been
-written and optimized but never run on x86 hardware). The same pass verified
-*correctness*, not just speed: `make self-test` green on that ISA, the pack
-converted on the box, and the f32/int8 WAVs validated by ear against the
-Apple-Silicon output. Server-class ARM remains the one unmeasured column.
+cloud instance — 4 vCPU, 15 GB RAM, gcc 15.2, Linux/OpenBLAS — until then the
+x86 kernels had been written and optimized but never run on x86 hardware. The
+same pass verified *correctness*, not just speed: `make self-test` green on that
+ISA, the pack converted on the box, and the f32/int8 WAVs validated by ear
+against the Apple-Silicon output. Server-class ARM remains the one unmeasured
+column.
+
+**Which ISA those numbers actually ran on — corrected 2026-09-12.** An earlier
+revision of this table credited them to AVX-512 VNNI. The host has AVX2,
+AVX-512 F/DQ/BW/VL and AVX512-VNNI; the binary does not. Linux x86 builds
+default to `-mavx2 -mfma` (`Makefile:22-46`), so AVX-512 was not even enabled,
+and the int8 kernel is `dot_q8_i32_avx2` (`src/qmat.c:117-134`), which widens
+int8 to int16 and accumulates with `_mm256_madd_epi16`. There is no `_mm512_*`
+and no `vpdpbusd` anywhere in `src/`, and hand-written AVX2 intrinsics are never
+promoted to VNNI by a compiler — `VPDPBUSD` is u8×s8 while the loop is s8×s8,
+and the `-128·Σw` correction is not something a compiler invents. `SIMD=avx512`
+adds compiler flags and selects no different kernel. The one AVX-512 consumer in
+the run is OpenBLAS, which dispatches its own sgemm at runtime, so the f32
+prefill uses it and the int8 decode lane does not.
+
+The measurements stand; the attribution did not. **0.427 is what AVX2 alone
+buys**, which makes it a floor for x86 rather than a ceiling. A VNNI/AMX lane is
+unbuilt work (`PLAN.md` E4-5, E4-7).
 
 Do not fill these rows from a sibling project: `qwen-tts` figures describe a
 different model and say nothing about Magpie.

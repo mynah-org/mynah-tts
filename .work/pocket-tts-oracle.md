@@ -128,3 +128,70 @@ Stages 3 (voice KV as loaded) and 11 (per-stage SEANet conv outputs) are not
 individually hooked yet, and none of the streaming-specific measurements
 (receptive field, `context: 250` eviction, chunk seam) have been run. Those are
 E2-3 to E2-5 and they are the ones that feed E1's design.
+
+## E2-3 measured — 2026-09-12: the codec must carry state, not replay context
+
+`tools/oracle_pocket_stream.py`, english/alba, 52 frames, chunk sizes 1-16.
+Two candidate designs for `stream.c`, compared against a one-shot decode:
+
+**A. carry codec state across chunks** (what upstream does)
+
+| chunk | max abs error | rel RMS |
+|---|---|---|
+| 1 frame (80 ms) | 1.0e-06 | 7.3e-07 |
+| 2 | 1.2e-07 | 3.4e-08 |
+| 4 | 1.2e-07 | 2.4e-08 |
+| 16 | 6.0e-08 | 1.1e-08 |
+
+Float32 rounding, nothing more. **Exact for practical purposes down to a single
+80 ms frame.**
+
+**B. fresh state per chunk, replaying K frames of left context** (what the
+Magpie/NanoCodec path does today with `STREAM_CONTEXT_FRAMES 32`)
+
+| K frames | max abs | rel RMS | |
+|---|---|---|---|
+| 0 | 1.13 | 7.2e-01 | unusable |
+| 8 | 3.1e-01 | 1.2e-01 | |
+| 16 | 1.2e-01 | 3.8e-02 | |
+| 32 | 4.0e-04 | 6.4e-05 | audible-threshold, not exact |
+| **64** | **0.0** | **0.0** | **bit-identical** |
+
+**Decision: option A.** Option B needs **64 frames = 5.12 s** of replayed
+context per chunk. At Magpie's 21.5 fps its 32 frames are ~1.5 s; the PocketTTS
+equivalent is over three times longer in wall-clock and, because each replayed
+frame costs a full SEANet pass, roughly an order of magnitude more work per
+emitted chunk. It is not a viable streaming design here.
+
+### The trap that made this measurable
+
+The first run said option A was *wrong* — rel RMS 0.46, worse as the chunk got
+smaller. It was not: `increment_steps(mimi, state, stride * n_latents)` after
+every `decode_from_latent` was missing from the harness
+(`models/tts_model.py:537`). The codec keeps an **explicit position counter,
+separate from the convolution ring buffers**, advancing by `encoder_stride` (16)
+per latent frame. Without it every chunk rewrites the decoder transformer's KV
+from position zero.
+
+It fails *gracefully*: no crash, no warning, output that degrades smoothly with
+chunk size. A C implementation will hit exactly this, and the symptom will look
+like a kernel bug rather than a missing counter. Two pieces of state, both
+mandatory:
+
+1. convolution ring buffers (the obvious one)
+2. a position counter advanced by `encoder_stride` per latent frame (the one
+   that gets forgotten)
+
+Also confirmed here: the codec's `sequence_length` is sized in **encoder frames**
+(`frames * 16`), not latent frames. Sizing it in latent frames fails loudly, at
+least — the first chunk's KV write raises.
+
+### Consequence for the engine seam
+
+`caps.audio_left_context_frames` (proposed in
+[engine-seam-refactor.md](engine-seam-refactor.md)) is the wrong abstraction: it
+assumes replay. Make `decode_audio` require **contiguous, monotonically
+increasing** frame ranges and let the engine keep whatever state that needs —
+Magpie replays 32 frames internally, PocketTTS carries a ring buffer and a
+counter. The capability then disappears from the public surface instead of
+leaking one engine's strategy into the driver.
