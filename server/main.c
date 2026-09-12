@@ -117,6 +117,24 @@ static struct {
     size_t max_pending;
     unsigned request_timeout_ms;
     int cancel_on_disconnect;   /* default on; --no-cancel-on-disconnect turns it off */
+
+    /* ---- language residency (E5-9) ----
+     *
+     * THIS process holds exactly one pack, so it holds exactly one set of
+     * weights, so every batch it forms is one language. That is not a rule
+     * anything here enforces -- it is the shape of the process, and it is why
+     * there is no per-slot language field anywhere below to get mixed.
+     *
+     * `language` is what the pack declares its weights are bound to, or "" for
+     * a pack whose weights are not language-specific (one Magpie pack serves
+     * twelve languages, choosing only a tokenizer). Empty means "serve any
+     * language the tokenizer knows"; non-empty means "refuse anything else",
+     * and refusing is the entire fix: before this, a PocketTTS server answered
+     * 200 to a request for a language it did not hold, with audio from the
+     * wrong model. */
+    const char *language;       /* never NULL; "" when the pack is unbound */
+    int         pack_index;     /* which -m this worker kept; 0 single-pack  */
+    int         fleet_packs;    /* how many the fleet holds; 1 = one language */
 } g;
 
 /* The synthesis thread, published once by the scheduler before it enters the
@@ -151,6 +169,11 @@ static struct {
     atomic_ulong failed;
     atomic_ulong streams_active;
     atomic_ulong streams_total;
+    /* Its own counter, never folded into `rejected`. A capacity refusal says
+     * "come back"; this one says "this server will never serve that, look at
+     * /health". An operator who sees these climbing has a routing or a
+     * residency problem, not a load problem, and the two have opposite fixes. */
+    atomic_ulong language_refused;
 } g_stats;
 
 static double now_ms(void) {
@@ -781,6 +804,26 @@ static void send_error(int fd, const char *status, const char *type,
     send_status(fd, status, "application/json", body, (size_t)n);
 }
 
+/* The same shape with an `error.code`, for the refusals that share a
+ * vocabulary with the prefork admission ladder. A client matching on
+ * `error.code` must see the same token whether the router refused it or the
+ * worker did, so the token comes from mynah_prefork_refusal_code() rather than
+ * being spelled out a second time here. */
+static void send_error_code(int fd, const char *status, const char *type,
+                            const char *code, const char *message) {
+    char escaped[512];
+    if (mynah_json_escape(message, escaped, sizeof(escaped)) == (size_t)-1) {
+        snprintf(escaped, sizeof(escaped), "request failed");
+    }
+    char body[832];
+    const int n = snprintf(body, sizeof(body),
+                           "{\"error\":{\"message\":\"%s\",\"type\":\"%s\","
+                           "\"code\":\"%s\"}}",
+                           escaped, type, code);
+    if (n <= 0) return;
+    send_status(fd, status, "application/json", body, (size_t)n);
+}
+
 /* ------------------------------------------------------------------ audio */
 
 static void wav_header(unsigned char h[44], uint32_t data_bytes, unsigned rate) {
@@ -847,8 +890,48 @@ static int handle_speech(int fd, const char *body) {
         return 0;
     }
 
-    char language[16] = "en";
+    /* LANGUAGE IS A ROUTING KEY, not a tokenizer argument, whenever the pack's
+     * weights are bound to one. It used to default to "en" unconditionally,
+     * which was harmless while it only chose a Magpie tokenizer and would be a
+     * disaster here: every request that omitted it would ask an Italian server
+     * for English. Unspecified now means "whatever this server holds".
+     *
+     * The empty string is therefore load bearing and is not a missing value. */
+    char language[32] = {0};
     (void)mynah_json_string(body, "language", language, sizeof(language));
+    if (g.language[0] != '\0') {
+        /* Bound weights. A mismatch is refused BEFORE a job exists, so a slot
+         * is never charged for a request that cannot be served, and so no
+         * batch can ever contain two languages -- there is only one model in
+         * this process and only requests for it get past this point. */
+        if (language[0] != '\0') {
+            const char *resident = g.language;
+            if (mynah_prefork_language_match(&resident, 1, language) != 0) {
+                atomic_fetch_add(&g_stats.language_refused, 1ul);
+                char msg[320];
+                const char *plan = mynah_prefork_language_plan();
+                snprintf(msg, sizeof(msg),
+                         "this server holds '%s' and was asked for '%.32s'%s%s"
+                         "; GET /health lists what is resident",
+                         g.language, language,
+                         plan[0] != '\0' ? "; the fleet holds " : "",
+                         plan[0] != '\0' ? plan : "");
+                send_error_code(fd, "400 Bad Request", "invalid_request_error",
+                                mynah_prefork_refusal_code(
+                                    MYNAH_PREFORK_REFUSE_LANGUAGE_NOT_SERVED),
+                                msg);
+                return 0;
+            }
+        }
+        /* Nothing downstream consumes it: a bound pack ships its own
+         * tokenizer, so the language is already baked into the weights and the
+         * vocabulary alike. */
+    } else if (language[0] == '\0') {
+        /* Unbound weights (Magpie): the tokenizer still needs a language, and
+         * "en" is the default this server has always used. Unchanged on
+         * purpose -- this is the path the goldens cover. */
+        snprintf(language, sizeof(language), "en");
+    }
 
     char format[32] = "wav";
     (void)mynah_json_string(body, "response_format", format, sizeof(format));
@@ -1054,13 +1137,52 @@ static void handle_health(int fd) {
     /* Grown with the disconnect counter and the cancel-on-disconnect flag.
      * snprintf would truncate rather than overflow, but a truncated /health is
      * invalid JSON, which a monitor reads as "the server is broken". */
-    char body[1024];
+    /* The resident languages, as a list, because "which languages does this
+     * server actually hold" is the first question a multi-language deployment
+     * asks and the one it must not have to infer from a filename. A bound pack
+     * lists its one language; an unbound one lists what its tokenizer can
+     * encode, which for Magpie is the twelve the weights genuinely serve.
+     * `bound` is the difference between "these are the only ones" and "these
+     * all run on the same weights", and it is the field a client should branch
+     * on rather than counting entries. */
+    char langs[512];
+    size_t ln = 0;
+    langs[0] = '\0';
+    if (g.language[0] != '\0') {
+        ln = (size_t)snprintf(langs, sizeof(langs), "\"%s\"", g.language);
+    } else if (g.tokenizer != NULL) {
+        const char *const *names = mynah_tokenizer_languages(g.tokenizer);
+        for (size_t i = 0; names != NULL && names[i] != NULL &&
+                           ln < sizeof(langs) - 24u; ++i) {
+            ln += (size_t)snprintf(langs + ln, sizeof(langs) - ln, "%s\"%s\"",
+                                   i == 0 ? "" : ",", names[i]);
+        }
+    }
+    (void)ln;
+    /* The language a request that names none lands on: this process's own.
+     * JSON `null` when the pack is unbound, because "" would read as a
+     * language whose name is the empty string. */
+    char fallback[48];
+    if (g.language[0] != '\0') {
+        snprintf(fallback, sizeof(fallback), "\"%s\"", g.language);
+    } else {
+        snprintf(fallback, sizeof(fallback), "null");
+    }
+
+    char body[2048];
     const int n = snprintf(body, sizeof(body),
                            "{\"status\":\"ok\",\"model\":\"%s\",\"engine\":\"%s\","
                            "\"sample_rate\":%u,\"voices\":%zu,"
+                           /* Residency, then how the fleet was divided. Both
+                            * printed rather than assumed: the capacity split
+                            * is a number this process CHOSE (W defaults to the
+                            * pack count), and config that is only assumed has
+                            * been wrong twice in this repository already. */
+                           "\"languages\":{\"resident\":[%s],\"bound\":%s,"
+                           "\"fleet\":\"%s\",\"default\":%s},"
                            "\"jobs\":{\"queued\":%lu,\"active\":%lu,\"completed\":%lu,"
                            "\"failed\":%lu,\"rejected\":%lu,\"timed_out\":%lu,"
-                           "\"disconnected\":%lu},"
+                           "\"disconnected\":%lu,\"language_refused\":%lu},"
                            "\"streams\":{\"active\":%lu,\"total\":%lu},"
                            /* A policy that is on by default has to be
                             * READABLE, or an operator cannot tell a server
@@ -1080,6 +1202,10 @@ static void handle_health(int fd) {
                            "\"synthesis_threads\":%d}}",
                            g.model_id, g.info.engine, g.info.sample_rate,
                            g.voice_count,
+                           langs,
+                           g.language[0] != '\0' ? "true" : "false",
+                           mynah_prefork_language_plan(),
+                           fallback,
                            atomic_load(&g_stats.queued),
                            atomic_load(&g_stats.active),
                            atomic_load(&g_stats.completed),
@@ -1087,6 +1213,7 @@ static void handle_health(int fd) {
                            atomic_load(&g_stats.rejected),
                            atomic_load(&g_stats.timed_out),
                            atomic_load(&g_stats.disconnected),
+                           atomic_load(&g_stats.language_refused),
                            atomic_load(&g_stats.streams_active),
                            atomic_load(&g_stats.streams_total),
                            g.max_batch, g.max_pending, g.worker_count,
@@ -1415,10 +1542,22 @@ static void dump_local_stats(void) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s -m MODEL_DIR [-p PORT] [--host ADDR] [-w WORKERS]\n"
+            "usage: %s -m MODEL_DIR [-m MODEL_DIR ...] [-p PORT] [--host ADDR] [-w WORKERS]\n"
             "       [--device cpu|metal|cuda] [--max-batch N] [--max-pending N]\n"
             "       [--request-timeout-ms MS] [--no-cancel-on-disconnect]\n"
             "       [--prefork W] [--prefork-threads T] [--prefork-plan]\n"
+            "\n"
+            "  -m MODEL_DIR       repeatable: ONE PACK PER LANGUAGE. The pack's\n"
+            "                     model.json says which language its weights are\n"
+            "                     bound to; a request naming another is refused 400\n"
+            "                     language_not_served rather than served from the\n"
+            "                     wrong model. The FIRST pack is the default, used by\n"
+            "                     a request that names no language.\n"
+            "                     Several packs imply --prefork: one worker holds one\n"
+            "                     pack, which is what makes a batch always one\n"
+            "                     language. W defaults to the number of packs.\n"
+            "                     A Magpie pack declares no language (one set of\n"
+            "                     weights serves twelve) and must be served alone.\n"
             "\n"
             "  --no-cancel-on-disconnect\n"
             "                     stop watching streaming sockets for a peer hangup.\n"
@@ -1447,8 +1586,14 @@ static void usage(const char *argv0) {
             "  GET  /health\n", argv0);
 }
 
+/* At most this many language packs in one fleet. Six PocketTTS languages exist
+ * today; the bound is generous and explicit so that a typo in a launch script
+ * is refused rather than silently growing an array. */
+#define MAX_PACKS 16
+
 int main(int argc, char **argv) {
-    const char *model_dir = NULL;
+    const char *pack_dir[MAX_PACKS];
+    int pack_count = 0;
     int port = 8080;
     const char *host = "127.0.0.1";
     mynah_tts_device device = MYNAH_TTS_DEVICE_CPU;
@@ -1469,7 +1614,14 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
-            model_dir = argv[++i];
+            /* REPEATABLE, one pack per language. The first is the default: the
+             * pack a request that names no language lands on. Order is
+             * therefore a decision, not an accident, and it is printed. */
+            if (pack_count >= MAX_PACKS) {
+                fprintf(stderr, "at most %d model packs\n", MAX_PACKS);
+                return 2;
+            }
+            pack_dir[pack_count++] = argv[++i];
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -1517,8 +1669,28 @@ int main(int argc, char **argv) {
         mynah_prefork_print_plan(&plan, stdout);
         return 0;
     }
-    if (model_dir == NULL || port <= 0 || port > 65535) { usage(argv[0]); return 2; }
+    if (pack_count == 0 || port <= 0 || port > 65535) { usage(argv[0]); return 2; }
     if (prefork_workers < 0) { usage(argv[0]); return 2; }
+    /* MORE THAN ONE PACK IMPLIES PREFORK, because the whole design is that a
+     * process holds one pack. If W was not given it becomes the pack count,
+     * and the banner says that it did -- a topology this process chose is
+     * exactly the kind of thing that must be printed. If W was given and is
+     * too small, that is an error and not a silently dropped language. */
+    if (pack_count > 1) {
+        if (prefork_workers == 0) {
+            prefork_workers = pack_count;
+            fprintf(stderr, "%d model packs: enabling --prefork %d "
+                            "(one worker per language; each worker holds one pack, "
+                            "so a batch is always one language)\n",
+                    pack_count, prefork_workers);
+        } else if (prefork_workers < pack_count) {
+            fprintf(stderr, "--prefork %d cannot serve %d languages: one worker holds "
+                            "exactly one pack, so a language would have no worker. "
+                            "Use --prefork %d or more.\n",
+                    prefork_workers, pack_count, pack_count);
+            return 2;
+        }
+    }
     if (g.worker_count < 1) g.worker_count = 1;
     if (g.worker_count > 64) g.worker_count = 64;
     if (g.max_batch < 1u) g.max_batch = 1u;
@@ -1544,12 +1716,60 @@ int main(int argc, char **argv) {
         prefork_workers = pf.workers;
     }
 
+    /* ---- open every pack, BEFORE the fork ----
+     *
+     * Before, so the mapped weights are one physical copy behind the whole
+     * tree rather than one per worker, and so that a bad path is a startup
+     * failure rather than a worker that dies after the router is already
+     * listening. A worker keeps exactly one of these and closes the rest; the
+     * router keeps them all and never enters any of them. */
     char err[512];
-    if (mynah_tts_model_open_device(model_dir, device, &g.model, err, sizeof(err)) != 0) {
-        fprintf(stderr, "cannot open model: %s\n", err);
-        return 1;
+    mynah_tts_model *packs[MAX_PACKS];
+    mynah_tts_model_info pack_info[MAX_PACKS];
+    const char *pack_lang[MAX_PACKS];
+    for (int i = 0; i < pack_count; ++i) packs[i] = NULL;
+
+    for (int i = 0; i < pack_count; ++i) {
+        if (mynah_tts_model_open_device(pack_dir[i], device, &packs[i],
+                                        err, sizeof(err)) != 0) {
+            fprintf(stderr, "cannot open model %s: %s\n", pack_dir[i], err);
+            for (int k = 0; k < i; ++k) mynah_tts_model_close(packs[k]);
+            return 1;
+        }
+        mynah_tts_model_get_info(packs[i], &pack_info[i]);
+        pack_lang[i] = pack_info[i].language;
     }
-    mynah_tts_model_get_info(g.model, &g.info);
+
+    /* ---- and validate the fleet, before anything is forked ----
+     *
+     * Two packs claiming one language, or a second pack whose weights are not
+     * bound to any, both mean a request could not be routed: the server would
+     * have to pick one silently, and picking silently is how a client gets a
+     * whole utterance from the wrong model and a 200 to go with it. */
+    if (pack_count > 1) {
+        for (int i = 0; i < pack_count; ++i) {
+            if (pack_lang[i][0] == '\0') {
+                fprintf(stderr,
+                    "%s declares no language in model.json, so it cannot be one of "
+                    "several packs: its weights serve any language, and there would "
+                    "be no way to decide which requests belong to it. Serve it alone, "
+                    "with a single -m.\n", pack_dir[i]);
+                for (int k = 0; k < pack_count; ++k) mynah_tts_model_close(packs[k]);
+                return 1;
+            }
+            for (int k = 0; k < i; ++k) {
+                if (mynah_prefork_language_match(&pack_lang[k], 1, pack_lang[i]) == 0) {
+                    fprintf(stderr,
+                        "%s and %s both claim language '%s'; a request naming it could "
+                        "go to either, so refusing to start\n",
+                        pack_dir[k], pack_dir[i], pack_lang[i]);
+                    for (int n = 0; n < pack_count; ++n) mynah_tts_model_close(packs[n]);
+                    return 1;
+                }
+            }
+        }
+    }
+
     /* The engine's own ceiling, not the runtime's: a continuous-latent engine
      * declares 1 until its batching is measured, and handing it more is an
      * error rather than a slower path.
@@ -1558,33 +1778,16 @@ int main(int argc, char **argv) {
      * asks the model, and before the open above there is no model to ask.
      * Asking too early did not fail, it answered 1 -- the conservative default
      * for "no model" -- so the server silently ran every request alone with a
-     * --max-batch the operator had set and /health cheerfully reported. */
-    {
-        const size_t engine_max = mynah_tts_model_max_batch(g.model);
+     * --max-batch the operator had set and /health cheerfully reported.
+     *
+     * The MINIMUM over the fleet, because every worker runs the same
+     * --max-batch and the router's slot accounting is one number. A fleet
+     * whose packs disagreed would otherwise hand one engine more slots than it
+     * declared. */
+    for (int i = 0; i < pack_count; ++i) {
+        const size_t engine_max = mynah_tts_model_max_batch(packs[i]);
         if (g.max_batch > engine_max) g.max_batch = engine_max;
     }
-    /* Which tokenizer applies is a property of the engine, so the pack decides.
-     * Opening Magpie's unconditionally rejected a valid PocketTTS pack for a
-     * missing english_phoneme.tsv it has no reason to carry. */
-    if (strcmp(g.info.engine, "pocket") == 0) {
-        char sp_path[1024];
-        snprintf(sp_path, sizeof(sp_path), "%s/tokenizer.model", model_dir);
-        if (mynah_sp_open(sp_path, &g.sp, err, sizeof(err)) != 0) {
-            fprintf(stderr, "cannot open tokenizer: %s\n", err);
-            mynah_tts_model_close(g.model);
-            return 1;
-        }
-    } else {
-        g.tokenizer = mynah_tokenizer_open(model_dir, err, sizeof(err));
-        if (g.tokenizer == NULL) {
-            fprintf(stderr, "cannot open tokenizer: %s\n", err);
-            mynah_tts_model_close(g.model);
-            return 1;
-        }
-    }
-    load_voices(model_dir);
-    snprintf(g.model_id, sizeof(g.model_id), "%s-%s", g.info.engine, g.info.revision);
-    g.default_speaker = g.voice_count > 0 ? g.voices[0].id : 0u;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1642,24 +1845,79 @@ int main(int argc, char **argv) {
          * actually opened. Forking with GPU state alive produces a wrong
          * answer rather than a crash, which is the worse failure. */
         pf.gpu_backend_open = (device != MYNAH_TTS_DEVICE_CPU);
+        /* The fleet's languages, in pack order. With one pack this is left
+         * NULL and every language-aware branch in the router stays dormant --
+         * which is what keeps the single-language server the one that shipped. */
+        if (pack_count > 1) {
+            pf.languages = pack_lang;
+            pf.language_count = pack_count;
+        }
         const mynah_prefork_role role = mynah_prefork_run(&pf, &g_shutdown, &chan_fd);
         if (role == MYNAH_PREFORK_ERROR) {
             close(listen_fd);
-            mynah_tokenizer_close(g.tokenizer);
-            mynah_sp_close(g.sp);
-            mynah_tts_model_close(g.model);
+            for (int i = 0; i < pack_count; ++i) mynah_tts_model_close(packs[i]);
             return 1;
         }
         if (role == MYNAH_PREFORK_PARENT_DONE) {
             /* The router closed the listening socket itself, has no threads to
-             * join and never entered the model. */
-            mynah_tokenizer_close(g.tokenizer);
-            mynah_sp_close(g.sp);
-            mynah_tts_model_close(g.model);
+             * join and never entered any model. */
+            for (int i = 0; i < pack_count; ++i) mynah_tts_model_close(packs[i]);
             return 0;
         }
         accept_fd = -1;              /* a worker never accepts; the parent routes */
+        /* WHICH PACK IS MINE. Decided by the parent before the fork and read
+         * back here, so a worker can never disagree with the router about what
+         * it holds -- a disagreement would mean requests routed to a worker
+         * that refuses them, or worse, one that served them from the wrong
+         * weights. */
+        if (pack_count > 1) g.pack_index = mynah_prefork_worker_language();
     }
+
+    /* ---- from here this process holds ONE pack ----
+     *
+     * Everything else is closed. Not for memory -- the mappings are shared and
+     * mostly clean -- but because a second model in a process that serves one
+     * language is a thing a future edit could reach for, and the shortest way
+     * to keep "a batch is one language" true is to leave nothing else here to
+     * batch with. */
+    if (g.pack_index < 0 || g.pack_index >= pack_count) g.pack_index = 0;
+    g.model = packs[g.pack_index];
+    g.info = pack_info[g.pack_index];
+    g.language = pack_info[g.pack_index].language;
+    g.fleet_packs = pack_count;
+    for (int i = 0; i < pack_count; ++i) {
+        if (i != g.pack_index) mynah_tts_model_close(packs[i]);
+    }
+    const char *model_dir = pack_dir[g.pack_index];
+
+    /* Which tokenizer applies is a property of the engine, so the pack decides.
+     * Opening Magpie's unconditionally rejected a valid PocketTTS pack for a
+     * missing english_phoneme.tsv it has no reason to carry.
+     *
+     * Opened AFTER the fork, and only for this worker's own pack: a tokenizer
+     * is per pack, and the parent would otherwise build N of them it never
+     * uses. The process is still single threaded here, so this is safe ground
+     * -- the fork ordering constraint is about threads and mutexes, not about
+     * opening files. */
+    if (strcmp(g.info.engine, "pocket") == 0) {
+        char sp_path[1024];
+        snprintf(sp_path, sizeof(sp_path), "%s/tokenizer.model", model_dir);
+        if (mynah_sp_open(sp_path, &g.sp, err, sizeof(err)) != 0) {
+            fprintf(stderr, "cannot open tokenizer: %s\n", err);
+            mynah_tts_model_close(g.model);
+            return 1;
+        }
+    } else {
+        g.tokenizer = mynah_tokenizer_open(model_dir, err, sizeof(err));
+        if (g.tokenizer == NULL) {
+            fprintf(stderr, "cannot open tokenizer: %s\n", err);
+            mynah_tts_model_close(g.model);
+            return 1;
+        }
+    }
+    load_voices(model_dir);
+    snprintf(g.model_id, sizeof(g.model_id), "%s-%s", g.info.engine, g.info.revision);
+    g.default_speaker = g.voice_count > 0 ? g.voices[0].id : 0u;
 
     /* The main thread's role is decided by the branch just above, so it names
      * itself here rather than at the top of main(): a prefork worker does not
@@ -1690,6 +1948,31 @@ int main(int argc, char **argv) {
     }
     g_batch.thread_started = 1;
 
+    /* One line that says what this process serves and how the fleet was
+     * divided. Assembled rather than branched into three fprintf calls so the
+     * banner has one shape whatever the topology, and so the multi-language
+     * case cannot be the one nobody printed. */
+    char lang_banner[640];
+    if (g.language[0] != '\0') {
+        const char *plan = mynah_prefork_language_plan();
+        snprintf(lang_banner, sizeof(lang_banner),
+                 "%s — this pack's weights are BOUND to it, so a request naming "
+                 "another is refused 400 %s%s%s%s",
+                 g.language,
+                 mynah_prefork_refusal_code(MYNAH_PREFORK_REFUSE_LANGUAGE_NOT_SERVED),
+                 plan[0] != '\0' ? "\n      fleet: " : "",
+                 plan[0] != '\0' ? plan : "",
+                 plan[0] != '\0'
+                     ? " (workers per language; a batch is one process's slots,"
+                       "\n      so a batch is always one language)"
+                     : "");
+    } else {
+        snprintf(lang_banner, sizeof(lang_banner),
+                 "not bound — one set of weights serves every language this pack's "
+                 "tokenizer\n      knows; `language` selects a tokenizer and defaults "
+                 "to en");
+    }
+
     fprintf(stderr,
             "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu  "
             "workers=%d  max_batch=%zu  queue=%zu  timeout=%ums%s\n"
@@ -1697,10 +1980,16 @@ int main(int argc, char **argv) {
             "      batch as slots free up, streaming and batch alike\n"
             "transport: TCP_NODELAY on every accepted socket; threads named\n"
             "      (mynah-accept/recv, mynah-http*, mynah-sched, mynah-out*)\n"
+            "language: %s\n"
             "cancel-on-disconnect: %s\n",
             host, port, g.model_id, mynah_tts_device_name(device), g.voice_count,
             g.worker_count, g.max_batch, g.max_pending, g.request_timeout_ms,
             chan_fd >= 0 ? "  [prefork worker]" : "",
+            /* Residency, printed whichever shape the server is in. "which
+             * languages does this thing hold" has to be answerable from the
+             * log of a server that has since died, and for a bound pack it is
+             * also the answer to "why was my request refused 400". */
+            lang_banner,
             /* Printed whichever way it is set: a policy visible only when
              * enabled tells an operator nothing when a stream outlives its
              * client and they are trying to work out why. */

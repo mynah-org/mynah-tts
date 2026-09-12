@@ -38,6 +38,25 @@ typedef struct {
     unsigned min_generated_frames;
     float default_temperature;
     char device[16];
+    /* The language these WEIGHTS are bound to, verbatim from model.json's
+     * scalar "language" -- "english", "italian", ... -- or EMPTY when the pack
+     * does not declare one.
+     *
+     * Empty is a statement, not a missing value: it says the weights are not
+     * language-specific. One Magpie pack serves twelve languages from one set
+     * of weights with `language` choosing only a tokenizer, so it declares
+     * none and mixing languages in one batch is legal for it. A PocketTTS pack
+     * declares exactly one, because the six language models are independently
+     * trained and share nothing -- relative L2 of about root-two on every
+     * probed tensor including the codec (.work/pocket-tts-model-facts.md 10).
+     * For such a pack a batch that mixed languages would be reading the wrong
+     * weights for some of its slots.
+     *
+     * A caller deciding whether it may batch two requests together, or which
+     * process may serve a request, must branch on THIS being empty and never
+     * on `engine`: the binding is a property of the checkpoint, and a future
+     * engine may fall on either side of it. */
+    char language[32];
 } mynah_tts_model_info;
 
 typedef struct {

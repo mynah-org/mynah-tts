@@ -170,6 +170,24 @@
  *      See the SERVICE CAP note on that function for what is enforced here and
  *      what still needs a call site in the synthesis loop.
  *
+ * AND THE LADDER IS PER LANGUAGE, when there is more than one. Capacity is a
+ * property of a language, because a worker holds one pack: an English worker's
+ * free slot is of no use to an Italian request. So rung 1 picks the
+ * least-loaded worker OF THAT LANGUAGE'S GROUP, rung 2's bound is
+ * `queue_per_worker * live workers of that group`, and rung 3's deadline is
+ * checked at that group's own head.
+ *
+ * The queue is one array with a group tag rather than N arrays, and it is
+ * scanned in arrival order per group, which gives every group its own FIFO.
+ * That detail is load bearing: a single FIFO would let one entry for a
+ * saturated language block a ready entry for an idle one behind it -- a fresh
+ * starvation channel introduced by the very partitioning that was chosen to
+ * make starvation impossible.
+ *
+ * A request naming a language no group holds is refused at rung 0, before any
+ * of this, with `language_not_served` and a 400. See E5-9 and
+ * .work/multi-language-serving.md.
+ *
  * WHERE THE QUEUE LIVES, and why that differs from the reference. The
  * reference parks rungs 2 and 3 in the CHILD, because in its topology the
  * parent had nowhere to hold an accepted descriptor. Ours holds them in the
@@ -229,6 +247,19 @@ typedef enum {
      * apart from at-capacity because it means a worker channel is broken,
      * which is an incident, not load. */
     MYNAH_PREFORK_REFUSE_HANDOFF_FAILED,
+    /* Not a rung either, and the only one of these that is NOT a 503: the
+     * request named a language this fleet does not hold. The machine is not
+     * full and there is nothing to wait for -- no worker has those weights and
+     * none will grow them -- so the answer is 400 with
+     * `invalid_request_error`, and Retry-After is deliberately absent. Telling
+     * a client to come back for a language the server will never serve is how
+     * a refusal becomes a retry storm.
+     *
+     * Appended last, as this enum's contract requires. See E5-9 and
+     * .work/multi-language-serving.md for why languages partition the fleet at
+     * all: the six PocketTTS language models share nothing, so a batch that
+     * mixed them would read the wrong weights for some of its slots. */
+    MYNAH_PREFORK_REFUSE_LANGUAGE_NOT_SERVED,
     MYNAH_PREFORK_REFUSE__COUNT
 } mynah_prefork_refusal;
 
@@ -247,6 +278,24 @@ typedef struct {
     int threads_per;    /* T; <= 0 derives it from W and the cpu mask */
     int slots_per;      /* requests in flight per worker: the child's max_batch */
     int quiet;          /* suppress the banner (tests) */
+
+    /* ---- LANGUAGE GROUPS (E5-9) ----
+     *
+     * The fleet's resident languages, in the order the caller opened their
+     * packs; `languages[0]` is the default, used by a request that names none.
+     * NULL, or a count below 2, means a single-language fleet and every
+     * mechanism below is dormant -- the router is then byte-for-byte the
+     * language-agnostic one, which is what keeps the existing path unchanged.
+     *
+     * With two or more, workers are divided into contiguous groups, one per
+     * language, and a worker holds exactly one pack for its life. That is what
+     * makes "a batch never mixes languages" a fact about the address space
+     * rather than a check somebody has to remember: a batch is drawn from one
+     * process's slots, and that process has one model.
+     *
+     * The strings are borrowed, not copied, and must outlive the call. */
+    const char *const *languages;
+    int language_count;
 
     /* ---- the admission ladder. Every one of these is "0 = unset", so a
      * caller that memsets this struct and never hears of the ladder gets the
@@ -303,9 +352,25 @@ void mynah_prefork_reserve_threads(mynah_prefork_config *cfg);
  *
  * In the parent: runs the routing loop until *stop is set or every worker is
  * gone, reaps the children, prints the final per-worker table and returns
- * MYNAH_PREFORK_PARENT_DONE. The parent never synthesizes and never parses
- * HTTP; the only thing it writes to a client socket is the 503 it sends when
- * every worker is full. */
+ * MYNAH_PREFORK_PARENT_DONE. The parent never synthesizes, and the only thing
+ * it writes to a client socket is a refusal.
+ *
+ * IT USED TO SAY "and never parses HTTP", and that is now true only with a
+ * qualification, so here is the qualification rather than a quietly deleted
+ * clause. In a MULTI-LANGUAGE fleet the router has to know a connection's
+ * language before it can choose a worker, because the worker is the thing that
+ * holds the weights. What it does is bounded and NON-CONSUMING: a MSG_PEEK of
+ * at most a few KiB, a search for one JSON key, and a search of the header
+ * block for the two header names that announce a body. It never consumes a
+ * byte -- the worker still reads the entire request itself -- and it never
+ * interprets a method, a status, a framing rule or a body's meaning. A
+ * connection whose prefix has not arrived yet is PARKED with its own deadline,
+ * never waited on, because a router that blocks on a slow client is rung 1's
+ * disease under another name.
+ *
+ * In a single-language fleet none of that code runs at all. That is not an
+ * optimisation; it is the guarantee that adding languages did not change the
+ * server everybody already has. */
 mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                                      volatile sig_atomic_t *stop,
                                      int *chan_fd);
@@ -316,6 +381,43 @@ int mynah_prefork_worker_index(void);
 
 /* The threads-per-worker actually in force, or 0 outside a worker. */
 int mynah_prefork_worker_threads(void);
+
+/* ------------------------------------------------------- language groups */
+
+/* Which language group this worker was assigned -- an index into the
+ * `languages` array the parent was given. 0 outside a prefork worker and in a
+ * single-language fleet, which is why a caller with one pack can read it
+ * unconditionally and always get the one pack it has.
+ *
+ * This is the ONLY thing that tells a worker which pack is its own, and it is
+ * resolved before the fork so a worker can never disagree with the router
+ * about what it holds. */
+int mynah_prefork_worker_language(void);
+
+/* The fleet's capacity split as one printable line -- "english=2 italian=2" --
+ * or "" when the fleet holds one language. Resolved before the fork and
+ * inherited, so a WORKER can print the whole fleet's shape in its own banner
+ * and in /health even though it holds one pack. Config that is printed is
+ * config that can be argued with; config that is assumed has been wrong twice
+ * in this repository already. */
+const char *mynah_prefork_language_plan(void);
+
+/* Resolves a requested language name against a set of resident ones. Returns
+ * the index, -1 when nothing matches, or -2 when the name is AMBIGUOUS.
+ *
+ * The rule, in one place because the router and the worker must not drift:
+ * case-insensitive exact match first; failing that, a case-insensitive prefix
+ * of at least two characters that matches exactly one resident name. So `it`
+ * and `Italian` both reach a pack that calls itself `italian`, which matters
+ * because PocketTTS packs spell languages out while Magpie packs use ISO
+ * codes, and a client should not have to know which spelling a pack chose.
+ *
+ * Ambiguity is refused rather than resolved: picking one of two plausible
+ * languages is a wrong answer, and a wrong answer here is a whole utterance in
+ * the wrong voice. `want` of NULL or "" returns -1, meaning "unspecified" --
+ * the caller decides that means the default, not that it is an error. */
+int mynah_prefork_language_match(const char *const *names, int count,
+                                 const char *want);
 
 /* Exactly once per connection the worker was handed, when it is finished with
  * it. This is the parent's only view of how loaded a worker is, so a path that

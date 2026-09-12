@@ -38,6 +38,7 @@
 #include "costmap.h"
 #include "threads.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -607,8 +608,59 @@ static int g_worker_threads = 0;
 static int g_worker_chan = -1;
 static volatile sig_atomic_t g_dump_request = 0;
 
+/* Both are written in the PARENT, before the fork, and read in the children.
+ * That ordering is the reason a worker can never disagree with the router
+ * about which pack it holds: the assignment is one value computed once and
+ * then copied by fork(), not a message that could be lost or reordered. */
+static int  g_worker_language = 0;
+static char g_language_plan[512];
+
 int mynah_prefork_worker_index(void) { return g_worker_index; }
 int mynah_prefork_worker_threads(void) { return g_worker_threads; }
+int mynah_prefork_worker_language(void) { return g_worker_language; }
+const char *mynah_prefork_language_plan(void) { return g_language_plan; }
+
+/* ------------------------------------------------------ language matching
+ *
+ * One implementation, used by the router and by the worker, because two
+ * spellings of "does this request fit this pack" that disagree means a request
+ * the router accepts and the worker refuses -- a 400 for a language the server
+ * demonstrably holds, which is the most confusing failure this feature could
+ * produce. See the contract on the declaration in prefork.h. */
+static int lang_ci_equal(const char *a, const char *b) {
+    while (*a != '\0' && *b != '\0') {
+        const int ca = tolower((unsigned char)*a++);
+        const int cb = tolower((unsigned char)*b++);
+        if (ca != cb) return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int lang_ci_prefix(const char *prefix, const char *name) {
+    while (*prefix != '\0') {
+        if (*name == '\0') return 0;
+        if (tolower((unsigned char)*prefix++) != tolower((unsigned char)*name++)) return 0;
+    }
+    return 1;
+}
+
+int mynah_prefork_language_match(const char *const *names, int count,
+                                 const char *want) {
+    if (names == NULL || count <= 0 || want == NULL || want[0] == '\0') return -1;
+    for (int i = 0; i < count; ++i) {
+        if (names[i] != NULL && lang_ci_equal(names[i], want)) return i;
+    }
+    /* A single character is not a language, it is a coin flip between `es` and
+     * `en` spelled shorter. Two is the shortest thing an ISO code can be. */
+    if (strlen(want) < 2u) return -1;
+    int found = -1;
+    for (int i = 0; i < count; ++i) {
+        if (names[i] == NULL || !lang_ci_prefix(want, names[i])) continue;
+        if (found >= 0) return -2;            /* ambiguous: refuse, never guess */
+        found = i;
+    }
+    return found;
+}
 
 static void on_usr1(int sig) {
     (void)sig;
@@ -948,17 +1000,26 @@ void mynah_prefork_print_plan(const mynah_prefork_config *cfg, FILE *out) {
 static const struct {
     const char *code;
     const char *status;
+    const char *type;          /* error.type in the body, OpenAI vocabulary */
     const char *message;
     int         retry_after;   /* 0 = omit the header entirely */
 } REFUSAL[MYNAH_PREFORK_REFUSE__COUNT] = {
-    { "server_at_capacity", "503 Service Unavailable",
+    { "server_at_capacity", "503 Service Unavailable", "server_error",
       "every worker is at its slot cap and the admission queue is full", 1 },
-    { "queued_too_long", "503 Service Unavailable",
+    { "queued_too_long", "503 Service Unavailable", "server_error",
       "waited in the admission queue longer than the deadline", 1 },
-    { "service_cap_exceeded", "503 Service Unavailable",
+    { "service_cap_exceeded", "503 Service Unavailable", "server_error",
       "the request ran past its per-request service cap", 0 },
-    { "handoff_failed", "503 Service Unavailable",
+    { "handoff_failed", "503 Service Unavailable", "server_error",
       "the chosen worker could not be handed the connection", 1 },
+    /* The one refusal in this table that is the CLIENT's to fix, which is why
+     * it is the one 400 and the one invalid_request_error. A 503 would tell a
+     * client to retry, and the retry would fail identically for as long as the
+     * server runs: residency is decided at startup and printed, never grown on
+     * demand. GET /health lists the languages that are actually held. */
+    { "language_not_served", "400 Bad Request", "invalid_request_error",
+      "no worker holds a model for the requested language; GET /health lists "
+      "the resident ones", 0 },
 };
 
 const char *mynah_prefork_refusal_code(mynah_prefork_refusal reason) {
@@ -975,10 +1036,10 @@ size_t mynah_prefork_refusal_response(mynah_prefork_refusal reason,
      * drift away from the body it describes. A hand-counted length is exactly
      * the constant that survives an edit to the message and then silently
      * truncates every refusal. */
-    char body[256];
+    char body[320];
     const int blen = snprintf(body, sizeof(body),
-        "{\"error\":{\"message\":\"%s\",\"type\":\"server_error\",\"code\":\"%s\"}}",
-        REFUSAL[reason].message, REFUSAL[reason].code);
+        "{\"error\":{\"message\":\"%s\",\"type\":\"%s\",\"code\":\"%s\"}}",
+        REFUSAL[reason].message, REFUSAL[reason].type, REFUSAL[reason].code);
     if (blen <= 0 || (size_t)blen >= sizeof(body)) return 0;
 
     char retry[40];
@@ -1015,7 +1076,7 @@ size_t mynah_prefork_refusal_response(mynah_prefork_refusal reason,
 typedef struct {
     int    fd;
     double deadline;      /* mono seconds */
-    char   msg[384];
+    char   msg[640];
     size_t msg_len;
     size_t msg_sent;
     size_t drained;
@@ -1119,16 +1180,163 @@ void mynah_prefork_refuse_and_close(int fd, mynah_prefork_refusal reason) {
 
 int mynah_prefork_service_cap_ms(void) { return g_service_cap_ms; }
 
+/* ------------------------------------------------- classifying a connection
+ *
+ * Only reached when the fleet holds more than one language. The router has to
+ * know which language a connection is for before it can choose a worker,
+ * because the worker is the thing that holds the weights -- so this is the one
+ * place where the parent looks at bytes a client sent.
+ *
+ * WHAT IT IS ALLOWED TO DO, stated as a boundary rather than as a description,
+ * because "the parent parses a little HTTP" is a door that only opens wider:
+ *
+ *   - it PEEKS. MSG_PEEK consumes nothing, so the worker still reads the
+ *     entire request from the start and there is no split-buffer to hand over
+ *     with the descriptor. The fd remains the only thing that moves.
+ *   - it reads a BOUNDED prefix and never more.
+ *   - it looks for exactly three things: the end of the header block, the two
+ *     header names that announce a body, and the JSON key "language". That is
+ *     framing plus one key. It does not interpret a method, a route, a status
+ *     or a body's meaning, and it never writes anything but a refusal.
+ *   - it NEVER BLOCKS. Undecided means "park this and look again", handled by
+ *     the caller's poll set with a deadline, because a router that waits on a
+ *     slow client is rung 1's mistake wearing a different hat.
+ *
+ * The residual imprecision, named rather than hidden: with chunked encoding
+ * and no Content-Length there is no length to compare against, so completeness
+ * falls back to "the object has closed", and a `}` inside a string value in a
+ * half-arrived body can end the search early. The cost of that misfire is a
+ * connection routed to the default group and refused there by a worker that
+ * did parse the body -- a wrong refusal, never a wrong answer, and never a
+ * batch that mixed two languages. */
+
+#define PF_PEEK_MAX     8192u
+#define PF_CLASSIFY_MS  2000.0       /* per-connection budget for deciding    */
+#define PF_PENDING_MAX  64           /* connections awaiting classification   */
+
+/* Negative results. Group indices are >= 0. */
+#define PF_CLASS_DEFAULT   (-1)      /* named nothing: the default group      */
+#define PF_CLASS_WAIT      (-2)      /* too little has arrived: park and retry*/
+#define PF_CLASS_UNKNOWN   (-3)      /* named a language nobody holds: refuse */
+
+/* Case-insensitive search for `needle` within [begin, end). */
+static const char *ci_find(const char *begin, const char *end, const char *needle) {
+    const size_t n = strlen(needle);
+    if (n == 0 || (size_t)(end - begin) < n) return NULL;
+    for (const char *p = begin; (size_t)(end - p) >= n; ++p) {
+        size_t i = 0;
+        while (i < n && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) ++i;
+        if (i == n) return p;
+    }
+    return NULL;
+}
+
+/* The announced body length, or -1 when no Content-Length is present. Only the
+ * framing number is read; nothing else about the header is interpreted. */
+static long header_content_length(const char *begin, const char *end) {
+    const char *p = ci_find(begin, end, "\ncontent-length:");
+    if (p == NULL) return -1;
+    p += strlen("\ncontent-length:");
+    while (p < end && (*p == ' ' || *p == '\t')) ++p;
+    long value = 0;
+    int digits = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        if (value > (2000000000L - 9) / 10) return -1;   /* absurd: ignore it */
+        value = value * 10 + (*p++ - '0');
+        ++digits;
+    }
+    return digits > 0 ? value : -1;
+}
+
+static const char *skip_json_space(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    return p;
+}
+
+static int classify_language(int fd, const char *const *langs, int count,
+                             char *named, size_t named_cap) {
+    if (named != NULL && named_cap > 0) named[0] = '\0';
+
+    char buf[PF_PEEK_MAX + 1u];
+    ssize_t got;
+    do {
+        got = recv(fd, buf, PF_PEEK_MAX, MSG_PEEK | MSG_DONTWAIT);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return PF_CLASS_WAIT;
+        return PF_CLASS_DEFAULT;    /* a broken socket is the worker's to report */
+    }
+    if (got == 0) return PF_CLASS_DEFAULT;            /* peer closed already */
+    buf[got] = '\0';
+    const int full = (size_t)got >= PF_PEEK_MAX;      /* our prefix is all we get */
+
+    /* The header block must be complete before a body can exist. */
+    const char *head_end = strstr(buf, "\r\n\r\n");
+    if (head_end == NULL) return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
+    const char *body = head_end + 4;
+
+    /* The key, searched for in the BODY only: a path or a header value that
+     * happened to contain the word must not decide where a request goes. */
+    const char *k = strstr(body, "\"language\"");
+    if (k != NULL) {
+        const char *p = skip_json_space(k + strlen("\"language\""));
+        if (*p == ':') {
+            p = skip_json_space(p + 1);
+            if (*p == '"') {
+                ++p;
+                size_t used = 0;
+                while (*p != '\0' && *p != '"' && used + 1u < named_cap) {
+                    named[used++] = *p++;
+                }
+                if (*p == '"') {
+                    named[used] = '\0';
+                    if (named[0] == '\0') return PF_CLASS_DEFAULT;
+                    const int at = mynah_prefork_language_match(langs, count, named);
+                    return at >= 0 ? at : PF_CLASS_UNKNOWN;
+                }
+            }
+        }
+        /* Truncated mid-value, or a shape we do not recognise. More bytes may
+         * settle it; if no more are coming, let the worker's real JSON parser
+         * have the argument. */
+        return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
+    }
+
+    /* No key. Decide whether more could still arrive. */
+    const long announced = header_content_length(buf, head_end);
+    if (announced < 0) {
+        if (ci_find(buf, head_end, "\ntransfer-encoding:") == NULL) {
+            return PF_CLASS_DEFAULT;     /* no body announced: none is coming */
+        }
+        /* Chunked: no length to compare against, so fall back to "the object
+         * has closed". See the residual named in the block comment above. */
+        return (strchr(body, '}') != NULL || full) ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
+    }
+    const long have = (long)(got - (body - buf));
+    if (have >= announced) return PF_CLASS_DEFAULT;   /* the whole body, no key */
+    return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
+}
+
 /* ----------------------------------------------------------------- routing */
 
 typedef struct {
     int    fd;
     double enqueued;      /* mono seconds, stamped at accept() */
+    int    lang;          /* language group; 0 in a single-language fleet */
 } pf_queued;
+
+/* A connection accepted but not yet classified. Distinct from a queued one:
+ * this is waiting for BYTES, not for a slot, so it is charged to no group's
+ * capacity and refused by no rung. */
+typedef struct {
+    int    fd;
+    double deadline;
+} pf_pending;
 
 typedef struct {
     pid_t pid;
     int chan;            /* parent's end of the socketpair */
+    int lang;            /* language group; 0 in a single-language fleet */
     int active;          /* dispatched minus finished */
     /* Two sets of counters on purpose. The `window_` ones are reset by every
      * SIGUSR1 dump, because "what happened in the last minute" is the question
@@ -1163,6 +1371,191 @@ static void disp_pop(worker_state *w, int n) {
     }
 }
 
+/* ------------------------------------------------------- the router's state
+ *
+ * Gathered into one struct so the admission path can be a function instead of
+ * a macro. It has to be callable from two places now -- a fresh accept, and a
+ * connection that has just finished being classified -- and two copies of the
+ * rung arithmetic is exactly how the two paths would come to disagree about
+ * capacity. */
+typedef struct {
+    worker_state *w;
+    int           workers;
+    int           slots;
+    int           q_per;          /* -1 unbounded, 0 none, >0 per live worker */
+    int           deadline_ms;
+    int           groups;         /* language groups; 1 when single-language  */
+    pf_queued   **q;              /* by pointer: rung 2 may grow the array    */
+    int          *q_alloc;
+    int          *q_n;
+    long long    *queued_total;
+    int          *queue_peak;
+    long long    *dispatched;
+    long long    *window_dispatched;
+    long long    *refused;        /* MYNAH_PREFORK_REFUSE__COUNT entries      */
+    long long    *window_refused;
+    pf_linger    *linger;
+    int          *linger_n;
+    long long    *linger_forced;
+} pf_router;
+
+/* Refuses without blocking: the router is single threaded, so it does as much
+ * of the write-shutdown-drain-close sequence as it can right now and parks the
+ * remainder in the poll set. Counting happens here too, so a refusal cannot be
+ * delivered without also being counted. */
+static void router_refuse(pf_router *R, int fd, mynah_prefork_refusal reason,
+                          double now) {
+    ++R->refused[reason];
+    ++R->window_refused[reason];
+    pf_linger L;
+    linger_begin(&L, fd, reason, now);
+    if (linger_step(&L, now)) return;
+    if (*R->linger_n < PF_LINGER_MAX) {
+        R->linger[(*R->linger_n)++] = L;
+        return;
+    }
+    /* The set is full. Finish what we can without blocking and close; this is
+     * the only path that can still produce an RST, so it is counted rather
+     * than hidden. */
+    ++(*R->linger_forced);
+    L.deadline = 0.0;
+    (void)linger_step(&L, now + 1.0);
+}
+
+/* Live workers holding `lang`. Recomputed rather than cached because a fleet
+ * that has lost a worker has lost the slots behind that group's queue entries
+ * too, and a bound that keeps promising capacity the machine no longer has is
+ * how a degraded server turns a refusal into a wait. */
+static int group_live(const pf_router *R, int lang) {
+    int n = 0;
+    for (int i = 0; i < R->workers; ++i) {
+        if (R->w[i].pid > 0 && R->w[i].lang == lang) ++n;
+    }
+    return n;
+}
+
+/* Rung 1 within a group: the least-loaded worker of that language with a free
+ * slot, or -1. A free slot in another language's worker is not capacity for
+ * this request -- that worker does not have these weights. */
+static int group_pick(const pf_router *R, int lang) {
+    int best = -1;
+    for (int i = 0; i < R->workers; ++i) {
+        if (R->w[i].pid <= 0 || R->w[i].lang != lang) continue;
+        if (R->w[i].active >= R->slots) continue;
+        if (best < 0 || R->w[i].active < R->w[best].active) best = i;
+    }
+    return best;
+}
+
+static int group_queued(const pf_router *R, int lang) {
+    int n = 0;
+    for (int i = 0; i < *R->q_n; ++i) if ((*R->q)[i].lang == lang) ++n;
+    return n;
+}
+
+static void queue_erase(pf_router *R, int at) {
+    pf_queued *q = *R->q;
+    memmove(&q[at], &q[at + 1], (size_t)(*R->q_n - at - 1) * sizeof(q[0]));
+    --(*R->q_n);
+}
+
+/* Hands `fd` to `worker`, or refuses when the channel is broken. Takes
+ * ownership of the descriptor either way. */
+static void router_dispatch(pf_router *R, int worker, int fd, double now) {
+    if (send_fd(R->w[worker].chan, fd) != 0) {
+        fprintf(stderr, "prefork: handing fd to worker %d failed: %s\n",
+                worker, strerror(errno));
+        router_refuse(R, fd, MYNAH_PREFORK_REFUSE_HANDOFF_FAILED, now);
+        return;
+    }
+    /* Our copy goes now: from here the worker is the only owner, and the
+     * client sees a close only when the worker closes. */
+    close(fd);
+    ++R->w[worker].active;
+    ++R->w[worker].assigned;
+    ++R->w[worker].window_assigned;
+    disp_push(&R->w[worker], now);
+    ++(*R->dispatched);
+    ++(*R->window_dispatched);
+}
+
+/* Rungs 1 and 2 for one freshly-decided connection. Takes ownership of `fd`. */
+static void router_admit(pf_router *R, int fd, int lang, double now) {
+    /* A new arrival may only go straight through when its GROUP's queue is
+     * empty -- otherwise it would jump ahead of entries that have already
+     * waited, and rung 3's deadline would start firing on requests that were
+     * merely unlucky rather than late. Another group's queue is irrelevant:
+     * those entries are not waiting for this worker. */
+    if (group_queued(R, lang) == 0) {
+        const int best = group_pick(R, lang);
+        if (best >= 0) {
+            router_dispatch(R, best, fd, now);
+            return;
+        }
+    }
+
+    /* RUNG 2, bounded per group because capacity is per group. */
+    const int bound = (R->q_per < 0) ? -1 : R->q_per * group_live(R, lang);
+    if (bound != 0 && (bound < 0 || group_queued(R, lang) < bound)) {
+        if (*R->q_n >= *R->q_alloc) {
+            const int grown = *R->q_alloc * 2;
+            pf_queued *bigger = (pf_queued *)realloc(*R->q, (size_t)grown * sizeof(**R->q));
+            if (bigger == NULL) {
+                router_refuse(R, fd, MYNAH_PREFORK_REFUSE_AT_CAPACITY, now);
+                return;
+            }
+            *R->q = bigger;
+            *R->q_alloc = grown;
+        }
+        pf_queued *q = *R->q;
+        q[*R->q_n].fd = fd;
+        q[*R->q_n].enqueued = now;
+        q[*R->q_n].lang = lang;
+        ++(*R->q_n);
+        ++(*R->queued_total);
+        if (*R->q_n > *R->queue_peak) *R->queue_peak = *R->q_n;
+        return;
+    }
+
+    router_refuse(R, fd, MYNAH_PREFORK_REFUSE_AT_CAPACITY, now);
+}
+
+/* RUNG 3, then RUNG 1: drain the queue, one group at a time.
+ *
+ * The deadline is checked at each GROUP's head, at pop time, never at push.
+ * Checking at push can only refuse on a prediction about a wait that has not
+ * happened; checking at pop refuses on a fact.
+ *
+ * Per group rather than over one FIFO, and that is not a detail: a single FIFO
+ * would let an entry for a saturated language block a ready entry for an idle
+ * one behind it, which is a starvation channel introduced by the partitioning
+ * that exists to prevent starvation. Array order is arrival order, so scanning
+ * it for one group's entries gives that group its own FIFO for free. */
+static void router_drain(pf_router *R, double now) {
+    for (int lang = 0; lang < R->groups; ++lang) {
+        for (;;) {
+            int head = -1;
+            for (int i = 0; i < *R->q_n; ++i) {
+                if ((*R->q)[i].lang == lang) { head = i; break; }
+            }
+            if (head < 0) break;
+
+            if (R->deadline_ms > 0 &&
+                (now - (*R->q)[head].enqueued) * 1000.0 >= (double)R->deadline_ms) {
+                const int fd = (*R->q)[head].fd;
+                queue_erase(R, head);
+                router_refuse(R, fd, MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG, now);
+                continue;
+            }
+            const int best = group_pick(R, lang);
+            if (best < 0) break;              /* no slot: it stays queued */
+            const int fd = (*R->q)[head].fd;
+            queue_erase(R, head);
+            router_dispatch(R, best, fd, now);
+        }
+    }
+}
+
 static void dump_table(const worker_state *w, int workers, long long dispatched,
                        const long long *refused, int queued, double window) {
     fprintf(stderr, "[prefork] dispatched=%lld queued=%d", dispatched, queued);
@@ -1193,6 +1586,52 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     const int deadline_ms = resolve_queue_deadline_ms(&local);
     g_service_cap_ms = resolve_service_cap_ms(&local);
 
+    /* ---- language groups (E5-9) ----
+     *
+     * One pack per worker, workers divided into contiguous groups. Contiguous
+     * rather than round-robin so that a language's workers get adjacent core
+     * slices: the slices are already ordered core-major, and a group whose
+     * workers are neighbours shares a memory path rather than straddling the
+     * machine.
+     *
+     * `groups == 1` is the single-language fleet, and from here on every
+     * language-aware branch collapses: one group, every worker in it, the
+     * classifier never called. That is the shape that shipped before this
+     * change and it must keep behaving identically. */
+    const int groups = (local.languages != NULL && local.language_count > 1)
+                     ? local.language_count : 1;
+    if (groups > workers) {
+        fprintf(stderr, "prefork: %d languages need at least %d workers, but W is %d. "
+                        "A language with no worker could not be served and would have "
+                        "to be dropped silently; refusing to start instead.\n",
+                groups, groups, workers);
+        return MYNAH_PREFORK_ERROR;
+    }
+    int lang_of[PREFORK_MAX_WORKERS];
+    {
+        const int base = workers / groups;
+        const int extra = workers % groups;
+        int at = 0;
+        for (int g = 0; g < groups; ++g) {
+            const int n = base + (g < extra ? 1 : 0);
+            for (int k = 0; k < n && at < workers; ++k) lang_of[at++] = g;
+        }
+        while (at < workers) lang_of[at++] = groups - 1;   /* cannot happen; be total */
+    }
+    g_language_plan[0] = '\0';
+    if (groups > 1) {
+        size_t used = 0;
+        for (int g = 0; g < groups; ++g) {
+            int n = 0;
+            for (int i = 0; i < workers; ++i) if (lang_of[i] == g) ++n;
+            const int m = snprintf(g_language_plan + used, sizeof(g_language_plan) - used,
+                                   "%s%s=%d", used > 0 ? " " : "",
+                                   local.languages[g] != NULL ? local.languages[g] : "?", n);
+            if (m <= 0 || (size_t)m >= sizeof(g_language_plan) - used) break;
+            used += (size_t)m;
+        }
+    }
+
     if (!local.quiet) {
         const int cores = count_physical_cores(cpus, ncpu);
         fprintf(stderr, "prefork: %d workers x %d threads over %d allowed cpus "
@@ -1210,6 +1649,32 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                     workers * threads, ncpu);
         }
         warn_cpu_budget(workers, threads, ncpu, stderr);
+        if (groups > 1) {
+            /* Printed, never assumed: how the machine was divided is the first
+             * thing anyone asks when one language is slow and another is not,
+             * and it is a number this process chose rather than one the
+             * operator typed. */
+            fprintf(stderr, "prefork: languages   %d resident, one pack per worker "
+                            "(a batch is one process's slots, so a batch is one "
+                            "language)\n", groups);
+            for (int g = 0; g < groups; ++g) {
+                int n = 0, first = -1, last = -1;
+                for (int i = 0; i < workers; ++i) {
+                    if (lang_of[i] != g) continue;
+                    ++n;
+                    if (first < 0) first = i;
+                    last = i;
+                }
+                fprintf(stderr, "prefork:   %-16s workers %d-%d (%d) · %d slots · "
+                                "rung2 queue %s\n",
+                        local.languages[g] != NULL ? local.languages[g] : "?",
+                        first, last, n, n * slots,
+                        q_per < 0 ? "unbounded"
+                                  : (q_per == 0 ? "disabled" : "per worker"));
+            }
+            fprintf(stderr, "prefork:   default    %s (a request naming no language)\n",
+                    local.languages[0] != NULL ? local.languages[0] : "?");
+        }
         describe_ladder(workers, slots, q_per, deadline_ms, g_service_cap_ms, stderr);
 #if !defined(__linux__)
         fprintf(stderr, "prefork: WARNING this platform has no cpu affinity API. "
@@ -1263,6 +1728,11 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             g_worker_index = i;
             g_worker_chan = sp[1];
             *chan_fd = sp[1];
+            /* Which pack this worker owns, decided in the parent and carried
+             * across by fork() rather than sent as a message. The caller reads
+             * it back with mynah_prefork_worker_language() and keeps that one
+             * model. */
+            g_worker_language = lang_of[i];
 
             char slice[192];
             const int pinned = pin_to_slice(cpus, i * per,
@@ -1328,8 +1798,11 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                     signal(SIGUSR1, SIG_IGN);
                 }
             }
-            fprintf(stderr, "prefork: worker %d pid %d threads %d cpus %s%s\n",
+            fprintf(stderr, "prefork: worker %d pid %d threads %d cpus %s%s%s%s\n",
                     i, (int)getpid(), g_worker_threads, slice,
+                    groups > 1 ? " language " : "",
+                    groups > 1 && local.languages[lang_of[i]] != NULL
+                        ? local.languages[lang_of[i]] : "",
                     pinned ? "" : "  <-- NOT PINNED");
             fflush(stderr);
             return MYNAH_PREFORK_CHILD;
@@ -1338,6 +1811,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
         close(sp[1]);
         w[i].pid = pid;
         w[i].chan = sp[0];
+        w[i].lang = lang_of[i];
         ++live;
     }
 
@@ -1364,7 +1838,8 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     pf_queued *q = (pf_queued *)calloc((size_t)q_alloc, sizeof(*q));
     int q_n = 0;
 
-    const size_t pfd_cap = (size_t)workers + 1u + PF_QPOLL_MAX + PF_LINGER_MAX;
+    const size_t pfd_cap = (size_t)workers + 1u + PF_QPOLL_MAX + PF_LINGER_MAX +
+                           (size_t)PF_PENDING_MAX;
     struct pollfd *pfd = (struct pollfd *)calloc(pfd_cap, sizeof(*pfd));
     if (pfd == NULL || q == NULL) {
         for (int i = 0; i < workers; ++i) if (w[i].pid > 0) kill(w[i].pid, SIGTERM);
@@ -1389,26 +1864,32 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     double window_start = mono_seconds();
     double prev = window_start;
 
-/* Parks a refusal in the lingering-close set. Never blocks, because the router
- * is single threaded and a blocking refusal would stall every other client --
- * the same disease as a router that stops polling its listener. */
-#define PF_REFUSE_PARK(FD, REASON, NOW)                                        \
-    do {                                                                       \
-        pf_linger L_;                                                          \
-        linger_begin(&L_, (FD), (REASON), (NOW));                              \
-        if (!linger_step(&L_, (NOW))) {                                        \
-            if (linger_n < PF_LINGER_MAX) {                                    \
-                linger[linger_n++] = L_;                                       \
-            } else {                                                           \
-                /* The set is full. Finish what we can without blocking and    \
-                 * close; this is the only path that can still produce an RST, \
-                 * so it is counted rather than hidden. */                     \
-                ++linger_forced;                                               \
-                L_.deadline = 0.0;                                             \
-                (void)linger_step(&L_, (NOW) + 1.0);                           \
-            }                                                                  \
-        }                                                                      \
-    } while (0)
+    /* Connections accepted but not yet classified. Only ever non-empty in a
+     * multi-language fleet: with one group the classifier is never called. */
+    pf_pending pending[PF_PENDING_MAX];
+    int pending_n = 0;
+    long long classify_timeouts = 0;
+
+    pf_router R;
+    memset(&R, 0, sizeof(R));
+    R.w = w;
+    R.workers = workers;
+    R.slots = slots;
+    R.q_per = q_per;
+    R.deadline_ms = deadline_ms;
+    R.groups = groups;
+    R.q = &q;
+    R.q_alloc = &q_alloc;
+    R.q_n = &q_n;
+    R.queued_total = &queued_total;
+    R.queue_peak = &queue_peak;
+    R.dispatched = &dispatched;
+    R.window_dispatched = &window_dispatched;
+    R.refused = refused;
+    R.window_refused = window_refused;
+    R.linger = linger;
+    R.linger_n = &linger_n;
+    R.linger_forced = &linger_forced;
 
     while (*stop == 0 && live > 0) {
         int nf = 0, listen_slot = -1;
@@ -1461,6 +1942,18 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             ++nf;
         }
 
+        /* Connections waiting to be classified, watched for POLLIN: unlike a
+         * queued client these have NOT finished speaking -- the whole reason
+         * they are here is that the bytes we need have not arrived -- so
+         * POLLIN is the right event and it does not spin. */
+        const int p_first = nf;
+        for (int i = 0; i < pending_n; ++i) {
+            pfd[nf].fd = pending[i].fd;
+            pfd[nf].events = POLLIN;
+            pfd[nf].revents = 0;
+            ++nf;
+        }
+
         /* Sleep no longer than the next thing that needs attention, so a queue
          * deadline is honoured even when nothing else happens. */
         int timeout = 200;
@@ -1472,6 +1965,10 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             }
             for (int i = 0; i < linger_n; ++i) {
                 const double left = (linger[i].deadline - now) * 1000.0;
+                if (left < timeout) timeout = left > 0.0 ? (int)left : 0;
+            }
+            for (int i = 0; i < pending_n; ++i) {
+                const double left = (pending[i].deadline - now) * 1000.0;
                 if (left < timeout) timeout = left > 0.0 ? (int)left : 0;
             }
             if (timeout < 0) timeout = 0;
@@ -1603,51 +2100,43 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             --q_n;
         }
 
-        /* ---- RUNG 3, then RUNG 1: drain the queue ----
-         * The deadline is checked HERE, at the head, at pop time -- never at
-         * push. Checking at push can only refuse on a prediction about a wait
-         * that has not happened; checking at pop refuses on a fact. An entry
-         * that waited and then got a slot anyway is served, which is the whole
-         * reason a queue is better than an immediate refusal. */
-        while (q_n > 0) {
-            if (deadline_ms > 0 &&
-                (now - q[0].enqueued) * 1000.0 >= (double)deadline_ms) {
-                ++refused[MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG];
-                ++window_refused[MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG];
-                PF_REFUSE_PARK(q[0].fd, MYNAH_PREFORK_REFUSE_QUEUED_TOO_LONG, now);
-                memmove(&q[0], &q[1], (size_t)(q_n - 1) * sizeof(q[0]));
-                --q_n;
-                continue;
-            }
-            int best = -1;
-            for (int i = 0; i < workers; ++i) {
-                if (w[i].pid <= 0 || w[i].active >= slots) continue;
-                if (best < 0 || w[i].active < w[best].active) best = i;
-            }
-            if (best < 0) break;                 /* no slot: it stays queued */
+        /* ---- classification: connections whose language is not known yet ----
+         * Handled before the drain so a connection that becomes decidable this
+         * tick gets its slot in the same tick. Walked backwards because a
+         * decided entry is removed by swapping the tail into its place. */
+        for (int i = pending_n - 1; i >= 0; --i) {
+            const int k = p_first + i;
+            const int fired = (k < nf) && (pfd[k].revents != 0);
+            const int expired = now >= pending[i].deadline;
+            if (!fired && !expired) continue;
 
-            const int fd = q[0].fd;
-            memmove(&q[0], &q[1], (size_t)(q_n - 1) * sizeof(q[0]));
-            --q_n;
-            /* The descriptor was made non-blocking by nothing so far, but it
-             * may have been accepted from a non-blocking listener; server/main.c
-             * clears O_NONBLOCK on arrival either way. */
-            if (send_fd(w[best].chan, fd) != 0) {
-                fprintf(stderr, "prefork: handing fd to worker %d failed: %s\n",
-                        best, strerror(errno));
-                ++refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
-                ++window_refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
-                PF_REFUSE_PARK(fd, MYNAH_PREFORK_REFUSE_HANDOFF_FAILED, now);
+            char named[64];
+            int lang = classify_language(pending[i].fd, local.languages, groups,
+                                         named, sizeof(named));
+            if (lang == PF_CLASS_WAIT) {
+                if (!expired) continue;
+                /* Out of time. Route it as unspecified rather than refusing:
+                 * the client has not done anything wrong, it is merely slow,
+                 * and the worker will read the whole request and refuse it
+                 * properly if the language turns out not to be ours. */
+                ++classify_timeouts;
+                lang = PF_CLASS_DEFAULT;
+            }
+            const int fd = pending[i].fd;
+            pending[i] = pending[pending_n - 1];
+            --pending_n;
+
+            if (lang == PF_CLASS_UNKNOWN) {
+                fprintf(stderr, "prefork: no worker holds language '%.32s'; refusing\n",
+                        named);
+                router_refuse(&R, fd, MYNAH_PREFORK_REFUSE_LANGUAGE_NOT_SERVED, now);
                 continue;
             }
-            close(fd);
-            ++w[best].active;
-            ++w[best].assigned;
-            ++w[best].window_assigned;
-            disp_push(&w[best], now);
-            ++dispatched;
-            ++window_dispatched;
+            router_admit(&R, fd, lang < 0 ? 0 : lang, now);
         }
+
+        /* ---- RUNG 3, then RUNG 1: drain the queue ---- */
+        router_drain(&R, now);
 
         if (listen_slot < 0 || listen_slot >= nf ||
             (pfd[listen_slot].revents & POLLIN) == 0) continue;
@@ -1660,77 +2149,45 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             break;
         }
 
-        /* RUNG 1: the least-loaded worker with a free slot. A new arrival may
-         * only go straight through when the queue is EMPTY -- otherwise it
-         * would jump ahead of entries that have already waited, and rung 3's
-         * deadline would start firing on requests that were merely unlucky
-         * rather than late. */
-        int best = -1;
-        if (q_n == 0) {
-            for (int i = 0; i < workers; ++i) {
-                if (w[i].pid <= 0 || w[i].active >= slots) continue;
-                if (best < 0 || w[i].active < w[best].active) best = i;
-            }
+        /* SINGLE-LANGUAGE FLEET: straight to the rungs, exactly as before.
+         * Nothing peeks, nothing parks, nothing about the connection is looked
+         * at. This branch is the guarantee that adding languages did not change
+         * the server that was already running. */
+        if (groups <= 1) {
+            router_admit(&R, cfd, 0, now);
+            continue;
         }
-        if (best >= 0) {
-            if (send_fd(w[best].chan, cfd) != 0) {
-                fprintf(stderr, "prefork: handing fd to worker %d failed: %s\n",
-                        best, strerror(errno));
-                ++refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
-                ++window_refused[MYNAH_PREFORK_REFUSE_HANDOFF_FAILED];
-                PF_REFUSE_PARK(cfd, MYNAH_PREFORK_REFUSE_HANDOFF_FAILED, now);
+
+        /* MULTI-LANGUAGE: decide now if the prefix is already here -- which it
+         * is for virtually every request, since a client sends its headers and
+         * a small JSON body in one go -- and park it only when it is not. */
+        {
+            char named[64];
+            const int lang = classify_language(cfd, local.languages, groups,
+                                               named, sizeof(named));
+            if (lang == PF_CLASS_UNKNOWN) {
+                fprintf(stderr, "prefork: no worker holds language '%.32s'; refusing\n",
+                        named);
+                router_refuse(&R, cfd, MYNAH_PREFORK_REFUSE_LANGUAGE_NOT_SERVED, now);
                 continue;
             }
-            /* Our copy goes now: from here the worker is the only owner, and
-             * the client sees a close only when the worker closes. */
-            close(cfd);
-            ++w[best].active;
-            ++w[best].assigned;
-            ++w[best].window_assigned;
-            disp_push(&w[best], now);
-            ++dispatched;
-            ++window_dispatched;
-            continue;
-        }
-
-        /* RUNG 2: no slot. Park it if the queue has room. The arithmetic is
-         * the reference's -- running + queued >= slots + queue_cap refuses --
-         * evaluated over the parent's own counters, which is possible here
-         * because a queued descriptor has not been charged to any worker and
-         * therefore cannot consume the capacity it is waiting for. */
-        /* Recomputed from LIVE workers, not from the W we started with. A
-         * fleet that has lost a worker has lost the slots behind those queue
-         * entries too, and a bound that keeps promising capacity the machine
-         * no longer has is how a degraded server turns a refusal into a wait. */
-        const int q_bound = (q_per < 0) ? -1 : q_per * live;
-        if (q_bound != 0 && (q_bound < 0 || q_n < q_bound)) {
-            if (q_n >= q_alloc) {
-                const int grown = q_alloc * 2;
-                pf_queued *bigger = (pf_queued *)realloc(q, (size_t)grown * sizeof(*q));
-                if (bigger == NULL) {
-                    ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
-                    ++window_refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
-                    PF_REFUSE_PARK(cfd, MYNAH_PREFORK_REFUSE_AT_CAPACITY, now);
-                    continue;
-                }
-                q = bigger;
-                q_alloc = grown;
+            if (lang != PF_CLASS_WAIT) {
+                router_admit(&R, cfd, lang < 0 ? 0 : lang, now);
+                continue;
             }
-            q[q_n].fd = cfd;
-            q[q_n].enqueued = now;
-            ++q_n;
-            ++queued_total;
-            if (q_n > queue_peak) queue_peak = q_n;
-            continue;
+            if (pending_n >= PF_PENDING_MAX) {
+                /* The classification set is full. Do NOT block to decide and do
+                 * NOT drop it: send it to the default group, where a worker
+                 * that reads the whole body will either serve it or refuse it
+                 * with the same `language_not_served` code. The bound stays a
+                 * bound; what it costs is precision, not a connection. */
+                router_admit(&R, cfd, 0, now);
+                continue;
+            }
+            pending[pending_n].fd = cfd;
+            pending[pending_n].deadline = now + PF_CLASSIFY_MS / 1000.0;
+            ++pending_n;
         }
-
-        /* RUNGS 1+2 exhausted: every slot busy and the queue full. Refuse now,
-         * with a reason and a counter of its own, and -- this is the part the
-         * reference still has open -- refuse in a way the client can actually
-         * read. See the RST note in prefork.h. */
-        ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
-        ++window_refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
-        PF_REFUSE_PARK(cfd, MYNAH_PREFORK_REFUSE_AT_CAPACITY, now);
     }
 
     /* ------------------------------------------------------------- shutdown */
@@ -1742,6 +2199,16 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
         ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
     }
     q_n = 0;
+    /* Same for a connection still waiting to be classified: it was accepted,
+     * so it is owed an answer, and "we are going away" is at-capacity as far as
+     * a client is concerned. Never a language refusal -- we never found out
+     * what it was asking for, and inventing a reason is worse than a generic
+     * one. */
+    for (int i = 0; i < pending_n; ++i) {
+        mynah_prefork_refuse_and_close(pending[i].fd, MYNAH_PREFORK_REFUSE_AT_CAPACITY);
+        ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+    }
+    pending_n = 0;
     /* Finish the lingering closes properly: the whole point is that the client
      * reads the status, and abandoning them here would reintroduce the RST at
      * exactly the moment an operator is most likely to be watching. */
@@ -1784,6 +2251,16 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     fprintf(stderr, "prefork: final  dispatched=%lld queued_total=%lld "
                     "queue_peak=%d client_gone=%lld\n",
             dispatched, queued_total, queue_peak, client_gone);
+    if (groups > 1) {
+        /* The plan, restated at the end beside the counters it explains, and
+         * the number that says whether classification was ever in doubt. A
+         * non-zero classify_timeout means some connection's prefix did not
+         * arrive within the budget and was routed as unspecified -- rare, but
+         * it is the one path where the router guesses, so it is counted rather
+         * than described. */
+        fprintf(stderr, "prefork: languages %s  classify_timeout=%lld\n",
+                g_language_plan, classify_timeouts);
+    }
     long long refused_all = 0;
     for (int r = 0; r < MYNAH_PREFORK_REFUSE__COUNT; ++r) refused_all += refused[r];
     fprintf(stderr, "prefork: refused=%lld", refused_all);
@@ -1801,9 +2278,13 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
      * worker was handed a connection it never reported finished, which is a
      * leaked slot. */
     for (int i = 0; i < workers; ++i) {
-        fprintf(stderr, "  worker %d: assigned=%lld completed=%lld still-in-flight=%d"
-                        " over-service-cap=%lld\n",
-                i, w[i].assigned, w[i].completed, w[i].active, w[i].over_cap);
+        fprintf(stderr, "  worker %d%s%s: assigned=%lld completed=%lld"
+                        " still-in-flight=%d over-service-cap=%lld\n",
+                i,
+                groups > 1 ? " " : "",
+                groups > 1 && local.languages[w[i].lang] != NULL
+                    ? local.languages[w[i].lang] : "",
+                w[i].assigned, w[i].completed, w[i].active, w[i].over_cap);
         free(w[i].disp);
     }
     close(local.listen_fd);
@@ -1813,4 +2294,3 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     return MYNAH_PREFORK_PARENT_DONE;
 }
 
-#undef PF_REFUSE_PARK

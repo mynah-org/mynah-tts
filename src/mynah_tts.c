@@ -300,6 +300,19 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
             return -1;
         }
         model->info.default_temperature = (float)temperature;
+        /* OPTIONAL, and its absence means something. A pack that names no
+         * language is saying its weights serve any of them: that is true of a
+         * Magpie pack, which carries a `languages` LIST and selects only a
+         * tokenizer from it. A pack that names one is saying the opposite, and
+         * a caller must not batch it with, or route another language's request
+         * to, these weights. The needle is the exact key `"language"`, so
+         * Magpie's `"languages"` and `"language_to_tokenizer"` do not match it
+         * -- which is the behaviour we want and not a lucky accident, because
+         * matching either would bind a multilingual pack to one language. */
+        if (json_string(manifest, "language", model->info.language,
+                        sizeof(model->info.language)) != 0) {
+            model->info.language[0] = '\0';
+        }
         if (json_unsigned(manifest, "min_generated_frames", &model->info.min_generated_frames) != 0) {
             model->info.min_generated_frames = 4u;
         }
