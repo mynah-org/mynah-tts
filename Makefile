@@ -123,7 +123,15 @@ STREAM_TEST_TARGET := $(BUILD_DIR)/tests/test_stream
 DRIVER_TEST_OBJECT := $(BUILD_DIR)/tests/test_driver.o
 DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 
-.PHONY: all cpu info caps self-test test stream-test driver-test server server-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+# The transformer_ar sliding window past `context: 250` (PLAN.md E2-4). Needs no
+# model pack and no oracle -- synthetic weights, an independent f64 reference of
+# the contract, and two structural invariants -- so it runs inside `make test`
+# and therefore inside ubsan/asan. Detail: .work/transformer-ar-sliding-window.md
+WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
+WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
+
+.PHONY: all cpu info caps self-test test stream-test driver-test window-test server server-test server-multilang-test \
+	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
@@ -163,6 +171,13 @@ $(DRIVER_TEST_TARGET): $(CORE_OBJECTS) $(DRIVER_TEST_OBJECT)
 driver-test: $(DRIVER_TEST_TARGET)
 	@$(DRIVER_TEST_TARGET)
 
+$(WINDOW_TEST_TARGET): $(CORE_OBJECTS) $(WINDOW_TEST_OBJECT)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+window-test: $(WINDOW_TEST_TARGET)
+	@$(WINDOW_TEST_TARGET)
+
 SERVER_SOURCES := server/main.c server/http_util.c server/stream_out.c server/prefork.c
 SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)
 SERVER_TARGET := $(BUILD_DIR)/mynah-tts-server
@@ -182,6 +197,41 @@ server-test: $(SERVER_TARGET)
 	@test -n "$(MODEL_DIR)" || (echo "usage: make server-test MODEL_DIR=pack" >&2; exit 2)
 	@MODEL_DIR="$(MODEL_DIR)" SERVER="$(SERVER_TARGET)" sh tests/test_server.sh
 
+# Multi-language serving (E5-9). MODEL_DIR_B is optional: without it the script
+# fabricates a second pack from the first and says which checks that weakens.
+# Defaults for the E5-8 concurrency gate (see tests/test_server_concurrency.sh).
+# A port of its own so it cannot collide with a server-test left running.
+CONC_PORT ?= 8987
+PREFORK ?= 4
+# Its own step cap: the top-of-file MAX_STEPS defaults to 0 ("no cap") for
+# `make synthesize`, and 0 here would turn a correctness gate into a long run.
+CONC_MAX_STEPS ?= 48
+CONC_LEVELS ?= 2 4 8
+
+# PLAN.md E5-8. Correctness only -- no wall-clock assertion anywhere in it, so
+# unlike the `batching` check in tests/test_server.sh it cannot go flaky on a
+# busy machine. SERVER_ARGS passes topology through ("--prefork 4"), or point
+# SERVER at tests/prefork_server.sh for the same thing.
+server-concurrency-test: $(SERVER_TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make server-concurrency-test MODEL_DIR=models/fake-magpie [SERVER_ARGS=--prefork 4]" >&2; exit 2)
+	@MODEL_DIR="$(MODEL_DIR)" SERVER="$(SERVER_TARGET)" SERVER_ARGS="$(SERVER_ARGS)" \
+	  LEVELS="$(CONC_LEVELS)" MAX_STEPS="$(CONC_MAX_STEPS)" PORT="$(CONC_PORT)" \
+	  sh tests/test_server_concurrency.sh
+
+# Both topologies, one command: single process, then a 4-worker prefork pool.
+# A request is byte-identical to itself whether one scheduler batched it with
+# its neighbours or a router handed it to a private process, or the claim is
+# not about the request.
+server-concurrency-test-all: $(SERVER_TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make server-concurrency-test-all MODEL_DIR=models/fake-magpie" >&2; exit 2)
+	@$(MAKE) --no-print-directory server-concurrency-test MODEL_DIR="$(MODEL_DIR)"
+	@$(MAKE) --no-print-directory server-concurrency-test MODEL_DIR="$(MODEL_DIR)" \
+	  SERVER_ARGS="--prefork $(PREFORK)"
+
+server-multilang-test: $(SERVER_TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make server-multilang-test MODEL_DIR=pack [MODEL_DIR_B=pack]" >&2; exit 2)
+	@MODEL_DIR="$(MODEL_DIR)" MODEL_DIR_B="$(MODEL_DIR_B)" SERVER="$(SERVER_TARGET)" sh tests/test_server_multilang.sh
+
 lib: $(LIBRARY)
 shared: $(TARGET)
 	@echo "shared-library packaging is not enabled in the v1 CPU slice"
@@ -195,7 +245,7 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 
-test: self-test driver-test playback-sim-test
+test: self-test driver-test window-test playback-sim-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
@@ -486,4 +536,4 @@ update-ingot:
 # which reached the admission ladder as nonsense defaults. Same class as the
 # mixed-binary trap in .work/linux-production.md: objects reused across a change
 # that altered their meaning.
--include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d)
+-include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d) $(WINDOW_TEST_OBJECT:.o=.d)

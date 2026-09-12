@@ -365,9 +365,14 @@ void mynah_transformer_ar_rope_apply_f32(float *values, size_t num_heads,
  * with and without a `context` window, KV-cache continuity (prefill of N plus
  * one step equals prefill of N+1), layer_scale NULL against an explicit unit
  * vector, a prefill that spans more than one tile against the same positions
- * stepped one at a time, and `_step_batch` of N states against those same N
- * states stepped alone -- the last two are bit-equality assertions, because the
- * whole point of both paths is that the row count must not reach the numbers.
+ * stepped one at a time, the same equality over 300 positions with the window
+ * engaged and a hard refusal past `max_seq_len`, and `_step_batch` of N states
+ * against those same N states stepped alone -- the tile and batch cases are
+ * bit-equality assertions, because the whole point of both paths is that the
+ * row count must not reach the numbers.  The long windowed case is the shipped
+ * half of `tests/test_transformer_ar_window.c` (`make window-test`), which
+ * carries the f64 reference, the receptive field and RoPE's base at the
+ * production `context = 250`.
  * Returns 0, or -1 with a message in `error`. */
 int mynah_transformer_ar_self_test(char *error, size_t error_capacity);
 

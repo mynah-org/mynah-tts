@@ -1574,6 +1574,173 @@ int mynah_transformer_ar_self_test(char *error, size_t error_capacity) {
         }
     }
 
+    /* 9b. The same equality with the WINDOW ENGAGED, at a scale no other case
+     *     here reaches. Test 9 above runs at `context = 0`, so until this was
+     *     added the tile path had never been run windowed at any length, and
+     *     the longest sequence in this file was 35 positions. That matters
+     *     because the production window is `context = 250` on a transformer
+     *     that runs at 200 Hz (12.5 Hz latents x `codec_upsample_stride = 16`),
+     *     i.e. it engages after 1.25 s of audio on every utterance -- and a
+     *     defect whose threshold sits above a handful of positions, such as a
+     *     span capped at a block size or a RoPE table valid only to 256, is
+     *     invisible to every other case in this file. Two such mutations were
+     *     written and confirmed silent against this self test before this case
+     *     existed (`.work/transformer-ar-sliding-window.md`).
+     *
+     *     `context` deliberately does not divide the tile, so the engage
+     *     boundary lands mid-tile rather than on its edge. The exhaustive
+     *     version -- an f64 reference, the receptive field, RoPE's base and a
+     *     ragged batch, all at C = 250 -- is
+     *     `tests/test_transformer_ar_window.c` (`make window-test`); this is
+     *     the part that has to travel inside the shipped binary. */
+    {
+        enum { TAR_LONG = 300u, TAR_CTX = 70u };
+        mynah_transformer_ar_config config;
+        tar_test_config(&config, TAR_CTX);
+        config.max_seq_len = TAR_LONG;
+        if (TAR_CTX % mynah_transformer_ar_prefill_tile() == 0u) {
+            free(store);
+            TAR_FAIL("the tile now divides the test window: the engage "
+                     "boundary would never fall inside a tile");
+        }
+        float *wide = calloc((size_t)TAR_LONG * 3u * TAR_D, sizeof(float));
+        if (wide == NULL) {
+            free(store);
+            TAR_FAIL("out of memory for the long windowed case");
+        }
+        float *tiled = wide + (size_t)TAR_LONG * TAR_D;
+        float *stepped = tiled + (size_t)TAR_LONG * TAR_D;
+        for (size_t i = 0; i < (size_t)TAR_LONG * TAR_D; ++i) {
+            wide[i] = tar_fake(i, 47u) * 4.0f;
+        }
+        mynah_transformer_ar_state *a =
+            mynah_transformer_ar_state_new(&config, error, error_capacity);
+        mynah_transformer_ar_state *b =
+            mynah_transformer_ar_state_new(&config, error, error_capacity);
+        int failed = a == NULL || b == NULL;
+        int wrapped = 0;
+        if (!failed) {
+            failed = mynah_transformer_ar_prefill(a, &store->weights, wide,
+                                                  TAR_LONG, tiled) != 0;
+        }
+        for (size_t t = 0; t < (size_t)TAR_LONG && !failed; ++t) {
+            failed = mynah_transformer_ar_step(b, &store->weights,
+                                               wide + t * TAR_D,
+                                               stepped + t * TAR_D) != 0;
+        }
+        /* A step past the capacity must be refused, not wrapped: the KV cache
+         * is indexed by absolute position and `max_seq_len` is a hard cap, not
+         * a recycling point.  A window does NOT make the cache a ring. */
+        if (!failed) {
+            wrapped = mynah_transformer_ar_step(b, &store->weights, wide,
+                                                stepped) != -1;
+        }
+        mynah_transformer_ar_state_free(a);
+        mynah_transformer_ar_state_free(b);
+        if (failed || wrapped) {
+            free(wide);
+            free(store);
+            TAR_FAIL("long windowed prefill: %s",
+                     wrapped ? "a step past max_seq_len was accepted, so the "
+                               "KV cache is behaving like a ring"
+                             : "a forward failed");
+        }
+        for (size_t t = 0; t < (size_t)TAR_LONG; ++t) {
+            for (size_t i = 0; i < TAR_D; ++i) {
+                const size_t at = t * TAR_D + i;
+                if (tiled[at] != stepped[at]) {
+                    free(wide);
+                    free(store);
+                    TAR_FAIL("long windowed prefill [%zu][%zu]: %.9g vs "
+                             "stepped %.9g (window start %zu)",
+                             t, i, (double)tiled[at], (double)stepped[at],
+                             tar_window_start(t, TAR_CTX));
+                }
+            }
+        }
+        free(wide);
+    }
+
+    /* 9c. The window's EDGE, asserted directly rather than by agreement
+     *     between two of our own paths.  9b compares the tile against the step,
+     *     which is a self-consistency check: a defect that moves both -- a span
+     *     capped at a block size, say -- passes it, and did, until this was
+     *     added.
+     *
+     *     With ONE layer the set of inputs that can reach the output at p is
+     *     exactly the window [p - C + 1, p].  So perturb the input at one
+     *     position and look at which outputs move: outside that range every
+     *     output must come back bit identical, inside it every output must
+     *     change.  Two-sided, so a window one position too wide fails the first
+     *     half and one too narrow fails the second.
+     *
+     *     The perturbation VARIES across the dimension on purpose.  A constant
+     *     offset is LayerNorm's null space -- norm1 subtracts the mean -- so it
+     *     perturbs nothing and every "it changed" assertion would pass on
+     *     rounding noise instead.  Measured: constant bump 7e-7 at p == j and
+     *     2e-7 after it, varying bump 3.7 and 0.1-0.5. */
+    {
+        enum { TAR_FIELD = 220u, TAR_FCTX = 70u, TAR_FJ = 40u };
+        mynah_transformer_ar_config config;
+        tar_test_config(&config, TAR_FCTX);
+        config.max_seq_len = TAR_FIELD;
+        config.num_layers = 1u; /* one layer, so the field is exactly the window */
+        float *buf = calloc((size_t)TAR_FIELD * 4u * TAR_D, sizeof(float));
+        if (buf == NULL) {
+            free(store);
+            TAR_FAIL("out of memory for the receptive-field case");
+        }
+        float *base_in = buf;
+        float *bump_in = base_in + (size_t)TAR_FIELD * TAR_D;
+        float *base_out = bump_in + (size_t)TAR_FIELD * TAR_D;
+        float *bump_out = base_out + (size_t)TAR_FIELD * TAR_D;
+        for (size_t i = 0; i < (size_t)TAR_FIELD * TAR_D; ++i) {
+            base_in[i] = tar_fake(i, 53u) * 4.0f;
+            bump_in[i] = base_in[i];
+        }
+        for (size_t i = 0; i < TAR_D; ++i) {
+            bump_in[(size_t)TAR_FJ * TAR_D + i] += tar_fake(i, 59u) * 8.0f;
+        }
+        mynah_transformer_ar_state *a =
+            mynah_transformer_ar_state_new(&config, error, error_capacity);
+        mynah_transformer_ar_state *b =
+            mynah_transformer_ar_state_new(&config, error, error_capacity);
+        int failed = a == NULL || b == NULL;
+        for (size_t t = 0; t < (size_t)TAR_FIELD && !failed; ++t) {
+            failed = mynah_transformer_ar_step(a, &store->weights,
+                                               base_in + t * TAR_D,
+                                               base_out + t * TAR_D) != 0 ||
+                     mynah_transformer_ar_step(b, &store->weights,
+                                               bump_in + t * TAR_D,
+                                               bump_out + t * TAR_D) != 0;
+        }
+        mynah_transformer_ar_state_free(a);
+        mynah_transformer_ar_state_free(b);
+        if (failed) {
+            free(buf);
+            free(store);
+            TAR_FAIL("receptive-field case: a forward failed");
+        }
+        for (size_t t = 0; t < (size_t)TAR_FIELD; ++t) {
+            int moved = 0;
+            for (size_t i = 0; i < TAR_D; ++i) {
+                if (base_out[t * TAR_D + i] != bump_out[t * TAR_D + i]) moved = 1;
+            }
+            const size_t lo = tar_window_start(t, TAR_FCTX);
+            const int reachable = (t >= (size_t)TAR_FJ) && (lo <= (size_t)TAR_FJ);
+            if (moved != reachable) {
+                free(buf);
+                free(store);
+                TAR_FAIL("output %zu %s though position %u is %s its window "
+                         "[%zu, %zu]: the window reaches %s",
+                         t, moved ? "moved" : "did not move", TAR_FJ,
+                         reachable ? "inside" : "outside", lo, t,
+                         moved ? "too far back" : "not far enough back");
+            }
+        }
+        free(buf);
+    }
+
     /* 10. `_step_batch` of N states is the same function as those N states
      *     stepped alone -- bit for bit, at ragged offsets, with a sliding
      *     window so the per-row `lo` differs, and once more through a
