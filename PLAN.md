@@ -125,7 +125,7 @@ the goldens with byte-identical audio:
       A shared transformer needs functions taking **resolved weight pointers** —
       that is E3 work, not a move
 - [ ] E1-5 remove Magpie fields from `src/mynah_tts.h` (breaking API change)
-- [ ] E1-6 real JSON parser with nesting and arrays, replacing `mynah_tts.c:112-163`
+- [x] E1-6 **done** `a3823ae` — one real parser in `src/json.{c,h}`, used by both readers; surrogate pairs, nesting, arrays, bounded depth, byte-offset errors · real JSON parser with nesting and arrays, replacing `mynah_tts.c:112-163`
 - [ ] E1-7 split the converter into a shared pack writer + per-engine metadata
 - [ ] E1-8 gate: Magpie stream↔offline output sample-identical to the pre-refactor binary
 - [x] E1-0 **prerequisite done**: `tools/make_fake_pack.py` + `tests/refactor_goldens.sh`
@@ -146,7 +146,7 @@ Independent of E1. **Start here** — it tells E1 which state the seam must mode
       the Magpie replay strategy does not transfer
 - [x] E2-4 **done** `891501b` — and the framing was wrong by 10x: the decoder transformer runs at **200 Hz**, so `context: 250` is **1.25 s of audio**. Every utterance longer than that already takes the windowed path, and the oracle only ever saw the first 20 ms → [`.work/transformer-ar-sliding-window.md`](.work/transformer-ar-sliding-window.md) · dump decoder-transformer behaviour past `context: 250` — needed to exercise
       the sliding window in `transformer_ar`, which no reference data reaches today
-- [ ] E2-5 dump the text-chunk seam at `MAX_TOKEN_PER_CHUNK = 50`, including the known skip bug
+- [x] E2-5 **done** `a477b19` — measured, not inherited: 173 tokens ran the whole 900-frame budget and never emitted EOS · dump the text-chunk seam at `MAX_TOKEN_PER_CHUNK = 50`, including the known skip bug
 
 ### E3 — `engine_pocket.c` → [`.work/pocket-tts-engine.md`](.work/pocket-tts-engine.md)
 
@@ -186,7 +186,7 @@ Needs E1 and E2.
 - [ ] E3-10 **voice cloning from a wav — required, not optional** (see E7)
 - [ ] E3-11 one pack = one language; compute `time_embed.*.freqs` at load instead of storing
 - [ ] E3-12 NaN-as-BOS sentinel: reproduce it or track validity explicitly — never let NaN reach a matmul
-- [ ] E3-13 pack refuses a voice KV from a different model/revision (upstream: it then never emits EOS)
+- [x] E3-13 **done** `a477b19` · pack refuses a voice KV from a different model/revision (upstream: it then never emits EOS)
 
 ### E7 — Voice cloning → [`.work/voice-cloning.md`](.work/voice-cloning.md)
 
@@ -315,7 +315,7 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       does not), OpenBLAS thread-count coordination with our pool, a CI matrix that
       actually runs, and a Linux measurement box. Until this lands, no production
       performance number can be quoted.
-- [ ] E4-8 `Makefile`: `SIMD=` profiles + `ARCH_STAMP` rebuild-on-flag-change
+- [x] E4-8 **done** `ffc28b4` — `SIMD=` profiles and the `.build-flags` stamp · `Makefile`: `SIMD=` profiles + `ARCH_STAMP` rebuild-on-flag-change
 
 ### E8 — The batched vocoder: the structural ceiling
 
@@ -341,10 +341,10 @@ wants a 64-core box. With it, a 32-core box returns to the conversation.
       width 1, sixteen requests wide once batching is on
 - [x] E8-3 done in the batching merge (`0d944e9`): a request that exhausts its step
       budget retires as EOS instead of failing every live slot
-- [ ] E8-4 `engine_pocket` implements the `decode_audio_batch` override — and needs its
+- [x] E8-4 **done** `a477b19` — `pocket_decode_audio_batch` fired 48 times at widths 3-6 against the real streaming server · `engine_pocket` implements the `decode_audio_batch` override — and needs its
       own parity check against `decode_audio`, since bit-identity per context has so far
       been tested only against the synthetic engine
-- [ ] E8-6 **`pocket_step_batch` is not atomic**: it advances contexts `0..i-1` before
+- [x] E8-6 **done** `a477b19` — pre-flight, ordered mutation, rollback; the gate was blind until a second injection reached it · **`pocket_step_batch` is not atomic**: it advances contexts `0..i-1` before
       refusing `i`. Harmless at its declared `max_batch` of 1, illegal once that widens —
       the driver's failure isolation depends on the atomicity the header now declares
 - [ ] E8-5 **`mynah_qmat_linear_batched_qt`** — the batched twin of
@@ -371,7 +371,7 @@ prefill helper (TTFA 435 → 2379 ms), utilization-aware admission (stall@250
 single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 
 - [x] E5-1 **done** `6ed9c63`/earlier — the scheduler owns `ctx`, nothing left to serialize · **remove the global stream mutex** (`server/main.c:451-460`) — scheduler owns `ctx`
-- [ ] E5-2 streaming requests enter the same slot driver as offline; no second path
+- [x] E5-2 **done** verified: streaming and offline enter the same slot driver · streaming requests enter the same slot driver as offline; no second path
 - [x] E5-3 async output writer **done** (`server/stream_out.{c,h}`): a slow client blocked
       the whole process for 66.5 s, now 4.81 s; leaks/ASan/UBSan/TSan clean
 - [x] E5-4 **done** `6ed9c63` · cancel on disconnect (`POLLRDHUP`), slot freed within one frame
