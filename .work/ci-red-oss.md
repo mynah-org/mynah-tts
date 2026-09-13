@@ -1,8 +1,9 @@
-# CI is red on the OSS repo — deferred until the C100 work on Axion lands
+# CI is red on the OSS repo — one job bug, fixed; awaiting a run to prove it
 
-Status: **recorded, not started.** The user's instruction is explicit: finish the
-C100/Axion work first, then come back to this. This note exists so that when we
-do come back we start from evidence instead of from `gh run list`.
+Status: **fix written and committed locally, NOT yet proven.** The job is
+guard-aware now and its logic is unit-tested against four outcomes, but the only
+thing that closes this is a real workflow run, and that needs a push — which is
+never done without asking.
 
 ## Problem
 
@@ -44,31 +45,75 @@ AVX-512F, so a binary compiled for AVX-512 cannot run there — and our own star
 check refuses it rather than taking a SIGILL, which is the behaviour we want and
 should keep.
 
-Not yet confirmed: run 34756081030 fails in the same job, but its log tail showed
-compiler diagnostics around `src/transformer_ar.c:1126` (`TAR_FAIL` macro notes)
-before the non-zero exit. Those are `note:` lines, not necessarily the cause.
-**Do not assume it is the same failure as 34755962323 until its log is read.**
+**Confirmed, both runs, one bug.** Run 34756081030 fails in exactly the same
+place as 34755962323:
 
-## Plan (when we pick this up)
+```
+Run ./build/cpu/mynah-tts --version
+fatal: this binary requires AVX-512F and this CPU does not have it. ...
+##[error]Process completed with exit code 1.
+```
 
-1. Read 34756081030's failing step in full and decide whether it is one bug or two.
-2. Fix the job, not the guard. Three candidate shapes, in order of preference:
-   - a link-only job **does not run** the binary — build and stop;
-   - if it must prove the artifact starts, build the *run* step at `SIMD=avx2`
-     and keep `avx512` as a compile/link target only;
-   - or assert the guard's refusal as the **expected** outcome for a
-     cross-profile binary, i.e. the job passes when it prints that fatal line.
-   The third is the only one that keeps testing anything, but it tests the guard,
-   not AVX-512 code. Pick deliberately.
-3. Decide whether AVX-512 code paths get real execution coverage anywhere. Today
-   they do not: no runner we use has AVX-512F. The EPYC Zen 5 box that produced
-   `docs/performance.md`'s x86 numbers does. If AVX-512 correctness matters, that
-   coverage has to come from a self-hosted runner or a manual gate, and saying so
-   out loud is better than a green CI that never executed the instructions.
+The compiler diagnostics around `src/transformer_ar.c:1126` earlier in its log
+are `note:` lines from the `TAR_FAIL` macro expansion, not the cause. It is one
+bug in one matrix entry, not two.
+
+## The fix (committed locally)
+
+`.github/workflows/build.yml`, the *"Start, and collect the dispatch table"*
+step. The guard is untouched — it was right. What changed is what the job
+accepts as a successful start:
+
+- the binary starts and prints what was asked of it, **or**
+- it exits non-zero carrying the ISA guard's own message.
+
+Anything else still fails the job. Crucially that includes **SIGILL (132) with
+no message**: if the guard ever stops firing, this step goes red instead of
+quietly passing. That is the reason the step is not simply
+`continue-on-error: true` — that spelling would accept the refusal and a real
+crash with the same shrug.
+
+Two details that are easy to get wrong and were:
+
+- `shell: bash` on GitHub means `bash --noprofile --norc -eo pipefail`. Under
+  `-e` a failing command substitution kills the script **before** its exit code
+  can be read — which is the exact thing this step exists to inspect. The step
+  sets `+e` explicitly.
+- the guard writes to stderr, so the capture is `2>&1`.
+
+Verified locally against four fakes before committing: clean exit 0 → pass;
+guard message with exit 1 → pass, with a `::notice`; `kill -ILL` → exit 132 →
+**fail**; unrelated exit 3 → **fail**.
+
+## The question the failure exposed, answered
+
+**AVX-512 code paths are deliberately not executed in CI.** No GitHub-hosted
+runner we use has AVX-512F: the x86 runners report `avx2 fma`. The matrix entry
+`x86 SIMD=avx512` therefore proves that the profile **compiles and links**, and
+now also that the binary **refuses to run** where it cannot — which is real
+coverage of the guard, and is all it ever was.
+
+Execution coverage for AVX-512 comes from the EPYC Zen 5 box by hand; that is
+where `docs/performance.md`'s x86 numbers (int8 0.427 vs f32 0.806) were taken.
+If that ever needs to be continuous, it needs a self-hosted runner. Written down
+here rather than left implicit, because a green matrix that never executed the
+instructions is worse than an honest gap.
+
+## Still open, tracked, not done
+
+`--self-test` is still missing from this matrix. The reason it was excluded is
+gone: the aarch64 strict-aliasing miscompile in `src/qmat.c` was fixed in
+`d95773e`, which is an ancestor of HEAD. Adding it is the right follow-through,
+but every profile has to be proven green on real aarch64 and x86 hosts first,
+and building sixteen configurations on the project's ARM box while the C100
+concurrency measurements are running on it would corrupt those measurements.
+Do it after Axion, not during.
 
 ## Acceptance gate
 
-- `gh run list --branch main` green, and a `workflow_dispatch` on a lane branch
-  green **twice in a row** (the flapping above means one green proves nothing).
-- The AVX-512 coverage question is answered in writing here — either "covered by
-  X" or "deliberately not executed in CI", never left implicit.
+- [x] both failures traced to one cause, and that cause is the job
+- [x] guard untouched; step logic verified against pass/refuse/SIGILL/other
+- [ ] `workflow_dispatch` on a lane branch green **twice in a row** (the matrix
+      flapped, so one green proves nothing) — needs a push
+- [x] the AVX-512 coverage question answered in writing, above
+- [ ] `--self-test` added to the matrix, after the Axion work

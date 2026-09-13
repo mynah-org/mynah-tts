@@ -245,27 +245,62 @@ jobs:
       - name: Report what was built
         run: make ${{ matrix.flags }} info
 
-      # Deliberately NOT `--self-test`, and this is the one thing in this file
-      # that is waiting on someone. On Linux/gcc 15.2/aarch64 every profile
-      # WITHOUT -march=native fails `mynah_qmat_self_test`:
+      # Deliberately NOT `--self-test`. The reason used to be a live defect:
+      # on Linux/gcc 15.2/aarch64 every profile WITHOUT -march=native failed
+      # `mynah_qmat_self_test` with a strict-aliasing miscompile in src/qmat.c
+      # (66088.4844 packed to 0xb01a where the reference says 0x7c00 -- not a
+      # rounding disagreement at the f16 overflow boundary, a structurally
+      # unrelated number). That is fixed: d95773e. Adding `--self-test` to this
+      # matrix is now the right follow-through and is tracked in
+      # `.work/ci-red-oss.md`; it is not in this commit because every profile
+      # here would have to be proven green on real aarch64 and x86 hosts first,
+      # and doing that on the project's ARM box right now would perturb the
+      # concurrency measurements running on it. These profiles link and start
+      # today; they do not yet compute.
+
+      # A binary compiled for an ISA the runner does not have MUST NOT start,
+      # and mynah-tts checks its own requirement before the first guarded
+      # instruction instead of taking a SIGILL (src/dispatch.c:402). The GitHub
+      # x86 runners report `avx2 fma` with no AVX-512F, so `SIMD=avx512` reaches
+      # exactly that refusal and exits non-zero. That is the guard working. The
+      # job used to read it as a build failure, which is why this matrix entry
+      # flapped red while the code under test was fine.
       #
-      #   qmat f16 pack disagrees with the scalar reference at 4124:
-      #   66088.4844 -> 0xb01a, reference 0x7c00
+      # So this step accepts two outcomes and nothing else:
       #
-      # It is NOT a precision disagreement at the f16 overflow boundary, and it
-      # is not an ISA gap: -march=armv8.6-a and -march=armv9-a both fail while
-      # -march=native and -mcpu=neoverse-v2 pass. It is a strict-aliasing
-      # miscompile. Recompiling ONLY src/qmat.c with -fno-strict-aliasing, with
-      # every other object and flag unchanged, turns the failure into a PASS;
-      # so do -fno-tree-vectorize and -O1, while -fno-fast-math does not.
-      # macOS/clang passes every one of the same profiles, which is why nobody
-      # had seen it. Measured 2026-09-13 on the project's Axion box, reproduced
-      # at 57596b3. Fix it in src/qmat.c, then add --self-test here in the same
-      # commit -- these profiles link and start today, they do not compute.
+      #   the binary starts and prints what was asked of it, or
+      #   it exits non-zero carrying the ISA guard's own message.
+      #
+      # Every other ending still fails: a different non-zero exit, and in
+      # particular a SIGILL (128+4 = 132, with no message) if the guard ever
+      # stops firing. Written this way the refusal itself stays under test
+      # rather than being papered over with `continue-on-error`, which would
+      # have hidden a real crash in the same breath.
       - name: Start, and collect the dispatch table
+        shell: bash
         run: |
-          ./build/cpu/mynah-tts --version
-          ./build/cpu/mynah-tts --dispatch-map
+          # `shell: bash` runs this with -eo pipefail, and under -e a failing
+          # command substitution kills the script before we can read its exit
+          # code -- which is the exact case this step exists to inspect.
+          set +e
+          set -uo pipefail
+          start() {
+            local out rc
+            out=$("$@" 2>&1)
+            rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -eq 0 ]; then
+              return 0
+            fi
+            if printf '%s' "$out" | grep -q 'this CPU does not have it'; then
+              echo "::notice title=ISA guard::$* refused to run on this runner, as it should: built for an ISA this CPU lacks."
+              return 0
+            fi
+            echo "::error title=Unexpected exit::$* exited $rc without the ISA guard message"
+            return 1
+          }
+          start ./build/cpu/mynah-tts --version
+          start ./build/cpu/mynah-tts --dispatch-map
 
   release:
     needs: [build, link-only]

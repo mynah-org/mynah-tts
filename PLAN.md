@@ -544,14 +544,18 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 
 ### Deferred
 
-- [ ] **CI is red on the OSS repo — after the C100/Axion work, not before** →
-  [`.work/ci-red-oss.md`](.work/ci-red-oss.md). `main` is green; the failures are
-  `workflow_dispatch` runs on the `lane/int8-*` branches, and the one inspected in
-  full is a **job bug, not a code bug**: a job named `link-only: x86 SIMD=avx512`
-  executes the binary it built on a runner whose CPU reports `avx2 fma`, so our own
-  startup guard correctly refuses to run it and exits 1. The same branch both passes
-  and fails, so it flaps. Fix the job, keep the guard, and answer in writing whether
-  AVX-512 gets executed anywhere at all.
+- [~] **CI red on the OSS repo — job fixed, awaiting one run to prove it** →
+  [`.work/ci-red-oss.md`](.work/ci-red-oss.md). `main` was always green; both
+  failures were `workflow_dispatch` runs on `lane/int8-*` and both trace to **one
+  job bug, not a code bug**: `link-only: x86 SIMD=avx512` executed the binary it
+  built on a runner reporting `avx2 fma`, so the startup guard correctly refused
+  and exited 1. The guard is untouched; the step now accepts *started* or
+  *refused with the guard's own message* and still fails on SIGILL (132) or any
+  other exit, verified against four fakes. Left open on purpose: the run that
+  proves it (needs a push, twice green — the matrix flapped) and `--self-test`
+  for the whole matrix, which waits until the Axion box is free. AVX-512 gets no
+  execution coverage on any hosted runner; that is now stated in the note rather
+  than implied by a green tick.
 - [-] GPU (Metal/CUDA) work — existing backends stay as they are. Metal measured
   *slower* than CPU on Apple Silicon (`docs/performance.md:71-80`).
 - [-] `*_24l` PocketTTS variants — non-distilled previews, 672 MB-1.3 GB each,
