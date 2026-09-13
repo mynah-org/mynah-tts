@@ -120,6 +120,33 @@ int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *back
                               int8_t *qx_scratch, float *sx_scratch,
                               char *error, size_t error_capacity);
 
+/* The same call with the encoding named per tensor instead of per cache -- what
+ * `mynah_qmat_linear_resolved_qt` is to `mynah_qmat_linear_resolved`.
+ *
+ * WHY: `mynah_qmat_linear_batched` takes no qtype, so it both gates on the
+ * cache's own encoding and, on a first touch, creates the cache entry in it.
+ * A group carrying an explicit encoding therefore could not use the
+ * weight-stationary path at all without a first-touch race deciding its
+ * precision -- which under `MYNAH_QUANT=int8` pushed every `:f16` group (the
+ * PocketTTS backbone and flow head) back onto one weight pass per row.  Here
+ * `qtype` decides both the gate and the entry, so precision comes from the
+ * group spec and never from whichever caller arrived first.
+ *
+ * `qtype`: 0 f32, 1 int8, 2 int4, 3 f16, or -1 for "whatever the cache
+ * resolved to" -- which is what `mynah_qmat_linear_batched` now passes, so
+ * every existing caller keeps its exact behaviour.  Row b stays bit-exact
+ * against `mynah_qmat_linear_resolved_qt(..., 1, ..., qtype)`; checked by
+ * mynah_qmat_self_test over every cache profile crossed with every encoding a
+ * group spec can name. */
+int mynah_qmat_linear_batched_qt(mynah_qmat_cache *cache,
+                                 const mynah_backend *backend, const char *name,
+                                 const float *weight,
+                                 const float *const *in_rows,
+                                 float *const *out_rows, size_t batch, size_t k,
+                                 size_t n, const float *bias, int8_t *qx_scratch,
+                                 float *sx_scratch, int qtype, char *error,
+                                 size_t error_capacity);
+
 /* Greedy f32 projection fused with the constrained argmax.  Returns 0 when
  * fused, 1 when the cache/backend is not eligible and the caller should use
  * mynah_qmat_linear, or -1 on a model/input error. */

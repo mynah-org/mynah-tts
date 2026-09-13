@@ -777,7 +777,21 @@ struct mynah_engine_ctx {
     size_t voice_positions;
     float *voice_kv; /* [2][voice_positions][heads][head_dim] */
 
-    float *text_embed; /* [text_length][hidden_dim] */
+    /* ---- the long-form text window (E5-5) -----------------------------
+     *
+     * `text_length` is what has been ACCEPTED, `text_prefilled` what is already
+     * in the backbone KV, and `text_capacity` what was paid for at admission.
+     * They are three different numbers only while `text_open` is set; for an
+     * ordinary single-text request all three are the request's own length and
+     * every branch below is dead.
+     *
+     * `text_capacity` is the ceiling, and it is declared at admission on
+     * purpose -- see `mynah_engine_pocket_reserve_text`. */
+    size_t text_capacity;
+    size_t text_prefilled;
+    int text_open;
+
+    float *text_embed; /* [text_capacity][hidden_dim] */
     float *step_input; /* [hidden_dim] */
     float *hidden;     /* [hidden_dim] */
     float *noise;      /* [latent_dim] */
@@ -1183,30 +1197,30 @@ static int pocket_proj_row(const pocket_proj *p, const float *weight,
 /*
  * May `rows` rows share one pass over the weight?
  *
- * Only when the encoding this group asked for is the encoding
- * `mynah_qmat_linear_batched` would use anyway.  That function takes no qtype:
- * it gates on `cache->qtype` and, if it is the first caller to touch a tensor,
- * creates the cache entry in the cache's own encoding.  So for a group carrying
- * an explicit encoding that differs from the cache's, a batched call could both
- * skip quantization it should do and create the entry in the wrong encoding,
- * with a first-touch race deciding which.  Rather than let that happen, such a
- * group keeps every row on `_resolved_qt`: exact, just not weight-stationary.
+ * The question used to have a second half.  `mynah_qmat_linear_batched` takes
+ * no qtype: it gates on `cache->qtype` and, if it is the first caller to touch
+ * a tensor, creates the cache entry in the cache's own encoding.  So a group
+ * carrying an explicit encoding that differed from the cache's had to be kept
+ * off the batched path entirely -- otherwise a first-touch race would decide
+ * the group's precision.  That refusal was correct and it was expensive: under
+ * `MYNAH_QUANT=int8` the three `:f16` groups in the shipped spec (backbone,
+ * flow_net, conditioner) read the weight once per row.
  *
- * Under the shipped group spec this still leaves the codec transformer -- the
- * group that runs 16 positions over the same weights every frame, and the one
- * this whole lane exists for -- on the batched path in both the default and the
- * int8 profile, because it takes the cache's own encoding in each.  Lifting the
- * restriction for the rest needs one function in `src/qmat.c`:
- * `mynah_qmat_linear_batched_qt`, the batched twin of `_resolved_qt`.
+ * E8-5 removed the cause rather than the refusal.  `mynah_qmat_linear_batched_qt`
+ * resolves the encoding from the qtype it is HANDED, before it touches the
+ * cache, and uses that same value for both the gate and the insert -- so
+ * precision still comes from the group spec and never from whichever caller
+ * arrived first, which is the property that made the refusal necessary.  What
+ * is left here is only the scratch-shape question.
+ *
+ * A group whose encoding this build cannot honour resolves to exact f32 inside
+ * qmat, which declines the weight-stationary path and puts every row back on
+ * `_resolved_qt` -- the same bytes either way, because row b is bit-exact
+ * against row b computed alone.
  */
 static int pocket_proj_batchable(const pocket_proj *p, const pocket_call *call,
                                  size_t rows, size_t k) {
-    if (!p->quantized || call == NULL || rows > call->rows || k > call->k_max) {
-        return 0;
-    }
-    const int cache_qtype = mynah_qmat_cache_qtype(p->qcache);
-    if (cache_qtype == 0) return 0; /* the cache is f32: nothing to share */
-    return (p->qtype < 0) || (p->qtype == cache_qtype);
+    return p->quantized && call != NULL && rows <= call->rows && k <= call->k_max;
 }
 
 static int pocket_proj_batched(const pocket_proj *p, pocket_call *call,
@@ -1214,9 +1228,9 @@ static int pocket_proj_batched(const pocket_proj *p, pocket_call *call,
                                const float *const *in_rows,
                                float *const *out_rows, size_t rows, size_t k,
                                size_t n) {
-    return mynah_qmat_linear_batched(p->qcache, p->backend, p->name, weight,
-                                     in_rows, out_rows, rows, k, n, bias, call->qx,
-                                     call->sx, NULL, 0);
+    return mynah_qmat_linear_batched_qt(p->qcache, p->backend, p->name, weight,
+                                        in_rows, out_rows, rows, k, n, bias,
+                                        call->qx, call->sx, p->qtype, NULL, 0);
 }
 
 
@@ -2860,6 +2874,24 @@ static int pocket_voice_open(mynah_engine_ctx *ctx, char *error, size_t capacity
     return 0;
 }
 
+/* The backbone's configuration at a given KV capacity.  Factored out of
+ * `ctx_new` because `reserve_text` has to rebuild the state at a LARGER
+ * capacity and the two must not be able to drift: everything except
+ * `max_seq_len` is a property of the pack. */
+static void pocket_backbone_config(const mynah_engine_ctx *ctx, size_t capacity,
+                                   mynah_transformer_ar_config *out) {
+    const pocket_config *cfg = &ctx->state->cfg;
+    mynah_transformer_ar_config_defaults(out);
+    out->d_model = cfg->hidden_dim;
+    out->num_heads = cfg->heads;
+    out->head_dim = cfg->head_dim;
+    out->num_layers = cfg->layers;
+    out->ffn_dim = cfg->ffn_dim;
+    out->max_seq_len = capacity;
+    out->context = 0u; /* the LM attends to the whole prefix */
+    out->layernorm_eps = cfg->layernorm_eps;
+}
+
 static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *state,
                           const mynah_tts_request *request, size_t max_steps,
                           uint64_t seed, mynah_engine_ctx **out_ctx, char *error,
@@ -2898,6 +2930,9 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     ctx->speaker = request->speaker;
     ctx->max_steps = max_steps;
     ctx->text_length = request->text_length;
+    /* No reserve yet: the ceiling is the text that was admitted, which makes
+     * every long-form branch below cost exactly one comparison. */
+    ctx->text_capacity = request->text_length;
     ctx->temperature = (request->temperature >= 0.0f) ? request->temperature
                                                       : cfg->temperature;
     ctx->noise_std = sqrtf(ctx->temperature);
@@ -2907,7 +2942,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
                                 : max_steps;
     ctx->dump = pocket_dump_open(cfg, max_steps);
 
-    ctx->text_ids = (int *)calloc(ctx->text_length, sizeof(*ctx->text_ids));
+    ctx->text_ids = (int *)calloc(ctx->text_capacity, sizeof(*ctx->text_ids));
     if (ctx->text_ids == NULL) {
         pocket_ctx_free(ctx);
         pocket_error(error, capacity, "out of memory copying the request text");
@@ -3002,11 +3037,11 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     size_t pcm_floats = 0;
     size_t codec_frames = 0;
     if (pocket_add(max_steps, 1u, &codec_frames) != 0 ||
-        pocket_add(ctx->voice_positions, ctx->text_length, &backbone_capacity) != 0 ||
+        pocket_add(ctx->voice_positions, ctx->text_capacity, &backbone_capacity) != 0 ||
         pocket_add(backbone_capacity, codec_frames, &backbone_capacity) != 0 ||
         pocket_mul(ctx->voice_positions, attn_dim, &voice_floats) != 0 ||
         pocket_mul(voice_floats, 2u, &voice_floats) != 0 ||
-        pocket_mul(ctx->text_length, cfg->hidden_dim, &text_floats) != 0 ||
+        pocket_mul(ctx->text_capacity, cfg->hidden_dim, &text_floats) != 0 ||
         pocket_mul(max_steps, cfg->latent_dim, &latent_floats) != 0 ||
         pocket_mul(codec_frames, cfg->upsample_stride, &codec_positions) != 0 ||
         pocket_mul(cfg->codec_dim, cfg->upsample_stride, &up_floats) != 0 ||
@@ -3040,15 +3075,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     }
 
     mynah_transformer_ar_config backbone;
-    mynah_transformer_ar_config_defaults(&backbone);
-    backbone.d_model = cfg->hidden_dim;
-    backbone.num_heads = cfg->heads;
-    backbone.head_dim = cfg->head_dim;
-    backbone.num_layers = cfg->layers;
-    backbone.ffn_dim = cfg->ffn_dim;
-    backbone.max_seq_len = backbone_capacity;
-    backbone.context = 0u; /* the LM attends to the whole prefix */
-    backbone.layernorm_eps = cfg->layernorm_eps;
+    pocket_backbone_config(ctx, backbone_capacity, &backbone);
     ctx->backbone = mynah_transformer_ar_state_new(&backbone, error, capacity);
 
     mynah_transformer_ar_config codec;
@@ -3157,6 +3184,69 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     return 0;
 }
 
+/*
+ * Push accepted-but-not-yet-prefilled text into the backbone KV.
+ *
+ * THE TILE ALIGNMENT IS THE WHOLE FUNCTION, and it is what makes "N pushes ==
+ * one push" true rather than approximately true.  `mynah_transformer_ar_prefill`
+ * runs its positions as tiles of at most `_prefill_tile()` rows, counted from
+ * the start of THAT CALL, and it presents each tile's projections to the hook
+ * as one call with `count == rows`.  For an unquantized group that call is a
+ * GEMM whose blocking is a function of the row count, so a 13-row tile and a
+ * 16-row tile need not reassociate a row's sum the same way.  Split the same
+ * text at a different place and the tiles land differently -- and the audio
+ * moves, by an amount no tolerance should be asked to absorb.
+ *
+ * So a push never prefills a partial tile.  Everything except the last tile is
+ * emitted in whole `tile`-sized groups at `tile`-aligned offsets, exactly where
+ * a one-shot prefill of the concatenated text would have put them, and the
+ * remainder waits in `text_embed` until the text is sealed -- at which point it
+ * becomes the one short final tile the one-shot also ends with.  The pending
+ * remainder is under `tile` tokens and lives in a buffer that was already
+ * allocated, so nothing here allocates and nothing here is unbounded.
+ *
+ * `final` is the seal: emit the remainder too.
+ */
+static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
+                             size_t capacity) {
+    const pocket_config *cfg = &ctx->state->cfg;
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    const size_t want = (final || tile == 0u)
+                            ? ctx->text_length
+                            : (ctx->text_length / tile) * tile;
+    if (want <= ctx->text_prefilled) return 0;
+    const size_t rows = want - ctx->text_prefilled;
+    /* The invariant the paragraph above is about, asserted rather than assumed.
+     * It restates the line that computed `want`, which is the point: it is a
+     * postcondition, and it is what makes a future edit to that line fail here
+     * -- loudly, on every quantization profile -- instead of failing as a one
+     * ULP difference that only the f32 tile path can see. */
+    if (!final && tile != 0u &&
+        ((ctx->text_prefilled % tile) != 0u || (rows % tile) != 0u)) {
+        pocket_error(error, capacity,
+                     "pocket: a non-final text flush of %zu rows at offset %zu is "
+                     "not aligned to the %zu-row prefill tile; the tiles would "
+                     "land where a one-shot prefill did not put them",
+                     rows, ctx->text_prefilled, tile);
+        return -1;
+    }
+    mynah_region_begin(MYNAH_RGN_PREFILL);
+    const int failed =
+        mynah_transformer_ar_prefill(
+            ctx->backbone, &ctx->backbone_w,
+            ctx->text_embed + ctx->text_prefilled * cfg->hidden_dim, rows,
+            NULL) != 0;
+    mynah_region_end(MYNAH_RGN_PREFILL);
+    if (failed) {
+        pocket_error(error, capacity,
+                     "pocket: the text prefill failed at token %zu of %zu",
+                     ctx->text_prefilled, ctx->text_length);
+        return -1;
+    }
+    ctx->text_prefilled = want;
+    return 0;
+}
+
 /* Voice KV, then the text prefix. Shared by `prepare` and `reset`, because a
  * rewind is exactly a re-entry into this state and nothing else. */
 static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capacity) {
@@ -3212,15 +3302,12 @@ static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capaci
                state->embed_table + id * cfg->hidden_dim,
                cfg->hidden_dim * sizeof(float));
     }
-    mynah_region_begin(MYNAH_RGN_PREFILL);
-    const int prefill_failed =
-        mynah_transformer_ar_prefill(ctx->backbone, &ctx->backbone_w, ctx->text_embed,
-                                     ctx->text_length, NULL) != 0;
-    mynah_region_end(MYNAH_RGN_PREFILL);
-    if (prefill_failed) {
-        pocket_error(error, capacity, "pocket: the text prefill failed");
-        return -1;
-    }
+    /* A closed context is sealed here and prefills its whole text in one call,
+     * which is byte for byte what this function did before E5-5 existed.  An
+     * OPEN one stops at the last whole tile, because the tokens that will share
+     * its final tile have not arrived yet -- see `pocket_text_flush`. */
+    ctx->text_prefilled = 0;
+    if (pocket_text_flush(ctx, !ctx->text_open, error, capacity) != 0) return -1;
     ctx->prepared = 1;
     return 0;
 }
@@ -3350,6 +3437,19 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         mynah_engine_ctx *ctx = ctxs[i];
         if (ctx == NULL || !ctx->prepared) {
             pocket_error(error, capacity, "pocket: request %zu is not prepared", i);
+            return -1;
+        }
+        /* A context whose text is still open has a partial tile waiting in
+         * `text_embed` and is one text position short in the KV.  Stepping it
+         * would generate from a prefix the caller has not finished writing, and
+         * the audio would be conditioned on text that is missing its tail --
+         * silently, and differently depending on where the pushes fell.  It is
+         * a caller error, and it is refused here where nothing has moved yet. */
+        if (ctx->text_open) {
+            pocket_error(error, capacity,
+                         "pocket: request %zu still has text open (%zu of %zu "
+                         "tokens prefilled); seal it before stepping", i,
+                         ctx->text_prefilled, ctx->text_length);
             return -1;
         }
         if (ctx->eos || ctx->broken) {
@@ -4234,6 +4334,262 @@ int mynah_engine_pocket_tokenize(const mynah_engine_state *state, const char *te
                            error, capacity);
 }
 
+/* ------------------------------------------------- long-form text (E5-5)
+ *
+ * HOW THE WINDOW GROWS, AND WHY IT IS A CEILING RATHER THAN A REALLOC.
+ *
+ * Three things in a context are sized from the text: `text_ids`, `text_embed`,
+ * and the backbone KV's `max_seq_len` (voice + text + max_steps + 1).  Nothing
+ * else is -- `latents`, the codec KV and the step budget are all functions of
+ * `max_steps` alone -- so the growth problem is narrower than it looks, but it
+ * does include a contiguous KV cache that `transformer_ar` allocates once.
+ *
+ * Three ways to grow it, weighed on the case that decides it: the growth fails
+ * on a stream that has already emitted audio.
+ *
+ *  1. REALLOCATE AND COPY.  The KV is one contiguous block per layer, so this
+ *     means a second allocation of the whole cache while the first is still
+ *     live -- peak footprint doubles at the exact moment memory is tight.  If
+ *     it fails, the request is mid-flight: the caller has PCM in its socket and
+ *     no way to un-send it.  There is no answer to that failure; it is not a
+ *     503, it is a truncated stream that looked healthy a millisecond earlier.
+ *  2. A LINKED RUN OF BLOCKS.  Survives the failure better -- only the new
+ *     block is lost -- but a chunked cache is a change to `transformer_ar`'s
+ *     attention inner loop, which every engine and every ISA kernel depends on,
+ *     to buy an allocation shape nothing else in this runtime wants.  Rejected
+ *     on blast radius, not on the idea.
+ *  3. A CEILING DECLARED AT ADMISSION.  `reserve_text` is legal only before
+ *     `prepare`: it allocates everything the request may ever need while the
+ *     request has done nothing, has emitted nothing, and can still be refused.
+ *     A failure there IS a 503.  Afterwards `append_text` allocates NOTHING --
+ *     it copies into space that was paid for, and a caller who asks for more
+ *     than it reserved gets a refusal that leaves the stream exactly where it
+ *     was, with both numbers in the message.
+ *
+ * (3), because it is the only one of the three whose append path contains no
+ * allocation at all, which is what turns "the growth failed" from an outcome
+ * into a case that cannot arise.  It costs the operator a number they must
+ * choose, and the KV is ~48 KB per position per request for this pack, so
+ * choosing it badly is expensive -- which is an argument for making it a
+ * per-request field rather than a process-wide one, and it is one of the two
+ * things this needs from the seam (see engine_pocket.h).
+ *
+ * Growth is committed all-or-nothing: every new buffer is allocated before any
+ * old one is released, so a failed `reserve_text` leaves the context exactly at
+ * the capacity it already had.
+ */
+int mynah_engine_pocket_reserve_text(mynah_engine_ctx *ctx, size_t total_tokens,
+                                     char *error, size_t capacity) {
+    if (ctx == NULL) {
+        pocket_error(error, capacity, "pocket: null context reserving text");
+        return -1;
+    }
+    if (ctx->prepared) {
+        /* The KV would have to be rebuilt under a prefix that is already in it.
+         * Admission is the only window where growing is free of consequence,
+         * and this is the check that keeps it that way. */
+        pocket_error(error, capacity,
+                     "pocket: reserve_text after prepare; the text ceiling is "
+                     "declared at admission");
+        return -1;
+    }
+    /* Declaring a ceiling is what opens the context, whether or not it grows:
+     * a caller that reserves exactly what it admitted still intends to push. */
+    ctx->text_open = 1;
+    if (total_tokens <= ctx->text_capacity) return 0;
+
+    const pocket_config *cfg = &ctx->state->cfg;
+    size_t backbone_capacity = 0, text_floats = 0, codec_frames = 0;
+    if (pocket_add(ctx->max_steps, 1u, &codec_frames) != 0 ||
+        pocket_add(ctx->voice_positions, total_tokens, &backbone_capacity) != 0 ||
+        pocket_add(backbone_capacity, codec_frames, &backbone_capacity) != 0 ||
+        pocket_mul(total_tokens, cfg->hidden_dim, &text_floats) != 0) {
+        pocket_error(error, capacity,
+                     "pocket: a text ceiling of %zu tokens overflows", total_tokens);
+        return -1;
+    }
+    /* Everything is allocated before anything is released, so the failure below
+     * leaves the context exactly at the capacity it already had. */
+    int *ids = (int *)calloc(total_tokens, sizeof(*ids));
+    if (ids == NULL) {
+        pocket_error(error, capacity,
+                     "pocket: out of memory reserving %zu text tokens",
+                     total_tokens);
+        return -1;
+    }
+    /* These two write their own message on failure. */
+    float *embed = mynah_alloc_floats(text_floats, error, capacity);
+    mynah_transformer_ar_config backbone;
+    pocket_backbone_config(ctx, backbone_capacity, &backbone);
+    mynah_transformer_ar_state *grown =
+        embed == NULL ? NULL
+                      : mynah_transformer_ar_state_new(&backbone, error, capacity);
+    if (embed == NULL || grown == NULL ||
+        mynah_transformer_ar_check_weights(grown, &ctx->backbone_w, error,
+                                           capacity) != 0) {
+        free(ids);
+        free(embed);
+        mynah_transformer_ar_state_free(grown);
+        return -1; /* the context is untouched, at the capacity it already had */
+    }
+    memcpy(ids, ctx->text_ids, ctx->text_length * sizeof(*ids));
+    free(ctx->text_ids);
+    ctx->text_ids = ids;
+    free(ctx->text_embed);
+    ctx->text_embed = embed;
+    mynah_transformer_ar_state_free(ctx->backbone);
+    ctx->backbone = grown;
+    ctx->text_capacity = total_tokens;
+    return 0;
+}
+
+/*
+ * Append text to a context that is prepared but has not stepped.
+ *
+ * THE ONE REFUSAL THAT IS NOT A LIMITATION.  `ctx->step != 0` is refused, and
+ * it is refused because the alternative cannot exist rather than because it was
+ * not built.  A one-shot run puts the whole text in the KV before position
+ * zero of the audio, so every frame is conditioned on all of it.  A context
+ * that has already generated k frames and then receives more text has the
+ * layout [voice][text A][step 0..k-1][text B][step k..]; the first k frames
+ * were produced by a model that had never seen text B and are already in the
+ * caller's socket.  No ordering of a causal cache makes that equal to the
+ * one-shot, and regenerating the frames is not open either -- they have been
+ * sent.  So appending mid-generation is not byte-identical to anything, which
+ * is the property this whole item is gated on, and weakening the gate to admit
+ * it would be the same mistake as weakening it to admit N sequential requests.
+ *
+ * What this DOES buy is real and is what the driver half wants: text may be
+ * prefilled as it arrives instead of after it has all arrived, so the prefill
+ * overlaps the text stream rather than following it.
+ */
+int mynah_engine_pocket_append_text(mynah_engine_ctx *ctx, const int *text_ids,
+                                    size_t count, char *error, size_t capacity) {
+    if (ctx == NULL || (count > 0u && text_ids == NULL)) {
+        pocket_error(error, capacity, "pocket: null argument appending text");
+        return -1;
+    }
+    if (!ctx->prepared) {
+        pocket_error(error, capacity, "pocket: append_text before prepare");
+        return -1;
+    }
+    /* Ordered before the `text_open` check on purpose.  Both refuse a context
+     * that has generated -- `step_batch` will not step one whose text is still
+     * open, so a stepped context is always a sealed one -- but only this branch
+     * says WHY, and the reason is the whole argument for the refusal rather
+     * than an implementation detail.  A caller told "this context was admitted
+     * as one complete text" would go looking for a reserve it already made. */
+    if (ctx->step != 0u) {
+        pocket_error(error, capacity,
+                     "pocket: append_text after %zu steps; text appended to a "
+                     "context that has already generated cannot be identical to "
+                     "the same text prefilled whole, and the frames it already "
+                     "emitted cannot be recalled", ctx->step);
+        return -1;
+    }
+    if (!ctx->text_open) {
+        pocket_error(error, capacity,
+                     "pocket: this context was admitted as one complete text; "
+                     "call reserve_text before prepare to open it");
+        return -1;
+    }
+    if (ctx->broken) {
+        pocket_error(error, capacity, "pocket: append_text on a failed request");
+        return -1;
+    }
+    if (count == 0u) return 0;
+    if (count > ctx->text_capacity - ctx->text_length) {
+        /* The refusal the ceiling exists to produce: nothing has been copied,
+         * nothing has been prefilled, and the context is still exactly where it
+         * was, so the caller may seal and generate what it has. */
+        pocket_error(error, capacity,
+                     "pocket: %zu more tokens would pass the text ceiling "
+                     "(%zu reserved, %zu used); raise it at admission",
+                     count, ctx->text_capacity, ctx->text_length);
+        return -1;
+    }
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    /* Validated before anything is copied, for the same reason `step_batch`
+     * validates before it advances: a bad id must refuse, not half-append. */
+    for (size_t i = 0; i < count; ++i) {
+        const int id = text_ids[i];
+        if (id < 0 || (size_t)id >= cfg->vocab_size) {
+            pocket_error(error, capacity,
+                         "text id %d at append position %zu is outside [0, %zu)",
+                         id, i, cfg->vocab_size);
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const size_t at = ctx->text_length + i;
+        ctx->text_ids[at] = text_ids[i];
+        memcpy(ctx->text_embed + at * cfg->hidden_dim,
+               state->embed_table + (size_t)text_ids[i] * cfg->hidden_dim,
+               cfg->hidden_dim * sizeof(float));
+    }
+    ctx->text_length += count;
+    if (pocket_text_flush(ctx, 0, error, capacity) != 0) {
+        /* The KV now holds an unknown number of the new positions.  Nothing has
+         * been emitted -- `step` is still 0 -- but this context can no longer be
+         * reasoned about, so it is retired rather than stepped. */
+        ctx->broken = 1;
+        return -1;
+    }
+    return 0;
+}
+
+/* Close the text: prefill the remainder and allow stepping.  Idempotent, and a
+ * no-op on a context that was never opened. */
+int mynah_engine_pocket_seal_text(mynah_engine_ctx *ctx, char *error,
+                                  size_t capacity) {
+    if (ctx == NULL) {
+        pocket_error(error, capacity, "pocket: null context sealing text");
+        return -1;
+    }
+    if (!ctx->prepared) {
+        pocket_error(error, capacity, "pocket: seal_text before prepare");
+        return -1;
+    }
+    if (!ctx->text_open) return 0;
+    if (ctx->step != 0u) {
+        pocket_error(error, capacity, "pocket: seal_text after %zu steps",
+                     ctx->step);
+        return -1;
+    }
+    if (pocket_text_flush(ctx, 1, error, capacity) != 0) {
+        ctx->broken = 1;
+        return -1;
+    }
+    ctx->text_open = 0;
+    /* E2-5 again, and this is where it bites hardest: the accumulated length is
+     * not known at admission, so a caller that pushes its way past the limit
+     * would never have seen the warning `ctx_new` prints.  Long-form does not
+     * make the no-EOS failure more or less likely at a given token count -- the
+     * KV it builds is the one the one-shot builds -- but it is the feature that
+     * makes reaching that count ordinary rather than exotic. */
+    {
+        const size_t limit = ctx->state->cfg.max_tokens_per_chunk;
+        if (limit != 0u && ctx->text_length > limit && !ctx->state->chunk_warned) {
+            ctx->state->chunk_warned = 1;
+            fprintf(stderr,
+                    "mynah-tts: %zu text tokens pushed past max_tokens_per_chunk "
+                    "%zu; this engine does not split text, and past roughly three "
+                    "times the limit the model may stop emitting EOS and run to "
+                    "the step budget (E2-5)\n", ctx->text_length, limit);
+        }
+    }
+    return 0;
+}
+
+size_t mynah_engine_pocket_text_length(const mynah_engine_ctx *ctx) {
+    return ctx == NULL ? 0u : ctx->text_length;
+}
+
+size_t mynah_engine_pocket_text_capacity(const mynah_engine_ctx *ctx) {
+    return ctx == NULL ? 0u : ctx->text_capacity;
+}
+
 int mynah_engine_pocket_set_frames_after_eos(mynah_engine_ctx *ctx, size_t frames) {
     if (ctx == NULL || frames > ctx->max_steps) return -1;
     ctx->frames_after_eos = frames;
@@ -4726,6 +5082,498 @@ static int pocket_check_chunk_seam(mynah_engine_state *state,
     return 0;
 }
 
+/*
+ * E5-5.  A text synthesized in N pushes must be BYTE-IDENTICAL to the same text
+ * synthesized in one.  Not correlated, not within a tolerance: identical.
+ *
+ * WHAT CAN ACTUALLY BREAK IT, which is why the split patterns are chosen rather
+ * than arbitrary.  `mynah_transformer_ar_prefill` tiles its positions in groups
+ * of `_prefill_tile()` counted from the start of the call, and hands each tile
+ * to the projection hook as one call with `count == rows`.  For an unquantized
+ * group that is a GEMM whose blocking depends on the row count, so a text split
+ * at 13 and a text split at 16 can reassociate a row's sum differently -- and
+ * every frame after it is downstream of that row through the AR loop.  The
+ * patterns below therefore include splits that are aligned to the tile, splits
+ * that are coprime with it, one token at a time, and a first piece shorter than
+ * one tile, because those are the four ways the tiling can come apart.
+ *
+ * THE CONTROLS, because a byte comparison between two runs of the same code is
+ * the easiest gate in the world to write blind:
+ *
+ *   - `reserve`: a one-shot run under a ceiling four times its own text must
+ *     equal the same run with no ceiling at all.  This pins that KV CAPACITY is
+ *     numerically inert -- if it were not, every push comparison below would be
+ *     comparing two runs that were both wrong in the same way, and the whole
+ *     check would be vacuous while green.
+ *   - `differs`: a different text must produce different bytes.  Cheap, and it
+ *     is what catches a harness that compares two empty buffers.
+ *   - a non-zero sample count is required, for the same reason.
+ */
+typedef struct {
+    const char *name;
+    size_t first;      /* tokens admitted with the request */
+    size_t chunk;      /* tokens per append, 0 = one token at a time */
+} pocket_split_pattern;
+
+/* Steps one context to its end, alone.  Alone rather than batched on purpose:
+ * the question here is the text window, and batching is a separate seam with
+ * its own gate -- mixing them would make a failure ambiguous. */
+static int pocket_lf_run(mynah_engine_ctx *ctx, mynah_engine_scratch *scratch,
+                         char *error, size_t capacity) {
+    mynah_engine_ctx *one[1] = {ctx};
+    mynah_engine_step_result result[1];
+    mynah_engine_ctx *const *ctxs = one;
+    while (!ctx->eos && !ctx->broken) {
+        if (pocket_step_batch(ctxs, 1u, scratch, error, capacity) != 0) return -1;
+        if (pocket_emit_batch(ctxs, 1u, result, scratch, error, capacity) != 0) {
+            return -1;
+        }
+        if (result[0].failed) {
+            pocket_error(error, capacity, "long-form: a step failed");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* One context carrying `text` pushed according to `split` (NULL = one shot),
+ * run to the end, with all of its audio decoded in one call. */
+static int pocket_lf_synth(mynah_engine_state *state, const mynah_tts_model *model,
+                           const int *ids, size_t n_ids,
+                           const pocket_split_pattern *split, size_t reserve,
+                           size_t max_steps, mynah_engine_scratch *scratch,
+                           float **out_pcm, size_t *out_n, size_t *out_frames,
+                           char *error, size_t capacity) {
+    *out_pcm = NULL;
+    *out_n = 0;
+    *out_frames = 0;
+    const size_t first = (split == NULL) ? n_ids : split->first;
+    if (first == 0u || first > n_ids) {
+        pocket_error(error, capacity, "long-form: bad split");
+        return -1;
+    }
+    mynah_tts_request request;
+    memset(&request, 0, sizeof(request));
+    request.text_ids = ids;
+    request.text_length = first;
+    request.speaker = 0u;
+    request.temperature = -1.0f;
+    mynah_engine_ctx *ctx = NULL;
+    if (pocket_ctx_new(model, state, &request, max_steps, 4242u, &ctx, error,
+                       capacity) != 0) {
+        return -1;
+    }
+    int bad = 0;
+    if (reserve != 0u) {
+        bad = mynah_engine_pocket_reserve_text(ctx, reserve, error, capacity) != 0;
+    }
+    if (!bad) bad = pocket_prepare(ctx, error, capacity) != 0;
+    if (!bad && split != NULL) {
+        size_t at = first;
+        while (at < n_ids && !bad) {
+            size_t take = (split->chunk == 0u) ? 1u : split->chunk;
+            if (take > n_ids - at) take = n_ids - at;
+            bad = mynah_engine_pocket_append_text(ctx, ids + at, take, error,
+                                                  capacity) != 0;
+            at += take;
+        }
+    }
+    if (!bad && reserve != 0u) {
+        bad = mynah_engine_pocket_seal_text(ctx, error, capacity) != 0;
+    }
+    if (!bad && mynah_engine_pocket_text_length(ctx) != n_ids) {
+        pocket_error(error, capacity,
+                     "long-form: %zu tokens accepted, %zu pushed",
+                     mynah_engine_pocket_text_length(ctx), n_ids);
+        bad = 1;
+    }
+    if (!bad) bad = pocket_lf_run(ctx, scratch, error, capacity) != 0;
+    if (!bad) {
+        *out_frames = ctx->frames;
+        bad = pocket_decode_audio(ctx, 0u, ctx->frames, out_pcm, out_n, error,
+                                  capacity) != 0;
+    }
+    pocket_ctx_free(ctx);
+    return bad ? -1 : 0;
+}
+
+static int pocket_lf_same(const char *what, const float *a, size_t an,
+                          const float *b, size_t bn, char *error, size_t capacity) {
+    if (an != bn) {
+        pocket_error(error, capacity,
+                     "long-form (%s): %zu samples against %zu -- the split "
+                     "changed how much audio the request produced", what, bn, an);
+        return -1;
+    }
+    for (size_t i = 0; i < an; ++i) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            pocket_error(error, capacity,
+                         "long-form (%s): sample %zu of %zu differs, %.9g against "
+                         "%.9g -- pushing the text in pieces is not identical to "
+                         "pushing it whole", what, i, an, (double)a[i], (double)b[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The refusals, which are the half of the design that the byte comparison
+ * cannot see.
+ *
+ * The whole reason the text ceiling is declared at admission is that it moves
+ * every allocation to a point where failing is a 503, and leaves `append_text`
+ * with nothing to fail at except a bounds check.  That is only worth anything
+ * if the bounds check leaves the context USABLE -- a refusal that quietly
+ * half-appended would be strictly worse than the allocation failure it
+ * replaced.  So the assertion is not "it returned -1", it is "it returned -1
+ * and the audio afterwards is byte-identical to a request that had asked for
+ * exactly the tokens that were accepted".
+ *
+ * Five refusals, each with the state it must not have disturbed:
+ *
+ *   1. reserve_text after prepare   -- the ceiling is an admission-time number
+ *   2. append past the ceiling      -- and the request still synthesizes
+ *   3. append after a step          -- and the request still synthesizes
+ *   4. step while the text is open  -- caught in the pre-flight, nothing moved
+ *   5. append without a reserve     -- an ordinary request is closed
+ */
+static int pocket_check_lf_refusals(mynah_engine_state *state,
+                                    const mynah_tts_model *model, char *error,
+                                    size_t capacity) {
+    static const char text[] =
+        "The quick brown fox jumps over the lazy dog while a patient cat watches "
+        "from the warm windowsill and counts the passing cars on the quiet road.";
+    const size_t max_steps = 12u;
+    int *ids = NULL;
+    size_t n_ids = 0;
+    if (mynah_engine_pocket_tokenize(state, text, strlen(text), &ids, &n_ids, error,
+                                     capacity) != 0) {
+        return -1;
+    }
+    int rc = -1;
+    float *ref = NULL, *got = NULL;
+    size_t ref_n = 0, got_n = 0, frames = 0;
+    mynah_engine_ctx *ctx = NULL;
+    char scratch_error[512];
+    const size_t accepted = n_ids / 2u;
+    if (accepted < 4u) {
+        pocket_error(error, capacity, "long-form refusals: the text is too short");
+        goto done;
+    }
+    /* What the request WILL have asked for once the over-ceiling push has been
+     * refused: the first `accepted` tokens, admitted the ordinary way. */
+    if (pocket_lf_synth(state, model, ids, accepted, NULL, 0u, max_steps, NULL,
+                        &ref, &ref_n, &frames, error, capacity) != 0) {
+        goto done;
+    }
+    if (ref_n == 0u) {
+        pocket_error(error, capacity, "long-form refusals: no reference audio");
+        goto done;
+    }
+
+    mynah_tts_request request;
+    memset(&request, 0, sizeof(request));
+    request.text_ids = ids;
+    request.text_length = 2u;
+    request.speaker = 0u;
+    request.temperature = -1.0f;
+
+    /* 5. an ordinary request is closed: append without a reserve is refused. */
+    if (pocket_ctx_new(model, state, &request, max_steps, 4242u, &ctx, error,
+                       capacity) != 0) {
+        goto done;
+    }
+    if (pocket_prepare(ctx, error, capacity) != 0) goto done;
+    if (mynah_engine_pocket_append_text(ctx, ids + 2u, 1u, scratch_error,
+                                        sizeof(scratch_error)) == 0) {
+        pocket_error(error, capacity,
+                     "long-form refusals: append_text succeeded on a context that "
+                     "never reserved; an ordinary request must be closed");
+        goto done;
+    }
+    /* 1. and the ceiling cannot be raised once the prefix is in the cache. */
+    if (mynah_engine_pocket_reserve_text(ctx, n_ids, scratch_error,
+                                         sizeof(scratch_error)) == 0) {
+        pocket_error(error, capacity,
+                     "long-form refusals: reserve_text succeeded after prepare");
+        goto done;
+    }
+    pocket_ctx_free(ctx);
+    ctx = NULL;
+
+    /* 2, 3 and 4, on one context that must survive all three. */
+    if (pocket_ctx_new(model, state, &request, max_steps, 4242u, &ctx, error,
+                       capacity) != 0) {
+        goto done;
+    }
+    /* One token of headroom, deliberately: the post-step refusal below must be
+     * the STEP rule refusing, not the ceiling refusing first.  Without the
+     * headroom, deleting the step check leaves this check green -- measured. */
+    if (mynah_engine_pocket_reserve_text(ctx, accepted + 1u, error, capacity) != 0 ||
+        pocket_prepare(ctx, error, capacity) != 0) {
+        goto done;
+    }
+    /* 4. stepping while the text is open is refused, and nothing moves. */
+    {
+        mynah_engine_ctx *one[1] = {ctx};
+        mynah_engine_ctx *const *ctxs = one;
+        const size_t before = mynah_transformer_ar_state_offset(ctx->backbone);
+        if (pocket_step_batch(ctxs, 1u, NULL, scratch_error,
+                              sizeof(scratch_error)) == 0) {
+            pocket_error(error, capacity,
+                         "long-form refusals: a context with open text stepped");
+            goto done;
+        }
+        if (mynah_transformer_ar_state_offset(ctx->backbone) != before ||
+            ctx->step != 0u) {
+            pocket_error(error, capacity,
+                         "long-form refusals: the refused step moved the context");
+            goto done;
+        }
+    }
+    if (mynah_engine_pocket_append_text(ctx, ids + 2u, accepted - 2u, error,
+                                        capacity) != 0) {
+        goto done;
+    }
+    /* 2. two tokens into one token of headroom: refused, and nothing accepted. */
+    if (mynah_engine_pocket_append_text(ctx, ids + accepted, 2u, scratch_error,
+                                        sizeof(scratch_error)) == 0) {
+        pocket_error(error, capacity,
+                     "long-form refusals: append_text passed the ceiling of %zu",
+                     mynah_engine_pocket_text_capacity(ctx));
+        goto done;
+    }
+    if (mynah_engine_pocket_text_length(ctx) != accepted) {
+        pocket_error(error, capacity,
+                     "long-form refusals: the refused append left %zu tokens, not "
+                     "%zu -- it was not a clean refusal",
+                     mynah_engine_pocket_text_length(ctx), accepted);
+        goto done;
+    }
+    if (mynah_engine_pocket_seal_text(ctx, error, capacity) != 0) goto done;
+    /* 3. one step, then an append that must be refused for good, then finish. */
+    {
+        mynah_engine_ctx *one[1] = {ctx};
+        mynah_engine_step_result result[1];
+        mynah_engine_ctx *const *ctxs = one;
+        if (pocket_step_batch(ctxs, 1u, NULL, error, capacity) != 0 ||
+            pocket_emit_batch(ctxs, 1u, result, NULL, error, capacity) != 0) {
+            goto done;
+        }
+        /* This one FITS the ceiling, so the ceiling cannot be what refuses it.
+         * The REASON is asserted, not just the refusal: a sealed context is
+         * also refused by the `text_open` check, so a test that accepted any
+         * non-zero return would stay green with the step rule deleted --
+         * measured, and it is why the message is matched. */
+        scratch_error[0] = '\0';
+        if (mynah_engine_pocket_append_text(ctx, ids, 1u, scratch_error,
+                                            sizeof(scratch_error)) == 0) {
+            pocket_error(error, capacity,
+                         "long-form refusals: append_text succeeded on a context "
+                         "that had already generated");
+            goto done;
+        }
+        if (strstr(scratch_error, "already generated") == NULL) {
+            pocket_error(error, capacity,
+                         "long-form refusals: the post-step append was refused for "
+                         "the wrong reason (%s)", scratch_error);
+            goto done;
+        }
+    }
+    if (pocket_lf_run(ctx, NULL, error, capacity) != 0) goto done;
+    if (pocket_decode_audio(ctx, 0u, ctx->frames, &got, &got_n, error,
+                            capacity) != 0) {
+        goto done;
+    }
+    if (pocket_lf_same("three refusals, then the accepted text", ref, ref_n, got,
+                       got_n, error, capacity) != 0) {
+        goto done;
+    }
+    rc = 0;
+done:
+    pocket_ctx_free(ctx);
+    free(ref);
+    free(got);
+    free(ids);
+    return rc;
+}
+
+static int pocket_lf_compare(mynah_engine_state *state,
+                             const mynah_tts_model *model, const char *profile,
+                             const int *ids, size_t n_ids, const int *other_ids,
+                             size_t n_other, mynah_engine_scratch *scratch,
+                             char *error, size_t capacity);
+
+/*
+ * THE PROFILE MATTERS, and finding out that it does is the reason this runs
+ * twice.  Deleting the tile alignment from `pocket_text_flush` -- the naive
+ * implementation, where every push prefills everything it has -- leaves this
+ * check GREEN under the shipped default and under `MYNAH_QUANT=int8`, and fails
+ * it at one ULP on sample 0 under `MYNAH_QUANT_GROUPS=none`.  That is not luck:
+ * a quantized group goes through a kernel that is bit-exact per row whatever
+ * the row count, while an UNQUANTIZED group's tile is a GEMM whose blocking is
+ * a function of the row count.  So the f32 tile path is the only place the
+ * split point can reach the arithmetic, and a version of this check that ran
+ * only the configured profile would have been one of the gates that pass while
+ * testing nothing.
+ *
+ * The masks are therefore forced off for a second pass and restored.  It is a
+ * reach into the state, and the alternative -- asking the operator to run the
+ * command three times under three environments -- leaves a CI that runs it once
+ * blind to the only failure mode there is.
+ */
+static int pocket_check_long_form(mynah_engine_state *state,
+                                  const mynah_tts_model *model,
+                                  mynah_engine_scratch *scratch, char *error,
+                                  size_t capacity) {
+    static const char text[] =
+        "The quick brown fox jumps over the lazy dog while a patient cat watches "
+        "from the warm windowsill and counts the passing cars on the quiet road "
+        "below, until the evening light finally fades behind the distant hills "
+        "and somebody switches on a small lamp inside the kitchen.";
+    static const char other[] =
+        "Bit identity is not a tolerance, and a gate that cannot fail is not a gate.";
+    int *ids = NULL, *other_ids = NULL;
+    size_t n_ids = 0, n_other = 0;
+    if (mynah_engine_pocket_tokenize(state, text, strlen(text), &ids, &n_ids, error,
+                                     capacity) != 0) {
+        return -1;
+    }
+    if (mynah_engine_pocket_tokenize(state, other, strlen(other), &other_ids,
+                                     &n_other, error, capacity) != 0) {
+        free(ids);
+        return -1;
+    }
+    int rc;
+    {
+        /* As configured, then with every quantization group forced off. */
+        const unsigned qgroups = state->qgroups;
+        const unsigned bb = state->backbone_hook.groups;
+        const unsigned ct = state->codec_hook.groups;
+        const unsigned fl = state->flow_hook.groups;
+        rc = pocket_check_lf_refusals(state, model, error, capacity);
+        if (rc == 0) {
+            rc = pocket_lf_compare(state, model, "as configured", ids, n_ids,
+                                   other_ids, n_other, scratch, error, capacity);
+        }
+        if (rc == 0 && (qgroups | bb | ct | fl) != 0u) {
+            state->qgroups = 0u;
+            state->backbone_hook.groups = 0u;
+            state->codec_hook.groups = 0u;
+            state->flow_hook.groups = 0u;
+            rc = pocket_lf_compare(state, model, "quantization forced off", ids,
+                                   n_ids, other_ids, n_other, scratch, error,
+                                   capacity);
+            state->qgroups = qgroups;
+            state->backbone_hook.groups = bb;
+            state->codec_hook.groups = ct;
+            state->flow_hook.groups = fl;
+        }
+    }
+    free(ids);
+    free(other_ids);
+    return rc;
+}
+
+static int pocket_lf_compare(mynah_engine_state *state,
+                             const mynah_tts_model *model, const char *profile,
+                             const int *ids, size_t n_ids, const int *other_ids,
+                             size_t n_other, mynah_engine_scratch *scratch,
+                             char *error, size_t capacity) {
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    const size_t max_steps = 20u;
+    int rc = -1;
+    float *base = NULL, *got = NULL, *control = NULL;
+    size_t base_n = 0, got_n = 0, control_n = 0, base_frames = 0, frames = 0;
+
+    if (n_ids < 3u * tile) {
+        pocket_error(error, capacity,
+                     "long-form (%s): the text is only %zu tokens against a "
+                     "tile of %zu; the split patterns would prove nothing",
+                     profile, n_ids, tile);
+        goto done;
+    }
+    /* The reference: one text, one push, no ceiling -- exactly what a request
+     * that never heard of E5-5 does. */
+    if (pocket_lf_synth(state, model, ids, n_ids, NULL, 0u, max_steps, scratch,
+                        &base, &base_n, &base_frames, error, capacity) != 0) {
+        goto done;
+    }
+    if (base_n == 0u) {
+        pocket_error(error, capacity,
+                     "long-form (%s): the reference produced no audio", profile);
+        goto done;
+    }
+    /* Control 1: capacity is numerically inert.  Without this the comparisons
+     * below could all be green and all be wrong together. */
+    if (pocket_lf_synth(state, model, ids, n_ids, NULL, 4u * n_ids, max_steps,
+                        scratch, &control, &control_n, &frames, error,
+                        capacity) != 0) {
+        goto done;
+    }
+    char control_what[160];
+    snprintf(control_what, sizeof(control_what),
+             "%s, a ceiling four times the text, still one push", profile);
+    if (pocket_lf_same(control_what, base, base_n, control, control_n, error,
+                       capacity) != 0) {
+        goto done;
+    }
+    free(control);
+    control = NULL;
+    /* Control 2: a different text differs, so the comparison is not comparing
+     * two identical nothings. */
+    if (pocket_lf_synth(state, model, other_ids, n_other, NULL, 0u, max_steps,
+                        scratch, &control, &control_n, &frames, error,
+                        capacity) != 0) {
+        goto done;
+    }
+    if (control_n == base_n &&
+        memcmp(control, base, base_n * sizeof(float)) == 0) {
+        pocket_error(error, capacity,
+                     "long-form (%s): a different text produced identical "
+                     "audio; the comparison proves nothing", profile);
+        goto done;
+    }
+    free(control);
+    control = NULL;
+
+    const pocket_split_pattern patterns[] = {
+        {"one token at a time", 1u, 0u},
+        {"a first piece under one tile, then tile-sized", 3u, tile},
+        {"tile-aligned throughout", tile, tile},
+        {"coprime with the tile", 7u, 5u},
+        {"one long piece, then a short tail", n_ids - 2u, 1u},
+        {"everything at admission, sealed with no append", n_ids, n_ids},
+    };
+    for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); ++p) {
+        if (pocket_lf_synth(state, model, ids, n_ids, &patterns[p], n_ids,
+                            max_steps, scratch, &got, &got_n, &frames, error,
+                            capacity) != 0) {
+            goto done;
+        }
+        if (frames != base_frames) {
+            pocket_error(error, capacity,
+                         "long-form (%s, %s): %zu frames against %zu", profile,
+                         patterns[p].name, frames, base_frames);
+            goto done;
+        }
+        char what[160];
+        snprintf(what, sizeof(what), "%s, %s", profile, patterns[p].name);
+        if (pocket_lf_same(what, base, base_n, got, got_n, error, capacity) != 0) {
+            goto done;
+        }
+        free(got);
+        got = NULL;
+    }
+    rc = 0;
+done:
+    free(base);
+    free(got);
+    free(control);
+    return rc;
+}
+
 int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
                                    size_t capacity) {
     if (model == NULL) {
@@ -4756,6 +5604,7 @@ int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
 
     int rc = -1;
     if (pocket_check_chunk_seam(state, model, error, capacity) != 0) goto done;
+    if (pocket_check_long_form(state, model, NULL, error, capacity) != 0) goto done;
     static const size_t widths[4] = {2u, 4u, 8u, 16u};
     for (size_t w = 0; w < 4u; ++w) {
         size_t count = widths[w];

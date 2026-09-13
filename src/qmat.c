@@ -1344,6 +1344,15 @@ typedef struct {
 struct mynah_qmat_cache {
     int qtype; /* QMAT_F32 (off) / QMAT_INT8 / QMAT_INT4 / QMAT_F16 */
     int use_row4;
+    /* Batched calls that actually reached the weight-stationary kernel, as
+     * opposed to falling back to one `_resolved_qt` per row.  It exists because
+     * that difference is invisible from the outside -- the fallback produces
+     * the same bytes AND leaves the same cache entry behind -- so without a
+     * counter, a self-test asserting "the batched path ran" would be asserting
+     * nothing.  E8-5's whole claim is that a group with its own encoding now
+     * reaches this path, and this is what makes that claim falsifiable.
+     * Written only under `mutex`, which the same call already holds. */
+    size_t batched_calls;
     qmat_entry **entries;
     size_t count;
     size_t capacity;
@@ -1948,34 +1957,74 @@ int mynah_qmat_linear_resolved(mynah_qmat_cache *cache,
                                          error_capacity);
 }
 
-int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *backend,
-                              const char *name, const float *weight_data,
-                              const float *const *in_rows, float *const *out_rows,
-                              size_t batch, size_t k, size_t n, const float *bias,
-                              int8_t *qx_scratch, float *sx_scratch,
-                              char *error, size_t error_capacity) {
+/*
+ * The batched linear with the encoding named per tensor instead of per cache --
+ * the weight-stationary twin of `mynah_qmat_linear_resolved_qt`, and the same
+ * relationship to `mynah_qmat_linear_batched` that that function has to
+ * `mynah_qmat_linear_resolved`.
+ *
+ * WHY IT HAD TO EXIST (E8-5).  `mynah_qmat_linear_batched` takes no qtype: it
+ * gates on `cache->qtype` and, when it is the first caller to touch a tensor,
+ * creates the cache entry in the CACHE's encoding.  For a group carrying an
+ * explicit encoding that differs, that is a first-touch race deciding the
+ * group's precision -- so `engine_pocket.c` kept such a group off the batched
+ * path entirely rather than allow it.  The consequence was concrete: under
+ * `MYNAH_QUANT=int8` the PocketTTS backbone and flow head, which carry `:f16`
+ * in the shipped group spec, fell off the weight-stationary path and read the
+ * weight once per row.
+ *
+ * The property that made the refusal necessary is KEPT, not traded away.
+ * `want` is resolved from the group spec before anything touches the cache, and
+ * it is what both the gate and `cache_insert` use, so precision is decided by
+ * the spec and never by whichever caller arrived first.  A tensor name belongs
+ * to exactly one group, so an entry's encoding still never changes under it.
+ *
+ * `qtype`: 0 f32 (exact, no cache entry), 1 int8, 2 int4, 3 f16, or -1 for
+ * "whatever the cache resolved to", which is what `mynah_qmat_linear_batched`
+ * passes -- so every existing caller keeps its exact behaviour.
+ *
+ * The lookup deliberately uses the entry it FINDS rather than insisting it
+ * match `want`: `_resolved_qt` does the same, and row b must come out bit
+ * identical to row b computed alone.  Agreeing with the unbatched path matters
+ * more than being right about a disagreement that the one-name-one-group
+ * invariant already rules out.
+ */
+int mynah_qmat_linear_batched_qt(mynah_qmat_cache *cache,
+                                 const mynah_backend *backend, const char *name,
+                                 const float *weight_data,
+                                 const float *const *in_rows,
+                                 float *const *out_rows, size_t batch, size_t k,
+                                 size_t n, const float *bias, int8_t *qx_scratch,
+                                 float *sx_scratch, int qtype, char *error,
+                                 size_t error_capacity) {
     if (batch == 0u) return 0;
     if (batch == 1u) {
-        return mynah_qmat_linear_resolved(cache, backend, name, weight_data,
-                                          in_rows[0], out_rows[0], 1u, k, n, bias,
-                                          error, error_capacity);
+        return mynah_qmat_linear_resolved_qt(cache, backend, name, weight_data,
+                                             in_rows[0], out_rows[0], 1u, k, n,
+                                             bias, qtype, error, error_capacity);
     }
-    const int use_q = cache != NULL && cache->qtype != QMAT_F32 && k <= QMAT_K_MAX &&
+    /* Resolved BEFORE the cache is touched, and used for both the gate and the
+     * insert: that pair is the whole of E8-5. */
+    const int want = (qtype < 0) ? (cache == NULL ? QMAT_F32 : cache->qtype)
+                                 : qmat_qtype_available(qtype);
+    const int use_q = cache != NULL && want != QMAT_F32 && k <= QMAT_K_MAX &&
                       cache->use_row4 && qx_scratch != NULL && sx_scratch != NULL;
     const qmat_entry *e = NULL;
     if (use_q) {
         pthread_mutex_lock(&cache->mutex);
         e = cache_lookup(cache, name);
-        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k, cache->qtype);
+        if (e == NULL) e = cache_insert(cache, name, weight_data, n, k, want);
+        if (e != NULL) ++cache->batched_calls;
         pthread_mutex_unlock(&cache->mutex);
     }
     if (e == NULL) {
         /* No bit-exact batching available here: keep every row on the exact
-         * path it would have taken alone. */
+         * path it would have taken alone, in the encoding its group asked for. */
         for (size_t b = 0; b < batch; ++b) {
-            if (mynah_qmat_linear_resolved(cache, backend, name, weight_data,
-                                           in_rows[b], out_rows[b], 1u, k, n, bias,
-                                           error, error_capacity) != 0) {
+            if (mynah_qmat_linear_resolved_qt(cache, backend, name, weight_data,
+                                              in_rows[b], out_rows[b], 1u, k, n,
+                                              bias, qtype, error,
+                                              error_capacity) != 0) {
                 return -1;
             }
         }
@@ -2019,6 +2068,17 @@ int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *back
         qmat_batch_rows(&job, row0, count);
     }
     return 0;
+}
+
+int mynah_qmat_linear_batched(mynah_qmat_cache *cache, const mynah_backend *backend,
+                              const char *name, const float *weight_data,
+                              const float *const *in_rows, float *const *out_rows,
+                              size_t batch, size_t k, size_t n, const float *bias,
+                              int8_t *qx_scratch, float *sx_scratch,
+                              char *error, size_t error_capacity) {
+    return mynah_qmat_linear_batched_qt(cache, backend, name, weight_data, in_rows,
+                                        out_rows, batch, k, n, bias, qx_scratch,
+                                        sx_scratch, -1, error, error_capacity);
 }
 
 int mynah_qmat_linear(mynah_qmat_cache *cache, const mynah_weights *file,
@@ -2373,6 +2433,185 @@ static int self_test_batched(int qtype, char *error, size_t error_capacity) {
                              "%.9g vs %.9g", qtype, b, i,
                              (double)ref[at], (double)got[at]);
                 goto done;
+            }
+        }
+    }
+    status = 0;
+done:
+    free(w); free(x); free(bias); free(ref); free(got); free(qx); free(sx);
+    mynah_qmat_cache_free(cache);
+    return status;
+}
+
+/*
+ * E8-5.  The same contract for a group that names its OWN encoding, plus the
+ * one hazard that kept such a group off the batched path until now.
+ *
+ * The experiment is built so that the batched call is the FIRST toucher of its
+ * tensor: `batched.qt.ref` is quantized by the per-row reference,
+ * `batched.qt.first` by the batched call alone.  If the batched path created
+ * its entry in the CACHE's encoding rather than the GROUP's -- which is exactly
+ * what `mynah_qmat_linear_batched` did, and why a group with an explicit
+ * encoding had to be refused the batched path -- the two tensors come out in
+ * different encodings and this fires.
+ *
+ * TWO ASSERTIONS, AND THE SECOND ONE IS THE LOAD-BEARING ONE.  Comparing the
+ * two outputs alone would pass VACUOUSLY: when `_batched_qt` declines the
+ * weight-stationary path it falls back to `_resolved_qt` per row, which is
+ * literally the reference, so a byte compare cannot distinguish "batched and
+ * correct" from "batched never ran".  So the entry the batched call left in the
+ * cache is inspected directly -- it must exist and it must carry `want` -- and
+ * that is both the anti-vacuity check and the direct statement of the property.
+ * It is skipped only under the two conditions that legitimately disable the
+ * path (`MYNAH_QMAT_SINGLE_ROW`, or k over QMAT_K_MAX), which this shape is
+ * chosen to stay inside.
+ *
+ * Both cache profiles the runtime ships are covered: f16, which
+ * `mynah_tts.c` selects for a non-Magpie pack when MYNAH_QUANT is unset, and
+ * int8, which is the case E8-5 exists for -- there the shipped `:f16` groups
+ * differ from the cache and are exactly what used to be refused.  f32 is run
+ * too, because a cache that is off is the case where the two encodings differ
+ * most.
+ */
+static int self_test_batched_qt(int cache_qtype, int group_qtype, char *error,
+                                size_t error_capacity) {
+    enum { N = 96, K = 256, B = 5 };
+    int status = -1;
+    const int want = qmat_qtype_available(group_qtype);
+    if (want != group_qtype) return 0; /* this build cannot honour it */
+    mynah_qmat_cache *cache = mynah_qmat_cache_new(cache_qtype);
+    if (cache == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat batched-qt self-test out of memory");
+        return -1;
+    }
+    if (cache->qtype != cache_qtype) {
+        /* Unsupported on this target (no half converts): nothing to check. */
+        mynah_qmat_cache_free(cache);
+        return 0;
+    }
+    float *w = (float *)malloc((size_t)N * K * sizeof(float));
+    float *x = (float *)malloc((size_t)B * K * sizeof(float));
+    float *bias = (float *)malloc((size_t)N * sizeof(float));
+    float *ref = (float *)malloc((size_t)B * N * sizeof(float));
+    float *got = (float *)malloc((size_t)B * N * sizeof(float));
+    int8_t *qx = (int8_t *)malloc((size_t)B * K);
+    float *sx = (float *)malloc((size_t)B * sizeof(float));
+    if (w == NULL || x == NULL || bias == NULL || ref == NULL || got == NULL ||
+        qx == NULL || sx == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat batched-qt self-test out of memory");
+        goto done;
+    }
+    for (size_t i = 0; i < (size_t)N * K; ++i)
+        w[i] = sinf(0.013f * (float)i) * (0.5f + 0.5f * cosf(0.0007f * (float)i));
+    for (size_t i = 0; i < (size_t)B * K; ++i) x[i] = cosf(0.023f * (float)i) + 0.125f;
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = 0.5f - (float)i * 0.0078125f;
+
+    const float *in_rows[B];
+    float *out_rows[B];
+    for (size_t b = 0; b < (size_t)B; ++b) {
+        in_rows[b] = x + b * K;
+        out_rows[b] = got + b * N;
+    }
+    for (size_t b = 0; b < (size_t)B; ++b) {
+        if (mynah_qmat_linear_resolved_qt(cache, NULL, "batched.qt.ref", w,
+                                          x + b * K, ref + b * N, 1u, K, N, bias,
+                                          group_qtype, error, error_capacity) != 0) {
+            goto done;
+        }
+    }
+    /*
+     * THREE SHAPES, because `_batched_qt` has three exits and only one of them
+     * is the weight-stationary kernel.  A test that exercised the wide call
+     * alone would pass while the qtype was dropped from either of the other
+     * two -- both measured: mutating the batch==1 delegate or the fallback loop
+     * to pass -1 leaves a B-row-only test green.
+     *
+     *   wide      B rows with scratch  -> the weight-stationary kernel
+     *   fallback  B rows, scratch NULL -> one `_resolved_qt` per row
+     *   single    1 row                -> the batch==1 delegate
+     *
+     * Each gets its own tensor name so that in every one of them the call under
+     * test is the tensor's FIRST toucher, which is the condition the whole item
+     * is about.
+     */
+    static const struct {
+        const char *name;
+        size_t rows;
+        int stationary;
+    } shapes[3] = {
+        {"batched.qt.wide", (size_t)B, 1},
+        {"batched.qt.fallback", (size_t)B, 0},
+        {"batched.qt.single", 1u, 0},
+    };
+    for (size_t sh = 0; sh < 3u; ++sh) {
+        pthread_mutex_lock(&cache->mutex);
+        const size_t before = cache->batched_calls;
+        pthread_mutex_unlock(&cache->mutex);
+        memset(got, 0, (size_t)B * N * sizeof(float));
+        if (mynah_qmat_linear_batched_qt(cache, NULL, shapes[sh].name, w, in_rows,
+                                         out_rows, shapes[sh].rows, K, N, bias,
+                                         shapes[sh].stationary ? qx : NULL,
+                                         shapes[sh].stationary ? sx : NULL,
+                                         group_qtype, error, error_capacity) != 0) {
+            goto done;
+        }
+        /* Anti-vacuity, and the property itself.  The byte compare below cannot
+         * tell "batched and correct" from "batched never ran" -- the fallback
+         * produces identical bytes AND leaves an identically-encoded entry --
+         * so which path ran is asserted directly, in both directions. */
+        pthread_mutex_lock(&cache->mutex);
+        const qmat_entry *made = cache_lookup(cache, shapes[sh].name);
+        const int made_qtype = (made == NULL) ? -1 : made->qtype;
+        const size_t engaged = cache->batched_calls - before;
+        pthread_mutex_unlock(&cache->mutex);
+        const int reachable = cache->use_row4 && (size_t)K <= (size_t)QMAT_K_MAX;
+        if (reachable && shapes[sh].stationary && engaged == 0u) {
+            if (error != NULL && error_capacity > 0)
+                snprintf(error, error_capacity,
+                         "qmat batched_qt cache=%s group=%s (%s): the "
+                         "weight-stationary path never ran -- the group was "
+                         "refused the batched path and every row read the weight "
+                         "on its own, which is the regression E8-5 removed",
+                         mynah_qmat_qtype_name(cache_qtype),
+                         mynah_qmat_qtype_name(want), shapes[sh].name);
+            goto done;
+        }
+        if (!shapes[sh].stationary && engaged != 0u) {
+            if (error != NULL && error_capacity > 0)
+                snprintf(error, error_capacity,
+                         "qmat batched_qt cache=%s group=%s (%s): took the "
+                         "weight-stationary path with no scratch to do it with",
+                         mynah_qmat_qtype_name(cache_qtype),
+                         mynah_qmat_qtype_name(want), shapes[sh].name);
+            goto done;
+        }
+        if (made_qtype != want) {
+            if (error != NULL && error_capacity > 0)
+                snprintf(error, error_capacity,
+                         "qmat batched_qt cache=%s group=%s (%s): the call left "
+                         "the tensor in encoding %s, not the group's -- precision "
+                         "was decided by the cache, not by the spec",
+                         mynah_qmat_qtype_name(cache_qtype),
+                         mynah_qmat_qtype_name(want), shapes[sh].name,
+                         made == NULL ? "none" : mynah_qmat_qtype_name(made_qtype));
+            goto done;
+        }
+        for (size_t b = 0; b < shapes[sh].rows; ++b) {
+            for (size_t i = 0; i < (size_t)N; ++i) {
+                const size_t at = b * N + i;
+                if (memcmp(&ref[at], &got[at], sizeof(float)) != 0) {
+                    if (error != NULL && error_capacity > 0)
+                        snprintf(error, error_capacity,
+                                 "qmat batched_qt cache=%s group=%s (%s) differs at "
+                                 "row %zu col %zu: %.9g vs %.9g -- a row's answer "
+                                 "changed because of how it was called",
+                                 mynah_qmat_qtype_name(cache_qtype),
+                                 mynah_qmat_qtype_name(want), shapes[sh].name, b, i,
+                                 (double)ref[at], (double)got[at]);
+                    goto done;
+                }
             }
         }
     }
@@ -2778,6 +3017,21 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_rows_blocked(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT4, error, error_capacity) != 0) return -1;
+    /* E8-5: a group that names its own encoding, with the batched call as the
+     * tensor's first toucher.  Every cache profile the runtime ships crossed
+     * with every encoding a group spec can name. */
+    {
+        static const int caches[3] = {QMAT_F32, QMAT_INT8, QMAT_F16};
+        static const int groups[3] = {QMAT_INT8, QMAT_INT4, QMAT_F16};
+        for (size_t c = 0; c < 3u; ++c) {
+            for (size_t g = 0; g < 3u; ++g) {
+                if (self_test_batched_qt(caches[c], groups[g], error,
+                                         error_capacity) != 0) {
+                    return -1;
+                }
+            }
+        }
+    }
     if (self_test_batch_membership(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_batch_membership(QMAT_INT4, error, error_capacity) != 0) return -1;
 #if defined(MYNAH_QMAT_F16)

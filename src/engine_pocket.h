@@ -152,6 +152,67 @@ int mynah_engine_pocket_tokenize(const mynah_engine_state *state,
                                  int **out_ids, size_t *out_count, char *error,
                                  size_t error_capacity);
 
+/* ------------------------------------------------------- long-form text
+ *
+ * E5-5.  Text may be prefilled as it arrives instead of after it has all
+ * arrived, so a request's prefill overlaps the stream that is producing its
+ * text.  The gate is absolute: a text pushed in N pieces produces audio that is
+ * BYTE-IDENTICAL to the same text pushed in one, for every split point,
+ * including one token at a time.
+ *
+ * THE ORDER IS THE CONTRACT:
+ *
+ *     ctx_new(first piece)        the request is admitted
+ *     reserve_text(ceiling)       BEFORE prepare; this is the only allocation
+ *     prepare()
+ *     append_text(piece) * N      allocation-free; refuses past the ceiling
+ *     seal_text()
+ *     step_batch() ...            refused while the text is still open
+ *
+ * `reserve_text` is where the memory is decided, and it is deliberately the
+ * only place: after `prepare` nothing grows, so an append cannot fail for want
+ * of memory on a request that is already under way.  The refusal it can produce
+ * instead -- "past the ceiling" -- leaves the context untouched, so the caller
+ * may seal and synthesize what it has.  `src/engine_pocket.c` carries the three
+ * options that were weighed and why this one won.
+ *
+ * `append_text` is refused once the context has stepped, and that refusal is
+ * permanent rather than pending work.  A context that has generated k frames
+ * has them in the KV between the old text and the new; the one-shot run has all
+ * the text before all the audio; the two are different sequences and the first
+ * k frames have already been sent.  Mid-generation append is therefore not
+ * byte-identical to anything, and the gate above is the reason it is refused
+ * rather than approximated.
+ *
+ * WHAT THIS STILL NEEDS FROM THE SEAM (owned elsewhere, `src/tts_engine.h`):
+ *
+ *   1. `unsigned text_capacity` in `mynah_tts_request` -- the ceiling is a
+ *      per-request number and the KV is ~48 KB per position per request for
+ *      this pack, so a process-wide default is either wasteful or too small.
+ *      `ctx_new` would apply it exactly where it now applies `text_length`.
+ *   2. Three appended vtable entries, all optional and NULL for Magpie:
+ *          int (*reserve_text)(ctx, size_t total, char *, size_t);
+ *          int (*append_text)(ctx, const int *ids, size_t n, char *, size_t);
+ *          int (*seal_text)(ctx, char *, size_t);
+ *      Magpie cannot implement them: `magpie_prepare` fixes the cross-attention
+ *      memory length at `decoder_cache_init`, so extending its text means
+ *      recomputing every layer's cross K/V.  NULL is the right answer there and
+ *      the driver falls back to the one-shot path, exactly as it does for
+ *      `decode_audio_batch`.
+ *
+ * Until those land these are reachable only by a caller that holds the pocket
+ * engine directly, which is what `--pocket-self-check` does. */
+int mynah_engine_pocket_reserve_text(mynah_engine_ctx *ctx, size_t total_tokens,
+                                     char *error, size_t error_capacity);
+int mynah_engine_pocket_append_text(mynah_engine_ctx *ctx, const int *text_ids,
+                                    size_t count, char *error,
+                                    size_t error_capacity);
+int mynah_engine_pocket_seal_text(mynah_engine_ctx *ctx, char *error,
+                                  size_t error_capacity);
+/* Tokens accepted so far, and the ceiling they are accepted against. */
+size_t mynah_engine_pocket_text_length(const mynah_engine_ctx *ctx);
+size_t mynah_engine_pocket_text_capacity(const mynah_engine_ctx *ctx);
+
 /* ------------------------------------------------------------------- EOS */
 
 /*
@@ -195,7 +256,7 @@ const float *mynah_engine_pocket_latent(const mynah_engine_ctx *ctx,
 /* ------------------------------------------------------ batching self-check */
 
 /*
- * The three seam properties that only real weights can test.
+ * The four properties that only real weights can test.
  *
  *  - `step_batch` is ATOMIC over the batch (E8-6): a refused call leaves every
  *    context exactly where it was, which is what makes the driver's
@@ -215,6 +276,20 @@ const float *mynah_engine_pocket_latent(const mynah_engine_ctx *ctx,
  *    `prepare` is the voice prefix plus every token.  It pins the ABSENCE of
  *    chunking, so that adding it here stops being something that can happen by
  *    accident.
+ *  - the long-form text window is BYTE-IDENTICAL however it is split (E5-5):
+ *    the same text pushed one token at a time, in tile-sized pieces, in pieces
+ *    coprime with the tile, or in one go, produces the same samples -- with a
+ *    ceiling four times the text as a control, because KV capacity must be
+ *    numerically inert, and a different text as a control, because a byte
+ *    comparison between two runs of the same code is the easiest gate in the
+ *    world to write blind.  It runs twice, as configured and with every
+ *    quantization group forced off, because the unquantized tile is the only
+ *    path whose arithmetic can see where the text was split -- measured: with
+ *    the tile alignment deleted the check is GREEN under the shipped default
+ *    and under int8, and fails at one ULP with quantization off.  The refusals
+ *    are gated with it: an append past the ceiling, an append after the first
+ *    step and a step on a context whose text is still open must each refuse and
+ *    leave the request able to synthesize exactly what it accepted.
  *
  * All three were, until now, tested only against the synthetic engine in
  * `tests/test_driver.c` -- whose step cannot fail inside a real graph and whose
@@ -223,11 +298,16 @@ const float *mynah_engine_pocket_latent(const mynah_engine_ctx *ctx,
  * pass an opened model and it does the rest.  Runs at widths 2, 4, 8 and 16,
  * and is wired up as `mynah-tts --pocket-self-check MODEL_DIR`.
  *
- * Every bit-identity assertion below has only ever been taken on macOS with
- * clang.  It is NOT known to hold on the Linux ARM production target, where
- * `qmat`'s own batched-vs-single gate currently fails by about one ULP under
- * gcc with `-ffast-math`; until that is understood, a green run here is a
- * statement about this host and this compiler.
+ * This caveat used to read "every bit-identity assertion below has only ever
+ * been taken on macOS with clang", with `qmat`'s own batched-vs-single gate
+ * failing by about one ULP on Linux ARM under gcc.  That gate now passes there:
+ * the cause was the strict-aliasing miscompile in the f16 weight packing that
+ * `d95773e` fixed, which macOS could not see.  Everything above has since been
+ * run on the production target -- GCP Neoverse aarch64, Ubuntu, gcc 15.2, both
+ * `SIMD=auto` (`-march=native`) and `SIMD=portable` -- and passes on both.
+ *
+ * It is still a statement about the hosts it was run on.  No x86-64 run has
+ * been taken, and `-ffast-math` is in the default CFLAGS on every one of them.
  *
  * Returns 0, or -1 with a message in `error`.
  */
