@@ -1794,8 +1794,10 @@ static double qmat_weight_rel(const qmat_entry *e, const float *w, size_t n,
                 const int nib = (j % 2u == 0) ? (byte & 0x0fu) : (byte >> 4);
                 got = (double)(nib - 8) *
                       (double)e->scales[i * (k / QMAT_Q4_GROUP) + g];
+#if defined(MYNAH_QMAT_F16)
             } else if (e->qtype == QMAT_F16) {
                 got = (double)qmat_f16_to_f32(e->f16[i * k + j]);
+#endif
             }
             num += (ref - got) * (ref - got);
             den += ref * ref;
