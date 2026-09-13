@@ -473,6 +473,17 @@ does not.
       lane's A/B harness measured the wrong workload on both sides of a pair and
       read it as contention. Pre-existing. Either treat empty as unset or refuse it
       loudly; silently meaning a third thing is what makes it a trap
+- [ ] E9-10 **what gates C80+ is waiting, not work** → `docs/performance.md`
+      (2026-09-13). After all three lanes: C48 0.736 → **0.680**, C64 0.954 → **0.895**,
+      so C64 is inside the mandatory gate and C80 is the first failure. But
+      **safe-to-play p95 at C48 went 908 → 890 ms**: the single-stream wall fell 17%
+      and the served latency fell 2%. TTFB p95 is **489 ms at C48** for a header sent
+      at *admission*, before a sample exists, with 256 slots for 48 arrivals and a warm
+      prefill of ~122 ms. Measure where that time goes before proposing a fix — the
+      obvious "serialised admission" reading was already falsified once (parent counters
+      read `queued_total=0 queue_peak=0 refused=0`, and `src/inference.c:754` is a
+      `while`, not an `if`). The pool meter now reaches prefork workers via its chained
+      SIGTERM handler, so the measurement is available where it was not
 - [x] E9-0 **allocations are constant across `--max-steps`** (3,441 at both 24 and 96
       steps): the autoregressive loop allocates nothing, and that is now a permanent
       check rather than a belief
