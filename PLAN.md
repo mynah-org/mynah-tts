@@ -385,10 +385,17 @@ First cost map on production hardware (`8b27fa1`, GCP Axion, one stream, varying
 core count, `nest_mismatch=0`). Percentages are of one request's wall; the scaling
 column is 1 core to 16.
 
+**Read this table knowing two of its rows were mislabelled.** E9-1 found that
+`MYNAH_RGN_MODEL_LOAD` and `MYNAH_RGN_DECODE_GANG` shared id 44, so every report
+ever printed summed them under one name: `driver.decode_gang` has never appeared
+and `runtime.model_load` was never only a model load. The five level-1 rows below
+do not share ids and stand; anything read off `runtime.model_load` before `50092de`
+does not.
+
 | region | % of wall | 1→16 cores | verdict |
 |---|---|---|---|
-| **`prep.decoder_prefill`** | **28.7%** | **1.5x, flat past 8** | **serial, and it all lands before the first sample** |
-| **`codec.conv_stack`** | **25.6%** | **2.6x** | **resists division** |
+| `prep.decoder_prefill` | 28.7% | 1.5x, flat past 8 | **premise wrong (E9-1): a one-time weight pack, not serial work** |
+| `codec.conv_stack` | 25.6% | 2.6x | **fixed (E9-2): 6.02x, and the cause was glue, not the kernels** |
 | `codec.transformer` | 22.9% | 4.3x | fine |
 | `step.backbone` | 16.8% | 4.6x | fine |
 | `flow.head` | 5.6% | — | small |
@@ -404,12 +411,20 @@ column is 1 core to 16.
       before accepting, so no client request ever paid it, and it cannot be why
       safe-to-play is 908 ms at C48. What is left is ~122 ms of per-request prefill
       at `16x2`, linear in text tokens, already parallel and starved of threads
-- [ ] E9-2 **the codec conv stack does not divide** — 2.6x against the transformer's
-      4.3x, and at sixteen cores it still spends 211 ms where the transformer spends
-      140. It is a quarter of the wall and the part of the vocoder that resists the
-      pool. Ask whether the limit is the dependency chain, the panel shape, or the
-      dispatch count per call, and answer it with the census rather than by reading
-      the loop
+- [x] E9-2 **the conv stack's limit was glue, not parallelism** →
+      [`.work/seanet-conv-scaling.md`](.work/seanet-conv-scaling.md). Split by *who
+      runs the loop*: at sixteen threads **66% of the region never reached the pool**
+      — `elu` 77.0 ms at 1.00x (scalar `expf`), `conv.gather` 57.8 ms re-gathering
+      weight taps **that never change**, 59 times a request, and `conv.bias` 4.5x
+      *slower* at sixteen threads than at one. Dispatch count was real but second:
+      25 GEMMs/frame at 51 µs mean, and a fit over eleven shapes puts the pool's
+      fixed cost at **26-44 µs on this box**, not the header's 20 — about 52 ms of
+      235. Fixed with fewer, larger regions and no new arithmetic (`conv_taps` fuses
+      K dispatches into one; ELU on the pool; `want == 1` stops dispatching a
+      matvec). **241.6 → 103.7 ms at 16 cores, scaling 2.59x → 6.02x, −18% of total
+      wall**, byte-identical on both SIMD profiles. Left open: the last 23% is calls
+      of 14-42 µs, *below* the measured dispatch cost, so folding them further is a
+      rounding change that needs its own qualification
 - [ ] E9-3 **topology is a first-class serving parameter and the reference's rule does
       not transfer.** Measured at C48 on 32 cores: `16x2` 0.736 · `8x4` 0.931 ·
       `4x8` at C30 already 0.922 · `2x16` 1.574 with 100% stall · `1x32` 48 of 90
