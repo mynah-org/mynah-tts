@@ -1248,11 +1248,15 @@ int mynah_transformer_ar_self_test(char *error, size_t error_capacity) {
             free(store);
             TAR_FAIL("prefill failed at context %zu", contexts[c]);
         }
-        if (mynah_transformer_ar_state_offset(state) != TAR_T) {
+        /* Read the offset BEFORE the free: the message is the whole point of
+         * this branch, and formatting it out of a freed state is a use-after-
+         * free that gcc 15 sees and that would print whatever the allocator
+         * left behind -- garbage in exactly the report someone is relying on. */
+        const size_t got_offset = mynah_transformer_ar_state_offset(state);
+        if (got_offset != TAR_T) {
             mynah_transformer_ar_state_free(state);
             free(store);
-            TAR_FAIL("prefill left offset %zu, want %u",
-                     mynah_transformer_ar_state_offset(state), TAR_T);
+            TAR_FAIL("prefill left offset %zu, want %u", got_offset, TAR_T);
         }
         mynah_transformer_ar_state_free(state);
 
@@ -1649,12 +1653,18 @@ int mynah_transformer_ar_self_test(char *error, size_t error_capacity) {
             for (size_t i = 0; i < TAR_D; ++i) {
                 const size_t at = t * TAR_D + i;
                 if (tiled[at] != stepped[at]) {
+                    /* Both pointers alias `wide`, so the two values have to be
+                     * copied out before it is freed.  Reading them afterwards
+                     * is a use-after-free, and it corrupts the one message that
+                     * explains the failure. */
+                    const double a_val = (double)tiled[at];
+                    const double b_val = (double)stepped[at];
+                    const size_t start = tar_window_start(t, TAR_CTX);
                     free(wide);
                     free(store);
                     TAR_FAIL("long windowed prefill [%zu][%zu]: %.9g vs "
                              "stepped %.9g (window start %zu)",
-                             t, i, (double)tiled[at], (double)stepped[at],
-                             tar_window_start(t, TAR_CTX));
+                             t, i, a_val, b_val, start);
                 }
             }
         }
