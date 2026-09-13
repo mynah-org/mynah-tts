@@ -379,6 +379,52 @@ wants a 64-core box. With it, a 32-core box returns to the conversation.
       `MYNAH_QUANT=int8` the backbone and flow head (`:f16` in the default spec) fall
       off the batched path. One function removes the restriction
 
+### E9 — What the profiler found, and where to act next
+
+First cost map on production hardware (`8b27fa1`, GCP Axion, one stream, varying
+core count, `nest_mismatch=0`). Percentages are of one request's wall; the scaling
+column is 1 core to 16.
+
+| region | % of wall | 1→16 cores | verdict |
+|---|---|---|---|
+| **`prep.decoder_prefill`** | **28.7%** | **1.5x, flat past 8** | **serial, and it all lands before the first sample** |
+| **`codec.conv_stack`** | **25.6%** | **2.6x** | **resists division** |
+| `codec.transformer` | 22.9% | 4.3x | fine |
+| `step.backbone` | 16.8% | 4.6x | fine |
+| `flow.head` | 5.6% | — | small |
+
+- [ ] E9-1 **`prep.decoder_prefill` is the TTFA floor** — 361 ms at one core, 241 ms
+      at eight, **241 ms at sixteen**. About 240 ms is irreducibly serial on this
+      machine, it is 28.7% of a request, and every millisecond of it is spent before
+      the caller hears anything. This is why safe-to-play is 908 ms at C48 while
+      prebuffer stays zero: the server does not stall, it starts late. Find out what
+      inside it is serial before proposing a fix — the region is one marker today and
+      needs splitting to be actionable
+- [ ] E9-2 **the codec conv stack does not divide** — 2.6x against the transformer's
+      4.3x, and at sixteen cores it still spends 211 ms where the transformer spends
+      140. It is a quarter of the wall and the part of the vocoder that resists the
+      pool. Ask whether the limit is the dependency chain, the panel shape, or the
+      dispatch count per call, and answer it with the census rather than by reading
+      the loop
+- [ ] E9-3 **topology is a first-class serving parameter and the reference's rule does
+      not transfer.** Measured at C48 on 32 cores: `16x2` 0.736 · `8x4` 0.931 ·
+      `4x8` at C30 already 0.922 · `2x16` 1.574 with 100% stall · `1x32` 48 of 90
+      completed. Narrower workers win because a small model's regions are too short to
+      amortise a wide barrier — a cost that does not shrink with the model, so a 100M
+      engine pays it *more* often per second of audio, not less. **C64 completes
+      192/192 at 0.954 on `16x2`.** Sweep it per host; do not inherit `4x8`
+- [ ] E9-4 **dispatch count per frame** — the mechanism behind E9-3 is unmeasured. The
+      reference collapses a whole step into one dispatch (`tk_region_run`) instead of a
+      barrier per phase; their 32-core review counts ~225 barriers per frame. Count
+      ours before copying theirs
+- [ ] E9-5 **the census and the dispatch report disagree about quantization**: a
+      default run carries f16 on every projection while `quant.requested` reads `off`,
+      because that row describes the cache default and not the per-group spec. Two
+      reports, one truth — fix the row, not the census
+- [x] E9-0 **allocations are constant across `--max-steps`** (3,441 at both 24 and 96
+      steps): the autoregressive loop allocates nothing, and that is now a permanent
+      check rather than a belief
+
 ### E5 — Streaming server v2 → [`.work/streaming-server-v2.md`](.work/streaming-server-v2.md)
 Design reference: [`.work/serving-design.md`](.work/serving-design.md) ·
 doctrine: [`.work/serving-doctrine.md`](.work/serving-doctrine.md)
