@@ -13,25 +13,37 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* vDSP and vForce, used by the snake activation's vectorised path. */
+/* Accelerate is still included on macOS builds for the BNNS im2col
+ * workspace decision below (src/conv1d.c owns the filter cache itself).  The
+ * vDSP/vForce Snake that used to be the reason for this include is gone:
+ * src/kernels.c has the vector sine now, on every target. */
 #if defined(MYNAH_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 #elif defined(MYNAH_USE_OPENBLAS)
 #include <cblas.h>
 #endif
 
-/* MYNAH_SNAKE_SCALAR falls back from the vectorised Snake activation
- * (vDSP_vsmul + vvsinf + vDSP_vsq + vDSP_vsma over whole channel rows) to the
- * per-sample scalar form.  The vector path exists only on Accelerate builds,
- * so elsewhere this is 0 by construction rather than by environment. */
+/* MYNAH_SNAKE_SCALAR falls back from the vectorised Snake activation to the
+ * per-sample scalar reference.
+ *
+ * WHAT CHANGED (PLAN.md E4-16d).  This used to read
+ * `vDSP_vsmul + vvsinf + vDSP_vsq + vDSP_vsma`, staged through a malloc'd
+ * array of sines, and it existed only on Accelerate builds -- so on the
+ * production target the predicate answered 0 and the codec ran a scalar libm
+ * loop.  macOS and Linux computed the Snake with two different sines.  Both
+ * now call mynah_snake_row_f32() from src/kernels.c, which is ours, exists on
+ * NEON and AVX2 and on neither, and needs no scratch array: the per-call
+ * allocation on the codec path is gone with it (coding rule 4).
+ *
+ * So the answer is no longer platform-dependent, and the environment variable
+ * now means what it says on every target rather than on one of them. */
 int mynah_snake_vector_enabled(void) {
-#if defined(MYNAH_USE_ACCELERATE)
     static int cached = -1;
-    if (cached < 0) cached = getenv("MYNAH_SNAKE_SCALAR") == NULL;
+    if (cached < 0) {
+        cached = (getenv("MYNAH_SNAKE_SCALAR") == NULL) &&
+                 (strcmp(mynah_vecmath_isa(), "scalar") != 0);
+    }
     return cached;
-#else
-    return 0;
-#endif
 }
 
 /* Snake activation on the first half of the channels, leaky-ReLU on the rest.
@@ -41,17 +53,17 @@ typedef struct {
     const float *alpha;
     size_t snake_channels;
     size_t length;
+    int vector;
 } snake_ctx;
 
 static void snake_channel(void *ctx, int c) {
     const snake_ctx *s = (const snake_ctx *)ctx;
     float *row = s->signal + (size_t)c * s->length;
     if ((size_t)c < s->snake_channels) {
-        const float a = s->alpha[c];
-        for (size_t t = 0; t < s->length; ++t) {
-            const float value = row[t];
-            const float sn = sinf(a * value);
-            row[t] = value + sn * sn / (a + 1.0e-9f);
+        if (s->vector) {
+            mynah_snake_row_f32(row, s->length, s->alpha[c]);
+        } else {
+            mynah_snake_row_f32_scalar(row, s->length, s->alpha[c]);
         }
     } else {
         for (size_t t = 0; t < s->length; ++t) {
@@ -89,44 +101,11 @@ static int half_snake(const mynah_weights *file, const mynah_backend *backend,
         }
         /* Fall through to CPU path on failure. */
     }
-#if defined(MYNAH_USE_ACCELERATE)
-    if (mynah_snake_vector_enabled() && snake_channels > 0u &&
-        length <= SIZE_MAX / snake_channels) {
-        const size_t count = snake_channels * length;
-        if (count <= (size_t)INT_MAX && count <= SIZE_MAX / sizeof(float)) {
-            float *sines = (float *)malloc(count * sizeof(*sines));
-            if (sines != NULL) {
-                for (size_t c = 0; c < snake_channels; ++c) {
-                    const float a = alpha.data[c];
-                    vDSP_vsmul(signal + c * length, 1, &a, sines + c * length, 1,
-                               (vDSP_Length)length);
-                }
-                const int vector_count = (int)count;
-                vvsinf(sines, sines, &vector_count);
-                vDSP_vsq(sines, 1, sines, 1, (vDSP_Length)count);
-                for (size_t c = 0; c < snake_channels; ++c) {
-                    const float inverse_alpha = 1.0f / (alpha.data[c] + 1.0e-9f);
-                    float *row = signal + c * length;
-                    vDSP_vsma(sines + c * length, 1, &inverse_alpha,
-                              row, 1, row, 1, (vDSP_Length)length);
-                }
-                free(sines);
-                for (size_t c = snake_channels; c < channels; ++c) {
-                    float *row = signal + c * length;
-                    for (size_t t = 0; t < length; ++t) {
-                        if (row[t] < 0.0f) row[t] *= 0.01f;
-                    }
-                }
-                if (profile != NULL) {
-                    profile->snake_seconds += mynah_phase_seconds() - operation_start;
-                    profile->snake_calls++;
-                }
-                return 0;
-            }
-        }
-    }
-#endif
-    snake_ctx ctx = {signal, alpha.data, channels / 2u, length};
+    /* One row per channel, each independent, so this parallelises
+     * bit-identically -- and it is now the ONLY Snake path.  There is no
+     * separate vendor branch to keep in step with it any more. */
+    snake_ctx ctx = {signal, alpha.data, snake_channels, length,
+                     mynah_snake_vector_enabled()};
     mynah_parallel_for((int)channels, snake_channel, &ctx);
     if (profile != NULL) {
         profile->snake_seconds += mynah_phase_seconds() - operation_start;
@@ -600,18 +579,16 @@ int mynah_nanocodec_decode(const mynah_tts_model *model, const unsigned *codes,
 static int probe_snake_vector(const char **why) {
     const int on = mynah_snake_vector_enabled();
     if (why != NULL) {
-#if defined(MYNAH_USE_ACCELERATE)
-        *why = on ? "[predicate] mynah_snake_vector_enabled(): the SEANet "
-                    "Snake activation runs vDSP_vsmul + vvsinf + vDSP_vsq + "
-                    "vDSP_vsma over whole channel rows"
-                  : "[predicate] mynah_snake_vector_enabled(): "
-                    "MYNAH_SNAKE_SCALAR is set, so Snake runs the per-sample "
-                    "scalar form -- the rollback path, not the default";
-#else
-        *why = "[predicate] mynah_snake_vector_enabled(): the vectorised Snake "
-               "needs vDSP/vForce, which this build does not link; the scalar "
-               "form is the only one compiled";
-#endif
+        static char text[300];
+        snprintf(text, sizeof text,
+                 "[predicate] mynah_snake_vector_enabled(): the SEANet Snake "
+                 "runs mynah_snake_row_f32 (%s sin, ours on every target "
+                 "since E4-16d; denormal inputs are %s by this build)%s",
+                 mynah_vecmath_isa(),
+                 mynah_vecmath_denormals_flush() ? "FLUSHED" : "preserved",
+                 on ? "" : "; MYNAH_SNAKE_SCALAR is set or no vector kernel "
+                           "is compiled here, so the scalar reference runs");
+        *why = text;
     }
     return on;
 }

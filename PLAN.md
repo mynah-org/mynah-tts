@@ -177,9 +177,12 @@ Needs E1 and E2.
       quantize, then int4. **f16 is a dead end on the target: it is ARM-only**
 - [ ] E3-5b next 2×: `codec.transformer` is 43% of the wall, running 16 positions as 16 steps
       over the same ~29 MB. A batched GEMM prefill estimates f32 ~0.35 / f16 ~0.17
-- [ ] E3-6 new kernels self-tested model-free: LayerNorm **with bias** (two different
-      epsilons), **variance-based RMSNorm** (`unbiased=True`, *not* `kernels.c:rmsnorm`),
-      GELU-tanh, causal conv, adaLN
+- [x] E3-6 **done** · model-free self tests for the hot kernels, `make kernels-test`
+      (13.4k checks) plus `make kernels-negative-control` (9 deliberate defects, 9
+      caught). The two LayerNorms **are** the same function — agree to 2.9e-07 of the
+      row scale; variance-RMSNorm and mean-square RMSNorm are 167% apart on offset
+      data and each is pinned to its own f64 reference; every kernel run at every
+      length 0..40; causal unfold against the contract → [`.work/accelerate-only-kernels.md`](.work/accelerate-only-kernels.md)
 - [ ] E3-7 offline parity across all 12 oracle stages, both checkpoint generations
 - [ ] E3-8 streaming sample-identical to offline, then batched through the shared driver
 - [ ] E3-9 WAV smoke for all 6 languages with explicit language/voice/seed
@@ -262,11 +265,22 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       the per-GEMM `mynah_blas_set_threads`, the three-way Makefile split, and
       `OPENBLAS_THREAD_TIMEOUT` along with the "`OPENBLAS_NUM_THREADS` must be absent"
       rule in every profile recipe
-- [ ] E4-16d **write the Accelerate-only kernels ourselves, both ISAs** — these are
-      *not* BLAS and not on the Linux path, so they are last: the BNNS conv1d filter
-      cache (8 call sites), `vvtanhf` for GELU (4), and the SEANet Snake's
-      `vvsinf`/`vDSP_vsmul`/`vDSP_vsq`/`vDSP_vsma` (12). Closing these is what lets
-      macOS and Linux run the same code instead of two paths that agree by luck
+- [~] E4-16d **the `vvtanhf` GELU and the vDSP Snake are ours now**, scalar + NEON +
+      AVX2, with the numerical qualification E4-16b asked for. Measured: our tanh
+      **1.35 ulp vs Accelerate's 2.60**, our sin **6.8e-08 vs vvsinf's 1.31e-07** — we
+      were *fixing* macOS, not degrading it. The two platforms were **already
+      producing different audio** at the pinned head (corr 0.9535); they now run one
+      function. Left: the BNNS conv1d filter cache (8 sites, `src/conv1d.c`, another
+      lane) → [`.work/accelerate-only-kernels.md`](.work/accelerate-only-kernels.md)
+- [ ] E4-16e **`mynah_exp_f32`, and the inventory question that missed it.** With the
+      GELU unified, macOS and Linux still part at sample 1660 of the same utterance.
+      Eliminated by measurement: not BLAS (`BLAS=none` identical), not FMA contraction
+      (`-ffp-contract=off` identical), not the pool (`MYNAH_THREADS=1` identical).
+      **It is libm**: Apple's and glibc's `expf` and `logf` produce different bitstreams,
+      and `expf` is on the hot path twice (`flow_silu`, `softmax`). Tier 3 missed it
+      because it was built by grepping Accelerate symbols, and the question that
+      predicts a divergence is not "what is macOS-only" but "what is not the same
+      function on both machines" → [`.work/accelerate-only-kernels.md`](.work/accelerate-only-kernels.md) §7
 - [x] E4-16a **done** · `OPENBLAS_THREAD_TIMEOUT=1` set from a constructor when unset, with
       `blas.thread_timeout` reporting **claim vs fact** — a shared libopenblas
       initialises before this executable's constructors, so only the environment

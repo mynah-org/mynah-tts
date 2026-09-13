@@ -186,10 +186,10 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
-        playback-sim-test json-test json-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
+        playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -239,6 +239,27 @@ $(WINDOW_TEST_TARGET): $(CORE_OBJECTS) $(WINDOW_TEST_OBJECT)
 
 window-test: $(WINDOW_TEST_TARGET)
 	@$(WINDOW_TEST_TARGET)
+
+# The hot kernels, model-free (PLAN.md E3-6) and the numerical qualification
+# for the Accelerate replacements (E4-16d). Needs no model pack and no oracle
+# -- an independent f64 reference, a ULP table against libm and, on macOS,
+# against Accelerate itself -- so it runs inside `make test` and therefore
+# inside ubsan/asan. Detail: .work/accelerate-only-kernels.md
+KERNELS_TEST_OBJECT := $(BUILD_DIR)/tests/test_kernels.o
+KERNELS_TEST_TARGET := $(BUILD_DIR)/tests/test_kernels
+$(KERNELS_TEST_TARGET): $(CORE_OBJECTS) $(KERNELS_TEST_OBJECT)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+kernels-test: $(KERNELS_TEST_TARGET)
+	@$(KERNELS_TEST_TARGET)
+
+# The negative control: break the kernels nine ways and require kernels-test to
+# catch each break. A suite that has only ever passed is not evidence that it
+# can fail. Slow (nine clean rebuilds of the core), so it is NOT in `make test`
+# -- run it when the kernels or the suite change.
+kernels-negative-control:
+	@sh tests/kernels_negative_control.sh
 
 # The JSON parser (src/json.c) and the two readers it replaced. Model-free,
 # network-free and millisecond-fast, so it runs inside `make test` and therefore
@@ -347,7 +368,7 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 
-test: self-test driver-test window-test json-test playback-sim-test simd-auto-test
+test: self-test kernels-test driver-test window-test json-test playback-sim-test simd-auto-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 

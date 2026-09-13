@@ -28,11 +28,69 @@ void mynah_gelu_f32_scalar(float *data, size_t n);
 int mynah_gelu_vector_enabled(void);
 
 /* tanh-approximation GELU, the form the Magpie conv-FFN and the PocketTTS
- * backbone both use. The array form takes optional scratch and uses vForce
- * when Accelerate is present; pass NULL for the scalar loop. */
+ * backbone both use.  Both forms now call mynah_tanh_f32 below, so the
+ * elementwise and array spellings are the same arithmetic on every target.
+ * `scratch` is accepted and ignored: the vector tanh works in registers and
+ * needs no staging buffer.  Callers may keep passing NULL. */
 float mynah_gelu_tanh(float x);
 void  mynah_gelu_tanh_array(float *values, size_t length, float *scratch);
 int   mynah_gelu_self_test(char *error, size_t error_capacity);
+
+/* ------------------------------------------------------------------------
+ * Vector transcendentals -- ours, on every target (PLAN.md E4-16d)
+ *
+ * These replace Accelerate's vvtanhf and vvsinf/vDSP Snake, which existed on
+ * macOS only.  The point is not speed: it is that the development platform
+ * and the production target must execute the same arithmetic, instead of two
+ * implementations that agree by luck.  Detail and the ULP measurements:
+ * .work/accelerate-only-kernels.md.
+ *
+ * For every function the `_scalar` spelling is the DEFINITION OF CORRECTNESS
+ * and is always compiled.  The unsuffixed spelling dispatches to NEON or AVX2
+ * where one exists and to the scalar body otherwise.  Both are exported so
+ * that mynah_vecmath_self_test() can compare them inside one binary with no
+ * environment variable and no model -- if the two ever disagree by more than
+ * a stated ULP bound on this machine, the build fails here rather than in an
+ * utterance three hundred steps long.
+ *
+ * Domain notes that are part of the contract:
+ *   tanh  -- exact on the whole line.  +-Inf -> +-1, NaN passes through,
+ *            -0.0 stays -0.0, denormals return themselves.
+ *   sin   -- the vector argument reduction is valid for |x| < 8192.  Outside
+ *            that, and for every non-finite input, the lane is recomputed
+ *            with libm sinf, so the vector and scalar paths are identical
+ *            there by construction.
+ * ------------------------------------------------------------------------ */
+void mynah_tanh_f32(const float *input, float *output, size_t n);
+void mynah_tanh_f32_scalar(const float *input, float *output, size_t n);
+void mynah_sin_f32(const float *input, float *output, size_t n);
+void mynah_sin_f32_scalar(const float *input, float *output, size_t n);
+
+/* One SEANet Snake channel row, fused and in place:
+ *     row[t] = row[t] + sin(alpha * row[t])^2 / (alpha + 1e-9)
+ * Fused on purpose.  The Accelerate spelling it replaces staged the sines
+ * through a malloc'd array on every call, which is an allocation on the codec
+ * path (coding rule 4); this one works a vector at a time in registers. */
+void mynah_snake_row_f32(float *row, size_t length, float alpha);
+void mynah_snake_row_f32_scalar(float *row, size_t length, float alpha);
+
+/* Which transcription of the above will actually run here?  Returns a static
+ * string: "NEON", "AVX2" or "scalar". */
+const char *mynah_vecmath_isa(void);
+
+/* Does this BUILD flush denormals to zero before any kernel sees them?  A
+ * property of the compiler driver, not of these kernels: -ffast-math sets the
+ * FPCR flush-to-zero bit through a startup object on gcc/aarch64 and does not
+ * on Apple clang, so the development platform preserves a denormal argument
+ * and the production one does not.  Reported so that a self test can assert
+ * the right thing instead of asserting the compiler's behaviour and calling
+ * it a kernel bug. */
+int mynah_vecmath_denormals_flush(void);
+
+/* Model-free: scalar vs vector agreement, and both against a double-precision
+ * reference, across zero, negative zero, denormals, the tanh saturation knee,
+ * infinities, NaN, and the sine argument reduction far from the origin. */
+int mynah_vecmath_self_test(char *error, size_t error_capacity);
 
 /* out[0..n) += weight * src[0..n) */
 void mynah_axpy_f32(float *out, const float *src, float weight, size_t n);
