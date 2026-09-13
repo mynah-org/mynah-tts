@@ -36,6 +36,25 @@ const char *mynah_qmat_qtype_name(int qtype);
 /* 1 = the four-row unrolled matvec, 0 = MYNAH_QMAT_SINGLE_ROW rollback. */
 int mynah_qmat_cache_row4(const mynah_qmat_cache *cache);
 
+/* TEST HOOK, not a runtime knob.  Forces the ARM SMMLA wiring in the batched
+ * linear on (1) or off (0) for the rest of the process, or restores the
+ * env/default resolution (-1); returns the mode that was in effect before.
+ * Reports -1 and does nothing where SMMLA is not compiled or the CPU has no
+ * FEAT_I8MM, so a test can call it unconditionally.
+ *
+ * WHY IT IS PUBLIC: the two int8 kernels must produce bit-identical output for
+ * the same (weight row, activation), or a request's audio would depend on who
+ * it was batched with.  Proving that needs both kernels in ONE process over the
+ * same data; an env variable can only pick one per run. */
+int mynah_qmat_i8mm_force(int mode);
+
+/* The canonical int8 float epilogue, exported so a test can pin the grouping
+ * the kernels compiled to.  `ws` is the weight row's scale and `sx` the
+ * activation's; the result is `(float)s * (ws * sx) + bias`, with the inner
+ * product forced to be computed first.  See the long comment above
+ * qmat_row_scale() in src/qmat.c for why that forcing is load-bearing. */
+float mynah_qmat_epilogue(int32_t s, float ws, float sx, float bias);
+
 /* Would a greedy projection of this shape be split over the thread pool?
  * Shape-dependent on purpose: the same binary threads a big projection and
  * runs a small one serially.  `why` (optional) receives a static string

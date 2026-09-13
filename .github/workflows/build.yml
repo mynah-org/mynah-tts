@@ -71,6 +71,45 @@ jobs:
       - name: Kernel self-test
         run: ./build/cpu/mynah-tts --self-test
 
+      # THE ONLY x86 SILICON THIS PROJECT CAN OBSERVE (PLAN.md E4-20b).
+      #
+      # src/qmat.c compiles two VPDPBUSD kernels -- VEX (AVX-VNNI) and EVEX
+      # (AVX-512 VNNI) -- through target attributes, selects between them with
+      # CPUID, and until now NEITHER HAD EVER EXECUTED. There is no x86 host in
+      # this fleet; every int8 number in docs/performance.md that is not from
+      # the EPYC bench came off ARM. So this step is not belt-and-braces, it is
+      # the first and only execution.
+      #
+      # MYNAH_QMAT_VNNI=256/512 REQUEST a level; qmat_u8_level() grants it only
+      # if CPUID says the unit is there, and falls back otherwise. That
+      # fallback is why the level is not asserted here: a hosted runner may
+      # well be pre-Ice-Lake and have no VNNI at all, and failing the build
+      # over that would say nothing about the kernel. What IS asserted is the
+      # int32 identity -- `sum w*x == sum w*(x+128) - 128*sum w` over the VNNI
+      # prefix plus the signed tail -- which is integer algebra with no
+      # rounding in it, so a failure names a genuine kernel bug and the message
+      # says which of the three terms is wrong.
+      #
+      # §1 of tests/test_qmat.c prints, for each level, whether the request
+      # RESOLVED. Read that line before quoting any of this as a VNNI result:
+      # "NOT RESOLVED" means the run exercised the scalar or AVX2 path and is
+      # evidence about those, not about VPDPBUSD.
+      - name: VNNI on real x86 silicon
+        if: matrix.arch == 'x86_64'
+        run: |
+          echo "::group::what this runner is"
+          grep -m1 'model name' /proc/cpuinfo || true
+          echo -n "vnni flags: "; grep -o -m1 -E 'avx512_vnni|avx_vnni|avx512f|avx2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "::endgroup::"
+          for level in off scalar 256 512; do
+            echo "::group::MYNAH_QMAT_VNNI=$level"
+            MYNAH_QMAT_VNNI=$level ./build/cpu/mynah-tts --dispatch-map | grep -E 'quant.int8_kernel|avx512vnni|avxvnni'
+            MYNAH_QMAT_VNNI=$level ./build/cpu/mynah-tts --self-test
+            echo "::endgroup::"
+          done
+          # The numeric gate, which is what a failure here would actually mean.
+          make qmat-test
+
       - name: Full test target
         run: make test
 

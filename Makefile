@@ -186,7 +186,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test qmat-test qmat-negative-control server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -247,7 +247,13 @@ window-test: $(WINDOW_TEST_TARGET)
 # inside ubsan/asan. Detail: .work/accelerate-only-kernels.md
 KERNELS_TEST_OBJECT := $(BUILD_DIR)/tests/test_kernels.o
 KERNELS_TEST_TARGET := $(BUILD_DIR)/tests/test_kernels
+QMAT_TEST_OBJECT := $(BUILD_DIR)/tests/test_qmat.o
+QMAT_TEST_TARGET := $(BUILD_DIR)/tests/test_qmat
 $(KERNELS_TEST_TARGET): $(CORE_OBJECTS) $(KERNELS_TEST_OBJECT)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+$(QMAT_TEST_TARGET): $(CORE_OBJECTS) $(QMAT_TEST_OBJECT)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
@@ -260,6 +266,40 @@ kernels-test: $(KERNELS_TEST_TARGET)
 # -- run it when the kernels or the suite change.
 kernels-negative-control:
 	@sh tests/kernels_negative_control.sh
+
+# The int8/int4 determinism suite. Model-free and fast, so it is in `make test`
+# and therefore inside ubsan and asan.
+#
+# It runs the binary FIVE TIMES, and the repeats are the point rather than
+# belt-and-braces:
+#
+#   - MYNAH_QMAT_I8MM=0 / =1 force the ARM SMMLA wiring off and on. The suite
+#     also flips it in-process, but a run with the env variable set is what a
+#     deployment would actually do, and it is the only way the DEFAULT
+#     resolution gets exercised as a default.
+#   - MYNAH_QMAT_VNNI=256 / =512 ask for the VEX and EVEX VPDPBUSD kernels.
+#     On ARM both are unreachable and the run just re-reports the SDOT path,
+#     which costs milliseconds. On x86 they are the only way this project
+#     observes its VNNI kernels at all -- there is no x86 host in the fleet, so
+#     `ubuntu-latest` in .github/workflows/build.yml is the silicon. §1 of the
+#     suite prints whether the level RESOLVED, so a runner without the unit
+#     reports "NOT RESOLVED" instead of quietly passing on the scalar path and
+#     being read later as a VNNI result.
+#
+# A level the CPU cannot run is not an error: qmat_u8_level() falls back and §1
+# says so. This target fails only on a numeric disagreement.
+qmat-test: $(QMAT_TEST_TARGET)
+	@$(QMAT_TEST_TARGET)
+	@MYNAH_QMAT_I8MM=0 $(QMAT_TEST_TARGET)
+	@MYNAH_QMAT_I8MM=1 $(QMAT_TEST_TARGET)
+	@MYNAH_QMAT_VNNI=256 $(QMAT_TEST_TARGET)
+	@MYNAH_QMAT_VNNI=512 $(QMAT_TEST_TARGET)
+
+# The negative control: break the epilogue the four ways it has actually been
+# broken, and require qmat-test to catch each one. Slow (rebuilds of the core
+# under more than one SIMD profile), so it is NOT in `make test`.
+qmat-negative-control:
+	@sh tests/qmat_negative_control.sh
 
 # The JSON parser (src/json.c) and the two readers it replaced. Model-free,
 # network-free and millisecond-fast, so it runs inside `make test` and therefore
@@ -368,7 +408,7 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 
-test: self-test kernels-test driver-test window-test json-test playback-sim-test simd-auto-test
+test: self-test kernels-test qmat-test driver-test window-test json-test playback-sim-test simd-auto-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
@@ -659,4 +699,4 @@ update-ingot:
 # which reached the admission ladder as nonsense defaults. Same class as the
 # mixed-binary trap in .work/linux-production.md: objects reused across a change
 # that altered their meaning.
--include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d) $(WINDOW_TEST_OBJECT:.o=.d)
+-include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d) $(WINDOW_TEST_OBJECT:.o=.d) $(QMAT_TEST_OBJECT:.o=.d)
