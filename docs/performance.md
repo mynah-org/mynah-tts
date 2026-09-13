@@ -491,3 +491,60 @@ work is admission latency rather than kernels.
 
 Untested: any other topology (2x16, 1x32, 8x4 were not swept), any other text
 length distribution, x86, and sustained load.
+
+## 2026-09-13 · PocketTTS after the three profile lanes — GCP Axion, 32 cores
+
+Same host and same topology as the topology sweep above (`--prefork 16
+--prefork-threads 2 --max-batch 16`, `BLAS=none`, `SIMD=auto`), so the two are
+comparable. Build: the merged tree carrying the prefill prepack, the conv-stack
+fusion and the pool meter. FAST screen, three waves per level, quiet box.
+
+| C | done/launched | TTFB p95 | TTFA p95 | STREAM_RTF p95 | prebuffer p95 | **safe-to-play p95** | stall@500 |
+|---|---|---|---|---|---|---|---|
+| 1 | 3/3 | 0.3 ms | 155 ms | 0.229 | 0 | **155 ms** | 0% |
+| 48 | 144/144 | 489 ms | 890 ms | 0.680 | 0 | **890 ms** | 0% |
+| 64 | 192/192 | 662 ms | 1001 ms | 0.895 | 0 | **1001 ms** | 0% |
+| 80 | 240/240 | 805 ms | 1230 ms | **1.120** | 434 ms | **1638 ms** | 8% |
+| 100 | 300/300 | 974 ms | 1490 ms | **1.537** | 1539 ms | **2994 ms** | 100% |
+
+Every request completes at every level, including C100. What fails is cadence,
+not completion.
+
+### What the three lanes bought, and what they did not
+
+| level | STREAM_RTF p95 before | after | |
+|---|---|---|---|
+| C48 | 0.736 | **0.680** | −7.6% |
+| C64 | 0.954 | **0.895** | −6.2% |
+
+C64 moves from the edge of the mandatory gate to inside it with margin, and C80
+becomes the first level that fails. That is one level of capacity, bought
+without a kernel rewrite and without touching the arithmetic.
+
+**Latency did not move at all.** Safe-to-play p95 at C48 was 908 ms before and
+is 890 ms now. The single-stream wall fell 17% and the served latency fell 2%,
+which is the entire story of this screen: the lanes removed *work*, and what
+gates a served request at this concurrency is *waiting*.
+
+TTFB p95 — the response header, which this server sends at admission, before a
+single sample exists — is 489 ms at C48 and 974 ms at C100. Synthesis has not
+started when that clock stops. With sixteen workers at sixteen slots there are
+256 slots for 100 arrivals, so nothing is queueing for capacity, and the warm
+prefill measured on this build is ~122 ms. The gap between 122 ms of work and
+890 ms of safe-to-play is admission and scheduling.
+
+### Reading this against C100
+
+**C100 is not reached and this build does not get there.** The honest statement
+is C64 with margin on the mandatory gates, C80 as the first failure, and
+STREAM_RTF 1.537 at C100 — a stream generated at two thirds of real time, which
+no player can absorb. Nothing here is promoted: a wave screen may disqualify a
+configuration and may never promote one, so C64 needs a SOAK before it is an
+operating point.
+
+The next lever is not the kernels. At `16x2` each worker has two threads, where
+the pool meter puts the barrier at 1.2% — the pool has nothing left to give at
+this width. The queue does.
+
+Untested here: x86, other topologies on this build, mixed-language load, and
+sustained load at any level.
