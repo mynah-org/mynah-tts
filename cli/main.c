@@ -562,6 +562,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "CPU backend self-test failed: %s\n", error);
             return 1;
         }
+        /* This one had no caller anywhere in the tree. `census-test` claims to
+         * exercise it (Makefile) but runs `--dispatch-map`, which only calls
+         * mynah_dispatch_report(): the census self-test, the id-collision check
+         * and the thread-pool litmus inside it had never run in a gate. A test
+         * that passes while nothing calls it is worse than no test, because it
+         * licenses writing PASS in a commit. */
+        if (mynah_dispatch_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "dispatch/census self-test failed: %s\n", error);
+            return 1;
+        }
         puts("CPU SIMD/scalar backend self-test: PASS");
         return 0;
     }

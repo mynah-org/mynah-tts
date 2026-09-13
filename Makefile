@@ -741,9 +741,13 @@ update-ingot:
 doctor:
 	@python3 tools/doctor.py --binary $(TARGET)
 
-# The census machinery has a model-free self-test; it runs inside
-# mynah_dispatch_self_test, which this target exercises along with the
-# cost map's own.
+# The census machinery has a model-free self-test, inside
+# mynah_dispatch_self_test.  This comment used to say that this target
+# exercised it.  It did not: `--dispatch-map` calls mynah_dispatch_report()
+# and nothing else, and mynah_dispatch_self_test() had no caller anywhere in
+# the tree, so the census self-test, the region-id collision check and the
+# thread-pool litmus had never run in any gate.  It is now called from
+# `--self-test` (cli/main.c), which the second line below runs.
 census-test: $(TARGET)
 	@$(TARGET) --dispatch-map >/dev/null
 	@echo "census + dispatch self-test: PASS (via --dispatch-map collect)"
