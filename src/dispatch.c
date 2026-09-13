@@ -1346,5 +1346,707 @@ int mynah_dispatch_self_test(char *error, size_t error_capacity) {
 
     const char *detail = "";
     if (drift_f16(&detail) != 0) return st_fail(error, error_capacity, detail);
+
+    /* The census is the empirical half of this file and is checked with it:
+     * a dispatch report whose census machinery is broken can still claim a
+     * kernel ran. */
+    if (mynah_census_self_test(error, error_capacity) != 0) return -1;
     return 0;
+}
+
+/* ======================================================================
+ * THE SHAPE AND KERNEL CENSUS — see dispatch.h for why a count and not a
+ * banner.  Same no-allocation, no-shared-atomic discipline as costmap.c: if
+ * the census changed what it measures, every number it produced would be
+ * about a program that does not ship.
+ * ====================================================================== */
+
+#include "costmap.h"
+
+#include <stdatomic.h>
+#include <stdint.h>
+#include <pthread.h>
+
+int mynah_census_on_v = 0;
+
+const char *mynah_census_path_name(int path) {
+    switch (path) {
+        case MYNAH_CENSUS_PATH_MATVEC_F32: return "matvec-f32";
+        case MYNAH_CENSUS_PATH_MATVEC_Q:   return "matvec-q";
+        case MYNAH_CENSUS_PATH_GEMM:       return "gemm";
+        case MYNAH_CENSUS_PATH_BATCHED_Q:  return "batched-q";
+        case MYNAH_CENSUS_PATH_ROWLOOP:    return "row-loop";
+        default:                           return "UNKNOWN";
+    }
+}
+
+static const char *census_qname(int qtype) {
+    switch (qtype) {
+        case 0:  return "f32";
+        case 1:  return "int8";
+        case 2:  return "int4";
+        case 3:  return "f16";
+        default: return "f32";       /* -1: the group was not selected */
+    }
+}
+
+/* One distinct (block, kind, shape, width, path, encoding).  `block` and
+ * `kind` are static strings, so the key is a pointer compare. */
+typedef struct {
+    const char *block;
+    const char *kind;
+    uint32_t    k, n, rows;
+    int16_t     path;
+    int16_t     qtype;
+    uint64_t    calls;
+    uint64_t    row_total;
+} census_op;
+
+#define CENSUS_SLOTS_PER_THREAD 192
+#define CENSUS_TLS_SLOTS        68   /* as costmap.c: pool + caller + server */
+
+typedef struct {
+    census_op ops[CENSUS_SLOTS_PER_THREAD];
+    int       used;
+    uint64_t  dropped;     /* table full: counted, never silently discarded */
+    int       in_use;
+} census_tls;
+
+static census_tls       g_cs[CENSUS_TLS_SLOTS];
+static atomic_int       g_cs_next;
+static atomic_ullong    g_cs_tls_overflow;
+static atomic_ullong    g_cs_dropped;
+static _Thread_local census_tls *t_cs;
+
+static census_tls *census_self(void) {
+    census_tls *t = t_cs;
+    if (t != NULL) return t;
+    const int slot = atomic_fetch_add_explicit(&g_cs_next, 1, memory_order_relaxed);
+    if (slot >= CENSUS_TLS_SLOTS) {
+        atomic_fetch_add_explicit(&g_cs_tls_overflow, 1ull, memory_order_relaxed);
+        return NULL;
+    }
+    t = &g_cs[slot];
+    t->in_use = 1;
+    t_cs = t;
+    return t;
+}
+
+void mynah_census_init(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const char *e = getenv("MYNAH_CENSUS");
+    const char *j = getenv("MYNAH_CENSUS_JSON");
+    int on = (e != NULL && e[0] != 0 && e[0] != '0');
+    if (!on && j != NULL && j[0] != 0) on = 1;
+    mynah_census_on_v = on;
+}
+
+int mynah_census_enabled(void) { return mynah_census_on_v; }
+
+void mynah_census_op_(const char *block, const char *kind, size_t k, size_t n,
+                      size_t rows, int path, int qtype) {
+    census_tls *t = census_self();
+    if (t == NULL || block == NULL || kind == NULL) return;
+    /* Linear scan over this thread's own table.  It is short (one entry per
+     * distinct shape, not per layer) and it is thread-local, so there is no
+     * lock and no shared line to bounce. */
+    for (int i = 0; i < t->used; ++i) {
+        census_op *o = &t->ops[i];
+        if (o->block == block && o->kind == kind && o->k == (uint32_t)k &&
+            o->n == (uint32_t)n && o->rows == (uint32_t)rows &&
+            o->path == (int16_t)path && o->qtype == (int16_t)qtype) {
+            ++o->calls;
+            o->row_total += (uint64_t)rows;
+            return;
+        }
+    }
+    if (t->used >= CENSUS_SLOTS_PER_THREAD) {
+        ++t->dropped;
+        atomic_fetch_add_explicit(&g_cs_dropped, 1ull, memory_order_relaxed);
+        return;
+    }
+    census_op *o = &t->ops[t->used++];
+    o->block = block;
+    o->kind = kind;
+    o->k = (uint32_t)k;
+    o->n = (uint32_t)n;
+    o->rows = (uint32_t)rows;
+    o->path = (int16_t)path;
+    o->qtype = (int16_t)qtype;
+    o->calls = 1;
+    o->row_total = (uint64_t)rows;
+}
+
+void mynah_census_reset(void) {
+    for (int i = 0; i < CENSUS_TLS_SLOTS; ++i) {
+        g_cs[i].used = 0;
+        g_cs[i].dropped = 0;
+        memset(g_cs[i].ops, 0, sizeof(g_cs[i].ops));
+    }
+    atomic_store_explicit(&g_cs_dropped, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_cs_tls_overflow, 0ull, memory_order_relaxed);
+}
+
+static int census_tls_used(void) {
+    const int n = atomic_load_explicit(&g_cs_next, memory_order_relaxed);
+    return n > CENSUS_TLS_SLOTS ? CENSUS_TLS_SLOTS : n;
+}
+
+int mynah_census_merge(mynah_census_row *out, int capacity) {
+    if (out == NULL || capacity <= 0) return -1;
+    int n = 0;
+    const int used = census_tls_used();
+    for (int s = 0; s < used; ++s) {
+        const census_tls *t = &g_cs[s];
+        if (!t->in_use) continue;
+        for (int i = 0; i < t->used; ++i) {
+            const census_op *o = &t->ops[i];
+            int found = -1;
+            for (int j = 0; j < n; ++j) {
+                if (out[j].block == o->block && out[j].kind == o->kind &&
+                    out[j].k == o->k && out[j].n == o->n &&
+                    out[j].rows == o->rows && out[j].path == o->path &&
+                    out[j].qtype == o->qtype) { found = j; break; }
+            }
+            if (found < 0) {
+                if (n >= capacity) return n;
+                found = n++;
+                memset(&out[found], 0, sizeof(out[found]));
+                out[found].block = o->block;
+                out[found].kind = o->kind;
+                out[found].k = o->k;
+                out[found].n = o->n;
+                out[found].rows = o->rows;
+                out[found].path = o->path;
+                out[found].qtype = o->qtype;
+            }
+            out[found].calls += o->calls;
+            out[found].row_total += o->row_total;
+            ++out[found].threads_seen;
+        }
+    }
+    return n;
+}
+
+/* The allocation counter lives in tests/alloc_shim.c and is preloaded, never
+ * linked: with no shim this stays null and the census says [UNKNOWN] rather
+ * than printing a number it did not measure. */
+static unsigned long long (*g_alloc_source)(void) = NULL;
+
+void mynah_census_set_alloc_source(unsigned long long (*fn)(void)) {
+    g_alloc_source = fn;
+}
+
+unsigned long long mynah_census_alloc_count(void) {
+    return g_alloc_source != NULL ? g_alloc_source() : 0ull;
+}
+
+/* ---- the refusals -------------------------------------------------------
+ *
+ * Each of these is a sentence the census would otherwise let somebody write
+ * and be wrong about.  They are checked against the DISPATCH table collected
+ * in the same process, which is the only scope in which "resolved ON" and
+ * "never executed" are about the same binary on the same host. */
+
+static const char *row_resolved(const mynah_dispatch_row *rows, int n,
+                                const char *id) {
+    for (int i = 0; i < n; ++i) if (strcmp(rows[i].id, id) == 0) return rows[i].resolved;
+    return NULL;
+}
+
+/* Did any op carry this encoding?  `want_batched` narrows it to the
+ * weight-stationary path, which is the only place the SMMLA kernel lives. */
+static int census_saw_qtype(const mynah_census_row *rows, int n, int qtype,
+                            int want_batched) {
+    for (int i = 0; i < n; ++i) {
+        if (rows[i].qtype != qtype) continue;
+        if (want_batched && rows[i].path != MYNAH_CENSUS_PATH_BATCHED_Q) continue;
+        if (rows[i].calls > 0) return 1;
+    }
+    return 0;
+}
+
+int mynah_census_refusals(char *reason, size_t capacity) {
+    mynah_census_row rows[MYNAH_CENSUS_MAX_ROWS];
+    const int n = mynah_census_merge(rows, MYNAH_CENSUS_MAX_ROWS);
+    int refusals = 0;
+    char first[512];
+    first[0] = 0;
+
+#define CENSUS_REFUSE(...)                                                     \
+    do {                                                                       \
+        if (refusals++ == 0) snprintf(first, sizeof first, __VA_ARGS__);        \
+    } while (0)
+
+    if (n < 0) {
+        CENSUS_REFUSE("the census could not be merged");
+        goto done;
+    }
+
+    /* R1 -- a hole in the census.  A table with an unattributed op cannot
+     * support "these are the kernels that ran", so it is not printed as if it
+     * could. */
+    for (int i = 0; i < n; ++i) {
+        if (rows[i].path == MYNAH_CENSUS_PATH_UNKNOWN) {
+            CENSUS_REFUSE("R1 UNKNOWN operation: %s.%s [%llux%llu] ran %llu times "
+                          "on a path no hook named. The census has a hole in it "
+                          "and cannot say which kernels ran",
+                          rows[i].block, rows[i].kind,
+                          (unsigned long long)rows[i].k,
+                          (unsigned long long)rows[i].n,
+                          (unsigned long long)rows[i].calls);
+        }
+    }
+    if (atomic_load_explicit(&g_cs_dropped, memory_order_relaxed) != 0ull) {
+        CENSUS_REFUSE("R1 the census table was full and %llu distinct operations "
+                      "were dropped: the table is incomplete",
+                      (unsigned long long)atomic_load_explicit(&g_cs_dropped,
+                                                              memory_order_relaxed));
+    }
+    if (atomic_load_explicit(&g_cs_tls_overflow, memory_order_relaxed) != 0ull) {
+        CENSUS_REFUSE("R1 a thread could not claim a census block, so its "
+                      "operations were not counted at all");
+    }
+
+    /* R2 and R3 compare the census against the dispatch table, and collecting
+     * that table is NOT free: mynah_dispatch_collect() opens the backends and
+     * runs the model-free kernel self-tests (~200 ms on a 32-core Neoverse).
+     * Two consequences, both measured rather than assumed:
+     *
+     *   - it is collected ONCE per process and cached, not per refusal check;
+     *   - it is not collected at all when the census is empty, because a
+     *     census with no rows has nothing to cross-check.
+     *
+     * This cost is entirely at EXIT, after the audio is written. The in-run
+     * synthesis time is unaffected -- measured clean 0.664/0.686/0.698 s
+     * against census 0.681/0.671/0.678 s on the same host -- which is the
+     * property that matters: the instrumentation does not change what it
+     * measures. `make census-overhead` reports the two separately for exactly
+     * this reason. */
+    if (n > 0) {
+        static mynah_dispatch_row drows[MYNAH_DISPATCH_MAX_ROWS];
+        static int dn = -1;
+        if (dn < 0) dn = mynah_dispatch_collect(drows, MYNAH_DISPATCH_MAX_ROWS);
+        if (dn > 0) {
+            /* R2 -- an encoding was asked for and resolved, and nothing used
+             * it.  This is the "I set MYNAH_QUANT=int8 and measured f32"
+             * failure, which otherwise looks exactly like a fast run. */
+            const char *req = row_resolved(drows, dn, "quant.requested");
+            if (req != NULL && strcmp(req, "off") != 0 && n > 0) {
+                const int qt = mynah_qmat_qtype_from_name(req);
+                if (qt > 0 && !census_saw_qtype(rows, n, qt, 0)) {
+                    CENSUS_REFUSE("R2 quant.requested resolved to '%s' and NOT ONE "
+                                  "projection carried that encoding. Whatever was "
+                                  "measured, it was not %s", req, req);
+                }
+            }
+            /* R3 -- a kernel class resolved ON that never ran.  The SMMLA
+             * kernel exists only on the weight-stationary path, so i8mm ON
+             * with zero batched int8 calls means the feature was reported and
+             * idled. */
+            const char *i8mm = row_resolved(drows, dn, "isa.arm.i8mm");
+            if (i8mm != NULL && strcmp(i8mm, "ON") == 0 && n > 0 &&
+                census_saw_qtype(rows, n, 1, 0) &&
+                !census_saw_qtype(rows, n, 1, 1)) {
+                CENSUS_REFUSE("R3 isa.arm.i8mm resolved ON, int8 projections ran, "
+                              "and none of them took the batched path -- the "
+                              "SMMLA kernel is only reachable there, so the "
+                              "feature was reported and idled");
+            }
+            const char *k8 = row_resolved(drows, dn, "quant.int8_kernel");
+            if (k8 != NULL && (strstr(k8, "vnni") != NULL) && n > 0 &&
+                !census_saw_qtype(rows, n, 1, 0)) {
+                CENSUS_REFUSE("R3 quant.int8_kernel resolved to '%s' and no int8 "
+                              "projection executed: the kernel named in this "
+                              "run's report never ran in it", k8);
+            }
+        }
+    }
+
+    /* R4 -- the cost map was on and rejected its own numbers.  A census taken
+     * beside an untrustworthy profile is still a true census, but the pair is
+     * what gets read, and the pair is not trustworthy. */
+    if (mynah_costmap_level() != 0) {
+        char why[256];
+        if (mynah_costmap_trustworthy(why, sizeof why) != 0) {
+            CENSUS_REFUSE("R4 the cost map refused its own numbers in this run "
+                          "(%s), so this census and that profile must not be "
+                          "read together", why);
+        }
+    }
+
+    /* R5 -- per-request scope.  The census is process-wide and summed over
+     * threads. Dividing it by a request count the process does not have is the
+     * WORKER-by-HOST division the roofs tool refuses; MYNAH_CENSUS_PER_REQUEST
+     * is the explicit request for that number and the cost map is the only
+     * thing that counts requests. */
+    {
+        const char *want = getenv("MYNAH_CENSUS_PER_REQUEST");
+        if (want != NULL && want[0] != 0 && want[0] != '0') {
+            mynah_costmap_health h;
+            mynah_costmap_health_get(&h);
+            if (mynah_costmap_level() == 0 || h.requests == 0u) {
+                CENSUS_REFUSE("R5 a per-request figure was asked for, and this "
+                              "process has no request count to divide by "
+                              "(MYNAH_COST_MAP is off, or no request completed). "
+                              "The scopes do not match and no number is printed");
+            }
+        }
+    }
+
+done:
+#undef CENSUS_REFUSE
+    if (refusals > 0 && reason != NULL && capacity > 0) {
+        snprintf(reason, capacity, "%s", first);
+    }
+    return refusals;
+}
+
+/* ---- the report ---------------------------------------------------------- */
+
+/* Which ISA kernel a row's encoding resolves to in THIS process.  Taken from
+ * src/qmat.c's own predicate, never from a compile gate: that is the same rule
+ * the dispatch table lives by, and the reason an attribution here is checkable
+ * rather than plausible. */
+static const char *census_kernel_for(int qtype, int path) {
+    const char *why = NULL;
+    switch (qtype) {
+        case 1:
+            if (path == MYNAH_CENSUS_PATH_BATCHED_Q && mynah_qmat_i8mm_enabled(&why)) {
+                return "arm-smmla";
+            }
+            return mynah_qmat_int8_kernel(&why);
+        case 2:  return mynah_qmat_int4_kernel(&why);
+        case 3:  return mynah_qmat_f16_kernel(&why);
+        default: return "f32";
+    }
+}
+
+static int census_cmp(const void *a, const void *b) {
+    const mynah_census_row *x = (const mynah_census_row *)a;
+    const mynah_census_row *y = (const mynah_census_row *)b;
+    const int c = strcmp(x->block, y->block);
+    if (c != 0) return c;
+    if (x->calls != y->calls) return x->calls < y->calls ? 1 : -1;
+    return strcmp(x->kind, y->kind);
+}
+
+int mynah_census_report(void *out_file, int as_json) {
+    FILE *f = out_file != NULL ? (FILE *)out_file : stderr;
+    mynah_census_row rows[MYNAH_CENSUS_MAX_ROWS];
+    int n = mynah_census_merge(rows, MYNAH_CENSUS_MAX_ROWS);
+    if (n < 0) return -1;
+    qsort(rows, (size_t)n, sizeof(rows[0]), census_cmp);
+
+    char refusal[512];
+    refusal[0] = 0;
+    const int refusals = mynah_census_refusals(refusal, sizeof refusal);
+
+    unsigned long long total_calls = 0, batched_calls = 0, rowloop_calls = 0;
+    for (int i = 0; i < n; ++i) {
+        total_calls += rows[i].calls;
+        if (rows[i].path == MYNAH_CENSUS_PATH_BATCHED_Q) batched_calls += rows[i].calls;
+        if (rows[i].path == MYNAH_CENSUS_PATH_ROWLOOP)    rowloop_calls += rows[i].calls;
+    }
+    const unsigned long long allocs = mynah_census_alloc_count();
+    mynah_costmap_health h;
+    mynah_costmap_health_get(&h);
+    const int have_requests = (mynah_costmap_level() != 0 && h.requests > 0u);
+
+    if (!as_json) {
+        fprintf(f, "[CENSUS] v=1 pid=%d rows=%d calls=%llu build=%s simd=%s\n",
+                (int)getpid(), n, (unsigned long long)total_calls,
+                MYNAH_GIT_REV, MYNAH_SIMD_PROFILE);
+        fprintf(f, "  every PocketTTS projection that executed, by shape and by "
+                   "the path it ACTUALLY took. `batched-q` is micro-batching "
+                   "that engaged; `row-loop` is a call that asked for several "
+                   "rows and got a per-row loop, which is the fallback a banner "
+                   "cannot see.\n");
+        if (n == 0) {
+            fprintf(f, "  (no operations recorded: nothing ran, or MYNAH_CENSUS "
+                       "was set after the work)\n");
+        } else {
+            fprintf(f, "  %-14s %-8s %12s %6s %-11s %-5s %-12s %10s\n",
+                    "block", "kind", "shape k x n", "rows", "path", "enc",
+                    "kernel", "calls");
+            for (int i = 0; i < n; ++i) {
+                char shape[24];
+                snprintf(shape, sizeof shape, "%llux%llu",
+                         (unsigned long long)rows[i].k,
+                         (unsigned long long)rows[i].n);
+                fprintf(f, "  %-14s %-8s %12s %6llu %-11s %-5s %-12s %10llu\n",
+                        rows[i].block, rows[i].kind, shape,
+                        (unsigned long long)rows[i].rows,
+                        mynah_census_path_name(rows[i].path),
+                        census_qname(rows[i].qtype),
+                        census_kernel_for(rows[i].qtype, rows[i].path),
+                        (unsigned long long)rows[i].calls);
+            }
+        }
+        /* The count, not the banner. */
+        fprintf(f, "  micro-batching: %llu of %llu calls took the batched path, "
+                   "%llu took a per-row loop. %s\n",
+                (unsigned long long)batched_calls, (unsigned long long)total_calls,
+                (unsigned long long)rowloop_calls,
+                batched_calls == 0
+                    ? "IT DID NOT ENGAGE in this run -- whatever the build says."
+                    : "It engaged.");
+        if (allocs > 0ull) {
+            fprintf(f, "  allocations: %llu [MEASURED, tests/alloc_shim.c]",
+                    (unsigned long long)allocs);
+            if (have_requests) {
+                fprintf(f, ", %.1f per request over %llu requests\n",
+                        (double)allocs / (double)h.requests,
+                        (unsigned long long)h.requests);
+            } else {
+                fprintf(f, "; per request [UNKNOWN]: no request count in this "
+                           "process (set MYNAH_COST_MAP=1)\n");
+            }
+        } else {
+            fprintf(f, "  allocations: [UNKNOWN] -- no counter is preloaded. "
+                       "The runtime does not interpose its own allocator; "
+                       "run under tests/alloc_shim to measure it.\n");
+        }
+        if (refusals > 0) {
+            fprintf(f, "  CENSUS REFUSED (%d): %s\n", refusals, refusal);
+            fprintf(f, "  A refusing census does not print a verdict. Fix the "
+                       "cause or stop quoting the run.\n");
+        } else {
+            fprintf(f, "  census: OK -- every operation is attributed, and every "
+                       "kernel class this run resolved ON executed at least "
+                       "once.\n");
+        }
+        fflush(f);
+        return n;
+    }
+
+    fprintf(f, "{\n  \"v\": 1,\n  \"pid\": %d,\n", (int)getpid());
+    fprintf(f, "  \"build\": ");  json_str(f, MYNAH_GIT_REV);
+    fprintf(f, ",\n  \"simd\": "); json_str(f, MYNAH_SIMD_PROFILE);
+    fprintf(f, ",\n  \"calls\": %llu", (unsigned long long)total_calls);
+    fprintf(f, ",\n  \"batched_calls\": %llu", (unsigned long long)batched_calls);
+    fprintf(f, ",\n  \"rowloop_calls\": %llu", (unsigned long long)rowloop_calls);
+    fprintf(f, ",\n  \"micro_batching_engaged\": %s",
+            batched_calls > 0 ? "true" : "false");
+    if (allocs > 0ull) {
+        fprintf(f, ",\n  \"allocations\": %llu", (unsigned long long)allocs);
+        fprintf(f, ",\n  \"allocations_label\": \"MEASURED\"");
+        if (have_requests) {
+            fprintf(f, ",\n  \"requests\": %llu", (unsigned long long)h.requests);
+            fprintf(f, ",\n  \"allocations_per_request\": %.3f",
+                    (double)allocs / (double)h.requests);
+        } else {
+            fprintf(f, ",\n  \"allocations_per_request\": null");
+        }
+    } else {
+        fprintf(f, ",\n  \"allocations\": null,\n  \"allocations_label\": \"UNKNOWN\"");
+    }
+    fprintf(f, ",\n  \"refusals\": %d", refusals);
+    fprintf(f, ",\n  \"refusal\": "); json_str(f, refusal);
+    fprintf(f, ",\n  \"ops\": [\n");
+    for (int i = 0; i < n; ++i) {
+        fprintf(f, "    {\"block\": ");  json_str(f, rows[i].block);
+        fprintf(f, ", \"kind\": ");      json_str(f, rows[i].kind);
+        fprintf(f, ", \"k\": %llu, \"n\": %llu, \"rows\": %llu",
+                (unsigned long long)rows[i].k, (unsigned long long)rows[i].n,
+                (unsigned long long)rows[i].rows);
+        fprintf(f, ", \"path\": ");      json_str(f, mynah_census_path_name(rows[i].path));
+        fprintf(f, ", \"encoding\": ");  json_str(f, census_qname(rows[i].qtype));
+        fprintf(f, ", \"kernel\": ");    json_str(f, census_kernel_for(rows[i].qtype, rows[i].path));
+        fprintf(f, ", \"calls\": %llu, \"row_total\": %llu, \"threads\": %u}%s\n",
+                (unsigned long long)rows[i].calls,
+                (unsigned long long)rows[i].row_total, rows[i].threads_seen,
+                i + 1 < n ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+    fflush(f);
+    return n;
+}
+
+static void census_atexit(void) {
+    if (!mynah_census_on_v) return;
+    const char *path = getenv("MYNAH_CENSUS_JSON");
+    (void)0;
+    if (path != NULL && path[0] != 0) {
+        char real[1024];
+        expand_pid(real, sizeof real, path);
+        FILE *j = fopen(real, "w");
+        if (j != NULL) { mynah_census_report(j, 1); fclose(j); }
+    } else {
+        mynah_census_report(stderr, 0);
+    }
+    const char *strict = getenv("MYNAH_CENSUS_STRICT");
+    if (strict != NULL && strict[0] != 0 && strict[0] != '0') {
+        char reason[512];
+        const int refusals = mynah_census_refusals(reason, sizeof reason);
+        if (refusals > 0) {
+            fprintf(stderr,
+                    "[CENSUS] REFUSED (%d): %s.\n"
+                    "         MYNAH_CENSUS_STRICT is set, so this run exits "
+                    "non-zero rather than print a number nobody should trust.\n",
+                    refusals, reason);
+            fflush(stderr);
+            _exit(5);
+        }
+    }
+}
+
+__attribute__((constructor)) static void census_ctor(void) {
+    mynah_census_init();
+    if (mynah_census_on_v) atexit(census_atexit);
+}
+
+/* ---- census self-test ---------------------------------------------------
+ *
+ * Model-free.  It asserts the properties the census's own claims rest on:
+ * identical keys merge, different shapes do NOT merge, an off census records
+ * nothing, a second thread accumulates into its own block and merges exactly,
+ * and an UNKNOWN op is REFUSED rather than printed.  It resets the table on
+ * entry and on exit, so it must never run inside a profiled synthesis. */
+
+static int cs_fail(char *error, size_t cap, const char *message) {
+    if (error != NULL && cap > 0) snprintf(error, cap, "%s", message);
+    return -1;
+}
+
+#define CS_THREAD_ITERS 100
+static const char cs_block_a[] = "selftest";
+static const char cs_kind_a[]  = "alpha";
+static const char cs_kind_b[]  = "beta";
+
+static void *cs_worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < CS_THREAD_ITERS; ++i) {
+        mynah_census_op(cs_block_a, cs_kind_a, 64, 128, 1,
+                        MYNAH_CENSUS_PATH_MATVEC_Q, 1);
+    }
+    return NULL;
+}
+
+static const mynah_census_row *cs_find(const mynah_census_row *r, int n,
+                                       const char *kind, int path) {
+    for (int i = 0; i < n; ++i) {
+        if (strcmp(r[i].kind, kind) == 0 && r[i].path == path) return &r[i];
+    }
+    return NULL;
+}
+
+int mynah_census_self_test(char *error, size_t error_capacity) {
+    const int saved = mynah_census_on_v;
+    mynah_census_row rows[MYNAH_CENSUS_MAX_ROWS];
+    int rc = 0;
+    int n;
+
+    mynah_census_on_v = 1;
+    mynah_census_reset();
+
+    /* 1. identical keys merge; a different shape does not. */
+    for (int i = 0; i < 5; ++i) {
+        mynah_census_op(cs_block_a, cs_kind_a, 64, 128, 1,
+                        MYNAH_CENSUS_PATH_MATVEC_Q, 1);
+    }
+    mynah_census_op(cs_block_a, cs_kind_a, 64, 256, 1,
+                    MYNAH_CENSUS_PATH_MATVEC_Q, 1);
+    n = mynah_census_merge(rows, MYNAH_CENSUS_MAX_ROWS);
+    if (n != 2) { rc = cs_fail(error, error_capacity, "census: shapes did not separate"); goto done; }
+    {
+        unsigned long long five = 0, one = 0;
+        for (int i = 0; i < n; ++i) {
+            if (rows[i].n == 128) five = rows[i].calls;
+            if (rows[i].n == 256) one = rows[i].calls;
+        }
+        if (five != 5 || one != 1) {
+            rc = cs_fail(error, error_capacity, "census: identical keys did not merge");
+            goto done;
+        }
+    }
+
+    /* 2. the path is part of the key: the same shape on two paths must stay
+     *    two rows, or "did micro-batching engage" could never be answered. */
+    mynah_census_reset();
+    mynah_census_op(cs_block_a, cs_kind_b, 64, 128, 4,
+                    MYNAH_CENSUS_PATH_BATCHED_Q, 1);
+    mynah_census_op(cs_block_a, cs_kind_b, 64, 128, 4,
+                    MYNAH_CENSUS_PATH_ROWLOOP, 1);
+    n = mynah_census_merge(rows, MYNAH_CENSUS_MAX_ROWS);
+    if (n != 2 || cs_find(rows, n, cs_kind_b, MYNAH_CENSUS_PATH_BATCHED_Q) == NULL ||
+        cs_find(rows, n, cs_kind_b, MYNAH_CENSUS_PATH_ROWLOOP) == NULL) {
+        rc = cs_fail(error, error_capacity,
+                     "census: a batched call and a row-loop of the same shape merged");
+        goto done;
+    }
+    {
+        const mynah_census_row *b = cs_find(rows, n, cs_kind_b, MYNAH_CENSUS_PATH_BATCHED_Q);
+        if (b->row_total != 4) {
+            rc = cs_fail(error, error_capacity, "census: row_total is not the width");
+            goto done;
+        }
+    }
+
+    /* 3. an UNKNOWN op REFUSES. */
+    mynah_census_reset();
+    mynah_census_op(cs_block_a, cs_kind_a, 8, 8, 1, MYNAH_CENSUS_PATH_UNKNOWN, -1);
+    {
+        char why[512];
+        if (mynah_census_refusals(why, sizeof why) == 0) {
+            rc = cs_fail(error, error_capacity,
+                         "census: an UNKNOWN operation was NOT refused");
+            goto done;
+        }
+        if (strstr(why, "R1") == NULL) {
+            rc = cs_fail(error, error_capacity,
+                         "census: the UNKNOWN refusal is not reported as R1");
+            goto done;
+        }
+    }
+
+    /* 4. a clean table does not refuse. */
+    mynah_census_reset();
+    mynah_census_op(cs_block_a, cs_kind_a, 8, 8, 1, MYNAH_CENSUS_PATH_MATVEC_F32, -1);
+    if (mynah_census_refusals(NULL, 0) != 0) {
+        rc = cs_fail(error, error_capacity, "census: a clean table refused");
+        goto done;
+    }
+
+    /* 5. two threads accumulate independently and merge exactly. */
+    mynah_census_reset();
+    {
+        pthread_t a, b;
+        if (pthread_create(&a, NULL, cs_worker, NULL) != 0 ||
+            pthread_create(&b, NULL, cs_worker, NULL) != 0) {
+            rc = cs_fail(error, error_capacity, "census: cannot create threads");
+            goto done;
+        }
+        pthread_join(a, NULL);
+        pthread_join(b, NULL);
+        n = mynah_census_merge(rows, MYNAH_CENSUS_MAX_ROWS);
+        if (n != 1 || rows[0].calls != 2u * CS_THREAD_ITERS) {
+            rc = cs_fail(error, error_capacity,
+                         "census: merged call count is wrong across two threads");
+            goto done;
+        }
+        if (rows[0].threads_seen != 2) {
+            rc = cs_fail(error, error_capacity,
+                         "census: the two threads did not get separate blocks");
+            goto done;
+        }
+    }
+
+    /* 6. off means off -- the property the whole parity proof rests on. */
+    mynah_census_reset();
+    mynah_census_on_v = 0;
+    mynah_census_op(cs_block_a, cs_kind_a, 1, 1, 1, MYNAH_CENSUS_PATH_MATVEC_Q, 1);
+    mynah_census_on_v = 1;
+    n = mynah_census_merge(rows, MYNAH_CENSUS_MAX_ROWS);
+    if (n != 0) {
+        rc = cs_fail(error, error_capacity, "census: an op recorded while off");
+        goto done;
+    }
+
+done:
+    mynah_census_reset();
+    mynah_census_on_v = saved;
+    return rc;
 }

@@ -41,7 +41,11 @@ typedef struct {
 } rgn_info;
 
 static const rgn_info g_rgn[] = {
-    { MYNAH_RGN_REQUEST,           "request.total",          MYNAH_RGN_NONE,     1, "driver",   "stack"   },
+    /* DERIVED, not stack: a request is opened on the driver loop thread and
+     * closed when its context is destroyed, with other requests interleaved in
+     * between, so no single thread-local stack can bracket it.  It is written
+     * by mynah_region_add_ns() from the context lifetime. */
+    { MYNAH_RGN_REQUEST,           "request.total",          MYNAH_RGN_NONE,     1, "driver",   "derived" },
     { MYNAH_RGN_PREPARE,           "request.prepare",        MYNAH_RGN_REQUEST,  1, "driver",   "stack"   },
     { MYNAH_RGN_TOKENIZE,          "prep.tokenize",          MYNAH_RGN_PREPARE,  1, "prep",     "stack"   },
     { MYNAH_RGN_ENCODER,           "prep.encoder",           MYNAH_RGN_PREPARE,  1, "encoder",  "stack"   },
@@ -53,12 +57,19 @@ static const rgn_info g_rgn[] = {
     { MYNAH_RGN_STEP_BACKBONE,     "step.backbone",          MYNAH_RGN_STEP,     2, "decoder",  "stack"   },
     { MYNAH_RGN_STEP_ATTENTION,    "step.attention",         MYNAH_RGN_STEP_BACKBONE, 2, "decoder", "stack" },
     { MYNAH_RGN_STEP_FFN,          "step.ffn",               MYNAH_RGN_STEP_BACKBONE, 2, "decoder", "stack" },
-    { MYNAH_RGN_STEP_HEAD,         "step.head",              MYNAH_RGN_STEP,     1, "decoder",  "stack"   },
+    /* MULTI: a discrete engine runs the head inside step_batch, PocketTTS runs
+     * its EOS head inside emit_batch.  Both are correct; declaring one of them
+     * flagged the other on every call. */
+    { MYNAH_RGN_STEP_HEAD,         "step.head",              MYNAH_RGN_MULTI,    1, "decoder",  "stack"   },
     { MYNAH_RGN_EMIT,              "step.emit",              MYNAH_RGN_REQUEST,  1, "decoder",  "stack"   },
 
     { MYNAH_RGN_LOCAL,             "local.total",            MYNAH_RGN_MULTI,    1, "local",    "stack"   },
     { MYNAH_RGN_LOCAL_STEP,        "local.stream_step",      MYNAH_RGN_LOCAL,    2, "local",    "stack"   },
     { MYNAH_RGN_LOCAL_PROJ,        "local.stream_proj",      MYNAH_RGN_LOCAL,    2, "local",    "stack"   },
+
+    /* MULTI: under step.emit in the batched path, under step.total when a
+     * single context draws its latent alone. */
+    { MYNAH_RGN_FLOW,              "flow.head",              MYNAH_RGN_MULTI,    1, "flow",     "stack"   },
 
     { MYNAH_RGN_CODEC,             "codec.total",            MYNAH_RGN_MULTI,    1, "codec",    "stack"   },
     { MYNAH_RGN_CODEC_EMBED,       "codec.embed",            MYNAH_RGN_CODEC,    2, "codec",    "stack"   },
@@ -73,6 +84,10 @@ static const rgn_info g_rgn[] = {
     { MYNAH_RGN_RT_PARALLEL,       "runtime.parallel_for",   MYNAH_RGN_MULTI,    1, "runtime",  "stack"   },
     { MYNAH_RGN_RT_PARALLEL_WAIT,  "runtime.parallel_wait",  MYNAH_RGN_RT_PARALLEL, 1, "runtime", "stack" },
     { MYNAH_RGN_MODEL_LOAD,        "runtime.model_load",     MYNAH_RGN_NONE,     1, "runtime",  "stack"   },
+
+    { MYNAH_RGN_DECODE_GANG,       "driver.decode_gang",     MYNAH_RGN_NONE,     1, "driver",   "stack"   },
+    { MYNAH_RGN_LANE_WAIT,         "driver.lane_wait",       MYNAH_RGN_NONE,     1, "driver",   "stack"   },
+    { MYNAH_RGN_LANE_DECODE,       "driver.lane_decode",     MYNAH_RGN_NONE,     1, "driver",   "stack"   },
 
     { MYNAH_RGN_WORK_MATVEC,       "work.matvec_blocks",     MYNAH_RGN_MULTI,    1, "runtime",  "stack"   },
     { MYNAH_RGN_WORK_ARGMAX,       "work.argmax_blocks",     MYNAH_RGN_MULTI,    1, "runtime",  "stack"   },
@@ -203,7 +218,16 @@ void mynah_region_begin_(int id) {
     const int declared = mynah_region_parent(id);
     if (declared != MYNAH_RGN_MULTI) {
         const int dynamic = t->depth > 0 ? t->stack_id[t->depth - 1] : MYNAH_RGN_NONE;
-        if (dynamic != declared) ++t->nest_mismatch[id];
+        /* A DERIVED parent is never on a stack, so "the declared parent is not
+         * the dynamic one" is guaranteed for its children and says nothing
+         * about the call site.  Such a child matches when it opens at the top
+         * of the stack; opening it under some other region still fails.  See
+         * costmap.h -- getting this wrong flagged 45 regions per request for
+         * two months and invalidated every report under the refusal rule. */
+        const int ok = (dynamic == declared) ||
+                       (dynamic == MYNAH_RGN_NONE && declared != MYNAH_RGN_NONE &&
+                        strcmp(rgn_mode(declared), "derived") == 0);
+        if (!ok) ++t->nest_mismatch[id];
     }
     t->stack_id[t->depth] = id;
     t->stack_t0[t->depth] = rgn_now_ns();
@@ -449,6 +473,14 @@ int mynah_costmap_report(void *out_file) {
                "exceed 100%%, and that is the parallel decomposition, not an "
                "error. occupancy = threads that touched the region / widest "
                "dispatch seen.\n", base_label);
+    fprintf(f, "  READ THE FLAGS BEFORE ADDING TWO ROWS. `threads=N` (N>1) "
+               "means the row is a SUM OVER N THREADS and shares no clock with "
+               "a single-threaded row: it may exceed its own parent's wall, and "
+               "subtracting it from anything is meaningless. `derived` means "
+               "the row was submitted as a duration by threads that handed the "
+               "job to each other, not measured by a begin/end pair on one "
+               "stack, so its self time is not a measurement and prints as "
+               "'-'. Only rows with neither flag, under one parent, sum.\n");
 
     if (n == 0) {
         fprintf(f, "  (no regions recorded: no instrumentation reached, or "
@@ -495,13 +527,43 @@ int mynah_costmap_report(void *out_file) {
             snprintf(b, sizeof b, "ticks=%llu", (unsigned long long)s->ticks);
             o = flags_add(flags, sizeof flags, o, b);
         }
+        /* Rows are printed in id order and indented by declared depth, so a
+         * row whose parent is not the row above it reads as a child of
+         * whatever happens to precede it -- runtime.admission landed under
+         * codec.conv_stack that way. Name the parent whenever the indentation
+         * alone would lie. */
+        if (s->parent != MYNAH_RGN_NONE && s->parent != MYNAH_RGN_MULTI &&
+            (i == 0 || st[i - 1].id != s->parent)) {
+            char b[48];
+            snprintf(b, sizeof b, "under=%s", mynah_region_name(s->parent));
+            o = flags_add(flags, sizeof flags, o, b);
+        }
+        /* The row crossed threads.  This is the flag that stops a reader from
+         * adding two numbers that were never on the same clock. */
+        if (s->threads_seen > 1) {
+            char b[32];
+            snprintf(b, sizeof b, "threads=%u", s->threads_seen);
+            o = flags_add(flags, sizeof flags, o, b);
+        }
         (void)o;
 
-        fprintf(f, "  %-28s %-8llu %10.3f %10.3f %6.2f%% %6.2f%% %-9s %s\n",
-                name, (unsigned long long)s->calls, ms(s->ns), ms(self),
+        /* A derived row's ns was submitted, not bracketed, so no child ever
+         * accumulated into its child_ns: ns - child_ns would be the whole
+         * inclusive time wearing the name "self".  Print '-' instead. */
+        const int derived = strcmp(s->mode, "derived") == 0;
+        char self_ms[12], self_pct[12];
+        if (derived) {
+            snprintf(self_ms, sizeof self_ms, "%10s", "-");
+            snprintf(self_pct, sizeof self_pct, "%7s", "-");
+        } else {
+            snprintf(self_ms, sizeof self_ms, "%10.3f", ms(self));
+            snprintf(self_pct, sizeof self_pct, "%6.2f%%",
+                     base ? 100.0 * (double)self / (double)base : 0.0);
+        }
+        fprintf(f, "  %-28s %-8llu %10.3f %s %6.2f%% %s %-9s %s\n",
+                name, (unsigned long long)s->calls, ms(s->ns), self_ms,
                 base ? 100.0 * (double)s->ns / (double)base : 0.0,
-                base ? 100.0 * (double)self  / (double)base : 0.0,
-                occ, flags);
+                self_pct, occ, flags);
     }
 
     fprintf(f, "  health: threads=%llu requests=%llu unbalanced=%llu "
@@ -651,10 +713,59 @@ int mynah_costmap_dump(const char *path) {
 /* Resolve the level before main(), so no thread can race the first marker, and
  * make an ordinary CLI run report on the way out without every entry point
  * having to remember to. */
+int mynah_costmap_trustworthy(char *reason, size_t capacity) {
+    mynah_costmap_health h;
+    mynah_costmap_health_get(&h);
+    const unsigned long long tls_lost =
+        atomic_load_explicit(&g_tls_overflow, memory_order_relaxed);
+    const char *why = NULL;
+    char buf[256];
+    if (h.nest_mismatch != 0) {
+        snprintf(buf, sizeof buf,
+                 "nest_mismatch=%llu: a region was entered under a parent it "
+                 "does not declare, so at least one number is attributed to the "
+                 "wrong row", (unsigned long long)h.nest_mismatch);
+        why = buf;
+    } else if (h.stack_overflow != 0) {
+        snprintf(buf, sizeof buf,
+                 "stack_overflow=%llu: the region stack was full and begins "
+                 "were dropped, so their time was charged to an ancestor",
+                 (unsigned long long)h.stack_overflow);
+        why = buf;
+    } else if (h.unbalanced != 0) {
+        snprintf(buf, sizeof buf,
+                 "unbalanced=%llu: an end did not match the top of the stack",
+                 (unsigned long long)h.unbalanced);
+        why = buf;
+    } else if (tls_lost != 0) {
+        snprintf(buf, sizeof buf,
+                 "thread_slots_exhausted=%llu: a thread recorded nothing, so "
+                 "every total is short by an unknown amount",
+                 (unsigned long long)tls_lost);
+        why = buf;
+    }
+    if (why == NULL) return 0;
+    if (reason != NULL && capacity > 0) snprintf(reason, capacity, "%s", why);
+    return -1;
+}
+
 static void costmap_atexit(void) {
     if (!mynah_costmap_level_v) return;
     mynah_costmap_dump(NULL);
     if (getenv("MYNAH_COSTMAP_JSON") == NULL) mynah_costmap_report(stderr);
+    const char *strict = getenv("MYNAH_COST_MAP_STRICT");
+    if (strict != NULL && strict[0] != 0 && strict[0] != '0') {
+        char reason[256];
+        if (mynah_costmap_trustworthy(reason, sizeof reason) != 0) {
+            fprintf(stderr,
+                    "[COSTMAP] REFUSED: %s.\n"
+                    "          MYNAH_COST_MAP_STRICT is set, so this run exits "
+                    "non-zero rather than let a number nobody should trust be "
+                    "recorded as a measurement.\n", reason);
+            fflush(stderr);
+            _exit(4);
+        }
+    }
 }
 
 __attribute__((constructor)) static void costmap_ctor(void) {

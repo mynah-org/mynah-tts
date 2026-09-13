@@ -194,7 +194,8 @@ WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
-        metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
+        metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot \
+        doctor census-test census-parity census-overhead alloc-shim alloc-constant-test observability-test
 
 all: $(TARGET)
 cpu: all
@@ -704,3 +705,76 @@ update-ingot:
 # mixed-binary trap in .work/linux-production.md: objects reused across a change
 # that altered their meaning.
 -include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d) $(WINDOW_TEST_OBJECT:.o=.d) $(QMAT_TEST_OBJECT:.o=.d)
+
+
+# ======================================================================
+# OBSERVABILITY (E4-2b / E4-13)
+#
+# Four tools, and each one declares a refusal
+# (.work/engineering-method.md §4):
+#
+#   make doctor              what this machine is, what this binary will choose
+#                            on it, and how the server should probably be run
+#                            here. Under a minute, no model pack. Every value
+#                            is labelled MEASURED / CACHED / TRANSFERRED /
+#                            PREDICTED / UNKNOWN, and it prints [UNKNOWN]
+#                            rather than a plausible number.
+#   make census-parity       the proof that the instrumentation does not change
+#                            what it measures: same binary, same workload,
+#                            census-only vs census+costmap, censuses diffed and
+#                            audio compared byte for byte.
+#   make census-overhead     what it costs, in interleaved A/B/B/A arms, never
+#                            a clean run followed by an instrumented one.
+#   make alloc-constant-test the allocation count is CONSTANT across
+#                            --max-steps, which is the evidence that the AR
+#                            loop allocates nothing.
+#
+# The cost map and the census themselves are env-driven, so they need no CLI
+# surface and no flag to forget:
+#
+#   MYNAH_COST_MAP=1|2   region profile (2 adds the per-layer regions)
+#   MYNAH_CENSUS=1       shape and kernel census
+#   *_STRICT=1           exit non-zero instead of printing a number nobody
+#                        should trust
+# ======================================================================
+
+doctor:
+	@python3 tools/doctor.py --binary $(TARGET)
+
+# The census machinery has a model-free self-test; it runs inside
+# mynah_dispatch_self_test, which this target exercises along with the
+# cost map's own.
+census-test: $(TARGET)
+	@$(TARGET) --dispatch-map >/dev/null
+	@echo "census + dispatch self-test: PASS (via --dispatch-map collect)"
+	@MYNAH_CENSUS=1 $(TARGET) --self-test >/dev/null
+	@echo "census enabled during --self-test: PASS"
+
+census-parity: $(TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make census-parity MODEL_DIR=models/pocket-en" >&2; exit 2)
+	@bash tests/census_parity.sh parity $(TARGET) "$(MODEL_DIR)"
+
+census-overhead: $(TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make census-overhead MODEL_DIR=models/pocket-en [REPS=3]" >&2; exit 2)
+	@bash tests/census_parity.sh overhead $(TARGET) "$(MODEL_DIR)" $(or $(REPS),3)
+
+# The shim is PRELOADED, never linked into the runtime: libmynah_tts contains
+# no allocator hook at all. See tests/alloc_shim.c.
+# dlsym lives in libdl on glibc < 2.34 and in libc after it; linking -ldl when
+# it exists is harmless, and this is the only object that needs it. The runtime
+# link line is deliberately untouched.
+ALLOC_SHIM_LIBS := $(shell uname -s | grep -qi darwin || echo -ldl)
+ALLOC_SHIM := $(BUILD_DIR)/alloc_shim.so
+alloc-shim: $(ALLOC_SHIM)
+$(ALLOC_SHIM): tests/alloc_shim.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -O2 -fPIC -shared -Wall -Wextra $< -o $@ $(ALLOC_SHIM_LIBS)
+
+alloc-constant-test: $(TARGET) $(ALLOC_SHIM)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make alloc-constant-test MODEL_DIR=models/pocket-en" >&2; exit 2)
+	@SHIM=$(ALLOC_SHIM) bash tests/census_parity.sh alloc $(TARGET) "$(MODEL_DIR)"
+
+# Everything above that does not need a model pack.
+observability-test: census-test
+	@python3 tools/doctor.py --binary $(TARGET) >/dev/null
+	@echo "doctor: PASS (ran, produced a labelled report)"

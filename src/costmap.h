@@ -19,6 +19,24 @@
  *   time to the wrong place.  MYNAH_RGN_MULTI declares a region that
  *   legitimately has several parents (the pool dispatch runs under all of them).
  *
+ *   A DERIVED PARENT IS SATISFIED BY THE TOP OF THE STACK.  A region whose
+ *   mode is "derived" is never on any thread's region stack -- that is what
+ *   derived means -- so requiring it to be the dynamic parent of its declared
+ *   children is a contradiction in the taxonomy, not a finding about the code.
+ *   A child of a derived region therefore matches when it opens at the top of
+ *   the stack.  This is not a loosening: the check still fails if such a child
+ *   opens underneath some UNRELATED region.
+ *
+ *   This rule was written after the fact and it cost something to learn.  From
+ *   the day the first markers landed until 2026-09 the pocket path reported
+ *   nest_mismatch=45 on a clean eleven-step synthesis -- request.total was
+ *   declared "stack" while the only thing that ever wrote it was
+ *   mynah_region_add_ns(), so step.total, step.emit and request.prepare were
+ *   each flagged on every single call.  Under the refusal in
+ *   .work/engineering-method.md 4 a non-zero nest_mismatch invalidates the
+ *   whole report, so the cost map spent two months rejecting its own numbers
+ *   for a reason that was in this table rather than in the engine.
+ *
  *   ACCUMULATION IS THREAD-LOCAL.  No atomic read-modify-write on the hot path
  *   and no allocation inside a region: each thread's block is calloc'd once, on
  *   its first marker, and linked into a global list under a mutex that one
@@ -47,11 +65,18 @@
  *   MYNAH_COSTMAP_JSON ("%d" in the path becomes the pid, so a forked server
  *   writes one file per worker).
  *
- * INSTRUMENTATION IS NOT IN THIS COMMIT.  This file and costmap.c define the
- * taxonomy and the API only; src/inference.c, src/engine_magpie.c and
- * src/codec_nanocodec.c are being refactored in parallel and get their markers
- * afterwards.  The region list below is already shaped for where those markers
- * go — the comment on each id names the call site it is waiting for.
+ * REGIONS THAT CROSS THREADS.  `threads_seen` is carried per region and the
+ * report prints it, because the single most available way to misread this
+ * table is to add two rows that were never on the same thread.  A row marked
+ * `threads=N` (N > 1) is a SUM OVER THREADS: it may exceed the wall clock of
+ * its own parent, and subtracting it from a single-threaded row is meaningless.
+ * The report says so in the header rather than trusting the reader to know.
+ *
+ * INSTRUMENTATION.  E4-2b placed the markers along the PocketTTS path:
+ * src/inference.c carries the driver and placement regions, src/engine_pocket.c
+ * the prepare / prefill / step / flow / codec ones.  Magpie's own graph is not
+ * instrumented and its rows stay absent rather than being faked from a
+ * neighbouring engine's numbers.
  */
 #ifndef MYNAH_TTS_COSTMAP_H
 #define MYNAH_TTS_COSTMAP_H
@@ -87,6 +112,14 @@ enum {
     MYNAH_RGN_LOCAL_STEP,        /* one stacked-stream iteration          (L2) */
     MYNAH_RGN_LOCAL_PROJ,        /* per-stream out projection + embed     (L2) */
 
+    /* ---- continuous-latent head (src/engine_pocket.c) ---------------------
+     * PocketTTS's second weight-bound stage.  It is NOT MYNAH_RGN_LOCAL: a
+     * flow head and a local transformer are different graphs, and reporting
+     * one under the other's name is the kind of borrowed label that makes a
+     * table agree with a story.  Until 2026-09 the pocket call site did
+     * exactly that, which is why this id exists.                            */
+    MYNAH_RGN_FLOW = 24,         /* mynah_flow_head_forward[_batch]            */
+
     /* ---- codec (src/codec_nanocodec.c, src/seanet.c, src/conv1d.c) ------- */
     MYNAH_RGN_CODEC = 28,        /* decode_audio(): frames -> PCM              */
     MYNAH_RGN_CODEC_EMBED,       /* codebook lookup / latent projection   (L2) */
@@ -106,6 +139,14 @@ enum {
     MYNAH_RGN_RT_PARALLEL_WAIT,  /* caller done, waiting for the workers       */
     MYNAH_RGN_MODEL_LOAD,        /* mmap + weight resolve, once per process    */
 
+    /* ---- driver placement (src/inference.c) ------------------------------
+     * WHERE the codec decode ran, which is a scheduling fact and never a
+     * numerical one.  The gang and the lane are alternatives, so a report in
+     * which both are non-zero is itself the finding.                        */
+    MYNAH_RGN_DECODE_GANG = 44,  /* stream_gang(): one wide decode call        */
+    MYNAH_RGN_LANE_WAIT,         /* lane_reap(blocking): THIS slot waiting     */
+    MYNAH_RGN_LANE_DECODE,       /* lane_decode(): the decode, on a lane thread*/
+
     /* ---- parallel work decomposition (MULTI parents) ---------------------
      * Wall time alone cannot say a region ran on two of six workers. These
      * carry the decomposition itself; see mynah_region_units_at below.      */
@@ -113,7 +154,7 @@ enum {
     MYNAH_RGN_WORK_ARGMAX,       /* argmax row blocks claimed per worker       */
     MYNAH_RGN_WORK_CONV,         /* codec conv panels claimed per worker       */
 
-    MYNAH_RGN_MAX = 51
+    MYNAH_RGN_MAX = 52
 };
 
 /* Declared parent of a region that legitimately has several. */
@@ -288,6 +329,23 @@ const char *mynah_region_name(int id);
 int         mynah_region_parent(int id);
 int         mynah_region_level(int id);
 const char *mynah_region_component(int id);
+
+/* ---- the cost map's refusal ---------------------------------------------
+ *
+ * .work/engineering-method.md 4: "the cost map rejects its own numbers if
+ * nest_mismatch != 0, if the region stack overflowed, or if there are
+ * unbalanced ends."  This is that rule as a call, so every consumer refuses
+ * for the same reasons rather than each inventing its own tolerance.
+ *
+ * Returns 0 when the table may be read, or -1 after writing why it may not.
+ * `leaked` is deliberately NOT fatal: an unwind is the designed response to an
+ * error return, the time is still attributed to the region that was open, and
+ * the count is printed.  A mismatch, an overflow or an unbalanced end are
+ * different -- each of them means a number is attributed to the wrong row.
+ *
+ * MYNAH_COST_MAP_STRICT=1 makes the process exit non-zero when this refuses,
+ * so a gate script cannot record a run whose profile was not trustworthy. */
+int mynah_costmap_trustworthy(char *reason, size_t capacity);
 
 /* Model-free check: nesting accepted, bad nesting DETECTED, unbalanced end
  * detected, unwind accounting, and two threads accumulating independently.

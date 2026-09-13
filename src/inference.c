@@ -14,6 +14,7 @@
  * Both walk the same admission block at the top of the same `for(;;)`, which is
  * why an offline batch and a live stream cannot drift apart (CLAUDE.md rule 7).
  */
+#include "costmap.h"
 #include "graph.h"
 #include "mynah_tts_internal.h"
 #include "mynah_util.h"
@@ -87,16 +88,22 @@ static int emit_stream_samples(mynah_tts_audio_callback callback, void *user_dat
                                size_t chunk_samples, char *error,
                                size_t error_capacity) {
     if (callback == NULL || count == 0) return 0;
+    /* The sink's own time, inside the synthesis loop. It is measured here and
+     * not folded into the decode precisely so that a slow consumer cannot be
+     * read as a slow codec (costmap.h, MYNAH_RGN_STREAM_EMIT). */
+    mynah_region_begin(MYNAH_RGN_STREAM_EMIT);
     size_t offset = 0;
     while (offset < count) {
         const size_t remaining = count - offset;
         const size_t chunk = remaining < chunk_samples ? remaining : chunk_samples;
         if (callback(samples + offset, chunk, user_data) != 0) {
+            mynah_region_end(MYNAH_RGN_STREAM_EMIT);
             mynah_graph_error(error, error_capacity, "audio callback aborted streaming");
             return -1;
         }
         offset += chunk;
     }
+    mynah_region_end(MYNAH_RGN_STREAM_EMIT);
     return 0;
 }
 
@@ -124,16 +131,24 @@ typedef struct {
  * point of putting the redirection in the dispatch primitive. */
 static void lane_decode(void *ud) {
     lane_unit *u = (lane_unit *)ud;
+    /* A lane thread owns its own region stack, so this region is a root there
+     * and its time shares no clock with the loop thread's rows. The report
+     * marks it threads=N for exactly that reason. */
+    mynah_region_thread_role("lane");
+    mynah_region_begin(MYNAH_RGN_LANE_DECODE);
     u->error[0] = '\0';
     u->pcm = NULL;
     u->produced = 0;
     u->failed = 0;
+    const int depth = mynah_region_depth();
     if (u->engine->decode_audio(u->ctx, u->first, u->frames, &u->pcm,
                                 &u->produced, u->error, sizeof(u->error)) != 0) {
         u->pcm = NULL;
         u->produced = 0;
         u->failed = 1;
     }
+    mynah_region_unwind(depth);
+    mynah_region_end(MYNAH_RGN_LANE_DECODE);
 }
 
 /* One request in flight.
@@ -283,7 +298,13 @@ static int slot_deliver(synth_slot *slot, float *audio, size_t produced,
 static void lane_reap(synth_slot *slot, size_t index, int blocking) {
     if (!slot->lane_busy) return;
     if (!blocking && mynah_lane_finished((int)index) != 1) return;
+    /* The only place the loop thread ever blocks on the lane. Non-blocking
+     * reaps return above without opening the region, so this row is the real
+     * stall and not the polling. */
+    const int waited = blocking;
+    if (waited) mynah_region_begin(MYNAH_RGN_LANE_WAIT);
     mynah_lane_wait((int)index);
+    if (waited) mynah_region_end(MYNAH_RGN_LANE_WAIT);
     slot->lane_busy = 0;
     lane_unit *u = &slot->unit;
     if (u->failed) {
@@ -442,10 +463,20 @@ static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps 
 
     char shared_error[256];
     shared_error[0] = '\0';
+    /* One wide decode call standing in for `count` narrow ones. `units` is the
+     * gang width, so the report can answer "did the gang ever actually gang"
+     * with units/dispatches rather than with the fact that the code path
+     * exists -- a banner is not a count. */
+    mynah_region_begin(MYNAH_RGN_DECODE_GANG);
+    mynah_region_pool_at(MYNAH_RGN_DECODE_GANG, 1, (long long)count);
+    mynah_region_units_at(MYNAH_RGN_DECODE_GANG, (long long)count);
+    const int gang_depth = mynah_region_depth();
     const int gang_failed =
         mynah_engine_decode_gang(engine, gang, count, first, want, pcm, produced,
                                  decode_failed, scratch, shared_error,
                                  sizeof(shared_error)) != 0;
+    mynah_region_unwind(gang_depth);
+    mynah_region_end(MYNAH_RGN_DECODE_GANG);
     for (size_t g = 0; g < count; ++g) {
         synth_slot *slot = &slots[step_slot[member[g]]];
         if (gang_failed || decode_failed[g]) {
@@ -460,7 +491,20 @@ static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps 
 }
 
 /* Close the sequence and, for the offline sink, decode all of it. */
+static int slot_finalize_inner(const mynah_tts_engine *engine, synth_slot *slot,
+                               int dump);
+
 static int slot_finalize(const mynah_tts_engine *engine, synth_slot *slot, int dump) {
+    mynah_region_begin(MYNAH_RGN_FINALIZE);
+    const int depth = mynah_region_depth();
+    const int rc = slot_finalize_inner(engine, slot, dump);
+    mynah_region_unwind(depth);
+    mynah_region_end(MYNAH_RGN_FINALIZE);
+    return rc;
+}
+
+static int slot_finalize_inner(const mynah_tts_engine *engine, synth_slot *slot,
+                               int dump) {
     if (slot->ctx != NULL) {
         engine->truncate(slot->ctx, engine->frame_count(slot->ctx));
         if (dump && engine->debug_dump != NULL) engine->debug_dump(slot->ctx, "codes");
@@ -646,7 +690,11 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     char shared_error[256];
     shared_error[0] = '\0';
     mynah_engine_state *state = NULL;
-    if (engine->model_init(model, &state, shared_error, sizeof(shared_error)) != 0) {
+    mynah_region_begin(MYNAH_RGN_MODEL_LOAD);
+    const int load_failed =
+        engine->model_init(model, &state, shared_error, sizeof(shared_error)) != 0;
+    mynah_region_end(MYNAH_RGN_MODEL_LOAD);
+    if (load_failed) {
         return refuse_all(sink, shared_error);
     }
     mynah_engine_caps caps;
@@ -751,6 +799,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * At the top of the step, not before the loop. `block` is set only
          * when there is nothing else to do, so a running batch is never held
          * up waiting for an arrival that may not come. */
+        const unsigned long long t_admit =
+            mynah_costmap_level() ? mynah_costmap_now_ns() : 0ull;
         while (!drained && used < max_batch &&
                (sink->running == NULL || sink->running(sink->ud) != 0)) {
             size_t index = max_batch;
@@ -788,6 +838,16 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 if (slot_retire(engine, sink, slot, dump_all) != 0) result = -1;
                 --used;
             }
+        }
+        /* Admission is submitted rather than bracketed: it is declared
+         * "derived" in the table because the region it sits under -- the
+         * request -- is itself derived, and a blocking next_job() waiting for
+         * an arrival is not this service's work. The report prints the mode,
+         * so this row is never read as if it had been measured on one stack
+         * alongside the decode rows. */
+        if (t_admit != 0ull) {
+            mynah_region_add_ns(MYNAH_RGN_RT_ADMISSION,
+                                mynah_costmap_now_ns() - t_admit);
         }
         if (timing && t_prep == t_start) t_prep = mynah_phase_seconds();
         if (used == 0u) break;

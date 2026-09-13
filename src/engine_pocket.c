@@ -15,6 +15,7 @@
 #include "ingot/safetensors.h"
 
 #include "costmap.h"
+#include "dispatch.h"
 #include "flow_head.h"
 #include "kernels.h"
 #include "mynah_tts_internal.h"
@@ -612,6 +613,7 @@ typedef struct {
     unsigned groups;
     unsigned kind_group[4];
     signed char kind_qtype[4]; /* -1 = the cache's encoding */
+    const char *block; /* static census label: "backbone" / "codec_tr" */
 } pocket_linear_hook;
 
 /* The flow head's equivalent.  Its nine kinds are indexed by (index, kind)
@@ -675,6 +677,13 @@ typedef struct {
     int qtype;         /* -1 = whatever the cache resolved to */
     int quantized;     /* 0 = this group is not selected: exact f32 */
     int f32_matvec;    /* 1 = mynah_matvec_bias_f32 for a single row */
+    /* The census identity of this projection. Both are STATIC strings, never
+     * the per-layer cache key: the census keys on the pointers, and merging
+     * layers of one shape is what makes the table readable -- the call count
+     * says how many layers ran. Set even when the group is not quantized, so
+     * an f32 projection is counted rather than invisible. */
+    const char *cs_block;
+    const char *cs_kind;
 } pocket_proj;
 
 
@@ -1130,6 +1139,13 @@ static unsigned pocket_flow_kind_group(mynah_flow_linear_kind kind) {
     }
 }
 
+/* Static census labels. They must outlive every record and be compared by
+ * pointer, which is why they are file-scope literals and not built per call. */
+static const char *const pocket_cs_tar_kind[4] = {"qkv", "oproj", "ffn1", "ffn2"};
+static const char *const pocket_cs_flow_kind[MYNAH_FLOW_LINEAR_KIND_COUNT] = {
+    "tmlp1", "tmlp2", "cond", "inproj", "adaln", "mlp1", "mlp2", "fadaln",
+    "fout"};
+
 static int pocket_tar_proj(const pocket_linear_hook *hook, size_t layer,
                            mynah_transformer_ar_linear_kind kind,
                            pocket_proj *out) {
@@ -1141,6 +1157,8 @@ static int pocket_tar_proj(const pocket_linear_hook *hook, size_t layer,
     out->qcache = hook->qcache;
     out->backend = hook->backend;
     out->qtype = -1;
+    out->cs_block = hook->block != NULL ? hook->block : "transformer";
+    out->cs_kind = pocket_cs_tar_kind[(size_t)kind];
     /* A single row of an unselected group must be exactly what `transformer_ar`
      * computes with no hook installed at all.  That is what makes binding the
      * hook unconditionally numerically free, which in turn is what lets the
@@ -1165,6 +1183,8 @@ static int pocket_flow_proj(const pocket_flow_hook *hook, size_t index,
     out->backend = hook->backend;
     out->qtype = -1;
     out->f32_matvec = 1;
+    out->cs_block = "flow";
+    out->cs_kind = pocket_cs_flow_kind[(size_t)kind];
     const unsigned group = pocket_flow_kind_group(kind);
     if ((hook->groups & group) == 0u) return 0;
     out->quantized = 1;
@@ -1183,14 +1203,35 @@ static int pocket_proj_row(const pocket_proj *p, const float *weight,
                            size_t k, size_t n) {
     if (!p->quantized) {
         if (p->f32_matvec) {
+            MYNAH_CENSUS_OP(p->cs_block, p->cs_kind, k, n, 1u,
+                            MYNAH_CENSUS_PATH_MATVEC_F32, -1);
             mynah_matvec_bias_f32(weight, in, bias, out, n, k);
             return 0;
         }
+        MYNAH_CENSUS_OP(p->cs_block, p->cs_kind, k, n, 1u,
+                        MYNAH_CENSUS_PATH_GEMM, -1);
         return mynah_backend_matmul(p->backend, in, out, 1u, k, n, weight, bias,
                                     NULL, 0);
     }
+    /* The encoding recorded is the one qmat will RESOLVE, not the one asked
+     * for: a build that cannot honour f16 downgrades to f32 inside qmat, and a
+     * census that recorded the request would describe a run that did not
+     * happen. That is the same silent fallback the dispatch table exists to
+     * surface, one layer down. */
+    MYNAH_CENSUS_OP(p->cs_block, p->cs_kind, k, n, 1u,
+                    MYNAH_CENSUS_PATH_MATVEC_Q,
+                    mynah_qmat_qtype_resolved(p->qtype >= 0
+                                                  ? p->qtype
+                                                  : mynah_qmat_cache_qtype(p->qcache)));
     return mynah_qmat_linear_resolved_qt(p->qcache, p->backend, p->name, weight, in,
                                          out, 1u, k, n, bias, p->qtype, NULL, 0);
+}
+
+/* The encoding a quantized projection will actually carry, resolved the same
+ * way in every census call site. */
+static int pocket_cs_qtype(const pocket_proj *p) {
+    return mynah_qmat_qtype_resolved(
+        p->qtype >= 0 ? p->qtype : mynah_qmat_cache_qtype(p->qcache));
 }
 
 
@@ -1228,6 +1269,11 @@ static int pocket_proj_batched(const pocket_proj *p, pocket_call *call,
                                const float *const *in_rows,
                                float *const *out_rows, size_t rows, size_t k,
                                size_t n) {
+    /* This call and only this call is micro-batching engaging. Every other
+     * multi-row path below records ROWLOOP, so "did it engage" is answered by
+     * the calls column of these rows and by nothing else. */
+    MYNAH_CENSUS_OP(p->cs_block, p->cs_kind, k, n, rows,
+                    MYNAH_CENSUS_PATH_BATCHED_Q, pocket_cs_qtype(p));
     return mynah_qmat_linear_batched_qt(p->qcache, p->backend, p->name, weight,
                                         in_rows, out_rows, rows, k, n, bias,
                                         call->qx, call->sx, p->qtype, NULL, 0);
@@ -1259,11 +1305,21 @@ static int pocket_proj_tile(const pocket_proj *p, pocket_call *call,
     if (!p->quantized) {
         /* The exact f32 matmul this group asked for, once for the whole tile
          * instead of once per row. */
+        MYNAH_CENSUS_OP(p->cs_block, p->cs_kind, k, n, count,
+                        MYNAH_CENSUS_PATH_GEMM, -1);
         return mynah_backend_matmul(p->backend, in, out, count, k, n, weight, bias,
                                     NULL, 0);
     }
     /* Quantized but not batchable: keep every row on the encoding it would have
-     * taken alone rather than silently moving it to another one. */
+     * taken alone rather than silently moving it to another one.
+     *
+     * THIS IS THE BRANCH THE BANNER COULD NOT SEE. The feature is compiled,
+     * supported and resolved ON, and this tile still reads the weight `count`
+     * times. It is recorded under its own path name at the tile's width, so it
+     * appears in the census as a row-loop of `count` rather than disappearing
+     * into `count` innocent-looking matvecs. */
+    MYNAH_CENSUS_OP(p->cs_block, p->cs_kind, k, n, count,
+                    MYNAH_CENSUS_PATH_ROWLOOP, pocket_cs_qtype(p));
     for (size_t b = 0; b < count; ++b) {
         if (pocket_proj_row(p, weight, bias, in + b * k, out + b * n, k, n) != 0) {
             return -1;
@@ -1289,6 +1345,14 @@ static int pocket_proj_rows(const pocket_proj *p, pocket_call *call,
     if (batch > 1u && pocket_proj_batchable(p, call, batch, k)) {
         return pocket_proj_batched(p, call, weight, bias, in_rows, out_rows, batch,
                                    k, n);
+    }
+    /* A batch of more than one that did NOT batch: the same finding as above,
+     * on the cross-request axis. A batch of exactly one is not a fallback and
+     * is left to pocket_proj_row to record as the matvec it is. */
+    if (batch > 1u) {
+        MYNAH_CENSUS_OP(p->cs_block, p->cs_kind, k, n, batch,
+                        MYNAH_CENSUS_PATH_ROWLOOP,
+                        p->quantized ? pocket_cs_qtype(p) : -1);
     }
     for (size_t b = 0; b < batch; ++b) {
         if (pocket_proj_row(p, weight, bias, in_rows[b], out_rows[b], k, n) != 0) {
@@ -1470,6 +1534,7 @@ static int pocket_hook_init(pocket_linear_hook *hook, const char *tag,
     hook->qcache = qcache;
     hook->backend = backend;
     hook->groups = groups;
+    hook->block = tag;   /* static: the caller passes a literal */
     for (size_t i = 0; i < 4u; ++i) {
         hook->kind_group[i] = kind_group[i];
         hook->kind_qtype[i] =
@@ -3722,7 +3787,10 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     }
 
     mynah_region_begin(MYNAH_RGN_EMIT);
-    mynah_region_begin(MYNAH_RGN_LOCAL);
+    /* MYNAH_RGN_FLOW, not MYNAH_RGN_LOCAL.  This is the flow head, and a local
+     * transformer is a different graph: reporting it under "local.total" made
+     * the pocket profile read as if it had Magpie's depth head. */
+    mynah_region_begin(MYNAH_RGN_FLOW);
     int flow_failed = 0;
     if (gathered > 0) {
         if (gathered <= flow_capacity && scratch != NULL &&
@@ -3742,7 +3810,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             }
         }
     }
-    mynah_region_end(MYNAH_RGN_LOCAL);
+    mynah_region_end(MYNAH_RGN_FLOW);
     mynah_region_end(MYNAH_RGN_EMIT);
 
     for (size_t i = 0; i < count; ++i) {
