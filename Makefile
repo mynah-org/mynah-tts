@@ -109,7 +109,7 @@ LDLIBS += $(INGOT_LIB)
 # with; without these it honestly says "unset" rather than guessing.
 CPPFLAGS += -DMYNAH_SIMD_PROFILE='"$(SIMD)"' -DMYNAH_GIT_REV='"$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)"'
 
-CORE_SOURCES := src/mynah_tts.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
@@ -133,7 +133,7 @@ WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 .PHONY: all cpu info caps self-test test stream-test driver-test window-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
-        playback-sim-test serving-profile serving-wave serving-soak serving-quantum-sweep \
+        playback-sim-test json-test json-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot
 
 all: $(TARGET)
@@ -177,6 +177,31 @@ $(WINDOW_TEST_TARGET): $(CORE_OBJECTS) $(WINDOW_TEST_OBJECT)
 
 window-test: $(WINDOW_TEST_TARGET)
 	@$(WINDOW_TEST_TARGET)
+
+# The JSON parser (src/json.c) and the two readers it replaced. Model-free,
+# network-free and millisecond-fast, so it runs inside `make test` and therefore
+# inside ubsan/asan -- which is where the byte-substitution sweep and the
+# truncate-at-every-offset pass earn their keep.
+#
+# It links only the three translation units it is about, NOT $(CORE_OBJECTS):
+# a parser test that needs the whole runtime to build is a parser test nobody
+# runs while changing the parser. server/http_util.c comes in because the
+# server's wrappers are part of what is under test.
+JSON_TEST_SOURCES := tests/test_json.c src/json.c server/http_util.c
+JSON_TEST_TARGET := $(BUILD_DIR)/tests/test_json
+$(JSON_TEST_TARGET): $(JSON_TEST_SOURCES) src/json.h server/http_util.h $(BUILD_STAMP)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Iserver $(CFLAGS) $(LDFLAGS) $(JSON_TEST_SOURCES) -lm -lpthread -o $@
+
+json-test: $(JSON_TEST_TARGET)
+	@$(JSON_TEST_TARGET)
+
+# The negative control: break the parser four ways and require json-test to
+# catch each break. A suite that has only ever passed is not evidence that it
+# can fail. Slow-ish (four rebuilds of three files), so it is NOT in `make test`
+# -- run it when the parser or the suite changes.
+json-negative-control:
+	@sh tests/json_negative_control.sh
 
 SERVER_SOURCES := server/main.c server/http_util.c server/stream_out.c server/prefork.c
 SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)
@@ -245,7 +270,7 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 
-test: self-test driver-test window-test playback-sim-test
+test: self-test driver-test window-test json-test playback-sim-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
