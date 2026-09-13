@@ -10,6 +10,7 @@
 #include "transformer_ar.h"
 #include "dispatch.h"
 #include "voice_clone.h"
+#include "engine_pocket.h"
 
 #include <math.h>
 #include <errno.h>
@@ -29,6 +30,7 @@ static void usage(const char *program) {
     printf("Usage:\n");
     printf("  %s --self-test\n", program);
     printf("  %s --inspect MODEL_DIR\n", program);
+    printf("  %s --pocket-self-check MODEL_DIR\n", program);
     printf("  %s --write-test-wav OUTPUT.wav\n", program);
     printf("  %s --synthesize MODEL_DIR --tokens IDS --output OUTPUT.wav [options]\n", program);
     printf("  %s --synthesize MODEL_DIR --text \"hello world\" --lang en --output OUTPUT.wav [options]\n", program);
@@ -579,6 +581,27 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "--write-test-wav") == 0 && argc == 3) {
         return write_test_wav(argv[2]);
+    }
+    /* The two seam properties that need real weights: `step_batch` is atomic
+     * over the batch and `decode_audio_batch` is bit-identical per context.
+     * Separate from `--self-test` because it needs a pack, which `--self-test`
+     * deliberately does not. */
+    if (strcmp(argv[1], "--pocket-self-check") == 0 && argc == 3) {
+        mynah_tts_model *model = NULL;
+        char error[512];
+        if (mynah_tts_model_open(argv[2], &model, error, sizeof(error)) != 0) {
+            fprintf(stderr, "pocket self-check: %s\n", error);
+            return 1;
+        }
+        const int bad =
+            mynah_engine_pocket_self_check(model, error, sizeof(error)) != 0;
+        mynah_tts_model_close(model);
+        if (bad) {
+            fprintf(stderr, "pocket batching self-check failed: %s\n", error);
+            return 1;
+        }
+        puts("pocket batching self-check: PASS");
+        return 0;
     }
     if (strcmp(argv[1], "--inspect") == 0 && argc == 3) {
         mynah_tts_model *model = NULL;

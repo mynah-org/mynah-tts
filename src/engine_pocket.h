@@ -76,9 +76,15 @@
  *
  * Known limits, stated rather than hidden:
  *
- *   - `max_tokens_per_chunk` from the manifest is **not** applied yet.  Long
- *     inputs are prefilled in one go, where upstream would split them; see
- *     .work/pocket-tts-model-facts.md section 8.
+ *   - `max_tokens_per_chunk` from the manifest is read, published and
+ *     reported, and deliberately **not applied**: splitting text is a policy
+ *     over TEXT and the seam hands this engine token ids.  Measured at the
+ *     boundary (E2-5, the block in `ctx_new`): nothing happens at 50, the skip
+ *     degrades smoothly from ~2.55 to ~1.97 frames per token -- which matches
+ *     upstream for a single comma-free sentence, because its splitter does not
+ *     split one either -- but on text WITH sentence boundaries, where upstream
+ *     would have split, past ~150 tokens this engine stops emitting EOS and
+ *     runs to the step budget.  The splitter belongs above the seam.
  *   - Upstream's `prepare_text_prompt` runs before tokenization: it upcases
  *     the first letter, appends terminal punctuation, and pads inputs under
  *     five words with eight spaces.  The seam hands this engine token ids, so
@@ -107,6 +113,18 @@ extern "C" {
 
 /* The vtable, resolved by `mynah_engine_lookup("pocket")`. */
 const mynah_tts_engine *mynah_engine_pocket(void);
+
+/* ------------------------------------------------------- the chunk seam */
+
+/* `max_tokens_per_chunk` from model.json, or 0 when the pack declares none.
+ *
+ * Published so that whoever holds the TEXT can split it, because that is where
+ * the split belongs (E2-5): upstream applies it before tokenization, on
+ * sentence and then clause boundaries, and by the time the request reaches this
+ * seam it carries token ids and that structure is gone.  This engine never
+ * splits; a request over the limit is prefilled whole and says so on stderr
+ * once per model.  See the measurement in the header comment. */
+size_t mynah_engine_pocket_max_tokens_per_chunk(const mynah_engine_state *state);
 
 /* ---------------------------------------------------------------- voices */
 
@@ -173,6 +191,48 @@ float mynah_engine_pocket_eos_logit(const mynah_engine_ctx *ctx);
  * is what feeds back into `input_linear`; the codec sees it denormalized. */
 const float *mynah_engine_pocket_latent(const mynah_engine_ctx *ctx,
                                         size_t index, size_t *out_count);
+
+/* ------------------------------------------------------ batching self-check */
+
+/*
+ * The three seam properties that only real weights can test.
+ *
+ *  - `step_batch` is ATOMIC over the batch (E8-6): a refused call leaves every
+ *    context exactly where it was, which is what makes the driver's
+ *    `step_isolate()` legal.  Forced at BOTH points a step can refuse -- a
+ *    non-finite latent, caught by the pre-flight, and a NaN in a cached key,
+ *    which the attention softmax refuses inside the forward after the rows
+ *    ahead of it have already advanced -- on both the batched and the per-row
+ *    path, and checked against the identical set of requests that never saw the
+ *    refusal.  Only the second injection is load-bearing: with the rollback
+ *    deleted, the first still reports PASS.
+ *  - `decode_audio_batch` is BIT-IDENTICAL per context (E8-4): the same frames
+ *    decoded as a gang and decoded alone come out byte for byte the same, over
+ *    ragged per-context ranges at different positions with different voices and
+ *    seeds.
+ *  - the text-chunk seam is where E2-5 says it is: a text three times over
+ *    `max_tokens_per_chunk` prefills in ONE pass, so the backbone offset after
+ *    `prepare` is the voice prefix plus every token.  It pins the ABSENCE of
+ *    chunking, so that adding it here stops being something that can happen by
+ *    accident.
+ *
+ * All three were, until now, tested only against the synthetic engine in
+ * `tests/test_driver.c` -- whose step cannot fail inside a real graph and whose
+ * codec carries no state, so none of them had ever been exercised where it can
+ * actually break.  Needs a model pack, so it is not part of `--self-test`:
+ * pass an opened model and it does the rest.  Runs at widths 2, 4, 8 and 16,
+ * and is wired up as `mynah-tts --pocket-self-check MODEL_DIR`.
+ *
+ * Every bit-identity assertion below has only ever been taken on macOS with
+ * clang.  It is NOT known to hold on the Linux ARM production target, where
+ * `qmat`'s own batched-vs-single gate currently fails by about one ULP under
+ * gcc with `-ffast-math`; until that is understood, a green run here is a
+ * statement about this host and this compiler.
+ *
+ * Returns 0, or -1 with a message in `error`.
+ */
+int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
+                                   size_t error_capacity);
 
 #ifdef __cplusplus
 }

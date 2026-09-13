@@ -346,6 +346,10 @@ typedef struct {
     size_t speaker_proj_input_dim;
 
     char language[32];
+    /* Provenance (E3-13). A voice KV is a slice of THIS checkpoint's attention
+     * state, so it is only meaningful against the weights that produced it; the
+     * two strings below are what a pack has to identify itself by. */
+    char revision[64];
     char weights_tts[128];
     char tokenizer_file[128];
     char speakers_file[128];
@@ -354,7 +358,8 @@ typedef struct {
 
 typedef struct {
     char *name;
-    char *file; /* relative to the pack directory */
+    char *file;    /* relative to the pack directory                          */
+    size_t frames; /* positions speakers.json declares; 0 = not declared      */
 } pocket_voice;
 
 /* ------------------------------------------------------ quantization groups
@@ -676,6 +681,10 @@ typedef struct {
 /* ---------------------------------------------------------- model weights */
 
 struct mynah_engine_state {
+    /* E2-5: the text-chunk seam has been reported once for this model. Benign
+     * if two threads race -- the worst case is the warning printed twice. */
+    int chunk_warned;
+
     pocket_config cfg;
 
     char *model_dir;
@@ -1170,6 +1179,7 @@ static int pocket_proj_row(const pocket_proj *p, const float *weight,
                                          out, 1u, k, n, bias, p->qtype, NULL, 0);
 }
 
+
 /*
  * May `rows` rows share one pass over the weight?
  *
@@ -1208,6 +1218,7 @@ static int pocket_proj_batched(const pocket_proj *p, pocket_call *call,
                                      in_rows, out_rows, rows, k, n, bias, call->qx,
                                      call->sx, NULL, 0);
 }
+
 
 /*
  * `count` contiguous rows that are consecutive positions of ONE request.
@@ -1725,6 +1736,7 @@ static int pocket_config_load(const char *manifest, pocket_config *cfg,
 
     cfg_opt_string(manifest, "language", cfg->language, sizeof(cfg->language),
                    "unknown");
+    cfg_opt_string(manifest, "revision", cfg->revision, sizeof(cfg->revision), "");
     cfg_opt_string(manifest, "tokenizer_file", cfg->tokenizer_file,
                    sizeof(cfg->tokenizer_file), "tokenizer.model");
     cfg_opt_string(manifest, "speakers_file", cfg->speakers_file,
@@ -1833,6 +1845,129 @@ static int pocket_config_load(const char *manifest, pocket_config *cfg,
 
 /* ------------------------------------------------------------- speakers */
 
+/* ------------------------------------------------------------ provenance
+ *
+ * E3-13.  A voice file is a KV CACHE: 126-ish positions of this checkpoint's
+ * own attention state, written by this checkpoint's own weights.  Handed to a
+ * different model, or to a different revision of the same one, the numbers are
+ * not merely a different speaker -- they are a prefix the weights never
+ * produced, and upstream's symptom for it is that the model THEN NEVER EMITS
+ * EOS.  Accepting such a file therefore turns a mis-copied pack into unbounded
+ * generation, which for a server is a denial of service it inflicts on itself.
+ * So it is refused, and refused at pack load rather than at first synthesis:
+ * the pack is either coherent or it is not, and finding out on request 40 000
+ * is finding out too late.
+ *
+ * What actually identifies a voice's provenance, in the pack we ship:
+ *
+ *   `speakers.json`  -- written by the converter from the same source the
+ *                       weights came from -- carries `revision`, `language`
+ *                       and `model_sha256`, and one `frames` count per voice.
+ *   `model.json`     carries `revision` and `language`.
+ *   `source.json`    carries the sha256 of the upstream weights file.
+ *
+ * Note what `revision` alone does NOT do: every language pack in this family
+ * comes from ONE HuggingFace revision, so `revision` is identical for english
+ * and italian and cannot tell them apart.  `model_sha256` can (it is per
+ * language file) and so can `language`.  The chain enforced below is therefore
+ * three links, not one:
+ *
+ *   the voice FILE     -> its speakers.json entry      (declared `frames`)
+ *   speakers.json      -> the weights file             (`model_sha256`)
+ *   speakers.json      -> model.json                   (`revision`, `language`)
+ *
+ * Each link is checked against something already inside the pack, so nothing
+ * has to be hashed at load time and the cost is 26 safetensors HEADERS.
+ */
+
+/* The sha256 `source.json` records for the weights file, or "" when the file
+ * is absent or says nothing.  Optional by design: a pack assembled by hand is
+ * still usable, it just has one fewer link in the chain. */
+static void pocket_source_weights_sha(const char *model_dir, char *out,
+                                      size_t capacity) {
+    if (capacity > 0) out[0] = '\0';
+    char path[POCKET_PATH_MAX];
+    if (pocket_join(path, sizeof(path), model_dir, "source.json", NULL, 0) != 0) {
+        return;
+    }
+    char *text = pocket_read_text(path, POCKET_MANIFEST_MAX, NULL, 0);
+    if (text == NULL) return;
+    const char *first = pj_array_first(pj_object_get(text, "files"));
+    for (const char *e = first; e != NULL; e = pj_array_next(e)) {
+        char role[32];
+        if (pj_string_copy(pj_object_get(e, "role"), role, sizeof(role)) != 0) continue;
+        if (strcmp(role, "weights") != 0) continue;
+        (void)pj_string_copy(pj_object_get(e, "sha256"), out, capacity);
+        break;
+    }
+    free(text);
+}
+
+/* Every layer of one voice file, checked against the model's own dimensions,
+ * with the number of cached positions handed back.
+ *
+ * Shared by the pack-load sweep and by `ctx_new`, because a voice that is only
+ * checked on the path that opens it for use is not checked at pack load, and a
+ * voice that is only checked at pack load could still be swapped underneath a
+ * long-running process. */
+static int pocket_voice_validate(ingot_st *file, const pocket_config *cfg,
+                                 const char *voice_name, size_t *out_positions,
+                                 char *error, size_t capacity) {
+    char name[POCKET_NAME_MAX];
+    size_t positions = 0;
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", l);
+        const ingot_st_tensor *tensor = ingot_st_find(file, name);
+        if (tensor == NULL) {
+            pocket_error(error, capacity, "voice %s has no %s", voice_name, name);
+            return -1;
+        }
+        /* [K/V, batch, T, heads, head_dim]: the batch axis is the only thing
+         * between this file and `transformer_ar`'s own layout.  Heads and
+         * head_dim are the first provenance check there is -- they are the
+         * model's shape, and a cache from another architecture fails here. */
+        if (tensor->rank != 5 || tensor->shape[0] != 2u || tensor->shape[1] != 1u ||
+            tensor->shape[3] != cfg->heads || tensor->shape[4] != cfg->head_dim) {
+            pocket_error(error, capacity, "voice %s: %s is not [2, 1, T, %zu, %zu]",
+                         voice_name, name, cfg->heads, cfg->head_dim);
+            return -1;
+        }
+        if (l == 0) {
+            positions = (size_t)tensor->shape[2];
+        } else if ((size_t)tensor->shape[2] != positions) {
+            pocket_error(error, capacity,
+                         "voice %s: layer %zu has %llu positions, layer 0 has %zu",
+                         voice_name, l, (unsigned long long)tensor->shape[2],
+                         positions);
+            return -1;
+        }
+
+        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/offset", l);
+        const ingot_st_tensor *offset = ingot_st_find(file, name);
+        if (offset == NULL || offset->nelem != 1u) {
+            pocket_error(error, capacity, "voice %s has no scalar %s", voice_name,
+                         name);
+            return -1;
+        }
+        float declared = 0.0f;
+        if (ingot_st_to_f32(file, offset, &declared) != 0 ||
+            (size_t)declared != positions) {
+            /* A partially filled cache would put the NaN padding upstream's
+             * `_expand_kv_cache` writes inside the prefix. */
+            pocket_error(error, capacity,
+                         "voice %s: %s says %g of %zu positions are valid",
+                         voice_name, name, (double)declared, positions);
+            return -1;
+        }
+    }
+    if (positions == 0) {
+        pocket_error(error, capacity, "voice %s is empty", voice_name);
+        return -1;
+    }
+    *out_positions = positions;
+    return 0;
+}
+
 static void pocket_voices_free(pocket_voice *voices, size_t count) {
     if (voices == NULL) return;
     for (size_t i = 0; i < count; ++i) {
@@ -1883,9 +2018,68 @@ static int pocket_voices_load(mynah_engine_state *state, const char *path,
             pocket_error(error, capacity, "out of memory reading %s", path);
             return -1;
         }
+        voices[index].frames = 0u;
+        {
+            double declared = 0.0;
+            if (pj_number(pj_object_get(e, "frames"), &declared) == 0 &&
+                declared > 0.0) {
+                voices[index].frames = (size_t)declared;
+            }
+        }
         ++index;
     }
+
+    /* ---- provenance, link by link (E3-13) --------------------------------
+     * All three come out of the pack itself, so nothing is hashed at load. */
+    char declared_revision[64];
+    char declared_language[32];
+    char declared_sha[80];
+    const int has_revision =
+        pj_string_copy(pj_object_get(text, "revision"), declared_revision,
+                       sizeof(declared_revision)) == 0;
+    const int has_language =
+        pj_string_copy(pj_object_get(text, "language"), declared_language,
+                       sizeof(declared_language)) == 0;
+    const int has_sha = pj_string_copy(pj_object_get(text, "model_sha256"),
+                                       declared_sha, sizeof(declared_sha)) == 0;
     free(text);
+
+    if (has_revision && state->cfg.revision[0] != '\0' &&
+        strcmp(declared_revision, state->cfg.revision) != 0) {
+        pocket_voices_free(voices, count);
+        pocket_error(error, capacity,
+                     "%s: these voices belong to revision %s, model.json is %s; a "
+                     "voice KV from another revision is a prefix these weights never "
+                     "produced and the model then never emits EOS",
+                     path, declared_revision, state->cfg.revision);
+        return -1;
+    }
+    /* Every language in this family shares one upstream revision, so the
+     * revision check above cannot separate english from italian. This can. */
+    if (has_language && state->cfg.language[0] != '\0' &&
+        strcmp(state->cfg.language, "unknown") != 0 &&
+        strcmp(declared_language, state->cfg.language) != 0) {
+        pocket_voices_free(voices, count);
+        pocket_error(error, capacity,
+                     "%s: these voices are for %s, model.json says %s; the language "
+                     "packs are independently trained, not fine-tuned from a shared "
+                     "base, so their KV caches are not interchangeable",
+                     path, declared_language, state->cfg.language);
+        return -1;
+    }
+    if (has_sha) {
+        char weights_sha[80];
+        pocket_source_weights_sha(state->model_dir, weights_sha,
+                                  sizeof(weights_sha));
+        if (weights_sha[0] != '\0' && strcmp(weights_sha, declared_sha) != 0) {
+            pocket_voices_free(voices, count);
+            pocket_error(error, capacity,
+                         "%s: these voices were captured from weights %.16s..., "
+                         "source.json records %.16s...",
+                         path, declared_sha, weights_sha);
+            return -1;
+        }
+    }
 
     state->voices = voices;
     state->voice_count = count;
@@ -1894,6 +2088,33 @@ static int pocket_voices_load(mynah_engine_state *state, const char *path,
                      "model.json says %zu speakers, %s lists %zu",
                      state->cfg.speaker_count, path, count);
         return -1;
+    }
+
+    /* The last link: each voice FILE against its own table entry. Opening 26
+     * safetensors headers is what turns "the table is coherent" into "the
+     * files are the ones the table describes" -- the case where somebody drops
+     * another pack's voice into this voices/ directory. */
+    for (size_t i = 0; i < count; ++i) {
+        char voice_path[POCKET_PATH_MAX];
+        if (pocket_join(voice_path, sizeof(voice_path), state->model_dir,
+                        voices[i].file, error, capacity) != 0) {
+            return -1;
+        }
+        ingot_st *file = NULL;
+        if (ingot_st_open(&file, voice_path, error, capacity) != 0) return -1;
+        size_t positions = 0;
+        const int bad =
+            pocket_voice_validate(file, &state->cfg, voices[i].name, &positions,
+                                  error, capacity) != 0;
+        ingot_st_close(file);
+        if (bad) return -1;
+        if (voices[i].frames != 0u && positions != voices[i].frames) {
+            pocket_error(error, capacity,
+                         "voice %s holds %zu positions, %s declares %zu; this file "
+                         "does not belong to this pack",
+                         voices[i].name, positions, path, voices[i].frames);
+            return -1;
+        }
     }
     return 0;
 }
@@ -2612,65 +2833,27 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
 static int pocket_voice_open(mynah_engine_ctx *ctx, char *error, size_t capacity) {
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
+    const pocket_voice *voice = &state->voices[ctx->speaker];
     char path[POCKET_PATH_MAX];
-    if (pocket_join(path, sizeof(path), state->model_dir,
-                    state->voices[ctx->speaker].file, error, capacity) != 0) {
+    if (pocket_join(path, sizeof(path), state->model_dir, voice->file, error,
+                    capacity) != 0) {
         return -1;
     }
     if (ingot_st_open(&ctx->voice_file, path, error, capacity) != 0) return -1;
 
-    char name[POCKET_NAME_MAX];
     size_t positions = 0;
-    for (size_t l = 0; l < cfg->layers; ++l) {
-        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", l);
-        const ingot_st_tensor *tensor = ingot_st_find(ctx->voice_file, name);
-        if (tensor == NULL) {
-            pocket_error(error, capacity, "voice %s has no %s",
-                         state->voices[ctx->speaker].name, name);
-            return -1;
-        }
-        /* [K/V, batch, T, heads, head_dim]: the batch axis is the only thing
-         * between this file and `transformer_ar`'s own layout. */
-        if (tensor->rank != 5 || tensor->shape[0] != 2u || tensor->shape[1] != 1u ||
-            tensor->shape[3] != cfg->heads || tensor->shape[4] != cfg->head_dim) {
-            pocket_error(error, capacity,
-                         "voice %s: %s is not [2, 1, T, %zu, %zu]",
-                         state->voices[ctx->speaker].name, name, cfg->heads,
-                         cfg->head_dim);
-            return -1;
-        }
-        if (l == 0) {
-            positions = (size_t)tensor->shape[2];
-        } else if ((size_t)tensor->shape[2] != positions) {
-            pocket_error(error, capacity,
-                         "voice %s: layer %zu has %llu positions, layer 0 has %zu",
-                         state->voices[ctx->speaker].name, l,
-                         (unsigned long long)tensor->shape[2], positions);
-            return -1;
-        }
-
-        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/offset", l);
-        const ingot_st_tensor *offset = ingot_st_find(ctx->voice_file, name);
-        if (offset == NULL || offset->nelem != 1u) {
-            pocket_error(error, capacity, "voice %s has no scalar %s",
-                         state->voices[ctx->speaker].name, name);
-            return -1;
-        }
-        float declared = 0.0f;
-        if (ingot_st_to_f32(ctx->voice_file, offset, &declared) != 0 ||
-            (size_t)declared != positions) {
-            /* A partially filled cache would put the NaN padding upstream's
-             * `_expand_kv_cache` writes inside the prefix. */
-            pocket_error(error, capacity,
-                         "voice %s: %s says %g of %zu positions are valid",
-                         state->voices[ctx->speaker].name, name, (double)declared,
-                         positions);
-            return -1;
-        }
+    if (pocket_voice_validate(ctx->voice_file, cfg, voice->name, &positions, error,
+                              capacity) != 0) {
+        return -1;
     }
-    if (positions == 0) {
-        pocket_error(error, capacity, "voice %s is empty",
-                     state->voices[ctx->speaker].name);
+    /* Re-checked here, not only at pack load: the file could have been replaced
+     * underneath a long-running process, and this is the last moment before its
+     * numbers become the model's attention prefix (E3-13). */
+    if (voice->frames != 0u && positions != voice->frames) {
+        pocket_error(error, capacity,
+                     "voice %s holds %zu positions, the pack declares %zu; this "
+                     "file does not belong to this pack",
+                     voice->name, positions, voice->frames);
         return -1;
     }
     ctx->voice_positions = positions;
@@ -2741,6 +2924,65 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
             return -1;
         }
         ctx->text_ids[i] = id;
+    }
+
+    /* ---- the text-chunk seam, E2-5 -------------------------------------
+     *
+     * `model.json` declares `max_tokens_per_chunk: 50` and THIS ENGINE DOES NOT
+     * APPLY IT.  That is a decision, not an omission, and the reasons are below
+     * together with what it costs -- because what it costs is not small.
+     *
+     * WHERE UPSTREAM PUTS IT.  `generate_audio_stream` splits the TEXT before
+     * the model sees it (`split_into_best_sentences`): sentence boundaries
+     * first, then commas/semicolons/colons for an oversized sentence, then
+     * greedy packing up to `max_tokens`.  Each chunk is a separate generation
+     * from a deep copy of the voice state, and the audio is concatenated.  So
+     * it is a policy over text, applied above the model -- and the seam here
+     * hands this engine TOKEN IDS, by which point the sentence structure the
+     * splitter needs is gone.  Putting it here would mean an engine that
+     * re-derives text structure from ids, which is the wrong place twice over.
+     *
+     * WHAT IT COSTS, MEASURED (models/pocket-en, alba, seed 1234, this machine,
+     * duration only -- the machine compiles for correctness, so nothing here is
+     * a timing claim):
+     *
+     *   tokens   15    25    40    49    64    78    91   116   150
+     *   frames   38    64    96   126   147   170   178   233   295
+     *   f/token 2.53  2.56  2.40  2.57  2.30  2.18  1.96  2.01  1.97
+     *
+     * Two things in that table.  First, NOTHING HAPPENS AT 50: the degradation
+     * is smooth, ~2.55 frames per token below the limit falling to ~1.97 well
+     * above it, i.e. about a quarter of the speech quietly missing.  That is
+     * upstream's documented skip (`.work/pocket-tts-model-facts.md` §8) and we
+     * REPRODUCE IT EXACTLY for a single comma-free sentence -- upstream's own
+     * splitter does not split one either: its sub-split finds no boundary, it
+     * keeps the oversized segment and only logs a warning.
+     *
+     * Second, and this is the divergence that matters: for text with SENTENCE
+     * boundaries upstream would have split, and we do not.  Measured on the
+     * same words cut into eight-word sentences, at 152 tokens and beyond the
+     * model NEVER EMITS EOS and runs to the step budget -- 900 steps, 72
+     * seconds of audio for the input.  That is the same unbounded-generation
+     * shape E3-13 is about, reached by long input instead of a wrong voice, and
+     * it is why this is a warning rather than a footnote.
+     *
+     * Re-checked in a later session on DIFFERENT eight-word sentences, which
+     * matters because it says the threshold is a property of the length and not
+     * of one paragraph: 116 tokens -> 241 frames (2.08 f/token, EOS reached),
+     * 173 tokens -> 900 frames, i.e. the whole `--max-steps 900` budget and
+     * 72.000 s of audio, with no EOS ever emitted.
+     *
+     * So: the limit is read, published (`_max_tokens_per_chunk`) and reported,
+     * and the split belongs to whoever still holds the text.  The step budget
+     * is what bounds the damage in the meantime. */
+    if (state->cfg.max_tokens_per_chunk != 0u &&
+        ctx->text_length > state->cfg.max_tokens_per_chunk && !state->chunk_warned) {
+        state->chunk_warned = 1;
+        fprintf(stderr,
+                "mynah-tts: %zu text tokens exceeds max_tokens_per_chunk %zu; this "
+                "engine does not split text, and past roughly three times the limit "
+                "the model may stop emitting EOS and run to the step budget (E2-5)\n",
+                ctx->text_length, state->cfg.max_tokens_per_chunk);
     }
 
     if (pocket_voice_open(ctx, error, capacity) != 0) {
@@ -3006,6 +3248,29 @@ static int pocket_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
 
 /* ------------------------------------------------------------------- steps */
 
+/* Is every value in `v` finite?
+ *
+ * `transformer_ar` asks this of its own input and refuses a non-finite one, but
+ * it asks INSIDE the forward -- which, on the per-row path, is after the rows
+ * before it have already advanced.  Asking here instead turns the one
+ * data-dependent refusal a step can raise into a pre-flight, which is what
+ * `step_batch`'s atomicity is built out of.
+ *
+ * The exponent bit test rather than isfinite(), because the answer must not
+ * depend on how this file was compiled.  The default CFLAGS pair `-ffast-math`
+ * with `-fno-finite-math-only`, which keeps isfinite() honest -- but CFLAGS is
+ * `?=` and the GPU variants set their own, so a build where -ffast-math wins
+ * and isfinite() folds to a constant is one overridden variable away.  The bit
+ * test cannot be optimized into a lie. */
+static int pocket_all_finite(const float *v, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t bits;
+        memcpy(&bits, &v[i], sizeof(bits));
+        if ((bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000)) return 0;
+    }
+    return 1;
+}
+
 /*
  * One AR step for `count` independent requests.
  *
@@ -3018,6 +3283,46 @@ static int pocket_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
  * The previous latent's embedding stays per request: `input_linear` is
  * [1024][32], 128 KB, small enough that stacking it would cost more in
  * bookkeeping than it saves in traffic.
+ *
+ * ## ATOMIC OVER THE BATCH (E8-6)
+ *
+ * `tts_engine.h` requires that a non-zero return mean NO context advanced, and
+ * the driver's failure isolation is built on it: `step_isolate()` re-steps the
+ * batch one context at a time to find whose data was refused, and that re-step
+ * is only legal if the refused call moved nobody.  An engine that advances
+ * 0..i-1 and then refuses i gets its survivors double-stepped, and no driver
+ * can see that from the outside.  At the `max_batch` of 16 this engine
+ * declares, that is one bad request corrupting fifteen strangers.
+ *
+ * It is enforced in three layers, in this order:
+ *
+ *   1. **A pre-flight that ends before the first mutation.**  Everything that
+ *      can be decided from state alone -- prepared / finished / same model /
+ *      not named twice, the batch width, and the KV capacity each backbone
+ *      needs for one more position -- is decided for EVERY context before any
+ *      of them is touched.
+ *   2. **Mutations ordered so the fallible ones come first.**  The input
+ *      projection can fail (it reaches the backend matmul), so it runs before
+ *      anything advances, and it writes only `step_input`, which is a pure
+ *      function of the request's own previous latent -- untouched by a refused
+ *      call, so a re-step recomputes the identical bytes.  Its output is then
+ *      checked for finiteness, which is the one data-dependent refusal the
+ *      backbone raises, so that refusal also happens with every offset still
+ *      where it was.
+ *   3. **A rollback for what is left.**  After that, the only observable thing
+ *      a backbone call advances is each state's KV offset, and
+ *      `_state_set_offset` puts it back.  The K/V a partial pass wrote sits at
+ *      or past the restored offset, where it is unreachable by exactly the
+ *      invariant `_state_reset` already relies on: nothing from the offset
+ *      onward is ever read, and it is overwritten before it becomes readable.
+ *      So the snapshot/restore below is a true rollback and not a best effort
+ *      -- and it holds whether the batch went through `_step_batch` or, with
+ *      no batch scratch, through the per-row loop, which is the path that was
+ *      actually non-atomic.
+ *
+ * `budget_exhausted` is decided in the pre-flight and committed at the end for
+ * the same reason: on a refused call the context has to look untouched, and a
+ * flag the caller can observe is part of "untouched".
  */
 static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                              mynah_engine_scratch *scratch, char *error,
@@ -3027,9 +3332,20 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         return -1;
     }
     if (count == 0u) return 0;
+    /* The staging arrays below are fixed-size because the decode loop must not
+     * allocate (CLAUDE.md rule 4), so a batch wider than this engine declares
+     * is refused rather than silently narrowed -- and refused before anything
+     * has moved, which is the whole contract. */
+    if (count > POCKET_MAX_BATCH) {
+        pocket_error(error, capacity,
+                     "pocket: batch of %zu exceeds max_batch %u", count,
+                     POCKET_MAX_BATCH);
+        return -1;
+    }
 
-    /* Every admission check first: a batched step fails for all its slots or
-     * for none, so none of them may have moved when one is refused. */
+    /* ---- 1. pre-flight: decided for every context, mutating none of them --- */
+    size_t offset_before[POCKET_MAX_BATCH];
+    int will_step[POCKET_MAX_BATCH];
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         if (ctx == NULL || !ctx->prepared) {
@@ -3046,6 +3362,35 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                          "pocket: request %zu belongs to a different model", i);
             return -1;
         }
+        for (size_t j = 0; j < i; ++j) {
+            /* Two slots naming one context would have the second write of a
+             * position overwrite the first, and the rollback below would then
+             * restore the wrong offset. */
+            if (ctxs[j] == ctx) {
+                pocket_error(error, capacity,
+                             "pocket: request %zu appears twice in the batch", i);
+                return -1;
+            }
+        }
+        /* A request that has used its whole step budget retires in `emit`; it
+         * must not be stepped, and it must not take the batch down with it. */
+        will_step[i] = (ctx->step < ctx->max_steps);
+        offset_before[i] = mynah_transformer_ar_state_offset(ctx->backbone);
+        if (will_step[i]) {
+            const mynah_transformer_ar_config *bc =
+                mynah_transformer_ar_state_config(ctx->backbone);
+            if (bc == NULL || offset_before[i] >= bc->max_seq_len) {
+                /* `ctx_new` sizes the cache at voice + text + max_steps + 1, so
+                 * this is unreachable for a context this engine built -- which
+                 * is exactly why it is checked here rather than left to fail
+                 * inside the forward, one row at a time, after its neighbours
+                 * have already moved. */
+                pocket_error(error, capacity,
+                             "pocket: request %zu has no KV capacity left (%zu positions)",
+                             i, offset_before[i]);
+                return -1;
+            }
+        }
     }
 
     const mynah_engine_state *state = ctxs[0]->state;
@@ -3056,17 +3401,13 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     const int can_gather = scratch != NULL && scratch->backbone_batch != NULL &&
                            scratch->states != NULL && count <= batch_capacity;
 
+    /* ---- 2. the fallible mutation, before anything advances --------------- */
     mynah_region_begin(MYNAH_RGN_STEP);
     mynah_region_begin2(MYNAH_RGN_STEP_EMBED);
     size_t live = 0;
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
-        /* A request that has used its whole step budget retires in `emit`; it
-         * must not be stepped, and it must not take the batch down with it. */
-        if (ctx->step >= ctx->max_steps) {
-            ctx->budget_exhausted = 1;
-            continue;
-        }
+        if (!will_step[i]) continue;
         /* BOS is a tracked fact, not a NaN: no latent yet means bos_emb. */
         const float *previous =
             (ctx->frames > 0)
@@ -3085,6 +3426,17 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                          "pocket: the input projection failed for request %zu", i);
             return -1;
         }
+        /* The backbone refuses a non-finite input -- and on the per-row path it
+         * refuses it row by row, after the earlier rows have stepped.  Asked
+         * here it is a pre-flight, and it names the guilty request instead of
+         * whichever row the loop happened to reach first. */
+        if (!pocket_all_finite(ctx->step_input, cfg->hidden_dim)) {
+            mynah_region_end2(MYNAH_RGN_STEP_EMBED);
+            mynah_region_end(MYNAH_RGN_STEP);
+            pocket_error(error, capacity,
+                         "pocket: request %zu produced a non-finite step input", i);
+            return -1;
+        }
         if (can_gather) {
             scratch->states[live] = ctx->backbone;
             scratch->inputs[live] = ctx->step_input;
@@ -3094,6 +3446,7 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     }
     mynah_region_end2(MYNAH_RGN_STEP_EMBED);
 
+    /* ---- 3. the only call that advances anything, with a rollback --------- */
     mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
     int failed = 0;
     size_t failed_at = 0;
@@ -3106,10 +3459,12 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     } else {
         /* No batch scratch (or a single live request): the same graph, one row
          * at a time.  Not a second implementation -- `_step_batch` of one row
-         * is `_step` -- just the path with nothing to share. */
+         * is `_step` -- just the path with nothing to share.  It is also the
+         * path that cannot fail atomically on its own, which is what the
+         * rollback below is for. */
         for (size_t i = 0; i < count && !failed; ++i) {
             mynah_engine_ctx *ctx = ctxs[i];
-            if (ctx->budget_exhausted) continue;
+            if (!will_step[i]) continue;
             if (mynah_transformer_ar_step(ctx->backbone, &ctx->backbone_w,
                                           ctx->step_input, ctx->hidden) != 0) {
                 failed = 1;
@@ -3120,16 +3475,29 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
     mynah_region_end(MYNAH_RGN_STEP);
     if (failed) {
+        /* Put every offset back.  Whatever K/V a partial pass wrote sits at or
+         * past the restored offset, where nothing reads it and the next step
+         * overwrites it -- the invariant `_state_reset` is already built on. */
+        for (size_t i = 0; i < count; ++i) {
+            if (!will_step[i]) continue;
+            (void)mynah_transformer_ar_state_set_offset(ctxs[i]->backbone,
+                                                        offset_before[i], NULL, 0);
+        }
         pocket_error(error, capacity,
                      "pocket: the backbone step failed for request %zu of %zu",
                      failed_at, count);
         return -1;
     }
+
+    /* ---- 4. commit ------------------------------------------------------- */
+    for (size_t i = 0; i < count; ++i) {
+        if (!will_step[i]) ctxs[i]->budget_exhausted = 1;
+    }
     /* The parity dump is captured after the step, once per stepped request,
      * because the step no longer happens inside the per-request loop. */
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
-        if (ctx->budget_exhausted || ctx->dump == NULL) continue;
+        if (!will_step[i] || ctx->dump == NULL) continue;
         if (ctx->dump->steps < ctx->dump->capacity) {
             memcpy(ctx->dump->hidden + ctx->dump->steps * cfg->hidden_dim,
                    ctx->hidden, cfg->hidden_dim * sizeof(float));
@@ -3326,18 +3694,127 @@ static void pocket_truncate(mynah_engine_ctx *ctx, size_t frame_count) {
 
 /* ------------------------------------------------------------------ audio */
 
-static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
-                               size_t frame_count, float **out_samples,
-                               size_t *out_count, char *error, size_t capacity) {
-    if (out_samples != NULL) *out_samples = NULL;
-    if (out_count != NULL) *out_count = 0;
-    if (ctx == NULL || out_samples == NULL || out_count == NULL) {
+/*
+ * ONE latent frame through the codec, into `ctx->pcm`.
+ *
+ * This is the whole codec, and it exists as its own function because the engine
+ * now decodes frames from two places -- one context's range, and a gang of
+ * ranges belonging to different contexts.  Those are two schedules over one
+ * body, not two implementations (CLAUDE.md rule 7), and writing it that way is
+ * what makes `decode_audio_batch`'s bit-identity STRUCTURAL rather than a
+ * property the tests have to keep rediscovering: there is no second arithmetic
+ * path for a frame to take when it happens to share a call.
+ *
+ * Every operation reads and writes this context's own state only -- the codec
+ * ring buffers, the decoder transformer's KV, the position counter -- so the
+ * order in which contexts are visited cannot reach any of the numbers.
+ */
+static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
+                               size_t capacity) {
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const size_t stride = cfg->upsample_stride;
+    const size_t dim = cfg->codec_dim;
+    const int depth = mynah_region_depth();
+
+    const float *latent = ctx->latents + frame * cfg->latent_dim;
+    mynah_region_begin2(MYNAH_RGN_CODEC_EMBED);
+    for (size_t d = 0; d < cfg->latent_dim; ++d) {
+        ctx->denorm[d] = latent[d] * state->emb_std[d] + state->emb_mean[d];
+    }
+    /* quantizer.output_proj is Conv1d(32, 512, 1): one matvec per frame. */
+    if (pocket_single_linear(state, POCKET_QG_CODEC_CONV, state->codec_conv_key,
+                             state->codec_conv_qtype, state->quantizer_proj, NULL,
+                             ctx->denorm, ctx->codec_in, cfg->latent_dim, dim) != 0) {
+        mynah_region_unwind(depth);
+        pocket_error(error, capacity, "pocket: the quantizer projection failed");
+        return -1;
+    }
+    if (mynah_seanet_upsample(ctx->codec, &state->upsample, ctx->codec_in, 1u,
+                              ctx->codec_up) != 0) {
+        mynah_region_unwind(depth);
+        pocket_error(error, capacity, "pocket: the codec upsample failed");
+        return -1;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_EMBED);
+
+    /* The decoder transformer runs at the encoder frame rate and its inner
+     * layers see [positions, channels]; the transpose belongs here, at the
+     * same place the reference puts it. */
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    for (size_t c = 0; c < dim; ++c) {
+        for (size_t t = 0; t < stride; ++t) {
+            ctx->codec_seq[t * dim + c] = ctx->codec_up[c * stride + t];
+        }
+    }
+    /* Two counters, both mandatory (E2-3): the ring buffers inside the SEANet
+     * state, and this position. If they ever disagree the audio degrades
+     * smoothly and silently, so they are compared instead. */
+    if (mynah_seanet_state_position(ctx->codec) !=
+        mynah_transformer_ar_state_offset(ctx->codec_transformer)) {
+        mynah_region_unwind(depth);
+        pocket_error(error, capacity,
+                     "pocket: codec position %zu != decoder transformer offset %zu",
+                     mynah_seanet_state_position(ctx->codec),
+                     mynah_transformer_ar_state_offset(ctx->codec_transformer));
+        return -1;
+    }
+    if (mynah_transformer_ar_prefill(ctx->codec_transformer, &ctx->codec_w,
+                                     ctx->codec_seq, stride, ctx->codec_out) != 0) {
+        mynah_region_unwind(depth);
+        pocket_error(error, capacity, "pocket: the decoder transformer failed");
+        return -1;
+    }
+    for (size_t t = 0; t < stride; ++t) {
+        for (size_t c = 0; c < dim; ++c) {
+            ctx->codec_back[c * stride + t] = ctx->codec_out[t * dim + c];
+        }
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
+        const size_t slot = ctx->dump->decoded;
+        memcpy(ctx->dump->denorm + slot * cfg->latent_dim, ctx->denorm,
+               cfg->latent_dim * sizeof(float));
+        memcpy(ctx->dump->codec_tf + slot * ctx->dump->codec_row, ctx->codec_out,
+               ctx->dump->codec_row * sizeof(float));
+    }
+    mynah_region_begin2(MYNAH_RGN_CODEC_CONV);
+    if (mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
+                            ctx->pcm) != 0) {
+        mynah_region_unwind(depth);
+        pocket_error(error, capacity, "pocket: the SEANet decoder failed");
+        return -1;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_CONV);
+    mynah_seanet_state_advance(ctx->codec, 1u);
+    if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
+        memcpy(ctx->dump->pcm + ctx->dump->decoded * ctx->dump->frame_samples,
+               ctx->pcm, ctx->dump->frame_samples * sizeof(float));
+        ++ctx->dump->decoded;
+    }
+    return 0;
+}
+
+/*
+ * Admit one range and hand back the buffer its samples go into.
+ *
+ * Shared by the single and the gang entry points so that a range is judged by
+ * exactly one piece of code: the gang's promise is that a context cannot tell
+ * who else was in the call, and that has to cover which ranges are legal, not
+ * only what the samples come out as.
+ *
+ * `*out_pcm` is malloc'd and becomes the caller's on success; on any refusal it
+ * is NULL and nothing about the context has changed.
+ */
+static int pocket_decode_admit(mynah_engine_ctx *ctx, size_t first_frame,
+                               size_t frame_count, float **out_pcm,
+                               size_t *out_samples, char *error, size_t capacity) {
+    *out_pcm = NULL;
+    *out_samples = 0;
+    if (ctx == NULL) {
         pocket_error(error, capacity, "pocket: null argument decoding audio");
         return -1;
     }
-    const mynah_engine_state *state = ctx->state;
-    const pocket_config *cfg = &state->cfg;
-
     if (first_frame != ctx->decoded_frames) {
         /* The codec carries state instead of replaying context (E2-3), so a
          * gap or a rewind cannot be served; saying so beats emitting audio
@@ -3359,115 +3836,207 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
     if (frame_count == 0) return 0;
 
     size_t samples = 0;
-    if (pocket_mul(frame_count, cfg->samples_per_frame, &samples) != 0) {
+    if (pocket_mul(frame_count, ctx->state->cfg.samples_per_frame, &samples) != 0) {
         pocket_error(error, capacity, "pocket: sample count overflow");
         return -1;
     }
     float *pcm = mynah_alloc_floats(samples, error, capacity);
     if (pcm == NULL) return -1;
+    *out_pcm = pcm;
+    *out_samples = samples;
+    return 0;
+}
 
-    const size_t stride = cfg->upsample_stride;
-    const size_t dim = cfg->codec_dim;
+static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
+                               size_t frame_count, float **out_samples,
+                               size_t *out_count, char *error, size_t capacity) {
+    if (out_samples != NULL) *out_samples = NULL;
+    if (out_count != NULL) *out_count = 0;
+    if (ctx == NULL || out_samples == NULL || out_count == NULL) {
+        pocket_error(error, capacity, "pocket: null argument decoding audio");
+        return -1;
+    }
+    float *pcm = NULL;
+    size_t samples = 0;
+    if (pocket_decode_admit(ctx, first_frame, frame_count, &pcm, &samples, error,
+                            capacity) != 0) {
+        return -1;
+    }
+    if (pcm == NULL) return 0; /* an empty range is a legal no-op */
+
+    const size_t frame_samples = ctx->state->cfg.samples_per_frame;
     mynah_region_begin(MYNAH_RGN_CODEC);
-    const int codec_depth = mynah_region_depth();
     for (size_t f = 0; f < frame_count; ++f) {
-        const float *latent = ctx->latents + (first_frame + f) * cfg->latent_dim;
-        mynah_region_begin2(MYNAH_RGN_CODEC_EMBED);
-        for (size_t d = 0; d < cfg->latent_dim; ++d) {
-            ctx->denorm[d] = latent[d] * state->emb_std[d] + state->emb_mean[d];
-        }
-        /* quantizer.output_proj is Conv1d(32, 512, 1): one matvec per frame. */
-        if (pocket_single_linear(state, POCKET_QG_CODEC_CONV,
-                                 state->codec_conv_key, state->codec_conv_qtype,
-                                 state->quantizer_proj,
-                                 NULL, ctx->denorm, ctx->codec_in,
-                                 cfg->latent_dim, dim) != 0) {
+        if (pocket_decode_frame(ctx, first_frame + f, error, capacity) != 0) {
             free(pcm);
-            mynah_region_unwind(codec_depth);
             mynah_region_end(MYNAH_RGN_CODEC);
-            pocket_error(error, capacity, "pocket: the quantizer projection failed");
+            /* The codec advanced through `f` frames that nobody will ever hear
+             * and cannot be rewound, so `decoded_frames` now disagrees with the
+             * conv rings. A later range would pass the contiguity check and be
+             * decoded from the wrong history; saying the request is over is the
+             * difference between a failed request and silent corruption. */
+            ctx->broken = 1;
             return -1;
         }
-
-        if (mynah_seanet_upsample(ctx->codec, &state->upsample, ctx->codec_in, 1u,
-                                  ctx->codec_up) != 0) {
-            free(pcm);
-            mynah_region_unwind(codec_depth);
-            mynah_region_end(MYNAH_RGN_CODEC);
-            pocket_error(error, capacity, "pocket: the codec upsample failed");
-            return -1;
-        }
-        mynah_region_end2(MYNAH_RGN_CODEC_EMBED);
-
-        /* The decoder transformer runs at the encoder frame rate and its inner
-         * layers see [positions, channels]; the transpose belongs here, at the
-         * same place the reference puts it. */
-        mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
-        for (size_t c = 0; c < dim; ++c) {
-            for (size_t t = 0; t < stride; ++t) {
-                ctx->codec_seq[t * dim + c] = ctx->codec_up[c * stride + t];
-            }
-        }
-        /* Two counters, both mandatory (E2-3): the ring buffers inside the
-         * SEANet state, and this position. If they ever disagree the audio
-         * degrades smoothly and silently, so they are compared instead. */
-        if (mynah_seanet_state_position(ctx->codec) !=
-            mynah_transformer_ar_state_offset(ctx->codec_transformer)) {
-            free(pcm);
-            mynah_region_unwind(codec_depth);
-            mynah_region_end(MYNAH_RGN_CODEC);
-            pocket_error(error, capacity,
-                         "pocket: codec position %zu != decoder transformer offset %zu",
-                         mynah_seanet_state_position(ctx->codec),
-                         mynah_transformer_ar_state_offset(ctx->codec_transformer));
-            return -1;
-        }
-        if (mynah_transformer_ar_prefill(ctx->codec_transformer, &ctx->codec_w,
-                                         ctx->codec_seq, stride,
-                                         ctx->codec_out) != 0) {
-            free(pcm);
-            mynah_region_unwind(codec_depth);
-            mynah_region_end(MYNAH_RGN_CODEC);
-            pocket_error(error, capacity, "pocket: the decoder transformer failed");
-            return -1;
-        }
-        for (size_t t = 0; t < stride; ++t) {
-            for (size_t c = 0; c < dim; ++c) {
-                ctx->codec_back[c * stride + t] = ctx->codec_out[t * dim + c];
-            }
-        }
-        mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
-        if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
-            const size_t slot = ctx->dump->decoded;
-            memcpy(ctx->dump->denorm + slot * cfg->latent_dim, ctx->denorm,
-                   cfg->latent_dim * sizeof(float));
-            memcpy(ctx->dump->codec_tf + slot * ctx->dump->codec_row,
-                   ctx->codec_out, ctx->dump->codec_row * sizeof(float));
-        }
-        mynah_region_begin2(MYNAH_RGN_CODEC_CONV);
-        if (mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
-                                ctx->pcm) != 0) {
-            free(pcm);
-            mynah_region_unwind(codec_depth);
-            mynah_region_end(MYNAH_RGN_CODEC);
-            pocket_error(error, capacity, "pocket: the SEANet decoder failed");
-            return -1;
-        }
-        mynah_region_end2(MYNAH_RGN_CODEC_CONV);
-        mynah_seanet_state_advance(ctx->codec, 1u);
-        memcpy(pcm + f * cfg->samples_per_frame, ctx->pcm,
-               cfg->samples_per_frame * sizeof(float));
-        if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
-            memcpy(ctx->dump->pcm + ctx->dump->decoded * ctx->dump->frame_samples,
-                   ctx->pcm, ctx->dump->frame_samples * sizeof(float));
-            ++ctx->dump->decoded;
-        }
+        memcpy(pcm + f * frame_samples, ctx->pcm, frame_samples * sizeof(float));
     }
     mynah_region_end(MYNAH_RGN_CODEC);
 
     ctx->decoded_frames += frame_count;
     *out_samples = pcm;
     *out_count = samples;
+    return 0;
+}
+
+/*
+ * ---- decode a gang ----------------------------------------------------
+ *
+ * The contract is in `tts_engine.h`; what follows is how this engine meets it
+ * and, just as importantly, what it does NOT yet do.
+ *
+ * ## Bit-identity, and why it is not a tolerance here
+ *
+ * Whoever shares a call, how many there are and in what order they appear are a
+ * scheduling decision the driver remakes every step on timing, so anything that
+ * crossed between rows would make a request's audio depend on server load. The
+ * guarantee here is structural rather than tested-and-hoped: every frame goes
+ * through `pocket_decode_frame` above, which touches this context's buffers and
+ * no others, so the loop below is free to visit contexts in any order it likes
+ * and there is no arithmetic anywhere that can see the row count. Nothing was
+ * relaxed to make batching possible, which is the reason it is safe.
+ *
+ * ## Frame-major, and what that is and is not worth
+ *
+ * The gang is walked frame index by frame index, all contexts at each index,
+ * rather than context by context. That is NOT a performance claim: the codec
+ * transformer and the SEANet stack are still one pass over their own weights
+ * per context per frame, exactly as before, and nothing here was benchmarked
+ * (this machine compiles for correctness only). Frame-major is chosen because
+ * it is the schedule a shared pass would need, and adopting it now means the
+ * step that actually shares work is local to this function instead of a
+ * restructuring of it.
+ *
+ * What blocks that step is named rather than implied: the 41.8% item is the
+ * decoder transformer, and sharing it across contexts needs a cross-request
+ * PREFILL in `transformer_ar` -- `_step_batch` takes one position per state,
+ * while a codec frame is `upsample_stride` consecutive positions of one state.
+ * That module belongs to another lane. Until it exists the only cross-context
+ * arithmetic available here is `quantizer.output_proj`, 32x512 against the
+ * transformer's millions, and batching it would trade a measurable risk to
+ * bit-identity for an unmeasurable gain. It was deliberately left alone.
+ *
+ * ## Blast radius
+ *
+ * A context whose range is refused, or whose codec fails partway, sets failed[i]
+ * and keeps its neighbours running: it is dropped from the remaining frame
+ * passes and every other context finishes its own range. The return value is
+ * non-zero only for something that belongs to no single context.
+ */
+static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                                     const size_t *first_frame,
+                                     const size_t *frame_count, float **out_samples,
+                                     size_t *out_count, int *failed,
+                                     mynah_engine_scratch *scratch, char *error,
+                                     size_t capacity) {
+    /* The driver owns the arrays and pre-clears them; nothing in `scratch` is
+     * needed while the codec is per context, and nothing here keeps a pointer
+     * into any of them. */
+    (void)scratch;
+    if (ctxs == NULL || first_frame == NULL || frame_count == NULL ||
+        out_samples == NULL || out_count == NULL || failed == NULL) {
+        pocket_error(error, capacity, "pocket: null argument decoding a gang");
+        return -1;
+    }
+    if (count == 0u) return 0;
+    if (count > POCKET_MAX_BATCH) {
+        /* Not a buffer bound -- this function stages nothing and the loop below
+         * would serve any width. It is refused because a gang wider than the
+         * `max_batch` this engine publishes means the driver and the engine
+         * disagree about the declared width, and the useful moment to say so is
+         * the first call, not whenever some other limit happens to bite. It
+         * belongs to no single context, so it is a whole-call failure. */
+        for (size_t i = 0; i < count; ++i) failed[i] = 1;
+        pocket_error(error, capacity, "pocket: gang of %zu exceeds max_batch %u",
+                     count, POCKET_MAX_BATCH);
+        return -1;
+    }
+
+    /* `tts_engine.h` grants that no context appears twice, so this is checking
+     * the driver rather than the input -- but a duplicate is the one violation
+     * that would corrupt audio silently instead of failing: both entries pass
+     * the contiguity check, because `decoded_frames` is only advanced at the
+     * end, and the frames then interleave through one codec state. At a width
+     * of at most 16 the check is 120 comparisons. */
+    for (size_t i = 0; i < count; ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (ctxs[j] != ctxs[i]) continue;
+            for (size_t k = 0; k < count; ++k) failed[k] = 1;
+            pocket_error(error, capacity,
+                         "pocket: request %zu appears twice in the gang", i);
+            return -1;
+        }
+    }
+
+    size_t longest = 0;
+    int reported = 0;
+    char one_error[256];
+    for (size_t i = 0; i < count; ++i) {
+        float *pcm = NULL;
+        size_t samples = 0;
+        one_error[0] = '\0';
+        if (pocket_decode_admit(ctxs[i], first_frame[i], frame_count[i], &pcm,
+                                &samples, one_error, sizeof(one_error)) != 0) {
+            failed[i] = 1;
+            if (!reported) {
+                pocket_error(error, capacity, "%s",
+                             one_error[0] != '\0' ? one_error
+                                                  : "pocket: decoding audio failed");
+                reported = 1;
+            }
+            continue;
+        }
+        out_samples[i] = pcm;   /* NULL for an empty range, which is legal */
+        out_count[i] = samples;
+        if (pcm != NULL && frame_count[i] > longest) longest = frame_count[i];
+    }
+
+    if (longest == 0u) return 0;
+    mynah_region_begin(MYNAH_RGN_CODEC);
+    for (size_t f = 0; f < longest; ++f) {
+        for (size_t i = 0; i < count; ++i) {
+            if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+            mynah_engine_ctx *ctx = ctxs[i];
+            const size_t frame_samples = ctx->state->cfg.samples_per_frame;
+            one_error[0] = '\0';
+            if (pocket_decode_frame(ctx, first_frame[i] + f, one_error,
+                                    sizeof(one_error)) != 0) {
+                /* This context's codec advanced through frames nobody will hear
+                 * and cannot be rewound -- same reasoning as the single-range
+                 * path. Its neighbours are untouched and keep decoding. */
+                ctx->broken = 1;
+                free(out_samples[i]);
+                out_samples[i] = NULL;
+                out_count[i] = 0u;
+                failed[i] = 1;
+                if (!reported) {
+                    pocket_error(error, capacity, "%s",
+                                 one_error[0] != '\0'
+                                     ? one_error
+                                     : "pocket: decoding audio failed");
+                    reported = 1;
+                }
+                continue;
+            }
+            memcpy(out_samples[i] + f * frame_samples, ctx->pcm,
+                   frame_samples * sizeof(float));
+        }
+    }
+    mynah_region_end(MYNAH_RGN_CODEC);
+
+    for (size_t i = 0; i < count; ++i) {
+        if (failed[i] || out_samples[i] == NULL) continue;
+        ctxs[i]->decoded_frames += frame_count[i];
+    }
     return 0;
 }
 
@@ -3622,12 +4191,17 @@ static const mynah_tts_engine pocket_engine = {
     pocket_decode_audio,
     pocket_scratch_new,
     pocket_scratch_free,
-    NULL,
+    NULL,                      /* debug_dump: the dump is written in ctx_free */
+    pocket_decode_audio_batch, /* APPENDED, never inserted (tts_engine.h) */
 };
 
 const mynah_tts_engine *mynah_engine_pocket(void) { return &pocket_engine; }
 
 /* ------------------------------------------------------------- accessors */
+
+size_t mynah_engine_pocket_max_tokens_per_chunk(const mynah_engine_state *state) {
+    return (state == NULL) ? 0u : state->cfg.max_tokens_per_chunk;
+}
 
 size_t mynah_engine_pocket_voice_count(const mynah_engine_state *state) {
     return (state == NULL) ? 0u : state->voice_count;
@@ -3694,4 +4268,532 @@ const float *mynah_engine_pocket_latent(const mynah_engine_ctx *ctx, size_t inde
     if (ctx == NULL || index >= ctx->frames) return NULL;
     if (out_count != NULL) *out_count = ctx->state->cfg.latent_dim;
     return ctx->latents + index * ctx->state->cfg.latent_dim;
+}
+
+/* ------------------------------------------------- the batching self-check
+ *
+ * Two properties of `tts_engine.h` that only real weights can test, and that
+ * until now nothing did: `step_batch` is atomic over the batch (E8-6), and
+ * `decode_audio_batch` is bit-identical per context whoever shared the call
+ * (E8-4).  Both had been checked only against the synthetic engine in
+ * `tests/test_driver.c`, which is exactly the wrong place to check them: the
+ * synthetic engine's step cannot fail halfway through a real graph and its
+ * codec carries no state, so neither property was ever exercised where it can
+ * actually break.
+ *
+ * Needs a pack, so it is not part of `--self-test`; it takes an opened model
+ * and does the rest itself.
+ */
+
+typedef struct {
+    const char *text;
+    unsigned speaker;
+    uint64_t seed;
+} pocket_check_case;
+
+#define POCKET_CHECK_MAX 16u
+
+/* Two sets of contexts built from the SAME cases.  Everything in this engine is
+ * a deterministic function of (weights, text, voice, seed), so set A and set B
+ * are two runs of one experiment and any difference between them is the thing
+ * being tested. */
+typedef struct {
+    mynah_engine_ctx *ctx[POCKET_CHECK_MAX];
+    size_t count;
+} pocket_check_set;
+
+static void pocket_check_set_free(pocket_check_set *set) {
+    for (size_t i = 0; i < set->count; ++i) pocket_ctx_free(set->ctx[i]);
+    set->count = 0;
+}
+
+static int pocket_check_set_new(mynah_engine_state *state,
+                                const mynah_tts_model *model,
+                                const pocket_check_case *cases, size_t count,
+                                size_t max_steps, pocket_check_set *set,
+                                char *error, size_t capacity) {
+    memset(set, 0, sizeof(*set));
+    for (size_t i = 0; i < count; ++i) {
+        int *ids = NULL;
+        size_t n_ids = 0;
+        if (mynah_engine_pocket_tokenize(state, cases[i].text,
+                                         strlen(cases[i].text), &ids, &n_ids, error,
+                                         capacity) != 0) {
+            pocket_check_set_free(set);
+            return -1;
+        }
+        mynah_tts_request request;
+        memset(&request, 0, sizeof(request));
+        request.text_ids = ids;
+        request.text_length = n_ids;
+        request.speaker = cases[i].speaker;
+        request.temperature = -1.0f;
+        mynah_engine_ctx *ctx = NULL;
+        const int bad = pocket_ctx_new(model, state, &request, max_steps,
+                                       cases[i].seed, &ctx, error, capacity) != 0;
+        free(ids);
+        if (bad) {
+            pocket_check_set_free(set);
+            return -1;
+        }
+        set->ctx[set->count++] = ctx;
+        if (pocket_prepare(ctx, error, capacity) != 0) {
+            pocket_check_set_free(set);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* The contexts of `set` that are still generating, in order.
+ *
+ * A set of sixteen real requests does not stay sixteen: they reach EOS at
+ * different steps, which is the whole reason the driver has slots.  Everything
+ * below therefore steps the LIVE subset, exactly as `step_live()` does. */
+static size_t pocket_check_live(const pocket_check_set *set,
+                                mynah_engine_ctx **out) {
+    size_t live = 0;
+    for (size_t i = 0; i < set->count; ++i) {
+        mynah_engine_ctx *ctx = set->ctx[i];
+        if (ctx->eos || ctx->broken) continue;
+        out[live++] = ctx;
+    }
+    return live;
+}
+
+/* One AR step for whoever is still live, through the engine's own entry points.
+ * Returns the number of contexts that stepped, or -1. */
+static long pocket_check_advance(pocket_check_set *set,
+                                 mynah_engine_scratch *scratch, char *error,
+                                 size_t capacity) {
+    mynah_engine_ctx *live_ctx[POCKET_CHECK_MAX];
+    mynah_engine_step_result results[POCKET_CHECK_MAX];
+    const size_t live = pocket_check_live(set, live_ctx);
+    if (live == 0u) return 0;
+    mynah_engine_ctx *const *ctxs = live_ctx;
+    if (pocket_step_batch(ctxs, live, scratch, error, capacity) != 0) return -1;
+    if (pocket_emit_batch(ctxs, live, results, scratch, error, capacity) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < live; ++i) {
+        if (results[i].failed) {
+            pocket_error(error, capacity, "self-check: request %zu failed to emit", i);
+            return -1;
+        }
+    }
+    return (long)live;
+}
+
+/* E8-6.  A step that refuses must leave every context exactly as it found it.
+ *
+ * FORCING THE FAILURE, in the two places a step can refuse.  The distinction is
+ * not academic: it is the difference between a gate that tests the property and
+ * one that only looks like it does.
+ *
+ *   - `POCKET_INJECT_LATENT_NAN` writes a NaN into the victim's most recent
+ *     latent, so `input_linear` produces a non-finite step input.  That is
+ *     refused by the PRE-FLIGHT, before any context is touched.  It exercises
+ *     layer 2 of the atomicity argument and nothing below it.
+ *   - `POCKET_INJECT_KV_NAN` writes a NaN into a position the victim's backbone
+ *     already has cached, which makes that row's attention scores non-finite;
+ *     `mynah_softmax_f32` refuses them INSIDE the forward, after the rows ahead
+ *     of it in the per-row loop have already advanced.  This is the only
+ *     failure mode the ROLLBACK exists for, and the latent injection cannot
+ *     reach it, because the pre-flight catches that one first.
+ *
+ * Measured, because a blind gate is worse than no gate.  With the rollback
+ * deleted the latent injection still reports PASS, while the KV injection fails
+ * on the first per-row width it reaches -- "step atomicity at width 2 (per-row,
+ * cached NaN, in-backbone): step_batch is not atomic -- request 0 advanced from
+ * 143 to 144 on a call that was refused".  Only one of the two injections is
+ * load-bearing, and it is not the obvious one, so both are run.
+ *
+ * Neither adds a fault-injection hook to the production path: one writes a
+ * float a diverged request could have written itself, the other writes one
+ * through `_state_kv`, which the header already exposes.  The single corrupted
+ * float is saved and restored around the attempt, so what follows is the run
+ * that would have happened had the refusal never occurred -- which is the whole
+ * question.
+ *
+ * Run with `scratch == NULL` as well as with a real one, because the two take
+ * different paths and it is the NULL one -- the per-row loop -- that is not
+ * atomic on its own.  `mynah_transformer_ar_step_batch` validates every row and
+ * advances every offset only after the forward has succeeded for all of them,
+ * so the batched path was already atomic; the per-row loop is what E8-6 is
+ * about.
+ */
+typedef enum {
+    POCKET_INJECT_LATENT_NAN = 0, /* refused by the pre-flight */
+    POCKET_INJECT_KV_NAN = 1      /* refused inside the backbone */
+} pocket_inject;
+static int pocket_check_atomic(mynah_engine_state *state,
+                               const mynah_tts_model *model,
+                               const pocket_check_case *cases, size_t count,
+                               size_t max_steps, mynah_engine_scratch *scratch,
+                               pocket_inject mode, const char *what, char *error,
+                               size_t capacity) {
+    const size_t latent_dim = state->cfg.latent_dim;
+    const size_t hidden_dim = state->cfg.hidden_dim;
+    const size_t warmup = 3u;
+    const size_t victim = count / 2u;
+
+    pocket_check_set a, b;
+    if (pocket_check_set_new(state, model, cases, count, max_steps, &a, error,
+                             capacity) != 0) {
+        return -1;
+    }
+    if (pocket_check_set_new(state, model, cases, count, max_steps, &b, error,
+                             capacity) != 0) {
+        pocket_check_set_free(&a);
+        return -1;
+    }
+    int rc = -1;
+    for (size_t step = 0; step < warmup; ++step) {
+        if (pocket_check_advance(&a, scratch, error, capacity) < 0 ||
+            pocket_check_advance(&b, scratch, error, capacity) < 0) {
+            goto done;
+        }
+    }
+
+    /* ---- the refused call, on set B only ---- */
+    {
+        mynah_engine_ctx *live_ctx[POCKET_CHECK_MAX];
+        const size_t live = pocket_check_live(&b, live_ctx);
+        if (live < 2u) {
+            pocket_error(error, capacity,
+                         "%s: only %zu requests still live; the test needs a "
+                         "neighbour in front of the victim",
+                         what, live);
+            goto done;
+        }
+        /* The victim sits in the middle on purpose: the defect being tested is
+         * that contexts BEFORE it in the array advance before it refuses. */
+        const size_t v = (victim < live) ? victim : live / 2u;
+        const size_t vi = (v == 0u) ? live / 2u : v;
+        if (vi == 0u) {
+            pocket_error(error, capacity,
+                         "%s: the victim landed at slot 0, so nothing steps "
+                         "before it and the test would be blind",
+                         what);
+            goto done;
+        }
+        mynah_engine_ctx *bad = live_ctx[vi];
+
+        /* Exactly one float is corrupted, and it is put back below. */
+        float *poison = NULL;
+        if (mode == POCKET_INJECT_LATENT_NAN) {
+            poison = bad->latents + (bad->frames - 1u) * latent_dim;
+        } else {
+            /* The last cached position, which every query attends to whatever
+             * `context` is set to -- position 0 would fall outside a sliding
+             * window and quietly stop being a fault at all.  K is the first
+             * half of the [2][max_seq_len][heads][head_dim] block, and
+             * heads*head_dim == hidden_dim is checked at config load. */
+            const size_t offset = mynah_transformer_ar_state_offset(bad->backbone);
+            float *kv = mynah_transformer_ar_state_kv(bad->backbone, 0u);
+            if (kv == NULL || offset == 0u) {
+                pocket_error(error, capacity,
+                             "%s: no cached position to corrupt", what);
+                goto done;
+            }
+            poison = kv + (offset - 1u) * hidden_dim;
+        }
+        const float saved = *poison;
+        const uint32_t nan_bits = UINT32_C(0x7fc00000);
+        memcpy(poison, &nan_bits, sizeof(nan_bits));
+
+        size_t before[POCKET_CHECK_MAX];
+        int budget_before[POCKET_CHECK_MAX];
+        for (size_t i = 0; i < live; ++i) {
+            before[i] = mynah_transformer_ar_state_offset(live_ctx[i]->backbone);
+            budget_before[i] = live_ctx[i]->budget_exhausted;
+        }
+        char ignored[256];
+        mynah_engine_ctx *const *ctxs = live_ctx;
+        if (pocket_step_batch(ctxs, live, scratch, ignored, sizeof(ignored)) == 0) {
+            pocket_error(error, capacity,
+                         "%s: a step with a non-finite input was accepted", what);
+            goto done;
+        }
+        for (size_t i = 0; i < live; ++i) {
+            const size_t now = mynah_transformer_ar_state_offset(live_ctx[i]->backbone);
+            if (now != before[i]) {
+                pocket_error(error, capacity,
+                             "%s: step_batch is not atomic -- request %zu advanced "
+                             "from %zu to %zu on a call that was refused",
+                             what, i, before[i], now);
+                goto done;
+            }
+            if (live_ctx[i]->budget_exhausted != budget_before[i] ||
+                live_ctx[i]->broken || live_ctx[i]->eos) {
+                pocket_error(error, capacity,
+                             "%s: a refused step changed request %zu's flags", what, i);
+                goto done;
+            }
+        }
+        *poison = saved;
+    }
+
+    /* ---- and now the run that should be indistinguishable from A's ---- */
+    for (size_t step = 0; step < warmup; ++step) {
+        if (pocket_check_advance(&a, scratch, error, capacity) < 0 ||
+            pocket_check_advance(&b, scratch, error, capacity) < 0) {
+            goto done;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (a.ctx[i]->frames != b.ctx[i]->frames ||
+            mynah_transformer_ar_state_offset(a.ctx[i]->backbone) !=
+                mynah_transformer_ar_state_offset(b.ctx[i]->backbone)) {
+            pocket_error(error, capacity,
+                         "%s: request %zu diverged in length after a refused step",
+                         what, i);
+            goto done;
+        }
+        if (memcmp(a.ctx[i]->hidden, b.ctx[i]->hidden,
+                   hidden_dim * sizeof(float)) != 0 ||
+            memcmp(a.ctx[i]->latents, b.ctx[i]->latents,
+                   a.ctx[i]->frames * latent_dim * sizeof(float)) != 0) {
+            pocket_error(error, capacity,
+                         "%s: request %zu is not bit-identical to the same request "
+                         "that never shared a refused step",
+                         what, i);
+            goto done;
+        }
+    }
+    rc = 0;
+done:
+    pocket_check_set_free(&a);
+    pocket_check_set_free(&b);
+    return rc;
+}
+
+/* E8-4.  `decode_audio_batch` must hand each context exactly what
+ * `decode_audio` would have handed it alone.
+ *
+ * Set A decodes context by context; set B decodes the same frames as a gang.
+ * The ranges are deliberately ragged -- context i takes 1, 2 or 3 frames a turn
+ * -- because the driver ramps each slot's quantum separately and a gang whose
+ * members are all the same length is the one case that cannot catch a length
+ * assumption. */
+static int pocket_check_gang(mynah_engine_state *state,
+                             const mynah_tts_model *model,
+                             const pocket_check_case *cases, size_t count,
+                             size_t max_steps, mynah_engine_scratch *scratch,
+                             char *error, size_t capacity) {
+    pocket_check_set a, b;
+    if (pocket_check_set_new(state, model, cases, count, max_steps, &a, error,
+                             capacity) != 0) {
+        return -1;
+    }
+    if (pocket_check_set_new(state, model, cases, count, max_steps, &b, error,
+                             capacity) != 0) {
+        pocket_check_set_free(&a);
+        return -1;
+    }
+    int rc = -1;
+    size_t done_frames[POCKET_CHECK_MAX];
+    for (size_t i = 0; i < count; ++i) done_frames[i] = 0;
+
+    for (size_t round = 0; round < 6u; ++round) {
+        /* Generate a few more frames for both sets in lockstep. */
+        for (size_t step = 0; step < 3u; ++step) {
+            if (pocket_check_advance(&a, scratch, error, capacity) < 0 ||
+                pocket_check_advance(&b, scratch, error, capacity) < 0) {
+                goto done;
+            }
+        }
+        size_t first[POCKET_CHECK_MAX];
+        size_t want[POCKET_CHECK_MAX];
+        float *got[POCKET_CHECK_MAX];
+        size_t got_n[POCKET_CHECK_MAX];
+        int failed[POCKET_CHECK_MAX];
+        for (size_t i = 0; i < count; ++i) {
+            const size_t available = b.ctx[i]->frames - done_frames[i];
+            size_t quantum = (i % 3u) + 1u;
+            if (quantum > available) quantum = available;
+            first[i] = done_frames[i];
+            want[i] = quantum;
+            got[i] = NULL;
+            got_n[i] = 0;
+            failed[i] = 0;
+        }
+        mynah_engine_ctx *const *bctxs = b.ctx;
+        if (pocket_decode_audio_batch(bctxs, count, first, want, got, got_n, failed,
+                                      scratch, error, capacity) != 0) {
+            goto done;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            float *solo = NULL;
+            size_t solo_n = 0;
+            const int bad = failed[i] ||
+                            pocket_decode_audio(a.ctx[i], first[i], want[i], &solo,
+                                                &solo_n, error, capacity) != 0;
+            if (bad || solo_n != got_n[i] ||
+                (solo_n != 0 &&
+                 memcmp(solo, got[i], solo_n * sizeof(float)) != 0)) {
+                pocket_error(error, capacity,
+                             "decode gang: request %zu of %zu differs from its own "
+                             "solo decode of frames [%zu, %zu)",
+                             i, count, first[i], first[i] + want[i]);
+                free(solo);
+                /* Only what this loop has not handed back yet: got[0..i-1] were
+                 * already freed at the bottom of their own iteration. */
+                for (size_t j = i; j < count; ++j) free(got[j]);
+                goto done;
+            }
+            free(solo);
+            free(got[i]);
+            done_frames[i] += want[i];
+        }
+    }
+    rc = 0;
+done:
+    pocket_check_set_free(&a);
+    pocket_check_set_free(&b);
+    return rc;
+}
+
+/* E2-5.  Pins what this engine does at and across `max_tokens_per_chunk`:
+ * NOTHING.  The text is prefilled in one pass whether it is under the limit or
+ * three times over it, so the backbone offset after `prepare` is exactly the
+ * voice prefix plus every text token.  That equality is the assertion, and it
+ * is what stops chunking from being added here by accident -- if a split ever
+ * appears in this engine, this fires. */
+static int pocket_check_chunk_seam(mynah_engine_state *state,
+                                   const mynah_tts_model *model, char *error,
+                                   size_t capacity) {
+    const size_t limit = state->cfg.max_tokens_per_chunk;
+    if (limit == 0u) return 0; /* the pack declares none; nothing to pin */
+
+    static const char under[] = "The quick brown fox jumps over the lazy dog.";
+    static const char over[] =
+        "The quick brown fox jumps over the lazy dog while a very patient cat "
+        "watches from the warm windowsill and counts every single passing car on "
+        "the quiet road below until the evening light finally fades away behind "
+        "the distant hills and someone switches on a lamp inside the kitchen "
+        "where a kettle is already whistling for the second time that hour.";
+    const char *texts[2] = {under, over};
+    size_t seen[2] = {0u, 0u};
+
+    for (size_t t = 0; t < 2u; ++t) {
+        int *ids = NULL;
+        size_t n_ids = 0;
+        if (mynah_engine_pocket_tokenize(state, texts[t], strlen(texts[t]), &ids,
+                                         &n_ids, error, capacity) != 0) {
+            return -1;
+        }
+        mynah_tts_request request;
+        memset(&request, 0, sizeof(request));
+        request.text_ids = ids;
+        request.text_length = n_ids;
+        request.speaker = 0u;
+        request.temperature = -1.0f;
+        mynah_engine_ctx *ctx = NULL;
+        int bad = pocket_ctx_new(model, state, &request, 16u, 7u, &ctx, error,
+                                 capacity) != 0;
+        free(ids);
+        if (bad) return -1;
+        if (pocket_prepare(ctx, error, capacity) != 0) {
+            pocket_ctx_free(ctx);
+            return -1;
+        }
+        const size_t offset = mynah_transformer_ar_state_offset(ctx->backbone);
+        const size_t expect = ctx->voice_positions + ctx->text_length;
+        seen[t] = ctx->text_length;
+        bad = (offset != expect);
+        pocket_ctx_free(ctx);
+        if (bad) {
+            pocket_error(error, capacity,
+                         "chunk seam: %zu text tokens prefilled to offset %zu, "
+                         "expected %zu -- the text was split",
+                         n_ids, offset, expect);
+            return -1;
+        }
+    }
+    if (seen[1] <= limit) {
+        pocket_error(error, capacity,
+                     "chunk seam: the long text is only %zu tokens against a limit "
+                     "of %zu, so the check proves nothing",
+                     seen[1], limit);
+        return -1;
+    }
+    if (seen[0] > limit) {
+        pocket_error(error, capacity,
+                     "chunk seam: the short text is already over the limit");
+        return -1;
+    }
+    return 0;
+}
+
+int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
+                                   size_t capacity) {
+    if (model == NULL) {
+        pocket_error(error, capacity, "pocket self-check: no model");
+        return -1;
+    }
+    static const pocket_check_case cases[POCKET_CHECK_MAX] = {
+        {"The quick brown fox jumps over the lazy dog.", 0u, 11u},
+        {"Hello there, this is a short one.", 3u, 22u},
+        {"Numbers like 1234 are read out loud.", 7u, 33u},
+        {"A somewhat longer sentence, with a comma in it, to move the EOS step.", 1u, 44u},
+        {"Short.", 5u, 55u},
+        {"Another distinct utterance entirely.", 9u, 66u},
+        {"Testing, testing, one two three.", 2u, 77u},
+        {"The rain in Spain stays mainly in the plain.", 4u, 88u},
+        {"Once upon a time there was a runtime with no Python.", 6u, 99u},
+        {"Bit identity is not a tolerance.", 8u, 110u},
+        {"Sixteen requests walk into a batch.", 10u, 121u},
+        {"The codec carries state and never replays context.", 11u, 132u},
+        {"One request's failure retires one request.", 12u, 143u},
+        {"Append, never insert.", 13u, 154u},
+        {"Measure before changing kernels.", 14u, 165u},
+        {"CPU is the product.", 15u, 176u},
+    };
+
+    mynah_engine_state *state = NULL;
+    if (pocket_model_init(model, &state, error, capacity) != 0) return -1;
+
+    int rc = -1;
+    if (pocket_check_chunk_seam(state, model, error, capacity) != 0) goto done;
+    static const size_t widths[4] = {2u, 4u, 8u, 16u};
+    for (size_t w = 0; w < 4u; ++w) {
+        size_t count = widths[w];
+        if (count > state->voice_count) count = state->voice_count;
+        if (count > POCKET_CHECK_MAX) count = POCKET_CHECK_MAX;
+        mynah_engine_scratch *scratch = NULL;
+        if (pocket_scratch_new(model, state, count, &scratch, error, capacity) != 0) {
+            goto done;
+        }
+        /* Both refusal points, on both paths. The per-row path (NULL scratch)
+         * crossed with the KV injection is the one combination that fails
+         * without the rollback; the other three would pass on their own. */
+        static const pocket_inject modes[2] = {POCKET_INJECT_LATENT_NAN,
+                                               POCKET_INJECT_KV_NAN};
+        static const char *const mode_name[2] = {"latent NaN, pre-flight",
+                                                 "cached NaN, in-backbone"};
+        char what[96];
+        int bad = 0;
+        for (size_t m = 0; m < 2u && !bad; ++m) {
+            snprintf(what, sizeof(what), "step atomicity at width %zu (batched, %s)",
+                     count, mode_name[m]);
+            bad = pocket_check_atomic(state, model, cases, count, 12u, scratch,
+                                      modes[m], what, error, capacity) != 0;
+            if (bad) break;
+            snprintf(what, sizeof(what), "step atomicity at width %zu (per-row, %s)",
+                     count, mode_name[m]);
+            bad = pocket_check_atomic(state, model, cases, count, 12u, NULL,
+                                      modes[m], what, error, capacity) != 0;
+        }
+        if (!bad) {
+            bad = pocket_check_gang(state, model, cases, count, 32u, scratch, error,
+                                    capacity) != 0;
+        }
+        pocket_scratch_free(scratch);
+        if (bad) goto done;
+    }
+    rc = 0;
+done:
+    pocket_model_free(state);
+    return rc;
 }
