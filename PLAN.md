@@ -428,21 +428,46 @@ does not.
       Direction and verdict held; the figures did not.) Left open: the last 23% is calls
       of 14-42 µs, *below* the measured dispatch cost, so folding them further is a
       rounding change that needs its own qualification
-- [ ] E9-3 **topology is a first-class serving parameter and the reference's rule does
-      not transfer.** Measured at C48 on 32 cores: `16x2` 0.736 · `8x4` 0.931 ·
+- [x] E9-3 **topology is a first-class serving parameter and the reference's rule does
+      not transfer** — and E9-4 now gives the mechanism, not just the ranking. Measured at C48 on 32 cores: `16x2` 0.736 · `8x4` 0.931 ·
       `4x8` at C30 already 0.922 · `2x16` 1.574 with 100% stall · `1x32` 48 of 90
       completed. Narrower workers win because a small model's regions are too short to
       amortise a wide barrier — a cost that does not shrink with the model, so a 100M
       engine pays it *more* often per second of audio, not less. **C64 completes
       192/192 at 0.954 on `16x2`.** Sweep it per host; do not inherit `4x8`
-- [ ] E9-4 **dispatch count per frame** — the mechanism behind E9-3 is unmeasured. The
-      reference collapses a whole step into one dispatch (`tk_region_run`) instead of a
-      barrier per phase; their 32-core review counts ~225 barriers per frame. Count
-      ours before copying theirs
+- [x] E9-4 **78 dispatches per frame, and the barrier is the tax** →
+      [`.work/pool-barrier-meter.md`](.work/pool-barrier-meter.md). Flat from 4 to 32
+      threads — the graph sets the region count, so a wider pool only makes each
+      piece shorter. Mean region 301 µs at 1 thread → **43-45 µs at 16-32**, barrier
+      0% → 22.4% → **35.6%**, and at 32 the pool admits 27.6 threads per region while
+      **19.0** do work. That explains E9-3 instead of restating it: at C48 `16x2` is
+      266 µs/region and 1.2% barrier (RTF 0.723), `1x32` is 60 µs and **31.3%** (1.616)
+      — and the wide topologies dispatch *fewer* regions per frame (41 vs 62) and lose
+      anyway, because the tax is per region, not per frame. `MYNAH_POOL_METER=1` ships
+      it per call site, +0.3-0.6% when off, byte-identical. Levers: wake pre-check ON
+      (−2.1/−2.3%), admission cap **measured and rejected** (+0.4 to +1.0%), `fastexit`
+      **dark** (−1.9/−4.9%) until it runs on x86. All three −7.0% at 32 threads — and
+      **production is narrow, where all three are noise**
 - [ ] E9-5 **the census and the dispatch report disagree about quantization**: a
       default run carries f16 on every projection while `quant.requested` reads `off`,
       because that row describes the cache default and not the per-group spec. Two
       reports, one truth — fix the row, not the census
+- [ ] E9-7 **fuse the regions — this is the one that changes the shape** — with the
+      count behind it at last: `qmat_rows_block` (`src/qmat.c:1481`) dispatches
+      **3240 regions per request** at 42 µs with a **43.1% barrier**, and `sg_task`
+      (`src/sgemm.c:670`) **1825** at 41 µs with **36.1%**; both are **100% below the
+      pool's break-even**. The same two sites at 2 threads cost 119 µs/1.2% and
+      157 µs/3.3% — which is exactly why `16x2` wins and why fusing is the lever that
+      would let a wider pool stop losing. Not yet measured: whether fusing actually
+      recovers that barrier, only that it is 36-43% of those sites' wall
+- [ ] E9-8 **`fastexit` has never run on x86** — the biggest pool lever (−4.9% at 32
+      threads) ships OFF for that reason alone. It is the mirror of a documented trap,
+      correct by the standard and clean over 120k regions on ARM with `MYNAH_POOL_SPIN=0`,
+      but unrun where the trap actually bites. Validate on x86, then flip it
+- [ ] E9-9 **the spin budget default is wrong off aarch64** — the knee on the Axion is
+      **65536**, and **4096**, which is what this binary uses on every non-aarch64
+      target, costs **+16.7% at 32 threads**. Measure the knee on x86 and set it from a
+      number rather than from a constant nobody has re-derived
 - [ ] E9-6 **`MYNAH_QUANT=` empty is not `MYNAH_QUANT` unset** — the empty value
       produces different audio *and* a ~1.8x different wall on HEAD, which is how a
       lane's A/B harness measured the wrong workload on both sides of a pair and
