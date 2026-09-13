@@ -404,6 +404,41 @@ static int qmat_i8mm(void) {
     }
     return cached;
 }
+
+/* Whether the SMMLA kernel is WIRED INTO the batched linear, which is a
+ * different question from whether the CPU has the instruction.
+ *
+ * It is off by default, and the reason is measured, not cautionary.  SMMLA's
+ * int32 tile is bit-identical to two SDOT rows -- verified over every row of a
+ * 96x256 matrix, 0 of 96 differ -- but the kernel also has to turn that int32
+ * into a float, and `(float)s * scales[row] * sx + bias[row]` is a three-factor
+ * product that -ffast-math (-fassociative-math) may group either way.  Four
+ * textually distinct copies of it live in matvec_q8_pair_i8mm's epilogue and a
+ * fifth in matvec_q8's, and GCC 15 on aarch64 groups them differently.
+ *
+ * That is not a cosmetic ULP: it made a row's answer depend on WHERE IT SAT IN
+ * THE BATCH.  Measured on a Neoverse-V2, one activation row against fixed
+ * weights produced four different results -- one as the lead of an SMMLA pair,
+ * one as the follower, one as the SDOT tail of an odd batch, one alone --
+ * differing in up to 39 of 96 columns by up to 2 ULP.  Under concurrent
+ * serving the position is decided by arrival order, so the same request would
+ * get a different answer depending on who else was in flight.  That is the one
+ * thing the batched linear promises not to do.
+ *
+ * E4-20 already closed the obvious repair: hoisting the epilogue into a shared
+ * helper does not work, because the compiler inlines and then reassociates per
+ * site anyway, and forcing one order with noinline would change matvec_q8's
+ * codegen -- the kernel the int8 goldens are frozen against.  So the kernel
+ * stays compiled and self-tested (self_test_i8mm_identity, in the integer
+ * domain where the identity is real) and stays out of the path that must be
+ * deterministic.  MYNAH_QMAT_I8MM=1 wires it in for measurement; --self-test
+ * then fails on purpose, because self_test_batch_membership is precisely the
+ * assertion that catches this. */
+static int qmat_i8mm_batched(void) {
+    if (!qmat_i8mm()) return 0;
+    const char *env = getenv("MYNAH_QMAT_I8MM");
+    return env != NULL && strcmp(env, "1") == 0;
+}
 #endif
 
 /* ------------------------------------------------------------- quantizers */
@@ -1481,9 +1516,13 @@ fail:
  * 2x2 tile with two 64-bit loads per operand and no weight repacking: the
  * existing row-major int8 layout is already what SMMLA wants.
  *
- * The accumulation is exact int32, and the float epilogue is written exactly
- * as matvec_q8's, so a batched row is BIT-IDENTICAL to the same row computed
- * alone -- which self_test_batched already asserts with memcmp. */
+ * The accumulation is exact int32 and IS bit-identical to two SDOT rows: that
+ * half of the original claim is measured and is what self_test_i8mm_identity
+ * now checks.  The other half was wrong.  The float epilogue is written
+ * textually as matvec_q8's, but "textually the same" is not "rounds the same"
+ * under -ffast-math, and it does not: see qmat_i8mm_batched() for the
+ * measurement and for why this kernel is not wired into the batched linear by
+ * default. */
 #if defined(MYNAH_QMAT_ARM_I8MM)
 __attribute__((target("+i8mm")))
 static void matvec_q8_pair_i8mm(float *out0, float *out1,
@@ -1552,11 +1591,17 @@ static void matvec_q8_pair_i8mm(float *out0, float *out1,
  * 768-wide int8 weight), so it stays resident in L1 across the batch.
  *
  * This must be bit-exact against the unbatched path, or the audio a request
- * gets would depend on which other requests it happened to batch with.  It is:
- * every (weight row, activation) pair runs the same kernel over the same k in
- * the same order, and only the order of independent pairs changes.  The f32
- * path has no such guarantee -- sgemm may accumulate differently for M=B than
- * for M=1 -- so it stays one call per row. */
+ * gets would depend on which other requests it happened to batch with.  It is,
+ * and the reason is narrower than it looks: every (weight row, activation)
+ * pair runs THE SAME COMPILED KERNEL over the same k in the same order, and
+ * only the order of independent pairs changes.  "The same arithmetic" is not
+ * enough -- a second kernel computing the same products, however carefully
+ * transcribed, rounds its float epilogue differently under -ffast-math and
+ * breaks the guarantee.  That is why the SMMLA pair kernel is not wired in
+ * here (qmat_i8mm_batched()), and why self_test_batch_membership() asserts the
+ * property directly rather than trusting the structure.  The f32 path has no
+ * such guarantee either -- sgemm may accumulate differently for M=B than for
+ * M=1 -- so it stays one call per row. */
 typedef struct {
     const qmat_entry *entry;
     const void *qx;         /* batch * cols, INT8 (signed or u8) / INT4 */
@@ -1582,7 +1627,7 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
     /* Two activations per SMMLA: only INT8, only the signed encoding (the
      * unsigned one belongs to x86), only when the CPU really has FEAT_I8MM. */
     if (e->qtype == QMAT_INT8 && j->level == QMAT_U8_OFF && j->batch >= 2u &&
-        j->qx != NULL && qmat_i8mm()) {
+        j->qx != NULL && qmat_i8mm_batched()) {
         const int8_t *qx = (const int8_t *)j->qx;
         const int8_t *wb = (const int8_t *)weights + row0 * j->cols;
         const float *sc = e->scales + row0;
@@ -2296,6 +2341,117 @@ done:
     return status;
 }
 
+/* The property self_test_batched cannot see, and the one the serving path
+ * actually depends on: a row's answer must not change when the BATCH AROUND IT
+ * changes.  self_test_batched compares a fixed batch against the single-row
+ * path, so it catches a kernel that is uniformly wrong -- but a kernel whose
+ * rounding depends on a row's POSITION can still pass it on a lucky shape, and
+ * one did.  On a Neoverse-V2 the SMMLA wiring gave one activation row four
+ * different answers (lead of a pair, follower of a pair, SDOT tail of an odd
+ * batch, alone) and self_test_batched's first mismatch looked like an ordinary
+ * 1 ULP epilogue difference.
+ *
+ * So this varies the two things the caller does not control: how many rows are
+ * in flight, and where this row landed among them.  The subject row is held
+ * fixed and its companions are changed, which is the literal statement of "a
+ * request's audio may not depend on who it was batched with".  Bit-equality,
+ * not a tolerance -- a tolerance here would be a promise that the audio only
+ * changes a little depending on the traffic, which is not a promise worth
+ * making. */
+static int self_test_batch_membership(int qtype, char *error,
+                                      size_t error_capacity) {
+    enum { N = 96, K = 256, BMAX = 6, SUBJECTS = 3 };
+    int status = -1;
+    mynah_qmat_cache *cache = mynah_qmat_cache_new(qtype);
+    if (cache == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat membership self-test OOM");
+        return -1;
+    }
+    if (cache->qtype != qtype) {   /* unsupported here: nothing to check */
+        mynah_qmat_cache_free(cache);
+        return 0;
+    }
+    float *w = (float *)malloc((size_t)N * K * sizeof(float));
+    float *x = (float *)malloc((size_t)BMAX * K * sizeof(float));
+    float *bias = (float *)malloc((size_t)N * sizeof(float));
+    float *alone = (float *)malloc((size_t)BMAX * N * sizeof(float));
+    float *got = (float *)malloc((size_t)BMAX * N * sizeof(float));
+    int8_t *qx = (int8_t *)malloc((size_t)BMAX * K);
+    float *sx = (float *)malloc((size_t)BMAX * sizeof(float));
+    if (w == NULL || x == NULL || bias == NULL || alone == NULL || got == NULL ||
+        qx == NULL || sx == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat membership self-test OOM");
+        goto done;
+    }
+    for (size_t i = 0; i < (size_t)N * K; ++i)
+        w[i] = sinf(0.017f * (float)i) * (0.5f + 0.5f * cosf(0.0011f * (float)i));
+    for (size_t i = 0; i < (size_t)BMAX * K; ++i)
+        x[i] = cosf(0.019f * (float)i) - 0.25f;
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = (float)i * 0.015625f - 0.75f;
+
+    /* The answer every batch must reproduce: the row on its own. */
+    for (size_t r = 0; r < (size_t)BMAX; ++r) {
+        if (mynah_qmat_linear_resolved(cache, NULL, "membership.self.test", w,
+                                       x + r * K, alone + r * N, 1u, K, N, bias,
+                                       error, error_capacity) != 0) {
+            goto done;
+        }
+    }
+    for (size_t subject = 0; subject < (size_t)SUBJECTS; ++subject) {
+        for (size_t batch = 1u; batch <= (size_t)BMAX; ++batch) {
+            for (size_t pos = 0; pos < batch; ++pos) {
+                /* Two different sets of companions for the same (batch, pos),
+                 * so a pass cannot come from one lucky arrangement. */
+                for (size_t variant = 0; variant < 2u; ++variant) {
+                    const float *in_rows[BMAX];
+                    float *out_rows[BMAX];
+                    for (size_t b = 0; b < batch; ++b) {
+                        size_t which = subject;
+                        if (b != pos) {
+                            which = (b + variant * 2u + 1u) % (size_t)BMAX;
+                            if (which == subject)
+                                which = (which + 1u) % (size_t)BMAX;
+                        }
+                        in_rows[b] = x + which * K;
+                        out_rows[b] = got + b * N;
+                    }
+                    if (mynah_qmat_linear_batched(cache, NULL,
+                                                  "membership.self.test", w,
+                                                  in_rows, out_rows, batch, K, N,
+                                                  bias, qx, sx, error,
+                                                  error_capacity) != 0) {
+                        goto done;
+                    }
+                    for (size_t i = 0; i < (size_t)N; ++i) {
+                        const float *ref = alone + subject * N;
+                        const float *mine = got + pos * N;
+                        if (memcmp(&ref[i], &mine[i], sizeof(float)) == 0)
+                            continue;
+                        if (error != NULL && error_capacity > 0) {
+                            snprintf(error, error_capacity,
+                                     "qmat batch membership qtype=%d: row %zu "
+                                     "at position %zu of %zu (variant %zu) "
+                                     "differs from the same row alone at col "
+                                     "%zu: %.9g vs %.9g -- a row's answer must "
+                                     "not depend on who it was batched with",
+                                     qtype, subject, pos, batch, variant, i,
+                                     (double)ref[i], (double)mine[i]);
+                        }
+                        goto done;
+                    }
+                }
+            }
+        }
+    }
+    status = 0;
+done:
+    free(w); free(x); free(bias); free(alone); free(got); free(qx); free(sx);
+    mynah_qmat_cache_free(cache);
+    return status;
+}
+
 /* ------------------------------------------------- the VNNI identity test
  *
  * The u8 x s8 rewrite is integer algebra, not an approximation:
@@ -2489,52 +2645,83 @@ static int self_test_u8_identity(char *error, size_t error_capacity) {
 #if defined(MYNAH_QMAT_ARM_I8MM)
 /* SMMLA accumulates the same products in a different order, and integer
  * addition does not care about order, so the batched 2x2 tile must land on the
- * same int32 as two separate SDOT rows -- and therefore on the same float.
- * Bit-identity is the contract self_test_batched already relies on; this
- * checks the kernel directly, including the odd row and the k tail. */
-static int self_test_i8mm_identity(char *error, size_t error_capacity) {
-    if (!qmat_i8mm()) return 0;
-    enum { N = 13, K = 37 };
+ * SAME INT32 as two separate SDOT rows.  That is the claim this checks, and it
+ * holds exactly: scales and sx are forced to 1 and bias to NULL, so the float
+ * epilogue is the identity on an int32 that is far inside the 2^24 a float
+ * represents exactly, and any surviving difference is an integer difference.
+ *
+ * It deliberately does NOT assert that the two kernels agree as floats.  They
+ * do not -- 71 of 192 rows differ by up to 2 ULP at 96x256 under GCC 15 -- and
+ * the previous version of this test asserted exactly that and passed, because
+ * 13x37 is too small a shape to make the epilogue's reassociation visible.  A
+ * gate that passes because it never reaches the road is worse than no gate: it
+ * is what let the SMMLA kernel be wired into the batched linear.  So the
+ * shapes below are chosen to reach it -- one large enough to diverge, one with
+ * an odd row count and an odd k to cover the two tails -- and the float side
+ * is reported as a bound, not as identity.  qmat_i8mm_batched() carries the
+ * consequence. */
+static int self_test_i8mm_identity_shape(size_t N, size_t K,
+                                         char *error, size_t error_capacity) {
     int status = -1;
-    float *w = (float *)malloc((size_t)N * K * sizeof(float));
+    float *w = (float *)malloc(N * K * sizeof(float));
     float *x = (float *)malloc(2u * K * sizeof(float));
-    float *bias = (float *)malloc((size_t)N * sizeof(float));
+    float *unit = (float *)malloc(N * sizeof(float));
     float *ref = (float *)malloc(2u * N * sizeof(float));
     float *got = (float *)malloc(2u * N * sizeof(float));
-    int8_t *q8 = (int8_t *)malloc((size_t)N * K);
-    float *scales = (float *)malloc((size_t)N * sizeof(float));
+    int8_t *q8 = (int8_t *)malloc(N * K);
+    float *scales = (float *)malloc(N * sizeof(float));
     int8_t *qx = (int8_t *)malloc(2u * K);
-    if (w == NULL || x == NULL || bias == NULL || ref == NULL || got == NULL ||
+    if (w == NULL || x == NULL || unit == NULL || ref == NULL || got == NULL ||
         q8 == NULL || scales == NULL || qx == NULL) {
         if (error != NULL && error_capacity > 0)
             snprintf(error, error_capacity, "qmat i8mm identity out of memory");
         goto done;
     }
-    for (size_t i = 0; i < (size_t)N * K; ++i)
+    for (size_t i = 0; i < N * K; ++i)
         w[i] = sinf(0.021f * (float)i) * (0.5f + 0.5f * cosf(0.0013f * (float)i));
     for (size_t i = 0; i < 2u * K; ++i) x[i] = cosf(0.017f * (float)i) - 0.2f;
-    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = (float)i * 0.03125f - 0.25f;
+    for (size_t i = 0; i < N; ++i) unit[i] = 1.0f;
     quantize_weight_int8(w, N, K, q8, scales);
-    const float s0 = quantize_act_int8(qx, x, K);
-    const float s1 = quantize_act_int8(qx + K, x + K, K);
-    matvec_q8(ref, qx, s0, q8, scales, NULL, bias, N, K, QMAT_U8_OFF);
-    matvec_q8(ref + N, qx + K, s1, q8, scales, NULL, bias, N, K, QMAT_U8_OFF);
-    matvec_q8_pair_i8mm(got, got + N, qx, qx + K, s0, s1, q8, scales, bias, N, K);
+    (void)quantize_act_int8(qx, x, K);
+    (void)quantize_act_int8(qx + K, x + K, K);
+    /* scale = sx = 1, bias = NULL: out is (float)s, exact for |s| < 2^24. */
+    matvec_q8(ref, qx, 1.0f, q8, unit, NULL, NULL, N, K, QMAT_U8_OFF);
+    matvec_q8(ref + N, qx + K, 1.0f, q8, unit, NULL, NULL, N, K, QMAT_U8_OFF);
+    matvec_q8_pair_i8mm(got, got + N, qx, qx + K, 1.0f, 1.0f, q8, unit, NULL,
+                        N, K);
     for (size_t i = 0; i < 2u * N; ++i) {
         if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
-                         "qmat i8mm not bit-identical at %zu: %.9g vs %.9g",
-                         i, (double)ref[i], (double)got[i]);
+                         "qmat i8mm int32 differs at %zu of %zux%zu: "
+                         "sdot %.1f vs smmla %.1f", i, N, K,
+                         (double)ref[i], (double)got[i]);
+            }
+            goto done;
+        }
+        if (fabsf(ref[i]) >= 16777216.0f) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat i8mm identity test is out of the exact-float "
+                         "range at %zu: %.1f", i, (double)ref[i]);
             }
             goto done;
         }
     }
     status = 0;
 done:
-    free(w); free(x); free(bias); free(ref); free(got);
+    free(w); free(x); free(unit); free(ref); free(got);
     free(q8); free(scales); free(qx);
     return status;
+}
+
+static int self_test_i8mm_identity(char *error, size_t error_capacity) {
+    if (!qmat_i8mm()) return 0;
+    /* Large enough that the float epilogue would diverge if it were asserted;
+     * then the two-tail edge case (odd rows, odd k). */
+    if (self_test_i8mm_identity_shape(96u, 256u, error, error_capacity) != 0)
+        return -1;
+    return self_test_i8mm_identity_shape(13u, 37u, error, error_capacity);
 }
 #endif
 
@@ -2549,11 +2736,14 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_rows_blocked(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT4, error, error_capacity) != 0) return -1;
+    if (self_test_batch_membership(QMAT_INT8, error, error_capacity) != 0) return -1;
+    if (self_test_batch_membership(QMAT_INT4, error, error_capacity) != 0) return -1;
 #if defined(MYNAH_QMAT_F16)
     if (self_test_f16_convert(error, error_capacity) != 0) return -1;
     if (self_test_f16(error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_F16, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_F16, error, error_capacity) != 0) return -1;
+    if (self_test_batch_membership(QMAT_F16, error, error_capacity) != 0) return -1;
 #endif
     return 0;
 }
@@ -2616,16 +2806,27 @@ const char *mynah_qmat_int8_kernel(const char **why) {
 
 int mynah_qmat_i8mm_enabled(const char **why) {
 #if defined(MYNAH_QMAT_ARM_I8MM)
-    const int on = qmat_i8mm();
+    const int hw = qmat_i8mm();
+    const int on = qmat_i8mm_batched();
     if (why != NULL) {
         *why = on ? "[predicate] src/qmat.c matvec_q8_pair_i8mm: SMMLA "
                     "(vmmlaq_s32), two activations x two weight rows x eight k "
-                    "per instruction, in the weight-stationary batched linear. "
-                    "Single-vector decode stays on SDOT, where SMMLA would "
-                    "waste half its lanes"
-                  : "[predicate] src/qmat.c compiled the SMMLA kernel, but this "
-                    "CPU reports no FEAT_I8MM (hw.optional.arm.FEAT_I8MM / "
-                    "HWCAP2_I8MM), so the batched linear stays on SDOT";
+                    "per instruction, wired into the weight-stationary batched "
+                    "linear because MYNAH_QMAT_I8MM=1. THIS IS A MEASUREMENT "
+                    "MODE, NOT A SERVING MODE: its float epilogue does not "
+                    "round like matvec_q8's, so a row's answer depends on its "
+                    "position in the batch and --self-test fails by design"
+            : hw ? "[predicate] src/qmat.c: this CPU HAS FEAT_I8MM and the "
+                   "SMMLA kernel is compiled and self-tested (exactly, in the "
+                   "int32 domain), but it is NOT wired into the batched linear. "
+                   "Its float epilogue reassociates differently from "
+                   "matvec_q8's under -ffast-math, which made a row's answer "
+                   "depend on where it sat in the batch -- measured, up to 2 "
+                   "ULP over 39 of 96 columns. Determinism wins; set "
+                   "MYNAH_QMAT_I8MM=1 to measure the kernel anyway"
+                 : "[predicate] src/qmat.c compiled the SMMLA kernel, but this "
+                   "CPU reports no FEAT_I8MM (hw.optional.arm.FEAT_I8MM / "
+                   "HWCAP2_I8MM), so the batched linear stays on SDOT";
     }
     return on;
 #else

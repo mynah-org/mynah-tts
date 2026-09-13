@@ -1,3 +1,12 @@
+/* glibc hides pthread_setname_np behind _GNU_SOURCE; without it the call
+ * compiles as an implicit declaration and the build breaks under gcc 15's
+ * default -Werror=implicit-function-declaration.  macOS declares it in
+ * <pthread.h> unconditionally, which is why this only ever failed on Linux.
+ * server/prefork.c already carries the same guard. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "http_util.h"
 
 #include <pthread.h>

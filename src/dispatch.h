@@ -166,6 +166,14 @@ extern "C" {
 #else
 #define MYNAH_DISPATCH_HAS_OPENBLAS 0
 #endif
+/* BLAS=none is not "no GEMM": src/sgemm.c serves it.  The distinction matters
+ * for the compiled column of any row whose fast path only needs SOME sgemm,
+ * which is not the same set as "an external BLAS is linked". */
+#if defined(MYNAH_USE_OWN_SGEMM)
+#define MYNAH_DISPATCH_HAS_OWN_SGEMM 1
+#else
+#define MYNAH_DISPATCH_HAS_OWN_SGEMM 0
+#endif
 #if defined(MYNAH_ENABLE_METAL)
 #define MYNAH_DISPATCH_HAS_METAL 1
 #else

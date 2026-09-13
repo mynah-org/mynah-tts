@@ -768,8 +768,13 @@ static void collect_backends(row_sink *s) {
     add_unknown(s, "codec.seanet_blas", "yes", "-", NULL,
                 "[UNKNOWN] src/seanet.c did not register "
                 "mynah_seanet_blas_name()");
+    /* The GEMM fold needs an sgemm, not specifically an external one: under
+     * BLAS=none src/sgemm.c provides it and the fold is compiled.  Reading
+     * only the two vendor macros made a BLAS=none build report compiled=no on
+     * a row that then resolved ON -- seen on Linux ARM, 2026-09-13. */
     add_unknown(s, "codec.seanet_gemm", yn(MYNAH_DISPATCH_HAS_ACCELERATE ||
-                                           MYNAH_DISPATCH_HAS_OPENBLAS),
+                                           MYNAH_DISPATCH_HAS_OPENBLAS ||
+                                           MYNAH_DISPATCH_HAS_OWN_SGEMM),
                 "-", "MYNAH_SEANET_GEMM",
                 "[UNKNOWN] src/seanet.c did not register "
                 "mynah_seanet_gemm_enabled()");
