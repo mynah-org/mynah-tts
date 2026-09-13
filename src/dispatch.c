@@ -842,6 +842,22 @@ static void collect_pool(row_sink *s) {
     add_unknown(s, "pool.decoder_lane", "yes", "-", "MYNAH_LANE_SPLIT",
                 "[UNKNOWN] src/threads.c did not register mynah_lane_width()");
 
+    /* E9-P1. Whether anybody is counting, and what the count says if they are.
+     * The serving sweep that put 16x2 at STREAM p95 0.736 and 1x32 at "did not
+     * complete" was explained by a barrier nobody had measured; this row is
+     * where that stops being an explanation and starts being a number. */
+    add_unknown(s, "pool.meter", "yes", "-", "MYNAH_POOL_METER",
+                "[UNKNOWN] src/threads.c did not register "
+                "mynah_pool_meter_read()");
+
+    /* E9-P2. The narrowing levers change WHO runs a chunk. This row is the
+     * evidence that they did not change WHAT is computed -- a short form of the
+     * litmus, run inside the report itself, because a knob reported as ON that
+     * has never been tested in this binary is a claim and not a fact. */
+    add_unknown(s, "pool.litmus", "yes", "-", NULL,
+                "[UNKNOWN] src/threads.c did not register "
+                "mynah_threads_self_test()");
+
 }
 
 static void collect_quant(row_sink *s) {
@@ -1278,6 +1294,12 @@ static int st_probe_on(const char **why) {
 }
 
 int mynah_dispatch_self_test(char *error, size_t error_capacity) {
+    /* E9-P2. The pool's narrowing levers decide WHO runs a chunk, and the claim
+     * that this cannot change WHAT is computed is the gate the whole item rests
+     * on. It is checked here, first and unconditionally, because this is the
+     * one self-test that every build and both sanitizers already run. */
+    if (mynah_threads_self_test(error, error_capacity) != 0) return -1;
+
     mynah_dispatch_row rows[MYNAH_DISPATCH_MAX_ROWS];
     int n = mynah_dispatch_collect(rows, MYNAH_DISPATCH_MAX_ROWS);
     if (n <= 0) return st_fail(error, error_capacity, "dispatch: no rows collected");

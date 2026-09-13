@@ -114,6 +114,166 @@ const char *mynah_pool_spin_source(void);
 void mynah_pool_wait_stats(long long *parks, long long *spin_wins);
 
 /* ---------------------------------------------------------------------------
+ * THE POOL METER -- E9-P1
+ *
+ * WHY IT EXISTS. The serving sweep on 32 Neoverse-V2 at C48 measured narrow
+ * workers beating wide ones MONOTONICALLY -- 16x2 at STREAM p95 0.736, 8x4 at
+ * 0.931, 2x16 at 1.574 with every frame stalling, 1x32 not completing at all.
+ * The explanation that fits is that a 109M model has regions too short to
+ * amortise a wide barrier, and that unlike weight traffic the barrier does not
+ * shrink with the model: a small engine pays it MORE often per second of audio.
+ * The counters above could not test that. They count regions; they do not say
+ * how many regions a frame costs, how wide they actually ran, or how much of
+ * the wall went into the barrier rather than into arithmetic. The reference
+ * engine counts ~225 barriers per frame in its decoder and attacks that number.
+ * We had never counted ours. This is the count.
+ *
+ * WHAT IT MEASURES, per region and aggregated per call site:
+ *   - dispatches, and the chunks they actually executed;
+ *   - WIDTH REQUESTED (min(n, pool width)) against WIDTH ENTERED (threads that
+ *     joined) against WIDTH USEFUL (threads that ran at least one chunk). The
+ *     gap between entered and useful is the wake-up that bought nothing, which
+ *     is the whole hypothesis stated as a subtraction;
+ *   - region wall, the submitter's BARRIER wall (time after its own chunks are
+ *     done, waiting for helpers), and each worker's PARK wall (time looking for
+ *     work) against its WORK wall;
+ *   - a log2 histogram of region durations, and the count below the break-even
+ *     (default 200 us: our own ~20 us per-region wake-up times ten).
+ *
+ * COST, AND THE PROMISE THAT IT DOES NOT MOVE WHAT IT WATCHES. Off it is one
+ * predicted branch on a cached int per dispatch and nothing else -- no timer,
+ * no atomic, no extra field touched. On it is two clock_gettime() calls per
+ * region on the submitter and two per wait on a worker, accumulated into
+ * per-thread cache-line-padded slots and a per-call-site table of relaxed
+ * atomics that only submitters write. It is compiled in always so that the
+ * instrumented binary and the production binary are THE SAME BINARY, which is
+ * the only way the off/on diff proves anything.
+ *
+ * MYNAH_POOL_METER=1 turns it on. MYNAH_POOL_METER_JSON=path writes the report
+ * at exit and on SIGTERM ("%d" in the path becomes the pid, which is what a
+ * prefork server needs); with the meter on and no path the human table goes to
+ * stderr at exit. The SIGTERM hook is installed ONLY when the meter is on, and
+ * it chains to whatever handler was already there, so a server still shuts down
+ * the way it always did.
+ * ------------------------------------------------------------------------- */
+
+/* Bucket b holds regions of [2^b, 2^(b+1)) nanoseconds. 20 buckets reach one
+ * second, which is far past anything this pool should ever see. */
+#define MYNAH_POOL_METER_BUCKETS 20
+
+typedef struct {
+    long long dispatches;       /* regions published to a pool               */
+    long long serial;           /* ran inline: n == 1, or a 1-wide pool      */
+    long long inline_fallbacks; /* pool exists, every slot busy. Must be 0    */
+    long long chunks;           /* fn(ctx, i) calls executed, all threads    */
+    long long width_requested;  /* sum of min(n, pool width)                 */
+    long long width_entered;    /* sum of threads that joined the region     */
+    long long width_useful;     /* sum of threads that ran >= 1 chunk        */
+    long long region_ns;        /* sum of publish -> last helper out         */
+    long long barrier_ns;       /* sum of submitter wall after its own chunks*/
+    long long park_ns;          /* sum of worker wall hunting for work       */
+    long long work_ns;          /* sum of worker wall inside a region        */
+    long long parks;            /* waits that reached the condvar            */
+    long long spin_wins;        /* waits the spin absorbed                   */
+    long long under_break_even; /* regions shorter than break_even_ns        */
+    long long break_even_ns;    /* the line, from MYNAH_POOL_BREAK_EVEN_US   */
+    long long meter_ns;         /* wall since the meter was armed or reset   */
+    long long worker_threads;   /* threads that ever reported park or work   */
+    long long sites;            /* distinct call sites seen                  */
+    long long site_overflow;    /* dispatches that found the site table full */
+    long long buckets[MYNAH_POOL_METER_BUCKETS];
+} mynah_pool_meter;
+
+/* 1 when MYNAH_POOL_METER is on. Resolved once; never calls getenv() twice. */
+int  mynah_pool_meter_enabled(void);
+/* Snapshot. Safe to call while the pool is running; the numbers are a skew of
+ * relaxed counters, which is what a profile is. */
+void mynah_pool_meter_read(mynah_pool_meter *out);
+void mynah_pool_meter_reset(void);
+/* Human table, including the per-call-site breakdown that names which dispatch
+ * to attack. `out_file` is a FILE*, NULL for stderr. Returns rows printed. */
+int  mynah_pool_meter_report(void *out_file);
+/* The same numbers as JSON. "%d" in `path` becomes the pid. NULL reads
+ * MYNAH_POOL_METER_JSON; with that unset too it is a no-op returning 0. */
+int  mynah_pool_meter_report_json(const char *path);
+
+/* ---------------------------------------------------------------------------
+ * NARROWING AND THE WAKE PRE-CHECK -- E9-P2
+ *
+ * Two things the count named, both inside mynah_parallel_for()/pool_worker()
+ * and neither visible to a caller.
+ *
+ * PRE-CHECK (MYNAH_POOL_PRECHECK, default on). A publish bumps `gen` and
+ * broadcasts, so EVERY idle worker wakes and takes the pool mutex to run
+ * pick_job(), whatever the region's width. On 32 threads a region of four
+ * chunks put 31 threads through one mutex to discover there was nothing for
+ * them. The pre-check is a lock-free scan of the job slots, ordered by an
+ * ACQUIRE load of `gen` taken BEFORE the scan, so a worker that finds nothing
+ * goes back to waiting without ever touching the lock. It cannot lose a wakeup:
+ * the publisher's release bump of `gen` synchronises with that acquire load, so
+ * a region published before the load is visible to the scan, and one published
+ * after leaves `seen` stale and the wait returns at once.
+ *
+ * NARROWING (MYNAH_POOL_NARROW, default OFF -- measured, see below). A region of n chunks can use at
+ * most n threads. Nothing enforced that: a 4-chunk region on a 32-wide pool
+ * admitted every worker that got there, each one paying a mutex, a refs
+ * increment, an empty pf_run() and a done_cv broadcast to discover the chunks
+ * were gone. The cap is min(n, width) - 1 helpers INSIDE the region at once,
+ * checked in pick_job() and in the pre-check. It is a performance cap and never
+ * a correctness one, because of an invariant this pool already had: THE
+ * SUBMITTER RUNS THE REGION TO COMPLETION ITSELF. Zero helpers is always a
+ * correct outcome, so under-admitting can only cost time.
+ *
+ * WHAT THEY MEASURED, on 32 Neoverse-V2, paired interleaved, median of
+ * within-round ratios against the pool as it was:
+ *
+ *      knob     | 8 threads | 16 threads | 32 threads | default
+ *   ------------|-----------|------------|------------|---------
+ *    precheck   |   -0.9%   |    -2.1%   |    -2.3%   |   ON
+ *    narrow     |   +1.0%   |    +0.5%   |    +0.4%   |   OFF
+ *
+ * NARROW IS OFF BECAUSE IT DID NOT PAY, and that is worth stating rather than
+ * quietly deleting: the count that motivated it is real (at 1x32 the meter saw
+ * 27.9 threads admitted per region and only 19.8 of them run a chunk), but
+ * capping admission does not turn those wasted wake-ups back into wall. It is
+ * kept, switchable and covered by the litmus, so the idea is not rediscovered
+ * from scratch by someone who reads the same count.
+ *
+ * BIT-IDENTITY. Chunks are handed out by one atomic counter and tasks write
+ * disjoint regions, so which thread runs chunk i has never affected the result
+ * and does not now. Both knobs change who shows up, not what is computed. */
+/* The litmus above, run from mynah_dispatch_self_test() so it is on every
+ * --self-test, every `make test`, and both sanitizer builds. 0 on success,
+ * -1 after writing why. */
+int mynah_threads_self_test(char *error, size_t error_capacity);
+
+int mynah_pool_precheck_enabled(void);
+int mynah_pool_narrow_enabled(void);
+
+/* ---------------------------------------------------------------------------
+ * THE FAST REGION EXIT -- E9-P3 (MYNAH_POOL_FASTEXIT, default OFF)
+ *
+ * Every helper used to leave a region by taking the pool mutex, decrementing
+ * refs under it and broadcasting if it was the last out. On 32 threads that is
+ * up to 31 acquisitions of one global mutex per region, against a region the
+ * meter measured at 40-60 us. The lock is not there for the decrement, which is
+ * already atomic; it is there to close a lost-wakeup window against a submitter
+ * about to park.
+ *
+ * With this on, the last helper out checks a waiter count and skips the mutex
+ * and the broadcast when nobody is parked. That is the same SHAPE as the
+ * store-buffer trap this pool documents -- "publish, then peek at sleeping",
+ * which deadlocks on x86 and silently does not on ARM, and we develop on ARM.
+ * So it is Dekker with SEQ_CST on both halves and a fence between each
+ * store/load pair (release/acquire is NOT enough: store-then-load to two
+ * different locations is precisely what it fails to order), and it ships OFF
+ * until a number on the target box says otherwise. See pf_region_exit(). */
+int mynah_pool_fastexit_enabled(void);
+/* Regions where the cap held a worker out, and pre-checks that skipped the
+ * mutex. These are the two levers' own evidence. */
+void mynah_pool_narrow_stats(long long *capped, long long *precheck_skips);
+
+/* ---------------------------------------------------------------------------
  * DECODER LANE -- E5-21
  *
  * A private, PINNED team on the last N cpus of this process's slice, with its
