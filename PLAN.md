@@ -395,7 +395,7 @@ does not.
 | region | % of wall | 1→16 cores | verdict |
 |---|---|---|---|
 | `prep.decoder_prefill` | 28.7% | 1.5x, flat past 8 | **premise wrong (E9-1): a one-time weight pack, not serial work** |
-| `codec.conv_stack` | 25.6% | 2.6x | **fixed (E9-2): 6.02x, and the cause was glue, not the kernels** |
+| `codec.conv_stack` | 25.6% | 2.6x | **fixed (E9-2): 5.71x, and the cause was glue, not the kernels** |
 | `codec.transformer` | 22.9% | 4.3x | fine |
 | `step.backbone` | 16.8% | 4.6x | fine |
 | `flow.head` | 5.6% | — | small |
@@ -421,8 +421,11 @@ does not.
       fixed cost at **26-44 µs on this box**, not the header's 20 — about 52 ms of
       235. Fixed with fewer, larger regions and no new arithmetic (`conv_taps` fuses
       K dispatches into one; ELU on the pool; `want == 1` stops dispatching a
-      matvec). **241.6 → 103.7 ms at 16 cores, scaling 2.59x → 6.02x, −18% of total
-      wall**, byte-identical on both SIMD profiles. Left open: the last 23% is calls
+      matvec). **230.2 → 104.1 ms at 16 cores, scaling 2.64x → 5.71x, −17% of total
+      wall on default *and* int8**, byte-identical on both SIMD profiles. (First
+      reported as 2.59x → 6.02x / −18%: the A/B harness wrote `MYNAH_QUANT=` empty,
+      both sides got the same wrong workload, and the ratio looked consistent.
+      Direction and verdict held; the figures did not.) Left open: the last 23% is calls
       of 14-42 µs, *below* the measured dispatch cost, so folding them further is a
       rounding change that needs its own qualification
 - [ ] E9-3 **topology is a first-class serving parameter and the reference's rule does
@@ -440,6 +443,11 @@ does not.
       default run carries f16 on every projection while `quant.requested` reads `off`,
       because that row describes the cache default and not the per-group spec. Two
       reports, one truth — fix the row, not the census
+- [ ] E9-6 **`MYNAH_QUANT=` empty is not `MYNAH_QUANT` unset** — the empty value
+      produces different audio *and* a ~1.8x different wall on HEAD, which is how a
+      lane's A/B harness measured the wrong workload on both sides of a pair and
+      read it as contention. Pre-existing. Either treat empty as unset or refuse it
+      loudly; silently meaning a third thing is what makes it a trap
 - [x] E9-0 **allocations are constant across `--max-steps`** (3,441 at both 24 and 96
       steps): the autoregressive loop allocates nothing, and that is now a permanent
       check rather than a belief

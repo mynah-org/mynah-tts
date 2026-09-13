@@ -99,26 +99,44 @@ because the caller re-touches output lines sixteen workers just dirtied.
 
 ## Result
 
-`codec.conv_stack`, paired interleaved runs, median of within-round ratios:
+`codec.conv_stack`, paired interleaved runs on a QUIET box, final shipped
+binary, median of within-round ratios:
 
-| threads | HEAD (median) | lane (median) | median of within-round ratios |
+| threads | HEAD (median) | lane (median) | median ratio |
 |---|---|---|---|
-| 1 | 625.9 ms | 624.0 ms | 1.00 |
-| 8 | 243.3 ms | 124.5 ms | 1.95 |
-| 16 | 241.6 ms | **103.7 ms** | **2.30** |
-| 32 | 268.9 ms | 113.2 ms | 2.37 |
+| 1 | 606.9 ms | 593.9 ms | 1.01 |
+| 8 | 240.6 ms | 124.2 ms | 1.93 |
+| 16 | 230.2 ms | **104.1 ms** | **2.20** |
+| 32 | 270.8 ms | 117.5 ms | 2.33 |
 
-Scaling 1 -> 16 cores: **2.59x -> 6.02x** (the target was 4.3x, its neighbour's).
-Re-taken on the exact shipped binary while another lane had ~9 cores of the
-box: base 253.9 ms, lane 115.4 ms, median ratio **2.25** -- the paired protocol
-holds the ratio across load 0 to load 9 (2.27 / 2.28 / 2.30 / 2.25 in four
-sessions), which is the whole reason it is paired.
+Scaling 1 -> 16 cores: **2.64x -> 5.71x**.  The target was 4.3x, its
+neighbour's.
 
-Whole request, `request.total`, 16 threads, quiet box: 834.6 ms -> 684.6 ms,
-**-18% of total wall**; RTF 0.186 -> 0.155.  Under contention the same pair
-compresses to 1.09, because a contended parallel region inflates on both sides;
-the 1.22 is the number that belongs to a dedicated box.
-Serial fraction of the region: 66% -> 23%.
+Whole request, `request.total`, 16 threads, both profiles:
+
+| profile | HEAD | lane | median ratio |
+|---|---|---|---|
+| default | 816.9 ms | 678.3 ms | **1.20** |
+| int8 | 793.4 ms | 658.4 ms | **1.20** |
+
+**-17% of total wall on both.**  RTF 0.186 -> 0.155.  Serial fraction of the
+region: 66% -> 23%.
+
+### A harness bug, recorded because it nearly became a number
+
+The first `request.total` pairs read 1.09, and the obvious explanation -- another
+lane had nine cores of the box -- was wrong.  The A/B script wrote
+`MYNAH_QUANT="$QUANT"` with `QUANT` empty, and **`MYNAH_QUANT=` is not the same
+as `MYNAH_QUANT` unset**: on HEAD alone the two produce different audio and a
+~1.8x different wall.  Both sides of the pair got the same wrong workload, so
+the ratio was internally consistent and looked like contention.  It was caught
+only by re-measuring on an idle box and finding the absolute still wrong.
+The `codec.conv_stack` conclusion was never affected (same env both sides, and
+the plain-invocation single runs agreed), but the end-to-end ratio was.
+Two lessons, both already in CLAUDE.md: a paired ratio does not protect you
+from measuring the wrong thing, and a green-looking harness has to be checked
+against a plain invocation.  The empty-vs-unset behaviour itself is
+pre-existing, is not in these files, and will bite anyone else scripting an A/B.
 
 Note for whoever owns the pool: **HEAD gets nothing from 8 -> 16 cores on this
 region (243 -> 240 ms) and both builds REGRESS from 16 -> 32 cores.**  That is
