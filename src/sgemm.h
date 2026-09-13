@@ -93,6 +93,59 @@ int mynah_sgemm_f32(int trans_a, int trans_b,
                     float beta,
                     float *c, size_t ldc);
 
+/* ------------------------------------------------------------------------
+ * Conv taps: several GEMMs in ONE pool region
+ * ------------------------------------------------------------------------
+ *
+ * WHY THIS EXISTS.  A causal conv1d with kernel K is K GEMMs that accumulate
+ * into the same C, one per kernel tap (src/seanet.c).  Written as K calls to
+ * mynah_sgemm_f32 that is K pool dispatches, and each one is far too small to
+ * pay for one: measured on the 32-core Neoverse-V2 box, m=512 n=16 k=512 --
+ * 28% of every GEMM the PocketTTS codec issues -- takes 115 us on one thread
+ * and 47 us on sixteen.  A 2.4x from 16x the cores, because ~40 us of that
+ * 47 is the dispatch itself.  The entry convolution alone pays that seven
+ * times per frame.
+ *
+ * Worse, each of those K calls needs op(A) as a DENSE [m][k] matrix, while the
+ * weight is stored [m][k][taps] -- so the caller gathered one tap out of the
+ * weight, on its own thread, before every dispatch.  That gather was 24.6% of
+ * codec.conv_stack at sixteen threads and scaled 1.2x.
+ *
+ * THE FIX IS ONE REGION, NOT MORE THREADS.  A task owns a block of C's ROWS.
+ * Tap t only ever accumulates C rows into themselves, and the gather for tap t
+ * only ever needs the matching rows of the weight, so a task can gather ITS
+ * rows and run ITS strip for every tap without looking at any other task's
+ * rows.  K dispatches become one, and the gather lands in the thread that is
+ * about to read it, while it is still in that core's L1.
+ *
+ * BYTE-IDENTICAL, NOT "AGREES TO 1e-6".  This is the same arithmetic in the
+ * same order, and the gate is memcmp, not a tolerance:
+ *   - the gathered values are a copy, not a computation;
+ *   - the row blocking is planned from (m, n, k) for ONE tap, exactly as the K
+ *     separate calls planned it, so every output element is computed by the
+ *     same micro-kernel instantiation as before;
+ *   - the reduction over k is still never split, and the taps are still
+ *     applied in order 0..taps-1 with the beta chain, so each tap's partial
+ *     sum is still rounded to f32 before the next one is added.
+ * mynah_sgemm_self_test() asserts the memcmp against the K-call sequence.
+ *
+ * REFUSAL.  Returns 1 -- "not applicable, do it yourself" -- when the planned
+ * column grid is wider than one block, because then two tasks share a row
+ * block and would race to gather the same rows.  The caller then runs its
+ * ordinary K-call loop, which is why this can never change a result: the
+ * refused path is the old path.
+ *
+ *   C[m][n] = sum over t of A_t * B_t, chained through beta,
+ *     A_t[i][p] = weight[i * k * taps + p * taps + t]   (gathered into scratch)
+ *     B_t       = b + t * b_tap_stride, row stride ldb
+ *
+ * `gather` is [m][k] caller-owned scratch; its contents after the call are
+ * unspecified.  Returns 0 done, 1 refused, -1 bad arguments. */
+int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
+                              const float *weight, float *gather,
+                              const float *b, size_t ldb, size_t b_tap_stride,
+                              float beta, float *c, size_t ldc);
+
 /* The definition of correctness: the naive i,j,p triple loop, always
  * compiled, never vectorised, never threaded.  Every kernel in sgemm.c is
  * checked against THIS by mynah_sgemm_self_test(), and src/backend.c uses it
@@ -175,6 +228,16 @@ typedef struct {
     unsigned long long narrow;
     unsigned long long panel;
     unsigned long long refused;   /* bad arguments, nothing computed */
+    /* Conv-tap regions: `fused` is the number of mynah_sgemm_f32_conv_taps
+     * calls that ran as ONE pool region, `fused_taps` the GEMMs those regions
+     * carried (also counted in `calls` and in the family row, because the
+     * arithmetic is the same), and `fused_refused` the calls that fell back to
+     * the caller's own per-tap loop.  Three numbers rather than one because
+     * "the fusion never applied" and "the fusion was never reached" are
+     * different failures and a single counter cannot tell them apart. */
+    unsigned long long fused;
+    unsigned long long fused_taps;
+    unsigned long long fused_refused;
 } mynah_sgemm_stats;
 
 void mynah_sgemm_stats_get(mynah_sgemm_stats *out);

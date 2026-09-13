@@ -13,10 +13,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "dispatch.h"
 #include "kernels.h"
 #include "sgemm.h"
+#include "threads.h"
 
 /* Which GEMM the two fast paths below call.  MYNAH_SEANET_BLAS says "a GEMM
  * exists", not "a vendor BLAS exists": with BLAS=none that GEMM is our own
@@ -195,13 +197,223 @@ static int sea_add(size_t a, size_t b, size_t *out) {
 
 static size_t sea_max(size_t a, size_t b) { return (a > b) ? a : b; }
 
+/* ---------------------------------------------------------- phase profiler
+ *
+ * WHY.  codec.conv_stack scales 2.6x on sixteen cores where codec.transformer
+ * gets 4.5x and step.backbone 4.7x, and a region timer cannot say why: it
+ * measures the sum of a GEMM that has a thread pool behind it and a dozen
+ * element-wise loops that do not.  Amdahl on the region total says "about a
+ * third of this is serial" without naming one line.  These counters split the
+ * region into phases whose parallelism is a property of the phase, so the
+ * serial fraction is READ OFF instead of inferred.
+ *
+ * The split is by WHO RUNS THE LOOP, not by what the loop computes:
+ *
+ *   *.gemm      dispatches to mynah_parallel_for   -> scales
+ *   everything else runs on the calling thread     -> does not
+ *
+ * so the table is a direct measurement of the ceiling.
+ *
+ * OFF unless MYNAH_SEANET_PROFILE is set to something other than "0": one
+ * relaxed load of an int and a predictable branch per phase boundary, never
+ * inside an inner loop.  Same level-0 contract as costmap.h.  Two clock reads
+ * per phase, so the numbers are wall time on the calling thread and are NOT
+ * summed over pool workers -- a `*.gemm` row is the caller's view of the
+ * dispatch (wake-up, its own share of the work, and the barrier), which is
+ * exactly the quantity that has to shrink for the region to scale. */
+enum {
+    SEA_PH_DECODE = 0,      /* whole mynah_seanet_decode: == codec.conv_stack */
+    SEA_PH_ELU,             /* mynah_seanet_elu_f32                           */
+    SEA_PH_RESADD,          /* the residual skip add                          */
+    SEA_PH_CONV_WINDOW,     /* prepend the carried tail                       */
+    SEA_PH_CONV_GATHER,     /* gather one kernel tap into a dense matrix      */
+    SEA_PH_CONV_GEMM,       /* sea_sgemm, conv1d                              */
+    SEA_PH_CONV_TAPS,       /* all taps fused into one pool region             */
+    SEA_PH_CONV_BIAS,       /* broadcast the bias over the output             */
+    SEA_PH_CONV_CARRY,      /* save the new tail                              */
+    SEA_PH_CONV_SCALAR,     /* the reference conv1d loop                      */
+    SEA_PH_CONVTR_FILL,     /* initialise `full` with the bias                */
+    SEA_PH_CONVTR_GEMM,     /* sea_sgemm, convtranspose                       */
+    SEA_PH_CONVTR_SCATTER,  /* taps -> full, stride-spaced                    */
+    SEA_PH_CONVTR_SCALAR,   /* the reference scatter (grouped/depthwise)      */
+    SEA_PH_CONVTR_TAIL,     /* fold the carried head, take the new tail       */
+    SEA_PH_CONVTR_COPY,     /* full -> output                                 */
+    SEA_PH_COUNT
+};
+
+static const char *const g_sea_phase_name[SEA_PH_COUNT] = {
+    "decode.total",   "elu",            "residual_add",  "conv.window",
+    "conv.gather",    "conv.gemm",      "conv.taps",     "conv.bias",
+    "conv.carry",     "conv.scalar",    "convtr.fill",   "convtr.gemm",
+    "convtr.scatter", "convtr.scalar",  "convtr.tail",   "convtr.copy"
+};
+
+/* 1 when the phase dispatches to the thread pool; 0 when it is a plain loop on
+ * the calling thread.  The report prints this column because the whole point
+ * of the table is that split, and a reader should not have to know which name
+ * means which. */
+static const int g_sea_phase_par[SEA_PH_COUNT] = {
+    0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0
+};
+
+typedef struct {
+    atomic_ullong ns;
+    atomic_ullong calls;
+    atomic_ullong elems;
+} sea_phase_acc;
+
+static sea_phase_acc g_sea_phase[SEA_PH_COUNT];
+static atomic_int g_sea_prof_state = -1; /* -1 unresolved, 0 off, 1 on */
+static atomic_int g_sea_prof_hooked;
+
+static void sea_prof_report(void);
+
+static int sea_prof_on(void) {
+    int state = atomic_load_explicit(&g_sea_prof_state, memory_order_relaxed);
+    if (state >= 0) return state;
+    const char *env = getenv("MYNAH_SEANET_PROFILE");
+    state = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    atomic_store_explicit(&g_sea_prof_state, state, memory_order_relaxed);
+    if (state) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&g_sea_prof_hooked, &expected, 1)) {
+            (void)atexit(sea_prof_report);
+        }
+    }
+    return state;
+}
+
+/* 0 means "not profiling": the caller skips the matching _add.  CLOCK_MONOTONIC
+ * is time since boot and is never 0 on a running process, so the sentinel
+ * cannot collide with a real reading. */
+static unsigned long long sea_prof_now(void) {
+    if (!sea_prof_on()) return 0ull;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull +
+           (unsigned long long)ts.tv_nsec;
+}
+
+static void sea_prof_add(int phase, unsigned long long start, size_t elems) {
+    if (start == 0ull) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned long long now =
+        (unsigned long long)ts.tv_sec * 1000000000ull +
+        (unsigned long long)ts.tv_nsec;
+    sea_phase_acc *acc = &g_sea_phase[phase];
+    atomic_fetch_add_explicit(&acc->ns, now - start, memory_order_relaxed);
+    atomic_fetch_add_explicit(&acc->calls, 1ull, memory_order_relaxed);
+    atomic_fetch_add_explicit(&acc->elems, (unsigned long long)elems,
+                              memory_order_relaxed);
+}
+
+static void sea_prof_report(void) {
+    const unsigned long long total = atomic_load_explicit(
+        &g_sea_phase[SEA_PH_DECODE].ns, memory_order_relaxed);
+    fprintf(stderr,
+            "[SEANET-PHASES] decode.total is codec.conv_stack; every other row "
+            "is a phase inside it.\n"
+            "  par=1 dispatches to the pool, par=0 runs on the calling "
+            "thread.  The par=0 rows are the scaling ceiling.\n");
+    fprintf(stderr, "  %-16s %3s %10s %12s %14s %8s\n", "phase", "par", "calls",
+            "ms", "elements", "%decode");
+    unsigned long long serial = 0, parallel = 0;
+    for (int i = 0; i < SEA_PH_COUNT; ++i) {
+        const unsigned long long ns =
+            atomic_load_explicit(&g_sea_phase[i].ns, memory_order_relaxed);
+        const unsigned long long calls =
+            atomic_load_explicit(&g_sea_phase[i].calls, memory_order_relaxed);
+        if (calls == 0ull) continue;
+        const unsigned long long el =
+            atomic_load_explicit(&g_sea_phase[i].elems, memory_order_relaxed);
+        if (i != SEA_PH_DECODE) {
+            if (g_sea_phase_par[i]) parallel += ns; else serial += ns;
+        }
+        fprintf(stderr, "  %-16s %3d %10llu %12.3f %14llu %7.2f%%\n",
+                g_sea_phase_name[i], g_sea_phase_par[i], calls,
+                (double)ns / 1e6, el,
+                total ? 100.0 * (double)ns / (double)total : 0.0);
+    }
+    const double t = (double)(total ? total : 1ull);
+    fprintf(stderr,
+            "  sum: parallel %.3f ms (%.2f%%), serial %.3f ms (%.2f%%), "
+            "unattributed %.3f ms (%.2f%%)\n",
+            (double)parallel / 1e6, 100.0 * (double)parallel / t,
+            (double)serial / 1e6, 100.0 * (double)serial / t,
+            ((double)total - (double)parallel - (double)serial) / 1e6,
+            100.0 * ((double)total - (double)parallel - (double)serial) / t);
+}
+
+/* ELU is element-wise, so splitting it over the pool is bit-identical by
+ * construction -- threads.h's contract is "tasks write to disjoint regions,
+ * the result is BIT-IDENTICAL to the serial loop" -- and there is no reduction
+ * here to reassociate.  It needed splitting: measured at sixteen threads it
+ * was 77.0 ms of the 234.7 ms codec.conv_stack (32.8%) and its speedup over
+ * one thread was 1.00x, because mynah_seanet_decode calls it ten times per
+ * frame on the calling thread and nothing ever dispatched it.
+ *
+ * THE THRESHOLDS ARE MEASURED, not chosen.  On the 32-core Neoverse-V2 box a
+ * pool region costs ~35 us of wake-up and barrier (fitted from the per-shape
+ * GEMM histogram: t16 - t1/16 over eleven shapes) and this loop runs at
+ * ~2.5 ns per element, so a region only starts to pay at ~16k elements and a
+ * task below ~8k elements is barrier, not work.  Both numbers belong to this
+ * box; they do not port.
+ *
+ * CHUNKS ARE WHOLE CACHE LINES.  Sixteen floats is one 64-byte line; the
+ * round-up to 64 floats keeps every task's stores four lines clear of its
+ * neighbour's and keeps each chunk a multiple of any vector width the compiler
+ * might use, so no element moves between a vector body and a scalar
+ * remainder. */
+#define SEA_ELU_MIN_PARALLEL 16384u
+#define SEA_ELU_MIN_CHUNK     8192u
+
+typedef struct {
+    const float *in;
+    float *out;
+    float alpha;
+    size_t n;
+    size_t chunk;
+} sea_elu_job;
+
+static void sea_elu_range(const float *in, float *out, size_t n, float alpha) {
+    for (size_t i = 0; i < n; ++i) {
+        const float x = in[i];
+        out[i] = (x > 0.0f) ? x : alpha * (expf(x) - 1.0f);
+    }
+}
+
+static void sea_elu_task(void *ctx, int index) {
+    const sea_elu_job *j = (const sea_elu_job *)ctx;
+    const size_t start = (size_t)index * j->chunk;
+    if (start >= j->n) return;
+    size_t len = j->chunk;
+    if (start + len > j->n) len = j->n - start;
+    sea_elu_range(j->in + start, j->out + start, len, j->alpha);
+}
+
 void mynah_seanet_elu_f32(const float *input, float *output, size_t n,
                           float alpha) {
     if (input == NULL || output == NULL) return;
-    for (size_t i = 0; i < n; ++i) {
-        const float x = input[i];
-        output[i] = (x > 0.0f) ? x : alpha * (expf(x) - 1.0f);
+    const unsigned long long t0 = sea_prof_now();
+    const int threads = mynah_num_threads();
+    if (threads > 1 && n >= SEA_ELU_MIN_PARALLEL) {
+        size_t tasks = n / SEA_ELU_MIN_CHUNK;
+        if (tasks > (size_t)threads) tasks = (size_t)threads;
+        if (tasks > 1u) {
+            size_t chunk = (n + tasks - 1u) / tasks;
+            chunk += (64u - chunk % 64u) % 64u;
+            tasks = (n + chunk - 1u) / chunk;
+            sea_elu_job job;
+            job.in = input; job.out = output; job.alpha = alpha;
+            job.n = n; job.chunk = chunk;
+            mynah_parallel_for((int)tasks, sea_elu_task, &job);
+            sea_prof_add(SEA_PH_ELU, t0, n);
+            return;
+        }
     }
+    sea_elu_range(input, output, n, alpha);
+    sea_prof_add(SEA_PH_ELU, t0, n);
 }
 
 /* ------------------------------------------------ causal streaming conv1d */
@@ -354,6 +566,7 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
     size_t window_len = in_len;
 
     if (tail > 0) {
+        const unsigned long long t_win = sea_prof_now();
         if (spec->pad_mode == MYNAH_CONV_PAD_REPLICATE && !conv->primed) {
             for (size_t c = 0; c < in_channels; ++c) {
                 const float first = input[c * in_len];
@@ -368,6 +581,7 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
             memcpy(dst + tail, input + c * in_len, in_len * sizeof(float));
         }
         win = conv->window;
+        sea_prof_add(SEA_PH_CONV_WINDOW, t_win, in_channels * window_len);
     }
 
     const size_t kernel = spec->kernel_size;
@@ -416,11 +630,38 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
     if (conv_use_gemm) {
         sea_bump(&g_sea.conv_gemm);
         const size_t oc_count = spec->out_channels;
-        for (size_t k = 0; k < kernel; ++k) {
+        /* All `kernel` taps in ONE pool region when the plan allows it: the
+         * gather lands on the thread that is about to multiply by it, and the
+         * dispatch is paid once instead of `kernel` times.  Byte-identical to
+         * the loop below -- see the contract in sgemm.h -- and it refuses
+         * rather than approximates, in which case the loop runs unchanged. */
+        int fused = 0;
+#if defined(MYNAH_SEANET_OWN_SGEMM)
+        /* ONLY when sea_sgemm above is mynah_sgemm_f32.  On a build that links
+         * Accelerate or OpenBLAS, sea_sgemm is THAT library's cblas_sgemm, and
+         * routing these taps through our own kernels instead would change the
+         * codec's f32 output -- a numerical change wearing a scheduling
+         * change's clothes, on the one platform (macOS) where nobody would be
+         * looking for it.  Production is Linux with BLAS=none, which is
+         * exactly where this is compiled in. */
+        if (kernel > 1u) {
+            const unsigned long long t_fused = sea_prof_now();
+            if (mynah_sgemm_f32_conv_taps(oc_count, out_len, in_channels,
+                                          kernel, weights->weight, conv->taps,
+                                          win, window_len, dilation, 0.0f,
+                                          output, out_len) == 0) {
+                fused = 1;
+                sea_prof_add(SEA_PH_CONV_TAPS, t_fused,
+                             oc_count * out_len * in_channels * kernel);
+            }
+        }
+#endif
+        for (size_t k = 0; !fused && k < kernel; ++k) {
             const float *a;
             if (kernel == 1u) {
                 a = weights->weight;
             } else {
+                const unsigned long long t_gather = sea_prof_now();
                 float *taps = conv->taps;
                 for (size_t oc = 0; oc < oc_count; ++oc) {
                     const float *src = weights->weight + oc * in_channels * kernel + k;
@@ -428,30 +669,40 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
                     for (size_t j = 0; j < in_channels; ++j) dst[j] = src[j * kernel];
                 }
                 a = taps;
+                sea_prof_add(SEA_PH_CONV_GATHER, t_gather,
+                             oc_count * in_channels);
             }
+            const unsigned long long t_gemm = sea_prof_now();
             sea_sgemm(0, oc_count, out_len, in_channels, a, in_channels,
                       win + k * dilation, window_len, (k == 0) ? 0.0f : 1.0f,
                       output, out_len);
+            sea_prof_add(SEA_PH_CONV_GEMM, t_gemm,
+                         oc_count * out_len * in_channels);
         }
         if (weights->bias != NULL) {
+            const unsigned long long t_bias = sea_prof_now();
             for (size_t oc = 0; oc < oc_count; ++oc) {
                 float *out_row = output + oc * out_len;
                 const float bias = weights->bias[oc];
                 for (size_t n = 0; n < out_len; ++n) out_row[n] += bias;
             }
+            sea_prof_add(SEA_PH_CONV_BIAS, t_bias, oc_count * out_len);
         }
         if (tail > 0) {
+            const unsigned long long t_carry = sea_prof_now();
             for (size_t c = 0; c < in_channels; ++c) {
                 memcpy(conv->previous + c * tail,
                        conv->window + c * window_len + (window_len - tail),
                        tail * sizeof(float));
             }
             conv->primed = 1;
+            sea_prof_add(SEA_PH_CONV_CARRY, t_carry, in_channels * tail);
         }
         return 0;
     }
 #endif
 
+    const unsigned long long t_scalar = sea_prof_now();
     for (size_t oc = 0; oc < spec->out_channels; ++oc) {
         const size_t group = oc / out_per_group;
         const float *weight_row = weights->weight + oc * in_per_group * kernel;
@@ -475,15 +726,19 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
             out_row[n] = acc + bias;
         }
     }
+    sea_prof_add(SEA_PH_CONV_SCALAR, t_scalar,
+                 spec->out_channels * out_len * in_per_group * kernel);
 
     if (tail > 0) {
         /* previous := last `tail` samples of the concatenated window. */
+        const unsigned long long t_carry = sea_prof_now();
         for (size_t c = 0; c < in_channels; ++c) {
             memcpy(conv->previous + c * tail,
                    conv->window + c * window_len + (window_len - tail),
                    tail * sizeof(float));
         }
         conv->primed = 1;
+        sea_prof_add(SEA_PH_CONV_CARRY, t_carry, in_channels * tail);
     }
     return 0;
 }
@@ -648,6 +903,7 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
     float *full = convtr->full;
 
     /* PyTorch adds the bias to every output position. */
+    const unsigned long long t_fill = sea_prof_now();
     for (size_t oc = 0; oc < spec->out_channels; ++oc) {
         float *row = full + oc * full_len;
         const float bias = (weights->bias != NULL) ? weights->bias[oc] : 0.0f;
@@ -657,6 +913,7 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
             for (size_t i = 0; i < full_len; ++i) row[i] = bias;
         }
     }
+    sea_prof_add(SEA_PH_CONVTR_FILL, t_fill, spec->out_channels * full_len);
 
     const size_t kernel = spec->kernel_size;
     const size_t stride = spec->stride;
@@ -701,8 +958,12 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
     if (folded) {
         sea_bump(&g_sea.convtr_gemm);
         const size_t rows = gemm_rows;
+        const unsigned long long t_gemm = sea_prof_now();
         sea_sgemm(1, rows, in_len, spec->in_channels, weights->weight, rows,
                   input, in_len, 0.0f, convtr->taps, in_len);
+        sea_prof_add(SEA_PH_CONVTR_GEMM, t_gemm,
+                     rows * in_len * spec->in_channels);
+        const unsigned long long t_scatter = sea_prof_now();
         for (size_t oc = 0; oc < spec->out_channels; ++oc) {
             float *row = full + oc * full_len;
             for (size_t k = 0; k < kernel; ++k) {
@@ -711,16 +972,21 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
                 for (size_t t = 0; t < in_len; ++t) dst[t * stride] += src[t];
             }
         }
+        sea_prof_add(SEA_PH_CONVTR_SCATTER, t_scatter, rows * in_len);
     }
 #endif
     if (!folded) {
+        const unsigned long long t_sc = sea_prof_now();
         convtr_scatter_scalar(spec, weights, input, in_len, full, full_len);
+        sea_prof_add(SEA_PH_CONVTR_SCALAR, t_sc,
+                     spec->out_channels * kernel * in_len);
     }
 
     if (tail > 0) {
         /* Faithful to upstream StreamingConvTranspose1d.forward: the carried
          * tail is folded into the head first, and only then is the new tail
          * taken (with the bias removed, because the next call re-adds it). */
+        const unsigned long long t_tail = sea_prof_now();
         for (size_t oc = 0; oc < spec->out_channels; ++oc) {
             float *row = full + oc * full_len;
             const float *carry = convtr->partial + oc * tail;
@@ -735,12 +1001,16 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
                 carry[i] = row[full_len - tail + i] - bias;
             }
         }
+        sea_prof_add(SEA_PH_CONVTR_TAIL, t_tail,
+                     2u * spec->out_channels * tail);
     }
 
+    const unsigned long long t_copy = sea_prof_now();
     for (size_t oc = 0; oc < spec->out_channels; ++oc) {
         memcpy(output + oc * out_len, full + oc * full_len,
                out_len * sizeof(float));
     }
+    sea_prof_add(SEA_PH_CONVTR_COPY, t_copy, spec->out_channels * out_len);
     return 0;
 }
 
@@ -1386,6 +1656,7 @@ int mynah_seanet_decode(mynah_seanet_state *state,
         n_encoder_frames > state->max_encoder_frames) {
         return -1;
     }
+    const unsigned long long t_decode = sea_prof_now();
     const float alpha = state->config.elu_alpha;
     float *a = state->work[0];
     float *b = state->work[1];
@@ -1453,9 +1724,12 @@ int mynah_seanet_decode(mynah_seanet_state *state,
                                           c) != 0) {
                 return -1;
             }
+            const unsigned long long t_add = sea_prof_now();
             for (size_t k = 0; k < channels * len; ++k) cur[k] += c[k];
+            sea_prof_add(SEA_PH_RESADD, t_add, channels * len);
         }
     }
+    sea_prof_add(SEA_PH_DECODE, t_decode, n_encoder_frames);
     return 0;
 }
 

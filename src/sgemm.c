@@ -62,6 +62,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ======================================================================
  * ISA abstraction
@@ -185,6 +186,9 @@ typedef struct {
     atomic_ullong narrow;
     atomic_ullong panel;
     atomic_ullong refused;
+    atomic_ullong fused;
+    atomic_ullong fused_taps;
+    atomic_ullong fused_refused;
 } sg_counters;
 
 static sg_counters g_sg;
@@ -206,6 +210,9 @@ void mynah_sgemm_stats_get(mynah_sgemm_stats *out) {
     out->narrow    = sg_read(&g_sg.narrow);
     out->panel     = sg_read(&g_sg.panel);
     out->refused   = sg_read(&g_sg.refused);
+    out->fused         = sg_read(&g_sg.fused);
+    out->fused_taps    = sg_read(&g_sg.fused_taps);
+    out->fused_refused = sg_read(&g_sg.fused_refused);
 }
 
 void mynah_sgemm_stats_reset(void) {
@@ -216,6 +223,161 @@ void mynah_sgemm_stats_reset(void) {
     atomic_store_explicit(&g_sg.narrow, 0ull, memory_order_relaxed);
     atomic_store_explicit(&g_sg.panel, 0ull, memory_order_relaxed);
     atomic_store_explicit(&g_sg.refused, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_sg.fused, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_sg.fused_taps, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_sg.fused_refused, 0ull, memory_order_relaxed);
+}
+
+/* ======================================================================
+ * Shape histogram -- E: what ACTUALLY ran, per shape
+ *
+ * sgemm.h states a measured histogram ("28% of calls are m=512 n=16 k=512")
+ * that was collected once, by hand, on a different question.  A scaling
+ * investigation needs the histogram AS EXECUTED, with per-shape wall time and
+ * the task count each call asked the pool for, because "how many dispatches"
+ * and "how long is one dispatch" are the two numbers that decide whether a
+ * barrier is the ceiling.  Deriving them from the source is exactly the
+ * mistake dispatch.h exists to prevent.
+ *
+ * A fixed table, no allocation, linear probe on a 5-tuple key.  OFF unless
+ * MYNAH_SGEMM_PROFILE is set to something other than "0"; when off this costs
+ * one relaxed load and a predictable branch per GEMM CALL (not per element,
+ * not per task).  A full table stops recording and says so rather than
+ * evicting, because a histogram that silently drops its tail is worse than
+ * one that refuses.
+ * ====================================================================== */
+#define SG_HIST_MAX 96
+
+typedef struct {
+    atomic_int used;
+    int trans_a, trans_b;
+    size_t m, n, k;
+    unsigned long long calls;
+    unsigned long long tasks;     /* summed: tasks asked of the pool         */
+    unsigned long long ns;        /* summed wall, caller's view              */
+    unsigned long long ns_min;
+    unsigned long long ns_max;
+    int family;
+} sg_hist_row;
+
+static sg_hist_row g_sg_hist[SG_HIST_MAX];
+static atomic_int g_sg_hist_full;
+static atomic_flag g_sg_hist_lock = ATOMIC_FLAG_INIT;
+static atomic_int g_sg_prof_state = -1;
+static atomic_int g_sg_prof_hooked;
+
+static void sg_hist_report(void);
+
+static int sg_prof_on(void) {
+    int state = atomic_load_explicit(&g_sg_prof_state, memory_order_relaxed);
+    if (state >= 0) return state;
+    const char *env = getenv("MYNAH_SGEMM_PROFILE");
+    state = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    atomic_store_explicit(&g_sg_prof_state, state, memory_order_relaxed);
+    if (state) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&g_sg_prof_hooked, &expected, 1))
+            (void)atexit(sg_hist_report);
+    }
+    return state;
+}
+
+static unsigned long long sg_now(void) {
+    if (!sg_prof_on()) return 0ull;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull +
+           (unsigned long long)ts.tv_nsec;
+}
+
+/* One spinlock, taken once per GEMM call and only while profiling.  The alt-
+ * ernative -- per-row atomics -- would make the min/max racy for no benefit:
+ * this path never runs in production. */
+static void sg_hist_add(unsigned long long start, int trans_a, int trans_b,
+                        size_t m, size_t n, size_t k, int family,
+                        size_t tasks) {
+    if (start == 0ull) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned long long dt =
+        (unsigned long long)ts.tv_sec * 1000000000ull +
+        (unsigned long long)ts.tv_nsec - start;
+    while (atomic_flag_test_and_set_explicit(&g_sg_hist_lock,
+                                             memory_order_acquire)) { }
+    sg_hist_row *slot = NULL;
+    for (int i = 0; i < SG_HIST_MAX; ++i) {
+        sg_hist_row *r = &g_sg_hist[i];
+        if (!atomic_load_explicit(&r->used, memory_order_relaxed)) {
+            slot = r;
+            break;
+        }
+        if (r->trans_a == trans_a && r->trans_b == trans_b && r->m == m &&
+            r->n == n && r->k == k) {
+            slot = r;
+            break;
+        }
+    }
+    if (slot == NULL) {
+        atomic_store_explicit(&g_sg_hist_full, 1, memory_order_relaxed);
+    } else if (!atomic_load_explicit(&slot->used, memory_order_relaxed)) {
+        slot->trans_a = trans_a; slot->trans_b = trans_b;
+        slot->m = m; slot->n = n; slot->k = k;
+        slot->calls = 1ull; slot->tasks = (unsigned long long)tasks;
+        slot->ns = dt; slot->ns_min = dt; slot->ns_max = dt;
+        slot->family = family;
+        atomic_store_explicit(&slot->used, 1, memory_order_relaxed);
+    } else {
+        slot->calls += 1ull;
+        slot->tasks += (unsigned long long)tasks;
+        slot->ns += dt;
+        if (dt < slot->ns_min) slot->ns_min = dt;
+        if (dt > slot->ns_max) slot->ns_max = dt;
+    }
+    atomic_flag_clear_explicit(&g_sg_hist_lock, memory_order_release);
+}
+
+static void sg_hist_report(void) {
+    unsigned long long calls = 0, ns = 0, tasks = 0;
+    for (int i = 0; i < SG_HIST_MAX; ++i) {
+        if (!atomic_load_explicit(&g_sg_hist[i].used, memory_order_relaxed))
+            continue;
+        calls += g_sg_hist[i].calls;
+        ns    += g_sg_hist[i].ns;
+        tasks += g_sg_hist[i].tasks;
+    }
+    fprintf(stderr,
+            "[SGEMM-SHAPES] isa=%s threads=%d narrow_max=%zu -- AS EXECUTED, "
+            "not as predicted.\n"
+            "  ns is the CALLER's wall for the whole call: wake-up + its own "
+            "share + barrier.  tasks/call is what the pool was asked for.\n",
+            SG_ISA_NAME, mynah_num_threads(), (size_t)SG_NARROW_MAX);
+    if (atomic_load_explicit(&g_sg_hist_full, memory_order_relaxed))
+        fprintf(stderr, "  WARNING: table full, some shapes not recorded.\n");
+    fprintf(stderr, "  %2s %2s %6s %6s %6s %8s %9s %7s %10s %9s %9s %7s\n",
+            "tA", "tB", "m", "n", "k", "calls", "family", "tasks", "total_ms",
+            "mean_us", "min_us", "%ns");
+    for (int i = 0; i < SG_HIST_MAX; ++i) {
+        sg_hist_row *r = &g_sg_hist[i];
+        if (!atomic_load_explicit(&r->used, memory_order_relaxed)) continue;
+        fprintf(stderr,
+                "  %2d %2d %6zu %6zu %6zu %8llu %9s %7.1f %10.3f %9.2f %9.2f "
+                "%6.2f%%\n",
+                r->trans_a, r->trans_b, r->m, r->n, r->k, r->calls,
+                mynah_sgemm_family_name((mynah_sgemm_family)r->family),
+                (double)r->tasks / (double)r->calls, (double)r->ns / 1e6,
+                (double)r->ns / (double)r->calls / 1e3,
+                (double)r->ns_min / 1e3,
+                ns ? 100.0 * (double)r->ns / (double)ns : 0.0);
+    }
+    long long disp = 0, serial = 0, inl = 0, joins = 0;
+    mynah_parallel_stats(&disp, &serial, &inl, &joins);
+    fprintf(stderr,
+            "  totals: calls=%llu wall=%.3f ms tasks=%llu (%.1f/call)  "
+            "pool: dispatches=%lld serial=%lld inline_fallbacks=%lld "
+            "helper_joins=%lld\n",
+            calls, (double)ns / 1e6, tasks,
+            calls ? (double)tasks / (double)calls : 0.0, disp, serial, inl,
+            joins);
 }
 
 /* ======================================================================
@@ -381,6 +543,13 @@ typedef struct {
     size_t row_block; /* rows per task, a multiple of SG_MR    */
     size_t grid_n;    /* column blocks                        */
     size_t grid_m;    /* row blocks                           */
+    /* conv-tap fusion; see mynah_sgemm_f32_conv_taps in sgemm.h.  taps == 0
+     * is an ordinary GEMM and none of the rest is read. */
+    int serial;       /* the plan asked for one task: run inline */
+    size_t taps;
+    const float *w_taps;    /* [m][k][taps]                   */
+    float *gather;          /* [m][k] scratch, row-block private */
+    size_t b_tap_stride;
 } sg_job;
 
 /* op(B) not transposed: columns of op(B) are contiguous, so the micro-kernels
@@ -434,6 +603,51 @@ static void sg_task(void *ctx, int index) {
     if (j0 + cols > j->n) cols = j->n - j0;
     if (j->family == MYNAH_SGEMM_FAMILY_DOT) sg_tile_dot(j, i0, rows, j0, cols);
     else sg_tile_nn(j, i0, rows, j0, cols);
+}
+
+/* One task of the fused conv-tap region.
+ *
+ * A TASK IS A ROW BLOCK, not a (row block, column group) tile, and that is the
+ * one structural difference from sg_task.  The gather is per-ROW: if two tasks
+ * shared a row block they would race to gather the same rows of the weight
+ * into the same scratch.  Owning the whole row -- all column groups -- removes
+ * the sharing instead of synchronising it, and costs nothing numerically,
+ * because which thread computes a tile has never affected its value.  The
+ * COLUMN plan is untouched, so every tile is still the same tile, on the same
+ * micro-kernel instantiation, as the per-tap calls produced.
+ *
+ * The tap loop is outermost so the beta chain still rounds each tap's partial
+ * sum to f32 before the next is added -- the property that makes this
+ * byte-identical rather than merely equivalent. */
+static void sg_task_taps(void *ctx, int index) {
+    const sg_job *j = (const sg_job *)ctx;
+    const size_t i0 = (size_t)index * j->row_block;
+    if (i0 >= j->m) return;
+    size_t rows = j->row_block;
+    if (i0 + rows > j->m) rows = j->m - i0;
+
+    sg_job local = *j;
+    local.trans_a = 0;
+    local.a = j->gather;
+    local.lda = j->k;
+    for (size_t t = 0; t < j->taps; ++t) {
+        float *dst = j->gather + i0 * j->k;
+        const float *src = j->w_taps + i0 * j->k * j->taps + t;
+        for (size_t r = 0; r < rows; ++r) {
+            for (size_t p = 0; p < j->k; ++p) dst[p] = src[p * j->taps];
+            dst += j->k;
+            src += j->k * j->taps;
+        }
+        local.b = j->b + t * j->b_tap_stride;
+        local.beta = (t == 0u) ? j->beta : 1.0f;
+        for (size_t bj = 0; bj < j->grid_n; ++bj) {
+            const size_t j0 = bj * j->nc;
+            if (j0 >= j->n) break;
+            size_t cols = j->nc;
+            if (j0 + cols > j->n) cols = j->n - j0;
+            sg_tile_nn(&local, i0, rows, j0, cols);
+        }
+    }
 }
 
 /* ======================================================================
@@ -555,6 +769,15 @@ static void sg_plan_rows(sg_job *j, size_t force_tasks) {
         if (threads > 1 && (huge || work >= SG_PARALLEL_MIN_WORK))
             want = (size_t)threads * 2u;
     }
+    /* `want == 1` means the work is below SG_PARALLEL_MIN_WORK and this GEMM
+     * should not touch the pool at all.  That intent used to be lost: the
+     * COLUMN grid is planned from the shape alone, so a matvec with nc = 256
+     * over n = 1920 still produced grid_n = 8 tasks and dispatched them.
+     * Measured, the 177 calls of m=1 n=1920 k=64 per utterance took 11.1 us
+     * each on one thread and 21.2 us on sixteen -- the pool made them twice as
+     * slow.  Running the same tasks inline, in order, is bit-identical (same
+     * task code, disjoint outputs) and is what `want == 1` always meant. */
+    j->serial = (want == 1u);
 
     size_t grid_m = (want + j->grid_n - 1u) / j->grid_n;
     if (grid_m == 0u) grid_m = 1u;
@@ -620,6 +843,7 @@ static int sg_dispatch(mynah_sgemm_family want, int forced, size_t force_tasks,
                        const float *a, size_t lda, const float *b, size_t ldb,
                        float beta, float *c, size_t ldc) {
     if (ran != NULL) *ran = MYNAH_SGEMM_FAMILY_REFERENCE;
+    const unsigned long long t_prof = sg_now();
     sg_bump(&g_sg.calls);
     if (sg_validate(trans_a, trans_b, m, n, k, a, lda, b, ldb, c, ldc) != 0) {
         sg_bump(&g_sg.refused);
@@ -638,6 +862,7 @@ static int sg_dispatch(mynah_sgemm_family want, int forced, size_t force_tasks,
     if (family == MYNAH_SGEMM_FAMILY_REFERENCE) {
         mynah_sgemm_f32_reference(trans_a, trans_b, m, n, k, alpha, a, lda, b,
                                   ldb, beta, c, ldc);
+        sg_hist_add(t_prof, trans_a, trans_b, m, n, k, (int)family, 1u);
         return 0;
     }
 
@@ -667,7 +892,12 @@ static int sg_dispatch(mynah_sgemm_family want, int forced, size_t force_tasks,
         job.grid_m = 1u;
         tasks = 1u;
     }
-    mynah_parallel_for((int)tasks, sg_task, &job);
+    if (job.serial) {
+        for (size_t t = 0; t < tasks; ++t) sg_task(&job, (int)t);
+    } else {
+        mynah_parallel_for((int)tasks, sg_task, &job);
+    }
+    sg_hist_add(t_prof, trans_a, trans_b, m, n, k, (int)family, tasks);
     return 0;
 }
 
@@ -676,6 +906,74 @@ int mynah_sgemm_f32(int trans_a, int trans_b, size_t m, size_t n, size_t k,
                     size_t ldb, float beta, float *c, size_t ldc) {
     return sg_dispatch(MYNAH_SGEMM_FAMILY_REFERENCE, 0, 0u, NULL, trans_a,
                        trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+}
+
+int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
+                              const float *weight, float *gather,
+                              const float *b, size_t ldb, size_t b_tap_stride,
+                              float beta, float *c, size_t ldc) {
+    if (taps == 0u || weight == NULL || gather == NULL || b == NULL ||
+        c == NULL) {
+        return -1;
+    }
+    if (m == 0u || n == 0u || k == 0u) return 1;
+    if (ldb < n || ldc < n) return -1;
+    /* The weight is indexed as one [m][k][taps] object and the gather as one
+     * [m][k] object, so m*k*taps must not wrap.  Refuse rather than clamp: the
+     * caller's per-tap loop handles any shape this declines. */
+    size_t weight_elems = 0;
+    if (sg_work(m, k, taps, &weight_elems) != 0) {
+        sg_bump(&g_sg.fused_refused);
+        return 1;
+    }
+
+    /* The plan is made for ONE tap, exactly as the taps-many separate calls
+     * would have made it, because that is what keeps every output element on
+     * the micro-kernel instantiation it had before. */
+    const mynah_sgemm_family family =
+        mynah_sgemm_family_for(0, 0, m, n, k, NULL);
+    if (family != MYNAH_SGEMM_FAMILY_NARROW &&
+        family != MYNAH_SGEMM_FAMILY_PANEL) {
+        sg_bump(&g_sg.fused_refused);
+        return 1;
+    }
+
+    sg_job job;
+    memset(&job, 0, sizeof job);
+    job.m = m; job.n = n; job.k = k;
+    job.alpha = 1.0f; job.beta = beta;
+    job.b = b; job.ldb = ldb;
+    job.c = c; job.ldc = ldc;
+    job.family = family;
+    sg_plan_columns(&job);
+    sg_plan_rows(&job, 0u);
+    if (job.grid_m == 0u || job.grid_m > (size_t)INT_MAX) {
+        sg_bump(&g_sg.fused_refused);
+        return 1;
+    }
+    job.taps = taps;
+    job.w_taps = weight;
+    job.gather = gather;
+    job.b_tap_stride = b_tap_stride;
+
+    /* The arithmetic is `taps` GEMMs, so it is counted as `taps` GEMMs: the
+     * family histogram must not change meaning because the dispatch did. */
+    const unsigned long long t_prof = sg_now();
+    for (size_t t = 0; t < taps; ++t) {
+        sg_bump(&g_sg.calls);
+        sg_count(family);
+    }
+    sg_bump(&g_sg.fused);
+    atomic_fetch_add_explicit(&g_sg.fused_taps, (unsigned long long)taps,
+                              memory_order_relaxed);
+
+    if (job.serial || job.grid_m == 1u) {
+        for (size_t t = 0; t < job.grid_m; ++t) sg_task_taps(&job, (int)t);
+    } else {
+        mynah_parallel_for((int)job.grid_m, sg_task_taps, &job);
+    }
+    sg_hist_add(t_prof, 0, 0, m, n, k, (int)family, job.grid_m);
+    return 0;
 }
 
 int mynah_sgemm_f32_forced(mynah_sgemm_family want, mynah_sgemm_family *ran,
@@ -902,6 +1200,69 @@ static int sg_case_threads(sg_test_ctx *t, const sg_case *sc, char *error,
     return 0;
 }
 
+/* The conv-tap fusion against the sequence of calls it replaces.  The
+ * assertion is memcmp, not a tolerance: the whole claim of
+ * mynah_sgemm_f32_conv_taps is that it is the SAME arithmetic in the SAME
+ * order, so anything short of byte-identical is a failure.  A refusal (rc 1)
+ * is a pass -- the caller then runs the old loop, which is the thing this is
+ * being compared against -- but it is counted, because a test in which the
+ * fused path never ran would prove nothing. */
+static int sg_taps_case(size_t m, size_t n, size_t k, size_t taps, float beta,
+                        unsigned long long *ran, char *error,
+                        size_t error_capacity) {
+    const size_t ldb = n + 3u; /* a window is wider than the output */
+    float *w = (float *)malloc(m * k * taps * sizeof(float));
+    float *gather = (float *)malloc(m * k * sizeof(float));
+    float *b = (float *)malloc((k + taps) * ldb * sizeof(float));
+    float *c_fused = (float *)malloc(m * n * sizeof(float));
+    float *c_loop = (float *)malloc(m * n * sizeof(float));
+    if (w == NULL || gather == NULL || b == NULL || c_fused == NULL ||
+        c_loop == NULL) {
+        free(w); free(gather); free(b); free(c_fused); free(c_loop);
+        snprintf(error, error_capacity, "sgemm taps self-test: out of memory");
+        return -1;
+    }
+    for (size_t i = 0; i < m * k * taps; ++i)
+        w[i] = (float)(((i * 1103515245u + 12345u) >> 9) % 2003u) / 1000.0f - 1.0f;
+    for (size_t i = 0; i < (k + taps) * ldb; ++i)
+        b[i] = (float)(((i * 22695477u + 1u) >> 11) % 1999u) / 997.0f - 1.0f;
+    for (size_t i = 0; i < m * n; ++i) {
+        c_fused[i] = 0.25f * (float)(i % 7u);
+        c_loop[i] = c_fused[i];
+    }
+
+    const int rc = mynah_sgemm_f32_conv_taps(m, n, k, taps, w, gather, b, ldb,
+                                             1u, beta, c_fused, n);
+    if (rc < 0) {
+        free(w); free(gather); free(b); free(c_fused); free(c_loop);
+        snprintf(error, error_capacity,
+                 "sgemm taps self-test: refused m=%zu n=%zu k=%zu", m, n, k);
+        return -1;
+    }
+    for (size_t t = 0; t < taps; ++t) {
+        for (size_t i = 0; i < m; ++i)
+            for (size_t p = 0; p < k; ++p)
+                gather[i * k + p] = w[i * k * taps + p * taps + t];
+        (void)mynah_sgemm_f32(0, 0, m, n, k, 1.0f, gather, k, b + t, ldb,
+                              (t == 0u) ? beta : 1.0f, c_loop, n);
+    }
+    int bad = (rc == 0) && memcmp(c_fused, c_loop, m * n * sizeof(float)) != 0;
+    if (bad) {
+        size_t at = 0;
+        for (; at < m * n; ++at) if (c_fused[at] != c_loop[at]) break;
+        snprintf(error, error_capacity,
+                 "sgemm taps self-test: m=%zu n=%zu k=%zu taps=%zu beta=%g "
+                 "differs at %zu: fused %.9g vs per-tap %.9g -- the fusion is "
+                 "only allowed to be byte-identical",
+                 m, n, k, taps, (double)beta, at, (double)c_fused[at],
+                 (double)c_loop[at]);
+    } else if (rc == 0 && ran != NULL) {
+        *ran += 1ull;
+    }
+    free(w); free(gather); free(b); free(c_fused); free(c_loop);
+    return bad ? -1 : 0;
+}
+
 int mynah_sgemm_self_test(char *error, size_t error_capacity) {
     char scratch[256];
     if (error == NULL || error_capacity == 0) {
@@ -965,6 +1326,34 @@ int mynah_sgemm_self_test(char *error, size_t error_capacity) {
             rc = sg_case_threads(&t, &sweep[i], error, error_capacity);
     }
 
+    /* The conv-tap fusion.  The first two are the shapes the PocketTTS SEANet
+     * decoder actually fuses (entry conv, and the first residual block's
+     * conv1); the rest exercise ragged m, taps == 1, and a non-zero beta. */
+    if (rc == 0) {
+        static const size_t taps_cases[][4] = {
+            {512, 16, 512, 7}, {128, 96, 256, 3}, {64, 480, 128, 3},
+            {32, 1920, 64, 3}, {13, 16, 37, 5},   {7, 9, 5, 1},
+            {1, 1920, 64, 3},  {4, 16, 16, 2}
+        };
+        unsigned long long taps_ran = 0;
+        for (size_t i = 0; i < sizeof taps_cases / sizeof taps_cases[0] &&
+                           rc == 0; ++i) {
+            rc = sg_taps_case(taps_cases[i][0], taps_cases[i][1],
+                              taps_cases[i][2], taps_cases[i][3], 0.0f,
+                              &taps_ran, error, error_capacity);
+            if (rc == 0)
+                rc = sg_taps_case(taps_cases[i][0], taps_cases[i][1],
+                                  taps_cases[i][2], taps_cases[i][3], 1.0f,
+                                  &taps_ran, error, error_capacity);
+        }
+        if (rc == 0 && taps_ran == 0ull) {
+            snprintf(error, error_capacity,
+                     "sgemm self-test: the conv-tap fusion refused every case, "
+                     "so the byte-identity it claims was never checked");
+            rc = -1;
+        }
+    }
+
     /* Coverage refusal.  A self-test in which a family never ran proves
      * nothing about that family, and reporting PASS would be the silent
      * fallback .work/engineering-method.md §4 exists to forbid. */
@@ -1018,8 +1407,14 @@ static int probe_sgemm_kernel(char *out, size_t capacity, const char **why) {
     return 0;
 }
 
+/* The conv-tap fusion is reported HERE, on the family row, and not on a row of
+ * its own: src/dispatch.c declares every row id it will print, and a value
+ * probe registered under an id that table does not carry is silently dropped.
+ * Adding `sgemm.conv_taps` there is a one-line change in a file this lane does
+ * not own; until it lands, the counters ride the row that exists rather than
+ * living nowhere. */
 static int probe_sgemm_family(char *out, size_t capacity, const char **why) {
-    static char text[240];
+    static char text[400];
     mynah_sgemm_stats st;
     mynah_sgemm_stats_get(&st);
     if (st.calls == 0ull) {
@@ -1034,9 +1429,12 @@ static int probe_sgemm_family(char *out, size_t capacity, const char **why) {
              "[predicate] src/sgemm.c counters: %llu narrow, %llu panel, %llu "
              "matvec, %llu dot, %llu reference, %llu refused. narrow is the "
              "n<=%zu frame-batch family; reference is degenerate or too small "
-             "to block",
+             "to block. conv-tap fusion: %llu regions carrying %llu of those "
+             "calls in one dispatch each, %llu refused and left to the "
+             "caller's per-tap loop",
              st.narrow, st.panel, st.matvec, st.dot, st.reference, st.refused,
-             mynah_sgemm_narrow_max());
+             mynah_sgemm_narrow_max(), st.fused, st.fused_taps,
+             st.fused_refused);
     *why = text;
     return 0;
 }
