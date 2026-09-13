@@ -42,6 +42,17 @@ if [ "${FAST_ALLOW_LOAD:-0}" -eq 0 ] && [ "$LOAD" -gt 2 ]; then
     exit 3
 fi
 
+# Topology is a genuinely open question on this class of host and the reference
+# implementation's rule does not resolve it. Their doctor picks one worker per
+# LLC domain, because on their 4-CCX Zen5 part a working set straddling two CCX
+# read SLOWER cache-resident than it did from DRAM, and a single wide pool was
+# "dead" -- C8 at STREAM 1.55 with 62% of frames stalling past 500 ms.
+#
+# GCP Axion is one NUMA node with ONE 80 MiB L3 instance across all 32 cores.
+# The collapse mechanism that killed their 1x32 does not obviously apply, and
+# their own fallback rule would say W=2 without having measured this shape. So
+# sweep the topology rather than inheriting a number: pass several through
+# SERVER_ARGS, or run this script once per topology.
 for c in $LEVELS; do
     echo "=== C$c ==="
     python3 tools/serving_profile.py \
@@ -57,3 +68,11 @@ echo "screen written to $OUT"
 echo "Capacity is the highest GOOD level with margin. It is discovered, not"
 echo "prescribed: if C12 is GOOD and C16 is MARGINAL, the operating point is C12."
 echo "Nothing here promotes anything — run a SOAK at the winner before that."
+
+# Suggested sweep for a 32-core single-LLC host, cheapest discriminator first:
+#   tools/fast-suite.sh models/pocket-en "1 4 8"           "--prefork 4 --prefork-threads 8"
+#   tools/fast-suite.sh models/pocket-en "8 12 16 20"      "--prefork 4 --prefork-threads 8"
+#   tools/fast-suite.sh models/pocket-en "8 12 16 20"      "--prefork 2 --prefork-threads 16"
+#   tools/fast-suite.sh models/pocket-en "16 20 24 30 32"  "--prefork 4 --prefork-threads 8 --max-batch 16"
+# Read prebuffer p95 and stall@250 first. STREAM_RTF is the capacity number and
+# it is the one most likely to flatter a configuration that bursts.
