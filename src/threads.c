@@ -60,6 +60,32 @@ static long default_threads(void) {
         return perf;
     }
 #endif
+#if defined(__linux__) && defined(_GNU_SOURCE)
+    /* E4-17.  sysconf(_SC_NPROCESSORS_ONLN) counts the machine; it sees neither
+     * an inherited taskset mask nor a cpuset cgroup.  A prefork worker pinned to
+     * eight cpus was therefore starting THIRTY-TWO threads, and with four
+     * workers that is 128 threads on 32 cores -- the same oversubscription we
+     * had just finished removing from OpenBLAS, kept in our own pool.
+     *
+     * Measured on the production box: OpenBLAS sized itself from the affinity
+     * mask and correctly picked 8, our pool picked 32, and the clamp we had
+     * written to protect us then overwrote their right answer with our wrong
+     * one, costing 24 threads and 11% of wall. This is that finding's other
+     * half, and the one that was ours.
+     *
+     * The mask is the honest denominator: it is what the scheduler will
+     * actually let us run on, whether that came from taskset, from a cpuset
+     * cgroup, or from our own prefork pinning. Fall through to the machine
+     * count only if the call fails or reports nothing. */
+    {
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof allowed, &allowed) == 0) {
+            const int n = CPU_COUNT(&allowed);
+            if (n > 0) return (long)n;
+        }
+    }
+#endif
     return sysconf(_SC_NPROCESSORS_ONLN);
 }
 
