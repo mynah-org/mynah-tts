@@ -428,3 +428,66 @@ make self-test                                           # kernels correct on th
 
 Report ISA, thread count, backend and model revision with any number.
 Single-request latency and batched throughput are different metrics.
+
+## First production-hardware capacity screen — 2026-09-13
+
+**Host** GCP Axion, 32x Neoverse-V2, SMT off, 80 MiB L3 (one instance), one NUMA
+node, gcc 15.2, `BLAS=none/mynah-sgemm`, `SIMD=auto`.
+**Build** `565e5c9`. **Pack** `models/pocket-en`, PocketTTS, default quantization
+(codec int8, backbone and flow f16). **Topology** `--prefork 4 --prefork-threads 8
+--max-batch 16`. **Mode** WAVE, three synchronised waves per level.
+
+| C | completed | TTFB p95 | TTFA p95 | STREAM_RTF p95 | prebuffer p95 | max gap p95 | stall@250 |
+|---|---|---|---|---|---|---|---|
+| 1 | 3/3 | 0.2 ms | 62 ms | 0.124 | 0 | 10 ms | 0% |
+| 4 | 12/12 | 0.2 ms | 137 ms | 0.130 | 0 | 11 ms | 0% |
+| 8 | 24/24 | 125 ms | 207 ms | 0.240 | 0 | 20 ms | 0% |
+| 16 | 48/48 | 200 ms | 331 ms | 0.468 | 0 | 39 ms | 0% |
+| 20 | 60/60 | 269 ms | 509 ms | 0.581 | 0 | 48 ms | 0% |
+| 24 | 72/72 | 337 ms | 591 ms | 0.691 | 0 | 57 ms | 0% |
+| 30 | 90/90 | 500 ms | 683 ms | **0.922** | 0 | 76 ms | 0% |
+
+**Every mandatory gate passes at every level through C30**: completed equals
+launched, STREAM_RTF p95 below 1.0, and no stall at any buffer depth. No request
+was rejected, timed out or disconnected, and required prebuffer was zero
+throughout — the server never made a player wait.
+
+**Nothing here is promoted.** A wave is a screen: it may disqualify a
+configuration and may never promote one. The operating point needs a SOAK at the
+candidate level with a drift gate across windows, and that has not been run.
+
+**The cadence percentiles are not quotable** and the harness says so rather than
+printing them as fact: 27% to 100% of client reads returned already-queued data,
+because generation outruns the reader. The share falls monotonically as
+concurrency rises (100% at C1, 54% at C8, 27% at C30), which is itself the
+evidence that the server is running well above real time. The columns that *are*
+quotable — completion, STREAM_RTF, TTFA, TTFB — do not depend on read granularity.
+
+### What stops C20 and C30 from being GOOD, and it is not synthesis
+
+The preferred gates that fail are **TTFB p95** and **TTFA p95**, not RTF and not
+stalls. TTFB is the time to the response header, which this server sends at
+admission, before any audio is generated — so a TTFB of 500 ms at C30 is
+**admission latency**, not synthesis. With four workers at sixteen slots each
+there are 64 slots for 30 arrivals, so nothing is queueing for capacity.
+
+The suspect is the serialised admission the engine inherits: one pending
+admission per worker, installed inside the frame loop. Thirty simultaneous
+arrivals then queue behind one admission per iteration per worker. That is a
+known lever with a known shape — the reference implementation reached for sliced
+admission and for a prefill helper, and measured the helper making TTFA five times
+worse — so it needs measuring here, not copying.
+
+STREAM_RTF p95 0.922 at C30 also sits above the preferred 0.90 while under the
+mandatory 1.0, which is the ordinary shape of a level that is at its edge.
+
+### Reading this against the target
+
+C20 is comfortably inside every mandatory gate with STREAM_RTF p95 0.581 — a
+stream generated at better than one and a half times real time while twenty run
+together. C30 still completes every request with no stall, at 0.922. The honest
+statement is that **C20 is reached and C30 is at the edge**, and that the next
+work is admission latency rather than kernels.
+
+Untested: any other topology (2x16, 1x32, 8x4 were not swept), any other text
+length distribution, x86, and sustained load.
