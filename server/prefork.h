@@ -313,6 +313,30 @@ typedef struct {
      * default below; a negative value disables the cap entirely. */
     int service_cap_ms;
 
+    /* ---- DECODER LANE (E5-21). 0 = off, and off is the default. ----
+     *
+     * How many cpus at the TAIL of each worker's slice become a private,
+     * pinned decoder team with its own submit lock and a one-unit-per-slot
+     * mailbox. The engine pool gets the rest.
+     *
+     * This is the one place in the tree where it can be turned on, and that is
+     * structural rather than tidy: pthreads inherit the creating thread's
+     * mask, so the split has to happen after the worker pins itself and before
+     * its pool exists, and this file owns both of those moments. A caller that
+     * sets it outside prefork gets nothing, because there is no pinned slice
+     * to split.
+     *
+     * The value is NOT clamped into range here. src/threads.c refuses a split
+     * whose lane or engine side would be narrower than MYNAH_LANE_MIN_CPUS,
+     * and prints why: on a narrow lane the decoder is slower than inline (the
+     * reference measured 6+2 at STREAM p95 1.364 against 0.997 at 4+4), so
+     * quietly rounding a bad request into a working one would be the exact
+     * failure this gate exists to prevent. A refusal leaves the decoder inline,
+     * which is the default and is correct.
+     *
+     * MYNAH_LANE_SPLIT overrides it; --decoder-lane N is the flag. */
+    int lane_cpus;
+
     /* Preconditions (see mynah_prefork_run). Set by a caller that knows it has
      * opened a GPU backend; prefork then refuses rather than forking a wrong
      * answer. The check does not rely on this being set -- a resident CUDA
@@ -513,7 +537,10 @@ int mynah_prefork_service_cap_ms(void);
  *                             slot is free. "unbounded" or a negative number
  *                             removes the bound and warns loudly.
  *   MYNAH_PREFORK_QUEUE_MS    rung 3, the queue deadline. 0 disables it.
- *   MYNAH_PREFORK_SERVICE_MS  rung 4, the service cap. 0 disables it. */
+ *   MYNAH_PREFORK_SERVICE_MS  rung 4, the service cap. 0 disables it.
+ *   MYNAH_LANE_SPLIT          E5-21, cpus at the tail of each worker's slice
+ *                             that become the private pinned decoder team.
+ *                             0 (the default) leaves the decoder inline. */
 void mynah_prefork_apply_env(mynah_prefork_config *cfg);
 
 #endif

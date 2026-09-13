@@ -221,8 +221,13 @@ static void warn_cpu_budget(int workers, int threads, int ncpu, FILE *out) {
  *                  REINITIALIZED (not zeroed) by mynah_threadpool_after_fork(),
  *                  registered with pthread_atfork() and also called explicitly
  *                  by the child below. Correct.
- *   src/threads.c  g_blas_mu       NOT reinitialized by anything.
- *   src/qmat.c     g_stats_mutex   NOT reinitialized by anything.
+ *   src/threads.c  g_blas_mu       REINITIALIZED by mynah_blas_after_fork(),
+ *                                  called from mynah_threadpool_after_fork()
+ *                                  so there is one handler to remember rather
+ *                                  than two. It used to be unrepaired; the
+ *                                  audit line is updated rather than deleted
+ *                                  because the hazard is worth keeping named.
+ *   src/qmat.c     g_stats_mutex   REINITIALIZED by its own atfork handler.
  *   src/costmap.c  no mutex at all: thread-local blocks indexed by an atomic
  *                  counter, so there is nothing to inherit. Its CONTENT is
  *                  still wrong in a child -- it holds the parent's model-load
@@ -231,10 +236,13 @@ static void warn_cpu_budget(int workers, int threads, int ncpu, FILE *out) {
  *                  mynah_costmap_after_fork() exists for exactly that and had
  *                  no caller anywhere in the tree. The child below calls it.
  *
- * The two unrepaired mutexes are safe ONLY while the fork is single-threaded,
- * because a lock no other thread can hold cannot be inherited held. That turns
- * "we fork from main, early" from a convention into a load-bearing invariant,
- * so it is checked rather than assumed. */
+ * Every lock this tree owns is therefore repaired. What is NOT repaired -- and
+ * cannot be from here -- is a lock inside a library that spawned threads of its
+ * own before the fork; a threaded BLAS is the one that actually happens, and on
+ * a 32-core host it reaches the fork with 32 threads regardless of how narrow
+ * the worker slices will be. That keeps "we fork from main, early" a
+ * load-bearing invariant rather than a convention, so the thread count is
+ * checked rather than assumed. */
 
 /* Threads in this process, or -1 where the platform will not say. */
 static int process_thread_count(void) {
@@ -350,21 +358,32 @@ static int check_fork_preconditions(const mynah_prefork_config *cfg) {
 
     const int threads = process_thread_count();
     if (threads > 1) {
-        /* Not fatal by itself: the pool registers a pthread_atfork child handler
-         * that reinitializes its four locks, so the pool survives. But g_blas_mu
-         * (src/threads.c) and g_stats_mutex (src/qmat.c) have no such handler,
-         * and a fork taken while another thread holds either gives every worker
-         * a mutex that can never be unlocked -- a hang with no error message, in
-         * a child, under load. Say exactly that, and let an operator who wants
-         * the invariant enforced rather than reported ask for it. */
+        /* CORRECTED. This warning used to name g_blas_mu (src/threads.c) and
+         * g_stats_mutex (src/qmat.c) as having no atfork handler. They both
+         * have one now, and a log line that describes a bug somebody already
+         * fixed is worse than no line: the next reader budgets for a hang that
+         * cannot happen and stops reading the rest of the warning, which is
+         * still true.
+         *
+         * What remains true is the general statement. fork() copies one thread
+         * and every lock in whatever state it was in, and the handlers only
+         * cover the locks this repository knows about -- a threaded BLAS, an
+         * allocator or any library that spawned a thread before the fork has
+         * state no handler here touches. On this machine that is not
+         * hypothetical: OpenBLAS builds a team sized to the HOST at its first
+         * call, so a parent that has synthesized anything reaches this line
+         * with as many threads as the box has cores, whatever the worker slice
+         * will be. The invariant is still "fork before any other thread
+         * exists", and the count is printed because it is the evidence. */
         fprintf(stderr,
             "prefork: WARNING forking with %d threads in this process, not 1.\n"
-            "  fork() copies one thread and every mutex in whatever state it was in.\n"
-            "  src/threads.c's pool locks are reinitialized by its atfork handler,\n"
-            "  but src/threads.c g_blas_mu and src/qmat.c g_stats_mutex are NOT: if\n"
-            "  any thread held one at this instant, every worker inherits it locked\n"
-            "  and the first worker to take it hangs forever. The fork belongs before\n"
-            "  the pool, the scheduler and the HTTP workers exist.\n"
+            "  fork() copies one thread and every lock in whatever state it was in.\n"
+            "  src/threads.c's pool locks, its g_blas_mu and src/qmat.c's\n"
+            "  g_stats_mutex are all reinitialized by atfork child handlers, so\n"
+            "  those are covered -- but a library that spawned its own threads\n"
+            "  before this point (a threaded BLAS is the usual one) has state no\n"
+            "  handler here can repair. The fork belongs before the pool, the\n"
+            "  scheduler and the HTTP workers exist.\n"
             "  Set MYNAH_PREFORK_STRICT=1 to make this a refusal.\n", threads);
         if (getenv("MYNAH_PREFORK_STRICT") != NULL) {
             fprintf(stderr, "prefork: MYNAH_PREFORK_STRICT is set; refusing.\n");
@@ -747,6 +766,11 @@ void mynah_prefork_apply_env(mynah_prefork_config *cfg) {
      * default, and unset is the absence of the variable. */
     if (env_int("MYNAH_PREFORK_QUEUE_MS", &v)) cfg->queue_deadline_ms = v > 0 ? v : -1;
     if (env_int("MYNAH_PREFORK_SERVICE_MS", &v)) cfg->service_cap_ms = v > 0 ? v : -1;
+    /* E5-21. Not validated here: src/threads.c owns the "is this split wide
+     * enough to be faster than inline" question and answers it with a printed
+     * reason, so a number that cannot work is refused where the measurement
+     * that condemns it is documented, rather than silently corrected here. */
+    if (env_int("MYNAH_LANE_SPLIT", &v)) cfg->lane_cpus = v > 0 ? v : 0;
 }
 
 /* -1 = unbounded, 0 = no queue, >0 = that many per live worker. */
@@ -1735,8 +1759,9 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             g_worker_language = lang_of[i];
 
             char slice[192];
-            const int pinned = pin_to_slice(cpus, i * per,
-                                            (i + 1) * per <= ncpu ? per : ncpu - i * per,
+            const int slice_cpus =
+                (i + 1) * per <= ncpu ? per : ncpu - i * per;
+            const int pinned = pin_to_slice(cpus, i * per, slice_cpus,
                                             slice, sizeof(slice));
 
             /* Belt and braces on the pool. src/threads.c registers a
@@ -1744,11 +1769,12 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
              * is idempotent and documented as such, and it keeps the invariant
              * visible at the one place a reader looks for it.
              *
-             * Note what this does NOT cover, because the audit above found it:
-             * src/threads.c's g_blas_mu and src/qmat.c's g_stats_mutex have no
-             * after-fork repair anywhere in the tree. They are safe only while
-             * the fork is single-threaded, which check_fork_preconditions()
-             * above now verifies rather than assumes. */
+             * g_blas_mu (src/threads.c) and g_stats_mutex (src/qmat.c) used
+             * to be named here as having no after-fork repair. Both have an
+             * atfork child handler now, so the note is kept only to say that
+             * it is no longer the open question it was; what
+             * check_fork_preconditions() above still verifies rather than
+             * assumes is the thread count itself. */
             mynah_threadpool_after_fork();
 
             /* The parent opened the pack and may have pre-warmed. Those regions
@@ -1759,6 +1785,33 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
              * blocks behind an atomic index -- so this is about correctness of
              * the numbers, not of the locking. */
             mynah_costmap_after_fork();
+
+            /* ---- decoder lane (E5-21) -------------------------------------
+             *
+             * HERE, AND NOWHERE ELSE, AND IN THIS ORDER. The full sequence is
+             *
+             *     sched_setaffinity(child)      <- pin_to_slice, just above
+             *     mynah_threadpool_after_fork() <- pool state reset
+             *     mynah_lane_split_prepare()    <- this
+             *     (first dispatch builds the engine pool)
+             *
+             * because pthreads inherit the creating thread's mask. Pin first
+             * or the pool is born unpinned and nothing later fixes it; split
+             * before the pool exists or the engine threads already hold the
+             * whole slice, lane cpus included. mynah_lane_split_prepare()
+             * checks that last condition itself and refuses rather than
+             * pretending, but the ordering is a property of this call site.
+             *
+             * A refusal is normal and is not an error: too narrow a split, or
+             * a platform that cannot pin, leaves the decoder inline -- which
+             * is both the default and, below four cpus a side, the faster
+             * arrangement. Either way the reason is printed, because "I asked
+             * for a lane" and "I have a lane" are different claims. */
+            char lane_why[256];
+            lane_why[0] = '\0';
+            (void)mynah_lane_split_prepare(cpus + i * per, slice_cpus,
+                                           local.lane_cpus, lane_why,
+                                           sizeof(lane_why));
 
             /* The pool resolves its width once and caches it, so MYNAH_THREADS
              * has to have been right BEFORE the model was opened -- which is
@@ -1804,6 +1857,14 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
                     groups > 1 && local.languages[lang_of[i]] != NULL
                         ? local.languages[lang_of[i]] : "",
                     pinned ? "" : "  <-- NOT PINNED");
+            /* Printed only when someone asked for a lane, or when one is up.
+             * The line above states the slice this worker was GIVEN; this one
+             * states how that slice was divided and, when it was not, why --
+             * `configured` and `actual` being different claims is the whole
+             * reason the topology is printed at all. */
+            if (local.lane_cpus > 0 || mynah_lane_width() > 0) {
+                fprintf(stderr, "prefork: worker %d %s\n", i, lane_why);
+            }
             fflush(stderr);
             return MYNAH_PREFORK_CHILD;
         }

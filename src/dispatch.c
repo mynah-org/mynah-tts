@@ -788,6 +788,18 @@ static void collect_blas(row_sink *s) {
     add_unknown(s, "blas.threads_owned", "-", "-", "OPENBLAS_NUM_THREADS",
                 "[UNKNOWN] src/threads.c did not register mynah_blas_owned()");
 
+    /* E4-16a. INTERIM compensation for a dependency E4-16 removes, and the row
+     * exists because the claim is weaker than it looks: this process sets the
+     * variable from a constructor, but a shared libopenblas is initialised
+     * before the executable's own constructors, so the only channel guaranteed
+     * to be read is the environment before exec. The probe reports which of
+     * the two happened rather than reporting success. Without it an idle
+     * OpenBLAS team spins: the reference measured TTFA C=1 at 108 ms BIMODAL
+     * against 66 ms stable, and 42,500 against 12,000 context switches/s. */
+    add_unknown(s, "blas.thread_timeout", "-", "-", "OPENBLAS_THREAD_TIMEOUT",
+                "[UNKNOWN] src/threads.c did not register "
+                "mynah_blas_thread_timeout()");
+
     /* E4-16, .work/no-blas.md.  One BLAS function was ever used --
      * cblas_sgemm, three call sites -- and src/sgemm.c replaces it.  These
      * four rows are declared UNKNOWN and then overridden by the predicates
@@ -858,6 +870,23 @@ static void collect_pool(row_sink *s) {
         add_row(s, "pool.parallel_for", "yes", "-", NULL, onoff(threads > 1),
                 MYNAH_DISPATCH_SRC_RUNTIME, text);
     }
+
+    /* E5-22. A VALUE row, not a boolean: 65536 and 4096 are different servers
+     * (their sweep moved STREAM p95 0.893 -> 0.808 and context switches 38k ->
+     * 7.6k/s), and a row saying ON would hide which one is running. The
+     * default is TRANSFERRED, never measured here, and src/threads.c's probe
+     * says so in the reason. */
+    add_unknown(s, "pool.spin", "yes", "-", "MYNAH_POOL_SPIN",
+                "[UNKNOWN] src/threads.c did not register "
+                "mynah_pool_spin_budget()");
+
+    /* E5-21. OFF, or the split actually in force. A lane that refused to
+     * engage -- too narrow, or a platform that cannot pin -- reads OFF here
+     * and the reason says which, because "I asked for a lane" and "I have a
+     * lane" are different claims and the reference lost a campaign to exactly
+     * that distinction. */
+    add_unknown(s, "pool.decoder_lane", "yes", "-", "MYNAH_LANE_SPLIT",
+                "[UNKNOWN] src/threads.c did not register mynah_lane_width()");
 
 }
 

@@ -14,12 +14,23 @@ PORT="${PORT:-8973}"
 BASE="http://127.0.0.1:$PORT"
 TMP="$(mktemp -d)"
 PID=""
+# The warm-up check (E5-20) needs servers that have never served anything, so
+# it starts its own on scratch ports. Tracked here rather than killed only on
+# the happy path: a `fail` between start and stop would otherwise leave a
+# process holding the whole pack.
+AUX_PID=""
 
 # A server holds the whole model resident (~2 GB once it has synthesized
 # anything), so a leaked one is expensive on a small-memory machine. SIGTERM
 # first, then make sure: a server killed mid-synthesis can take a moment, and
 # an escaped one would still be holding those 2 GB an hour later.
 cleanup() {
+    if [ -n "$AUX_PID" ]; then
+        kill "$AUX_PID" 2>/dev/null || true
+        kill -9 "$AUX_PID" 2>/dev/null || true
+        wait "$AUX_PID" 2>/dev/null || true
+        AUX_PID=""
+    fi
     if [ -n "$PID" ]; then
         kill "$PID" 2>/dev/null || true
         i=0
@@ -257,5 +268,144 @@ for i in 1 2; do
         fail "stream client $i under mixed load differs from solo"
 done
 echo "mixed       ok (2 streams + 2 batches concurrent, all byte-identical to solo)"
+
+# --- JSON body handling ----------------------------------------------------
+# server/main.c parses the body ONCE with src/json.c and hands the parsed root
+# to the route, instead of re-parsing it per key through the compatibility
+# wrappers. Three behaviours came with that and all three are asserted here,
+# because each is the kind of thing a future "optimisation" would quietly undo:
+#
+#   - a refusal names the byte offset and the expectation. "invalid JSON" with
+#     no locus is not actionable for whoever is holding the request, and the
+#     old brace-sniff could not produce one at all -- a body that was not JSON
+#     but started with `{` got through and failed later somewhere that could
+#     only say "missing 'input'".
+#   - a nested key does not satisfy a top-level lookup.
+#   - surrogate pairs decode, so anything outside the BMP reaches the
+#     tokenizer instead of being rejected.
+J="$BASE/v1/audio/speech"
+
+curl -s -X POST "$J" -H 'Content-Type: application/json' \
+    -d '{"input":"hi", "voice":' > "$TMP/j_trunc.json"
+grep -q 'not valid JSON at byte' "$TMP/j_trunc.json" ||
+    fail "a truncated body did not report the offset: $(cat "$TMP/j_trunc.json")"
+
+curl -s -X POST "$J" -H 'Content-Type: application/json' -d '[1,2,3]' \
+    > "$TMP/j_arr.json"
+grep -q 'not an object' "$TMP/j_arr.json" ||
+    fail "a JSON array body was not refused as a non-object"
+
+curl -s -X POST "$J" -H 'Content-Type: application/json' \
+    -d '{"outer":{"input":"nested"}}' > "$TMP/j_nest.json"
+grep -q "missing 'input'" "$TMP/j_nest.json" ||
+    fail "a nested \"input\" satisfied the top-level lookup"
+
+code=$(curl -s -o "$TMP/j_emoji.wav" -w '%{http_code}' -X POST "$J" \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"hello \ud83d\ude00 world","voice":"Sofia","seed":7}')
+[ "$code" = "200" ] || fail "a surrogate pair was refused ($code)"
+head -c 4 "$TMP/j_emoji.wav" | grep -q RIFF || fail "the emoji request returned no audio"
+echo "json        ok (offset in the error, non-object refused, nested key is not"
+echo "            top-level, surrogate pair reaches the tokenizer)"
+
+# --- Warm-up: no trajectory fork at request one (E5-20) --------------------
+#
+# The bug this guards against is the reference implementation's, and it is the
+# hardest kind to find later: its warm-up ran on whatever state the CLI had
+# left behind, primed per-request state for a configuration no request uses,
+# and THE FIRST REAL REQUEST CAME OUT DIFFERENT FROM EVERY ONE AFTER IT
+# (.work/serving-design.md §7). It reproduces only on a fresh process, so no
+# load test ever sees it, and every A/B measured afterwards quietly contains it.
+#
+# The assertion is deliberately three-cornered, because two of the corners
+# would each pass for the wrong reason on their own:
+#
+#   warm1  first request to a server that warmed up
+#   cold1  first request to a server that did NOT warm up
+#   cold2  second request to that same server
+#
+# warm1 == cold1  says the warm-up changed no audio at all.
+# cold1 == cold2  says the first request equals the second without a warm-up --
+#                 i.e. the property holds on its own merits and the warm-up is
+#                 an optimisation, not a patch over a divergence.
+# Both together are what "the warm-up goes through the request path's own
+# reset" means operationally. A warm-up that left per-request state behind
+# breaks the first; a first request that differed for any other reason breaks
+# the second.
+#
+# Every check above this one runs against a server that has already served
+# dozens of requests, so none of them can see request one.
+AUX_PORT=$((PORT + 11))
+
+start_aux() {   # $1 = port, $2... = extra server args
+    _p=$1
+    shift
+    # shellcheck disable=SC2086
+    "$SERVER" -m "$MODEL_DIR" -p "$_p" ${SERVER_ARGS:-} "$@" \
+        > "$TMP/aux.log" 2>&1 &
+    AUX_PID=$!
+    _i=0
+    while [ "$_i" -lt 90 ]; do
+        if curl -sf --max-time 2 "http://127.0.0.1:$_p/health" > /dev/null 2>&1; then
+            return 0
+        fi
+        kill -0 "$AUX_PID" 2>/dev/null || { cat "$TMP/aux.log" >&2; fail "aux server exited"; }
+        _i=$((_i + 1))
+        sleep 1
+    done
+    cat "$TMP/aux.log" >&2
+    fail "aux server on port $_p did not become ready"
+}
+
+stop_aux() {
+    [ -n "$AUX_PID" ] || return 0
+    kill "$AUX_PID" 2>/dev/null || true
+    _i=0
+    while kill -0 "$AUX_PID" 2>/dev/null && [ "$_i" -lt 40 ]; do
+        _i=$((_i + 1))
+        sleep 0.25
+    done
+    kill -9 "$AUX_PID" 2>/dev/null || true
+    wait "$AUX_PID" 2>/dev/null || true
+    AUX_PID=""
+}
+
+if curl -sf --max-time 2 "http://127.0.0.1:$AUX_PORT/health" > /dev/null 2>&1; then
+    fail "something is already serving on port $AUX_PORT"
+fi
+
+WREQ='{"input":"warm up parity","voice":"Sofia","seed":11}'
+WREQ_OTHER='{"input":"warm up parity control","voice":"Sofia","seed":11}'
+
+start_aux "$AUX_PORT" --warmup 1
+curl -s "http://127.0.0.1:$AUX_PORT/health" | grep -q '"warmups":{"requested":1,"done":1}' ||
+    fail "a --warmup 1 server does not report a completed warm-up in /health"
+curl -s --max-time 600 -X POST "http://127.0.0.1:$AUX_PORT/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$WREQ" -o "$TMP/warm1.wav"
+stop_aux
+[ -s "$TMP/warm1.wav" ] || fail "the warmed server returned nothing"
+
+start_aux "$AUX_PORT" --warmup 0
+curl -s "http://127.0.0.1:$AUX_PORT/health" | grep -q '"warmups":{"requested":0,"done":0}' ||
+    fail "--warmup 0 still reports a warm-up"
+curl -s --max-time 600 -X POST "http://127.0.0.1:$AUX_PORT/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$WREQ" -o "$TMP/cold1.wav"
+curl -s --max-time 600 -X POST "http://127.0.0.1:$AUX_PORT/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$WREQ" -o "$TMP/cold2.wav"
+# The anti-vacuity control, on the same process: if this server returned the
+# same bytes for every input, all three comparisons above would pass while
+# proving nothing.
+curl -s --max-time 600 -X POST "http://127.0.0.1:$AUX_PORT/v1/audio/speech" \
+    -H 'Content-Type: application/json' -d "$WREQ_OTHER" -o "$TMP/cold_other.wav"
+stop_aux
+
+[ -s "$TMP/cold1.wav" ] && [ -s "$TMP/cold2.wav" ] || fail "the unwarmed server returned nothing"
+cmp -s "$TMP/cold1.wav" "$TMP/cold_other.wav" &&
+    fail "a different input produced identical audio; the warm-up check would be vacuous"
+cmp -s "$TMP/cold1.wav" "$TMP/cold2.wav" ||
+    fail "request 1 differs from request 2 on an unwarmed server (trajectory fork)"
+cmp -s "$TMP/warm1.wav" "$TMP/cold1.wav" ||
+    fail "the first request to a warmed server differs from the first to an unwarmed one"
+echo "warmup      ok (warm-first == cold-first == cold-second, and not vacuous)"
 
 echo "server test: PASS"

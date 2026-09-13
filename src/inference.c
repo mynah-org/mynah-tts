@@ -17,6 +17,7 @@
 #include "graph.h"
 #include "mynah_tts_internal.h"
 #include "mynah_util.h"
+#include "threads.h"
 #include "tts_engine.h"
 
 #include <stddef.h>
@@ -99,6 +100,42 @@ static int emit_stream_samples(mynah_tts_audio_callback callback, void *user_dat
     return 0;
 }
 
+/* One decode handed to the decoder lane -- E5-21.
+ *
+ * It lives inside the slot rather than being allocated per decode: nothing in
+ * the AR loop may allocate (CLAUDE.md rule 4), and a unit the lane is reading
+ * must outlive the call that submitted it. One per slot is also the bounded
+ * contract made structural -- there is nowhere to put a second. */
+typedef struct {
+    const mynah_tts_engine *engine;
+    mynah_engine_ctx *ctx;
+    size_t first;
+    size_t frames;
+    float *pcm;
+    size_t produced;
+    int    failed;
+    char   error[256];
+} lane_unit;
+
+/* Runs ON A LANE THREAD. Everything it dispatches -- the conv stack, the codec
+ * transformer, every SGEMM slice inside them -- lands on the lane team,
+ * because mynah_parallel_for() reads the thread-local tag that lane thread
+ * carries. Nothing in this function or below it knows that, and that is the
+ * point of putting the redirection in the dispatch primitive. */
+static void lane_decode(void *ud) {
+    lane_unit *u = (lane_unit *)ud;
+    u->error[0] = '\0';
+    u->pcm = NULL;
+    u->produced = 0;
+    u->failed = 0;
+    if (u->engine->decode_audio(u->ctx, u->first, u->frames, &u->pcm,
+                                &u->produced, u->error, sizeof(u->error)) != 0) {
+        u->pcm = NULL;
+        u->produced = 0;
+        u->failed = 1;
+    }
+}
+
 /* One request in flight.
  *
  * The request's generation state lives in the engine context; what the driver
@@ -128,6 +165,14 @@ typedef struct {
     void *tag;
     int in_use;
     int cancelled;
+    /* decoder lane (E5-21). `lane_busy` means this slot owns mailbox entry
+     * `index` -- a unit is running, or has finished and not been reaped.
+     * `streamed_frames` is advanced at SUBMIT, not at delivery, so the range
+     * the lane is decoding is never handed out twice and the next range stays
+     * contiguous with it; `streamed_samples` still advances only when the PCM
+     * actually reaches the sink. */
+    lane_unit unit;
+    int lane_busy;
 } synth_slot;
 
 static int slot_fail(synth_slot *slot, const char *message) {
@@ -199,17 +244,57 @@ static size_t slot_quantum(const mynah_engine_caps *caps, const synth_slot *slot
     return quantum < steady ? quantum : steady;
 }
 
-/* Hand one gang member its PCM. */
-static int slot_deliver(synth_slot *slot, float *audio, size_t produced,
-                        size_t frames) {
+/* Push decoded PCM at the sink, WITHOUT moving the frame cursor.
+ *
+ * The split exists for the decoder lane. Inline, a range is decoded and
+ * delivered in one breath and the two cursors move together. With the lane the
+ * frames are charged to the slot when the decode is SUBMITTED -- otherwise the
+ * next step would compute the same range as still pending and hand it out a
+ * second time -- while the samples only exist once the unit comes back. */
+static int slot_emit(synth_slot *slot, float *audio, size_t produced) {
     if (emit_stream_samples(slot->callback, slot->user_data, audio, produced,
                             slot->chunk_samples, slot->error,
                             slot->error_capacity) != 0) {
         return slot_fail(slot, NULL);
     }
     slot->streamed_samples += produced;
+    return 0;
+}
+
+/* Hand one gang member its PCM. */
+static int slot_deliver(synth_slot *slot, float *audio, size_t produced,
+                        size_t frames) {
+    if (slot_emit(slot, audio, produced) != 0) return -1;
     slot->streamed_frames += frames;
     return 0;
+}
+
+/* Reap this slot's lane unit: deliver its PCM and release its mailbox entry.
+ *
+ * `blocking` is the whole policy. The driver reaps non-blocking at the top of
+ * every iteration, so a finished unit costs nothing to collect; it blocks in
+ * exactly two places, and both are about THIS slot -- when this slot has a
+ * full quantum waiting behind the unit and cannot go further, and when this
+ * slot is about to be retired and its context freed. NO SLOT EVER BLOCKS ON
+ * ANOTHER SLOT'S DECODE. That is the property that makes the lane a latency
+ * win rather than a second serialization point, and it is also why
+ * "never free state the lane is decoding" is enforceable at all: there is
+ * exactly one place where the context goes away, and it drains first. */
+static void lane_reap(synth_slot *slot, size_t index, int blocking) {
+    if (!slot->lane_busy) return;
+    if (!blocking && mynah_lane_finished((int)index) != 1) return;
+    mynah_lane_wait((int)index);
+    slot->lane_busy = 0;
+    lane_unit *u = &slot->unit;
+    if (u->failed) {
+        slot_fail(slot, u->error[0] != '\0' ? u->error : "decoding audio failed");
+    } else {
+        slot_emit(slot, u->pcm, u->produced);
+    }
+    free(u->pcm);
+    u->pcm = NULL;
+    u->produced = 0;
+    u->failed = 0;
 }
 
 /* Form the decode gang for this step and run it.
@@ -254,7 +339,8 @@ static int slot_deliver(synth_slot *slot, float *audio, size_t produced,
 static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps *caps,
                         mynah_engine_scratch *scratch, synth_slot *slots,
                         const size_t *step_slot,
-                        const mynah_engine_step_result *results, size_t live) {
+                        const mynah_engine_step_result *results, size_t live,
+                        int lane_on) {
     size_t pending[MYNAH_GRAPH_MAX_JOBS];
     int ready[MYNAH_GRAPH_MAX_JOBS];
     int leading = 0;
@@ -304,6 +390,55 @@ static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps 
         ++count;
     }
     if (count == 0u) return;
+
+    /* ---- the decoder lane (E5-21) ---------------------------------------
+     *
+     * WHO decodes and HOW MUCH is decided above, by the one policy, and is not
+     * touched here: the lane changes only WHERE the work runs. Each member's
+     * range is exactly the range the inline path would have passed, in the same
+     * order, to the same `decode_audio`, so the audio is byte-identical -- the
+     * lane is a placement decision, never a numerical one.
+     *
+     * The lane is per slot, so it cannot be combined with an engine that has a
+     * real `decode_audio_batch`; `serve` refuses to turn it on for one rather
+     * than silently discarding that engine's batching. Today no engine in the
+     * tree has one. */
+    if (lane_on) {
+        for (size_t g = 0; g < count; ++g) {
+            const size_t index = step_slot[member[g]];
+            synth_slot *slot = &slots[index];
+            /* PER-SLOT BLOCKING ONLY. This slot has accumulated a full quantum
+             * behind a unit still in flight, which is exactly the bound the
+             * mailbox enforces, so THIS slot waits. Every other slot's step
+             * has already happened and none of them waits for this. */
+            lane_reap(slot, index, 1);
+            if (slot->failed) continue;
+            slot->unit.engine = engine;
+            slot->unit.ctx = slot->ctx;
+            slot->unit.first = first[g];
+            slot->unit.frames = want[g];
+            if (mynah_lane_submit((int)index, lane_decode, &slot->unit) != 0) {
+                /* The lane refused -- it is off, or the bound was violated and
+                 * said so. Decode inline rather than drop the audio: a lane
+                 * refusal is a scheduling failure and must never become a
+                 * correctness one. */
+                float *one = NULL;
+                size_t made = 0;
+                if (engine->decode_audio(slot->ctx, first[g], want[g], &one, &made,
+                                         slot->error, slot->error_capacity) != 0) {
+                    slot_fail(slot, NULL);
+                } else {
+                    slot_deliver(slot, one, made, want[g]);
+                }
+                free(one);
+                continue;
+            }
+            slot->lane_busy = 1;
+            /* Charged now, delivered later: see slot_emit. */
+            slot->streamed_frames += want[g];
+        }
+        return;
+    }
 
     char shared_error[256];
     shared_error[0] = '\0';
@@ -438,7 +573,8 @@ static size_t step_isolate(const mynah_tts_engine *engine,
 static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *caps,
                       mynah_engine_scratch *scratch, synth_slot *slots,
                       mynah_engine_ctx **step_ctxs, size_t *step_slot,
-                      mynah_engine_step_result *results, size_t live, int dump) {
+                      mynah_engine_step_result *results, size_t live, int dump,
+                      int lane_on) {
     char shared_error[256];
     shared_error[0] = '\0';
     if (engine->step_batch(step_ctxs, live, scratch, shared_error,
@@ -482,7 +618,7 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     }
     /* Delivery is decided for the whole batch at once, not slot by slot: that
      * is the only place the driver can see two requests' codec work together. */
-    stream_gang(engine, caps, scratch, slots, step_slot, results, live);
+    stream_gang(engine, caps, scratch, slots, step_slot, results, live, lane_on);
     for (size_t j = 0; j < live; ++j) {
         synth_slot *slot = &slots[step_slot[j]];
         if (slot->failed) continue;
@@ -539,6 +675,50 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         return refuse_all(sink, shared_error);
     }
 
+    /* ---- decoder lane (E5-21), decided once per service -----------------
+     *
+     * The lane must EXIST -- mynah_lane_split_prepare() refuses a split that
+     * would be too narrow or that it cannot pin, so a zero here is already the
+     * considered answer and not an absence of one -- and the mailbox must have
+     * an entry per slot, which it does by construction. The second check is
+     * here so that raising MYNAH_GRAPH_MAX_JOBS fails loudly instead of
+     * writing past the mailbox.
+     *
+     * THE LANE AND THE DECODE GANG ARE MUTUALLY EXCLUSIVE, and that is the one
+     * thing to understand before turning either on. Both attack the same cost
+     * -- the codec is the largest per-slot term in a frame -- from opposite
+     * directions. The gang makes one wide call where there would have been N
+     * narrow ones; the lane keeps the N calls but takes them off the loop
+     * thread so they overlap the next AR steps. A lane unit is per slot by
+     * construction (that is what "at most one in flight per slot" means), so
+     * running the lane means calling `decode_audio` per context and not
+     * `decode_audio_batch`.
+     *
+     * That is a SCHEDULING choice and never a numerical one: the seam requires
+     * `decode_audio_batch` to be bit-identical per context to `decode_audio`
+     * on the same range (tts_engine.h), so whichever runs, each request gets
+     * the same bytes. Which one is faster is a property of the host and the
+     * model and can only be settled by measurement, so the default is OFF --
+     * the gang, which is what ships -- and the lane is an explicit opt-in that
+     * says out loud what it is giving up.
+     *
+     * Nothing about the AUDIO depends on this flag. The lane changes which
+     * threads run the decode and when its result is delivered, never the
+     * ranges or their order, which is why the goldens do not care. */
+    const int lane_on = mynah_lane_width() > 0 &&
+                        max_batch <= (size_t)MYNAH_LANE_SLOTS;
+    if (lane_on) {
+        fprintf(stderr,
+                "driver: decoder lane ON (%d pinned threads). Decodes run per "
+                "slot on the lane and overlap the AR steps%s\n",
+                mynah_lane_width(),
+                engine->decode_audio_batch != NULL
+                    ? ", so this engine's BATCHED codec is not used -- the two "
+                      "are alternatives, not layers, and only a measurement on "
+                      "this host can say which wins"
+                    : "");
+    }
+
     const int timing = getenv("MYNAH_TIMING") != NULL;
     const double t_start = timing ? mynah_phase_seconds() : 0.0;
     double t_prep = t_start, t_ar = t_start;
@@ -555,6 +735,18 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     int drained = 0;      /* the sink said there will be no more work */
 
     for (;;) {
+        /* ---- reap whatever the decoder lane finished --------------------
+         * Non-blocking, and first, so that a unit that completed while the
+         * batch was stepping is delivered before anything else looks at the
+         * slot's cursors. A slot whose unit is still running is simply left
+         * alone; it is not waited for here and never on another slot's
+         * account. */
+        if (lane_on) {
+            for (size_t i = 0; i < max_batch; ++i) {
+                if (slots[i].in_use) lane_reap(&slots[i], i, 0);
+            }
+        }
+
         /* ---- admission ------------------------------------------------
          * At the top of the step, not before the loop. `block` is set only
          * when there is nothing else to do, so a running batch is never held
@@ -621,7 +813,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         }
         if (live > 0u) {
             step_live(engine, &caps, scratch, slots, step_ctxs, step_slot, results,
-                      live, dump_all);
+                      live, dump_all, lane_on);
         }
 
         /* ---- retire, per slot, as soon as it stops ---------------------
@@ -630,6 +822,13 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * wait continuous admission exists to remove. */
         for (size_t i = 0; i < max_batch; ++i) {
             if (!slots[i].in_use || slots[i].active) continue;
+            /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates the
+             * frame history and frees the context; a unit still reading it
+             * would be reading freed memory and writing into a slot that no
+             * longer belongs to this request. This is the second and last
+             * place the driver blocks on the lane, and like the first it
+             * blocks only on the slot it is about to take away. */
+            lane_reap(&slots[i], i, 1);
             if (slot_retire(engine, sink, &slots[i], dump_all) != 0) result = -1;
             --used;
         }

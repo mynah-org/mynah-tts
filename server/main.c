@@ -65,6 +65,7 @@
 #include "stream_out.h"
 
 #include "graph.h"
+#include "json.h"
 #include "mynah_tts.h"
 #include "tokenizer_sentencepiece.h"
 #include "tokenizer.h"
@@ -117,6 +118,13 @@ static struct {
     size_t max_pending;
     unsigned request_timeout_ms;
     int cancel_on_disconnect;   /* default on; --no-cancel-on-disconnect turns it off */
+    /* E5-20. How many synthetic requests to run before the first client one.
+     * The count, not a flag: warming twice is a legitimate thing to ask for on
+     * a machine whose first allocation pattern differs from its second, and
+     * `--warmup 0` has to be expressible because a startup-latency-sensitive
+     * deployment may prefer to pay the cost on the first request. */
+    unsigned warmups;
+    unsigned warmups_done;      /* main thread only, before the accept loop */
 
     /* ---- language residency (E5-9) ----
      *
@@ -237,6 +245,15 @@ typedef struct synth_job {
     int *text_ids;                 /* owned: the request points into this */
     int want_pcm;
 
+    /* E5-20. A warm-up job is an ordinary job with no client behind it: same
+     * queue, same sink, same admission, same ctx_new/prepare/retire. The flag
+     * exists for the two things that are about the CONNECTION rather than about
+     * synthesis -- there is no prefork slot to give back and no completion to
+     * count in the public stats -- and for nothing else. If it ever starts
+     * gating something inside the driver, the warm-up has stopped being the
+     * request path and the whole item is void. */
+    int is_warmup;
+
     /* Streaming requests differ from batch ones in their sink and in nothing
      * else: same queue, same scheduler, same batch. The response header is
      * built by the worker and sent by the writer the scheduler starts at
@@ -328,8 +345,13 @@ static void job_release(synth_job *j) {
      * happen exactly once per connection: a job is built exactly once per
      * connection that gets past validation, and this is its last reference, so
      * this line is that "once". Its counterpart, for a connection that never
-     * became a job, is conn_close(). Outside a prefork worker it is a no-op. */
-    mynah_prefork_conn_done();
+     * became a job, is conn_close(). Outside a prefork worker it is a no-op.
+     *
+     * A warm-up job never came from the router, so it has no slot to give
+     * back: calling this for one would credit the parent a connection it never
+     * handed out, and the worker would be over-admitted for the rest of its
+     * life by exactly the number of warm-ups it ran. */
+    if (!j->is_warmup) mynah_prefork_conn_done();
     free(j->text_ids);
     mynah_tts_free_samples(j->samples);
     pthread_cond_destroy(&j->done_cv);
@@ -563,6 +585,17 @@ static void sink_on_done(void *ud, void *tag, int result) {
         return;
     }
 
+    /* A warm-up is not traffic. It is counted in `limits.warmups` -- where an
+     * operator reads it as configuration -- and deliberately not in
+     * `jobs.completed`, which is the number a load test differences against
+     * the requests it issued. Folding startup work into it would make every
+     * such comparison off by the warm-up count, which reads as the server
+     * having invented a request. */
+    if (j->is_warmup) {
+        job_finish(j, result == MYNAH_GRAPH_OK ? 0 : -1, NULL);
+        return;
+    }
+
     if (result == MYNAH_GRAPH_OK) atomic_fetch_add(&g_stats.completed, 1ul);
     else if (result == MYNAH_GRAPH_CANCELLED) atomic_fetch_add(&g_stats.timed_out, 1ul);
     else atomic_fetch_add(&g_stats.failed, 1ul);
@@ -759,6 +792,106 @@ static int resolve_voice(const char *voice, unsigned *out) {
     return -1;
 }
 
+/* ------------------------------------------------------------------ warm-up
+ *
+ * E5-20. WHY THIS GOES THROUGH THE QUEUE.
+ *
+ * The obvious warm-up is a direct call into the model from whatever thread is
+ * handy, on whatever state the process already has. The reference
+ * implementation did exactly that and it produced the one bug in this area
+ * worth naming: its warm-up primed per-request state for a configuration no
+ * request uses, so THE FIRST REAL REQUEST DIFFERED FROM EVERY ONE AFTER IT
+ * (.work/serving-design.md §7). A trajectory fork at request one is close to
+ * undebuggable -- it reproduces only on a fresh process, it never reproduces
+ * under a load test, and every A/B measured afterwards silently contains it.
+ *
+ * So the warm-up here is not a special path at all. It builds an ordinary
+ * `synth_job`, puts it on the ordinary queue, and lets the scheduler admit it
+ * through `sink_next_job` like anything else. It therefore walks exactly the
+ * reset a request walks -- `slot_start` -> `ctx_new` + `prepare`, steps,
+ * `slot_retire` -> `ctx_free` -- and leaves the process in exactly the state a
+ * finished request leaves it in. There is nothing for it to fork, because
+ * there is no second path for it to take.
+ *
+ * What it is for: the lazily-built caches a `mynah_tts_model` carries
+ * (quantized weights, codec filters, the projection cache) and the thread
+ * pool's own first dispatch. Those are per process, and under `--prefork` they
+ * are per WORKER -- this runs after the fork for exactly that reason.
+ *
+ * The gate is `tests/test_server.sh`'s `warmup` check: the first request to a
+ * warmed server, the first request to an unwarmed one and the second request
+ * to that same unwarmed one must all be byte-identical. Warm-up that changed
+ * any audio would fail it, and so would a first request that differed from the
+ * second for any other reason.
+ *
+ * Returns 0 when every warm-up ran, -1 otherwise. A failure is reported and
+ * not fatal: a server that cannot warm up can still serve, and refusing to
+ * start would turn a latency optimisation into an outage. */
+static int warmup_run(unsigned count) {
+    if (count == 0u) return 0;
+
+    /* The same two-branch tokenizer choice `handle_speech` makes, for the same
+     * reason: which tokenizer applies is a property of the pack. A bound pack
+     * ships SentencePiece and needs no language; an unbound Magpie pack needs
+     * one, and "en" is the language every other default in this file uses. */
+    static const char WARMUP_TEXT[] = "mynah warm up";
+    int *ids = NULL;
+    size_t id_count = 0;
+    char err[512];
+    const int encode_failed = g.sp != NULL
+        ? mynah_sp_encode(g.sp, WARMUP_TEXT, strlen(WARMUP_TEXT), &ids, &id_count,
+                          err, sizeof(err))
+        : mynah_tokenizer_encode(g.tokenizer, "en", WARMUP_TEXT, &ids, &id_count,
+                                 err, sizeof(err));
+    if (encode_failed != 0 || id_count == 0u) {
+        fprintf(stderr, "warm-up skipped: cannot tokenize (%s)\n",
+                encode_failed != 0 ? err : "no tokens");
+        free(ids);
+        return -1;
+    }
+
+    int failures = 0;
+    for (unsigned n = 0; n < count; ++n) {
+        int *copy = (int *)malloc(id_count * sizeof(*copy));
+        if (copy == NULL) { ++failures; break; }
+        memcpy(copy, ids, id_count * sizeof(*copy));
+
+        synth_job *job = job_new(-1);     /* no client: nothing to answer */
+        if (job == NULL) { free(copy); ++failures; break; }
+        job->is_warmup = 1;
+        job->text_ids = copy;
+        job->request.text_ids = copy;
+        job->request.text_length = id_count;
+        job->request.speaker = g.default_speaker;
+        job->request.max_steps = 0u;      /* the pack's own default */
+        job->request.temperature = (float)g.info.default_temperature;
+        job->request.topk = g.info.default_topk;
+        job->request.use_local_transformer = 1;
+        job->request.seed = 42u;
+        /* No deadline. A warm-up runs before anything is accepted, so there is
+         * no client whose patience it could be spending, and a cancelled
+         * warm-up would leave the caches half-built -- which is the state this
+         * exists to avoid. */
+        job->sink.deadline_ms = 0.0;
+
+        if (job_enqueue(job) != 0) {
+            job_release(job);
+            ++failures;
+            break;
+        }
+        if (job_wait(job, 0u) != 0 || job->result != 0) {
+            fprintf(stderr, "warm-up request %u failed: %s\n", n + 1u,
+                    job->error[0] != '\0' ? job->error : "unknown");
+            ++failures;
+        } else {
+            ++g.warmups_done;
+        }
+        job_release(job);
+    }
+    free(ids);
+    return failures == 0 ? 0 : -1;
+}
+
 /* -------------------------------------------------------------------- http */
 
 static int write_all(int fd, const void *data, size_t len) {
@@ -865,10 +998,42 @@ static int16_t to_pcm16(float v) {
  * early validation failures are the only cases that return 0: they answer on
  * the caller's descriptor and leave the closing to it, exactly as the other
  * routes do. */
-static int handle_speech(int fd, const char *body) {
+/* The request body, parsed ONCE.
+ *
+ * These three replace the `mynah_json_string(body, key, ...)` wrappers at the
+ * call sites below. The wrappers are unchanged and other callers still use
+ * them, but each one parses the whole document to answer one lookup, and a
+ * speech request asks eleven questions of a body that may be a megabyte. Eleven
+ * linear passes over a megabyte, per request, to read eleven short scalars.
+ *
+ * `root` is validated by http_precheck and handed down, so the body is scanned
+ * exactly once per request and every lookup after that is a bounded re-scan of
+ * the object's own span. Same answers: src/json.h is what the wrappers call
+ * too, so first-duplicate-wins, top-level-only and surrogate reassembly all
+ * behave identically. */
+static int body_string(const mynah_json_value *root, const char *key,
+                       char *out, size_t capacity) {
+    mynah_json_value v;
+    if (mynah_json_object_get(root, key, &v) != 0) return -1;
+    return mynah_json_as_string(&v, out, capacity);
+}
+
+static int body_number(const mynah_json_value *root, const char *key, double *out) {
+    mynah_json_value v;
+    if (mynah_json_object_get(root, key, &v) != 0) return -1;
+    return mynah_json_as_number(&v, out);
+}
+
+static int body_bool(const mynah_json_value *root, const char *key, int *out) {
+    mynah_json_value v;
+    if (mynah_json_object_get(root, key, &v) != 0) return -1;
+    return mynah_json_as_bool(&v, out);
+}
+
+static int handle_speech(int fd, const mynah_json_value *body) {
     char text[MAX_TEXT];
-    if (mynah_json_string(body, "input", text, sizeof(text)) != 0 &&
-        mynah_json_string(body, "text", text, sizeof(text)) != 0) {
+    if (body_string(body, "input", text, sizeof(text)) != 0 &&
+        body_string(body, "text", text, sizeof(text)) != 0) {
         send_error(fd, "400 Bad Request", "invalid_request_error",
                    "missing 'input' (or 'text')");
         return 0;
@@ -880,8 +1045,8 @@ static int handle_speech(int fd, const char *body) {
     }
 
     char voice[64] = {0};
-    if (mynah_json_string(body, "voice", voice, sizeof(voice)) != 0) {
-        (void)mynah_json_string(body, "speaker", voice, sizeof(voice));
+    if (body_string(body, "voice", voice, sizeof(voice)) != 0) {
+        (void)body_string(body, "speaker", voice, sizeof(voice));
     }
     unsigned speaker = 0;
     if (resolve_voice(voice, &speaker) != 0) {
@@ -898,7 +1063,7 @@ static int handle_speech(int fd, const char *body) {
      *
      * The empty string is therefore load bearing and is not a missing value. */
     char language[32] = {0};
-    (void)mynah_json_string(body, "language", language, sizeof(language));
+    (void)body_string(body, "language", language, sizeof(language));
     if (g.language[0] != '\0') {
         /* Bound weights. A mismatch is refused BEFORE a job exists, so a slot
          * is never charged for a request that cannot be served, and so no
@@ -934,7 +1099,7 @@ static int handle_speech(int fd, const char *body) {
     }
 
     char format[32] = "wav";
-    (void)mynah_json_string(body, "response_format", format, sizeof(format));
+    (void)body_string(body, "response_format", format, sizeof(format));
     const int want_pcm = ci_equal(format, "pcm");
     if (!want_pcm && !ci_equal(format, "wav")) {
         /* Be explicit rather than silently returning WAV under another name:
@@ -945,16 +1110,16 @@ static int handle_speech(int fd, const char *body) {
     }
 
     int stream = 0;
-    (void)mynah_json_bool(body, "stream", &stream);
+    (void)body_bool(body, "stream", &stream);
 
     double temperature = g.info.default_temperature;
-    (void)mynah_json_number(body, "temperature", &temperature);
+    (void)body_number(body, "temperature", &temperature);
     double seed = 42.0;
-    (void)mynah_json_number(body, "seed", &seed);
+    (void)body_number(body, "seed", &seed);
     double topk = (double)g.info.default_topk;
-    (void)mynah_json_number(body, "top_k", &topk);
+    (void)body_number(body, "top_k", &topk);
     double max_steps = 0.0;
-    (void)mynah_json_number(body, "max_steps", &max_steps);
+    (void)body_number(body, "max_steps", &max_steps);
 
     int *ids = NULL;
     size_t id_count = 0;
@@ -1191,15 +1356,31 @@ static void handle_health(int fd) {
                             * client actually goes away. */
                            "\"limits\":{\"max_batch\":%zu,\"queue_capacity\":%zu,"
                            "\"workers\":%d,\"request_timeout_ms\":%u,"
-                           "\"cancel_on_disconnect\":%s},"
+                           "\"cancel_on_disconnect\":%s,"
+                           /* E5-20. `requested` is the configuration and `done`
+                            * is the fact. They differ when a warm-up failed,
+                            * and an operator chasing a slow or a divergent
+                            * first request needs to be able to tell "warm-up
+                            * was off" from "warm-up was asked for and did not
+                            * run", which one number cannot say. */
+                           "\"warmups\":{\"requested\":%u,\"done\":%u}},"
                            /* Which PROCESS answered. Under prefork the counters
                             * above are that worker's, not the machine's, so a
                             * caller polling /health samples a different worker
                             * each time and needs to be told which one. -1 means
                             * a single-process server, where they are the whole
                             * picture. */
+                           /* E5-21 and E5-22, reported as FACTS. `decoder_lane`
+                            * is what mynah_lane_width() answers, so a lane that
+                            * was asked for and refused -- too narrow, or a
+                            * platform that cannot pin -- reads 0 here, and the
+                            * reason is in the startup log. `pool_spin` is the
+                            * budget in force; 65536 and 4096 are different
+                            * servers, so the number has to be readable from a
+                            * running process and not only from the source. */
                            "\"process\":{\"pid\":%d,\"prefork_worker\":%d,"
-                           "\"synthesis_threads\":%d}}",
+                           "\"synthesis_threads\":%d,\"decoder_lane\":%d,"
+                           "\"engine_threads\":%d,\"pool_spin\":%d}}",
                            g.model_id, g.info.engine, g.info.sample_rate,
                            g.voice_count,
                            langs,
@@ -1219,10 +1400,13 @@ static void handle_health(int fd) {
                            g.max_batch, g.max_pending, g.worker_count,
                            g.request_timeout_ms,
                            g.cancel_on_disconnect ? "true" : "false",
+                           g.warmups, g.warmups_done,
                            (int)getpid(), mynah_prefork_worker_index(),
                            mynah_prefork_worker_threads() > 0
                                ? mynah_prefork_worker_threads()
-                               : mynah_num_threads());
+                               : mynah_num_threads(),
+                           mynah_lane_width(), mynah_lane_engine_width(),
+                           mynah_pool_spin_budget());
     if (n > 0) send_status(fd, "200 OK", "application/json", body, (size_t)n);
 }
 
@@ -1264,7 +1448,7 @@ static const struct {
  * have to re-validate. */
 static route_id http_precheck(int fd, const char *method, const char *path,
                               const char *headers, size_t headers_len,
-                              const char *body) {
+                              const char *body, mynah_json_value *out_root) {
     const char *allow = NULL;
     route_id id = ROUTE_NONE;
     for (size_t i = 0; i < sizeof(ROUTES) / sizeof(ROUTES[0]); ++i) {
@@ -1302,14 +1486,46 @@ static route_id http_precheck(int fd, const char *method, const char *path,
         }
     }
 
+    /* PARSE THE BODY, do not sniff it.
+     *
+     * This used to be `*b != '{'` after skipping whitespace, which is two
+     * failures wearing one line. A body that was not JSON at all but started
+     * with a brace got through and broke later, somewhere that could only say
+     * "missing 'input'" -- a caller with a truncated body, a stray comma or a
+     * bad escape was told nothing about any of those. And a body that was
+     * valid JSON but not an object was refused with the same sentence as an
+     * empty one.
+     *
+     * src/json.h validates in one pass and reports the byte offset and the
+     * expectation, so the refusal now names the place. That is the whole
+     * difference between a 400 a client can act on and a 400 they have to
+     * bisect their request to understand. */
     const char *b = body != NULL ? body : "";
-    while (*b == ' ' || *b == '\t' || *b == '\r' || *b == '\n') ++b;
-    if (*b != '{') {
-        send_error(fd, "400 Bad Request", "invalid_request_error",
-                   *b != '\0' ? "body is not a JSON object"
-                              : "empty body: expected a JSON object");
+    const size_t blen = strlen(b);
+    mynah_json_value root;
+    mynah_json_error jerr;
+    memset(&jerr, 0, sizeof(jerr));
+    if (mynah_json_parse(b, blen, &root, &jerr) != 0) {
+        char msg[320];
+        if (blen == 0) {
+            snprintf(msg, sizeof(msg), "empty body: expected a JSON object");
+        } else {
+            snprintf(msg, sizeof(msg),
+                     "body is not valid JSON at byte %zu: %s",
+                     jerr.offset, jerr.message);
+        }
+        send_error(fd, "400 Bad Request", "invalid_request_error", msg);
         return ROUTE_ANSWERED;
     }
+    if (root.type != MYNAH_JSON_OBJECT) {
+        send_error(fd, "400 Bad Request", "invalid_request_error",
+                   "body is valid JSON but not an object: this endpoint takes "
+                   "a JSON object with the request fields as members");
+        return ROUTE_ANSWERED;
+    }
+    /* The one parse of this request. The value is a span into `body`, which
+     * belongs to handle_connection's buffer and outlives the route. */
+    if (out_root != NULL) *out_root = root;
     return id;
 }
 
@@ -1447,8 +1663,10 @@ static void handle_connection(int fd) {
             "Connection: close\r\n\r\n";
         write_all(fd, pre, strlen(pre));
     } else {
-        switch (http_precheck(fd, method, path, buf, head_len, body)) {
-            case ROUTE_SPEECH:   handed_off = handle_speech(fd, body); break;
+        mynah_json_value root;
+        memset(&root, 0, sizeof(root));
+        switch (http_precheck(fd, method, path, buf, head_len, body, &root)) {
+            case ROUTE_SPEECH:   handed_off = handle_speech(fd, &root); break;
             case ROUTE_VOICES:   handle_voices(fd); break;
             case ROUTE_MODELS:   handle_models(fd); break;
             case ROUTE_HEALTH:   handle_health(fd); break;
@@ -1545,7 +1763,8 @@ static void usage(const char *argv0) {
             "usage: %s -m MODEL_DIR [-m MODEL_DIR ...] [-p PORT] [--host ADDR] [-w WORKERS]\n"
             "       [--device cpu|metal|cuda] [--max-batch N] [--max-pending N]\n"
             "       [--request-timeout-ms MS] [--no-cancel-on-disconnect]\n"
-            "       [--prefork W] [--prefork-threads T] [--prefork-plan]\n"
+            "       [--warmup N] [--prefork W] [--prefork-threads T] [--prefork-plan]\n"
+            "       [--decoder-lane N]\n"
             "\n"
             "  -m MODEL_DIR       repeatable: ONE PACK PER LANGUAGE. The pack's\n"
             "                     model.json says which language its weights are\n"
@@ -1568,6 +1787,14 @@ static void usage(const char *argv0) {
             "                     failed still ends, because it has nowhere to write.\n"
             "                     /health reports which is in force.\n"
             "\n"
+            "  --warmup N         run N synthetic requests before accepting any\n"
+            "                     traffic (default 1; 0 disables). They go through\n"
+            "                     the SAME queue, the same admission and the same\n"
+            "                     per-request reset a client request does, so the\n"
+            "                     first request served is identical to the second.\n"
+            "                     Under --prefork every worker warms itself, after\n"
+            "                     the fork: the caches this builds are per process.\n"
+            "\n"
             "  --prefork W        serve from W pinned worker processes instead of one\n"
             "                     process. The parent loads the pack, forks W workers\n"
             "                     that share it, routes each connection to the least\n"
@@ -1578,6 +1805,17 @@ static void usage(const char *argv0) {
             "                     which subscribes the machine exactly once.\n"
             "  --prefork-plan     print this machine\'s topology and the measurement\n"
             "                     procedure for choosing W, then exit. No model needed.\n"
+            "\n"
+            "  --decoder-lane N   give the last N cpus of each worker\'s slice to a\n"
+            "                     private, PINNED decoder team with its own submit\n"
+            "                     lock and one decode in flight per slot. Off by\n"
+            "                     default. Requires --prefork (there is no pinned\n"
+            "                     slice without it) and at least 4 cpus on each side:\n"
+            "                     on a narrower lane the decoder measures SLOWER than\n"
+            "                     inline, so a split that cannot work is REFUSED with\n"
+            "                     a reason rather than rounded into one that can.\n"
+            "                     Linux only: an unpinned private team oversubscribes.\n"
+            "                     MYNAH_LANE_SPLIT sets the same thing.\n"
             "\n"
             "  POST /v1/audio/speech   {\"input\":\"...\",\"voice\":\"Sofia\"}\n"
             "  POST /v1/tts            {\"text\":\"...\",\"speaker\":\"Sofia\"}\n"
@@ -1608,9 +1846,18 @@ int main(int argc, char **argv) {
      * judgement about a socket, and an operator who believes it is wrong
      * needs a way to say so without rebuilding. */
     g.cancel_on_disconnect = 1;
+    /* Default ON, at one request. The cost is one short synthesis at startup;
+     * what it buys is that the first client request is served from the same
+     * warm caches as every one after it, and -- the part that is correctness
+     * rather than latency -- that there is a single, tested answer to "is
+     * request one different from request two". */
+    g.warmups = 1u;
     int prefork_workers = 0;
     int prefork_threads = 0;
     int prefork_plan_only = 0;
+    /* E5-21. Off by default, and the default is not timidity: below four cpus
+     * a side the lane measures SLOWER than running the decoder inline. */
+    int decoder_lane = 0;
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
@@ -1637,10 +1884,20 @@ int main(int argc, char **argv) {
             const long v = strtol(argv[++i], NULL, 10);
             /* 0 disables the deadline; negative is a typo, not an intent. */
             g.request_timeout_ms = v >= 0 ? (unsigned)v : REQUEST_TIMEOUT_MS;
+        } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            const long v = strtol(argv[++i], NULL, 10);
+            /* Negative is a typo, not an intent; 0 really means "do not warm
+             * up" and must not be silently promoted to the default. */
+            g.warmups = v > 0 ? (unsigned)v : 0u;
+        } else if (strcmp(argv[i], "--no-warmup") == 0) {
+            g.warmups = 0u;
         } else if (strcmp(argv[i], "--prefork") == 0 && i + 1 < argc) {
             prefork_workers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prefork-threads") == 0 && i + 1 < argc) {
             prefork_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--decoder-lane") == 0 && i + 1 < argc) {
+            const long v = strtol(argv[++i], NULL, 10);
+            decoder_lane = v > 0 ? (int)v : 0;
         } else if (strcmp(argv[i], "--prefork-plan") == 0) {
             prefork_plan_only = 1;
         } else if (strcmp(argv[i], "--no-cancel-on-disconnect") == 0) {
@@ -1666,6 +1923,7 @@ int main(int argc, char **argv) {
         plan.workers = prefork_workers;
         plan.threads_per = prefork_threads;
         plan.slots_per = (int)g.max_batch;
+        plan.lane_cpus = decoder_lane;
         mynah_prefork_print_plan(&plan, stdout);
         return 0;
     }
@@ -1690,6 +1948,18 @@ int main(int argc, char **argv) {
                     prefork_workers, pack_count, pack_count);
             return 2;
         }
+    }
+    /* E5-21. A lane is a split of a PINNED slice, and only prefork makes one.
+     * Refusing here rather than later keeps the two answers to "is the lane
+     * on" -- what was asked for and what is running -- from ever disagreeing
+     * silently, which is the failure the whole item is shaped against. */
+    if (decoder_lane > 0 && prefork_workers <= 0) {
+        fprintf(stderr,
+                "--decoder-lane %d ignored: the lane is a split of a worker's "
+                "PINNED cpu slice and only --prefork creates one. An unpinned "
+                "private team oversubscribes (the reference measured 21 threads "
+                "on 8 cores), so the decoder stays inline.\n", decoder_lane);
+        decoder_lane = 0;
     }
     if (g.worker_count < 1) g.worker_count = 1;
     if (g.worker_count > 64) g.worker_count = 64;
@@ -1837,6 +2107,7 @@ int main(int argc, char **argv) {
     if (prefork_workers > 0) {
         pf.listen_fd = listen_fd;
         pf.slots_per = (int)g.max_batch;
+        pf.lane_cpus = decoder_lane;
         /* The authoritative answer to "is a GPU backend resident in this
          * process?", which prefork refuses to fork across. Its own scan of the
          * CUDA runtime is a backstop for a library someone else pulled in;
@@ -1973,18 +2244,36 @@ int main(int argc, char **argv) {
                  "to en");
     }
 
+    char lane_banner[96];
+    if (mynah_lane_width() > 0) {
+        snprintf(lane_banner, sizeof(lane_banner),
+                 "ON (%d pinned threads, own submit lock)", mynah_lane_width());
+    } else {
+        snprintf(lane_banner, sizeof(lane_banner),
+                 "off (the decoder runs inline)");
+    }
+
     fprintf(stderr,
             "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu  "
             "workers=%d  max_batch=%zu  queue=%zu  timeout=%ums%s\n"
             "note: one scheduler thread synthesizes; requests join the running\n"
             "      batch as slots free up, streaming and batch alike\n"
             "transport: TCP_NODELAY on every accepted socket; threads named\n"
-            "      (mynah-accept/recv, mynah-http*, mynah-sched, mynah-out*)\n"
+            "      (mynah-accept/recv, mynah-http*, mynah-sched, mynah-out*,\n"
+            "      mynah-pool, and mynah-lane/mynah-lanew when the lane is up)\n"
+            "pool: %d engine thread%s, decoder lane %s, spin budget %d (%s)\n"
             "language: %s\n"
             "cancel-on-disconnect: %s\n",
             host, port, g.model_id, mynah_tts_device_name(device), g.voice_count,
             g.worker_count, g.max_batch, g.max_pending, g.request_timeout_ms,
             chan_fd >= 0 ? "  [prefork worker]" : "",
+            /* What is RUNNING, not what was requested. A lane that refused to
+             * engage prints "off" here and its reason in the prefork line
+             * above, because the two are different claims (E5-21). */
+            mynah_lane_engine_width(),
+            mynah_lane_engine_width() == 1 ? "" : "s",
+            lane_banner,
+            mynah_pool_spin_budget(), mynah_pool_spin_source(),
             /* Residency, printed whichever shape the server is in. "which
              * languages does this thing hold" has to be answerable from the
              * log of a server that has since died, and for a bound pack it is
@@ -1999,6 +2288,33 @@ int main(int argc, char **argv) {
                   "      (--no-cancel-on-disconnect)"
                 : "OFF — streaming sockets are not watched for a hangup; a stream\n"
                   "      ends only when a write to it actually fails");
+
+    /* E5-20, and the placement is the item.
+     *
+     * AFTER the scheduler thread exists, because the warm-up is a queued job
+     * and the scheduler is what admits it -- that is what makes it the request
+     * path rather than a second one. AFTER the fork, because the caches it
+     * builds are per process and a warm-up in the parent would be inherited as
+     * dead weight (see prefork.h on the codec's pthread_t-keyed filter cache).
+     * BEFORE the accept loop, because nothing else would be true afterwards:
+     * the whole point is that the first request a client sends is not the
+     * first request this process has served.
+     *
+     * Note what "before the accept loop" means for readiness: the listening
+     * socket is already bound, so a client that connects during the warm-up
+     * waits in the backlog and is served once it finishes. /health therefore
+     * answers exactly when the server is warm, which is the honest definition
+     * of ready and the one tests/test_server.sh polls. */
+    if (g.warmups > 0u) {
+        const double t0 = now_ms();
+        const int warm = warmup_run(g.warmups);
+        fprintf(stderr, "warm-up: %u/%u request%s through the queue, admission and "
+                        "per-request reset in %.0f ms%s\n",
+                g.warmups_done, g.warmups, g.warmups == 1u ? "" : "s",
+                now_ms() - t0,
+                warm == 0 ? "" : "  <-- INCOMPLETE: the first served request may "
+                                 "differ from the second");
+    }
 
     queue_init(&g_queue);
     pthread_t workers[64];

@@ -267,11 +267,15 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       cache (8 call sites), `vvtanhf` for GELU (4), and the SEANet Snake's
       `vvsinf`/`vDSP_vsmul`/`vDSP_vsq`/`vDSP_vsma` (12). Closing these is what lets
       macOS and Linux run the same code instead of two paths that agree by luck
-- [ ] E4-16a **interim, while BLAS is still linked**: `OPENBLAS_THREAD_TIMEOUT=1` —
-      TTFA 108 ms **bimodal** to 66 ms stable, 42.5k to 12k context switches/s — and
-      report claim vs fact in the dispatch table. Do **not** partition rigidly:
-      lowering BLAS threads improves RTF and costs 30% of TTFA. This is compensation
-      for a dependency we are removing, not a design
+- [x] E4-16a **done** · `OPENBLAS_THREAD_TIMEOUT=1` set from a constructor when unset, with
+      `blas.thread_timeout` reporting **claim vs fact** — a shared libopenblas
+      initialises before this executable's constructors, so only the environment
+      before exec is guaranteed to be read → [`.work/decoder-lane.md`](.work/decoder-lane.md) §4.
+      TTFA 108 ms **bimodal** to 66 ms stable, 42.5k to 12k context switches/s (theirs).
+      Deliberately **not** partitioned: lowering BLAS threads improves RTF and costs
+      30% of TTFA. Compensation for a dependency E4-16 removes, not a design.
+      Measured here while verifying: OpenBLAS builds a team sized to the HOST per
+      worker — **32 threads inside a worker pinned to 8 cpus** (§5)
 - [ ] E4-17 **plan from `sched_getaffinity`, not `sysconf`** — `sysconf` sees neither an
       inherited taskset nor a cpuset cgroup, so every containerised deployment plans the
       whole host. Also read cgroup v2 `cpu.max` and warn (they never closed that one)
@@ -371,7 +375,15 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 - [x] E5-3 async output writer **done** (`server/stream_out.{c,h}`): a slow client blocked
       the whole process for 66.5 s, now 4.81 s; leaks/ASan/UBSan/TSan clean
 - [x] E5-4 **done** `6ed9c63` · cancel on disconnect (`POLLRDHUP`), slot freed within one frame
-- [ ] E5-5 long-form: incremental push into a running decode, persistent conv state across flushes
+- [ ] E5-5 long-form **BLOCKED on an engine hook**, and the driver half is already done →
+      [`.work/decoder-lane.md`](.work/decoder-lane.md) §6. `pocket_decode_audio` already
+      carries conv state and a position counter across calls and refuses a
+      non-contiguous range, and `serve()` already decodes in contiguous monotone ranges
+      from slots that outlive a call. What is missing is appending TEXT to a prepared
+      context: `pocket_ctx_new` sizes `text_embed`, the backbone KV, `latents` and the
+      codec KV from a text length known at admission, so the hook and its allocations
+      belong in `src/engine_pocket.c`. Do not settle for "chunk the text into N
+      requests" — that cannot be byte-identical to the one-shot
 - [x] E5-6 **prefork done** (`85d6380`): `server/prefork.{c,h}`, parent opens the pack
       then forks W workers and hands each accepted fd to the least-loaded one over
       `SCM_RIGHTS`. Only `sched_setaffinity` and the sysfs read are Linux-only, so the
@@ -425,17 +437,30 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 - [x] E5-19 **done** `facdc06` · **keep polling the listener while full, and refuse** — a full server that
       stops accepting hides the wait in the kernel backlog where no deadline can see
       it. Theirs measured TTFB/TTFA p95 4470/4635 ms of which >97% was before `accept()`
-- [ ] E5-20 **warm up through the same reset the request path uses** — theirs warmed on
-      leftover CLI state and the first real request differed from every one after it
-- [ ] E5-21 **decoder lane: a private pinned team on the last N cpus**, own submit lock,
-      bounded one-unit-per-slot mailbox, redirection done inside `parallel()` by a
-      thread-local tag. Only **after** E5-1/E5-6/E5-12: on a narrow lane it is slower
-      than inline (theirs: 6+2 gave 1.364 vs 0.997 at 4+4). Our decoder is 72% of the
-      frame and per-slot — the same position theirs was in
-- [ ] E5-22 **spin budget and per-CCX bandwidth, measured on our host before choosing W** —
-      their spin sweep moved STREAM p95 0.893 → 0.808 with context switches 38k → 7.6k/s,
-      and their 16-thread mask read *slower cache-resident than DRAM* because the working
-      set straddled two CCX. Both are ten-minute measurements
+- [x] E5-20 **done** · **warm up through the same reset the request path uses** → [`.work/decoder-lane.md`](.work/decoder-lane.md) §1.
+      `--warmup N` (default 1) enqueues an ordinary job on the ordinary queue, so it
+      walks `ctx_new`/`prepare`/`ctx_free` exactly as a request does. Gated by
+      `tests/test_server.sh warmup`: warm-first == cold-first == cold-second, with a
+      must-differ control. Theirs warmed on leftover CLI state and the first real
+      request differed from every one after it
+- [x] E5-21 **done, OFF by default** (`--decoder-lane N`) → [`.work/decoder-lane.md`](.work/decoder-lane.md) §2.
+      Private **pinned** team on the last N cpus, own submit lock, bounded
+      one-unit-per-slot mailbox, redirection inside `mynah_parallel_for()` by a
+      thread-local tag — one branch, never discipline at call sites. **Refuses**
+      rather than narrowing: both sides need 4 cpus (theirs: 6+2 gave 1.364 vs 0.997
+      at 4+4) and it will not run unpinned (theirs: 21 threads on 8 cores). Verified
+      engaged and pinned at 4+4 on 32-core Neoverse-V2, byte-identical through
+      `server-test` and `server-concurrency-test`, ASan and UBSan clean, 0 mailbox
+      overruns. **The lane and the decode gang are alternatives, not layers** — which
+      is faster here is unmeasured, so the gang stays the default
+- [~] E5-22 **spin budget exposed, not tuned; per-CCX bandwidth still unmeasured** → [`.work/decoder-lane.md`](.work/decoder-lane.md) §3.
+      The pool now spins before it parks: `MYNAH_POOL_SPIN`, default 65536 on
+      Linux/aarch64 and 4096 elsewhere, in the dispatch table as `pool.spin` with its
+      source and its park/spin counters. The default is **TRANSFERRED** — their sweep
+      moved STREAM p95 0.893 → 0.808 with context switches 38k → 7.6k/s — and the
+      curve does not port, so pin the measured value per box. Still to do: sweep it
+      here, and the per-CCX bandwidth reading (their 16-thread mask read *slower
+      cache-resident than DRAM*). Both are ten-minute measurements
 - [x] E5-8 **done** `89070f8` — proven through HTTP at C=2/4/8, both routes, either arrival order, ragged, single-process and across 4 prefork processes, with two injected contamination mutants caught · gate: **N concurrent streams byte-identical to the same request run alone**
 
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)
