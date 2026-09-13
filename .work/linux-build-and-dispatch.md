@@ -146,26 +146,90 @@ configuration nobody builds. Three entries in the matrix carry
 `known_broken: true` and `continue-on-error`; **that flag comes out in the same
 commit that fixes `qmat.c`**, or the entry stops meaning anything.
 
-**B. Every non-`-march=native` ARM profile fails `--self-test` on Linux/gcc.**
+**B. Every non-`-march=native` ARM profile fails `--self-test` on Linux/gcc —
+and it is a strict-aliasing miscompile, not a precision bug.**
 
 ```
 qmat self-test failed: qmat f16 pack disagrees with the scalar reference
 at 4124: 66088.4844 -> 0xb01a, reference 0x7c00
 ```
 
-66088.48 is past the f16 maximum (65504); the reference saturates to `+inf`
-(`0x7c00`) and the pack produces `0xb01a`, which is not a saturation of anything.
-Reproduced on `SIMD=portable`, `SIMD=neon`, `SIMD=portable BLAS=none`, and both
-`-march=armv8-a` baselines. **`SIMD=auto` (`-march=native`) passes, and
-macOS/clang passes every one of the same profiles** — so it is a baseline-ARM
-codegen difference in the f16 pack, at the overflow boundary that
-`dtype-and-fallbacks.md` §5 says the self-test was written to cover. The
-self-test earned its place again; the ISA it was earning it on was the wrong one.
+66088.48 is past the f16 maximum (65504), so the correct answer is `0x7c00`,
+`+inf`. `0xb01a` is a small **negative** finite half, about −0.128: not a
+rounding disagreement at the boundary but a result structurally unrelated to its
+input. First reported as "fails at the overflow boundary", which undersold it.
+
+Chased down 2026-09-13 after the coordinator could not reproduce it. Reproduces
+deterministically, same index and same value every time, at `d7281b9` and at
+`57596b3`. The flag sweep, all on `SIMD=portable` with only `EXTRA_CFLAGS`
+varying:
+
+| flags | result |
+|---|---|
+| *(baseline)*, `-march=armv8-a`, `-march=armv8.2-a`, `+fp16`, `+dotprod` | **FAIL** |
+| `-march=armv8.6-a`, `-march=armv9-a` | **FAIL** |
+| `-mtune=neoverse-v2` | **FAIL** |
+| `-fno-fast-math` | **FAIL** |
+| `-march=native`, `-mcpu=neoverse-v2` | pass |
+| `-fno-tree-vectorize` | pass |
+| `-O1` | pass |
+| **`-fno-strict-aliasing`** | **pass** |
+
+So it is **not an ISA gap** — `armv8.6-a` carries fp16, dotprod, i8mm and bf16
+and still fails — and not `-ffast-math`. It is the optimizer.
+
+**Localized to one translation unit.** Build the whole tree in the failing
+configuration, then recompile **only `src/qmat.c`** with `-fno-strict-aliasing`
+and relink, every other object and flag untouched: PASS. The defect is inside
+`src/qmat.c`, and it is a miscompile that strict aliasing licenses.
+
+The prime suspect is `src/qmat.c:354-357`, where the pack writes through an
+`__fp16 *` aliased onto storage allocated and read back as `uint16_t`:
+
+```c
+static void qmat_f16_pack(uint16_t *dst, const float *src, size_t n) {
+#if defined(MYNAH_QMAT_F16_NEON)
+    __fp16 *h = (__fp16 *)(void *)dst;
+    for (size_t i = 0; i < n; ++i) h[i] = (__fp16)src[i];
+```
+
+`__fp16` and `uint16_t` are not compatible types; the `(void *)` cast silences
+the diagnostic without removing the UB, and gcc does warn on the same construct
+under `-Wstrict-aliasing` (which `-Wall -Wextra` does not surface here). Stated
+as a suspect, not a conclusion: **an isolated 40-line reproducer of exactly that
+loop does not miscompile** at `-O2`, `-O3` or `-O3 -march=native`, so the
+miscompile needs surrounding context this lane did not chase further. The file
+belongs to another lane and the fix is theirs to make and to verify.
+
+Why it hid: `uint16_t` storage is *correct* and deliberate — `__fp16` is ARM-only
+and `_Float16` needs GCC ≥ 12 on x86 ([`dtype-and-fallbacks.md`](dtype-and-fallbacks.md) §5) —
+so the pun is load-bearing, and every build anyone runs is `-march=native`, where
+the vectorizer happens to choose a shape that does not bite.
+
+**Why the first non-reproduction was a false negative, and what it teaches.**
+The check was run as `make ARCH_FLAGS=-march=armv8-a` and `make SIMD=portable`
+in `~/mynah-tts` on the box. Both were no-ops:
+
+- `ARCH_FLAGS` is **not a variable in this Makefile** — it is the reference
+  repo's name, quoted in [`linux-production.md`](linux-production.md). Ours is
+  `EXTRA_CFLAGS`, added in `ffc28b4`. `make ARCH_FLAGS=...` silently builds the
+  default.
+- `~/mynah-tts` still carried the **pre-`ffc28b4` Makefile**, which has no
+  `portable` branch, so `SIMD=portable` fell through the `else` and compiled
+  `-march=native`. `make SIMD=portable info` in that tree prints
+  `SIMD=native/arm`.
+
+So all four invocations built `-march=native`, the one arm that passes. Nothing
+was contradicted; the profile name resolved to something else and said so only
+if you asked `make info`. That is this lane's own subject matter arriving as a
+worked example, and it is the argument for `$(error)` on an unknown `SIMD=`
+value and for the resolved profile being printed in `make info`, `make
+simd-auto` and `MYNAH_SIMD_PROFILE` — all of which `ffc28b4` added.
 
 This is why the link-only job runs `--version` and `--dispatch-map` and **not**
-`--self-test`: the item asks for link-only, and adding the runtime check would
-paint the job red for a defect belonging to another file. Add `--self-test`
-there in the same commit that fixes `qmat.c`.
+`--self-test`: the item asks for link-only, and these profiles link and start
+today but do not compute. Add `--self-test` there in the same commit that fixes
+`qmat.c`.
 
 Everything else links and starts, on both machines:
 
@@ -243,11 +307,15 @@ resolutions and link results only.
 
 ## 8. What this lane did not do, and who has to
 
-1. **`src/qmat.c:1798`** — three lines to put the `QMAT_F16` branch of
-   `qmat_weight_rel()` behind `#if MYNAH_QMAT_F16`. Unblocks `SIMD=scalar`
-   everywhere; then delete `known_broken` from the three CI entries.
-2. **`src/qmat.c` f16 pack at the 65504 boundary on baseline ARM/gcc** — §5B.
-   Then add `--self-test` back to the link-only job.
+1. ~~`src/qmat.c:1798`~~ — **done, `57596b3`**. Verified here on the box:
+   `SIMD=scalar` and `SIMD=scalar BLAS=scalar` both link and self-test PASS. The
+   three `known_broken` exemptions and the job's `continue-on-error` were removed
+   in the same change that verified it; every matrix entry is a hard gate again.
+2. **`src/qmat.c` — a strict-aliasing miscompile in the f16 pack** — §5B, and it
+   is the open one. Not a boundary-precision bug: recompiling only that file with
+   `-fno-strict-aliasing` fixes it. Every non-`-march=native` ARM profile on
+   Linux/gcc computes wrong f16 weights today. Then add `--self-test` back to the
+   link-only job.
 3. **`src/threads.c`** — `blas.thread_timeout`, `blas.threads_owned`,
    `pool.spin` and `pool.decoder_lane` resolve UNKNOWN on Linux (0 UNKNOWN at
    `d7281b9`). The rows and their reasons are already written; they need the

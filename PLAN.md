@@ -229,11 +229,12 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [x] E4-12 **done** · fatal ISA guard — `mynah_dispatch_isa_guard()`, first statement of
       `main()`, fires only on a DEFINITE absence so an unprobeable CPU still runs → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
 - [x] E4-13 **done** · 16-entry `link-only` CI matrix, x86 + ARM. **It found two pre-existing
-      defects on its first run, both invisible on macOS**: `SIMD=scalar` does not compile
-      (`src/qmat.c:1798` uses `qmat_f16_to_f32`/`.f16` outside `MYNAH_QMAT_F16`), and every
-      non-`-march=native` ARM profile fails the qmat f16 self-test on Linux/gcc at the 65504
-      boundary. Both belong to the qmat lane; 3 matrix entries carry `known_broken` until
-      then → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
+      defects on its first run, both invisible on macOS**: `SIMD=scalar` did not compile
+      (`src/qmat.c:1798`, fixed in `57596b3`, exemptions removed), and every
+      non-`-march=native` ARM profile computes wrong f16 weights on Linux/gcc — a
+      **strict-aliasing miscompile** in `src/qmat.c`, not a boundary-precision bug:
+      recompiling that one file with `-fno-strict-aliasing` fixes it, `-march=armv8.6-a`
+      does not. Open, and it is why the job omits `--self-test` → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
 - [x] E4-14 **done** · `build/cpu/.build-flags`; every object depends on the effective
       CC/SIMD/BLAS/CFLAGS/CPPFLAGS/LDLIBS text, rewritten only when it changes → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
 - [x] E4-15 **done** · `tools/simd-auto.sh` + `make simd-auto`; double test, printed profile,

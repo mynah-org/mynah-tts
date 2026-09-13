@@ -122,19 +122,9 @@ jobs:
       matrix:
         include:
           # --- Linux x86_64 -------------------------------------------------
-          # KNOWN RED, and left red on purpose. SIMD=scalar does not compile
-          # src/qmat.c at all: qmat_weight_rel() (src/qmat.c:1798) calls
-          # qmat_f16_to_f32() and reads qmat_entry.f16, both of which exist only
-          # under MYNAH_QMAT_F16 -- which -DMYNAH_DISABLE_SIMD switches off.
-          # Introduced by d1ffd01, long before this job existed, and invisible
-          # until something built the configuration: the exact thesis of E4-13,
-          # confirmed by E4-13 on its first run. src/qmat.c belongs to another
-          # lane; REMOVE continue-on-error in the same commit that fixes it, or
-          # this entry quietly stops meaning anything.
           - runner: ubuntu-latest
             name: "x86 SIMD=scalar"
             flags: "SIMD=scalar"
-            known_broken: true
           - runner: ubuntu-latest
             name: "x86 SIMD=portable"
             flags: "SIMD=portable"
@@ -162,7 +152,6 @@ jobs:
           - runner: ubuntu-latest
             name: "x86 SIMD=scalar BLAS=scalar"
             flags: "SIMD=scalar BLAS=scalar"
-            known_broken: true   # same src/qmat.c:1798 break as above
           # --- Linux aarch64 ------------------------------------------------
           # The armv8-a baseline: no dotprod, no i8mm, no fp16 arithmetic, so
           # every ARM kernel behind a __ARM_FEATURE_* gate is compiled out and
@@ -173,7 +162,6 @@ jobs:
           - runner: ubuntu-24.04-arm
             name: "arm SIMD=scalar"
             flags: "SIMD=scalar"
-            known_broken: true   # same src/qmat.c:1798 break as above
           - runner: ubuntu-24.04-arm
             name: "arm SIMD=neon"
             flags: "SIMD=neon"
@@ -192,10 +180,10 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     name: "link-only: ${{ matrix.name }}"
-    # Only the three entries flagged known_broken above are allowed to fail, and
-    # only because a defect they found is owned by another file. Everything else
-    # is a hard gate.
-    continue-on-error: ${{ matrix.known_broken == true }}
+    # Every entry is a hard gate. Three of them were allowed to fail for as long
+    # as SIMD=scalar did not compile (src/qmat.c:1798, fixed in 57596b3); the
+    # exemption came out in the same change that confirmed the fix, which is the
+    # only way an exemption ever stays honest.
 
     steps:
       - uses: actions/checkout@v7
@@ -218,15 +206,23 @@ jobs:
       - name: Report what was built
         run: make ${{ matrix.flags }} info
 
-      # Deliberately NOT `--self-test`. This job is about configurations, not
-      # about runtime correctness, and adding the kernel self-test here would
-      # make it red for a reason that belongs to another lane: on Linux/gcc
-      # 15.2/aarch64, every profile WITHOUT -march=native currently fails
-      # `mynah_qmat_self_test` -- "qmat f16 pack disagrees with the scalar
-      # reference at 4124: 66088.4844 -> 0xb01a, reference 0x7c00", the 65504
-      # overflow boundary. macOS/clang passes the identical profiles, which is
-      # why nobody had seen it. Measured 2026-09-13 on the project's Axion box.
-      # Fix that in src/qmat.c, then add --self-test here in the same commit.
+      # Deliberately NOT `--self-test`, and this is the one thing in this file
+      # that is waiting on someone. On Linux/gcc 15.2/aarch64 every profile
+      # WITHOUT -march=native fails `mynah_qmat_self_test`:
+      #
+      #   qmat f16 pack disagrees with the scalar reference at 4124:
+      #   66088.4844 -> 0xb01a, reference 0x7c00
+      #
+      # It is NOT a precision disagreement at the f16 overflow boundary, and it
+      # is not an ISA gap: -march=armv8.6-a and -march=armv9-a both fail while
+      # -march=native and -mcpu=neoverse-v2 pass. It is a strict-aliasing
+      # miscompile. Recompiling ONLY src/qmat.c with -fno-strict-aliasing, with
+      # every other object and flag unchanged, turns the failure into a PASS;
+      # so do -fno-tree-vectorize and -O1, while -fno-fast-math does not.
+      # macOS/clang passes every one of the same profiles, which is why nobody
+      # had seen it. Measured 2026-09-13 on the project's Axion box, reproduced
+      # at 57596b3. Fix it in src/qmat.c, then add --self-test here in the same
+      # commit -- these profiles link and start today, they do not compute.
       - name: Start, and collect the dispatch table
         run: |
           ./build/cpu/mynah-tts --version
