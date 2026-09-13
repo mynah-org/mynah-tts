@@ -473,17 +473,38 @@ does not.
       lane's A/B harness measured the wrong workload on both sides of a pair and
       read it as contention. Pre-existing. Either treat empty as unset or refuse it
       loudly; silently meaning a third thing is what makes it a trap
-- [ ] E9-10 **what gates C80+ is waiting, not work** → `docs/performance.md`
-      (2026-09-13). After all three lanes: C48 0.736 → **0.680**, C64 0.954 → **0.895**,
-      so C64 is inside the mandatory gate and C80 is the first failure. But
-      **safe-to-play p95 at C48 went 908 → 890 ms**: the single-stream wall fell 17%
-      and the served latency fell 2%. TTFB p95 is **489 ms at C48** for a header sent
-      at *admission*, before a sample exists, with 256 slots for 48 arrivals and a warm
-      prefill of ~122 ms. Measure where that time goes before proposing a fix — the
-      obvious "serialised admission" reading was already falsified once (parent counters
-      read `queued_total=0 queue_peak=0 refused=0`, and `src/inference.c:754` is a
-      `while`, not an `if`). The pool meter now reaches prefork workers via its chained
-      SIGTERM handler, so the measurement is available where it was not
+- [x] E9-10 **it is work, not waiting** → [`.work/ttfa-under-load.md`](.work/ttfa-under-load.md).
+      Measured, not reasoned: under 48 live streams `connect()` takes **0.1 ms** and
+      `GET /health` answers in **0.7 ms**, so neither the backlog nor the HTTP side is
+      involved; a request arriving into a loaded server gets audio at **149 ms p50**.
+      The screen's number is the *burst* a wave creates. Fire 48 at once and every one
+      gets first audio at 580-585 ms — **five milliseconds of spread across
+      forty-eight**, flat rather than a ramp or a step — linear in slots/worker
+      (+192 ms each) and linear in text (**6.05 ms/word/slot ≈ 4.65 ms/token**, E9-1's
+      per-token prefill cost). And the arithmetic closes: one prefill is 331 core-ms at
+      two threads, ×48 ÷ 32 cores = 497 ms + 88 ms of first frames = **585 predicted vs
+      581 measured**. Sixteen workers × two threads *is* the machine — no idle resource
+      exists for a better scheduler to find
+- [ ] E9-11 **the f16 batched linear runs at a third of the roof, and that is the TTFA
+      lever** — the prefill is **165.8 ms at two threads, 149.9 of it projections**, or
+      ~13.6 GFLOP/s/core against the ~41 the seanet lane measured on this box. Fixing it
+      carries **no numerical question at all**: the arithmetic is unchanged, only its
+      scheduling. A 2× here takes burst TTFA at C48 from 581 ms to ~330. E9-1 handed
+      this over and could not act on it because `qmat` belonged to another lane
+- [ ] E9-12 **int8 never reaches the prefill** — `MYNAH_QUANT=int8` leaves
+      `prep.prefill_proj` at 149.9 ms, identical to default, while taking
+      `request.total` 1848 → 1496. That is `POCKET_QG_DEFAULT_SPEC` working as designed:
+      the backbone is inside the AR loop where int8's per-step error compounds over ~50
+      steps into a different trajectory. The prefill is **not** inside that loop, so the
+      measurement that rules int8 out does not directly apply — but it does not clear it
+      either, because the prefill writes the KV every step attends to, a *static* error
+      rather than a compounding one, which is a different risk and not a smaller one.
+      Needs its own quality gate (frame count, EOS step, log-mel corr) and a second
+      quantized copy of the backbone, since the steps must stay f16
+- [-] **rejected: widen the prefill tile.** Swept `TAR_PREFILL_TILE` 2→128 on the box.
+      Above 16 nothing changes (165.3-166.9 ms) and the projection call count stays 72
+      at every value, so those 72 were never tiles; below 16 it gets worse. Output
+      byte-identical at every tile. The GEMM's shape is not what costs us
 - [x] E9-0 **allocations are constant across `--max-steps`** (3,441 at both 24 and 96
       steps): the autoregressive loop allocates nothing, and that is now a permanent
       check rather than a belief
