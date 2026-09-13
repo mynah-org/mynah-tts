@@ -34,6 +34,16 @@ per-slot decoder is **glue-bound, not compute-bound** — ~5% of VNNI peak, with
 50-120 pool dispatches per decoder call per item. Our own thread work measured
 ~20 us of wake-up per region independently. **Expect the same wall.**
 
+**Standing decision: OpenBLAS leaves the process for good.** Not for speed — for
+ownership. A second thread pool inside our address space is a permanent source of
+non-reproducible measurement, and every profile has to carry environment variables
+that must be *absent* to be valid. Whatever it computes, we write ourselves for
+x86 and ARM. The surface is already down to **two `cblas_sgemm` call sites**, both
+switchable today, and `BLAS=none` links neither OpenBLAS nor Accelerate — the
+inventory and the order of work are in [`.work/no-blas.md`](.work/no-blas.md) §3b.
+Keep `BLAS=openblas` as a comparison build forever, so the A/B never stops being
+available and never becomes the default again.
+
 **Production is Linux server, x86-64 and ARM64.** macOS/M1 is the development
 machine and every number in this repo so far was taken there, which makes them
 development signals rather than product claims. Three concrete reasons they do
@@ -237,6 +247,20 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       three-way Makefile split. **Flipping the default is blocked on two separate
       things**: a Linux RTF measurement, and qualifying the loss of vForce's `vvtanhf`
       in the GELU, which is not a GEMM decision and must not ride along on one
+- [ ] E4-16b **flip the default to `BLAS=none`** — the only thing blocking it is an
+      RTF comparison against `BLAS=openblas`, and the Axion box now exists to take it.
+      Two decisions, not one: the GEMM flip, and separately qualifying the loss of
+      Accelerate's `vvtanhf` in the GELU, which on a continuous-AR model compounds
+- [ ] E4-16c **delete the OpenBLAS compensation machinery** once E4-16b lands — the
+      weak-symbol clamp and `mynah_blas_owned()` in `threads.c`, three dispatch rows,
+      the per-GEMM `mynah_blas_set_threads`, the three-way Makefile split, and
+      `OPENBLAS_THREAD_TIMEOUT` along with the "`OPENBLAS_NUM_THREADS` must be absent"
+      rule in every profile recipe
+- [ ] E4-16d **write the Accelerate-only kernels ourselves, both ISAs** — these are
+      *not* BLAS and not on the Linux path, so they are last: the BNNS conv1d filter
+      cache (8 call sites), `vvtanhf` for GELU (4), and the SEANet Snake's
+      `vvsinf`/`vDSP_vsmul`/`vDSP_vsq`/`vDSP_vsma` (12). Closing these is what lets
+      macOS and Linux run the same code instead of two paths that agree by luck
 - [ ] E4-16a **interim, while BLAS is still linked**: `OPENBLAS_THREAD_TIMEOUT=1` —
       TTFA 108 ms **bimodal** to 66 ms stable, 42.5k to 12k context switches/s — and
       report claim vs fact in the dispatch table. Do **not** partition rigidly:

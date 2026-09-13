@@ -110,6 +110,64 @@ The `n=480/1920` family is an ordinary panel GEMM.
 Note also `m=1, n=1920, k=64`: 129 calls of a single output row. That is a matvec
 wearing a GEMM's clothes and should never reach a packed kernel at all.
 
+## 3b. The inventory, as of 2026-09-13 — author: remove OpenBLAS for good
+
+The author's position is now unconditional: **OpenBLAS should leave the process
+permanently, and anything it was doing we write ourselves for x86 and ARM.** This
+section is the map of what that actually means, because "BLAS" has come to cover
+three different things in this tree and only one of them is OpenBLAS.
+
+### Tier 1 — real BLAS. Two call sites left, and both already have our kernel.
+
+| site | what | status |
+|---|---|---|
+| `src/backend.c:219` | the vtable `sgemm` | `mynah_sgemm_f32` under `BLAS=none` |
+| `src/seanet.c:163` | `sea_sgemm`, the codec conv/convtranspose fast path | same |
+
+`matmul_block` no longer calls cblas at all — it went through `mynah_sgemm_f32`
+when `src/sgemm.c` landed. So the OpenBLAS dependency proper is **two lines**, both
+already switchable, and `BLAS=none` links neither OpenBLAS nor Accelerate today.
+
+**What stands between here and deleting it: nothing but a measurement.** The
+default flip needs an RTF comparison on Linux, which we can now take — the Axion
+box exists. That is E4-16's remaining half.
+
+### Tier 2 — the thread-pool compensation machinery, which is pure OpenBLAS tax
+
+Listed in §4 below. All of it exists because a second thread pool lives inside our
+process. When OpenBLAS goes, every line of it goes with it, and so does
+`OPENBLAS_THREAD_TIMEOUT=1`, the `OPENBLAS_NUM_THREADS`-must-be-absent rule in
+every profile, and the 21%-of-time-in-the-scheduler oversubscription trap.
+
+### Tier 3 — Accelerate-only, NOT BLAS, and therefore not on the Linux path at all
+
+This is the part that gets conflated. These are macOS vector-library calls with no
+OpenBLAS equivalent and no presence on the production target:
+
+| function | count | where | what we owe it |
+|---|---|---|---|
+| `BNNSFilterCreateLayerConvolution` + apply/destroy | 8 | `conv1d.c`, `conv1d.h` | the macOS conv1d filter cache |
+| `vvtanhf` | 4 | `kernels.c` | GELU-tanh over an array |
+| `vvsinf`, `vDSP_vsmul`, `vDSP_vsq`, `vDSP_vsma` | 12 | `codec_nanocodec.c` | the SEANet Snake activation |
+
+On Linux these already fall to our own scalar/NEON code, which is why the Linux
+build works at all. **They matter only to the macOS development experience**, and
+one of them is a trap for the flip: dropping Accelerate swaps `vvtanhf` for libm's
+`tanhf` in the GELU, and on a continuous-AR model that compounds. That is a
+separate numerical qualification and must not ride along on a GEMM decision.
+
+### So the honest order of work
+
+1. measure `BLAS=none` against `BLAS=openblas` on the Axion box — the only thing
+   blocking the flip;
+2. flip the default, delete Tier 2 entirely;
+3. qualify the `vvtanhf` substitution on its own, then drop Accelerate too and
+   write the Snake and the conv filter path ourselves for both ISAs;
+4. keep `BLAS=openblas` as a comparison build forever, so the A/B never stops
+   being available and never becomes the default again.
+
+---
+
 ## 4. What removal deletes as a bonus
 
 All of this exists only to compensate for a thread pool we do not own:
