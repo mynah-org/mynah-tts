@@ -154,7 +154,11 @@ extern "C" {
 #endif
 
 #define MYNAH_DISPATCH_HAS_AMX_KERNEL        0   /* no tile ops                */
-#define MYNAH_DISPATCH_HAS_BF16_KERNEL       0   /* no bfdot / bfmmla          */
+/* NOT a macro any more: whether a bf16 or SVE kernel exists is a fact about
+ * src/kernels.c and src/qmat.c, and mirroring it here is the drift this header
+ * spends a paragraph warning about.  mynah_kernels_isa_kernels() (kernels.h)
+ * is the single definition, and the isa.arm.{sve,sve2,svei8mm,svebf16,bf16}
+ * rows resolve by calling it. */
 
 #if defined(MYNAH_USE_ACCELERATE)
 #define MYNAH_DISPATCH_HAS_ACCELERATE 1
@@ -285,6 +289,21 @@ int mynah_dispatch_report(void *out_file, int as_json);
  * `path` is NULL the environment variable MYNAH_DISPATCH_JSON is used, and the
  * call is a no-op when that is unset too. */
 int mynah_dispatch_report_json_path(const char *path);
+
+/* E4-12: does this CPU have every instruction set this binary may contain?
+ *
+ * Call it FIRST, before any allocation and before any model is opened.  It
+ * returns 0 when the binary can run here, or -1 after writing a message that
+ * names the instruction set the binary needs, the profile it was built with,
+ * and the feature list this CPU reports -- which is the whole diagnosis that an
+ * -mavx2 binary on a pre-Haswell host otherwise delivers as a bare SIGILL.
+ *
+ * It fires only on a DEFINITE absence.  A feature the process cannot probe
+ * (no getauxval, a leaf the hypervisor hid, an emulator) is not an absence, and
+ * refusing to start over our own ignorance would be a worse bug than the one
+ * this prevents.  It allocates nothing and opens nothing.
+ */
+int mynah_dispatch_isa_guard(char *error, size_t error_capacity);
 
 /* The coarse class of the best matrix lever this host+binary pair can reach.
  * Keyed by expected-vs-observed tooling; deliberately coarse. */

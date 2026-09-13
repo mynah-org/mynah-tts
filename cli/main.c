@@ -491,6 +491,18 @@ static int write_test_wav(const char *path) {
 }
 
 int main(int argc, char **argv) {
+    /* PLAN.md E4-12.  Before argument parsing, before any allocation and before
+     * any model is opened: if this binary contains instructions this CPU does
+     * not have, the next thing that happens is SIGILL with no message.  The
+     * guard fires only on a definite absence, so a CPU we cannot probe still
+     * runs. */
+    {
+        char isa_error[512];
+        if (mynah_dispatch_isa_guard(isa_error, sizeof(isa_error)) != 0) {
+            fprintf(stderr, "fatal: %s\n", isa_error);
+            return 1;
+        }
+    }
     if (argc == 1 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
         usage(argv[0]);

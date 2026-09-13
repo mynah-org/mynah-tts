@@ -18,11 +18,36 @@ BENCH_OUTPUT ?= build/bench.wav
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-# Architecture flags: -march=native on macOS and Linux ARM (like mynah/qwen-tts);
-# portable -mavx2 -mfma on Linux x86 (override with SIMD=scalar/avx512).
+# Architecture flags.  Six profiles, and `auto` is the only one that asks the
+# host anything:
+#
+#   auto      resolved by tools/simd-auto.sh: the kernel's /proc/cpuinfo AND a
+#             compiler capability probe must BOTH agree before a flag is passed,
+#             and the resolution is printed (`make simd-auto`).  Until E4-15 this
+#             branch appended a fixed `-mavx2 -mfma` to every Linux x86 build
+#             without asking, so a host without AVX2 got a binary that dies on
+#             its first vpaddd with no message.  -march=native on macOS/ARM.
+#   portable  no ISA flag at all: the compiler's baseline for the target.  On
+#             x86-64 that leaves __AVX2__ undefined, so src/kernels.c takes its
+#             scalar path while src/qmat.c keeps the target-attributed
+#             VNNI/F16C kernels it selects by CPUID.  This is NOT SIMD=scalar,
+#             and it is exactly the configuration in which the reference tree
+#             shipped unlinkable for days -- hence the E4-13 CI matrix.
+#   scalar    -DMYNAH_DISABLE_SIMD: every intrinsic compiled out.  The oracle.
+#   neon      no flag, but names the profile; aarch64 always has AdvSIMD.
+#   avx2      -mavx2 -mfma, the portable x86 release profile.
+#   avx512    explicit opt-in.  `auto` will not choose it: no f32 kernel in src/
+#             dispatches on AVX-512 (see the isa.x86.avx512f row in
+#             src/dispatch.c), so it only widens autovectorization, which is an
+#             unmeasured change that also pins the artifact to the build host.
+MYNAH_CPUINFO ?= /proc/cpuinfo
+SIMD_AUTO_MK := $(BUILD_DIR)/simd-auto.mk
+
 ifeq ($(SIMD),scalar)
 CFLAGS += -DMYNAH_DISABLE_SIMD
 SIMD_NAME := scalar
+else ifeq ($(SIMD),portable)
+SIMD_NAME := portable
 else ifeq ($(SIMD),avx2)
 CFLAGS += -mavx2 -mfma
 SIMD_NAME := avx2/fma
@@ -31,19 +56,20 @@ CFLAGS += -mavx512f -mavx512bw -mavx512vl -mavx2 -mfma
 SIMD_NAME := avx512
 else ifeq ($(SIMD),neon)
 SIMD_NAME := neon
+else ifeq ($(SIMD),auto)
+SIMD_AUTO_RUN := $(shell tools/simd-auto.sh --cc '$(CC)' --cpuinfo '$(MYNAH_CPUINFO)' --out '$(SIMD_AUTO_MK)' && echo ok)
+-include $(SIMD_AUTO_MK)
+CFLAGS += $(SIMD_AUTO_FLAGS)
+SIMD_NAME := $(if $(SIMD_AUTO_NAME),$(SIMD_AUTO_NAME),auto/unresolved)
 else
-# auto: -march=native on macOS/ARM, -mavx2 -mfma on x86 Linux
-ifeq ($(UNAME_S),Darwin)
-CFLAGS += -march=native
-SIMD_NAME := native
-else ifneq (,$(filter aarch64 arm64,$(UNAME_M)))
-CFLAGS += -march=native
-SIMD_NAME := native/arm
-else
-CFLAGS += -mavx2 -mfma
-SIMD_NAME := avx2/fma
+$(error SIMD=$(SIMD) is not a profile. Use auto, portable, scalar, neon, avx2 or avx512)
 endif
-endif
+
+# Appended after the profile, so `make SIMD=portable EXTRA_CFLAGS=-march=armv8-a`
+# is a baseline build.  Setting CFLAGS on the command line instead would replace
+# it wholesale -- it is `?=` -- and silently drop -std=c11, -O3 and the warning
+# flags, which is how a "baseline build passed" result stops meaning anything.
+CFLAGS += $(EXTRA_CFLAGS)
 
 # BLAS selection. Four values, and only the first one links nothing:
 #
@@ -106,8 +132,38 @@ CPPFLAGS += -I$(INGOT_DIR)/include
 LDLIBS += $(INGOT_LIB)
 
 # The dispatch report prints the SIMD profile and git revision it was built
-# with; without these it honestly says "unset" rather than guessing.
-CPPFLAGS += -DMYNAH_SIMD_PROFILE='"$(SIMD)"' -DMYNAH_GIT_REV='"$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)"'
+# with; without these it honestly says "unset" rather than guessing.  The
+# profile carries BOTH halves -- what was asked for and what it resolved to --
+# because "SIMD=auto" alone is not an answer to "which ISA is this binary".
+CPPFLAGS += -DMYNAH_SIMD_PROFILE='"$(SIMD)->$(SIMD_NAME)"' -DMYNAH_GIT_REV='"$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)"'
+
+# ---------------------------------------------------------------------------
+# E4-14: the flag stamp.
+#
+# `make` then `make SIMD=portable` without a clean reused every object: the
+# -march=native qmat.o from the first run was linked into the second binary,
+# which then carried native kernels behind a portable dispatch.  It is silent,
+# it survives a passing test run, and the only symptom is a SIGILL on another
+# host.  So every object depends on a file holding the effective flags, which is
+# rewritten only when that text changes -- with `sleep 1`, because GNU make 3.81
+# (which is what /usr/bin/make still is on macOS) compares whole seconds.
+#
+# The git revision is excluded on purpose: it is compiled into exactly one
+# string in the dispatch report, and stamping it would rebuild the whole tree on
+# every commit.  Quotes and `$` are stripped before the text reaches the shell.
+# Scope is the CPU build dir; build/metal and build/cuda have their own fixed
+# flags and their own object directories, so they cannot mix with these.
+# ---------------------------------------------------------------------------
+MYNAH_SQ := '
+MYNAH_DQ := "
+BUILD_STAMP := $(BUILD_DIR)/.build-flags
+STAMP_TEXT := CC=$(CC) SIMD=$(SIMD)/$(SIMD_NAME) BLAS=$(BLAS)/$(BLAS_NAME) CFLAGS=$(CFLAGS) CPPFLAGS=$(filter-out -DMYNAH_GIT_REV=%,$(CPPFLAGS)) LDFLAGS=$(LDFLAGS) LDLIBS=$(LDLIBS)
+STAMP_SAFE := $(subst $(MYNAH_DQ),,$(subst $(MYNAH_SQ),,$(subst $$,,$(STAMP_TEXT))))
+STAMP_WRITE := $(shell mkdir -p $(BUILD_DIR) && \
+	if [ "x$$(cat $(BUILD_STAMP) 2>/dev/null)" != "x$(STAMP_SAFE)" ]; then \
+		sleep 1; printf '%s\n' "$(STAMP_SAFE)" > $(BUILD_STAMP); echo rewritten; \
+	fi)
+
 
 CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
@@ -130,7 +186,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps self-test test stream-test driver-test window-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -139,7 +195,13 @@ WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 all: $(TARGET)
 cpu: all
 
-$(BUILD_DIR)/%.o: %.c
+# Self-healing only: the $(shell) above already wrote this at parse time.  The
+# rule exists so a deleted stamp is not a "No rule to make target" error, and it
+# must live AFTER `all` so it can never become the default goal.
+$(BUILD_STAMP):
+	@mkdir -p $(@D) && printf '%s\n' "$(STAMP_SAFE)" > $@
+
+$(BUILD_DIR)/%.o: %.c $(BUILD_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
@@ -207,7 +269,7 @@ SERVER_SOURCES := server/main.c server/http_util.c server/stream_out.c server/pr
 SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(BUILD_DIR)/%.o)
 SERVER_TARGET := $(BUILD_DIR)/mynah-tts-server
 
-$(SERVER_OBJECTS): $(BUILD_DIR)/%.o: %.c
+$(SERVER_OBJECTS): $(BUILD_DIR)/%.o: %.c $(BUILD_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Iserver $(CFLAGS) -MMD -MP -c $< -o $@
 
@@ -262,7 +324,22 @@ shared: $(TARGET)
 	@echo "shared-library packaging is not enabled in the v1 CPU slice"
 
 info:
-	@printf 'OS=%s\nARCH=%s\nCC=%s\nSIMD=%s\nBLAS=%s\nMETAL=%s\nCUDA=%s\n' "$$(uname -s)" "$$(uname -m)" "$(CC)" "$(SIMD_NAME)" "$(BLAS_NAME)" "$$(command -v metal 2>/dev/null || echo unavailable)" "$$(command -v nvcc 2>/dev/null || echo unavailable)"
+	@printf 'OS=%s\nARCH=%s\nCC=%s\nSIMD=%s (%s)\nBLAS=%s\nMETAL=%s\nCUDA=%s\n' "$$(uname -s)" "$$(uname -m)" "$(CC)" "$(SIMD)" "$(SIMD_NAME)" "$(BLAS_NAME)" "$$(command -v metal 2>/dev/null || echo unavailable)" "$$(command -v nvcc 2>/dev/null || echo unavailable)"
+	@printf 'SIMD_FLAGS=%s\n' "$(SIMD_AUTO_FLAGS)"
+	@printf 'STAMP=%s\n' "$(BUILD_STAMP)"
+
+# E4-15.  What SIMD=auto resolved on THIS host, and -- as important -- what it
+# saw and deliberately did not use.  Print it before quoting any ISA in a
+# benchmark note; `--dispatch-map` is the runtime half of the same question.
+simd-auto:
+	@tools/simd-auto.sh --cc '$(CC)' --cpuinfo '$(MYNAH_CPUINFO)' --human
+
+# The resolution table itself, against captured /proc/cpuinfo from parts this
+# project does not own.  Needs no x86 host, no model pack and no compiler for
+# the fixture's architecture -- see the header of tests/test_simd_auto.sh for
+# what that does and does not prove.
+simd-auto-test:
+	@sh tests/test_simd_auto.sh
 
 caps: $(TARGET)
 	@$(TARGET) --version; $(TARGET) --self-test
@@ -270,7 +347,7 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 
-test: self-test driver-test window-test json-test playback-sim-test
+test: self-test driver-test window-test json-test playback-sim-test simd-auto-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 

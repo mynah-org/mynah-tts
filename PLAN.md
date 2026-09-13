@@ -226,18 +226,23 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [x] E4-11 **done** `6ad9ada` · **no silently-chosen scalar BLAS** — a scalar path taken without anyone
       knowing is worse than a slow one that announces itself. `blas.accelerate` is ON
       here and absent on the target, and the 36x conv-stack win goes through BLAS
-- [ ] E4-12 **fatal ISA guard** — a `-mavx2` binary on a CPU without AVX2 gives an
-      opaque SIGILL today. ~15 lines, checked before any allocation
-- [ ] E4-13 **CI `link-only` job — no longer theoretical.** Our x86 CI builds only the
-      default `-mavx2`, which is exactly the configuration in which their tree shipped
-      unlinkable for days; ours shipped unlinkable too, and we found it by hand
-      (E4-19). Add `SIMD=scalar`, `SIMD=portable`, `ARCH_FLAGS=-march=armv8-a`,
-      `BLAS=scalar`, `BLAS=openblas`
-- [ ] E4-14 **flag stamp file in the Makefile** — eight lines; without it `make` then
-      `make SIMD=...` without `clean` silently yields a mixed binary
-- [ ] E4-15 **`SIMD=auto` must read `/proc/cpuinfo` on x86**, with the kernel-flag +
-      `cc_ok` double test and a printed resolved profile. Value is in VNNI and
-      AVX-512 BF16; AMX costs far more for less (their AMX 8c does C2, VNNI 32c C12)
+- [x] E4-12 **done** · fatal ISA guard — `mynah_dispatch_isa_guard()`, first statement of
+      `main()`, fires only on a DEFINITE absence so an unprobeable CPU still runs → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
+- [x] E4-13 **done** · 16-entry `link-only` CI matrix, x86 + ARM. **It found two pre-existing
+      defects on its first run, both invisible on macOS**: `SIMD=scalar` does not compile
+      (`src/qmat.c:1798` uses `qmat_f16_to_f32`/`.f16` outside `MYNAH_QMAT_F16`), and every
+      non-`-march=native` ARM profile fails the qmat f16 self-test on Linux/gcc at the 65504
+      boundary. Both belong to the qmat lane; 3 matrix entries carry `known_broken` until
+      then → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
+- [x] E4-14 **done** · `build/cpu/.build-flags`; every object depends on the effective
+      CC/SIMD/BLAS/CFLAGS/CPPFLAGS/LDLIBS text, rewritten only when it changes → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
+- [x] E4-15 **done** · `tools/simd-auto.sh` + `make simd-auto`; double test, printed profile,
+      fixtures for 6 real parts and 23 checks in `make test` so the table is falsifiable with
+      no x86 host. **Correction to the item**: VNNI was already reachable — `src/qmat.c`
+      target-attributes it and picks by CPUID — what was broken is that `auto` passed
+      `-mavx2 -mfma` on Linux x86 *without asking the CPU*. AVX-512/VNNI/BF16/AMX are
+      detected and reported, never turned into flags no kernel is gated on. `SIMD=portable`
+      and `EXTRA_CFLAGS` added; the x86 release job moved off `auto` → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
 - [~] E4-16 **kernel landed (`fa3df67`), default not flipped** — `mynah_sgemm_f32` and `BLAS=none` → [`.work/no-blas.md`](.work/no-blas.md)
       Decided: we do not want a second thread pool inside our process. The surface is
       one function (`cblas_sgemm`) at three call sites, and **the whole PocketTTS
@@ -269,9 +274,13 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-17 **plan from `sched_getaffinity`, not `sysconf`** — `sysconf` sees neither an
       inherited taskset nor a cpuset cgroup, so every containerised deployment plans the
       whole host. Also read cgroup v2 `cpu.max` and warn (they never closed that one)
-- [ ] E4-18 **arena allocator in the codec before measuring on Linux** — glibc's mmap
-      threshold cost them 78 mmap + 154 munmap and 11,899 allocs per request; a
-      per-stream bump arena took it to 1.3 and 41, bit-identical. Invisible on macOS
+- [x] E4-18 **closed: not applicable, by measurement.** Measured on the Axion box with an
+      `LD_PRELOAD` counter: **2,786 allocations, 3 mmap, 2 munmap** per request (theirs:
+      11,899 / 78 / 154), and the count is **constant** over `--max-steps` 20→160 — the AR
+      loop allocates nothing. `BLAS=none` is lower still (2 mmap). `codec_nanocodec.c`
+      already hands one `columns_workspace` to `conv1d`, which is the data-structure fix
+      they arrived at. An arena would be an unmeasured change against a problem we do not
+      have → [`.work/linux-build-and-dispatch.md`](.work/linux-build-and-dispatch.md)
 - [x] E4-19 **two production-blocking defects found and fixed** (`3892ba6`) →
       [`.work/dtype-and-fallbacks.md`](.work/dtype-and-fallbacks.md). No Linux build
       linked at HEAD (`mynah_conv1d_sgemm_enabled` trapped inside the Accelerate block

@@ -661,6 +661,81 @@ static int probe_gelu_vector(const char **why) {
     return on;
 }
 
+/* ----------------------------------------------------------------------
+ * The ISA kernel inventory (kernels.h)
+ *
+ * This is a fact about this translation unit and its siblings, so it is
+ * written once, here, and the report calls it.  Today every bit is 0: there
+ * is no `svfloat32_t` anywhere under src/, no `svmmla`, no `bfdot`/`bfmmla`,
+ * and src/qmat.c stores weights as f32, f16, int8 or int4 but never bf16
+ * (src/weights.c converts bf16 to f32 once at load).
+ *
+ * Note what is deliberately NOT tested here: __ARM_FEATURE_SVE.  That macro
+ * says the compiler was allowed to emit SVE -- which -march=native does on the
+ * Neoverse V2 box, for autovectorization -- and says nothing about whether a
+ * hand-written kernel exists.  Confusing "the flag was passed" with "a kernel
+ * dispatches on it" is the exact error that put an AVX-512 VNNI claim in
+ * README.md next to a file with no _mm512_* in it.  So the answer is a
+ * constant that a future kernel author edits, not a macro test.
+ * ---------------------------------------------------------------------- */
+unsigned mynah_kernels_isa_kernels(void) {
+    return 0u;
+}
+
+const char *mynah_kernels_isa_missing_reason(unsigned bit) {
+    switch (bit) {
+    case MYNAH_KERNELS_ISA_SVE:
+        return "no svfloat32_t kernel; src/kernels.c is NEON-only and "
+               "fixed at 4 lanes";
+    case MYNAH_KERNELS_ISA_SVE2:
+        return "no SVE2 kernel and no vector-length-agnostic path to widen";
+    case MYNAH_KERNELS_ISA_SVEI8MM:
+        return "no SVE SMMLA kernel; src/qmat.c reaches i8mm only through "
+               "the fixed-width NEON matvec_q8_pair_i8mm";
+    case MYNAH_KERNELS_ISA_SVEBF16:
+        return "no SVE BFMMLA/BFDOT kernel, and no bf16 weight type to feed it";
+    case MYNAH_KERNELS_ISA_BF16:
+        return "no bfdot/bfmmla and no bf16 weight type; src/weights.c "
+               "widens bf16 to f32 at load and f32 paths stay f32";
+    default:
+        return "unknown ISA bit";
+    }
+}
+
+/* One probe body for all five rows.  It answers from the inventory above, so
+ * `resolved` can never disagree with what the binary contains. */
+static int probe_isa_bit(unsigned bit, const char **why) {
+    const int on = (mynah_kernels_isa_kernels() & bit) != 0u;
+    if (why != NULL) {
+        static char text[5][240];
+        static const unsigned bits[5] = {
+            MYNAH_KERNELS_ISA_SVE, MYNAH_KERNELS_ISA_SVE2,
+            MYNAH_KERNELS_ISA_SVEI8MM, MYNAH_KERNELS_ISA_SVEBF16,
+            MYNAH_KERNELS_ISA_BF16
+        };
+        int slot = 0;
+        for (int i = 0; i < 5; ++i) if (bits[i] == bit) slot = i;
+        snprintf(text[slot], sizeof text[slot],
+                 "[predicate] mynah_kernels_isa_kernels(): %s -- %s. "
+                 "supported=yes here means the CPU has the unit and we idle it",
+                 on ? "kernel present" : "NOT IMPLEMENTED",
+                 mynah_kernels_isa_missing_reason(bit));
+        *why = text[slot];
+    }
+    return on;
+}
+
+static int probe_sve(const char **why)     { return probe_isa_bit(MYNAH_KERNELS_ISA_SVE, why); }
+static int probe_sve2(const char **why)    { return probe_isa_bit(MYNAH_KERNELS_ISA_SVE2, why); }
+static int probe_svei8mm(const char **why) { return probe_isa_bit(MYNAH_KERNELS_ISA_SVEI8MM, why); }
+static int probe_svebf16(const char **why) { return probe_isa_bit(MYNAH_KERNELS_ISA_SVEBF16, why); }
+static int probe_bf16(const char **why)    { return probe_isa_bit(MYNAH_KERNELS_ISA_BF16, why); }
+
 void mynah_kernels_dispatch_probes(void) {
     mynah_dispatch_register_probe("kernel.gelu_vector", probe_gelu_vector);
+    mynah_dispatch_register_probe("isa.arm.sve", probe_sve);
+    mynah_dispatch_register_probe("isa.arm.sve2", probe_sve2);
+    mynah_dispatch_register_probe("isa.arm.svei8mm", probe_svei8mm);
+    mynah_dispatch_register_probe("isa.arm.svebf16", probe_svebf16);
+    mynah_dispatch_register_probe("isa.arm.bf16", probe_bf16);
 }

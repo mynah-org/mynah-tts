@@ -106,6 +106,10 @@ static long sysctl_long(const char *name) {
 #define MYNAH_HWCAP_ASIMD    (1UL << 1)
 #define MYNAH_HWCAP_ASIMDHP  (1UL << 10)
 #define MYNAH_HWCAP_ASIMDDP  (1UL << 20)
+#define MYNAH_HWCAP_SVE      (1UL << 22)
+#define MYNAH_HWCAP2_SVE2    (1UL << 1)
+#define MYNAH_HWCAP2_SVEI8MM (1UL << 9)
+#define MYNAH_HWCAP2_SVEBF16 (1UL << 12)
 #define MYNAH_HWCAP2_I8MM    (1UL << 13)
 #define MYNAH_HWCAP2_BF16    (1UL << 14)
 #endif
@@ -198,6 +202,61 @@ static tri cpu_has_i8mm(void) {
 #endif
 }
 
+/* SVE and its three extensions.  Apple silicon has none of them and exposes no
+ * sysctl for them, so the Darwin answer is a definite 0 rather than "?": a
+ * question mark there would suggest a probe worth writing, and there is not
+ * one.  On Linux they are HWCAP bits, which is also how the kernel decides
+ * what to print in /proc/cpuinfo -- the same source tools/simd-auto.sh reads
+ * at build time, so the two halves of the E4-15 double test agree by
+ * construction. */
+static tri cpu_has_sve(void) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    return 0;
+#elif defined(MYNAH_DISPATCH_HAVE_AUXV)
+    return (getauxval(AT_HWCAP) & MYNAH_HWCAP_SVE) ? 1 : 0;
+#elif defined(__aarch64__)
+    return -1;
+#else
+    return 0;
+#endif
+}
+
+static tri cpu_has_sve2(void) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    return 0;
+#elif defined(MYNAH_DISPATCH_HAVE_AUXV)
+    return (getauxval(AT_HWCAP2) & MYNAH_HWCAP2_SVE2) ? 1 : 0;
+#elif defined(__aarch64__)
+    return -1;
+#else
+    return 0;
+#endif
+}
+
+static tri cpu_has_svei8mm(void) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    return 0;
+#elif defined(MYNAH_DISPATCH_HAVE_AUXV)
+    return (getauxval(AT_HWCAP2) & MYNAH_HWCAP2_SVEI8MM) ? 1 : 0;
+#elif defined(__aarch64__)
+    return -1;
+#else
+    return 0;
+#endif
+}
+
+static tri cpu_has_svebf16(void) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    return 0;
+#elif defined(MYNAH_DISPATCH_HAVE_AUXV)
+    return (getauxval(AT_HWCAP2) & MYNAH_HWCAP2_SVEBF16) ? 1 : 0;
+#elif defined(__aarch64__)
+    return -1;
+#else
+    return 0;
+#endif
+}
+
 static tri cpu_has_bf16(void) {
 #if defined(__aarch64__) && defined(__APPLE__)
     return sysctl_flag("hw.optional.arm.FEAT_BF16");
@@ -230,6 +289,137 @@ static tri cpu_has_avx512vnni(void)  { return 0; }
 static tri cpu_has_avxvnni(void)     { return 0; }
 static tri cpu_has_amx_int8(void)    { return 0; }
 #endif
+
+/* ======================================================================
+ * E4-12: the fatal ISA guard
+ *
+ * A binary compiled with -mavx2 and started on a CPU without AVX2 dies with
+ * SIGILL at the first vpaddd.  There is no message, no exit code that means
+ * anything, and no line in any log that names the cause; on a fleet it looks
+ * like a crash loop on some hosts and not others.  The whole diagnosis is
+ * fifteen lines of CPUID, and it has to run before anything else so that what
+ * the operator sees is the mismatch rather than a signal.
+ *
+ * WHICH MACROS THIS TESTS, AND WHY THEY ARE NOT THE ROW MACROS.  The rows
+ * above ask "which kernel will dispatch", and answer through
+ * MYNAH_DISPATCH_HAS_*, which folds in MYNAH_DISABLE_SIMD.  That is the wrong
+ * question here.  SIMD=scalar compiles out our intrinsics but does not stop
+ * the compiler from autovectorizing with whatever -march allowed -- so
+ * `make SIMD=scalar` on a host whose -march=native implies SVE still produces
+ * a binary full of SVE, and it is the raw predefined macros, not our gates,
+ * that say so.  This is the one place in this file entitled to read them.
+ *
+ * ONLY A DEFINITE ABSENCE IS FATAL.  Each probe returns 1 / 0 / -1 and the
+ * guard fires on 0 alone.  A "?" means we could not ask -- an OS with no
+ * getauxval, a CPUID leaf the hypervisor hid -- and turning that into an exit
+ * would take a working process down over our own ignorance.  It is exactly the
+ * emulator case from .work/dtype-and-fallbacks.md, where the layer did not
+ * expose F16C through CPUID.
+ * ====================================================================== */
+
+/* Defined with the rest of the report below; the guard runs before any of it. */
+static const char *arch_name(void);
+
+typedef struct {
+    const char *name;
+    tri (*probe)(void);
+} isa_requirement;
+
+static const isa_requirement *isa_requirements(void) {
+    /* Listed only when the compiler was allowed to emit the unit anywhere in
+     * this translation unit's build.  The sentinel is unconditional so the
+     * array is never zero-length, which -Wpedantic rejects. */
+    static const isa_requirement table[] = {
+#if defined(__AVX512F__)
+        { "AVX-512F", cpu_has_avx512f },
+#endif
+#if defined(__AVX512BW__)
+        { "AVX-512BW", cpu_has_avx512bw },
+#endif
+#if defined(__AVX512VL__)
+        { "AVX-512VL", cpu_has_avx512vl },
+#endif
+#if defined(__AVX2__)
+        { "AVX2", cpu_has_avx2 },
+#endif
+#if defined(__FMA__)
+        { "FMA", cpu_has_fma },
+#endif
+#if defined(__ARM_FEATURE_SVE)
+        { "SVE", cpu_has_sve },
+#endif
+#if defined(__ARM_FEATURE_SVE2)
+        { "SVE2", cpu_has_sve2 },
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+        { "i8mm", cpu_has_i8mm },
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+        { "dotprod", cpu_has_dotprod },
+#endif
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        { "fp16", cpu_has_fp16 },
+#endif
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        { "AdvSIMD", cpu_has_neon },
+#endif
+        { NULL, NULL }
+    };
+    return table;
+}
+
+/* What this CPU does have, for the second half of the message.  A mismatch
+ * report that names only what is missing leaves the operator to guess which
+ * build to fetch instead. */
+static void isa_guard_host(char *out, size_t cap) {
+    static const isa_requirement known[] = {
+#if defined(__x86_64__) || defined(__i386__)
+        { "avx2", cpu_has_avx2 },       { "fma", cpu_has_fma },
+        { "avx512f", cpu_has_avx512f }, { "avx512bw", cpu_has_avx512bw },
+        { "avx512vl", cpu_has_avx512vl },
+        { "avx512vnni", cpu_has_avx512vnni }, { "avxvnni", cpu_has_avxvnni },
+        { "amx_int8", cpu_has_amx_int8 },
+#else
+        { "asimd", cpu_has_neon },      { "asimdhp", cpu_has_fp16 },
+        { "asimddp", cpu_has_dotprod }, { "i8mm", cpu_has_i8mm },
+        { "bf16", cpu_has_bf16 },       { "sve", cpu_has_sve },
+        { "sve2", cpu_has_sve2 },       { "svei8mm", cpu_has_svei8mm },
+        { "svebf16", cpu_has_svebf16 },
+#endif
+        { NULL, NULL }
+    };
+    size_t o = 0;
+    out[0] = '\0';
+    for (size_t i = 0; known[i].name != NULL && o + 1 < cap; ++i) {
+        if (known[i].probe() != 1) continue;
+        const int k = snprintf(out + o, cap - o, "%s%s", o > 0 ? " " : "",
+                               known[i].name);
+        if (k > 0) o += (size_t)k;
+    }
+    if (out[0] == '\0') snprintf(out, cap, "(nothing this build knows how to probe)");
+}
+
+int mynah_dispatch_isa_guard(char *error, size_t error_capacity) {
+    const isa_requirement *req = isa_requirements();
+    for (size_t i = 0; req[i].name != NULL; ++i) {
+        if (req[i].probe() != 0) continue;     /* 1 = have it, -1 = cannot ask */
+        if (error != NULL && error_capacity > 0) {
+            char host[256];
+            isa_guard_host(host, sizeof host);
+            snprintf(error, error_capacity,
+                     "this binary requires %s and this CPU does not have it. "
+                     "Built as SIMD=%s (%s, %s); the CPU reports: %s. "
+                     "Rebuild with a profile this host supports "
+                     "(make SIMD=portable, or SIMD=avx2 for a travelling x86 "
+                     "binary) -- without this check the next instruction would "
+                     "have been SIGILL.",
+                     req[i].name, MYNAH_SIMD_PROFILE, arch_name(),
+                     MYNAH_GIT_REV, host);
+        }
+        return -1;
+    }
+    return 0;
+}
 
 /* ======================================================================
  * Probe registry
@@ -484,9 +674,37 @@ static void collect_isa(row_sink *s) {
                 "mynah_qmat_i8mm_enabled() -- the SMMLA row cannot be resolved "
                 "from the compile gate, because the kernel is compiled "
                 "unconditionally and chosen by a runtime CPU probe");
+
+    /* SVE and BF16: the rows that were missing, and the reason they are here.
+     *
+     * On the project's production box -- GCP Axion, Neoverse V2 -- the kernel
+     * advertises `sve sve2 svei8mm svebf16 i8mm bf16` and this report printed
+     * ONE of those six.  There was no isa.arm.sve row at all, so a reader of a
+     * clean report had no way to learn that four vector units on the target CPU
+     * are idle; and isa.arm.bf16 said compiled=no with a reason that never
+     * mentioned that the hardware in front of it has the unit.  A report whose
+     * silence has to be interpreted is not doing the job this file exists for.
+     *
+     * `resolved` for all five comes from src/kernels.c's exported inventory,
+     * never from a #if here -- add_row promotes them to [predicate] and the
+     * reason each one prints is written next to where the kernel would live.
+     * The supported column is the hardware half, and `compiled=no` beside
+     * `supported=yes` is the finding; the footer counts those pairs. */
+    add_absent(s, "isa.arm.sve", cpu_has_sve(),
+               "[gate] NOT IMPLEMENTED (no predicate registered by "
+               "src/kernels.c)");
+    add_absent(s, "isa.arm.sve2", cpu_has_sve2(),
+               "[gate] NOT IMPLEMENTED (no predicate registered by "
+               "src/kernels.c)");
+    add_absent(s, "isa.arm.svei8mm", cpu_has_svei8mm(),
+               "[gate] NOT IMPLEMENTED (no predicate registered by "
+               "src/kernels.c)");
+    add_absent(s, "isa.arm.svebf16", cpu_has_svebf16(),
+               "[gate] NOT IMPLEMENTED (no predicate registered by "
+               "src/kernels.c)");
     add_absent(s, "isa.arm.bf16", cpu_has_bf16(),
-               "[gate] NOT IMPLEMENTED: no bfdot/bfmmla and no bf16 weight "
-               "type in src/qmat.c; every f32 path stays f32");
+               "[gate] NOT IMPLEMENTED (no predicate registered by "
+               "src/kernels.c)");
     add_gate(s, "isa.x86.avx2", MYNAH_DISPATCH_HAS_AVX2, cpu_has_avx2(),
              "[gate] src/kernels.c AVX2 kernels and src/qmat.c "
              "dot_q8_i32_avx2 (_mm256_cvtepi8_epi16 + _mm256_madd_epi16), the "
@@ -917,12 +1135,30 @@ static int write_report(FILE *f, int as_json, mynah_dispatch_row *rows, int n) {
     const char *drift_detail = "";
     const int drift = drift_f16(&drift_detail);
     int unknown = 0, predicate = 0, runtime = 0, gate = 0;
+    /* Units this CPU advertises and this binary contains no kernel for.  It is
+     * derived from the rows rather than listed by hand -- supported=yes with
+     * compiled=no is exactly that pair -- so a feature can never be idle and
+     * unmentioned, which is how four SVE units on the production box went
+     * unreported for as long as there was no isa.arm.sve row to be silent in. */
+    int idle = 0;
+    char idle_list[256];
+    size_t idle_used = 0;
+    idle_list[0] = '\0';
     for (int i = 0; i < n; ++i) {
         switch (rows[i].source) {
         case MYNAH_DISPATCH_SRC_PREDICATE: ++predicate; break;
         case MYNAH_DISPATCH_SRC_RUNTIME:   ++runtime;   break;
         case MYNAH_DISPATCH_SRC_GATE:      ++gate;      break;
         default:                           ++unknown;   break;
+        }
+        if (strcmp(rows[i].supported, "yes") != 0) continue;
+        if (strcmp(rows[i].compiled, "no") != 0) continue;
+        ++idle;
+        if (idle_used + 1 < sizeof idle_list) {
+            const int k = snprintf(idle_list + idle_used,
+                                   sizeof idle_list - idle_used, "%s%s",
+                                   idle_used > 0 ? " " : "", rows[i].id);
+            if (k > 0) idle_used += (size_t)k;
         }
     }
 
@@ -953,6 +1189,21 @@ static int write_report(FILE *f, int as_json, mynah_dispatch_row *rows, int n) {
                        "wrapper to add; UNKNOWN is never replaced by a guess.\n",
                     unknown, unknown == 1 ? "" : "s");
         }
+        if (idle > 0) {
+            fprintf(f, "  IDLE HARDWARE: %d unit%s this CPU has and this "
+                       "binary has no kernel for: %s. Each row's reason names "
+                       "what would have to be written and where.\n",
+                    idle, idle == 1 ? "" : "s", idle_list);
+        }
+        {
+            char guard[512];
+            if (mynah_dispatch_isa_guard(guard, sizeof guard) != 0) {
+                fprintf(f, "  ISA GUARD: FATAL -- %s\n", guard);
+            } else {
+                fprintf(f, "  ISA GUARD: ok -- every instruction set this "
+                           "build may emit is present on this CPU\n");
+            }
+        }
         fprintf(f, "  gate canary: %s -- %s\n", drift ? "DRIFT" : "ok",
                 drift_detail);
         fflush(f);
@@ -970,6 +1221,14 @@ static int write_report(FILE *f, int as_json, mynah_dispatch_row *rows, int n) {
     fprintf(f, ",\n  \"gate_drift_detail\": "); json_str(f, drift_detail);
     fprintf(f, ",\n  \"counts\": {\"predicate\": %d, \"runtime\": %d, "
                "\"gate\": %d, \"unknown\": %d}", predicate, runtime, gate, unknown);
+    fprintf(f, ",\n  \"idle_hardware_count\": %d", idle);
+    fprintf(f, ",\n  \"idle_hardware\": "); json_str(f, idle_list);
+    {
+        char guard[512];
+        const int bad = mynah_dispatch_isa_guard(guard, sizeof guard) != 0;
+        fprintf(f, ",\n  \"isa_guard_ok\": %s", bad ? "false" : "true");
+        fprintf(f, ",\n  \"isa_guard_detail\": "); json_str(f, bad ? guard : "");
+    }
     fprintf(f, ",\n  \"features\": [\n");
     for (int i = 0; i < n; ++i) {
         fprintf(f, "    {\"id\": ");        json_str(f, rows[i].id);
