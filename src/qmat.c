@@ -1725,6 +1725,28 @@ typedef struct {
 static qmat_stats_entry g_stats[QMAT_STATS_MAX];
 static size_t g_stats_count;
 static pthread_mutex_t g_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* fork() keeps only the calling thread, so a mutex a pool thread held at that
+ * instant stays locked forever in the child: its owner is not there to unlock
+ * it.  The prefork server forks with the pool already running -- the model has
+ * to be open before the fork so the weights are one physical copy -- so this
+ * is reachable, not theoretical.  Registered once, lazily, from the first
+ * stats call; pthread_atfork handlers survive fork and run in the child. */
+static void qmat_stats_after_fork(void) {
+    pthread_mutex_init(&g_stats_mutex, NULL);
+}
+
+static void qmat_stats_register_atfork(void) {
+    pthread_atfork(NULL, NULL, qmat_stats_after_fork);
+}
+
+/* Registered once from the first stats call.  pthread_atfork handlers survive
+ * fork and run in the child; registering lazily keeps a process that never
+ * touches qmat from paying for a handler it cannot need. */
+static void qmat_stats_atfork_once(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, qmat_stats_register_atfork);
+}
 static int g_stats_on = -1;
 static int g_stats_registered;
 
@@ -1801,6 +1823,7 @@ static void qmat_stats_record(const char *name, const qmat_entry *e,
     pthread_mutex_lock(&g_stats_mutex);
     if (!g_stats_registered) {
         atexit(qmat_stats_report);
+        qmat_stats_atfork_once();
         g_stats_registered = 1;
     }
     qmat_stats_entry *slot = NULL;

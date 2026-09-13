@@ -180,6 +180,11 @@ static void *pool_worker(void *arg) {
     return NULL; /* never reached */
 }
 
+#if defined(__GNUC__) && !defined(__APPLE__)
+extern void openblas_set_num_threads(int) __attribute__((weak));
+#define PF_HAVE_BLAS_KNOB 1
+#endif
+
 static void pool_init(void) {
     const int nth = mynah_num_threads();
     for (int k = 0; k < nth - 1; k++) {
@@ -199,6 +204,17 @@ static void pool_init(void) {
  * that a dead thread might hold, which is what makes it legal from an atfork
  * child handler. */
 void mynah_threadpool_after_fork(void) {
+    /* g_blas_mu lives further down this file and is taken on every region
+     * entry, so a pool thread can be holding it at the instant of fork.  It is
+     * reinitialized here rather than in its own handler because atfork child
+     * handlers run in registration order and this one is already registered
+     * first: a second handler would be a second thing to remember.  An
+     * inherited locked mutex can never be unlocked -- the owner does not exist
+     * in the child -- so this is not defensive, it is the only repair. */
+#ifdef PF_HAVE_BLAS_KNOB
+    extern void mynah_blas_after_fork(void);
+    mynah_blas_after_fork();
+#endif
     pthread_mutex_init(&g_job_mu, NULL);
     pthread_mutex_init(&g_init_mu, NULL);
     pthread_cond_init(&g_job_cv, NULL);
@@ -238,13 +254,17 @@ static void pool_init_once(void) {
  * count under the second, which then oversubscribed.  Region entries are
  * counted instead: the first sets, an overlapping one can only lower, and only
  * the last to leave restores the base. */
-#if defined(__GNUC__) && !defined(__APPLE__)
-extern void openblas_set_num_threads(int) __attribute__((weak));
-#define PF_HAVE_BLAS_KNOB 1
-#endif
 
 #ifdef PF_HAVE_BLAS_KNOB
 static pthread_mutex_t g_blas_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Called from mynah_threadpool_after_fork, which runs as the atfork CHILD
+ * handler.  Only async-signal-safe work belongs here: re-initializing a mutex
+ * whose owner thread does not exist in the child is exactly that, while
+ * anything that allocates or logs is not. */
+void mynah_blas_after_fork(void) {
+    pthread_mutex_init(&g_blas_mu, NULL);
+}
 static int g_blas_depth;
 static int g_blas_cur = -1;
 static int g_blas_base;
