@@ -209,13 +209,6 @@ static void backend_sgemm_call(int trans_a, int trans_b,
         if (m <= (size_t)INT_MAX && n <= (size_t)INT_MAX &&
             k <= (size_t)INT_MAX && lda <= (size_t)INT_MAX &&
             ldb <= (size_t)INT_MAX && ldc <= (size_t)INT_MAX) {
-#if defined(MYNAH_USE_OPENBLAS)
-            /* This path bypasses the pthread pool. Keep direct calls aligned
-             * with MYNAH_THREADS instead of OpenBLAS' process-wide default
-             * team.  Compensation for a thread pool we do not own; it goes
-             * away with the default flip, not with this kernel. */
-            mynah_blas_set_threads(mynah_num_threads());
-#endif
             cblas_sgemm(CblasRowMajor,
                         trans_a ? CblasTrans : CblasNoTrans,
                         trans_b ? CblasTrans : CblasNoTrans,
@@ -326,7 +319,12 @@ const char *mynah_cpu_matvec_mode(size_t rows, size_t input_width,
     const char *matvec_env = getenv("MYNAH_CPU_MATVEC");
     int matvec_parallel = matvec_env != NULL &&
                           strcmp(matvec_env, "parallel") == 0;
-#if defined(MYNAH_USE_OPENBLAS) && defined(__AVX2__)
+#if MYNAH_HAVE_SGEMM && defined(__AVX2__)
+    /* Keyed on MYNAH_HAVE_SGEMM, not on which GEMM: this said
+     * MYNAH_USE_OPENBLAS, and with BLAS=none as the Linux default that would
+     * have silently turned the x86 rows=1 parallel matvec off on the
+     * production target.  BLAS=scalar still does not get it -- there
+     * MYNAH_HAVE_SGEMM is 0 and the serial SIMD matvec is the point. */
     if (matvec_env == NULL) matvec_parallel = 1;
 #endif
 #if defined(MYNAH_USE_ACCELERATE) && (defined(__ARM_NEON) || defined(__aarch64__))

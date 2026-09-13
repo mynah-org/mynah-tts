@@ -655,12 +655,6 @@ static int qmat_probe(int qtype) {
     return on;
 }
 
-#if MYNAH_DISPATCH_HAS_OPENBLAS && defined(__GNUC__) && !defined(__APPLE__)
-/* The same weak reference src/threads.c:105 uses: it answers "did this process
- * actually link a threaded OpenBLAS", which no #define can. */
-extern void openblas_set_num_threads(int) __attribute__((weak));
-#endif
-
 static void collect_isa(row_sink *s) {
     add_gate(s, "isa.arm.neon", MYNAH_DISPATCH_HAS_NEON, cpu_has_neon(),
              "[gate] src/kernels.c NEON dot/matvec/rmsnorm/layernorm/gelu/axpy; "
@@ -742,64 +736,24 @@ static void collect_isa(row_sink *s) {
                "src/; E4 lists AMX last, as the narrowest-platform item");
 }
 
-static void collect_blas(row_sink *s) {
-    tri accel_ok = -1;
-#if defined(__APPLE__)
-    accel_ok = 1;
-#else
-    accel_ok = 0;
-#endif
-    add_gate(s, "blas.accelerate", MYNAH_DISPATCH_HAS_ACCELERATE, accel_ok,
-             "[gate] macOS Accelerate cblas_sgemm for the multi-row prefill and "
-             "vvtanhf for the array GELU (src/backend.c, src/kernels.c)");
-
-#if MYNAH_DISPATCH_HAS_OPENBLAS && defined(__GNUC__) && !defined(__APPLE__)
-    {
-        const int linked = (openblas_set_num_threads != NULL);
-        add_row(s, "blas.openblas", "yes", yn(linked), NULL, onoff(linked),
-                MYNAH_DISPATCH_SRC_RUNTIME,
-                linked
-                  ? "[runtime] weak openblas_set_num_threads resolved: a "
-                    "threaded OpenBLAS is linked and src/threads.c can hold it "
-                    "at one thread inside a parallel region"
-                  : "[runtime] compiled against cblas.h but the weak symbol did "
-                    "NOT resolve: no thread control, so the vendor BLAS keeps "
-                    "its own team and nests under the pool");
-    }
-#else
-    add_row(s, "blas.openblas", yn(MYNAH_DISPATCH_HAS_OPENBLAS), "-", NULL,
-            onoff(MYNAH_DISPATCH_HAS_OPENBLAS), MYNAH_DISPATCH_SRC_GATE,
-            MYNAH_DISPATCH_HAS_OPENBLAS
-              ? "[gate] linked, but this platform has no weak-symbol thread "
-                "control probe"
-              : "[gate] not compiled (Linux BLAS=openblas selects it)");
-#endif
-
-    {   /* Not a CPU feature, so `supported` is "-" rather than a probe. */
-        const int scalar_only =
-            !(MYNAH_DISPATCH_HAS_ACCELERATE || MYNAH_DISPATCH_HAS_OPENBLAS);
-        add_row(s, "blas.scalar_fallback", yn(scalar_only), "-", NULL,
-                onoff(scalar_only), MYNAH_DISPATCH_SRC_GATE,
-                "[gate] BLAS=scalar: every matmul falls back to the in-tree "
-                "matvec loop. It is the correctness oracle, never the "
-                "performance target");
-    }
-
-    add_unknown(s, "blas.threads_owned", "-", "-", "OPENBLAS_NUM_THREADS",
-                "[UNKNOWN] src/threads.c did not register mynah_blas_owned()");
-
-    /* E4-16a. INTERIM compensation for a dependency E4-16 removes, and the row
-     * exists because the claim is weaker than it looks: this process sets the
-     * variable from a constructor, but a shared libopenblas is initialised
-     * before the executable's own constructors, so the only channel guaranteed
-     * to be read is the environment before exec. The probe reports which of
-     * the two happened rather than reporting success. Without it an idle
-     * OpenBLAS team spins: the reference measured TTFA C=1 at 108 ms BIMODAL
-     * against 66 ms stable, and 42,500 against 12,000 context switches/s. */
-    add_unknown(s, "blas.thread_timeout", "-", "-", "OPENBLAS_THREAD_TIMEOUT",
-                "[UNKNOWN] src/threads.c did not register "
-                "mynah_blas_thread_timeout()");
-
+/* E4-16.  THERE ARE NO blas.* ROWS ANY MORE, and their absence is the finding.
+ *
+ * There used to be five: blas.accelerate, blas.openblas, blas.scalar_fallback,
+ * blas.threads_owned and blas.thread_timeout.  The first three asked "which
+ * library multiplies two f32 matrices", which is exactly what sgemm.provider
+ * answers -- and answers better, because it names the provider that actually
+ * ran instead of listing the ones that were compiled.  The last two were not
+ * about GEMM at all: they reported whether we had managed to wrestle control
+ * of a foreign thread pool, and one of them had to be declared UNKNOWN
+ * because the honest answer was "we cannot tell from here".  With BLAS=none
+ * the default on Linux there is no foreign pool in the process, so there is
+ * nothing to report and no row that can go stale.
+ *
+ * Accelerate has NOT left this report: it is still the macOS default, and the
+ * parts of it that are not a GEMM keep their own rows -- kernel.gelu_vector
+ * for the vForce tanh, codec.sgemm_conv for the BNNS convolution, and
+ * codec.seanet_gemm for the decoder fast path. */
+static void collect_sgemm(row_sink *s) {
     /* E4-16, .work/no-blas.md.  One BLAS function was ever used --
      * cblas_sgemm, three call sites -- and src/sgemm.c replaces it.  These
      * four rows are declared UNKNOWN and then overridden by the predicates
@@ -1105,7 +1059,7 @@ int mynah_dispatch_collect(mynah_dispatch_row *rows, int capacity) {
     row_sink sink = { rows, capacity, 0 };
     register_module_probes();
     collect_isa(&sink);
-    collect_blas(&sink);
+    collect_sgemm(&sink);
     collect_pool(&sink);
     collect_quant(&sink);
     collect_backends(&sink);

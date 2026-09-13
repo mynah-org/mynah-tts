@@ -35,6 +35,23 @@
 
 #include <stddef.h>
 
+/* "A REAL f32 GEMM EXISTS IN THIS BUILD" -- Accelerate, OpenBLAS, or ours.
+ *
+ * NOT "a vendor BLAS is linked", and the distinction is the one the default
+ * flip turned into a bug hazard.  Several fast paths outside this file were
+ * keyed on MYNAH_USE_OPENBLAS when what they actually needed was "some GEMM":
+ * the conv1d tap-GEMM accumulation and its packed-tap cache, and the rows=1
+ * parallel matvec on x86.  With `none` as the Linux default those would have
+ * switched themselves off on the production target -- silently, and with no
+ * test that could see it, because the PocketTTS path goes through seanet.c
+ * and never touches them.  One macro, so the question is asked once. */
+#if defined(MYNAH_USE_ACCELERATE) || defined(MYNAH_USE_OPENBLAS) || \
+    defined(MYNAH_USE_OWN_SGEMM)
+#define MYNAH_HAVE_SGEMM 1
+#else
+#define MYNAH_HAVE_SGEMM 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

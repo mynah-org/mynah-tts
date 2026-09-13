@@ -71,57 +71,61 @@ endif
 # flags, which is how a "baseline build passed" result stops meaning anything.
 CFLAGS += $(EXTRA_CFLAGS)
 
-# BLAS selection. Four values, and only the first one links nothing:
+# BLAS selection. Five values, and the one Linux resolves by default links
+# nothing:
 #
 #   none      our own f32 GEMM (src/sgemm.c) at every call site. NO external
-#             BLAS in the process, which is the whole point: OpenBLAS brings
-#             its own thread pool with its own policies and every one of them
-#             is a trap to recheck on every host forever (.work/no-blas.md).
-#   openblas  Linux vendor BLAS -- a COMPARISON build, kept so the A/B is
-#             always available.
-#   auto      the current default: Accelerate on macOS, OpenBLAS on Linux when
-#             cblas.h is present, scalar otherwise. Also a comparison build.
+#             BLAS in the process. THE LINUX DEFAULT since E4-16, and the
+#             reason is ownership, not speed: OpenBLAS brings its own thread
+#             pool with its own policies, and a pool we do not own is a
+#             permanent source of non-reproducible measurement. Measured on
+#             the Axion box (.work/no-blas.md §3c): a worker pinned to eight
+#             cpus carried 63 threads with OpenBLAS linked and 32 without it,
+#             and our own clamp was responsible for 24 of that difference.
+#             It is also 9% FASTER on that box, but that is the tiebreak,
+#             not the argument.
+#   openblas  Linux vendor BLAS -- a COMPARISON build, kept forever so the
+#             A/B never stops being available. Never the default again.
+#   accelerate  macOS Accelerate -- the macOS default, and a comparison build
+#             on the Linux question. It is NOT dropped here: Accelerate also
+#             owns vForce's vvtanhf in the GELU and the BNNS conv filter
+#             cache, which are a separate numerical qualification and not a
+#             GEMM decision (.work/no-blas.md §3b, tier 3).
+#   auto      Accelerate on macOS, `none` everywhere else. No probing: the
+#             old auto asked the host whether cblas.h existed and silently
+#             linked a vendor BLAS if it did, which made the production build
+#             a property of the build machine.
 #   scalar    no GEMM at all: the naive triple loop and the SEANet scalar conv
 #             reference. The correctness oracle, never the performance target.
-#
-# The default is deliberately NOT `none` yet. Landing the kernel and flipping
-# the default are two decisions, and the second needs an RTF measurement on
-# Linux ARM and x86 that cannot be taken on a development Mac.
-ifeq ($(BLAS),none)
-CPPFLAGS += -DMYNAH_USE_OWN_SGEMM
-BLAS_NAME := none/mynah-sgemm
-ifneq ($(UNAME_S),Darwin)
-CPPFLAGS += -D_DEFAULT_SOURCE
-endif
-else
 ifeq ($(UNAME_S),Darwin)
-ifeq ($(BLAS),scalar)
-BLAS_NAME := scalar
-else
-CPPFLAGS += -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
-LDLIBS += -framework Accelerate
-BLAS_NAME := Accelerate
-endif
+BLAS_RESOLVED := $(if $(filter auto,$(BLAS)),accelerate,$(BLAS))
 else
 # Linux: -D_DEFAULT_SOURCE exposes POSIX/BSD APIs (clock_gettime, strcasecmp, mmap…)
 CPPFLAGS += -D_DEFAULT_SOURCE
-ifeq ($(BLAS),openblas)
+BLAS_RESOLVED := $(if $(filter auto,$(BLAS)),none,$(BLAS))
+endif
+
+ifeq ($(BLAS_RESOLVED),none)
+CPPFLAGS += -DMYNAH_USE_OWN_SGEMM
+BLAS_NAME := none/mynah-sgemm
+else ifeq ($(BLAS_RESOLVED),accelerate)
+ifneq ($(UNAME_S),Darwin)
+$(error BLAS=accelerate is macOS-only; this host is $(UNAME_S))
+endif
+CPPFLAGS += -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+LDLIBS += -framework Accelerate
+BLAS_NAME := Accelerate
+else ifeq ($(BLAS_RESOLVED),openblas)
+ifeq ($(UNAME_S),Darwin)
+$(error BLAS=openblas is the Linux comparison build; this host is Darwin)
+endif
 CPPFLAGS += -DMYNAH_USE_OPENBLAS
 LDLIBS += -lopenblas
 BLAS_NAME := OpenBLAS
-else ifeq ($(BLAS),scalar)
+else ifeq ($(BLAS_RESOLVED),scalar)
 BLAS_NAME := scalar
 else
-# auto: detect system OpenBLAS (fail-early hint like mynah ASR)
-ifneq ($(shell printf '\043include <cblas.h>\n' | $(CC) $(CPPFLAGS) -E -xc - >/dev/null 2>&1 && echo ok),)
-CPPFLAGS += -DMYNAH_USE_OPENBLAS
-LDLIBS += -lopenblas
-BLAS_NAME := OpenBLAS
-else
-BLAS_NAME := scalar
-endif
-endif
-endif
+$(error BLAS=$(BLAS) is not a profile. Use auto, none, openblas, accelerate or scalar)
 endif
 
 # ingot: the GGUF/safetensors reader, vendored as a subtree. Built by its own

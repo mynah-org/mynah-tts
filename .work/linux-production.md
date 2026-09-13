@@ -55,6 +55,24 @@ be worth ≥200 µs to pay for itself. **Same conclusion from two directions.**
 
 ## The traps, ranked by what they cost
 
+> **SUPERSEDED for our tree (E4-16, 2026-09-13).** Sections 1 and 2 below are
+> kept as the reference's findings and as the reason the decision was taken;
+> they are **no longer rules for our profiles**. `BLAS=none` is the Linux
+> default, no OpenBLAS is linked, and therefore:
+>
+> - there is no `openblas_set_num_threads` clamp, no ownership predicate and no
+>   `OPENBLAS_THREAD_TIMEOUT=1` to pin in a profile;
+> - **the "`OPENBLAS_NUM_THREADS` must be absent" rule is withdrawn.** A
+>   profile no longer has to prove the absence of an environment variable to be
+>   valid, which was the whole objection: a rule that is satisfied by something
+>   *not* being there cannot be checked by looking at what is.
+>
+> Measured on the Axion box the day the default flipped, and it is the
+> argument: one worker pinned to 8 cpus held **63 threads** with OpenBLAS
+> linked and **32** without it (.work/no-blas.md §3c). Section 3 below is NOT
+> superseded — the pool still plans from `sysconf` rather than the affinity
+> mask, which is where that 32 comes from.
+
 ### 1. BLAS oversubscription — 21% of time in the scheduler
 `perf` on Neoverse-N1 showed 21% in `__sched_yield` + `__schedule`: their pool
 (4 threads) and OpenBLAS (4 threads) on 4 cores. Worse, the engine **never
@@ -179,9 +197,12 @@ we already have.
 
 **3. The flag stamp file.** Eight lines, and it prevents a mixed binary.
 
-**4. BLAS from "the weak symbol exists" to structural ownership**, plus
-`OPENBLAS_THREAD_TIMEOUT=1` in the deployment env set. Our GEMM fast path in the
-decoder goes through BLAS — that is exactly where the two pools collide.
+**4. ~~BLAS from "the weak symbol exists" to structural ownership~~** —
+**withdrawn, E4-16.** The collision was real, and the answer turned out not to
+be better ownership of someone else's pool but not having one: `BLAS=none` is
+the Linux default and the decoder's GEMM fast path is `mynah_sgemm_f32` on our
+own pool. Nothing to clamp, nothing to time out, no env var that has to be
+absent.
 
 **5. The pool must plan from `sched_getaffinity`**, and agree with the prefork
 planner. Add what they did *not* do: read cgroup v2 `cpu.max` and at least warn.

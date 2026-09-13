@@ -4,6 +4,7 @@
 
 #include "kernels.h"
 #include "mynah_util.h"
+#include "sgemm.h"
 #include "threads.h"
 
 #include <limits.h>
@@ -106,7 +107,7 @@ int mynah_conv1d_sgemm_enabled(void) {
 #endif
 }
 
-#if defined(MYNAH_USE_OPENBLAS) && !defined(MYNAH_USE_ACCELERATE)
+#if MYNAH_HAVE_SGEMM && !defined(MYNAH_USE_ACCELERATE)
 typedef struct {
     const float *weight;
     size_t in_channels;
@@ -132,7 +133,7 @@ void *mynah_graph_codec_cache_new(void) {
         return NULL;
     }
     return cache;
-#elif defined(MYNAH_USE_OPENBLAS)
+#elif MYNAH_HAVE_SGEMM
     codec_bnns_cache *cache = (codec_bnns_cache *)calloc(1, sizeof(*cache));
     if (cache == NULL) return NULL;
     if (pthread_mutex_init(&cache->mutex, NULL) != 0) {
@@ -148,7 +149,7 @@ void *mynah_graph_codec_cache_new(void) {
 void mynah_graph_codec_cache_free(void *opaque) {
 #if defined(MYNAH_USE_ACCELERATE)
     codec_bnns_cache_free((codec_bnns_cache *)opaque);
-#elif defined(MYNAH_USE_OPENBLAS)
+#elif MYNAH_HAVE_SGEMM
     codec_bnns_cache *cache = (codec_bnns_cache *)opaque;
     if (cache == NULL) return;
     pthread_mutex_lock(&cache->mutex);
@@ -162,7 +163,7 @@ void mynah_graph_codec_cache_free(void *opaque) {
 #endif
 }
 
-#if defined(MYNAH_USE_OPENBLAS) && !defined(MYNAH_USE_ACCELERATE)
+#if MYNAH_HAVE_SGEMM && !defined(MYNAH_USE_ACCELERATE)
 static float *codec_cached_taps(codec_bnns_cache *cache, const float *weight,
                                 size_t in_channels, size_t out_channels,
                                 size_t kernel) {
@@ -425,7 +426,10 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
     if (profile != NULL) profile->calls++;
     const char *tap_env = getenv("MYNAH_CONV_TAP_GEMMS");
     int use_tap_gemms = tap_env != NULL && strcmp(tap_env, "0") != 0;
-#if defined(MYNAH_USE_OPENBLAS)
+#if MYNAH_HAVE_SGEMM && !defined(MYNAH_USE_ACCELERATE)
+    /* On by default wherever a real GEMM exists and BNNS does not.  This was
+     * keyed on MYNAH_USE_OPENBLAS, which stopped meaning "a GEMM exists" the
+     * moment BLAS=none became the Linux default. */
     if (tap_env == NULL) use_tap_gemms = 1;
 #endif
     /* GPU fast path: im2col + sgemm in one backend call. */
@@ -522,7 +526,7 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
         }
     float *wk = NULL;
     int owns_wk = 0;
-#if defined(MYNAH_USE_OPENBLAS) && !defined(MYNAH_USE_ACCELERATE)
+#if MYNAH_HAVE_SGEMM && !defined(MYNAH_USE_ACCELERATE)
     wk = codec_cached_taps(bnns_cache, weight.data,
                            in_channels, out_channels, kernel);
 #endif

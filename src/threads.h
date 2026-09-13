@@ -14,13 +14,6 @@
 
 int mynah_num_threads(void);
 
-/* Configure direct BLAS calls to match MYNAH_THREADS. */
-void mynah_blas_set_threads(int n);
-/* 1 when mynah_blas_set_threads() really does control the vendor BLAS: a
- * non-Apple GNU-C build, the weak openblas_set_num_threads resolved, and no
- * explicit OPENBLAS_NUM_THREADS. 0 means the clamp is a silent no-op. */
-int mynah_blas_owned(void);
-
 /* Runs fn(ctx, i) for i in [0, n): tasks are distributed over
  * min(n, mynah_num_threads()) threads (the caller participates).
  * With n <= 1 or a single thread it runs inline with no spawn. */
@@ -218,31 +211,5 @@ int mynah_lane_wait(int slot);
  * printed rather than asserted so a violation is visible in a production log
  * instead of only in a debug build. */
 long long mynah_lane_overruns(void);
-
-/* ---------------------------------------------------------------------------
- * BLAS THREAD TIMEOUT -- E4-16a
- *
- * INTERIM COMPENSATION FOR A DEPENDENCY WE ARE REMOVING, not design. E4-16
- * deletes the BLAS call entirely; until it does, an idle OpenBLAS team spins,
- * and the reference measured what that costs:
- *
- *                       | without | with OPENBLAS_THREAD_TIMEOUT=1
- *   TTFA C=1            | 108 ms, BIMODAL | 66 ms, stable
- *   context switches/s  | 42,500  | 12,000
- *
- * Bimodal is the word that matters: a single run looks definitive whichever
- * mode it draws, so this is invisible to anyone who measures once.
- *
- * CLAIM VERSUS FACT. This process sets the variable if it is unset, as early
- * as it can. That is a backstop and not a guarantee: a shared libopenblas is
- * initialized before the executable's own constructors, so if that build reads
- * the variable in its constructor our write is too late. The only channel that
- * always works is the process environment before exec. The dispatch report
- * says which of the two happened rather than claiming success.
- *
- * Returns the value in force, or NULL when the variable is unset. */
-const char *mynah_blas_thread_timeout(void);
-/* 1 when this process set it, 0 when it was inherited or absent. */
-int mynah_blas_thread_timeout_ours(void);
 
 #endif

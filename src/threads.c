@@ -82,40 +82,6 @@ double mynah_parallel_now_ms(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * E4-16a: OPENBLAS_THREAD_TIMEOUT, set as early as this translation unit can
- * be reached.
- *
- * This is compensation for a dependency we are removing (E4-16), not a design
- * decision, and the comment is part of the deliverable: when the BLAS call
- * goes, this block goes with it. See threads.h for the measurement and for why
- * the claim it makes is deliberately weak.
- *
- * A constructor rather than a call from main(): every binary in this tree
- * links this file, and there is no one main() to put it in -- the CLI, the
- * server, five test programs. It has to run before the first BLAS call, and
- * this is the earliest hook a library object gets.
- * ------------------------------------------------------------------------- */
-static int g_obt_ours;          /* this process wrote the variable */
-
-static void blas_thread_timeout_init(void) {
-    const char *cur = getenv("OPENBLAS_THREAD_TIMEOUT");
-    if (cur != NULL && cur[0] != '\0') return;   /* an explicit choice wins */
-    if (setenv("OPENBLAS_THREAD_TIMEOUT", "1", 0) == 0) g_obt_ours = 1;
-}
-
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((constructor))
-static void mynah_threads_ctor(void) { blas_thread_timeout_init(); }
-#endif
-
-const char *mynah_blas_thread_timeout(void) {
-    const char *v = getenv("OPENBLAS_THREAD_TIMEOUT");
-    return (v != NULL && v[0] != '\0') ? v : NULL;
-}
-
-int mynah_blas_thread_timeout_ours(void) { return g_obt_ours; }
-
-/* ---------------------------------------------------------------------------
  * E5-22: the spin budget.
  *
  * Resolved once and cached, so a dispatch never calls getenv(). The default is
@@ -420,11 +386,6 @@ static void *pool_worker(void *arg) {
     return NULL; /* never reached */
 }
 
-#if defined(__GNUC__) && !defined(__APPLE__)
-extern void openblas_set_num_threads(int) __attribute__((weak));
-#define PF_HAVE_BLAS_KNOB 1
-#endif
-
 /* ---------------------------------------------------------------------------
  * The decoder lane -- E5-21.
  * ------------------------------------------------------------------------- */
@@ -660,17 +621,6 @@ static void pool_init(pf_pool *pool, int width) {
  * property of a cpu slice, and a child has a different slice than its parent.
  * The child re-prepares it after it pins itself. */
 void mynah_threadpool_after_fork(void) {
-    /* g_blas_mu lives further down this file and is taken on every region
-     * entry, so a pool thread can be holding it at the instant of fork.  It is
-     * reinitialized here rather than in its own handler because atfork child
-     * handlers run in registration order and this one is already registered
-     * first: a second handler would be a second thing to remember.  An
-     * inherited locked mutex can never be unlocked -- the owner does not exist
-     * in the child -- so this is not defensive, it is the only repair. */
-#ifdef PF_HAVE_BLAS_KNOB
-    extern void mynah_blas_after_fork(void);
-    mynah_blas_after_fork();
-#endif
     pf_pool *const pools[2] = { &g_engine, &g_lane };
     for (int p = 0; p < 2; ++p) {
         pthread_mutex_init(&pools[p]->mu, NULL);
@@ -710,87 +660,6 @@ static void pool_init_once(void) {
     pthread_mutex_unlock(&g_init_mu);
 }
 
-/* Inside a parallel_for the cores belong to the workers: if each worker calls a
- * multi-threaded OpenBLAS we get catastrophic oversubscription.  Force BLAS to a
- * single thread for the region and restore on exit.  Accelerate (macOS) nests
- * via GCD and needs none of this.  Weak symbol as in qwen-tts: resolved only if
- * linked against OpenBLAS; an explicit OPENBLAS_NUM_THREADS always wins.
- *
- * The count is process-global, so "set on entry, restore on exit" was wrong as
- * soon as two regions overlapped: the first one to finish restored the full
- * count under the second, which then oversubscribed.  Region entries are
- * counted instead: the first sets, an overlapping one can only lower, and only
- * the last to leave restores the base. */
-
-#ifdef PF_HAVE_BLAS_KNOB
-static pthread_mutex_t g_blas_mu = PTHREAD_MUTEX_INITIALIZER;
-
-/* Called from mynah_threadpool_after_fork, which runs as the atfork CHILD
- * handler.  Only async-signal-safe work belongs here: re-initializing a mutex
- * whose owner thread does not exist in the child is exactly that, while
- * anything that allocates or logs is not. */
-void mynah_blas_after_fork(void) {
-    pthread_mutex_init(&g_blas_mu, NULL);
-}
-static int g_blas_depth;
-static int g_blas_cur = -1;
-static int g_blas_base;
-
-static void blas_apply(int n) {
-    if (getenv("OPENBLAS_NUM_THREADS")) return; /* explicit user choice */
-    if (n < 1) n = 1;
-    if (n == g_blas_cur) return;
-    if (openblas_set_num_threads) openblas_set_num_threads(n);
-    g_blas_cur = n;
-}
-
-static void blas_region_enter(int want) {
-    pthread_mutex_lock(&g_blas_mu);
-    if (g_blas_base == 0) g_blas_base = mynah_num_threads();
-    if (g_blas_depth++ == 0 || want < g_blas_cur) blas_apply(want);
-    pthread_mutex_unlock(&g_blas_mu);
-}
-
-static void blas_region_leave(void) {
-    pthread_mutex_lock(&g_blas_mu);
-    if (--g_blas_depth <= 0) {
-        g_blas_depth = 0;
-        blas_apply(g_blas_base ? g_blas_base : mynah_num_threads());
-    }
-    pthread_mutex_unlock(&g_blas_mu);
-}
-
-void mynah_blas_set_threads(int n) {
-    pthread_mutex_lock(&g_blas_mu);
-    g_blas_base = n > 0 ? n : 1;
-    if (g_blas_depth == 0) blas_apply(g_blas_base);
-    pthread_mutex_unlock(&g_blas_mu);
-}
-#else
-static void blas_region_enter(int want) { (void)want; }
-static void blas_region_leave(void) {}
-void mynah_blas_set_threads(int n) { (void)n; }
-#endif
-
-/* Does this process actually own the vendor BLAS's thread count?
- *
- * Three things have to line up, and mynah_blas_set_threads() above is a silent
- * no-op when any of them does not: the build must be a non-Apple GNU-C one
- * (Accelerate nests through GCD and needs no clamping), the weak
- * openblas_set_num_threads must have resolved, and OPENBLAS_NUM_THREADS must
- * be unset -- an explicit user choice always wins over ours.  Exported so the
- * dispatch report reads the same three conditions the setter does instead of
- * restating them, because the failure this hides is oversubscription: every
- * pool worker calling a threaded BLAS. */
-int mynah_blas_owned(void) {
-#ifdef PF_HAVE_BLAS_KNOB
-    if (getenv("OPENBLAS_NUM_THREADS") != NULL) return 0;
-    return openblas_set_num_threads != NULL;
-#else
-    return 0;
-#endif
-}
-
 void mynah_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     if (n <= 0) return;
 
@@ -817,9 +686,6 @@ void mynah_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
      * engine pool is built lazily. */
     if (!g_on_lane) pool_init_once();
 
-    const int active = n < nth ? n : nth;
-    const int blas_want = active <= 2 ? nth / active : 1;
-
     pf_job *slot = NULL;
     pthread_mutex_lock(&pool->mu);
     if (pool->workers > 0) {
@@ -830,11 +696,9 @@ void mynah_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     if (slot == NULL) {
         pthread_mutex_unlock(&pool->mu);
         if (pool->workers > 0) PF_STAT(g_stat_inline); else PF_STAT(g_stat_serial);
-        blas_region_enter(blas_want);
         g_depth++;
         for (int i = 0; i < n; i++) fn(ctx, i);
         g_depth--;
-        blas_region_leave();
         return;
     }
     slot->fn = fn;
@@ -850,7 +714,6 @@ void mynah_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     pthread_mutex_unlock(&pool->mu);
 
     PF_STAT(g_stat_dispatch);
-    blas_region_enter(blas_want);
     pf_run(slot); /* the caller works too */
 
     /* Spin before parking here too: at the end of a region the helpers are
@@ -876,35 +739,11 @@ void mynah_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     }
     slot->live = 0;
     pthread_mutex_unlock(&pool->mu);
-    /* Only now: helpers were still running tasks that may call BLAS, and
-     * restoring the count from under them is exactly the clobber this counter
-     * exists to prevent. */
-    blas_region_leave();
 }
 
 /* ======================================================================
  * Dispatch predicates
  * ====================================================================== */
-static int probe_blas_owned(const char **why) {
-    const int on = mynah_blas_owned();
-    if (why != NULL) {
-#ifdef PF_HAVE_BLAS_KNOB
-        *why = on ? "[predicate] mynah_blas_owned(): the weak "
-                    "openblas_set_num_threads resolved and OPENBLAS_NUM_THREADS "
-                    "is unset, so src/threads.c holds BLAS at one thread inside "
-                    "a parallel region"
-                  : "[predicate] mynah_blas_owned(): either OPENBLAS_NUM_THREADS "
-                    "is set (an explicit choice that always wins) or the weak "
-                    "symbol did not resolve. The vendor BLAS keeps its own team "
-                    "and can nest under the pool";
-#else
-        *why = "[predicate] mynah_blas_owned(): not applicable on this build -- "
-               "Accelerate nests through GCD, so there is nothing to clamp";
-#endif
-    }
-    return on;
-}
-
 /* E5-22. The VALUE, not a boolean: 65536 and 4096 are different servers and a
  * row saying ON would hide which one is running. */
 static int probe_pool_spin(char *out, size_t capacity, const char **why) {
@@ -949,36 +788,7 @@ static int probe_pool_lane(char *out, size_t capacity, const char **why) {
     return 0;
 }
 
-/* E4-16a. Claim versus fact, and the fact is weaker than the claim. */
-static int probe_blas_thread_timeout(char *out, size_t capacity, const char **why) {
-    static char text[384];
-    const char *v = mynah_blas_thread_timeout();
-    snprintf(out, capacity, "%s", v != NULL ? v : "unset");
-    if (v == NULL) {
-        /* Unset AND unsettable: an idle OpenBLAS team spins. */
-        snprintf(text, sizeof text,
-                 "[predicate] unset and could not be set. An idle OpenBLAS team "
-                 "spins: TTFA C=1 108 ms BIMODAL vs 66 ms stable, 42.5k vs 12k "
-                 "csw/s (their numbers)");
-    } else {
-        /* CLAIM vs FACT: setting it here is a backstop, because a shared
-         * libopenblas initialises before this executable's constructors. Only
-         * the environment before exec is guaranteed to be read. */
-        snprintf(text, sizeof text,
-                 "[predicate] =%s, %s. INTERIM compensation for the dependency "
-                 "E4-16 removes, not design. Setting it here is a BACKSTOP: "
-                 "only the env before exec is guaranteed to be read",
-                 v, mynah_blas_thread_timeout_ours() ? "set by this process"
-                                                     : "inherited");
-    }
-    *why = text;
-    return 0;
-}
-
 void mynah_threads_dispatch_probes(void) {
-    mynah_dispatch_register_probe("blas.threads_owned", probe_blas_owned);
     mynah_dispatch_register_value_probe("pool.spin", probe_pool_spin);
     mynah_dispatch_register_value_probe("pool.decoder_lane", probe_pool_lane);
-    mynah_dispatch_register_value_probe("blas.thread_timeout",
-                                        probe_blas_thread_timeout);
 }
