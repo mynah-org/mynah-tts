@@ -353,8 +353,25 @@ static void qmat_f16_pack_f16c(uint16_t *dst, const float *src, size_t n) {
 /* One pass over the weight at cache-insert time, never in the decode loop. */
 static void qmat_f16_pack(uint16_t *dst, const float *src, size_t n) {
 #if defined(MYNAH_QMAT_F16_NEON)
-    __fp16 *h = (__fp16 *)(void *)dst;
-    for (size_t i = 0; i < n; ++i) h[i] = (__fp16)src[i];
+    /* Convert into an __fp16 and memcpy the two bytes out.  Writing through an
+     * `__fp16 *` aliased onto this `uint16_t` storage is what the code used to
+     * do, and the (void *) cast silenced the diagnostic without removing the
+     * undefined behaviour: every other access to the cache reads these bytes as
+     * uint16_t, so under -fstrict-aliasing -- the default at -O2 and above --
+     * the compiler is entitled to assume the two never overlap.
+     *
+     * It is not theoretical.  On Linux/gcc 15 every non-native ARM profile
+     * packed WRONG WEIGHTS: 66088.48, which is above the f16 maximum and must
+     * saturate to 0x7c00 (+inf), came out as 0xb01a, a small negative finite
+     * number -- a value structurally unrelated to its input rather than a
+     * rounding difference.  -march=native happened to hide it, which is why
+     * every build anyone runs by hand was fine and the portable profile was
+     * not.  memcpy is the standard, always-legal spelling of this store and
+     * both compilers fold it to a single 16-bit write. */
+    for (size_t i = 0; i < n; ++i) {
+        const __fp16 h = (__fp16)src[i];
+        memcpy(&dst[i], &h, sizeof dst[i]);
+    }
 #elif defined(MYNAH_QMAT_F16_X86)
     if (qmat_f16_kernel() == QMAT_F16K_F16C) {
         qmat_f16_pack_f16c(dst, src, n);
