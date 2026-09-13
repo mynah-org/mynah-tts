@@ -315,6 +315,16 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       `convtr_scatter_scalar` silently; `conv1d.c:487,530` ignore the sgemm return
       (NULL backend gives bias-only output, no error); `seanet.c:53-55` narrows
       `size_t`→`int` six times per call with no guard, where `conv1d.c` has one
+- [x] E4-20b/E4-21b **int8 is deterministic again and SMMLA is back on; VNNI has now
+      executed** → [`.work/int8-int4-determinism.md`](.work/int8-int4-determinism.md).
+      The batched linear's answer depended on a row's position because `dot_q8` let
+      each caller add the bias (two roundings) while the quad epilogues fused it
+      (one) — the *rounding count*, not the grouping the brief named. One pinned
+      epilogue for every int8 kernel; goldens and PocketTTS byte-identical. CI's
+      Xeon 8573C resolved `avx512vnni` and `avxvnni` and passed — first execution of
+      `VPDPBUSD` on silicon. int4 got its first x86 vector path (AVX2, not VNNI: a
+      32-element group scale forces a float flush that is 6 of ~18 instructions, so
+      `VPDPBUSD` would move it ~10%)
 - [ ] E4-22 **438 MB of dead f32.** RSS f32 626 / f16 805 / int8 724 MB: the f32
       conversion cache stays resident in full while every hot projection is served from
       f16. ~82M of 109.5M params could go bf16→f16 direct, ~328 MB per pack. Memory, not

@@ -37,4 +37,5 @@ that holds the detail. Nothing in `PLAN.md` should need more than one line.
 | [serving-design.md](serving-design.md) | The serving mechanisms worth copying from qwen-tts |
 | [linux-production.md](linux-production.md) | The Linux traps qwen-tts already paid for, and what to copy |
 | [tokenizer-sentencepiece.md](tokenizer-sentencepiece.md) | E3-2 — SentencePiece Unigram in C |
+| [int8-int4-determinism.md](int8-int4-determinism.md) | E4-20b/E4-21b — the int8 float epilogue, SMMLA, VNNI on CI silicon, int4 on x86 |
 | [archive-2026-07-checkpoints.md](archive-2026-07-checkpoints.md) | Historical `PLAN.md` §17-24, moved verbatim |

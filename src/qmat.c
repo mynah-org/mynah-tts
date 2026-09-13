@@ -425,36 +425,42 @@ static int qmat_i8mm(void) {
 /* Whether the SMMLA kernel is WIRED INTO the batched linear, which is a
  * different question from whether the CPU has the instruction.
  *
- * It is off by default, and the reason is measured, not cautionary.  SMMLA's
- * int32 tile is bit-identical to two SDOT rows -- verified over every row of a
- * 96x256 matrix, 0 of 96 differ -- but the kernel also has to turn that int32
- * into a float, and `(float)s * scales[row] * sx + bias[row]` is a three-factor
- * product that -ffast-math (-fassociative-math) may group either way.  Four
- * textually distinct copies of it live in matvec_q8_pair_i8mm's epilogue and a
- * fifth in matvec_q8's, and GCC 15 on aarch64 groups them differently.
+ * It is ON by default as of E4-20b, and the history is worth keeping because
+ * it is what the gate now exists to prevent.  SMMLA's int32 tile is
+ * bit-identical to two SDOT rows -- verified over every row of a 96x256 matrix,
+ * 0 of 96 differ -- but the kernel also has to turn that int32 into a float,
+ * and the epilogue used to be written out longhand as a three-factor product
+ * in each kernel.  Under -ffast-math the compiler grouped those products
+ * differently per site, and that made a row's answer depend on WHERE IT SAT IN
+ * THE BATCH: one activation row against fixed weights produced four different
+ * results -- lead of an SMMLA pair, follower, SDOT tail of an odd batch, alone
+ * -- differing in up to 39 of 96 columns by up to 2 ULP.  Under concurrent
+ * serving the position is decided by arrival order, so the same request got a
+ * different answer depending on who else was in flight.
  *
- * That is not a cosmetic ULP: it made a row's answer depend on WHERE IT SAT IN
- * THE BATCH.  Measured on a Neoverse-V2, one activation row against fixed
- * weights produced four different results -- one as the lead of an SMMLA pair,
- * one as the follower, one as the SDOT tail of an odd batch, one alone --
- * differing in up to 39 of 96 columns by up to 2 ULP.  Under concurrent
- * serving the position is decided by arrival order, so the same request would
- * get a different answer depending on who else was in flight.  That is the one
- * thing the batched linear promises not to do.
+ * The cause was never in the integer math.  It is removed at the source now:
+ * every int8 kernel here ends through qmat_row_scale()/qmat_row_epilogue(),
+ * whose value barrier leaves a two-factor product with exactly one grouping,
+ * so the kernels agree by construction instead of by luck.  See the long
+ * comment above qmat_row_scale().
  *
- * E4-20 already closed the obvious repair: hoisting the epilogue into a shared
- * helper does not work, because the compiler inlines and then reassociates per
- * site anyway, and forcing one order with noinline would change matvec_q8's
- * codegen -- the kernel the int8 goldens are frozen against.  So the kernel
- * stays compiled and self-tested (self_test_i8mm_identity, in the integer
- * domain where the identity is real) and stays out of the path that must be
- * deterministic.  MYNAH_QMAT_I8MM=1 wires it in for measurement; --self-test
- * then fails on purpose, because self_test_batch_membership is precisely the
- * assertion that catches this. */
+ * MYNAH_QMAT_I8MM=0 disables the wiring (the kernel stays compiled and
+ * self-tested); =1 is the default and is accepted for symmetry.
+ * mynah_qmat_i8mm_force() is the in-process override the self-test uses to run
+ * the same shapes both ways and require bit-identical output; it is a test
+ * hook, not a runtime knob, and the env variable is resolved once so nothing
+ * in the decode loop calls getenv(). */
+static int qmat_i8mm_override = -1;   /* -1 env/default, 0 off, 1 on */
+
 static int qmat_i8mm_batched(void) {
     if (!qmat_i8mm()) return 0;
-    const char *env = getenv("MYNAH_QMAT_I8MM");
-    return env != NULL && strcmp(env, "1") == 0;
+    if (qmat_i8mm_override >= 0) return qmat_i8mm_override;
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("MYNAH_QMAT_I8MM");
+        cached = (env != NULL && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return cached;
 }
 #endif
 
@@ -770,14 +776,281 @@ static int32_t dot_q8_i32(const void *qa, const int8_t *w, int32_t rowsum,
 #endif
 }
 
+/* ------------------------------------------------ THE INT8 FLOAT EPILOGUE
+ *
+ * Every int8 kernel in this file ends the same way: an exact int32 dot product
+ * becomes a float.  Written the obvious way that is
+ *
+ *     out[row] = (float)s * scales[row] * sx + bias[row];
+ *
+ * a THREE-factor product, and -ffast-math (-fassociative-math, see the
+ * Makefile) lets the compiler pick any of its three groupings:
+ *
+ *     ((float)s * scales[row]) * sx
+ *     (float)s * (scales[row] * sx)
+ *     ((float)s * sx) * scales[row]
+ *
+ * They do not round alike, and the compiler chooses PER SITE -- per textual
+ * copy of the epilogue, and also per INLINED COPY of the same textual one.
+ * Measured at 10f8f48 on this tree with GCC 15.2/aarch64, by disassembling
+ * src/qmat.c: under SIMD=auto (-march=native) matvec_q8's out-of-line copy
+ * emits `fmul s31, s0, s31` (sx * scale) then `fmul s31, s31, s27` -- the
+ * middle grouping -- while under SIMD=portable the SAME SOURCE emits
+ * `fmul s31, s31, s0` (s * sx) then `fmul s31, s31, s24` -- the last one.
+ * Two profiles of one compiler, one source line, two different answers.
+ *
+ * That is not a cosmetic ULP.  It is what made a row's answer depend on WHERE
+ * IT SAT IN THE BATCH: matvec_q8_pair_i8mm (SMMLA) and matvec_q8 (SDOT) are
+ * two textual copies, and the weight-stationary batched linear routes a row
+ * through one or the other according to the batch's size and the row's
+ * position in it -- which under concurrent serving is decided by arrival
+ * order.  One activation row against fixed weights produced four different
+ * results: lead of an SMMLA pair, follower, SDOT tail of an odd batch, alone.
+ *
+ * E4-20 tried the obvious repair and it failed: hoisting the epilogue into a
+ * `static inline` helper changes nothing, because the compiler inlines the
+ * helper and then reassociates the resulting expression per site exactly as
+ * before.  A source-level hoist is a HINT.  The optimizer works on the whole
+ * expression DAG, not on statement boundaries, so `float rs = ws * sx;` is
+ * substituted straight back into `(float)s * (ws * sx)` and regrouped.
+ *
+ * So the hoist has to be enforced, not suggested, and that is what this is.
+ * The empty `__asm__` with `rs` as an in-out operand is a value barrier: it
+ * emits NO instruction, but after it the compiler no longer knows that `rs`
+ * came from `ws * sx`, so `(float)s * rs` is a two-factor product with exactly
+ * one grouping and nothing left to reassociate.  Every int8 kernel here --
+ * SDOT quad, AVX2 quad, u8/VNNI quad, the scalar tails, and the SMMLA pair --
+ * goes through this one function, so they agree BY CONSTRUCTION rather than by
+ * the compiler happening to choose alike.
+ *
+ * HOW MUCH OF THE DEFECT THE GROUPING ACTUALLY WAS: less than it looks, and
+ * the measurement is worth keeping because the obvious reading of the
+ * disassembly overstates it.  The two profiles above really do group
+ * differently -- but they are two different BINARIES, and a row's answer
+ * cannot depend on a build it was not built by.  Within one binary GCC 15.2
+ * was consistent, and tests/qmat_negative_control.sh proves it: removing this
+ * barrier on its own is NOT caught by any gate here, because on a target with
+ * a hardware FMA the epilogue below is written with fmaf(), whose second
+ * operand must be materialised as a value -- so the fma pins `ws * sx` as a
+ * unit all by itself.  The barrier is what holds the grouping on the OTHER
+ * branch, where there is no fma to do it: x86 built without -mfma, which is
+ * SIMD=portable on the production target.  Both halves are needed and neither
+ * is decoration; the negative control breaks them together for that reason.
+ *
+ * The canonical grouping is therefore `(float)s * (scales[row] * sx)`, and it
+ * was not chosen for elegance: it is the one SIMD=auto -- the production
+ * profile, -march=native on the Neoverse-V2 -- already emitted for matvec_q8
+ * before this change, so the default output does not move and only the other
+ * kernels come to meet it.  Verified: the Magpie int8 golden (offline-int8 in
+ * tests/goldens/fake-magpie.sha256) is byte-identical before and after, under
+ * SIMD=auto, SIMD=portable and SIMD=scalar.
+ *
+ * THE SECOND FREEDOM, AND IT IS THE ONE THAT ACTUALLY BIT.  Fixing the
+ * grouping is only half of it, and measured here, the smaller half.  `(float)s * rs + bias` may also CONTRACT into a single-rounding
+ * FMA, and `-ffp-contract=fast` is the default, so whether a site rounds once
+ * or twice depends on whether the product and the add ended up adjacent in that
+ * site's expression tree.  They did not, everywhere: `dot_q8()` used to return
+ * the product and let each caller write `value += bias[row]` itself, which is
+ * two roundings, while the quad epilogues wrote `... * sx + bias[row]`, which
+ * is one.  Measured here at 10f8f48 + the grouping fix, GCC 15.2/aarch64: with
+ * the groupings already identical, SIMD=portable still failed
+ * self_test_i8mm_identity by exactly 1 ULP at 96x256, and rebuilding the very
+ * same source with -ffp-contract=off turned every profile green.  That is the
+ * whole of the residual, and it is why this function takes the bias: the
+ * epilogue is ONE expression with one rounding decision, not a product that
+ * each caller finishes in its own way.
+ *
+ * So the contraction is settled by construction too, rather than by hoping the
+ * optimizer contracts alike at every site.  Where the target has a hardware FMA
+ * (__FP_FAST_FMAF: aarch64 always, x86 with -mfma) fmaf() IS the contraction,
+ * named explicitly, which is also what SIMD=auto already emitted for the quad
+ * epilogue before this change -- so the production numerics do not move.  Where
+ * it does not, the product is frozen before the add so nothing can fuse it
+ * later.  Either way every int8 kernel in this file rounds the same number of
+ * times in the same places. */
+/* A value barrier on a float: after it the compiler knows nothing about where
+ * the value came from, so it can neither regroup the product that produced it
+ * nor fuse it into what consumes it.  It emits no instruction; the constraint
+ * just names a register class the value is already in. */
+#if defined(__GNUC__) && defined(__aarch64__)
+#define QMAT_FREEZE_F32(v) __asm__("" : "+w"(v))
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#define QMAT_FREEZE_F32(v) __asm__("" : "+x"(v))
+#elif defined(__GNUC__)
+#define QMAT_FREEZE_F32(v) __asm__("" : "+m"(v))
+#else
+#define QMAT_FREEZE_F32(v) do { volatile float qmat_frz_ = (v); (v) = qmat_frz_; } while (0)
+#endif
+
+static inline float qmat_row_scale(float ws, float sx) {
+    float rs = ws * sx;
+    QMAT_FREEZE_F32(rs);
+    return rs;
+}
+
+/* The epilogue itself, so the one expression shape has one name.  `rs` must
+ * come from qmat_row_scale(); passing `ws * sx` directly would hand the
+ * optimizer the three-factor product back.  `bias` is a value, not a pointer:
+ * a caller with no bias passes 0.0f, which keeps the rounding count the same
+ * for biased and unbiased rows (fmaf(a, b, 0) is a*b rounded once, and the
+ * frozen fallback's `p + 0.0f` is exact). */
+static inline float qmat_row_epilogue(int32_t s, float rs, float bias) {
+#if defined(__FP_FAST_FMAF)
+    return fmaf((float)s, rs, bias);
+#else
+    float p = (float)s * rs;
+    QMAT_FREEZE_F32(p);
+    return p + bias;
+#endif
+}
+
 static float dot_q8(const void *qa, float sx, const int8_t *w, float ws,
-                    int32_t rowsum, size_t k, int level) {
-    return (float)dot_q8_i32(qa, w, rowsum, k, level) * ws * sx;
+                    int32_t rowsum, size_t k, int level, float bias) {
+    return qmat_row_epilogue(dot_q8_i32(qa, w, rowsum, k, level),
+                             qmat_row_scale(ws, sx), bias);
+}
+
+/* The int4 group accumulation, and it is the int8 epilogue's problem again in
+ * a different costume.  `acc += (float)gi * scales[g]` is a multiply-add whose
+ * rounding count -- fused or not -- the compiler decides PER SITE, and int4 has
+ * four sites: dot_q4's three branches and matvec_q4's quad macro.  Nothing
+ * caught it, because int4's existing gates compare against an f32 dot with a
+ * relative tolerance and a 1 ULP accumulation difference disappears into it;
+ * self_test_q4_identity() found it the moment it asserted equality instead.
+ *
+ * It is the same hazard for the same reason: matvec_q4 sends rows 0..3 through
+ * the quad macro and the remainder through dot_q4, so two spellings of one sum
+ * decide a row's answer.  Today that is position-INdependent, because a row's
+ * index does not change with the batch -- but "it happens not to be reachable"
+ * is what was said about the SMMLA pair too.  One helper, one shape, one
+ * rounding decision, and self_test_q4_identity() asserts it rather than
+ * assuming it. */
+static inline float qmat_q4_accum(float acc, int32_t gi, float scale) {
+#if defined(__FP_FAST_FMAF)
+    return fmaf((float)gi, scale, acc);
+#else
+    float p = (float)gi * scale;
+    QMAT_FREEZE_F32(p);
+    return acc + p;
+#endif
+}
+
+/* And the row's last step, `acc * sx + bias`, for the same reason and with the
+ * same answer.  The bias is a value here rather than something each caller
+ * adds afterwards, because `acc * sx` followed by a separate `+= bias[row]`
+ * rounds twice where the inlined `acc * sx + bias[row]` rounds once -- which
+ * is precisely the asymmetry that made dot_q8 and the quad epilogues disagree
+ * by 1 ULP before E4-20b. */
+static inline float qmat_q4_finish(float acc, float sx, float bias) {
+#if defined(__FP_FAST_FMAF)
+    return fmaf(acc, sx, bias);
+#else
+    float p = acc * sx;
+    QMAT_FREEZE_F32(p);
+    return p + bias;
+#endif
 }
 
 /* qx is the int8 activation; q is the packed INT4 weight group row; scales has
  * one entry per group of 32.  k must be a multiple of 32. */
-static float dot_q4(const int8_t *qx, float sx, const uint8_t *q, const float *scales, size_t k) {
+/* ------------------------------------------------------- INT4 on x86 (E4-21)
+ *
+ * Until this existed, int4 on the x86 production target had NO VECTOR PATH AT
+ * ALL: `dot_q4` had a NEON SDOT branch and, for everything else, a scalar
+ * nibble loop -- while int8 next door had AVX2 madd, AVX-VNNI and AVX-512
+ * VNNI.  int4 therefore carried half the weight bytes and computed them one
+ * nibble at a time, and would lose to int8 on every shape.  It also reframes
+ * the one number this repo had recorded: "int4 buys only 3% over int8 on the
+ * codec" was taken on ARM, where int4 at least has SDOT.
+ *
+ * WHY AVX2 AND NOT VNNI, WHICH IS THE INTERESTING PART.  int8 carries ONE
+ * SCALE PER ROW, so its VNNI loop accumulates int32 across a 64-element block
+ * -- QMAT_U8_BLOCK -- and in fact across the whole row, touching a float once
+ * at the end: about 2 instructions per 64 MACs.  int4 carries ONE SCALE PER
+ * GROUP OF 32, so the int32 accumulator MUST be flushed to float every 32
+ * elements.  That flush -- a horizontal reduce plus a convert, a multiply and
+ * an add -- is about 6 of the ~18 instructions this kernel spends per group,
+ * and the nibble unpack is another 6.  The dot itself is 3.
+ *
+ * So VPDPBUSD, which would replace those 3 with 2, moves the whole kernel by
+ * roughly a tenth.  The 32-element group really is too short for VNNI to be
+ * the story here, and the prize is simply HAVING a vector path: ~18
+ * instructions per 32 MACs against the scalar loop's ~140.  An int4 VNNI
+ * variant is a small, well-understood delta on top of this one and is
+ * deliberately NOT written yet -- it should be measured on the machine that
+ * would benefit, not guessed at from here.
+ *
+ * THE ALGEBRA, AND THE CORRECTION THAT IS NOT A ROW SUM.  Q4_0 nibbles are
+ * stored offset by +8, so the weight is `n - 8` for a nibble n in [0, 15].
+ * _mm256_maddubs_epi16 wants its FIRST operand unsigned, and the nibble
+ * already is, so the weights go in unsigned and the activation stays signed:
+ *
+ *     sum (n - 8) * x  ==  sum n * x  -  8 * sum x
+ *
+ * and BOTH terms are computed with maddubs against the same activation, so
+ * the correction is subtracted in int16 before the widening and there is no
+ * precomputed sum of anything.  That is on purpose: the int8 path's +128
+ * correction needs a cached per-row prefix sum, and the mistake its own
+ * self-test exists to catch is taking that sum over the wrong extent.  Here
+ * the equivalent term is per group AND depends only on the activation, so
+ * rather than add a second table with a second extent to get wrong, it is
+ * recomputed in two instructions from the operand that defines it.
+ *
+ * No saturation: n in [0,15] and x in [-128,127] give pairwise sums in
+ * [-3840, 3810]; the correction term is in [-2048, 2032]; their difference is
+ * in [-5888, 5858], all far inside int16.  self_test_q4_x86_identity() asserts
+ * the bound as well as the result.
+ *
+ * BIT-IDENTICAL, NOT MERELY CLOSE.  The group loop keeps the scalar
+ * reference's order, and each group's int32 is exact, so `acc += (float)gi *
+ * scales[g]` sees the same sequence of floats in the same order.  The gates
+ * assert equality, not a tolerance. */
+/* The scalar group, always compiled: it is the #else branch below AND the
+ * reference self_test_q4_identity() holds every vector variant to.  Neither
+ * the NEON nor the x86 int4 kernel had ever been compared against it. */
+static int32_t q4_group_i32_scalar(const uint8_t *q, const int8_t *x) {
+    int32_t gi = 0;
+    for (size_t j = 0; j < QMAT_Q4_GROUP; j += 2) {
+        const uint8_t b = q[j / 2];
+        const int lo = (int)(b & 0x0F) - 8;
+        const int hi = (int)(b >> 4) - 8;
+        gi += lo * (int32_t)x[j] + hi * (int32_t)x[j + 1];
+    }
+    return gi;
+}
+
+#if defined(MYNAH_QMAT_AVX2)
+/* 32 unsigned nibbles in natural index order from 16 packed bytes.  Low nibble
+ * is the even index and high nibble the odd one, so interleaving lo and hi
+ * with two unpacks puts them back in order -- which is cheaper than
+ * deinterleaving the activation, and leaves the activation a plain load. */
+static inline __m256i q4_unpack_u8(const uint8_t *q) {
+    const __m128i b = _mm_loadu_si128((const __m128i *)q);
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    const __m128i lo = _mm_and_si128(b, mask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), mask);
+    return _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+}
+
+/* sum over one group of 32 of (nibble - 8) * x, exactly. */
+static inline int32_t q4_group_i32_avx2(const uint8_t *q, const int8_t *x) {
+    const __m256i w = q4_unpack_u8(q);
+    const __m256i xv = _mm256_loadu_si256((const __m256i *)x);
+    const __m256i eight = _mm256_set1_epi8(8);
+    /* maddubs: unsigned x signed, pairwise, into int16. */
+    const __m256i t = _mm256_sub_epi16(_mm256_maddubs_epi16(w, xv),
+                                       _mm256_maddubs_epi16(eight, xv));
+    __m256i acc = _mm256_madd_epi16(t, _mm256_set1_epi16(1));
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc),
+                              _mm256_extracti128_si256(acc, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    return _mm_cvtsi128_si32(s);
+}
+#endif
+
+static float dot_q4(const int8_t *qx, float sx, const uint8_t *q,
+                    const float *scales, size_t k, float bias) {
     const size_t groups = k / QMAT_Q4_GROUP;
 #if defined(MYNAH_QMAT_DOTPROD)
     const int8x16_t off = vdupq_n_s8(8);
@@ -789,22 +1062,23 @@ static float dot_q4(const int8_t *qx, float sx, const uint8_t *q, const float *s
         const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), off);
         const int8x16x2_t xg = vld2q_s8(qx + g * 32); /* val[0]=even, val[1]=odd */
         int32x4_t ig = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, xg.val[0]), hi, xg.val[1]);
-        acc += (float)vaddvq_s32(ig) * scales[g];
+        acc = qmat_q4_accum(acc, vaddvq_s32(ig), scales[g]);
     }
-    return acc * sx;
+    return qmat_q4_finish(acc, sx, bias);
+#elif defined(MYNAH_QMAT_AVX2)
+    float acc = 0.0f;
+    for (size_t g = 0; g < groups; ++g) {
+        acc = qmat_q4_accum(acc, q4_group_i32_avx2(q + g * 16, qx + g * 32),
+                            scales[g]);
+    }
+    return qmat_q4_finish(acc, sx, bias);
 #else
     float acc = 0.0f;
     for (size_t g = 0; g < groups; ++g) {
-        int32_t gi = 0;
-        for (size_t j = 0; j < QMAT_Q4_GROUP; j += 2) {
-            const uint8_t b = q[g * 16 + j / 2];
-            const int lo = (int)(b & 0x0F) - 8;
-            const int hi = (int)(b >> 4) - 8;
-            gi += lo * (int32_t)qx[g * 32 + j] + hi * (int32_t)qx[g * 32 + j + 1];
-        }
-        acc += (float)gi * scales[g];
+        acc = qmat_q4_accum(acc, q4_group_i32_scalar(q + g * 16, qx + g * 32),
+                            scales[g]);
     }
-    return acc * sx;
+    return qmat_q4_finish(acc, sx, bias);
 #endif
 }
 
@@ -823,15 +1097,15 @@ static void matvec_q8(float *out, const void *qa, float sx,
             int32_t s[4];
             dot4_u8_i32(xu, weights, cols, rowsum, row, level, s);
             for (size_t r = 0; r < 4u; ++r) {
-                out[row + r] = (float)s[r] * scales[row + r] * sx +
-                               (bias == NULL ? 0.0f : bias[row + r]);
+                out[row + r] = qmat_row_epilogue(
+                    s[r], qmat_row_scale(scales[row + r], sx),
+                    bias == NULL ? 0.0f : bias[row + r]);
             }
         }
         for (; row < rows; ++row) {
-            float value = dot_q8(xu, sx, weights + row * cols, scales[row],
-                                 rowsum[row], cols, level);
-            if (bias != NULL) value += bias[row];
-            out[row] = value;
+            out[row] = dot_q8(xu, sx, weights + row * cols, scales[row],
+                              rowsum[row], cols, level,
+                              bias == NULL ? 0.0f : bias[row]);
         }
         return;
     }
@@ -865,13 +1139,14 @@ static void matvec_q8(float *out, const void *qa, float sx,
             s2 += (int32_t)w2[j] * x;
             s3 += (int32_t)w3[j] * x;
         }
-        out[row] = (float)s0 * scales[row] * sx + (bias == NULL ? 0.0f : bias[row]);
-        out[row + 1u] = (float)s1 * scales[row + 1u] * sx +
-                        (bias == NULL ? 0.0f : bias[row + 1u]);
-        out[row + 2u] = (float)s2 * scales[row + 2u] * sx +
-                        (bias == NULL ? 0.0f : bias[row + 2u]);
-        out[row + 3u] = (float)s3 * scales[row + 3u] * sx +
-                        (bias == NULL ? 0.0f : bias[row + 3u]);
+        out[row] = qmat_row_epilogue(s0, qmat_row_scale(scales[row], sx),
+                                     bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = qmat_row_epilogue(s1, qmat_row_scale(scales[row + 1u], sx),
+                                          bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = qmat_row_epilogue(s2, qmat_row_scale(scales[row + 2u], sx),
+                                          bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = qmat_row_epilogue(s3, qmat_row_scale(scales[row + 3u], sx),
+                                          bias == NULL ? 0.0f : bias[row + 3u]);
     }
 #elif defined(MYNAH_QMAT_AVX2)
     for (; row + 4u <= rows; row += 4u) {
@@ -879,20 +1154,19 @@ static void matvec_q8(float *out, const void *qa, float sx,
         const int32_t s1 = dot_q8_i32_avx2(qx, weights + (row + 1u) * cols, cols);
         const int32_t s2 = dot_q8_i32_avx2(qx, weights + (row + 2u) * cols, cols);
         const int32_t s3 = dot_q8_i32_avx2(qx, weights + (row + 3u) * cols, cols);
-        out[row] = (float)s0 * scales[row] * sx + (bias == NULL ? 0.0f : bias[row]);
-        out[row + 1u] = (float)s1 * scales[row + 1u] * sx +
-                        (bias == NULL ? 0.0f : bias[row + 1u]);
-        out[row + 2u] = (float)s2 * scales[row + 2u] * sx +
-                        (bias == NULL ? 0.0f : bias[row + 2u]);
-        out[row + 3u] = (float)s3 * scales[row + 3u] * sx +
-                        (bias == NULL ? 0.0f : bias[row + 3u]);
+        out[row] = qmat_row_epilogue(s0, qmat_row_scale(scales[row], sx),
+                                     bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = qmat_row_epilogue(s1, qmat_row_scale(scales[row + 1u], sx),
+                                          bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = qmat_row_epilogue(s2, qmat_row_scale(scales[row + 2u], sx),
+                                          bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = qmat_row_epilogue(s3, qmat_row_scale(scales[row + 3u], sx),
+                                          bias == NULL ? 0.0f : bias[row + 3u]);
     }
 #endif
     for (; row < rows; ++row) {
-        float value = dot_q8(qx, sx, weights + row * cols, scales[row], 0,
-                             cols, QMAT_U8_OFF);
-        if (bias != NULL) value += bias[row];
-        out[row] = value;
+        out[row] = dot_q8(qx, sx, weights + row * cols, scales[row], 0,
+                          cols, QMAT_U8_OFF, bias == NULL ? 0.0f : bias[row]);
     }
 }
 
@@ -926,7 +1200,8 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
                 const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), off); \
                 const int32x4_t dot = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x.val[0]), \
                                                 hi, x.val[1]); \
-                (accumulator) += (float)vaddvq_s32(dot) * (scale)[group]; \
+                (accumulator) = qmat_q4_accum((accumulator), vaddvq_s32(dot), \
+                                             (scale)[group]); \
             } while (0)
             Q4_DOT_ROW(w0, s0, a0);
             Q4_DOT_ROW(w1, s1, a1);
@@ -934,17 +1209,19 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
             Q4_DOT_ROW(w3, s3, a3);
 #undef Q4_DOT_ROW
         }
-        out[row] = a0 * sx + (bias == NULL ? 0.0f : bias[row]);
-        out[row + 1u] = a1 * sx + (bias == NULL ? 0.0f : bias[row + 1u]);
-        out[row + 2u] = a2 * sx + (bias == NULL ? 0.0f : bias[row + 2u]);
-        out[row + 3u] = a3 * sx + (bias == NULL ? 0.0f : bias[row + 3u]);
+        out[row] = qmat_q4_finish(a0, sx, bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = qmat_q4_finish(a1, sx,
+                                       bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = qmat_q4_finish(a2, sx,
+                                       bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = qmat_q4_finish(a3, sx,
+                                       bias == NULL ? 0.0f : bias[row + 3u]);
     }
 #endif
     for (; row < rows; ++row) {
-        float value = dot_q4(qx, sx, weights + row * (cols / 2u),
-                             scales + row * (cols / QMAT_Q4_GROUP), cols);
-        if (bias != NULL) value += bias[row];
-        out[row] = value;
+        out[row] = dot_q4(qx, sx, weights + row * (cols / 2u),
+                          scales + row * (cols / QMAT_Q4_GROUP), cols,
+                          bias == NULL ? 0.0f : bias[row]);
     }
 }
 
@@ -1589,14 +1866,14 @@ static void matvec_q8_pair_i8mm(float *out0, float *out1,
             s10 += (int32_t)w1[j] * a0;
             s11 += (int32_t)w1[j] * a1;
         }
-        out0[row]      = (float)s00 * scales[row] * sx0 +
-                         (bias == NULL ? 0.0f : bias[row]);
-        out0[row + 1u] = (float)s10 * scales[row + 1u] * sx0 +
-                         (bias == NULL ? 0.0f : bias[row + 1u]);
-        out1[row]      = (float)s01 * scales[row] * sx1 +
-                         (bias == NULL ? 0.0f : bias[row]);
-        out1[row + 1u] = (float)s11 * scales[row + 1u] * sx1 +
-                         (bias == NULL ? 0.0f : bias[row + 1u]);
+        out0[row]      = qmat_row_epilogue(s00, qmat_row_scale(scales[row], sx0),
+                                           bias == NULL ? 0.0f : bias[row]);
+        out0[row + 1u] = qmat_row_epilogue(s10, qmat_row_scale(scales[row + 1u], sx0),
+                                           bias == NULL ? 0.0f : bias[row + 1u]);
+        out1[row]      = qmat_row_epilogue(s01, qmat_row_scale(scales[row], sx1),
+                                           bias == NULL ? 0.0f : bias[row]);
+        out1[row + 1u] = qmat_row_epilogue(s11, qmat_row_scale(scales[row + 1u], sx1),
+                                           bias == NULL ? 0.0f : bias[row + 1u]);
     }
     if (row < rows) {
         matvec_q8(out0 + row, x0, sx0, weights + row * cols, scales + row, NULL,
@@ -1618,16 +1895,25 @@ static void matvec_q8_pair_i8mm(float *out0, float *out1,
  *
  * This must be bit-exact against the unbatched path, or the audio a request
  * gets would depend on which other requests it happened to batch with.  It is,
- * and the reason is narrower than it looks: every (weight row, activation)
- * pair runs THE SAME COMPILED KERNEL over the same k in the same order, and
- * only the order of independent pairs changes.  "The same arithmetic" is not
- * enough -- a second kernel computing the same products, however carefully
- * transcribed, rounds its float epilogue differently under -ffast-math and
- * breaks the guarantee.  That is why the SMMLA pair kernel is not wired in
- * here (qmat_i8mm_batched()), and why self_test_batch_membership() asserts the
- * property directly rather than trusting the structure.  The f32 path has no
- * such guarantee either -- sgemm may accumulate differently for M=B than for
- * M=1 -- so it stays one call per row. */
+ * and the reason used to be narrower than it looks: every (weight row,
+ * activation) pair ran THE SAME COMPILED KERNEL over the same k in the same
+ * order, and only the order of independent pairs changed.  "The same
+ * arithmetic" was not enough -- a second kernel computing the same products,
+ * however carefully transcribed, rounded its float epilogue differently under
+ * -ffast-math and broke the guarantee.  That is what kept the SMMLA pair
+ * kernel out of this path until E4-20b.
+ *
+ * It is wired in now, and the guarantee no longer rests on there being only
+ * one kernel.  The int32 side was always exact -- SMMLA's 2x2 tile is
+ * bit-identical to two SDOT rows -- and the float side now goes through
+ * qmat_row_scale()/qmat_row_epilogue(), one two-factor product with one
+ * grouping, so a row rounds the same whether it arrived as the lead of a pair,
+ * the follower, the SDOT tail of an odd batch, or alone.  The structure is
+ * still not what is trusted: self_test_batch_membership() asserts the property
+ * directly, and mynah_qmat_self_test() additionally runs every shape with the
+ * SMMLA wiring forced on and forced off and requires the two to agree bit for
+ * bit.  The f32 path has no such guarantee -- sgemm may accumulate differently
+ * for M=B than for M=1 -- so it stays one call per row. */
 typedef struct {
     const qmat_entry *entry;
     const void *qx;         /* batch * cols, INT8 (signed or u8) / INT4 */
@@ -1927,14 +2213,14 @@ int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
         const float sx = quantize_act(qx, xr, k, level);
         if (!cache->use_row4) {
             for (size_t row = 0; row < n; ++row) {
-                float value = e->qtype == QMAT_INT8
-                                  ? dot_q8(qx, sx, e->q8 + row * k, e->scales[row],
-                                           e->rowsum[row], k, level)
-                                  : dot_q4((const int8_t *)qx, sx,
-                                           e->q4 + row * (k / 2u),
-                                           e->scales + row * (k / QMAT_Q4_GROUP), k);
-                if (bias != NULL) value += bias[row];
-                orow[row] = value;
+                const float b = bias == NULL ? 0.0f : bias[row];
+                orow[row] = e->qtype == QMAT_INT8
+                                ? dot_q8(qx, sx, e->q8 + row * k, e->scales[row],
+                                         e->rowsum[row], k, level, b)
+                                : dot_q4((const int8_t *)qx, sx,
+                                         e->q4 + row * (k / 2u),
+                                         e->scales + row * (k / QMAT_Q4_GROUP),
+                                         k, b);
             }
         } else if (e->qtype == QMAT_INT8) {
             matvec_q_rows(orow, qx, xr, sx, e->q8, e->scales, e->rowsum, bias,
@@ -2129,8 +2415,9 @@ static int self_test_one(int qtype, char *error, size_t error_capacity) {
         for (size_t j = 0; j < (size_t)K; ++j) ref += w[i * K + j] * x[j];
         const float got = qtype == QMAT_INT8
                               ? dot_q8(qx, sx, q8 + i * K, scales8[i], 0, K,
-                                       QMAT_U8_OFF)
-                              : dot_q4(qx, sx, q4 + i * (K / 2), scales4 + i * (K / QMAT_Q4_GROUP), K);
+                                       QMAT_U8_OFF, 0.0f)
+                              : dot_q4(qx, sx, q4 + i * (K / 2),
+                                       scales4 + i * (K / QMAT_Q4_GROUP), K, 0.0f);
         if (i < MATVEC_ROWS) {
             const float expected = got + bias[i];
             const float tolerance = 1.0e-6f * (1.0f + fabsf(expected));
@@ -2858,36 +3145,45 @@ static int u8_identity_one(size_t n, size_t k, int level,
         }
     }
 
-    /* And the assembled matvec, to 2 ULP.  This catches a wrong row index or a
-     * wrong scale in the quad epilogue (either lands far outside 2 ULP) while
-     * tolerating the -ffast-math reassociation documented above. */
+    /* And the assembled matvec, BIT FOR BIT.  This used to be a 2 ULP bound,
+     * and the bound was a symptom: the signed quad epilogue and the u8 quad
+     * epilogue were two textual three-factor products that -ffast-math grouped
+     * independently, so they disagreed at lane r == 3 of each quad on x86 while
+     * every integer above was already identical.  Both now end through
+     * qmat_row_scale()/qmat_row_epilogue(), which is one grouping, so the only
+     * honest assertion is equality -- and asserting it here is what makes the
+     * repair visible on a machine with a VNNI unit, which is where the ULP
+     * disagreement was originally seen. */
     matvec_q8(ref, qs, ss, q8, scales, NULL, bias, n, k, QMAT_U8_OFF);
     matvec_q8(got, qu, su, q8, scales, rowsum, bias, n, k, level);
     for (size_t i = 0; i < n; ++i) {
-        const long gap = u8_ulp_gap(ref[i], got[i]);
-        if (gap > 2) {
+        if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
-                         "qmat u8 level=%d matvec row %zu of %zu (k=%zu) is "
-                         "%ld ULP off, bound is 2: %.9g vs %.9g",
-                         level, i, n, k, gap, (double)ref[i], (double)got[i]);
+                         "qmat u8 level=%d matvec row %zu of %zu (k=%zu) "
+                         "differs from the signed kernel by %ld ULP: %.9g vs "
+                         "%.9g -- the int32 above is identical, so this is the "
+                         "float epilogue regrouping per site again",
+                         level, i, n, k, u8_ulp_gap(ref[i], got[i]),
+                         (double)ref[i], (double)got[i]);
             }
             goto done;
         }
     }
-    /* And the single-row entry, which the non-row4 path uses.  Same 2 ULP
-     * bound and for the same reason: dot_q8's `* ws * sx` is the same
-     * three-factor product the optimizer may regroup per call site. */
+    /* And the single-row entry, which the non-row4 path uses.  Same reason and
+     * the same assertion: dot_q8's `* ws * sx` is now one call to
+     * qmat_row_scale(), so the two levels share one compiled epilogue. */
     for (size_t i = 0; i < n; ++i) {
-        const float a = dot_q8(qs, ss, q8 + i * k, scales[i], 0, k, QMAT_U8_OFF);
-        const float b = dot_q8(qu, su, q8 + i * k, scales[i], rowsum[i], k, level);
-        const long gap = u8_ulp_gap(a, b);
-        if (gap > 2) {
+        const float a = dot_q8(qs, ss, q8 + i * k, scales[i], 0, k,
+                               QMAT_U8_OFF, bias[i]);
+        const float b = dot_q8(qu, su, q8 + i * k, scales[i], rowsum[i], k,
+                               level, bias[i]);
+        if (memcmp(&a, &b, sizeof(float)) != 0) {
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
-                         "qmat u8 level=%d single-row %zu is %ld ULP off, "
-                         "bound is 2: %.9g vs %.9g",
-                         level, i, gap, (double)a, (double)b);
+                         "qmat u8 level=%d single-row %zu differs by %ld ULP: "
+                         "%.9g vs %.9g", level, i, u8_ulp_gap(a, b),
+                         (double)a, (double)b);
             }
             goto done;
         }
@@ -2926,34 +3222,42 @@ static int self_test_u8_identity(char *error, size_t error_capacity) {
 #if defined(MYNAH_QMAT_ARM_I8MM)
 /* SMMLA accumulates the same products in a different order, and integer
  * addition does not care about order, so the batched 2x2 tile must land on the
- * SAME INT32 as two separate SDOT rows.  That is the claim this checks, and it
- * holds exactly: scales and sx are forced to 1 and bias to NULL, so the float
- * epilogue is the identity on an int32 that is far inside the 2^24 a float
- * represents exactly, and any surviving difference is an integer difference.
+ * SAME INT32 as two separate SDOT rows.  That was always true and is checked
+ * first, with scales and sx forced to 1 and bias NULL, so the float epilogue is
+ * the identity on an int32 far inside the 2^24 a float represents exactly and
+ * any surviving difference is an integer difference.
  *
- * It deliberately does NOT assert that the two kernels agree as floats.  They
- * do not -- 71 of 192 rows differ by up to 2 ULP at 96x256 under GCC 15 -- and
- * the previous version of this test asserted exactly that and passed, because
- * 13x37 is too small a shape to make the epilogue's reassociation visible.  A
- * gate that passes because it never reaches the road is worse than no gate: it
- * is what let the SMMLA kernel be wired into the batched linear.  So the
- * shapes below are chosen to reach it -- one large enough to diverge, one with
- * an odd row count and an odd k to cover the two tails -- and the float side
- * is reported as a bound, not as identity.  qmat_i8mm_batched() carries the
- * consequence. */
+ * The second pass is the one that is new, and it is the whole point of E4-20b.
+ * It runs the same shapes with REAL per-row scales, a real activation scale and
+ * a real bias -- the arithmetic the serving path actually does -- and demands
+ * BIT-IDENTICAL floats.  The previous version of this test deliberately did not
+ * assert that, because it was not true: 71 of 192 rows differed by up to 2 ULP
+ * at 96x256 under GCC 15, the two kernels' three-factor epilogues having been
+ * grouped differently by the optimizer.  Now both end through
+ * qmat_row_scale()/qmat_row_epilogue() and the difference is gone by
+ * construction, so anything but equality is a regression in the thing the
+ * barrier exists to hold.
+ *
+ * The shapes are chosen to REACH the epilogue's reassociation rather than to
+ * be convenient: one large enough that the old defect was visible (96x256), one
+ * with an odd row count and an odd k so both tails are covered (13x37).  An
+ * earlier version used only 13x37, passed, and thereby licensed wiring the
+ * broken kernel into the batched linear -- a gate that passes because it never
+ * reaches the road is worse than no gate. */
 static int self_test_i8mm_identity_shape(size_t N, size_t K,
                                          char *error, size_t error_capacity) {
     int status = -1;
     float *w = (float *)malloc(N * K * sizeof(float));
     float *x = (float *)malloc(2u * K * sizeof(float));
     float *unit = (float *)malloc(N * sizeof(float));
+    float *bias = (float *)malloc(N * sizeof(float));
     float *ref = (float *)malloc(2u * N * sizeof(float));
     float *got = (float *)malloc(2u * N * sizeof(float));
     int8_t *q8 = (int8_t *)malloc(N * K);
     float *scales = (float *)malloc(N * sizeof(float));
     int8_t *qx = (int8_t *)malloc(2u * K);
-    if (w == NULL || x == NULL || unit == NULL || ref == NULL || got == NULL ||
-        q8 == NULL || scales == NULL || qx == NULL) {
+    if (w == NULL || x == NULL || unit == NULL || bias == NULL || ref == NULL ||
+        got == NULL || q8 == NULL || scales == NULL || qx == NULL) {
         if (error != NULL && error_capacity > 0)
             snprintf(error, error_capacity, "qmat i8mm identity out of memory");
         goto done;
@@ -2962,10 +3266,13 @@ static int self_test_i8mm_identity_shape(size_t N, size_t K,
         w[i] = sinf(0.021f * (float)i) * (0.5f + 0.5f * cosf(0.0013f * (float)i));
     for (size_t i = 0; i < 2u * K; ++i) x[i] = cosf(0.017f * (float)i) - 0.2f;
     for (size_t i = 0; i < N; ++i) unit[i] = 1.0f;
+    for (size_t i = 0; i < N; ++i) bias[i] = (float)i * 0.03125f - 0.6f;
     quantize_weight_int8(w, N, K, q8, scales);
-    (void)quantize_act_int8(qx, x, K);
-    (void)quantize_act_int8(qx + K, x + K, K);
-    /* scale = sx = 1, bias = NULL: out is (float)s, exact for |s| < 2^24. */
+    const float sx0 = quantize_act_int8(qx, x, K);
+    const float sx1 = quantize_act_int8(qx + K, x + K, K);
+
+    /* Pass 1: scale = sx = 1, bias = NULL.  out is (float)s, exact for
+     * |s| < 2^24, so this is an assertion about the integers. */
     matvec_q8(ref, qx, 1.0f, q8, unit, NULL, NULL, N, K, QMAT_U8_OFF);
     matvec_q8(ref + N, qx + K, 1.0f, q8, unit, NULL, NULL, N, K, QMAT_U8_OFF);
     matvec_q8_pair_i8mm(got, got + N, qx, qx + K, 1.0f, 1.0f, q8, unit, NULL,
@@ -2989,9 +3296,31 @@ static int self_test_i8mm_identity_shape(size_t N, size_t K,
             goto done;
         }
     }
+
+    /* Pass 2: the real epilogue -- per-row scales, two different activation
+     * scales, a bias.  Bit-identical, not bounded. */
+    matvec_q8(ref, qx, sx0, q8, scales, NULL, bias, N, K, QMAT_U8_OFF);
+    matvec_q8(ref + N, qx + K, sx1, q8, scales, NULL, bias, N, K, QMAT_U8_OFF);
+    matvec_q8_pair_i8mm(got, got + N, qx, qx + K, sx0, sx1, q8, scales, bias,
+                        N, K);
+    for (size_t i = 0; i < 2u * N; ++i) {
+        if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat i8mm float epilogue differs at row %zu of "
+                         "%zux%zu (activation %zu) by %ld ULP: sdot %.9g vs "
+                         "smmla %.9g -- the int32 above is identical, so the "
+                         "two kernels are grouping the scale product "
+                         "differently again",
+                         i % N, N, K, i / N, u8_ulp_gap(ref[i], got[i]),
+                         (double)ref[i], (double)got[i]);
+            }
+            goto done;
+        }
+    }
     status = 0;
 done:
-    free(w); free(x); free(unit); free(ref); free(got);
+    free(w); free(x); free(unit); free(bias); free(ref); free(got);
     free(q8); free(scales); free(qx);
     return status;
 }
@@ -3006,11 +3335,264 @@ static int self_test_i8mm_identity(char *error, size_t error_capacity) {
 }
 #endif
 
+/* ---------------------------------------------- the INT4 identity (E4-21)
+ *
+ * int4's vector kernels compute the same integers as the scalar nibble loop or
+ * they are wrong.  There is no rounding anywhere in a group: nibbles are
+ * exact, the activation is exact int8, and the products and their sum all fit
+ * int32 with room to spare.  So the only acceptable result is BIT-IDENTICAL
+ * output, and this asserts exactly that -- first per group, in the integer
+ * domain where the claim is unambiguous, then through the assembled dot_q4()
+ * and matvec_q4() where a wrong group index or a wrong scale would show.
+ *
+ * IT IS NOT ONLY AN x86 TEST.  Nothing in this tree had ever compared the NEON
+ * int4 kernel against the scalar one either: the existing int4 gates compare
+ * the quantized result against an f32 dot with a RELATIVE TOLERANCE, which int4
+ * needs (it is a lossy format) but which is far too loose to notice a kernel
+ * that has, say, swapped the even and odd nibbles -- that lands inside the
+ * tolerance on smooth data and is the exact mistake the interleave in
+ * q4_unpack_u8() could make.  So this runs everywhere and compares the kernel
+ * this build actually uses against the reference it is supposed to reproduce.
+ *
+ * THE SATURATION BOUND is asserted too, not just assumed.  The x86 kernel
+ * leans on _mm256_maddubs_epi16 not saturating: nibble in [0,15] against an
+ * int8 activation gives pairwise sums in [-3840, 3810], the `- 8 * sum x`
+ * correction term is in [-2048, 2032], and the int16 difference is in
+ * [-5888, 5858].  The data below is built to reach the extremes (an all-0x0F
+ * group against an all -128 activation and the mirror of it), because a bound
+ * that is only ever exercised at a tenth of its range is not evidence. */
+static int self_test_q4_identity(char *error, size_t error_capacity) {
+    enum { GROUPS = 9, K = GROUPS * QMAT_Q4_GROUP, N = 7 };
+    int status = -1;
+    uint8_t *q = (uint8_t *)malloc((size_t)N * (K / 2u));
+    int8_t *x = (int8_t *)malloc(K);
+    float *scales = (float *)malloc((size_t)N * GROUPS * sizeof(float));
+    float *bias = (float *)malloc((size_t)N * sizeof(float));
+    float *ref = (float *)malloc((size_t)N * sizeof(float));
+    float *acc_ref = (float *)malloc((size_t)N * sizeof(float));
+    float *got = (float *)malloc((size_t)N * sizeof(float));
+    if (q == NULL || x == NULL || scales == NULL || bias == NULL || ref == NULL ||
+        acc_ref == NULL || got == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat q4 identity out of memory");
+        goto done;
+    }
+    /* Group 0 of every row is all 0x0F against an all -128 activation, and
+     * group 1 is all 0x00, so the two int16 extremes are actually reached. */
+    for (size_t i = 0; i < (size_t)N * (K / 2u); ++i) {
+        const size_t g = (i % (K / 2u)) / 16u;
+        if (g == 0u) q[i] = 0xFFu;
+        else if (g == 1u) q[i] = 0x00u;
+        else q[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    }
+    for (size_t j = 0; j < (size_t)K; ++j) {
+        if (j < QMAT_Q4_GROUP) x[j] = -128;
+        else if (j < 2u * QMAT_Q4_GROUP) x[j] = 127;
+        else x[j] = (int8_t)((int)((j * 53u + 7u) % 255u) - 127);
+    }
+    for (size_t i = 0; i < (size_t)N * GROUPS; ++i)
+        scales[i] = 1.0e-3f * (1.0f + (float)(i % 13) * 0.37f);
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = (float)i * 0.0625f - 0.25f;
+
+    /* 1. Per group, in the integer domain, plus the int16 bound the x86
+     *    kernel's lack of saturation depends on. */
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        for (size_t g = 0; g < (size_t)GROUPS; ++g) {
+            const uint8_t *qg = q + i * (K / 2u) + g * 16u;
+            const int8_t *xg = x + g * 32u;
+            const int32_t want = q4_group_i32_scalar(qg, xg);
+            int32_t have = want;
+#if defined(MYNAH_QMAT_AVX2)
+            have = q4_group_i32_avx2(qg, xg);
+#endif
+            if (want != have) {
+                if (error != NULL && error_capacity > 0) {
+                    snprintf(error, error_capacity,
+                             "qmat q4 group int32 differs at row %zu group %zu: "
+                             "scalar %d vs vector %d -- the nibble order, the "
+                             "-8 offset or the correction term is wrong",
+                             i, g, want, have);
+                }
+                goto done;
+            }
+            /* Pairwise int16 partials must not have saturated on the way. */
+            for (size_t j = 0; j < QMAT_Q4_GROUP; j += 2) {
+                const uint8_t b = qg[j / 2];
+                const long p = (long)((int)(b & 0x0F) - 8) * (long)xg[j] +
+                               (long)((int)(b >> 4) - 8) * (long)xg[j + 1];
+                if (p < -32768L || p > 32767L) {
+                    if (error != NULL && error_capacity > 0) {
+                        snprintf(error, error_capacity,
+                                 "qmat q4 pairwise partial %ld at row %zu group "
+                                 "%zu pair %zu is outside int16 -- the x86 "
+                                 "kernel's maddubs would saturate", p, i, g,
+                                 j / 2u);
+                    }
+                    goto done;
+                }
+            }
+        }
+    }
+
+    /* 2. The assembled row, bit for bit, against the same group order. */
+    const float sx = 0.0072f;
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        float acc = 0.0f;
+        for (size_t g = 0; g < (size_t)GROUPS; ++g) {
+            acc = qmat_q4_accum(acc,
+                                q4_group_i32_scalar(q + i * (K / 2u) + g * 16u,
+                                                    x + g * 32u),
+                                scales[i * GROUPS + g]);
+        }
+        acc_ref[i] = acc;
+        ref[i] = qmat_q4_finish(acc, sx, 0.0f);
+        got[i] = dot_q4(x, sx, q + i * (K / 2u), scales + i * GROUPS, K, 0.0f);
+        if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat q4 dot row %zu differs: reference %.9g vs kernel "
+                         "%.9g -- the integers matched, so this is the group "
+                         "order or a scale index", i, (double)ref[i],
+                         (double)got[i]);
+            }
+            goto done;
+        }
+    }
+
+    /* 3. And matvec_q4, which has its own quad unroll on ARM and falls to the
+     *    dot above on x86 -- both must land on the same floats as the row loop
+     *    plus the bias. */
+    matvec_q4(got, x, sx, q, scales, bias, (size_t)N, (size_t)K);
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        const float want = qmat_q4_finish(acc_ref[i], sx, bias[i]);
+        if (memcmp(&want, &got[i], sizeof(float)) != 0) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat q4 matvec row %zu of %d differs from the row "
+                         "loop: %.9g vs %.9g", i, (int)N, (double)want,
+                         (double)got[i]);
+            }
+            goto done;
+        }
+    }
+    status = 0;
+done:
+    free(q); free(x); free(scales); free(bias); free(ref); free(acc_ref);
+    free(got);
+    return status;
+}
+
+/* ------------------------------------------- the SMMLA on/off A/B (E4-20b)
+ *
+ * self_test_batch_membership asks whether a row's answer survives a change of
+ * companions.  This asks the other half of the same question: whether it
+ * survives a change of KERNEL.  The batched linear is run twice over identical
+ * inputs, once with the SMMLA wiring forced off and once forced on, and the
+ * two must be bit-identical -- not close, identical, because the two runs
+ * differ only in which instruction did the integer accumulation and integer
+ * accumulation has no rounding to differ about.
+ *
+ * It is the direct statement of the promise that was broken before E4-20b: a
+ * deployment that flips MYNAH_QMAT_I8MM must not change one sample of audio.
+ * Membership alone would not catch a kernel that is consistently wrong in the
+ * same way for every position, and the goldens would not catch it either on a
+ * machine where the wiring is off.
+ *
+ * The shapes deliberately straddle the kernel's seams: an odd BATCH leaves one
+ * activation to the SDOT fallback, and an odd ROW COUNT leaves one weight row
+ * to matvec_q8 inside the SMMLA path, so both tails are compared as well as the
+ * 2x2 body.  On a build or CPU without SMMLA the force is a no-op and this
+ * degenerates to running the same thing twice, which costs a little time and
+ * asserts something trivially true -- preferable to an #if that would stop the
+ * test existing on the machines where it is cheapest to run. */
+static int self_test_i8mm_ab(char *error, size_t error_capacity) {
+    /* Odd and even on both axes; K covers a k with and without a 16-byte tail. */
+    static const size_t rows[4] = { 96u, 13u, 64u, 7u };
+    static const size_t cols[4] = { 256u, 37u, 128u, 40u };
+    enum { BMAX = 5 };
+    int status = -1;
+    const int saved = mynah_qmat_i8mm_force(-1);
+    mynah_qmat_cache *cache = mynah_qmat_cache_new(QMAT_INT8);
+    float *w = NULL, *x = NULL, *bias = NULL, *a = NULL, *b = NULL, *sx = NULL;
+    int8_t *qx = NULL;
+    if (cache == NULL || cache->qtype != QMAT_INT8) {
+        if (cache != NULL) { mynah_qmat_cache_free(cache); return 0; }
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat i8mm A/B self-test OOM");
+        return -1;
+    }
+    for (size_t sh = 0; sh < 4u; ++sh) {
+        const size_t N = rows[sh], K = cols[sh];
+        free(w); free(x); free(bias); free(a); free(b); free(qx); free(sx);
+        w = (float *)malloc(N * K * sizeof(float));
+        x = (float *)malloc((size_t)BMAX * K * sizeof(float));
+        bias = (float *)malloc(N * sizeof(float));
+        a = (float *)malloc((size_t)BMAX * N * sizeof(float));
+        b = (float *)malloc((size_t)BMAX * N * sizeof(float));
+        qx = (int8_t *)malloc((size_t)BMAX * K);
+        sx = (float *)malloc((size_t)BMAX * sizeof(float));
+        if (w == NULL || x == NULL || bias == NULL || a == NULL || b == NULL ||
+            qx == NULL || sx == NULL) {
+            if (error != NULL && error_capacity > 0)
+                snprintf(error, error_capacity, "qmat i8mm A/B self-test OOM");
+            goto done;
+        }
+        for (size_t i = 0; i < N * K; ++i)
+            w[i] = sinf(0.013f * (float)i) * (0.5f + 0.5f * cosf(0.0007f * (float)i));
+        for (size_t i = 0; i < (size_t)BMAX * K; ++i)
+            x[i] = cosf(0.023f * (float)i) - 0.15f;
+        for (size_t i = 0; i < N; ++i) bias[i] = (float)i * 0.0078125f - 0.4f;
+        for (size_t batch = 1u; batch <= (size_t)BMAX; ++batch) {
+            const float *in_rows[BMAX];
+            float *out_a[BMAX];
+            float *out_b[BMAX];
+            for (size_t j = 0; j < batch; ++j) {
+                in_rows[j] = x + j * K;
+                out_a[j] = a + j * N;
+                out_b[j] = b + j * N;
+            }
+            for (int pass = 0; pass < 2; ++pass) {
+                mynah_qmat_i8mm_force(pass);
+                if (mynah_qmat_linear_batched(cache, NULL, "i8mm.ab.self.test",
+                                              w, in_rows,
+                                              pass == 0 ? out_a : out_b, batch,
+                                              K, N, bias, qx, sx, error,
+                                              error_capacity) != 0) {
+                    goto done;
+                }
+            }
+            for (size_t j = 0; j < batch; ++j) {
+                for (size_t i = 0; i < N; ++i) {
+                    const size_t at = j * N + i;
+                    if (memcmp(&a[at], &b[at], sizeof(float)) == 0) continue;
+                    if (error != NULL && error_capacity > 0) {
+                        snprintf(error, error_capacity,
+                                 "qmat i8mm A/B %zux%zu batch %zu: activation "
+                                 "%zu row %zu differs by %ld ULP with the SMMLA "
+                                 "wiring off (%.9g) vs on (%.9g) -- flipping "
+                                 "MYNAH_QMAT_I8MM must not change one sample",
+                                 N, K, batch, j, i, u8_ulp_gap(a[at], b[at]),
+                                 (double)a[at], (double)b[at]);
+                    }
+                    goto done;
+                }
+            }
+        }
+    }
+    status = 0;
+done:
+    free(w); free(x); free(bias); free(a); free(b); free(qx); free(sx);
+    mynah_qmat_cache_free(cache);
+    mynah_qmat_i8mm_force(saved);
+    return status;
+}
+
 int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_u8_identity(error, error_capacity) != 0) return -1;
 #if defined(MYNAH_QMAT_ARM_I8MM)
     if (self_test_i8mm_identity(error, error_capacity) != 0) return -1;
 #endif
+    if (self_test_q4_identity(error, error_capacity) != 0) return -1;
     if (self_test_one(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_one(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_INT8, error, error_capacity) != 0) return -1;
@@ -3032,7 +3614,23 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
             }
         }
     }
-    if (self_test_batch_membership(QMAT_INT8, error, error_capacity) != 0) return -1;
+    /* INT8 membership is asserted against BOTH int8 kernels, not just the one
+     * this host would pick: the SMMLA wiring is what made the property fail,
+     * and a suite that only ever ran the default would have gone quiet again
+     * the moment the default changed. */
+    {
+        const int saved = mynah_qmat_i8mm_force(-1);
+        for (int mode = 0; mode < 2; ++mode) {
+            mynah_qmat_i8mm_force(mode);
+            if (self_test_batch_membership(QMAT_INT8, error,
+                                           error_capacity) != 0) {
+                mynah_qmat_i8mm_force(saved);
+                return -1;
+            }
+        }
+        mynah_qmat_i8mm_force(saved);
+    }
+    if (self_test_i8mm_ab(error, error_capacity) != 0) return -1;
     if (self_test_batch_membership(QMAT_INT4, error, error_capacity) != 0) return -1;
 #if defined(MYNAH_QMAT_F16)
     if (self_test_f16_convert(error, error_capacity) != 0) return -1;
@@ -3100,6 +3698,65 @@ const char *mynah_qmat_int8_kernel(const char **why) {
 #endif
 }
 
+/* The canonical epilogue, exported.  It is the same inline pair every kernel
+ * in this file ends with, so a test that pins this pins them. */
+float mynah_qmat_epilogue(int32_t s, float ws, float sx, float bias) {
+    return qmat_row_epilogue(s, qmat_row_scale(ws, sx), bias);
+}
+
+/* Test hook: force the SMMLA wiring on (1) or off (0) for the rest of this
+ * process, or return to the env/default resolution (-1).  Returns what was in
+ * effect before, so a caller can restore it.  It exists so a test can run the
+ * SAME shapes through both kernels in one process and require bit-identical
+ * output -- the property the batched linear promises and the one a
+ * position-dependent epilogue breaks.  On a build or a CPU with no SMMLA it is
+ * a no-op that reports -1, which is what lets the test run everywhere. */
+int mynah_qmat_i8mm_force(int mode) {
+#if defined(MYNAH_QMAT_ARM_I8MM)
+    if (!qmat_i8mm()) return -1;
+    const int before = qmat_i8mm_override;
+    qmat_i8mm_override = (mode < 0) ? -1 : (mode != 0);
+    return before;
+#else
+    (void)mode;
+    return -1;
+#endif
+}
+
+/* Names the int4 kernel this host resolves to: "neon-sdot", "avx2" or
+ * "scalar".  It exists because int4's x86 path was INVISIBLE: until E4-21
+ * there was no vector kernel there at all, the dispatch report had no int4 row
+ * to say so, and the one recorded int4 measurement ("only 3% over int8 on the
+ * codec") was taken on ARM, where int4 at least had SDOT.  A format that is
+ * slower than the wider one it is supposed to beat should be discoverable by
+ * reading the report, not by reading the source. */
+const char *mynah_qmat_int4_kernel(const char **why) {
+#if defined(MYNAH_QMAT_DOTPROD)
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c dot_q4/matvec_q4: ARM SDOT (vdotq_s32) "
+               "on nibbles unpacked to int8, with vld2q_s8 splitting the "
+               "activation into the even and odd halves the two nibbles need";
+    return "neon-sdot";
+#elif defined(MYNAH_QMAT_AVX2)
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c q4_group_i32_avx2: AVX2 "
+               "_mm256_maddubs_epi16 on UNSIGNED nibbles against the signed "
+               "activation, with the -8 offset applied as a second maddubs "
+               "rather than a table. NOT VNNI on purpose: int4's per-group "
+               "scale forces a float flush every 32 elements, so the dot is "
+               "~3 of ~18 instructions per group and VPDPBUSD would move the "
+               "kernel by about a tenth";
+    return "avx2";
+#else
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c: scalar nibble loop, the correctness "
+               "reference -- roughly eight times the instructions per MAC of "
+               "the vector paths, so int4 here will lose to int8 despite half "
+               "the weight bytes";
+    return "scalar";
+#endif
+}
+
 int mynah_qmat_i8mm_enabled(const char **why) {
 #if defined(MYNAH_QMAT_ARM_I8MM)
     const int hw = qmat_i8mm();
@@ -3108,18 +3765,14 @@ int mynah_qmat_i8mm_enabled(const char **why) {
         *why = on ? "[predicate] src/qmat.c matvec_q8_pair_i8mm: SMMLA "
                     "(vmmlaq_s32), two activations x two weight rows x eight k "
                     "per instruction, wired into the weight-stationary batched "
-                    "linear because MYNAH_QMAT_I8MM=1. THIS IS A MEASUREMENT "
-                    "MODE, NOT A SERVING MODE: its float epilogue does not "
-                    "round like matvec_q8's, so a row's answer depends on its "
-                    "position in the batch and --self-test fails by design"
+                    "linear -- and ONLY there, because a single-vector decode "
+                    "matvec has nothing to put in the other half of the tile. "
+                    "Bit-identical to the SDOT path: the int32 tile always was, "
+                    "and the float epilogue now goes through qmat_row_scale()'s "
+                    "value barrier, so both kernels round alike by construction"
             : hw ? "[predicate] src/qmat.c: this CPU HAS FEAT_I8MM and the "
-                   "SMMLA kernel is compiled and self-tested (exactly, in the "
-                   "int32 domain), but it is NOT wired into the batched linear. "
-                   "Its float epilogue reassociates differently from "
-                   "matvec_q8's under -ffast-math, which made a row's answer "
-                   "depend on where it sat in the batch -- measured, up to 2 "
-                   "ULP over 39 of 96 columns. Determinism wins; set "
-                   "MYNAH_QMAT_I8MM=1 to measure the kernel anyway"
+                   "SMMLA kernel is compiled and self-tested, but the batched "
+                   "linear was told to stay on SDOT by MYNAH_QMAT_I8MM=0"
                  : "[predicate] src/qmat.c compiled the SMMLA kernel, but this "
                    "CPU reports no FEAT_I8MM (hw.optional.arm.FEAT_I8MM / "
                    "HWCAP2_I8MM), so the batched linear stays on SDOT";
