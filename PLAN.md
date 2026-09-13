@@ -544,6 +544,14 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 
 ### Deferred
 
+- [ ] **CI is red on the OSS repo — after the C100/Axion work, not before** →
+  [`.work/ci-red-oss.md`](.work/ci-red-oss.md). `main` is green; the failures are
+  `workflow_dispatch` runs on the `lane/int8-*` branches, and the one inspected in
+  full is a **job bug, not a code bug**: a job named `link-only: x86 SIMD=avx512`
+  executes the binary it built on a runner whose CPU reports `avx2 fma`, so our own
+  startup guard correctly refuses to run it and exits 1. The same branch both passes
+  and fails, so it flaps. Fix the job, keep the guard, and answer in writing whether
+  AVX-512 gets executed anywhere at all.
 - [-] GPU (Metal/CUDA) work — existing backends stay as they are. Metal measured
   *slower* than CPU on Apple Silicon (`docs/performance.md:71-80`).
 - [-] `*_24l` PocketTTS variants — non-distilled previews, 672 MB-1.3 GB each,
