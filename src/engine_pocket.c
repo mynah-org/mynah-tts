@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -661,6 +662,12 @@ typedef struct {
 typedef struct {
     const pocket_linear_hook *hook;
     pocket_call call;
+    /* Set for the duration of `mynah_transformer_ar_prefill` and clear
+     * everywhere else, so the cost map can charge the prefill's projections to
+     * the prefill.  It is per caller, like the scratch beside it, and the
+     * prefill runs on the thread that opened the region -- so no worker ever
+     * reads it and there is nothing here to share. */
+    int in_prefill;
 } pocket_tar_call;
 
 typedef struct {
@@ -1371,7 +1378,14 @@ static int pocket_linear(void *user, size_t layer,
     pocket_tar_call *u = (pocket_tar_call *)user;
     pocket_proj proj;
     if (u == NULL || pocket_tar_proj(u->hook, layer, kind, &proj) != 0) return -1;
-    return pocket_proj_tile(&proj, &u->call, weight, bias, in, out, count, k, n);
+    if (!u->in_prefill) {
+        return pocket_proj_tile(&proj, &u->call, weight, bias, in, out, count, k, n);
+    }
+    mynah_region_begin(MYNAH_RGN_PREFILL_PROJ);
+    const int rc =
+        pocket_proj_tile(&proj, &u->call, weight, bias, in, out, count, k, n);
+    mynah_region_end(MYNAH_RGN_PREFILL_PROJ);
+    return rc;
 }
 
 static int pocket_linear_rows(void *user, size_t layer,
@@ -1465,6 +1479,7 @@ static int pocket_tar_call_init(pocket_tar_call *user,
                                 const pocket_linear_hook *hook, size_t rows,
                                 size_t k_max, char *error, size_t capacity) {
     user->hook = hook;
+    user->in_prefill = 0;
     return pocket_call_init(&user->call, rows, k_max, error, capacity);
 }
 
@@ -2670,6 +2685,282 @@ static void pocket_model_free(mynah_engine_state *state) {
     free(state);
 }
 
+/* ------------------------------------------------- eager weight prepacking
+ *
+ * WHAT THIS REPLACES.  `mynah_qmat_linear_resolved_qt` and its batched twin
+ * build a tensor's quantized copy on FIRST TOUCH: `cache_lookup` misses,
+ * `cache_insert` mallocs the packed buffer and converts the whole f32 weight
+ * into it, under the cache mutex, on the calling thread.  For the PocketTTS
+ * backbone that is 24 tensors and 302 MB of f32 read into 151 MB of f16 -- and
+ * the first thing that ever touches those tensors is the text prefill of the
+ * first request.
+ *
+ * MEASURED, GCP Axion (32x Neoverse-V2), `--runs 1` against `--runs 8`, which
+ * separates the first call of `prep.decoder_prefill` from the steady-state
+ * ones:
+ *
+ *     cores        1       4       8      16
+ *     first     442.3   282.2   255.1   242.9  ms
+ *     steady    230.0    68.2    39.4    27.5  ms
+ *     first-steady  212.3   214.0   215.7   215.4  ms
+ *
+ * The steady-state prefill divides 8.4x across 16 cores.  The difference does
+ * not move at all -- 212/214/216/215 -- because packing a weight is one thread
+ * converting an array while every other thread waits on a mutex it cannot
+ * help with.  That flat ~215 ms is the whole of the "prefill does not scale"
+ * finding, and `MYNAH_QUANT_GROUPS=none` removes it entirely (first call 38.2
+ * ms, steady 37.4 ms, difference 0.8 ms), which is what says it is the pack
+ * and not a page-in of the mapped weights.
+ *
+ * WHY HERE AND NOT IN THE REQUEST.  The cost is per PROCESS, not per request,
+ * so it was never a rate -- it was a cliff sitting on whichever request
+ * arrived first.  Moving it to model open does three things a warm-up request
+ * cannot:
+ *
+ *   1. It stops being latency.  A caller that opens a model and synthesizes
+ *      once -- the CLI, an embedded user, a server started `--no-warmup` --
+ *      pays 215 ms of TTFA today for work that has nothing to do with its
+ *      text.
+ *   2. It lands BEFORE the prefork fork.  `server/main.c` opens every pack
+ *      before forking, deliberately, "so the mapped weights are one physical
+ *      copy behind the whole tree"; the packed copies were not, because they
+ *      were built by each worker's own warm-up AFTER the fork.  Built here
+ *      they are ordinary heap pages of the parent and the children share them
+ *      copy-on-write like everything else: at 16 workers that is 16 x 151 MB
+ *      of resident f16 collapsing to 151 MB, and 16 x 215 ms of startup
+ *      collapsing to 215 ms.
+ *   3. It makes the cost map honest.  The work is reported under
+ *      `runtime.weight_prepack`, inside `runtime.model_load`, instead of
+ *      inflating a decoder region by 28% of a request's wall.
+ *
+ * WHY IT CANNOT MOVE THE AUDIO.  A cache entry is a pure function of (name,
+ * weight bytes, n, k, resolved qtype), and every consumer resolves the qtype
+ * the same way -- from the group spec, before the cache is touched (E8-5).
+ * This walk asks `pocket_tar_proj` / `pocket_flow_proj` for exactly the
+ * `pocket_proj` the real call site will build, and hands
+ * `mynah_qmat_linear_resolved_qt` the same name, weight pointer, shape and
+ * qtype that call would.  So the entry that exists afterwards is the entry
+ * that would have existed anyway; the only difference is when it was built and
+ * by whom.  A group the spec does not select is skipped, because touching it
+ * would CREATE an entry the lazy path never would.
+ *
+ * The one row it computes is thrown away.  It is the price of building the
+ * entry through the public linear rather than through a cache API this file is
+ * not allowed to add; it is one matvec against 24 tensors and it does not
+ * appear in the shape census, because a prepack is not a graph op and
+ * recording it as one would put 37 calls into a census of a run that made
+ * none.
+ *
+ * `MYNAH_PREPACK=0` turns it off, and it is also skipped under
+ * `MYNAH_QMAT_ACT_STATS`, where the throwaway row would enter the activation
+ * statistic as a call the model never made.
+ */
+/* ONCE PER CACHE, and the guard is not decoration.
+ *
+ * `mynah_engine_state` is not the model: `serve()` in src/inference.c calls
+ * `engine->model_init` at the top of every driver call and `model_free` at the
+ * bottom, so this function runs once per server lifetime but once per
+ * `mynah_tts_synthesize()` for a one-shot caller.  The weight cache underneath
+ * it is the MODEL's and outlives all of them, so the second call would find
+ * every entry already built -- and would still pay one full matvec per tensor
+ * to find that out.  Measured before this guard existed: +2.1 ms per repeated
+ * serve at 16 threads and +14.2 ms at one, charged to `runtime.model_load`.
+ * A prepack that makes the tenth request slower has stopped being a prepack.
+ *
+ * The memo is the cache pointer, because that is what owns the entries.  A
+ * pointer reused by a later cache allocated at the same address costs a prepack
+ * that is skipped; a full table costs the same, deliberately, because the
+ * failure mode of "prepack anyway" is a cost on every serve and the failure mode
+ * of "skip" is the lazy path this function exists to anticipate.  Neither can
+ * reach the audio: the entry `cache_insert` builds is the same whoever asks for
+ * it.  Inherited across fork(), which is correct -- a child's cache really is
+ * packed, copy-on-write.
+ */
+#define POCKET_PREPACK_MEMO 8
+static pthread_mutex_t g_prepack_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const void *g_prepacked[POCKET_PREPACK_MEMO];
+static size_t g_prepacked_n;
+
+static int pocket_prepack_claim(const void *cache) {
+    if (cache == NULL) return 0;
+    pthread_mutex_lock(&g_prepack_mutex);
+    for (size_t i = 0; i < g_prepacked_n; ++i) {
+        if (g_prepacked[i] == cache) {
+            pthread_mutex_unlock(&g_prepack_mutex);
+            return 0;
+        }
+    }
+    const int room = g_prepacked_n < POCKET_PREPACK_MEMO;
+    if (room) g_prepacked[g_prepacked_n++] = cache;
+    pthread_mutex_unlock(&g_prepack_mutex);
+    return room;
+}
+
+static int pocket_prepack_enabled(void) {
+    const char *off = getenv("MYNAH_PREPACK");
+    if (off != NULL && off[0] == '0' && off[1] == '\0') return 0;
+    const char *stats = getenv("MYNAH_QMAT_ACT_STATS");
+    if (stats != NULL && stats[0] != '\0' && strcmp(stats, "0") != 0) return 0;
+    return 1;
+}
+
+/* One tensor, through the same call the graph would make. */
+static void pocket_prepack_one(const pocket_proj *p, const float *weight,
+                               const float *bias, const float *in, float *out,
+                               size_t k, size_t n) {
+    if (!p->quantized || weight == NULL || k == 0u || n == 0u) return;
+    /* The return is deliberately ignored: a prepack that cannot build an entry
+     * has changed nothing -- the lazy path will try again and take whatever
+     * fallback it would have taken -- so failing the model open over it would
+     * turn a latency optimisation into an outage. */
+    (void)mynah_qmat_linear_resolved_qt(p->qcache, p->backend, p->name, weight,
+                                        in, out, 1u, k, n, bias, p->qtype, NULL,
+                                        0u);
+}
+
+/* The four projections of one transformer_ar layer, shaped exactly as
+ * `mynah_transformer_ar_linear_kind` documents them and as
+ * `pocket_resolve_backbone` validated them against model.json. */
+static void pocket_prepack_tar(const pocket_linear_hook *hook,
+                               const mynah_transformer_ar_layer *layers,
+                               size_t count, size_t d_model, size_t attn_dim,
+                               size_t ffn_dim, const float *in, float *out) {
+    if (layers == NULL) return;
+    for (size_t l = 0; l < count; ++l) {
+        const mynah_transformer_ar_layer *w = &layers[l];
+        const float *weight[4] = {w->in_proj_weight, w->out_proj_weight,
+                                  w->linear1_weight, w->linear2_weight};
+        const float *bias[4] = {w->in_proj_bias, w->out_proj_bias,
+                                w->linear1_bias, w->linear2_bias};
+        const size_t k[4] = {d_model, attn_dim, d_model, ffn_dim};
+        const size_t n[4] = {3u * attn_dim, d_model, ffn_dim, d_model};
+        for (size_t kind = 0; kind < 4u; ++kind) {
+            pocket_proj proj;
+            if (pocket_tar_proj(hook, l, (mynah_transformer_ar_linear_kind)kind,
+                                &proj) != 0) {
+                continue;
+            }
+            pocket_prepack_one(&proj, weight[kind], bias[kind], in, out, k[kind],
+                               n[kind]);
+        }
+    }
+}
+
+static void pocket_prepack_flow_one(const pocket_flow_hook *hook, size_t index,
+                                    mynah_flow_linear_kind kind,
+                                    const mynah_flow_linear *w, size_t k,
+                                    size_t n, const float *in, float *out) {
+    pocket_proj proj;
+    if (w == NULL || pocket_flow_proj(hook, index, kind, &proj) != 0) return;
+    pocket_prepack_one(&proj, w->weight, w->bias, in, out, k, n);
+}
+
+/* Every projection the engine can route through the weight cache, built once,
+ * here.  Returns nothing: see `pocket_prepack_one`. */
+static void pocket_prepack(mynah_engine_state *state) {
+    if (state == NULL || state->qgroups == 0u || !pocket_prepack_enabled()) return;
+    if (!pocket_prepack_claim(state->qcache)) return;
+    const pocket_config *cfg = &state->cfg;
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    const size_t codec_attn = cfg->codec_tf_dim;
+
+    /* Wide enough for the widest reduction and the widest output of any
+     * projection below, computed from the manifest the same way `ctx_new`
+     * sizes its own scratch.  `in` is zero, which is a legal activation on
+     * every path: f16 needs no activation scale at all, and int8/int4 take the
+     * `amax == 0` branch of `quantize_act`. */
+    size_t k_max = cfg->hidden_dim;
+    if (attn_dim > k_max) k_max = attn_dim;
+    if (cfg->ffn_dim > k_max) k_max = cfg->ffn_dim;
+    if (codec_attn > k_max) k_max = codec_attn;
+    if (cfg->codec_tf_ffn > k_max) k_max = cfg->codec_tf_ffn;
+    if (cfg->flow_dim > k_max) k_max = cfg->flow_dim;
+    if (2u * cfg->flow_freqs > k_max) k_max = 2u * cfg->flow_freqs;
+    size_t n_max = 3u * attn_dim;
+    if (3u * codec_attn > n_max) n_max = 3u * codec_attn;
+    if (cfg->ffn_dim > n_max) n_max = cfg->ffn_dim;
+    if (cfg->codec_tf_ffn > n_max) n_max = cfg->codec_tf_ffn;
+    if (3u * cfg->flow_dim > n_max) n_max = 3u * cfg->flow_dim;
+    if (cfg->codec_dim > n_max) n_max = cfg->codec_dim;
+    if (cfg->hidden_dim > n_max) n_max = cfg->hidden_dim;
+
+    float *in = (float *)calloc(k_max ? k_max : 1u, sizeof(float));
+    float *out = (float *)calloc(n_max ? n_max : 1u, sizeof(float));
+    if (in == NULL || out == NULL) {
+        free(in);
+        free(out);
+        return;
+    }
+
+    mynah_region_begin(MYNAH_RGN_PREPACK);
+    pocket_prepack_tar(&state->backbone_hook, state->backbone_layers, cfg->layers,
+                       cfg->hidden_dim, attn_dim, cfg->ffn_dim, in, out);
+    pocket_prepack_tar(&state->codec_hook, state->codec_layers,
+                       cfg->codec_tf_layers, cfg->codec_tf_dim, codec_attn,
+                       cfg->codec_tf_ffn, in, out);
+
+    const size_t hidden = cfg->flow_dim;
+    for (size_t t = 0; t < cfg->flow_time_conds; ++t) {
+        const mynah_flow_time_embed_weights *e = &state->time_embed[t];
+        pocket_prepack_flow_one(&state->flow_hook, t,
+                                MYNAH_FLOW_LINEAR_TIME_MLP_IN, &e->mlp_in,
+                                2u * cfg->flow_freqs, hidden, in, out);
+        pocket_prepack_flow_one(&state->flow_hook, t,
+                                MYNAH_FLOW_LINEAR_TIME_MLP_OUT, &e->mlp_out,
+                                hidden, hidden, in, out);
+    }
+    for (size_t b = 0; b < cfg->flow_depth; ++b) {
+        const mynah_flow_res_block_weights *r = &state->res_blocks[b];
+        pocket_prepack_flow_one(&state->flow_hook, b,
+                                MYNAH_FLOW_LINEAR_BLOCK_ADALN, &r->adaln, hidden,
+                                3u * hidden, in, out);
+        pocket_prepack_flow_one(&state->flow_hook, b,
+                                MYNAH_FLOW_LINEAR_BLOCK_MLP_IN, &r->mlp_in,
+                                hidden, hidden, in, out);
+        pocket_prepack_flow_one(&state->flow_hook, b,
+                                MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT, &r->mlp_out,
+                                hidden, hidden, in, out);
+    }
+    pocket_prepack_flow_one(&state->flow_hook, 0u, MYNAH_FLOW_LINEAR_COND_EMBED,
+                            &state->flow.cond_embed, cfg->hidden_dim, hidden, in,
+                            out);
+    pocket_prepack_flow_one(&state->flow_hook, 0u, MYNAH_FLOW_LINEAR_INPUT_PROJ,
+                            &state->flow.input_proj, cfg->latent_dim, hidden, in,
+                            out);
+    pocket_prepack_flow_one(&state->flow_hook, 0u, MYNAH_FLOW_LINEAR_FINAL_ADALN,
+                            &state->flow.final_adaln, hidden, 2u * hidden, in,
+                            out);
+    pocket_prepack_flow_one(&state->flow_hook, 0u, MYNAH_FLOW_LINEAR_FINAL_LINEAR,
+                            &state->flow.final_linear, hidden, cfg->latent_dim,
+                            in, out);
+
+    /* The three the engine projects itself, keyed and routed by
+     * `pocket_single_linear`; the shapes are its own call sites'. */
+    {
+        const unsigned group[3] = {POCKET_QG_COND_IN, POCKET_QG_COND_EOS,
+                                   POCKET_QG_CODEC_CONV};
+        const char *key[3] = {state->cond_in_key, state->cond_eos_key,
+                              state->codec_conv_key};
+        const int qtype[3] = {state->cond_in_qtype, state->cond_eos_qtype,
+                              state->codec_conv_qtype};
+        const float *weight[3] = {state->input_linear, state->out_eos_weight,
+                                  state->quantizer_proj};
+        const float *bias[3] = {NULL, state->out_eos_bias, NULL};
+        const size_t k[3] = {cfg->latent_dim, cfg->hidden_dim, cfg->latent_dim};
+        const size_t n[3] = {cfg->hidden_dim, 1u, cfg->codec_dim};
+        for (size_t i = 0; i < 3u; ++i) {
+            if ((state->qgroups & group[i]) == 0u || weight[i] == NULL) continue;
+            (void)mynah_qmat_linear_resolved_qt(state->qcache, state->backend,
+                                                key[i], weight[i], in, out, 1u,
+                                                k[i], n[i], bias[i], qtype[i],
+                                                NULL, 0u);
+        }
+    }
+    mynah_region_end(MYNAH_RGN_PREPACK);
+    free(in);
+    free(out);
+}
+
 static int pocket_model_init(const mynah_tts_model *model,
                              mynah_engine_state **out, char *error,
                              size_t capacity) {
@@ -2822,6 +3113,8 @@ static int pocket_model_init(const mynah_tts_model *model,
         pocket_model_free(state);
         return -1;
     }
+
+    pocket_prepack(state);
 
     *out = state;
     if (error != NULL && capacity > 0) error[0] = '\0';
@@ -3296,11 +3589,13 @@ static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
         return -1;
     }
     mynah_region_begin(MYNAH_RGN_PREFILL);
+    ctx->backbone_call.in_prefill = 1;
     const int failed =
         mynah_transformer_ar_prefill(
             ctx->backbone, &ctx->backbone_w,
             ctx->text_embed + ctx->text_prefilled * cfg->hidden_dim, rows,
             NULL) != 0;
+    ctx->backbone_call.in_prefill = 0;
     mynah_region_end(MYNAH_RGN_PREFILL);
     if (failed) {
         pocket_error(error, capacity,

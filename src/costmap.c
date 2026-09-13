@@ -51,6 +51,11 @@ static const rgn_info g_rgn[] = {
     { MYNAH_RGN_ENCODER,           "prep.encoder",           MYNAH_RGN_PREPARE,  1, "encoder",  "stack"   },
     { MYNAH_RGN_PREFILL,           "prep.decoder_prefill",   MYNAH_RGN_PREPARE,  1, "decoder",  "stack"   },
     { MYNAH_RGN_FINALIZE,          "request.finalize",       MYNAH_RGN_REQUEST,  1, "driver",   "stack"   },
+    /* The prefill's four linear projections, and only those.  Its parent's
+     * self time is then the prefill's other half -- attention scores, softmax,
+     * the RoPE rotation, the KV writes, the norms, GELU and the residuals --
+     * which is the half no hook can hand to the pool. */
+    { MYNAH_RGN_PREFILL_PROJ,      "prep.prefill_proj",      MYNAH_RGN_PREFILL,  1, "decoder",  "stack"   },
 
     { MYNAH_RGN_STEP,              "step.total",             MYNAH_RGN_REQUEST,  1, "decoder",  "stack"   },
     { MYNAH_RGN_STEP_EMBED,        "step.embed",             MYNAH_RGN_STEP,     2, "decoder",  "stack"   },
@@ -84,6 +89,7 @@ static const rgn_info g_rgn[] = {
     { MYNAH_RGN_RT_PARALLEL,       "runtime.parallel_for",   MYNAH_RGN_MULTI,    1, "runtime",  "stack"   },
     { MYNAH_RGN_RT_PARALLEL_WAIT,  "runtime.parallel_wait",  MYNAH_RGN_RT_PARALLEL, 1, "runtime", "stack" },
     { MYNAH_RGN_MODEL_LOAD,        "runtime.model_load",     MYNAH_RGN_NONE,     1, "runtime",  "stack"   },
+    { MYNAH_RGN_PREPACK,           "runtime.weight_prepack", MYNAH_RGN_MODEL_LOAD, 1, "runtime", "stack"  },
 
     { MYNAH_RGN_DECODE_GANG,       "driver.decode_gang",     MYNAH_RGN_NONE,     1, "driver",   "stack"   },
     { MYNAH_RGN_LANE_WAIT,         "driver.lane_wait",       MYNAH_RGN_NONE,     1, "driver",   "stack"   },
@@ -94,6 +100,32 @@ static const rgn_info g_rgn[] = {
     { MYNAH_RGN_WORK_CONV,         "work.conv_panels",       MYNAH_RGN_MULTI,    1, "codec",    "stack"   },
 };
 static const int g_rgn_n = (int)(sizeof g_rgn / sizeof g_rgn[0]);
+
+/* Two rows sharing an id is not a small defect: every merge adds their times
+ * together and prints the sum under whichever name this function reaches
+ * first, so one region disappears and the other reports work it never did.
+ * MYNAH_RGN_MODEL_LOAD and MYNAH_RGN_DECODE_GANG were both 44 from the day the
+ * markers landed until this check existed.  Checked once, from the same
+ * constructor that reads the level, and reported to stderr unconditionally:
+ * a profiler that cannot name its own rows has nothing to say. */
+static void rgn_unique_check(void) {
+    for (int i = 0; i < g_rgn_n; ++i) {
+        if (g_rgn[i].id <= 0 || g_rgn[i].id >= MYNAH_RGN_MAX) {
+            fprintf(stderr, "[COSTMAP] BROKEN TABLE: '%s' has id %d, outside "
+                            "1..%d; its time will be dropped\n",
+                    g_rgn[i].name, g_rgn[i].id, MYNAH_RGN_MAX - 1);
+            continue;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (g_rgn[j].id == g_rgn[i].id) {
+                fprintf(stderr, "[COSTMAP] BROKEN TABLE: '%s' and '%s' share id "
+                                "%d; their times will be summed and reported "
+                                "under one name\n",
+                        g_rgn[j].name, g_rgn[i].name, g_rgn[i].id);
+            }
+        }
+    }
+}
 
 static const rgn_info *rgn_find(int id) {
     for (int i = 0; i < g_rgn_n; ++i) if (g_rgn[i].id == id) return &g_rgn[i];
@@ -192,6 +224,7 @@ void mynah_costmap_init(void) {
     static int done = 0;
     if (done) return;
     done = 1;
+    rgn_unique_check();
     const char *e = getenv("MYNAH_COST_MAP");
     int level = 0;
     if (e != NULL && e[0] != 0 && e[0] != '0') level = (e[0] == '2') ? 2 : 1;

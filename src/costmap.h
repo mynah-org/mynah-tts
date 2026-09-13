@@ -97,6 +97,13 @@ enum {
     MYNAH_RGN_ENCODER,           /* text/context encoder stack                 */
     MYNAH_RGN_PREFILL,           /* decoder KV prefill over the conditioning   */
     MYNAH_RGN_FINALIZE,          /* slot_finalize(): trailing decode + trim    */
+    /* The four linear projections OF THE PREFILL, and nothing else: the same
+     * hook serves the per-step path and the codec transformer, and this row
+     * counts only the calls that ran inside mynah_transformer_ar_prefill.  It
+     * is what splits the prefill into the half a thread pool can divide (these)
+     * and the half it cannot (attention scores, RoPE, the KV writes and the
+     * elementwise stack, which are `prep.decoder_prefill`'s self time). */
+    MYNAH_RGN_PREFILL_PROJ = 7,
 
     /* ---- one autoregressive step (engine step_batch/emit_batch) ---------- */
     MYNAH_RGN_STEP = 10,         /* step_batch(): one AR step, whole batch     */
@@ -137,7 +144,25 @@ enum {
     MYNAH_RGN_RT_ADMISSION,      /* enqueue -> admitted into a batch (derived) */
     MYNAH_RGN_RT_PARALLEL,       /* mynah_parallel_for dispatch        (MULTI) */
     MYNAH_RGN_RT_PARALLEL_WAIT,  /* caller done, waiting for the workers       */
-    MYNAH_RGN_MODEL_LOAD,        /* mmap + weight resolve, once per process    */
+    /* 52, NOT 44.  It was written without a value under RT_PARALLEL_WAIT=43,
+     * which made it 44 -- the value MYNAH_RGN_DECODE_GANG declares explicitly
+     * a few lines further down.  Two names, one slot: every merge added
+     * the decode gang's time to the model load's and printed the sum under
+     * whichever name rgn_find() reached first, so `driver.decode_gang` has
+     * never appeared in a report and `runtime.model_load` has never been only
+     * a model load.  Renumbering is what the append-only rule forbids, and it
+     * is also the only repair: an id that two regions share does not carry a
+     * meaning for an old report to keep.  `rgn_unique_check()` in costmap.c now
+     * refuses the table at startup so a third region cannot land on a fourth's
+     * id. */
+    MYNAH_RGN_MODEL_LOAD = 52,   /* mmap + weight resolve, once per process    */
+    /* Materialising the quantized weight cache, eagerly, at engine init -- the
+     * top of serve(), before any slot is prepared.  It is the same work
+     * `cache_insert` used to do lazily inside whichever request touched a
+     * tensor first, which for the backbone is the first text prefill.  Having
+     * it here is the point: a cost that belongs to loading a model must be
+     * reported against loading a model and not against a decoder phase.     */
+    MYNAH_RGN_PREPACK = 53,
 
     /* ---- driver placement (src/inference.c) ------------------------------
      * WHERE the codec decode ran, which is a scheduling fact and never a
@@ -154,7 +179,7 @@ enum {
     MYNAH_RGN_WORK_ARGMAX,       /* argmax row blocks claimed per worker       */
     MYNAH_RGN_WORK_CONV,         /* codec conv panels claimed per worker       */
 
-    MYNAH_RGN_MAX = 52
+    MYNAH_RGN_MAX = 56
 };
 
 /* Declared parent of a region that legitimately has several. */

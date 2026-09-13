@@ -39,3 +39,4 @@ that holds the detail. Nothing in `PLAN.md` should need more than one line.
 | [tokenizer-sentencepiece.md](tokenizer-sentencepiece.md) | E3-2 — SentencePiece Unigram in C |
 | [int8-int4-determinism.md](int8-int4-determinism.md) | E4-20b/E4-21b — the int8 float epilogue, SMMLA, VNNI on CI silicon, int4 on x86 |
 | [archive-2026-07-checkpoints.md](archive-2026-07-checkpoints.md) | Historical `PLAN.md` §17-24, moved verbatim |
+| [prefill-ttfa.md](prefill-ttfa.md) | E9-1 — what is serial inside `prep.decoder_prefill` |

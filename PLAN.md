@@ -393,13 +393,17 @@ column is 1 core to 16.
 | `step.backbone` | 16.8% | 4.6x | fine |
 | `flow.head` | 5.6% | — | small |
 
-- [ ] E9-1 **`prep.decoder_prefill` is the TTFA floor** — 361 ms at one core, 241 ms
-      at eight, **241 ms at sixteen**. About 240 ms is irreducibly serial on this
-      machine, it is 28.7% of a request, and every millisecond of it is spent before
-      the caller hears anything. This is why safe-to-play is 908 ms at C48 while
-      prebuffer stays zero: the server does not stall, it starts late. Find out what
-      inside it is serial before proposing a fix — the region is one marker today and
-      needs splitting to be actionable
+- [x] E9-1 **`prep.decoder_prefill` was a cold start, not a serial phase** →
+      [`.work/prefill-ttfa.md`](.work/prefill-ttfa.md). Splitting first call from
+      steady state (`--runs 1` vs `--runs 8`) shows the steady-state prefill divides
+      8.4x across sixteen cores and the flat part is a constant ~215 ms — the
+      quantized weight cache being built on first touch, one thread, under
+      `cache->mutex`. It is now built at engine init (`runtime.weight_prepack`), and
+      the prefill's own serial half — attention, RoPE, KV writes, norms — measures
+      **11.3 ms and does not move**. The causal claim was wrong: the server warms up
+      before accepting, so no client request ever paid it, and it cannot be why
+      safe-to-play is 908 ms at C48. What is left is ~122 ms of per-request prefill
+      at `16x2`, linear in text tokens, already parallel and starved of threads
 - [ ] E9-2 **the codec conv stack does not divide** — 2.6x against the transformer's
       4.3x, and at sixteen cores it still spends 211 ms where the transformer spends
       140. It is a quarter of the wall and the part of the vocoder that resists the
