@@ -31,11 +31,22 @@
 #                      THE SECOND HALF of the same defect, and the one that was
 #                      still there after the grouping was fixed: it was worth
 #                      exactly 1 ULP at 96x256 under SIMD=portable.
-#   3  smmla-row-scale use scales[row] for both rows of the SMMLA tile, i.e.
+#   3  q4-nibble-order swap the even and odd activation halves in the NEON int4
+#                      dot, so the low nibble meets the odd element. THE
+#                      MISTAKE THE x86 INT4 KERNEL COULD MAKE: q4_unpack_u8()
+#                      reassembles natural index order with two unpacks, and
+#                      getting that backwards is invisible to int4's older
+#                      gates, which compare against an f32 dot with a RELATIVE
+#                      TOLERANCE that a lossy format needs and that swallows a
+#                      permuted-but-plausible result on smooth data.
+#   4  q4-accum-split  put one int4 branch's group accumulation back to
+#                      `acc += (float)gi * scales[g]`, so it rounds differently
+#                      from matvec_q4's quad macro. The int4 twin of break 2.
+#   5  smmla-row-scale use scales[row] for both rows of the SMMLA tile, i.e.
 #                      apply the wrong weight row's scale to the second output.
 #                      A gross error, here to prove the shapes reach the kernel
 #                      at all.
-#   4  smmla-sx-swap   swap the two activation scales in one of the four tile
+#   6  smmla-sx-swap   swap the two activation scales in one of the four tile
 #                      writes, so out1's second row is scaled by out0's sx.
 #                      This is the one a careless 2x2 transcription makes, and
 #                      it is invisible to any test that uses a single
@@ -55,10 +66,22 @@
 # by name and fails the script -- that means the SUITE needs fixing, not the
 # kernel.
 #
-# ON A HOST WITH NO SMMLA (x86, or aarch64 built SIMD=scalar) breaks 3 and 4
-# patch code that is not compiled and break 1 has only the u8-vs-signed pair to
-# show up in. The script detects that from --dispatch-map and SKIPS what it
-# cannot prove, by name, rather than reporting a catch it did not make.
+# ON A HOST WITH NO SMMLA (x86, or aarch64 built SIMD=scalar) breaks 5 and 6
+# patch code that is not compiled, and on a host with no NEON dotprod so do 3
+# and 4. The script detects both from the suite's own §1 and SKIPS what it
+# cannot prove, BY NAME, rather than reporting a catch it did not make.
+#
+# THE x86 INT4 KERNEL CANNOT BE BROKEN FROM HERE, and saying so is the point.
+# q4_group_i32_avx2() only compiles on x86, and this project has no x86 host.
+# Its three equivalent breaks -- swapping the two unpacks, dropping the
+# `- 8 * sum x` correction, and shifting the high nibble by 3 instead of 4 --
+# were applied by hand to a cross-compiled x86-64 build and run under
+# qemu-user 10.2 (TCG, AVX2; note TCG implements NO VNNI, so the VPDPBUSD
+# kernels are NOT reachable that way and only CI's runner executes them).
+# All three were caught by self_test_q4_identity's per-group int32 assertion,
+# at rows/groups it named. Anyone re-running that needs a cross toolchain, so
+# it is recorded here rather than automated into a script that would silently
+# skip it on every machine in this fleet.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -111,6 +134,12 @@ static float dot_q8"""),
                                            bias == NULL ? 0.0f : bias[row + 1u]);""",
    """        out0[row + 1u] = qmat_row_epilogue(s10, qmat_row_scale(scales[row], sx0),
                                            bias == NULL ? 0.0f : bias[row + 1u]);"""),
+ "q4-nibble-order": ("src/qmat.c",
+   """        int32x4_t ig = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, xg.val[0]), hi, xg.val[1]);""",
+   """        int32x4_t ig = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, xg.val[1]), hi, xg.val[0]);"""),
+ "q4-accum-split": ("src/qmat.c",
+   """        acc = qmat_q4_accum(acc, vaddvq_s32(ig), scales[g]);""",
+   """        acc += (float)vaddvq_s32(ig) * scales[g];   /* break: per-site rounding */"""),
  "smmla-sx-swap": ("src/qmat.c",
    """        out1[row + 1u] = qmat_row_epilogue(s11, qmat_row_scale(scales[row + 1u], sx1),
                                            bias == NULL ? 0.0f : bias[row + 1u]);""",
@@ -153,9 +182,17 @@ fresh_tree() {
     ( cd "$ROOT" && tar -cf - Makefile src cli tests server gpu third_party \
         2>/dev/null ) | ( cd "$WORK/tree" && tar -xf - )
     rm -rf "$WORK/tree/build"
+    # SIMD=auto needs priming. tools/simd-auto.sh writes $(BUILD_DIR)/simd-auto.mk
+    # from a $(shell ...) that runs AFTER the -include that would have read it,
+    # so the FIRST make in a tree with no build/ resolves SIMD=auto to no ISA
+    # flag at all. Left unprimed, every "caught under: auto" line below would be
+    # a baseline build wearing auto's name -- and on aarch64 that is the
+    # difference between compiling the NEON int4 kernel and not, which is
+    # exactly what breaks 3 and 4 are about.
+    ( cd "$WORK/tree" && make info ) >/dev/null 2>&1 || true
 }
 
-echo "qmat negative control: four deliberate defects, each must be caught"
+echo "qmat negative control: six deliberate defects, each must be caught"
 echo
 
 # Does this build have a second int8 kernel to disagree with itself? If not,
@@ -167,6 +204,12 @@ if ! ( cd "$WORK/tree" && make qmat-test ) >"$WORK/base.log" 2>&1; then
     exit 1
 fi
 echo "  baseline (no break)            PASS, as it must be"
+if grep -q "int4 kernel   : neon-sdot" "$WORK/base.log"; then
+    HAVE_DOTPROD=1
+else
+    HAVE_DOTPROD=0
+    echo "  NOTE: no NEON int4 kernel here. Breaks 3 and 4 are SKIPPED, not passed."
+fi
 if grep -q "smmla wiring  : on" "$WORK/base.log"; then
     HAVE_SMMLA=1
 else
@@ -178,8 +221,13 @@ echo
 
 missed=""
 skipped=""
-for b in freeze-off contract-split smmla-row-scale smmla-sx-swap; do
+for b in freeze-off contract-split q4-nibble-order q4-accum-split smmla-row-scale smmla-sx-swap; do
     case "$b" in
+      q4-*) if [ "$HAVE_DOTPROD" -eq 0 ]; then
+                skipped="$skipped $b"
+                printf '  %-18s SKIPPED (no NEON int4 kernel on this host)\n' "$b"
+                continue
+            fi ;;
       smmla-*) if [ "$HAVE_SMMLA" -eq 0 ]; then
                    skipped="$skipped $b"
                    printf '  %-18s SKIPPED (no SMMLA kernel on this host)\n' "$b"

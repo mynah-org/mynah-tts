@@ -910,9 +910,147 @@ static float dot_q8(const void *qa, float sx, const int8_t *w, float ws,
                              qmat_row_scale(ws, sx), bias);
 }
 
+/* The int4 group accumulation, and it is the int8 epilogue's problem again in
+ * a different costume.  `acc += (float)gi * scales[g]` is a multiply-add whose
+ * rounding count -- fused or not -- the compiler decides PER SITE, and int4 has
+ * four sites: dot_q4's three branches and matvec_q4's quad macro.  Nothing
+ * caught it, because int4's existing gates compare against an f32 dot with a
+ * relative tolerance and a 1 ULP accumulation difference disappears into it;
+ * self_test_q4_identity() found it the moment it asserted equality instead.
+ *
+ * It is the same hazard for the same reason: matvec_q4 sends rows 0..3 through
+ * the quad macro and the remainder through dot_q4, so two spellings of one sum
+ * decide a row's answer.  Today that is position-INdependent, because a row's
+ * index does not change with the batch -- but "it happens not to be reachable"
+ * is what was said about the SMMLA pair too.  One helper, one shape, one
+ * rounding decision, and self_test_q4_identity() asserts it rather than
+ * assuming it. */
+static inline float qmat_q4_accum(float acc, int32_t gi, float scale) {
+#if defined(__FP_FAST_FMAF)
+    return fmaf((float)gi, scale, acc);
+#else
+    float p = (float)gi * scale;
+    QMAT_FREEZE_F32(p);
+    return acc + p;
+#endif
+}
+
+/* And the row's last step, `acc * sx + bias`, for the same reason and with the
+ * same answer.  The bias is a value here rather than something each caller
+ * adds afterwards, because `acc * sx` followed by a separate `+= bias[row]`
+ * rounds twice where the inlined `acc * sx + bias[row]` rounds once -- which
+ * is precisely the asymmetry that made dot_q8 and the quad epilogues disagree
+ * by 1 ULP before E4-20b. */
+static inline float qmat_q4_finish(float acc, float sx, float bias) {
+#if defined(__FP_FAST_FMAF)
+    return fmaf(acc, sx, bias);
+#else
+    float p = acc * sx;
+    QMAT_FREEZE_F32(p);
+    return p + bias;
+#endif
+}
+
 /* qx is the int8 activation; q is the packed INT4 weight group row; scales has
  * one entry per group of 32.  k must be a multiple of 32. */
-static float dot_q4(const int8_t *qx, float sx, const uint8_t *q, const float *scales, size_t k) {
+/* ------------------------------------------------------- INT4 on x86 (E4-21)
+ *
+ * Until this existed, int4 on the x86 production target had NO VECTOR PATH AT
+ * ALL: `dot_q4` had a NEON SDOT branch and, for everything else, a scalar
+ * nibble loop -- while int8 next door had AVX2 madd, AVX-VNNI and AVX-512
+ * VNNI.  int4 therefore carried half the weight bytes and computed them one
+ * nibble at a time, and would lose to int8 on every shape.  It also reframes
+ * the one number this repo had recorded: "int4 buys only 3% over int8 on the
+ * codec" was taken on ARM, where int4 at least has SDOT.
+ *
+ * WHY AVX2 AND NOT VNNI, WHICH IS THE INTERESTING PART.  int8 carries ONE
+ * SCALE PER ROW, so its VNNI loop accumulates int32 across a 64-element block
+ * -- QMAT_U8_BLOCK -- and in fact across the whole row, touching a float once
+ * at the end: about 2 instructions per 64 MACs.  int4 carries ONE SCALE PER
+ * GROUP OF 32, so the int32 accumulator MUST be flushed to float every 32
+ * elements.  That flush -- a horizontal reduce plus a convert, a multiply and
+ * an add -- is about 6 of the ~18 instructions this kernel spends per group,
+ * and the nibble unpack is another 6.  The dot itself is 3.
+ *
+ * So VPDPBUSD, which would replace those 3 with 2, moves the whole kernel by
+ * roughly a tenth.  The 32-element group really is too short for VNNI to be
+ * the story here, and the prize is simply HAVING a vector path: ~18
+ * instructions per 32 MACs against the scalar loop's ~140.  An int4 VNNI
+ * variant is a small, well-understood delta on top of this one and is
+ * deliberately NOT written yet -- it should be measured on the machine that
+ * would benefit, not guessed at from here.
+ *
+ * THE ALGEBRA, AND THE CORRECTION THAT IS NOT A ROW SUM.  Q4_0 nibbles are
+ * stored offset by +8, so the weight is `n - 8` for a nibble n in [0, 15].
+ * _mm256_maddubs_epi16 wants its FIRST operand unsigned, and the nibble
+ * already is, so the weights go in unsigned and the activation stays signed:
+ *
+ *     sum (n - 8) * x  ==  sum n * x  -  8 * sum x
+ *
+ * and BOTH terms are computed with maddubs against the same activation, so
+ * the correction is subtracted in int16 before the widening and there is no
+ * precomputed sum of anything.  That is on purpose: the int8 path's +128
+ * correction needs a cached per-row prefix sum, and the mistake its own
+ * self-test exists to catch is taking that sum over the wrong extent.  Here
+ * the equivalent term is per group AND depends only on the activation, so
+ * rather than add a second table with a second extent to get wrong, it is
+ * recomputed in two instructions from the operand that defines it.
+ *
+ * No saturation: n in [0,15] and x in [-128,127] give pairwise sums in
+ * [-3840, 3810]; the correction term is in [-2048, 2032]; their difference is
+ * in [-5888, 5858], all far inside int16.  self_test_q4_x86_identity() asserts
+ * the bound as well as the result.
+ *
+ * BIT-IDENTICAL, NOT MERELY CLOSE.  The group loop keeps the scalar
+ * reference's order, and each group's int32 is exact, so `acc += (float)gi *
+ * scales[g]` sees the same sequence of floats in the same order.  The gates
+ * assert equality, not a tolerance. */
+/* The scalar group, always compiled: it is the #else branch below AND the
+ * reference self_test_q4_identity() holds every vector variant to.  Neither
+ * the NEON nor the x86 int4 kernel had ever been compared against it. */
+static int32_t q4_group_i32_scalar(const uint8_t *q, const int8_t *x) {
+    int32_t gi = 0;
+    for (size_t j = 0; j < QMAT_Q4_GROUP; j += 2) {
+        const uint8_t b = q[j / 2];
+        const int lo = (int)(b & 0x0F) - 8;
+        const int hi = (int)(b >> 4) - 8;
+        gi += lo * (int32_t)x[j] + hi * (int32_t)x[j + 1];
+    }
+    return gi;
+}
+
+#if defined(MYNAH_QMAT_AVX2)
+/* 32 unsigned nibbles in natural index order from 16 packed bytes.  Low nibble
+ * is the even index and high nibble the odd one, so interleaving lo and hi
+ * with two unpacks puts them back in order -- which is cheaper than
+ * deinterleaving the activation, and leaves the activation a plain load. */
+static inline __m256i q4_unpack_u8(const uint8_t *q) {
+    const __m128i b = _mm_loadu_si128((const __m128i *)q);
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    const __m128i lo = _mm_and_si128(b, mask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), mask);
+    return _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+}
+
+/* sum over one group of 32 of (nibble - 8) * x, exactly. */
+static inline int32_t q4_group_i32_avx2(const uint8_t *q, const int8_t *x) {
+    const __m256i w = q4_unpack_u8(q);
+    const __m256i xv = _mm256_loadu_si256((const __m256i *)x);
+    const __m256i eight = _mm256_set1_epi8(8);
+    /* maddubs: unsigned x signed, pairwise, into int16. */
+    const __m256i t = _mm256_sub_epi16(_mm256_maddubs_epi16(w, xv),
+                                       _mm256_maddubs_epi16(eight, xv));
+    __m256i acc = _mm256_madd_epi16(t, _mm256_set1_epi16(1));
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc),
+                              _mm256_extracti128_si256(acc, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    return _mm_cvtsi128_si32(s);
+}
+#endif
+
+static float dot_q4(const int8_t *qx, float sx, const uint8_t *q,
+                    const float *scales, size_t k, float bias) {
     const size_t groups = k / QMAT_Q4_GROUP;
 #if defined(MYNAH_QMAT_DOTPROD)
     const int8x16_t off = vdupq_n_s8(8);
@@ -924,22 +1062,23 @@ static float dot_q4(const int8_t *qx, float sx, const uint8_t *q, const float *s
         const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), off);
         const int8x16x2_t xg = vld2q_s8(qx + g * 32); /* val[0]=even, val[1]=odd */
         int32x4_t ig = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, xg.val[0]), hi, xg.val[1]);
-        acc += (float)vaddvq_s32(ig) * scales[g];
+        acc = qmat_q4_accum(acc, vaddvq_s32(ig), scales[g]);
     }
-    return acc * sx;
+    return qmat_q4_finish(acc, sx, bias);
+#elif defined(MYNAH_QMAT_AVX2)
+    float acc = 0.0f;
+    for (size_t g = 0; g < groups; ++g) {
+        acc = qmat_q4_accum(acc, q4_group_i32_avx2(q + g * 16, qx + g * 32),
+                            scales[g]);
+    }
+    return qmat_q4_finish(acc, sx, bias);
 #else
     float acc = 0.0f;
     for (size_t g = 0; g < groups; ++g) {
-        int32_t gi = 0;
-        for (size_t j = 0; j < QMAT_Q4_GROUP; j += 2) {
-            const uint8_t b = q[g * 16 + j / 2];
-            const int lo = (int)(b & 0x0F) - 8;
-            const int hi = (int)(b >> 4) - 8;
-            gi += lo * (int32_t)qx[g * 32 + j] + hi * (int32_t)qx[g * 32 + j + 1];
-        }
-        acc += (float)gi * scales[g];
+        acc = qmat_q4_accum(acc, q4_group_i32_scalar(q + g * 16, qx + g * 32),
+                            scales[g]);
     }
-    return acc * sx;
+    return qmat_q4_finish(acc, sx, bias);
 #endif
 }
 
@@ -1061,7 +1200,8 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
                 const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), off); \
                 const int32x4_t dot = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x.val[0]), \
                                                 hi, x.val[1]); \
-                (accumulator) += (float)vaddvq_s32(dot) * (scale)[group]; \
+                (accumulator) = qmat_q4_accum((accumulator), vaddvq_s32(dot), \
+                                             (scale)[group]); \
             } while (0)
             Q4_DOT_ROW(w0, s0, a0);
             Q4_DOT_ROW(w1, s1, a1);
@@ -1069,17 +1209,19 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
             Q4_DOT_ROW(w3, s3, a3);
 #undef Q4_DOT_ROW
         }
-        out[row] = a0 * sx + (bias == NULL ? 0.0f : bias[row]);
-        out[row + 1u] = a1 * sx + (bias == NULL ? 0.0f : bias[row + 1u]);
-        out[row + 2u] = a2 * sx + (bias == NULL ? 0.0f : bias[row + 2u]);
-        out[row + 3u] = a3 * sx + (bias == NULL ? 0.0f : bias[row + 3u]);
+        out[row] = qmat_q4_finish(a0, sx, bias == NULL ? 0.0f : bias[row]);
+        out[row + 1u] = qmat_q4_finish(a1, sx,
+                                       bias == NULL ? 0.0f : bias[row + 1u]);
+        out[row + 2u] = qmat_q4_finish(a2, sx,
+                                       bias == NULL ? 0.0f : bias[row + 2u]);
+        out[row + 3u] = qmat_q4_finish(a3, sx,
+                                       bias == NULL ? 0.0f : bias[row + 3u]);
     }
 #endif
     for (; row < rows; ++row) {
-        float value = dot_q4(qx, sx, weights + row * (cols / 2u),
-                             scales + row * (cols / QMAT_Q4_GROUP), cols);
-        if (bias != NULL) value += bias[row];
-        out[row] = value;
+        out[row] = dot_q4(qx, sx, weights + row * (cols / 2u),
+                          scales + row * (cols / QMAT_Q4_GROUP), cols,
+                          bias == NULL ? 0.0f : bias[row]);
     }
 }
 
@@ -2077,7 +2219,8 @@ int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
                                          e->rowsum[row], k, level, b)
                                 : dot_q4((const int8_t *)qx, sx,
                                          e->q4 + row * (k / 2u),
-                                         e->scales + row * (k / QMAT_Q4_GROUP), k) + b;
+                                         e->scales + row * (k / QMAT_Q4_GROUP),
+                                         k, b);
             }
         } else if (e->qtype == QMAT_INT8) {
             matvec_q_rows(orow, qx, xr, sx, e->q8, e->scales, e->rowsum, bias,
@@ -2273,7 +2416,8 @@ static int self_test_one(int qtype, char *error, size_t error_capacity) {
         const float got = qtype == QMAT_INT8
                               ? dot_q8(qx, sx, q8 + i * K, scales8[i], 0, K,
                                        QMAT_U8_OFF, 0.0f)
-                              : dot_q4(qx, sx, q4 + i * (K / 2), scales4 + i * (K / QMAT_Q4_GROUP), K);
+                              : dot_q4(qx, sx, q4 + i * (K / 2),
+                                       scales4 + i * (K / QMAT_Q4_GROUP), K, 0.0f);
         if (i < MATVEC_ROWS) {
             const float expected = got + bias[i];
             const float tolerance = 1.0e-6f * (1.0f + fabsf(expected));
@@ -3191,6 +3335,153 @@ static int self_test_i8mm_identity(char *error, size_t error_capacity) {
 }
 #endif
 
+/* ---------------------------------------------- the INT4 identity (E4-21)
+ *
+ * int4's vector kernels compute the same integers as the scalar nibble loop or
+ * they are wrong.  There is no rounding anywhere in a group: nibbles are
+ * exact, the activation is exact int8, and the products and their sum all fit
+ * int32 with room to spare.  So the only acceptable result is BIT-IDENTICAL
+ * output, and this asserts exactly that -- first per group, in the integer
+ * domain where the claim is unambiguous, then through the assembled dot_q4()
+ * and matvec_q4() where a wrong group index or a wrong scale would show.
+ *
+ * IT IS NOT ONLY AN x86 TEST.  Nothing in this tree had ever compared the NEON
+ * int4 kernel against the scalar one either: the existing int4 gates compare
+ * the quantized result against an f32 dot with a RELATIVE TOLERANCE, which int4
+ * needs (it is a lossy format) but which is far too loose to notice a kernel
+ * that has, say, swapped the even and odd nibbles -- that lands inside the
+ * tolerance on smooth data and is the exact mistake the interleave in
+ * q4_unpack_u8() could make.  So this runs everywhere and compares the kernel
+ * this build actually uses against the reference it is supposed to reproduce.
+ *
+ * THE SATURATION BOUND is asserted too, not just assumed.  The x86 kernel
+ * leans on _mm256_maddubs_epi16 not saturating: nibble in [0,15] against an
+ * int8 activation gives pairwise sums in [-3840, 3810], the `- 8 * sum x`
+ * correction term is in [-2048, 2032], and the int16 difference is in
+ * [-5888, 5858].  The data below is built to reach the extremes (an all-0x0F
+ * group against an all -128 activation and the mirror of it), because a bound
+ * that is only ever exercised at a tenth of its range is not evidence. */
+static int self_test_q4_identity(char *error, size_t error_capacity) {
+    enum { GROUPS = 9, K = GROUPS * QMAT_Q4_GROUP, N = 7 };
+    int status = -1;
+    uint8_t *q = (uint8_t *)malloc((size_t)N * (K / 2u));
+    int8_t *x = (int8_t *)malloc(K);
+    float *scales = (float *)malloc((size_t)N * GROUPS * sizeof(float));
+    float *bias = (float *)malloc((size_t)N * sizeof(float));
+    float *ref = (float *)malloc((size_t)N * sizeof(float));
+    float *acc_ref = (float *)malloc((size_t)N * sizeof(float));
+    float *got = (float *)malloc((size_t)N * sizeof(float));
+    if (q == NULL || x == NULL || scales == NULL || bias == NULL || ref == NULL ||
+        acc_ref == NULL || got == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat q4 identity out of memory");
+        goto done;
+    }
+    /* Group 0 of every row is all 0x0F against an all -128 activation, and
+     * group 1 is all 0x00, so the two int16 extremes are actually reached. */
+    for (size_t i = 0; i < (size_t)N * (K / 2u); ++i) {
+        const size_t g = (i % (K / 2u)) / 16u;
+        if (g == 0u) q[i] = 0xFFu;
+        else if (g == 1u) q[i] = 0x00u;
+        else q[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    }
+    for (size_t j = 0; j < (size_t)K; ++j) {
+        if (j < QMAT_Q4_GROUP) x[j] = -128;
+        else if (j < 2u * QMAT_Q4_GROUP) x[j] = 127;
+        else x[j] = (int8_t)((int)((j * 53u + 7u) % 255u) - 127);
+    }
+    for (size_t i = 0; i < (size_t)N * GROUPS; ++i)
+        scales[i] = 1.0e-3f * (1.0f + (float)(i % 13) * 0.37f);
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = (float)i * 0.0625f - 0.25f;
+
+    /* 1. Per group, in the integer domain, plus the int16 bound the x86
+     *    kernel's lack of saturation depends on. */
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        for (size_t g = 0; g < (size_t)GROUPS; ++g) {
+            const uint8_t *qg = q + i * (K / 2u) + g * 16u;
+            const int8_t *xg = x + g * 32u;
+            const int32_t want = q4_group_i32_scalar(qg, xg);
+            int32_t have = want;
+#if defined(MYNAH_QMAT_AVX2)
+            have = q4_group_i32_avx2(qg, xg);
+#endif
+            if (want != have) {
+                if (error != NULL && error_capacity > 0) {
+                    snprintf(error, error_capacity,
+                             "qmat q4 group int32 differs at row %zu group %zu: "
+                             "scalar %d vs vector %d -- the nibble order, the "
+                             "-8 offset or the correction term is wrong",
+                             i, g, want, have);
+                }
+                goto done;
+            }
+            /* Pairwise int16 partials must not have saturated on the way. */
+            for (size_t j = 0; j < QMAT_Q4_GROUP; j += 2) {
+                const uint8_t b = qg[j / 2];
+                const long p = (long)((int)(b & 0x0F) - 8) * (long)xg[j] +
+                               (long)((int)(b >> 4) - 8) * (long)xg[j + 1];
+                if (p < -32768L || p > 32767L) {
+                    if (error != NULL && error_capacity > 0) {
+                        snprintf(error, error_capacity,
+                                 "qmat q4 pairwise partial %ld at row %zu group "
+                                 "%zu pair %zu is outside int16 -- the x86 "
+                                 "kernel's maddubs would saturate", p, i, g,
+                                 j / 2u);
+                    }
+                    goto done;
+                }
+            }
+        }
+    }
+
+    /* 2. The assembled row, bit for bit, against the same group order. */
+    const float sx = 0.0072f;
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        float acc = 0.0f;
+        for (size_t g = 0; g < (size_t)GROUPS; ++g) {
+            acc = qmat_q4_accum(acc,
+                                q4_group_i32_scalar(q + i * (K / 2u) + g * 16u,
+                                                    x + g * 32u),
+                                scales[i * GROUPS + g]);
+        }
+        acc_ref[i] = acc;
+        ref[i] = qmat_q4_finish(acc, sx, 0.0f);
+        got[i] = dot_q4(x, sx, q + i * (K / 2u), scales + i * GROUPS, K, 0.0f);
+        if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat q4 dot row %zu differs: reference %.9g vs kernel "
+                         "%.9g -- the integers matched, so this is the group "
+                         "order or a scale index", i, (double)ref[i],
+                         (double)got[i]);
+            }
+            goto done;
+        }
+    }
+
+    /* 3. And matvec_q4, which has its own quad unroll on ARM and falls to the
+     *    dot above on x86 -- both must land on the same floats as the row loop
+     *    plus the bias. */
+    matvec_q4(got, x, sx, q, scales, bias, (size_t)N, (size_t)K);
+    for (size_t i = 0; i < (size_t)N; ++i) {
+        const float want = qmat_q4_finish(acc_ref[i], sx, bias[i]);
+        if (memcmp(&want, &got[i], sizeof(float)) != 0) {
+            if (error != NULL && error_capacity > 0) {
+                snprintf(error, error_capacity,
+                         "qmat q4 matvec row %zu of %d differs from the row "
+                         "loop: %.9g vs %.9g", i, (int)N, (double)want,
+                         (double)got[i]);
+            }
+            goto done;
+        }
+    }
+    status = 0;
+done:
+    free(q); free(x); free(scales); free(bias); free(ref); free(acc_ref);
+    free(got);
+    return status;
+}
+
 /* ------------------------------------------- the SMMLA on/off A/B (E4-20b)
  *
  * self_test_batch_membership asks whether a row's answer survives a change of
@@ -3301,6 +3592,7 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
 #if defined(MYNAH_QMAT_ARM_I8MM)
     if (self_test_i8mm_identity(error, error_capacity) != 0) return -1;
 #endif
+    if (self_test_q4_identity(error, error_capacity) != 0) return -1;
     if (self_test_one(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_one(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_rows_blocked(QMAT_INT8, error, error_capacity) != 0) return -1;
@@ -3428,6 +3720,40 @@ int mynah_qmat_i8mm_force(int mode) {
 #else
     (void)mode;
     return -1;
+#endif
+}
+
+/* Names the int4 kernel this host resolves to: "neon-sdot", "avx2" or
+ * "scalar".  It exists because int4's x86 path was INVISIBLE: until E4-21
+ * there was no vector kernel there at all, the dispatch report had no int4 row
+ * to say so, and the one recorded int4 measurement ("only 3% over int8 on the
+ * codec") was taken on ARM, where int4 at least had SDOT.  A format that is
+ * slower than the wider one it is supposed to beat should be discoverable by
+ * reading the report, not by reading the source. */
+const char *mynah_qmat_int4_kernel(const char **why) {
+#if defined(MYNAH_QMAT_DOTPROD)
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c dot_q4/matvec_q4: ARM SDOT (vdotq_s32) "
+               "on nibbles unpacked to int8, with vld2q_s8 splitting the "
+               "activation into the even and odd halves the two nibbles need";
+    return "neon-sdot";
+#elif defined(MYNAH_QMAT_AVX2)
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c q4_group_i32_avx2: AVX2 "
+               "_mm256_maddubs_epi16 on UNSIGNED nibbles against the signed "
+               "activation, with the -8 offset applied as a second maddubs "
+               "rather than a table. NOT VNNI on purpose: int4's per-group "
+               "scale forces a float flush every 32 elements, so the dot is "
+               "~3 of ~18 instructions per group and VPDPBUSD would move the "
+               "kernel by about a tenth";
+    return "avx2";
+#else
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c: scalar nibble loop, the correctness "
+               "reference -- roughly eight times the instructions per MAC of "
+               "the vector paths, so int4 here will lose to int8 despite half "
+               "the weight bytes";
+    return "scalar";
 #endif
 }
 

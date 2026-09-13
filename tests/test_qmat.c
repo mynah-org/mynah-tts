@@ -106,6 +106,9 @@ static void report_resolution(void) {
     const char *int8 = mynah_qmat_int8_kernel(&why);
     printf("   int8 kernel   : %-12s %s\n", int8, why == NULL ? "" : why);
     why = NULL;
+    const char *int4 = mynah_qmat_int4_kernel(&why);
+    printf("   int4 kernel   : %-12s %s\n", int4, why == NULL ? "" : why);
+    why = NULL;
     const char *f16 = mynah_qmat_f16_kernel(&why);
     printf("   f16 kernel    : %-12s %s\n", f16, why == NULL ? "" : why);
     why = NULL;

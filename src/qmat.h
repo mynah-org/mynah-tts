@@ -68,6 +68,11 @@ const char *mynah_qmat_int8_kernel(const char **why);
 /* 1 when the SMMLA path is compiled AND the CPU reports FEAT_I8MM. */
 int mynah_qmat_i8mm_enabled(const char **why);
 
+/* Names the int4 kernel this build resolves to: "neon-sdot", "avx2" or
+ * "scalar".  Unlike int8 this is a compile-time choice, not a CPUID one.
+ * `why` (optional) receives a static reason string. */
+const char *mynah_qmat_int4_kernel(const char **why);
+
 /* Names the f16 kernel this host resolves to: "neon", "f16c", "scalar" or
  * "off".  "off" is the one that used to be silent: on a build with no half
  * weight type, mynah_qmat_cache_new() rewrites QMAT_F16 to QMAT_F32 and the
