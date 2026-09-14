@@ -83,9 +83,21 @@ not begin cooperative slicing from this result."*
       engine, and our topology gives it nowhere to run.
 - [-] **Do not build a fixed-target admission guard.** Measured: it buys short
       gaps with seconds of TTFA.
-- [ ] Consider whether our harness can even produce a closed-loop load.
-      `tools/serving_profile.py` has `--mode wave` and `--mode soak`; check what
-      soak actually does — if it is a wave repeated, it is not this.
+- [x] **Checked: our harness already does this properly.**
+      `tools/serving_profile.py --mode soak` keeps C requests in flight back to
+      back for `--soak-seconds` after `--warmup-seconds` of discarded traffic, and
+      `soak_windows()` cuts the measured span into `--window-seconds` windows so a
+      metric that walks over time shows as a trend instead of a respectable mean.
+      Its own docstring states the doctrine and cites the reference's wave-0.919 /
+      soak-1.004 case. The drift gate is unit-tested ("a soak that walks upward
+      fails"). **We have the tool and have never run it**, which is the real gap.
+      The command, for when the box is back:
+
+          python3 tools/serving_profile.py --server-bin build/cpu/mynah-tts-server \
+            --model models/pocket-en --server-args "--prefork 16 --prefork-threads 2 --max-batch 16" \
+            --mode soak --levels 8 --soak-seconds 240 --warmup-seconds 30 --window-seconds 60
+
+      Low concurrency first, per their 2-5 minute reproduction — not C64.
 
 ## What is still open, on their side and ours
 
