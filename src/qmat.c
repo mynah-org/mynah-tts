@@ -2739,6 +2739,61 @@ static void qmat_stats_record(const char *name, const qmat_entry *e,
     pthread_mutex_unlock(&g_stats_mutex);
 }
 
+/* Scratch for turning a contiguous multi-row call into a weight-stationary one.
+ *
+ * Per thread, grown once, and freed by a pthread_key destructor rather than
+ * leaked: `make leaks` is a gate here and a cache that cannot be reclaimed is a
+ * leak with a good excuse.  Sized for the largest call this path accepts --
+ * QMAT_SMALL_COUNT rows of QMAT_K_MAX -- which is 128 KB of int8 plus a scale
+ * per row, too much to put on a stack that pool workers also use. */
+typedef struct {
+    int8_t *qx;
+    float *sx;
+    size_t rows, cols;
+} qmat_row_scratch;
+
+static pthread_key_t g_row_scratch_key;
+static pthread_once_t g_row_scratch_once = PTHREAD_ONCE_INIT;
+
+static void row_scratch_free(void *p) {
+    qmat_row_scratch *sc = (qmat_row_scratch *)p;
+    if (sc == NULL) return;
+    free(sc->qx);
+    free(sc->sx);
+    free(sc);
+}
+
+static void row_scratch_init(void) {
+    (void)pthread_key_create(&g_row_scratch_key, row_scratch_free);
+}
+
+/* 0 and both pointers set, or -1 and the caller keeps its per-row loop. */
+static int row_scratch_get(size_t rows, size_t cols, int8_t **qx, float **sx) {
+    pthread_once(&g_row_scratch_once, row_scratch_init);
+    qmat_row_scratch *sc = (qmat_row_scratch *)pthread_getspecific(g_row_scratch_key);
+    if (sc == NULL) {
+        sc = (qmat_row_scratch *)calloc(1, sizeof(*sc));
+        if (sc == NULL) return -1;
+        if (pthread_setspecific(g_row_scratch_key, sc) != 0) { free(sc); return -1; }
+    }
+    if (rows > sc->rows || cols > sc->cols) {
+        const size_t r = rows > sc->rows ? rows : sc->rows;
+        const size_t c = cols > sc->cols ? cols : sc->cols;
+        if (r > SIZE_MAX / c) return -1;
+        int8_t *nq = (int8_t *)realloc(sc->qx, r * c);
+        if (nq == NULL) return -1;
+        sc->qx = nq;
+        float *ns = (float *)realloc(sc->sx, r * sizeof(float));
+        if (ns == NULL) return -1;
+        sc->sx = ns;
+        sc->rows = r;
+        sc->cols = c;
+    }
+    *qx = sc->qx;
+    *sx = sc->sx;
+    return 0;
+}
+
 int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
                       const mynah_backend *backend, const char *name,
                       const float *weight_data,
@@ -2767,6 +2822,41 @@ int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
         return mynah_backend_matmul(backend, in, out, count, k, n, weight_data, bias,
                                     error, error_capacity);
     }
+    /* MORE THAN ONE ROW IS A GEMM, and it was being run as `count` GEMVs.
+     *
+     * The loop below walks the activation rows and sweeps the whole weight for
+     * each one, so a 16-row prefill tile read every weight block sixteen times.
+     * The weight-stationary path already exists, already blocks over rows for
+     * the pool, and already carries the four- and two-activation kernels; all
+     * that was missing was handing it these rows.  The pool meter says what
+     * this is worth: qmat_rows_block was 72.5% of all regions against
+     * qmat_batch_block's 14.5%.
+     *
+     * Byte-identical, and gated rather than argued:
+     * self_test_lane_widths() compares this exact delegation against the
+     * row-at-a-time reference with memcmp, at every width from 1 to 9, for
+     * every batched encoding.
+     *
+     * A refusal -- no scratch, too many rows -- falls through to the loop
+     * below, which is a slower call and never a different sample. */
+    if (count >= 2u) {
+        const float *in_rows[QMAT_SMALL_COUNT];
+        float *out_rows[QMAT_SMALL_COUNT];
+        int8_t *qs = NULL;
+        float *ss = NULL;
+        if (count <= (size_t)QMAT_SMALL_COUNT &&
+            row_scratch_get(count, k, &qs, &ss) == 0) {
+            for (size_t t = 0; t < count; ++t) {
+                in_rows[t] = in + t * k;
+                out_rows[t] = out + t * n;
+            }
+            return mynah_qmat_linear_batched_qt(cache, backend, name, weight_data,
+                                                in_rows, out_rows, count, k, n,
+                                                bias, qs, ss, qtype, error,
+                                                error_capacity);
+        }
+    }
+
     /* uint8_t because the INT8 activation may be the unsigned x+128 encoding
      * the VNNI kernels need; both are character types, so the int8 paths read
      * the same storage through an int8_t* without an aliasing violation. */
