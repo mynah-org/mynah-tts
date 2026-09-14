@@ -74,11 +74,22 @@ static void resolve(void) {
     if (real_malloc != NULL || resolving) return;
     resolving = 1;
 #if defined(__APPLE__)
-    /* Mach-O interposition (below) leaves the real symbols reachable by name. */
-    real_malloc  = (malloc_fn)dlsym(RTLD_NEXT, "malloc");
-    real_calloc  = (calloc_fn)dlsym(RTLD_NEXT, "calloc");
-    real_realloc = (realloc_fn)dlsym(RTLD_NEXT, "realloc");
-    real_free    = (free_fn)dlsym(RTLD_NEXT, "free");
+    /* NOT dlsym(RTLD_NEXT, ...).  Under DYLD_INSERT_LIBRARIES that returns this
+     * shim's OWN function -- measured, all three of RTLD_NEXT, RTLD_DEFAULT and
+     * the shim's address come back equal -- and since shim_malloc ends in
+     * `return real_malloc(n)`, a tail call, the process spins at 100% CPU with
+     * RSS pinned and never allocates again.  It looked like "too slow to
+     * finish", which is what tests/census_parity.sh used to say; it was an
+     * infinite loop, reproducible on `mynah-tts --version` with no model and no
+     * Accelerate involved.
+     *
+     * Take the addresses directly instead.  A Mach-O interpose table rewrites
+     * calls made from OTHER images; calls made from the image that declares the
+     * table are not rewritten, so `malloc` here is libsystem's malloc. */
+    real_malloc  = malloc;
+    real_calloc  = calloc;
+    real_realloc = realloc;
+    real_free    = free;
 #else
     real_malloc  = (malloc_fn)dlsym(RTLD_NEXT, "malloc");
     real_calloc  = (calloc_fn)dlsym(RTLD_NEXT, "calloc");
@@ -153,10 +164,21 @@ static void shim_free(void *p) {
         const void *o;                                                         \
     } _interpose_##old __attribute__((section("__DATA,__interpose"))) = {       \
         (const void *)(unsigned long)&new, (const void *)(unsigned long)&old}
+/* posix_memalign is interposed here too, and it is not optional: the engine's
+ * aligned scratch goes through it, and a shim that counts three quarters of the
+ * allocations answers a question nobody asked. */
+static int shim_posix_memalign(void **out, size_t align, size_t n) {
+    static int (*real)(void **, size_t, size_t);
+    if (real == NULL) real = posix_memalign;
+    atomic_fetch_add_explicit(&g_posix, 1ull, memory_order_relaxed);
+    return real(out, align, n);
+}
+
 INTERPOSE(shim_malloc, malloc);
 INTERPOSE(shim_calloc, calloc);
 INTERPOSE(shim_realloc, realloc);
 INTERPOSE(shim_free, free);
+INTERPOSE(shim_posix_memalign, posix_memalign);
 #else
 void *malloc(size_t n)              { return shim_malloc(n); }
 void *calloc(size_t a, size_t b)    { return shim_calloc(a, b); }
