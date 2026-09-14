@@ -1426,6 +1426,82 @@ static void matvec_f16_neon_x4(float *o0, float *o1, float *o2, float *o3,
     }
 }
 
+/* Two activations, for the batch sizes the four-wide kernel cannot serve.
+ *
+ * This is not a rounding-out of the API: at the shipping topology a worker
+ * holds C/workers live slots, which is two or three at the concurrencies that
+ * matter, and the AR step batches exactly those. Without this, the production
+ * case is the one case that gets no weight reuse at all -- measured as
+ * step.total 496.7 ms at batch 3 against 414.2 at batch 4, where the larger
+ * batch does a third more work and still costs less. It also serves the
+ * remainder of any batch that is not a multiple of four.
+ *
+ * Same construction, same bits: one accumulator pair per (activation, row),
+ * same column order, same reduction, same tail, same bias. */
+static void matvec_f16_neon_x2(float *o0, float *o1,
+                               const float *x0, const float *x1,
+                               const __fp16 *weights, const float *bias,
+                               size_t rows, size_t cols) {
+    size_t row = 0;
+    for (; row + 2u <= rows; row += 2u) {
+        const __fp16 *wa = weights + row * cols;
+        const __fp16 *wb = wa + cols;
+        float32x4_t a0l = vdupq_n_f32(0.0f), a0h = vdupq_n_f32(0.0f);
+        float32x4_t a1l = vdupq_n_f32(0.0f), a1h = vdupq_n_f32(0.0f);
+        float32x4_t b0l = vdupq_n_f32(0.0f), b0h = vdupq_n_f32(0.0f);
+        float32x4_t b1l = vdupq_n_f32(0.0f), b1h = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const float16x8_t va = vld1q_f16(wa + j);
+            const float16x8_t vb = vld1q_f16(wb + j);
+            const float32x4_t wal = vcvt_f32_f16(vget_low_f16(va));
+            const float32x4_t wah = vcvt_f32_f16(vget_high_f16(va));
+            const float32x4_t wbl = vcvt_f32_f16(vget_low_f16(vb));
+            const float32x4_t wbh = vcvt_f32_f16(vget_high_f16(vb));
+            const float32x4_t x0l = vld1q_f32(x0 + j), x0h = vld1q_f32(x0 + j + 4u);
+            a0l = vfmaq_f32(a0l, wal, x0l); a0h = vfmaq_f32(a0h, wah, x0h);
+            b0l = vfmaq_f32(b0l, wbl, x0l); b0h = vfmaq_f32(b0h, wbh, x0h);
+            const float32x4_t x1l = vld1q_f32(x1 + j), x1h = vld1q_f32(x1 + j + 4u);
+            a1l = vfmaq_f32(a1l, wal, x1l); a1h = vfmaq_f32(a1h, wah, x1h);
+            b1l = vfmaq_f32(b1l, wbl, x1l); b1h = vfmaq_f32(b1h, wbh, x1h);
+        }
+        float sa0 = vaddvq_f32(vaddq_f32(a0l, a0h));
+        float sa1 = vaddvq_f32(vaddq_f32(a1l, a1h));
+        float sb0 = vaddvq_f32(vaddq_f32(b0l, b0h));
+        float sb1 = vaddvq_f32(vaddq_f32(b1l, b1h));
+        for (; j < cols; ++j) {
+            const float wav = (float)wa[j], wbv = (float)wb[j];
+            sa0 += wav * x0[j]; sb0 += wbv * x0[j];
+            sa1 += wav * x1[j]; sb1 += wbv * x1[j];
+        }
+        const float ba = (bias == NULL) ? 0.0f : bias[row];
+        const float bb = (bias == NULL) ? 0.0f : bias[row + 1u];
+        o0[row] = sa0 + ba; o0[row + 1u] = sb0 + bb;
+        o1[row] = sa1 + ba; o1[row + 1u] = sb1 + bb;
+    }
+    for (; row < rows; ++row) {
+        const __fp16 *w = weights + row * cols;
+        float32x4_t a0 = vdupq_n_f32(0.0f), h0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = vdupq_n_f32(0.0f), h1 = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const float16x8_t v = vld1q_f16(w + j);
+            const float32x4_t wl = vcvt_f32_f16(vget_low_f16(v));
+            const float32x4_t wh = vcvt_f32_f16(vget_high_f16(v));
+            a0 = vfmaq_f32(a0, wl, vld1q_f32(x0 + j)); h0 = vfmaq_f32(h0, wh, vld1q_f32(x0 + j + 4u));
+            a1 = vfmaq_f32(a1, wl, vld1q_f32(x1 + j)); h1 = vfmaq_f32(h1, wh, vld1q_f32(x1 + j + 4u));
+        }
+        float s0 = vaddvq_f32(vaddq_f32(a0, h0));
+        float s1 = vaddvq_f32(vaddq_f32(a1, h1));
+        for (; j < cols; ++j) {
+            const float wv = (float)w[j];
+            s0 += wv * x0[j]; s1 += wv * x1[j];
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        o0[row] = s0 + bv; o1[row] = s1 + bv;
+    }
+}
+
 #endif /* MYNAH_QMAT_F16_NEON */
 
 #if defined(MYNAH_QMAT_F16_X86)
@@ -1586,6 +1662,66 @@ static void matvec_f16_f16c_x4(float *o0, float *o1, float *o2, float *o3,
         const float bv = (bias == NULL) ? 0.0f : bias[row];
         o0[row] = s0 + bv; o1[row] = s1 + bv;
         o2[row] = s2 + bv; o3[row] = s3 + bv;
+    }
+}
+
+/* The x86 two-activation kernel; see matvec_f16_neon_x2 for why it exists.
+ * Written on arm64 and never executed, like its four-wide sibling, and gated by
+ * the same self_test_batched_qt() byte compare. */
+__attribute__((target("avx2,f16c,fma")))
+static void matvec_f16_f16c_x2(float *o0, float *o1,
+                               const float *x0, const float *x1,
+                               const uint16_t *weights, const float *bias,
+                               size_t rows, size_t cols) {
+    size_t row = 0;
+    for (; row + 2u <= rows; row += 2u) {
+        const uint16_t *wa = weights + row * cols;
+        const uint16_t *wb = wa + cols;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const __m256 wav = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(const void *)(wa + j)));
+            const __m256 wbv = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(const void *)(wb + j)));
+            const __m256 v0 = _mm256_loadu_ps(x0 + j);
+            a0 = _mm256_fmadd_ps(wav, v0, a0);
+            b0 = _mm256_fmadd_ps(wbv, v0, b0);
+            const __m256 v1 = _mm256_loadu_ps(x1 + j);
+            a1 = _mm256_fmadd_ps(wav, v1, a1);
+            b1 = _mm256_fmadd_ps(wbv, v1, b1);
+        }
+        float sa0 = qmat_hsum256(a0), sa1 = qmat_hsum256(a1);
+        float sb0 = qmat_hsum256(b0), sb1 = qmat_hsum256(b1);
+        for (; j < cols; ++j) {
+            const float wav = qmat_f16_to_f32(wa[j]);
+            const float wbv = qmat_f16_to_f32(wb[j]);
+            sa0 += wav * x0[j]; sb0 += wbv * x0[j];
+            sa1 += wav * x1[j]; sb1 += wbv * x1[j];
+        }
+        const float ba = (bias == NULL) ? 0.0f : bias[row];
+        const float bb = (bias == NULL) ? 0.0f : bias[row + 1u];
+        o0[row] = sa0 + ba; o0[row + 1u] = sb0 + bb;
+        o1[row] = sa1 + ba; o1[row + 1u] = sb1 + bb;
+    }
+    for (; row < rows; ++row) {
+        const uint16_t *w = weights + row * cols;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const __m256 wv = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(const void *)(w + j)));
+            a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + j), a0);
+            a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x1 + j), a1);
+        }
+        float s0 = qmat_hsum256(a0), s1 = qmat_hsum256(a1);
+        for (; j < cols; ++j) {
+            const float wv = qmat_f16_to_f32(w[j]);
+            s0 += wv * x0[j]; s1 += wv * x1[j];
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        o0[row] = s0 + bv; o1[row] = s1 + bv;
     }
 }
 
@@ -2186,8 +2322,7 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
     {
         const int f16k = qmat_f16_kernel();
         const int wide_f16 =
-            e->qtype == QMAT_F16 && j->x != NULL &&
-            j->batch >= QMAT_F16_BATCH_LANES &&
+            e->qtype == QMAT_F16 && j->x != NULL && j->batch >= 2u &&
             (f16k == QMAT_F16K_NEON || f16k == QMAT_F16K_F16C);
         if (wide_f16) {
             const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
@@ -2207,6 +2342,42 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
                     j->x[b], j->x[b + 1u], j->x[b + 2u], j->x[b + 3u],
                     (const uint16_t *)weights + row0 * j->cols, bs, count, j->cols);
 #endif
+            }
+            /* Two at a time for what is left, and this is the case that
+             * matters in production rather than a tidy-up: at the shipping
+             * topology a worker holds C/workers live slots -- three at C48 --
+             * and the AR step batches exactly those. */
+            if (j->batch - b == 3u) {
+                /* EXPERIMENT: three left, served by the four-lane kernel with
+                 * the last activation repeated. */
+#if defined(MYNAH_QMAT_F16_NEON)
+                matvec_f16_neon_x4(
+                    j->out[b] + row0, j->out[b + 1u] + row0,
+                    j->out[b + 2u] + row0, j->out[b + 2u] + row0,
+                    j->x[b], j->x[b + 1u], j->x[b + 2u], j->x[b + 2u],
+                    (const __fp16 *)weights + row0 * j->cols, bs, count, j->cols);
+#else
+                matvec_f16_f16c_x4(
+                    j->out[b] + row0, j->out[b + 1u] + row0,
+                    j->out[b + 2u] + row0, j->out[b + 2u] + row0,
+                    j->x[b], j->x[b + 1u], j->x[b + 2u], j->x[b + 2u],
+                    (const uint16_t *)weights + row0 * j->cols, bs, count, j->cols);
+#endif
+                return;
+            }
+            if (b + 2u <= j->batch) {
+#if defined(MYNAH_QMAT_F16_NEON)
+                matvec_f16_neon_x2(
+                    j->out[b] + row0, j->out[b + 1u] + row0,
+                    j->x[b], j->x[b + 1u],
+                    (const __fp16 *)weights + row0 * j->cols, bs, count, j->cols);
+#else
+                matvec_f16_f16c_x2(
+                    j->out[b] + row0, j->out[b + 1u] + row0,
+                    j->x[b], j->x[b + 1u],
+                    (const uint16_t *)weights + row0 * j->cols, bs, count, j->cols);
+#endif
+                b += 2u;
             }
             for (; b < j->batch; ++b) {
                 const qmat_rows_job rj = {
@@ -3022,6 +3193,90 @@ done:
  * too, because a cache that is off is the case where the two encodings differ
  * most.
  */
+/* EVERY batch width, because the f16 batched path now has four of them and the
+ * existing B=5 test exercises exactly two.
+ *
+ * The widths are not decoration.  A worker at the shipping topology holds
+ * C/workers live slots -- two or three at the concurrencies that matter -- and
+ * the AR step batches precisely those, so the remainders are the production
+ * case and not the leftovers.  One of them, the three-remainder, is served by
+ * the four-lane kernel with the last activation REPEATED: it spends a quarter
+ * more arithmetic to load the weight block once instead of twice, which wins
+ * because the kernel is memory-bound, and it writes one output address twice
+ * with bits that are identical by construction.  That is subtle enough that it
+ * must be tested rather than argued, and B=5 would never have reached it.
+ *
+ * The reference is the row-at-a-time path, compared with memcmp: the claim is
+ * bit-identity, not closeness. */
+static int self_test_f16_lane_widths(char *error, size_t error_capacity) {
+    enum { N = 96, K = 256, BMAX = 9 };
+    if (qmat_qtype_available(QMAT_F16) != QMAT_F16) return 0;
+    int status = -1;
+    mynah_qmat_cache *cache = mynah_qmat_cache_new(QMAT_F16);
+    if (cache == NULL) return -1;
+    if (cache->qtype != QMAT_F16) { mynah_qmat_cache_free(cache); return 0; }
+
+    float *w = (float *)malloc((size_t)N * K * sizeof(float));
+    float *x = (float *)malloc((size_t)BMAX * K * sizeof(float));
+    float *bias = (float *)malloc((size_t)N * sizeof(float));
+    float *ref = (float *)malloc((size_t)BMAX * N * sizeof(float));
+    float *got = (float *)malloc((size_t)BMAX * N * sizeof(float));
+    int8_t *qx = (int8_t *)malloc((size_t)BMAX * K);
+    float *sx = (float *)malloc((size_t)BMAX * sizeof(float));
+    if (w == NULL || x == NULL || bias == NULL || ref == NULL || got == NULL ||
+        qx == NULL || sx == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "qmat f16 lane-width self-test out of memory");
+        goto done;
+    }
+    for (size_t i = 0; i < (size_t)N * K; ++i)
+        w[i] = sinf(0.011f * (float)i) * (0.5f + 0.5f * cosf(0.0009f * (float)i));
+    for (size_t i = 0; i < (size_t)BMAX * K; ++i)
+        x[i] = cosf(0.019f * (float)i) - 0.0625f;
+    for (size_t i = 0; i < (size_t)N; ++i) bias[i] = 0.25f - (float)i * 0.00390625f;
+
+    for (size_t b = 0; b < (size_t)BMAX; ++b) {
+        if (mynah_qmat_linear_resolved_qt(cache, NULL, "f16.lanes.ref", w,
+                                          x + b * K, ref + b * N, 1u, K, N, bias,
+                                          QMAT_F16, error, error_capacity) != 0) {
+            goto done;
+        }
+    }
+    for (size_t batch = 1; batch <= (size_t)BMAX; ++batch) {
+        const float *in_rows[BMAX];
+        float *out_rows[BMAX];
+        for (size_t b = 0; b < batch; ++b) {
+            in_rows[b] = x + b * K;
+            out_rows[b] = got + b * N;
+        }
+        memset(got, 0, (size_t)BMAX * N * sizeof(float));
+        if (mynah_qmat_linear_batched_qt(cache, NULL, "f16.lanes.ref", w, in_rows,
+                                         out_rows, batch, K, N, bias, qx, sx,
+                                         QMAT_F16, error, error_capacity) != 0) {
+            goto done;
+        }
+        for (size_t b = 0; b < batch; ++b) {
+            for (size_t i = 0; i < (size_t)N; ++i) {
+                const size_t at = b * N + i;
+                if (memcmp(&ref[at], &got[at], sizeof(float)) != 0) {
+                    if (error != NULL && error_capacity > 0)
+                        snprintf(error, error_capacity,
+                                 "qmat f16 batch=%zu differs from the row-at-a-time "
+                                 "reference at row %zu col %zu: %.9g vs %.9g -- a "
+                                 "lane width changed a row's answer",
+                                 batch, b, i, (double)ref[at], (double)got[at]);
+                    goto done;
+                }
+            }
+        }
+    }
+    status = 0;
+done:
+    free(w); free(x); free(bias); free(ref); free(got); free(qx); free(sx);
+    mynah_qmat_cache_free(cache);
+    return status;
+}
+
 static int self_test_batched_qt(int cache_qtype, int group_qtype, char *error,
                                 size_t error_capacity) {
     enum { N = 96, K = 256, B = 5 };
@@ -3861,6 +4116,7 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_rows_blocked(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT4, error, error_capacity) != 0) return -1;
+    if (self_test_f16_lane_widths(error, error_capacity) != 0) return -1;
     /* E8-5: a group that names its own encoding, with the batched call as the
      * tensor's first toucher.  Every cache profile the runtime ships crossed
      * with every encoding a group spec can name. */
