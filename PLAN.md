@@ -537,7 +537,10 @@ development signals taken while the Axion was off and must be re-taken there.
       from the linked BLAS (PASS, named). Verified: `malloc/calloc/realloc` identical
       across 24 and 96 steps, `posix_memalign` +209 ≈ 19/frame from Accelerate, and
       `BLAS=none` is fully constant at 3606
-- [ ] E10-1 **hoist the conv tap gather out of the `BLAS` guard** — `src/seanet.c:666-670`
+- [x] E10-1 **hoist the conv tap gather out of the `BLAS` guard** — done, byte-identical,
+      `codec.conv_stack` **1.210×** and `request.total` **1.044×** *(mac)*, and `conv.gather`
+      is gone from the phase table. Production (`BLAS=none`) is untouched by construction:
+      the fused path already runs there, so the memo is never consulted. — `src/seanet.c:666-670`
       re-derives **1,964,224 floats per frame, 1.43 GB per request**, of a weight layout
       that never changes. The gather-free path is behind `#if defined(MYNAH_SEANET_OWN_SGEMM)`,
       i.e. `BLAS=none` only, so **macOS and `BLAS=openblas` builds still pay it**:
