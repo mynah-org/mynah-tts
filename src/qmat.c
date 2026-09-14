@@ -1306,6 +1306,126 @@ static void matvec_f16_neon(float *out, const float *x, const __fp16 *weights,
         out[row] = s + (bias == NULL ? 0.0f : bias[row]);
     }
 }
+/* The same arithmetic as matvec_f16_neon, with the activation loop pulled
+ * INSIDE the column loop so one weight load serves four activations.
+ *
+ * WHY: the batched path used to walk the batch and call the single-activation
+ * kernel once per row, so a 16-row prefill tile read every weight block
+ * sixteen times.  matvec_f16_neon is a good GEMV -- four weight rows against
+ * one activation, eight FMAs per 64 bytes of f16 weights -- but 0.5 FLOP per
+ * weight byte is memory-bound by construction, and a GEMM run as B GEMVs
+ * inherits that ceiling B times over.  Here two weight rows are loaded once
+ * and multiplied into four activations: sixteen FMAs per 32 weight bytes, or
+ * 2 FLOP/byte, four times the arithmetic intensity.
+ *
+ * BIT-IDENTICAL, and that is the point rather than a hope.  Each (activation,
+ * row) pair keeps its own pair of accumulators, visits j in the same order,
+ * reduces with the same vaddvq_f32(vaddq_f32(lo, hi)), runs the same scalar
+ * tail and adds the same bias.  Nothing is reassociated: the only thing that
+ * changed is the interleaving of chains that never interacted.  The batch
+ * remainder falls back to the row-at-a-time kernel, which is the same
+ * arithmetic again.
+ *
+ * Register budget on aarch64 (32 vectors): 16 accumulators, 4 converted
+ * weight vectors, 8 activation vectors. */
+#define QMAT_F16_BATCH_LANES 4u
+
+static void matvec_f16_neon_x4(float *o0, float *o1, float *o2, float *o3,
+                               const float *x0, const float *x1,
+                               const float *x2, const float *x3,
+                               const __fp16 *weights, const float *bias,
+                               size_t rows, size_t cols) {
+    size_t row = 0;
+    for (; row + 2u <= rows; row += 2u) {
+        const __fp16 *wa = weights + row * cols;
+        const __fp16 *wb = wa + cols;
+        float32x4_t a0l = vdupq_n_f32(0.0f), a0h = vdupq_n_f32(0.0f);
+        float32x4_t a1l = vdupq_n_f32(0.0f), a1h = vdupq_n_f32(0.0f);
+        float32x4_t a2l = vdupq_n_f32(0.0f), a2h = vdupq_n_f32(0.0f);
+        float32x4_t a3l = vdupq_n_f32(0.0f), a3h = vdupq_n_f32(0.0f);
+        float32x4_t b0l = vdupq_n_f32(0.0f), b0h = vdupq_n_f32(0.0f);
+        float32x4_t b1l = vdupq_n_f32(0.0f), b1h = vdupq_n_f32(0.0f);
+        float32x4_t b2l = vdupq_n_f32(0.0f), b2h = vdupq_n_f32(0.0f);
+        float32x4_t b3l = vdupq_n_f32(0.0f), b3h = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const float16x8_t va = vld1q_f16(wa + j);
+            const float16x8_t vb = vld1q_f16(wb + j);
+            const float32x4_t wal = vcvt_f32_f16(vget_low_f16(va));
+            const float32x4_t wah = vcvt_f32_f16(vget_high_f16(va));
+            const float32x4_t wbl = vcvt_f32_f16(vget_low_f16(vb));
+            const float32x4_t wbh = vcvt_f32_f16(vget_high_f16(vb));
+
+            const float32x4_t x0l = vld1q_f32(x0 + j), x0h = vld1q_f32(x0 + j + 4u);
+            a0l = vfmaq_f32(a0l, wal, x0l); a0h = vfmaq_f32(a0h, wah, x0h);
+            b0l = vfmaq_f32(b0l, wbl, x0l); b0h = vfmaq_f32(b0h, wbh, x0h);
+
+            const float32x4_t x1l = vld1q_f32(x1 + j), x1h = vld1q_f32(x1 + j + 4u);
+            a1l = vfmaq_f32(a1l, wal, x1l); a1h = vfmaq_f32(a1h, wah, x1h);
+            b1l = vfmaq_f32(b1l, wbl, x1l); b1h = vfmaq_f32(b1h, wbh, x1h);
+
+            const float32x4_t x2l = vld1q_f32(x2 + j), x2h = vld1q_f32(x2 + j + 4u);
+            a2l = vfmaq_f32(a2l, wal, x2l); a2h = vfmaq_f32(a2h, wah, x2h);
+            b2l = vfmaq_f32(b2l, wbl, x2l); b2h = vfmaq_f32(b2h, wbh, x2h);
+
+            const float32x4_t x3l = vld1q_f32(x3 + j), x3h = vld1q_f32(x3 + j + 4u);
+            a3l = vfmaq_f32(a3l, wal, x3l); a3h = vfmaq_f32(a3h, wah, x3h);
+            b3l = vfmaq_f32(b3l, wbl, x3l); b3h = vfmaq_f32(b3h, wbh, x3h);
+        }
+        float sa0 = vaddvq_f32(vaddq_f32(a0l, a0h));
+        float sa1 = vaddvq_f32(vaddq_f32(a1l, a1h));
+        float sa2 = vaddvq_f32(vaddq_f32(a2l, a2h));
+        float sa3 = vaddvq_f32(vaddq_f32(a3l, a3h));
+        float sb0 = vaddvq_f32(vaddq_f32(b0l, b0h));
+        float sb1 = vaddvq_f32(vaddq_f32(b1l, b1h));
+        float sb2 = vaddvq_f32(vaddq_f32(b2l, b2h));
+        float sb3 = vaddvq_f32(vaddq_f32(b3l, b3h));
+        for (; j < cols; ++j) {
+            const float wav = (float)wa[j], wbv = (float)wb[j];
+            sa0 += wav * x0[j]; sb0 += wbv * x0[j];
+            sa1 += wav * x1[j]; sb1 += wbv * x1[j];
+            sa2 += wav * x2[j]; sb2 += wbv * x2[j];
+            sa3 += wav * x3[j]; sb3 += wbv * x3[j];
+        }
+        const float ba = (bias == NULL) ? 0.0f : bias[row];
+        const float bb = (bias == NULL) ? 0.0f : bias[row + 1u];
+        o0[row] = sa0 + ba; o0[row + 1u] = sb0 + bb;
+        o1[row] = sa1 + ba; o1[row + 1u] = sb1 + bb;
+        o2[row] = sa2 + ba; o2[row + 1u] = sb2 + bb;
+        o3[row] = sa3 + ba; o3[row + 1u] = sb3 + bb;
+    }
+    /* An odd last row: the one-row shape of the same accumulation. */
+    for (; row < rows; ++row) {
+        const __fp16 *w = weights + row * cols;
+        float32x4_t a0 = vdupq_n_f32(0.0f), h0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = vdupq_n_f32(0.0f), h1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), h2 = vdupq_n_f32(0.0f);
+        float32x4_t a3 = vdupq_n_f32(0.0f), h3 = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const float16x8_t v = vld1q_f16(w + j);
+            const float32x4_t wl = vcvt_f32_f16(vget_low_f16(v));
+            const float32x4_t wh = vcvt_f32_f16(vget_high_f16(v));
+            a0 = vfmaq_f32(a0, wl, vld1q_f32(x0 + j)); h0 = vfmaq_f32(h0, wh, vld1q_f32(x0 + j + 4u));
+            a1 = vfmaq_f32(a1, wl, vld1q_f32(x1 + j)); h1 = vfmaq_f32(h1, wh, vld1q_f32(x1 + j + 4u));
+            a2 = vfmaq_f32(a2, wl, vld1q_f32(x2 + j)); h2 = vfmaq_f32(h2, wh, vld1q_f32(x2 + j + 4u));
+            a3 = vfmaq_f32(a3, wl, vld1q_f32(x3 + j)); h3 = vfmaq_f32(h3, wh, vld1q_f32(x3 + j + 4u));
+        }
+        float s0 = vaddvq_f32(vaddq_f32(a0, h0));
+        float s1 = vaddvq_f32(vaddq_f32(a1, h1));
+        float s2 = vaddvq_f32(vaddq_f32(a2, h2));
+        float s3 = vaddvq_f32(vaddq_f32(a3, h3));
+        for (; j < cols; ++j) {
+            const float wv = (float)w[j];
+            s0 += wv * x0[j]; s1 += wv * x1[j];
+            s2 += wv * x2[j]; s3 += wv * x3[j];
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        o0[row] = s0 + bv; o1[row] = s1 + bv;
+        o2[row] = s2 + bv; o3[row] = s3 + bv;
+    }
+}
+
 #endif /* MYNAH_QMAT_F16_NEON */
 
 #if defined(MYNAH_QMAT_F16_X86)
@@ -1372,6 +1492,103 @@ static void matvec_f16_f16c(float *out, const float *x, const uint16_t *weights,
         out[row] = s + (bias == NULL ? 0.0f : bias[row]);
     }
 }
+/* The x86 counterpart of matvec_f16_neon_x4, and the same bargain: two weight
+ * rows converted once, multiplied into four activations, so the batched path
+ * stops re-reading the weight block once per activation.  Sixteen FMAs per 32
+ * bytes of f16 weights instead of four.
+ *
+ * Bit-identical for the same reason and by the same construction: each
+ * (activation, row) pair keeps ONE __m256 accumulator, visits j in the same
+ * order, reduces with the same qmat_hsum256(), runs the same scalar tail and
+ * adds the same bias.  Nothing is reassociated.
+ *
+ * Register budget on x86-64 (16 YMM): 8 accumulators, 2 converted weight
+ * vectors, 4 activation vectors.
+ *
+ * NOT EXECUTED ON THE MACHINE THAT WROTE IT -- this was developed on arm64.
+ * It is gated by self_test_batched_qt(), which memcmps the batched result
+ * against the row-at-a-time reference for every cache/group encoding including
+ * F16, and which asserts the weight-stationary path actually ran rather than
+ * being quietly skipped.  Run `--self-test` on x86 before trusting the speed
+ * claim; the correctness claim is the test's to make, not this comment's. */
+__attribute__((target("avx2,f16c,fma")))
+static void matvec_f16_f16c_x4(float *o0, float *o1, float *o2, float *o3,
+                               const float *x0, const float *x1,
+                               const float *x2, const float *x3,
+                               const uint16_t *weights, const float *bias,
+                               size_t rows, size_t cols) {
+    size_t row = 0;
+    for (; row + 2u <= rows; row += 2u) {
+        const uint16_t *wa = weights + row * cols;
+        const uint16_t *wb = wa + cols;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+        __m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const __m256 wav = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(const void *)(wa + j)));
+            const __m256 wbv = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(const void *)(wb + j)));
+            const __m256 v0 = _mm256_loadu_ps(x0 + j);
+            a0 = _mm256_fmadd_ps(wav, v0, a0);
+            b0 = _mm256_fmadd_ps(wbv, v0, b0);
+            const __m256 v1 = _mm256_loadu_ps(x1 + j);
+            a1 = _mm256_fmadd_ps(wav, v1, a1);
+            b1 = _mm256_fmadd_ps(wbv, v1, b1);
+            const __m256 v2 = _mm256_loadu_ps(x2 + j);
+            a2 = _mm256_fmadd_ps(wav, v2, a2);
+            b2 = _mm256_fmadd_ps(wbv, v2, b2);
+            const __m256 v3 = _mm256_loadu_ps(x3 + j);
+            a3 = _mm256_fmadd_ps(wav, v3, a3);
+            b3 = _mm256_fmadd_ps(wbv, v3, b3);
+        }
+        float sa0 = qmat_hsum256(a0), sa1 = qmat_hsum256(a1);
+        float sa2 = qmat_hsum256(a2), sa3 = qmat_hsum256(a3);
+        float sb0 = qmat_hsum256(b0), sb1 = qmat_hsum256(b1);
+        float sb2 = qmat_hsum256(b2), sb3 = qmat_hsum256(b3);
+        for (; j < cols; ++j) {
+            const float wav = qmat_f16_to_f32(wa[j]);
+            const float wbv = qmat_f16_to_f32(wb[j]);
+            sa0 += wav * x0[j]; sb0 += wbv * x0[j];
+            sa1 += wav * x1[j]; sb1 += wbv * x1[j];
+            sa2 += wav * x2[j]; sb2 += wbv * x2[j];
+            sa3 += wav * x3[j]; sb3 += wbv * x3[j];
+        }
+        const float ba = (bias == NULL) ? 0.0f : bias[row];
+        const float bb = (bias == NULL) ? 0.0f : bias[row + 1u];
+        o0[row] = sa0 + ba; o0[row + 1u] = sb0 + bb;
+        o1[row] = sa1 + ba; o1[row + 1u] = sb1 + bb;
+        o2[row] = sa2 + ba; o2[row + 1u] = sb2 + bb;
+        o3[row] = sa3 + ba; o3[row + 1u] = sb3 + bb;
+    }
+    for (; row < rows; ++row) {
+        const uint16_t *w = weights + row * cols;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const __m256 wv = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(const void *)(w + j)));
+            a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + j), a0);
+            a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x1 + j), a1);
+            a2 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x2 + j), a2);
+            a3 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x3 + j), a3);
+        }
+        float s0 = qmat_hsum256(a0), s1 = qmat_hsum256(a1);
+        float s2 = qmat_hsum256(a2), s3 = qmat_hsum256(a3);
+        for (; j < cols; ++j) {
+            const float wv = qmat_f16_to_f32(w[j]);
+            s0 += wv * x0[j]; s1 += wv * x1[j];
+            s2 += wv * x2[j]; s3 += wv * x3[j];
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        o0[row] = s0 + bv; o1[row] = s1 + bv;
+        o2[row] = s2 + bv; o3[row] = s3 + bv;
+    }
+}
+
 #endif /* MYNAH_QMAT_F16_X86 */
 
 /* The portable kernel.  It is the correctness reference for the two above, and
@@ -1956,6 +2173,51 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
                       NULL, bs, count, j->cols, QMAT_U8_OFF);
         }
         return;
+    }
+#endif
+#if defined(MYNAH_QMAT_F16)
+    /* Four activations per weight load.  This is the f16 counterpart of the
+     * SMMLA pair above and exists for the same reason: without it the batch is
+     * walked one activation at a time and a 16-row prefill tile reads every
+     * weight block sixteen times.  Same arithmetic, same order, same bits --
+     * see matvec_f16_neon_x4.  The scalar half kernel is deliberately excluded:
+     * it has no vector registers to keep a weight block in, so the four-wide
+     * shape would buy it nothing and cost it clarity. */
+    {
+        const int f16k = qmat_f16_kernel();
+        const int wide_f16 =
+            e->qtype == QMAT_F16 && j->x != NULL &&
+            j->batch >= QMAT_F16_BATCH_LANES &&
+            (f16k == QMAT_F16K_NEON || f16k == QMAT_F16K_F16C);
+        if (wide_f16) {
+            const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
+            size_t b = 0;
+            for (; b + QMAT_F16_BATCH_LANES <= j->batch;
+                 b += QMAT_F16_BATCH_LANES) {
+#if defined(MYNAH_QMAT_F16_NEON)
+                matvec_f16_neon_x4(
+                    j->out[b] + row0, j->out[b + 1u] + row0,
+                    j->out[b + 2u] + row0, j->out[b + 3u] + row0,
+                    j->x[b], j->x[b + 1u], j->x[b + 2u], j->x[b + 3u],
+                    (const __fp16 *)weights + row0 * j->cols, bs, count, j->cols);
+#else
+                matvec_f16_f16c_x4(
+                    j->out[b] + row0, j->out[b + 1u] + row0,
+                    j->out[b + 2u] + row0, j->out[b + 3u] + row0,
+                    j->x[b], j->x[b + 1u], j->x[b + 2u], j->x[b + 3u],
+                    (const uint16_t *)weights + row0 * j->cols, bs, count, j->cols);
+#endif
+            }
+            for (; b < j->batch; ++b) {
+                const qmat_rows_job rj = {
+                    j->out[b], NULL, j->x[b], 0.0f,
+                    weights, e->scales, e->rowsum, j->bias, j->rows, j->cols,
+                    e->qtype, j->level
+                };
+                qmat_rows_dispatch(&rj, row0, count);
+            }
+            return;
+        }
     }
 #endif
     for (size_t b = 0; b < j->batch; ++b) {
