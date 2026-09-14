@@ -549,7 +549,14 @@ development signals taken while the Axion was off and must be re-taken there.
       gather**, which is `dst[j] = src[j*kernel]`, a copy. Measured *(mac)*: `request.total`
       −78.8 ms, **byte-identical**. It also unblocks an honest `none`-vs-`openblas` A/B,
       which E4-16 needs and which today partly measures the gather
-- [ ] E10-2 **free the F32 copy once a tensor is packed** — BF16→F32 materialisation is
+- [-] E10-2 **superseded by E10-3, and its naive form was unsafe anyway** — `use_q` in
+      `mynah_qmat_linear_resolved_qt` requires `count <= QMAT_SMALL_COUNT` (16); above that
+      `src/qmat.c:2623` hands `weight_data` to `mynah_backend_matmul`, so freeing the F32
+      would leave a **dangling** pointer the engine still holds, not an unreachable one. It
+      does not fire today (prefill tile is 16) but that is a runtime property, not a
+      guarantee. And with E10-3 the F32 is now one shared copy, so the prize fell from
+      ~5.6 GB to 349 MiB once. Revisit only with E10-3b. Original text follows.
+- [ ] E10-2b **the F32 copy is still dead weight after packing, now costing once** — BF16→F32 materialisation is
       **399,011,464 B** (`src/weights.c:155`) and the f16 pack **183,142,400 B**
       (`src/qmat.c:2127`). After packing, the F32 is dead: the census reports 1,108
       `matvec-q` + 216 `batched-q`, **100% f16, 0 f32, 0 rowloop**, unchanged at a 527-char
@@ -557,7 +564,15 @@ development signals taken while the Axion was off and must be re-taken there.
       falls back to `mynah_backend_matmul(weight_data)` when `count > 16` or `k > 8192`,
       and `MYNAH_QUANT=f32` uses the F32 copy as the working weights — so it needs a
       re-materialise-or-refuse path, not a bare free
-- [ ] E10-3 **build the conversions and the prepack in the parent, before the fork** —
+- [~] E10-3 **conversions built in the parent — done; the pack is not, and cannot be yet**
+      *(`mynah_tts_model_warm`)*. Measured: per-worker physical footprint **572.6 → 201.2 MB**,
+      parent 1.7 → 558.7 MB, audio byte-identical — **≈5.6 GB at W=16**. Gated on >1 worker
+      because at W=1 it is a 186 MB *loss*. The `prefork.h` warning was narrowed rather than
+      deleted: BNNS is 68 references across `conv1d.c`/`codec_nanocodec.c` (Magpie) and
+      **zero** in the PocketTTS path. **Still open:** the f16 pack (183 MB) is owned by the
+      engine *state*, so it is still built per worker; sharing it means moving that cache to
+      the model — a different ownership question. Original item text follows.
+- [ ] E10-3b **move the quantized weight cache to the model so the pack is shared too** —
       both are immutable after build and both are built **per worker, after the fork**.
       Measured per-worker private footprint: 582.1 MB (f16) / 414.1 MB (quant off), so
       **≈8.3 GB at W=16**. The blocker in `server/prefork.h` does not apply to PocketTTS:
