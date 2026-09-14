@@ -485,18 +485,21 @@ does not.
       two threads, ×48 ÷ 32 cores = 497 ms + 88 ms of first frames = **585 predicted vs
       581 measured**. Sixteen workers × two threads *is* the machine — no idle resource
       exists for a better scheduler to find
-- [ ] E9-11 **the f16 batched path does not batch** — `qmat_batch_rows()` carries a
-      two-activations-per-SMMLA fast path for INT8+i8mm and drops every other encoding,
-      f16 included, into `for (b) qmat_rows_dispatch(...)`: **one activation at a time,
-      so a 16-row tile reads the weight block sixteen times**. `matvec_f16_neon` is a
-      fine GEMV (4 weight rows × 1 activation, 8 FMAs per 64 B of weights, 0.5
-      FLOP/byte) and a GEMV is memory-bound by construction — running a GEMM as B GEMVs
-      is precisely the third-of-roof shape. The prefill is **165.8 ms at two threads,
-      149.9 of it projections**, or
-      ~13.6 GFLOP/s/core against the ~41 the seanet lane measured on this box. Fixing it
-      carries **no numerical question at all**: the arithmetic is unchanged, only its
-      scheduling. A 2× here takes burst TTFA at C48 from 581 ms to ~330. E9-1 handed
-      this over and could not act on it because `qmat` belonged to another lane
+- [~] E9-11 **the f16 batched path batches now — measured on macOS, unvalidated on the
+      box** → `src/qmat.c`. It carried a two-activations-per-SMMLA path for INT8+i8mm
+      and dropped every other encoding, f16 included, into `for (b)
+      qmat_rows_dispatch(...)`: one activation at a time, so a 16-row tile read each
+      weight block **sixteen times**. Now two weight rows are converted once and
+      multiplied into two or four activations (both ISAs), and a three-remainder — the
+      production width at C48, where a worker holds three live slots — is served by the
+      four-lane kernel with the last activation **repeated**, spending a quarter more
+      arithmetic to halve the weight traffic, which wins and thereby proves the kernel
+      memory-bound. macOS, clean build, paired: `prep.prefill_proj` **1.62-1.71x**,
+      `prep.decoder_prefill` 1.32-1.55x; `step.total` at batch 3 **496.7 → 361.8 ms**.
+      Byte-identical, 180/180. New `self_test_f16_lane_widths()` gates widths 1-9 by
+      `memcmp` and both new paths were mutation-tested. **Re-take on the Axion before
+      any of these numbers are quoted as production**, and run `--self-test` on x86 —
+      the x86 kernels were written on arm64 and have never executed
 - [ ] E9-12 **int8 never reaches the prefill** — `MYNAH_QUANT=int8` leaves
       `prep.prefill_proj` at 149.9 ms, identical to default, while taking
       `request.total` 1848 → 1496. That is `POCKET_QG_DEFAULT_SPEC` working as designed:
@@ -507,15 +510,14 @@ does not.
       rather than a compounding one, which is a different risk and not a smaller one.
       Needs its own quality gate (frame count, EOS step, log-mel corr) and a second
       quantized copy of the backbone, since the steps must stay f16
-- [ ] E9-13 **the prefill tile is capped at 16 by its own scratch, and the sweep that
-      said otherwise was invalid** — the box knob changed only
-      `mynah_transformer_ar_prefill_tile()`, while `tar_rows_reserve` sizes the scratch
-      from the **macro** and the prefill clamps `rows` to `rows_cap`. Above 16 the
-      experiment never reached the path it claimed to test; below 16 it did (tile 2 is
-      slower) because `engine_pocket` tiles before calling in. Byte-identity across
-      tiles stands. Raising it is the **second** lever, worth nothing until E9-11 lands:
-      while the kernel walks the batch one activation at a time, a wider tile re-reads
-      the weight block just as often
+- [-] E9-13 **moot after E9-11: the tile is not what sets weight traffic** — the sweep
+      that called it a lever was invalid (the knob moved the accessor while
+      `tar_rows_reserve` sizes the scratch from the macro and the prefill clamps to
+      `rows_cap`), and the question it was asking is now answered elsewhere: the batched
+      kernel amortises a weight block over four activations *regardless of tile*, so
+      going from 16 rows to 32 changes nothing per row. Only `QMAT_F16_BATCH_LANES`
+      would, and that is register-bound rather than scratch-bound. Byte-identity across
+      tiles stands as a result
 - [x] E9-0 **allocations are constant across `--max-steps`** (3,441 at both 24 and 96
       steps): the autoregressive loop allocates nothing, and that is now a permanent
       check rather than a belief
