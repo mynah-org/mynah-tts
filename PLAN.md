@@ -592,9 +592,16 @@ development signals taken while the Axion was off and must be re-taken there.
       measured win and a production one
 - [ ] E10-4b **the x86 u8/VNNI batched int8 kernel** — still the fall-through-only path
       there, and it cannot be executed or measured on an arm64 machine. Needs an x86 box
-- [ ] E10-4d **why does the default spec not take the int8 batched kernel?** The group
-      resolves to int8 and `MYNAH_QUANT=int8` moves 1.14× on the same shapes while the
-      default moves nothing. Find the divergence before quoting either number
+- [x] E10-4d **the default spec did not do what its own measured comment says** — a bare
+      clause means "whatever `MYNAH_QUANT` says", and once `src/mynah_tts.c:402` began
+      requesting f16 when `MYNAH_QUANT` is unset, the two codec clauses inherited f16 and
+      the shipped default became **"f16 everywhere"** — the one configuration that comment
+      never measured. Fixed with a pinned twin used only when `MYNAH_QUANT` is absent (an
+      unconditional pin also changed `MYNAH_QUANT=int4`, 36/180 cases — caught by the
+      identity sweep, not by reasoning). **`codec.transformer` 183.5 → 130.9 ms, 1.40×**,
+      WAV the same length to the byte so frame count and EOS do not move. Changes default
+      audio, deliberately, and nothing else: 144/180 identical, the 36 differing are all
+      the default. This also closes the other half of **E9-5**
 - [-] E10-4-orig **original text** — the f16 hole fixed in `8614117`
       one floor down. **x86 falls straight through to `for (b) qmat_rows_dispatch(...)`:
       at m=16 that is sixteen passes over the weight.** ARM has only the 2-wide
