@@ -301,3 +301,37 @@ rather than the same one.
 The last row is not hypothetical: a 36× on one region took our RTF to 0.245 and
 the machine still served two or three real-time streams, because the limit was
 never that region. A cost model would have said so before the work, not after.
+
+---
+
+## 7. The local build lies once a second (macOS, 2026-09-14)
+
+A self-test failed on source with no modification in it — `grep -c MUTANT` was
+zero and the failure text named a real disagreement at batch 3. Deleting one
+object file and rebuilding made it pass, three times.
+
+Apple ships **GNU Make 3.81**, whose file-time comparison is **whole seconds**.
+An edit that lands in the same second as the object's last build is not newer by
+make's reckoning, so it is silently skipped and the binary keeps the old code
+with the new source on disk. The tighter the edit-build-test loop — a scripted
+`python3 - <<PY ... PY && make && ./binary --self-test` in one command is exactly
+tight enough — the likelier it is.
+
+**It cuts both ways, and the second way is worse.** A stale object can fail a
+test that should pass, which is loud and self-correcting. It can also *pass* a
+test that should fail, which is silent: a mutation test that reports "the gate
+caught it" may have run the unmutated binary, and a gate that reports PASS may
+have run yesterday's kernel.
+
+Rules, then:
+
+- any measurement or gate that decides something gets a `make clean` first, or
+  at minimum an `rm` of the objects under test;
+- a mutation test is only evidence if the mutated build is *observed* to differ
+  — same-second builds make "it failed as expected" unfalsifiable;
+- when a result is absurd, suspect the build before the code. This is already
+  rule 1 of the global method note and it was still not the first thing checked.
+
+None of this applies to the Linux box, which has a modern make — which is its
+own trap, since the platform where the numbers are taken is not the platform
+where this bites.
