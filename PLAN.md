@@ -522,6 +522,123 @@ does not.
       steps): the autoregressive loop allocates nothing, and that is now a permanent
       check rather than a belief
 
+### E10 — What five parallel audits found, 2026-09-14 → [`.work/reference-arm-soak-2026-09-13.md`](.work/reference-arm-soak-2026-09-13.md)
+
+Five read-only audits against the engine and against the reference OSS engine
+(`../qwen-tts` at `97c0fa1`): kernels, serving design, allocations, thread pool,
+dtype conversions. Ordered by **(measured cost touched) ÷ (risk)**, and every
+item carries the measurement that justifies it. Numbers marked *(mac)* are
+development signals taken while the Axion was off and must be re-taken there.
+
+- [x] E10-0 **the allocation gate skipped macOS for a reason that was not true**
+      (`8919950`). `dlsym(RTLD_NEXT,"malloc")` returned the shim's own function and
+      `shim_malloc` tail-called it: an infinite loop, read as "too slow to finish".
+      Fixed; the check now runs here and separates our allocators (FAIL if they grow)
+      from the linked BLAS (PASS, named). Verified: `malloc/calloc/realloc` identical
+      across 24 and 96 steps, `posix_memalign` +209 ≈ 19/frame from Accelerate, and
+      `BLAS=none` is fully constant at 3606
+- [ ] E10-1 **hoist the conv tap gather out of the `BLAS` guard** — `src/seanet.c:666-670`
+      re-derives **1,964,224 floats per frame, 1.43 GB per request**, of a weight layout
+      that never changes. The gather-free path is behind `#if defined(MYNAH_SEANET_OWN_SGEMM)`,
+      i.e. `BLAS=none` only, so **macOS and `BLAS=openblas` builds still pay it**:
+      `conv.gather` 109 ms, 31.7% of `codec.conv_stack`. The guard's stated reason — our
+      GEMM kernels would change macOS numerics — is true of `conv_taps` and **false of the
+      gather**, which is `dst[j] = src[j*kernel]`, a copy. Measured *(mac)*: `request.total`
+      −78.8 ms, **byte-identical**. It also unblocks an honest `none`-vs-`openblas` A/B,
+      which E4-16 needs and which today partly measures the gather
+- [ ] E10-2 **free the F32 copy once a tensor is packed** — BF16→F32 materialisation is
+      **399,011,464 B** (`src/weights.c:155`) and the f16 pack **183,142,400 B**
+      (`src/qmat.c:2127`). After packing, the F32 is dead: the census reports 1,108
+      `matvec-q` + 216 `batched-q`, **100% f16, 0 f32, 0 rowloop**, unchanged at a 527-char
+      input. **349 MiB per process.** Must be conditional: `mynah_qmat_linear_resolved_qt`
+      falls back to `mynah_backend_matmul(weight_data)` when `count > 16` or `k > 8192`,
+      and `MYNAH_QUANT=f32` uses the F32 copy as the working weights — so it needs a
+      re-materialise-or-refuse path, not a bare free
+- [ ] E10-3 **build the conversions and the prepack in the parent, before the fork** —
+      both are immutable after build and both are built **per worker, after the fork**.
+      Measured per-worker private footprint: 582.1 MB (f16) / 414.1 MB (quant off), so
+      **≈8.3 GB at W=16**. The blocker in `server/prefork.h` does not apply to PocketTTS:
+      the pthread_t-keyed BNNS cache is in `conv1d.c`/`codec_nanocodec.c`, the Magpie
+      path, and `seanet.c` contains **zero** BNNS references. Warm conversions and prepack
+      only — never a synthesis. Also corrects the record: the 594/767 MB pair was RSS and
+      each contained the **same** 209 MB shared mmap of `tts.safetensors`
+- [ ] E10-4 **the int8 batched path has no GEMM tile** — the f16 hole fixed in `8614117`
+      one floor down. **x86 falls straight through to `for (b) qmat_rows_dispatch(...)`:
+      at m=16 that is sixteen passes over the weight.** ARM has only the 2-wide
+      `matvec_q8_pair_i8mm` → eight passes. The structure above is already right
+      (`pocket_proj_tile` hands 16 rows down as one call). Touches **22.9%** (codec
+      transformer). The reference measured 2.04-2.78× on Sapphire Rapids, 2.48-2.79× on
+      EPYC, **2.03-2.10× on Graviton3 — and its self-test reports SMMLA int8 matmat
+      L2 = 0.00e+00, bit-identical to B× SDOT matvec**, which is the property our per-row
+      promise needs. No dependency; ~250 lines
+- [ ] E10-5 **the SEANet conv stack is entirely f32** — `codec_conv` in our spec is only
+      `mimi.quantizer.output_proj [512][32]`, so **25.6% of the wall has no quantized
+      kernel at all**, and the depthwise upsample is *permanently scalar*
+      (`groups == out_channels == 512` can never qualify). The reference measured **−18%
+      of whole-request wall** from its int8 decoder conv on Neoverse-N1. **Skip the three
+      convtranspose stages** — it measured those slower than f32 sgemm and ships them off.
+      Needs its own quality gate (frame count, EOS step, log-mel corr)
+- [ ] E10-6 **weighted-LSQ int4 block scales** — the reference solves the block scale in
+      closed form with `w = v²` instead of `amax/7`; same layout, same bytes, same
+      kernels, ~10 lines. Measured there: word accuracy **83.9% → 90.9%**, utterance
+      duration **+71% → +22%** against the gold. Ours is naive absmax RTN
+      (`src/qmat.c:490`). For the codec only — **not** the AR loop
+- [ ] E10-7 **fuse the dispatches the pool cannot amortise** — at the production width of
+      **2 threads**, 62 regions/frame and **75.2% below the 200 µs break-even**. One site
+      dominates: `src/seanet.c:410` (`sea_elu_task`) dispatches `n=2`, pays **22% barrier**
+      on **86% sub-break-even** regions, where the qmat sites pay 2-3%. The reference's
+      mechanism is a persistent team with an intra-region spin barrier — one dispatch per
+      transformer block with ten internal phase barriers. **We have no barrier primitive
+      at all** in `src/threads.{c,h}`
+- [ ] E10-8 **the spin budget gate keys on the OS, not the ISA** — `#if defined(__linux__)
+      && defined(__aarch64__)` → 65536, everything else 4096, and `src/threads.c:112-117`
+      already admits the value is *"transferred from the reference's measurement, not
+      measured by us"*. Two consequences: macOS arm64 takes 4096 despite being the same
+      ISA with the same `yield`; and **Linux x86-64 production runs 4096 `pause`es, never
+      measured**. It is an iteration count, not a time budget, and `yield` vs `pause`
+      differ 50-100× in duration — **one integer cannot be right on both**
+- [ ] E10-9 **our C64 is a wave result and the reference has the wave-vs-soak gap
+      measured** — their closed-loop runs push STREAM_RTF past 1.0 and make stalls
+      material at the same concurrency, with zero rejects or timeouts. Their regression
+      reproduces in **2-5 minutes at C6-C8**. We already have `--mode soak` (proper
+      closed loop, warm-up discarded, windowed drift gate, unit-tested) and **have never
+      run it**. Run it low and short before trusting C64
+- [ ] E10-10 **the topology claim comes from one machine** — `16x2` beats `1x32` by 2.2×
+      on RTF p95, measured only on the Axion. The reference ran the same class of question
+      across three Arm parts: on Graviton5 a **4×8** shape lost **4.45× per worker** with
+      aggregate bandwidth flat, against 1.57-1.81× on the V2 hosts. **Our 16×2 is four
+      times more aggressive than the shape that collapsed.** A standalone simultaneous-worker
+      screen is written (scratchpad, `shape_screen.c`, 4096×1024 f16 = our `linear1`, sized
+      so 16 workers exceed the 80 MiB L3); it needs ≥32 cores and cannot be answered on an
+      8-core Mac
+- [ ] E10-11 **serving-loop observability** — we can say where wall time went but not how
+      many slots were live per frame, nor *why* a free slot stayed free, nor the
+      share-of-wall that was "blocked: no work queued" (the row that decides whether C80's
+      1.120 is saturation or variance). The reference has all three plus a per-request
+      stage decomposition from admission to first audio. Our 585 ms burst model is
+      arithmetic that lands within 4% of measurement — good, but a model
+- [ ] E10-12 **small, each real** — `getenv` + `strcmp` on **every** conv call
+      (`src/conv1d.c:427`, ~97 per decode) where three neighbouring sites memoize;
+      `rows->gelu` allocated `count * ffn_dim` floats and **never written**
+      (`src/transformer_ar.c:196`, `mynah_gelu_tanh_array` ignores its scratch argument),
+      256 KB dead per live request; `serve()` re-running `engine->model_init` per
+      `mynah_tts_synthesize` on the one-shot path — **1,933 allocations, 27 opens, 28
+      mmaps and ~1.1 ms per request**, re-validating all 26 voice files each time; and
+      **277 MB of KV `calloc`'d per request** sized from max steps rather than the
+      admitted text
+- [-] **rejected, with the reference's own numbers.** Do not build these: prefill helper
+      thread (stall@250 20.1%→46.8%); token-range slicing (occupancy floor invariant at
+      83-97 ms); per-layer prefill checkpointing (TTFA p95 223→1208 ms); fixed-target
+      admission guard (TTFA p95 241→2805 ms, largest defer 19.4 s, −14% throughput);
+      dedicating a core to admission (stall@500 8.6%→24.4%); kernel-layout weight prepack
+      (+1.4 GB for +1.1/+3.5%, and +4.3 GB/+10.8% TTFA on the AMX side); batched int4 GEMM
+      (0.80-0.97× on three x86 boxes); ConvTranspose int8 (slower than f32 sgemm);
+      KleidiAI (Apache-2.0, 40 files, hand-written asm, a second packed copy of every
+      weight, **and no committed head-to-head against their own SMMLA**); storing f32
+      weights instead of f16 (**2.22× slower on the backbone**, measured); a different f16
+      packing (all four candidate layouts lose to the current row-4 row-major); `FMLAL`
+      (needs the activation narrowed to f16, which is what the spec exists to prevent)
+
 ### E5 — Streaming server v2 → [`.work/streaming-server-v2.md`](.work/streaming-server-v2.md)
 Design reference: [`.work/serving-design.md`](.work/serving-design.md) ·
 doctrine: [`.work/serving-doctrine.md`](.work/serving-doctrine.md)
