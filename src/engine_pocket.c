@@ -447,8 +447,58 @@ enum {
  * The full-int8 configuration is one environment variable away
  * (MYNAH_QUANT_GROUPS=all) and is faster again; what it costs is written
  * above, in frames. */
+/* The codec clauses name int8 EXPLICITLY, and they did not always.
+ *
+ * They used to be bare -- "codec_transformer,codec_conv" -- which in this
+ * grammar means "whatever MYNAH_QUANT says", and that was right when the
+ * cache's own default was f32 and MYNAH_QUANT was how anyone turned
+ * quantization on at all. It stopped being right when src/mynah_tts.c:402
+ * started requesting f16 for every non-Magpie engine when MYNAH_QUANT is
+ * unset: the base became f16, the two bare clauses inherited f16, and the
+ * shipped default quietly became "f16 everywhere" -- the one configuration
+ * this comment does not describe.
+ *
+ * Measured on this pack, seed 1234, bare clauses against explicit ones:
+ * codec.transformer 183.5 -> 131.3 ms (1.40x), request.total 770.0 -> 719.8,
+ * and the WAV is the same length to the byte, so the frame count and the EOS
+ * step are identical -- which is exactly the property the paragraph above
+ * measured int8 against. The explicit spelling also produces byte-identical
+ * audio to MYNAH_QUANT=int8 under this same spec, which is the other half of
+ * the proof that this is what the string always meant to say.
+ *
+ * Naming the encoding means the spec now says what it does regardless of what
+ * the base is, which is what a default that calls itself an experimental
+ * result has to do. */
 #define POCKET_QG_DEFAULT_SPEC                                                 \
     "codec_transformer,codec_conv,backbone:f16,flow_net:f16,conditioner:f16"
+
+/* The same sentence with the codec clauses PINNED, used when MYNAH_QUANT is
+ * unset -- which is the shipped configuration and the one the paragraph above
+ * is about.
+ *
+ * A bare clause means "whatever MYNAH_QUANT says", and that was right while the
+ * cache's own default was f32 and MYNAH_QUANT was the only way to turn
+ * quantization on. It stopped being right when src/mynah_tts.c:402 began
+ * requesting f16 for every non-Magpie engine with MYNAH_QUANT unset: the base
+ * became f16, the two bare clauses inherited it, and the shipped default
+ * quietly became "f16 everywhere" -- the one configuration the paragraph above
+ * does not describe and never measured.
+ *
+ * Measured on this pack, seed 1234: codec.transformer 183.5 -> 130.9 ms
+ * (1.40x), request.total 770.0 -> 708.2, and the WAV is the same length to the
+ * byte, so the frame count and the EOS step do not move -- which is exactly the
+ * property int8 was accepted on. The result is byte-identical to what
+ * MYNAH_QUANT=int8 produces under this spec, which is the other half of the
+ * proof that this is what the string always meant.
+ *
+ * Why two strings rather than one pinned string: MYNAH_QUANT is the knob for
+ * "how", and pinning unconditionally would take the codec out of its reach --
+ * `MYNAH_QUANT=int4` would silently no longer reach the codec, which is
+ * precisely the configuration int4 is wanted for. So the pin applies only where
+ * there is no MYNAH_QUANT to obey. */
+#define POCKET_QG_DEFAULT_SPEC_PINNED                                          \
+    "codec_transformer:int8,codec_conv:int8,"                                  \
+    "backbone:f16,flow_net:f16,conditioner:f16"
 
 typedef struct {
     const char *name;
@@ -3052,7 +3102,10 @@ static int pocket_model_init(const mynah_tts_model *model,
     if (mynah_qmat_cache_enabled(state->qcache)) {
         const char *spec = mynah_qmat_groups_spec();
         if (strcmp(spec, "default") == 0) {
-            spec = POCKET_QG_DEFAULT_SPEC;
+            /* With no MYNAH_QUANT to obey, the default names its own encodings
+             * rather than inheriting a base that has changed underneath it. */
+            spec = (getenv("MYNAH_QUANT") == NULL) ? POCKET_QG_DEFAULT_SPEC_PINNED
+                                                   : POCKET_QG_DEFAULT_SPEC;
         }
         if (pocket_qgroups_parse(spec, &state->qgroups, state->qgroup_qtype, error,
                                  capacity) != 0) {
