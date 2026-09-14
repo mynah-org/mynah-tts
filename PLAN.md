@@ -580,7 +580,22 @@ development signals taken while the Axion was off and must be re-taken there.
       path, and `seanet.c` contains **zero** BNNS references. Warm conversions and prepack
       only — never a synthesis. Also corrects the record: the 594/767 MB pair was RSS and
       each contained the **same** 209 MB shared mmap of `tts.safetensors`
-- [ ] E10-4 **the int8 batched path has no GEMM tile** — the f16 hole fixed in `8614117`
+- [~] E10-4 **batched int8 kernel landed (`ba2200d`), and the per-row GEMM loop is routed
+      into it (`E10-4c`)** — `matvec_q8_neon_x4`, signed SDOT, bit-exact by arithmetic
+      (int32 accumulation). `mynah_qmat_linear_resolved_qt` no longer runs a `[count][k]`
+      block as `count` GEMVs. Measured under `MYNAH_QUANT=int8` on `codec.transformer`:
+      **1.141× / 1.142× / 1.142×** at batch 2 / 3 / 4. Byte-identical 180/180.
+      **Two open ends, both load-bearing:** a single stream gains nothing (every AR step
+      is `count=1`, which is 72.5% of pool regions and cannot be batched against itself),
+      and **the default spec shows no change at all** (374.0 → 375.8 at batch 3) although
+      it names int8 for `codec_transformer` — unexplained, and the difference between a
+      measured win and a production one
+- [ ] E10-4b **the x86 u8/VNNI batched int8 kernel** — still the fall-through-only path
+      there, and it cannot be executed or measured on an arm64 machine. Needs an x86 box
+- [ ] E10-4d **why does the default spec not take the int8 batched kernel?** The group
+      resolves to int8 and `MYNAH_QUANT=int8` moves 1.14× on the same shapes while the
+      default moves nothing. Find the divergence before quoting either number
+- [-] E10-4-orig **original text** — the f16 hole fixed in `8614117`
       one floor down. **x86 falls straight through to `for (b) qmat_rows_dispatch(...)`:
       at m=16 that is sixteen passes over the weight.** ARM has only the 2-wide
       `matvec_q8_pair_i8mm` → eight passes. The structure above is already right
