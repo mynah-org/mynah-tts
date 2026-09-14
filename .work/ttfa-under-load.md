@@ -104,18 +104,40 @@ compounds over ~50 steps of feedback into a different sampled trajectory — the
 frame count moves, the EOS step moves, log-mel correlation against f32 falls to
 0.73-0.96. f16 measures 1.2e-06 per step and moves nothing.
 
-### The tile is not the lever (falsified)
+### The tile sweep was invalid, and the retraction matters
 
-`TAR_PREFILL_TILE` is 16. A box-local knob over 2/4/8/16/32/48/64/128:
+Recorded first as "falsified", which was wrong. The box-local knob changed only
+`mynah_transformer_ar_prefill_tile()`. The per-request scratch is reserved with
+the **macro** `TAR_PREFILL_TILE` (`src/transformer_ar.c:297`) and the prefill
+loop clamps to it:
 
-- above 16: **no change at all** — 165.3 to 166.9 ms, and the projection call
-  count stays 72 at every value, so those 72 calls were never tiles;
-- below 16: worse (176 ms at tile 2);
-- output **byte-identical at every tile**, so the shape is not a numerical knob.
+    if (rows > state->rows.rows_cap) rows = state->rows.rows_cap;   /* 16 */
 
-Hypothesis dead. The GEMM's shape is not what is costing us.
+So above 16 the knob could not take effect at all — the flat 165.3-166.9 ms was
+an experiment that never exercised the path it claimed to test. Below 16 it did
+work, because `engine_pocket` tiles with the function value before calling in,
+which is why tile 2 measured slower. The byte-identity across tiles is still a
+real result.
+
+Raising the tile needs the macro raised too, which is a per-request memory
+decision (~57 KB of scratch per row). But it is the *second* lever, not the
+first: while the kernel walks the batch one activation at a time, a larger tile
+buys nothing, because the weight block is re-read per row regardless.
 
 ## Where the headroom actually is
+
+**The f16 batched path does not batch.** `qmat_batch_rows()` has a
+two-activations-per-SMMLA fast path for INT8 with i8mm — one weight load serving
+two rows — and every other encoding, f16 included, falls through to:
+
+    for (size_t b = 0; b < j->batch; ++b)
+        qmat_rows_dispatch(&rj, row0, count);    /* one activation at a time */
+
+With a 16-row tile the weight block is read **sixteen times**. `matvec_f16_neon`
+is a good GEMV — four weight rows against one activation, 8 FMAs per 64 bytes of
+weights, 0.5 FLOP/byte — and a GEMV is memory-bound by construction. Running a
+GEMM as B independent GEMVs is exactly the shape that lands at a third of the
+roof.
 
 The prefill moves ~151 MFLOP per token through six layers (`3+1+4+4` × 1024²
 MACs per layer). For this text at two threads that is roughly **13.6 GFLOP/s per

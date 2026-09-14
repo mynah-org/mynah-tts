@@ -485,8 +485,14 @@ does not.
       two threads, ×48 ÷ 32 cores = 497 ms + 88 ms of first frames = **585 predicted vs
       581 measured**. Sixteen workers × two threads *is* the machine — no idle resource
       exists for a better scheduler to find
-- [ ] E9-11 **the f16 batched linear runs at a third of the roof, and that is the TTFA
-      lever** — the prefill is **165.8 ms at two threads, 149.9 of it projections**, or
+- [ ] E9-11 **the f16 batched path does not batch** — `qmat_batch_rows()` carries a
+      two-activations-per-SMMLA fast path for INT8+i8mm and drops every other encoding,
+      f16 included, into `for (b) qmat_rows_dispatch(...)`: **one activation at a time,
+      so a 16-row tile reads the weight block sixteen times**. `matvec_f16_neon` is a
+      fine GEMV (4 weight rows × 1 activation, 8 FMAs per 64 B of weights, 0.5
+      FLOP/byte) and a GEMV is memory-bound by construction — running a GEMM as B GEMVs
+      is precisely the third-of-roof shape. The prefill is **165.8 ms at two threads,
+      149.9 of it projections**, or
       ~13.6 GFLOP/s/core against the ~41 the seanet lane measured on this box. Fixing it
       carries **no numerical question at all**: the arithmetic is unchanged, only its
       scheduling. A 2× here takes burst TTFA at C48 from 581 ms to ~330. E9-1 handed
@@ -501,10 +507,15 @@ does not.
       rather than a compounding one, which is a different risk and not a smaller one.
       Needs its own quality gate (frame count, EOS step, log-mel corr) and a second
       quantized copy of the backbone, since the steps must stay f16
-- [-] **rejected: widen the prefill tile.** Swept `TAR_PREFILL_TILE` 2→128 on the box.
-      Above 16 nothing changes (165.3-166.9 ms) and the projection call count stays 72
-      at every value, so those 72 were never tiles; below 16 it gets worse. Output
-      byte-identical at every tile. The GEMM's shape is not what costs us
+- [ ] E9-13 **the prefill tile is capped at 16 by its own scratch, and the sweep that
+      said otherwise was invalid** — the box knob changed only
+      `mynah_transformer_ar_prefill_tile()`, while `tar_rows_reserve` sizes the scratch
+      from the **macro** and the prefill clamps `rows` to `rows_cap`. Above 16 the
+      experiment never reached the path it claimed to test; below 16 it did (tile 2 is
+      slower) because `engine_pocket` tiles before calling in. Byte-identity across
+      tiles stands. Raising it is the **second** lever, worth nothing until E9-11 lands:
+      while the kernel walks the batch one activation at a time, a wider tile re-reads
+      the weight block just as often
 - [x] E9-0 **allocations are constant across `--max-steps`** (3,441 at both 24 and 96
       steps): the autoregressive loop allocates nothing, and that is now a permanent
       check rather than a belief
