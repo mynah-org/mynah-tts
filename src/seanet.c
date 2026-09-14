@@ -9,8 +9,10 @@
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -459,6 +461,109 @@ static int conv_validate(const mynah_conv1d_spec *spec, size_t *effective,
 /* Floats the GEMM fast path needs on top of the ring buffers: one kernel tap
  * of the weight, gathered dense.  Zero when the shape does not qualify, so a
  * grouped or strided conv costs exactly what it did before. */
+/* ------------------------------------------------- the tap permutation memo
+ *
+ * `out[oc][n] = sum_k sum_j W[oc][j][k] * win[j][n + k*d]` is run as one GEMM
+ * per tap k, and for a fixed k the left operand is W[.][.][k] -- a slice of
+ * the weight strided by `kernel`.  Gathering it into a dense
+ * [out_channels][in_channels] matrix is what `conv->taps` was for, and it was
+ * being redone on EVERY FRAME for a weight that never changes: measured at
+ * 1,964,224 floats per frame, 1.43 GB per request, 31.7% of the conv stack.
+ *
+ * The permutation is the whole of it.  It is NOT arithmetic -- `dst[j] =
+ * src[j*kernel]` is a copy -- so hoisting it is byte-identical on every build,
+ * which is why this memo sits outside the `MYNAH_SEANET_OWN_SGEMM` guard that
+ * (correctly) protects the FUSED path.  That guard exists because routing the
+ * taps through our own GEMM kernels would change the codec's f32 output on a
+ * build that links Accelerate or OpenBLAS.  Moving a copy earlier changes
+ * nothing at all, and the guard was covering both.
+ *
+ * SHARED, not per-state.  The permuted copy depends only on the weight
+ * pointer, and weights are immutable and mmapped for the life of the process,
+ * while a `mynah_seanet_state` is per request: a per-state copy would cost
+ * ~6.5 MB times max_batch times workers, which is the wrong trade against a
+ * one-off 6.5 MB here.  Keyed on the weight pointer because that is what
+ * identifies the tensor -- this module never sees a tensor name, by design.
+ *
+ * Freed at exit rather than never: `make leaks` is a gate on this project and
+ * a cache that cannot be reclaimed is a leak with a good excuse. */
+typedef struct {
+    const float *weight;
+    size_t in_channels, out_channels, kernel;
+    float *permuted;        /* [kernel][out_channels][in_channels] */
+} sea_tap_entry;
+
+static struct {
+    sea_tap_entry *entries;
+    size_t count, capacity;
+    pthread_mutex_t mutex;
+    int atexit_registered;
+} g_sea_taps = { NULL, 0, 0, PTHREAD_MUTEX_INITIALIZER, 0 };
+
+static void sea_taps_release(void) {
+    pthread_mutex_lock(&g_sea_taps.mutex);
+    for (size_t i = 0; i < g_sea_taps.count; ++i) free(g_sea_taps.entries[i].permuted);
+    free(g_sea_taps.entries);
+    g_sea_taps.entries = NULL;
+    g_sea_taps.count = g_sea_taps.capacity = 0;
+    pthread_mutex_unlock(&g_sea_taps.mutex);
+}
+
+/* Returns [kernel][out_channels][in_channels], or NULL -- in which case the
+ * caller gathers into its own scratch exactly as before.  A NULL here is a
+ * slower frame and never a different sample. */
+static const float *sea_taps_all(const float *weight, size_t in_channels,
+                                 size_t out_channels, size_t kernel) {
+    if (weight == NULL || in_channels == 0u || out_channels == 0u ||
+        kernel <= 1u) return NULL;
+    pthread_mutex_lock(&g_sea_taps.mutex);
+    for (size_t i = 0; i < g_sea_taps.count; ++i) {
+        const sea_tap_entry *e = &g_sea_taps.entries[i];
+        if (e->weight == weight && e->in_channels == in_channels &&
+            e->out_channels == out_channels && e->kernel == kernel) {
+            const float *p = e->permuted;
+            pthread_mutex_unlock(&g_sea_taps.mutex);
+            return p;
+        }
+    }
+    if (g_sea_taps.count == g_sea_taps.capacity) {
+        const size_t cap = (g_sea_taps.capacity == 0u) ? 16u : g_sea_taps.capacity * 2u;
+        sea_tap_entry *grown = (sea_tap_entry *)realloc(g_sea_taps.entries,
+                                                        cap * sizeof(*grown));
+        if (grown == NULL) { pthread_mutex_unlock(&g_sea_taps.mutex); return NULL; }
+        g_sea_taps.entries = grown;
+        g_sea_taps.capacity = cap;
+    }
+    /* Checked, because these three come from a model file. */
+    size_t floats = 0u;
+    if (out_channels > SIZE_MAX / in_channels) goto refuse;
+    floats = out_channels * in_channels;
+    if (floats > SIZE_MAX / kernel) goto refuse;
+    floats *= kernel;
+    if (floats > SIZE_MAX / sizeof(float)) goto refuse;
+    float *permuted = (float *)malloc(floats * sizeof(float));
+    if (permuted == NULL) { pthread_mutex_unlock(&g_sea_taps.mutex); return NULL; }
+    for (size_t k = 0; k < kernel; ++k) {
+        float *dst_k = permuted + k * out_channels * in_channels;
+        for (size_t oc = 0; oc < out_channels; ++oc) {
+            const float *src = weight + oc * in_channels * kernel + k;
+            float *dst = dst_k + oc * in_channels;
+            for (size_t j = 0; j < in_channels; ++j) dst[j] = src[j * kernel];
+        }
+    }
+    g_sea_taps.entries[g_sea_taps.count++] = (sea_tap_entry){
+        weight, in_channels, out_channels, kernel, permuted };
+    if (!g_sea_taps.atexit_registered) {
+        g_sea_taps.atexit_registered = 1;
+        atexit(sea_taps_release);
+    }
+    pthread_mutex_unlock(&g_sea_taps.mutex);
+    return permuted;
+refuse:
+    pthread_mutex_unlock(&g_sea_taps.mutex);
+    return NULL;
+}
+
 static size_t conv_taps_floats(const mynah_conv1d_spec *spec) {
     if (spec->stride != 1u || spec->groups != 1u || spec->kernel_size <= 1u) {
         return 0;
@@ -656,10 +761,16 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
             }
         }
 #endif
+        /* Built once for this weight, on any build; NULL falls back to the
+         * per-frame gather below, which is the same bytes either way. */
+        const float *all_taps =
+            fused ? NULL : sea_taps_all(weights->weight, in_channels, oc_count, kernel);
         for (size_t k = 0; !fused && k < kernel; ++k) {
             const float *a;
             if (kernel == 1u) {
                 a = weights->weight;
+            } else if (all_taps != NULL) {
+                a = all_taps + k * oc_count * in_channels;
             } else {
                 const unsigned long long t_gather = sea_prof_now();
                 float *taps = conv->taps;
