@@ -2010,6 +2010,50 @@ int main(int argc, char **argv) {
         pack_lang[i] = pack_info[i].language;
     }
 
+    /* ---- materialise the model-owned caches, before anything is forked ----
+     *
+     * Copy-on-write shares what exists at the fork and nothing built after it.
+     * The dtype conversion cache is the biggest thing the workers would
+     * otherwise build privately and identically -- 399 MB on the pinned
+     * PocketTTS pack, whose tensors are all bf16 -- and it belongs to the
+     * model, so building it here makes it ONE copy for the whole tree instead
+     * of one per worker.
+     *
+     * server/prefork.h warns against prewarming in the parent, and it is right
+     * about the case it names: the codec's BNNS filter cache is keyed by
+     * pthread_t and never pruned, so filters the parent built would be dead
+     * entries in every child. That cache is in src/conv1d.c and
+     * src/codec_nanocodec.c -- the Magpie NanoCodec path, 68 references
+     * between them -- and the PocketTTS path has ZERO: src/seanet.c,
+     * src/engine_pocket.c, src/flow_head.c and src/transformer_ar.c mention
+     * BNNS not once. mynah_tts_model_warm() also does not synthesise, so no
+     * pool thread ever enters that cache here.
+     *
+     * A failure is reported and ignored: every worker still builds what it
+     * needs lazily, exactly as before, and a server that will not start
+     * because an optimisation did not is a worse server. */
+    /* Only when there is more than one worker to share it with. With a single
+     * worker there is nobody to share with: the parent would hold a copy the
+     * worker cannot use and the process tree would be LARGER, measured at
+     * +186 MB. The break-even is two workers, where it already pays. */
+    for (int i = 0; prefork_workers > 1 && i < pack_count; ++i) {
+        char werr[256];
+        werr[0] = '\0';
+        struct timespec wt0, wt1;
+        clock_gettime(CLOCK_MONOTONIC, &wt0);
+        if (mynah_tts_model_warm(packs[i], werr, sizeof werr) != 0) {
+            fprintf(stderr, "warm %s: %s (workers will build it themselves)\n",
+                    pack_dir[i], werr);
+        } else {
+            clock_gettime(CLOCK_MONOTONIC, &wt1);
+            fprintf(stderr, "warm: %s model caches built in %.0f ms, shared by "
+                            "every worker\n",
+                    pack_dir[i],
+                    (double)(wt1.tv_sec - wt0.tv_sec) * 1000.0 +
+                        (double)(wt1.tv_nsec - wt0.tv_nsec) / 1e6);
+        }
+    }
+
     /* ---- and validate the fleet, before anything is forked ----
      *
      * Two packs claiming one language, or a second pack whose weights are not

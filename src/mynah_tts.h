@@ -80,6 +80,26 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
                                 mynah_tts_model **out_model,
                                 char *error, size_t error_capacity);
 void mynah_tts_model_close(mynah_tts_model *model);
+
+/* Materialise everything the model can build BEFORE anyone forks.
+ *
+ * A pack is opened once and then forked into N workers. Anything the workers
+ * build lazily is built N times, privately, because copy-on-write only shares
+ * what already exists at the fork. The largest of those is the dtype
+ * conversion cache -- a pack whose tensors are bf16 is materialised to f32 on
+ * first use, 399 MB on the pinned PocketTTS pack -- and that cache belongs to
+ * the MODEL, so building it here makes it one shared copy for the whole tree
+ * instead of one private copy per worker.
+ *
+ * This runs the engine's model_init and frees the state again. It does NOT
+ * synthesise: a fork after a synthesis, or from any thread but main, inherits
+ * locked mutexes, which is the rule server/prefork.h exists to state. What it
+ * leaves behind is exactly the model-owned caches.
+ *
+ * Optional, idempotent, and safe to skip: every caller works unchanged without
+ * it, one worker at a time and slower. Returns 0, or -1 with `error` set. */
+int mynah_tts_model_warm(mynah_tts_model *model, char *error,
+                         size_t error_capacity);
 int mynah_tts_model_get_info(const mynah_tts_model *model,
                              mynah_tts_model_info *info);
 

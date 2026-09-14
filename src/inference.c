@@ -943,6 +943,39 @@ int mynah_graph_serve_continuous(const mynah_tts_model *model, size_t max_batch,
     return serve(mynah_engine_lookup(model->info.engine), model, sink, max_batch, 0, 0);
 }
 
+/* See mynah_tts.h. Builds the model-owned caches and throws the rest away.
+ *
+ * The per-ENGINE-STATE caches -- the quantized weight cache above all -- are
+ * freed with the state, so this does not pre-build those: they are per worker
+ * by construction today, and making them shared is a different change with a
+ * different ownership question. What survives is what the model owns, which is
+ * the dtype conversion cache, and that is the larger of the two. */
+int mynah_tts_model_warm(mynah_tts_model *model, char *error,
+                         size_t error_capacity) {
+    if (model == NULL) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "warm: no model");
+        return -1;
+    }
+    const mynah_tts_engine *engine = mynah_engine_lookup(model->info.engine);
+    if (engine == NULL || engine->model_init == NULL ||
+        engine->model_free == NULL) {
+        /* Not an error: an engine without the seam simply has nothing to warm,
+         * and the caller is no worse off than before it asked. */
+        return 0;
+    }
+    mynah_engine_state *state = NULL;
+    char local[256];
+    local[0] = '\0';
+    if (engine->model_init(model, &state, local, sizeof local) != 0) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity, "warm: %s", local);
+        return -1;
+    }
+    engine->model_free(state);
+    return 0;
+}
+
 int mynah_graph_synthesize_jobs(const mynah_tts_model *model,
                                 mynah_graph_job *jobs, size_t count) {
     if (model == NULL || jobs == NULL) return -1;
