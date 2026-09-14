@@ -1086,6 +1086,107 @@ static float dot_q4(const int8_t *qx, float sx, const uint8_t *q,
  * output rows in flight so SDOT latency is hidden and the quantized activation
  * vector is loaded once for four weight rows.  Each row retains the same
  * accumulation order as dot_q8/dot_q4; the scalar tail is the reference path. */
+#if defined(MYNAH_QMAT_DOTPROD)
+/* Two weight rows, four activations, one weight load -- the int8 counterpart of
+ * matvec_f16_neon_x4, and it exists for the same reason: without it the batched
+ * path walks the batch and calls the single-activation kernel, so a 16-row
+ * prefill tile reads every weight block sixteen times.
+ *
+ * BIT-IDENTICAL, and here that is not an argument, it is arithmetic. The
+ * accumulation is int32: vdotq_s32 sums exactly, with no rounding to reassociate
+ * and no order to preserve. Only the epilogue is float, and each (activation,
+ * row) pair runs exactly the epilogue the row-at-a-time kernel would run, on
+ * exactly the same integer. An int32 overflow would change the answer, but it
+ * would change it identically in both kernels -- the existing one already
+ * assumes it cannot happen for these shapes.
+ *
+ * SIGNED ONLY, deliberately. The u8 encoding (level != QMAT_U8_OFF) carries the
+ * +128 bias and its row-sum correction, and it is the encoding x86 uses for
+ * VPDPBUSD. The batched x86 hole is real and bigger than this one -- there the
+ * fall-through is the ONLY path -- but it cannot be executed, let alone
+ * measured, on an arm64 development machine, so it is not written here on
+ * faith. E10-4b.
+ *
+ * Registers: 8 accumulators, 2 weight vectors, 4 activation vectors. */
+static void matvec_q8_neon_x4(float *o0, float *o1, float *o2, float *o3,
+                              const int8_t *x0, const int8_t *x1,
+                              const int8_t *x2, const int8_t *x3,
+                              float s0f, float s1f, float s2f, float s3f,
+                              const int8_t *weights, const float *scales,
+                              const float *bias, size_t rows, size_t cols) {
+    size_t row = 0;
+    for (; row + 2u <= rows; row += 2u) {
+        const int8_t *wa = weights + row * cols;
+        const int8_t *wb = wa + cols;
+        int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+        int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+        int32x4_t b0 = vdupq_n_s32(0), b1 = vdupq_n_s32(0);
+        int32x4_t b2 = vdupq_n_s32(0), b3 = vdupq_n_s32(0);
+        size_t j = 0;
+        for (; j + 16u <= cols; j += 16u) {
+            const int8x16_t va = vld1q_s8(wa + j);
+            const int8x16_t vb = vld1q_s8(wb + j);
+            const int8x16_t v0 = vld1q_s8(x0 + j);
+            a0 = vdotq_s32(a0, va, v0); b0 = vdotq_s32(b0, vb, v0);
+            const int8x16_t v1 = vld1q_s8(x1 + j);
+            a1 = vdotq_s32(a1, va, v1); b1 = vdotq_s32(b1, vb, v1);
+            const int8x16_t v2 = vld1q_s8(x2 + j);
+            a2 = vdotq_s32(a2, va, v2); b2 = vdotq_s32(b2, vb, v2);
+            const int8x16_t v3 = vld1q_s8(x3 + j);
+            a3 = vdotq_s32(a3, va, v3); b3 = vdotq_s32(b3, vb, v3);
+        }
+        int32_t sa0 = vaddvq_s32(a0), sa1 = vaddvq_s32(a1);
+        int32_t sa2 = vaddvq_s32(a2), sa3 = vaddvq_s32(a3);
+        int32_t sb0 = vaddvq_s32(b0), sb1 = vaddvq_s32(b1);
+        int32_t sb2 = vaddvq_s32(b2), sb3 = vaddvq_s32(b3);
+        for (; j < cols; ++j) {
+            const int32_t wav = wa[j], wbv = wb[j];
+            sa0 += wav * (int32_t)x0[j]; sb0 += wbv * (int32_t)x0[j];
+            sa1 += wav * (int32_t)x1[j]; sb1 += wbv * (int32_t)x1[j];
+            sa2 += wav * (int32_t)x2[j]; sb2 += wbv * (int32_t)x2[j];
+            sa3 += wav * (int32_t)x3[j]; sb3 += wbv * (int32_t)x3[j];
+        }
+        const float ba = (bias == NULL) ? 0.0f : bias[row];
+        const float bb = (bias == NULL) ? 0.0f : bias[row + 1u];
+        const float ka = scales[row], kb = scales[row + 1u];
+        o0[row] = qmat_row_epilogue(sa0, qmat_row_scale(ka, s0f), ba);
+        o1[row] = qmat_row_epilogue(sa1, qmat_row_scale(ka, s1f), ba);
+        o2[row] = qmat_row_epilogue(sa2, qmat_row_scale(ka, s2f), ba);
+        o3[row] = qmat_row_epilogue(sa3, qmat_row_scale(ka, s3f), ba);
+        o0[row + 1u] = qmat_row_epilogue(sb0, qmat_row_scale(kb, s0f), bb);
+        o1[row + 1u] = qmat_row_epilogue(sb1, qmat_row_scale(kb, s1f), bb);
+        o2[row + 1u] = qmat_row_epilogue(sb2, qmat_row_scale(kb, s2f), bb);
+        o3[row + 1u] = qmat_row_epilogue(sb3, qmat_row_scale(kb, s3f), bb);
+    }
+    for (; row < rows; ++row) {
+        const int8_t *w = weights + row * cols;
+        int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+        int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+        size_t j = 0;
+        for (; j + 16u <= cols; j += 16u) {
+            const int8x16_t v = vld1q_s8(w + j);
+            a0 = vdotq_s32(a0, v, vld1q_s8(x0 + j));
+            a1 = vdotq_s32(a1, v, vld1q_s8(x1 + j));
+            a2 = vdotq_s32(a2, v, vld1q_s8(x2 + j));
+            a3 = vdotq_s32(a3, v, vld1q_s8(x3 + j));
+        }
+        int32_t t0 = vaddvq_s32(a0), t1 = vaddvq_s32(a1);
+        int32_t t2 = vaddvq_s32(a2), t3 = vaddvq_s32(a3);
+        for (; j < cols; ++j) {
+            const int32_t wv = w[j];
+            t0 += wv * (int32_t)x0[j]; t1 += wv * (int32_t)x1[j];
+            t2 += wv * (int32_t)x2[j]; t3 += wv * (int32_t)x3[j];
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        const float kv = scales[row];
+        o0[row] = qmat_row_epilogue(t0, qmat_row_scale(kv, s0f), bv);
+        o1[row] = qmat_row_epilogue(t1, qmat_row_scale(kv, s1f), bv);
+        o2[row] = qmat_row_epilogue(t2, qmat_row_scale(kv, s2f), bv);
+        o3[row] = qmat_row_epilogue(t3, qmat_row_scale(kv, s3f), bv);
+    }
+}
+#endif /* MYNAH_QMAT_DOTPROD */
+
 static void matvec_q8(float *out, const void *qa, float sx,
                       const int8_t *weights, const float *scales,
                       const int32_t *rowsum, const float *bias,
@@ -2311,6 +2412,49 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         return;
     }
 #endif
+#if defined(MYNAH_QMAT_DOTPROD)
+    /* The same bargain for signed int8, and the one that matters most: this is
+     * where a 16-row prefill tile of the codec transformer lands, and it was
+     * reading the weight block once per activation.  Signed only -- the u8
+     * encoding carries the +128 row-sum correction and is x86's, which cannot
+     * be executed here (E10-4b). */
+    if (e->qtype == QMAT_INT8 && j->level == QMAT_U8_OFF && j->qx != NULL &&
+        j->batch >= 2u) {   /* DOTPROD is a compile gate here, as in matvec_q8 */
+        const int8_t *qx = (const int8_t *)j->qx;
+        const int8_t *wb = (const int8_t *)weights + row0 * j->cols;
+        const float *sc = e->scales + row0;
+        const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
+        size_t b = 0;
+        for (; b + 4u <= j->batch; b += 4u) {
+            matvec_q8_neon_x4(j->out[b] + row0, j->out[b + 1u] + row0,
+                              j->out[b + 2u] + row0, j->out[b + 3u] + row0,
+                              qx + b * j->cols, qx + (b + 1u) * j->cols,
+                              qx + (b + 2u) * j->cols, qx + (b + 3u) * j->cols,
+                              j->sx[b], j->sx[b + 1u], j->sx[b + 2u],
+                              j->sx[b + 3u], wb, sc, bs, count, j->cols);
+        }
+        if (j->batch - b == 3u) {
+            /* Three left: the four-lane kernel with the last activation
+             * repeated, spending a quarter more arithmetic to load the weight
+             * block once instead of twice.  The repeated lane writes the same
+             * address twice with the same integer, so the bytes cannot differ;
+             * see the f16 twin below for the same reasoning and the lane-width
+             * self-test that gates both. */
+            matvec_q8_neon_x4(j->out[b] + row0, j->out[b + 1u] + row0,
+                              j->out[b + 2u] + row0, j->out[b + 2u] + row0,
+                              qx + b * j->cols, qx + (b + 1u) * j->cols,
+                              qx + (b + 2u) * j->cols, qx + (b + 2u) * j->cols,
+                              j->sx[b], j->sx[b + 1u], j->sx[b + 2u],
+                              j->sx[b + 2u], wb, sc, bs, count, j->cols);
+            return;
+        }
+        for (; b < j->batch; ++b) {
+            matvec_q8(j->out[b] + row0, qx + b * j->cols, j->sx[b], wb, sc,
+                      NULL, bs, count, j->cols, QMAT_U8_OFF);
+        }
+        return;
+    }
+#endif
 #if defined(MYNAH_QMAT_F16)
     /* Four activations per weight load.  This is the f16 counterpart of the
      * SMMLA pair above and exists for the same reason: without it the batch is
@@ -3208,13 +3352,13 @@ done:
  *
  * The reference is the row-at-a-time path, compared with memcmp: the claim is
  * bit-identity, not closeness. */
-static int self_test_f16_lane_widths(char *error, size_t error_capacity) {
+static int self_test_lane_widths(int qtype, char *error, size_t error_capacity) {
     enum { N = 96, K = 256, BMAX = 9 };
-    if (qmat_qtype_available(QMAT_F16) != QMAT_F16) return 0;
+    if (qmat_qtype_available(qtype) != qtype) return 0;
     int status = -1;
-    mynah_qmat_cache *cache = mynah_qmat_cache_new(QMAT_F16);
+    mynah_qmat_cache *cache = mynah_qmat_cache_new(qtype);
     if (cache == NULL) return -1;
-    if (cache->qtype != QMAT_F16) { mynah_qmat_cache_free(cache); return 0; }
+    if (cache->qtype != qtype) { mynah_qmat_cache_free(cache); return 0; }
 
     float *w = (float *)malloc((size_t)N * K * sizeof(float));
     float *x = (float *)malloc((size_t)BMAX * K * sizeof(float));
@@ -3226,7 +3370,7 @@ static int self_test_f16_lane_widths(char *error, size_t error_capacity) {
     if (w == NULL || x == NULL || bias == NULL || ref == NULL || got == NULL ||
         qx == NULL || sx == NULL) {
         if (error != NULL && error_capacity > 0)
-            snprintf(error, error_capacity, "qmat f16 lane-width self-test out of memory");
+            snprintf(error, error_capacity, "qmat lane-width self-test out of memory");
         goto done;
     }
     for (size_t i = 0; i < (size_t)N * K; ++i)
@@ -3236,9 +3380,9 @@ static int self_test_f16_lane_widths(char *error, size_t error_capacity) {
     for (size_t i = 0; i < (size_t)N; ++i) bias[i] = 0.25f - (float)i * 0.00390625f;
 
     for (size_t b = 0; b < (size_t)BMAX; ++b) {
-        if (mynah_qmat_linear_resolved_qt(cache, NULL, "f16.lanes.ref", w,
+        if (mynah_qmat_linear_resolved_qt(cache, NULL, "lanes.ref", w,
                                           x + b * K, ref + b * N, 1u, K, N, bias,
-                                          QMAT_F16, error, error_capacity) != 0) {
+                                          qtype, error, error_capacity) != 0) {
             goto done;
         }
     }
@@ -3250,9 +3394,9 @@ static int self_test_f16_lane_widths(char *error, size_t error_capacity) {
             out_rows[b] = got + b * N;
         }
         memset(got, 0, (size_t)BMAX * N * sizeof(float));
-        if (mynah_qmat_linear_batched_qt(cache, NULL, "f16.lanes.ref", w, in_rows,
+        if (mynah_qmat_linear_batched_qt(cache, NULL, "lanes.ref", w, in_rows,
                                          out_rows, batch, K, N, bias, qx, sx,
-                                         QMAT_F16, error, error_capacity) != 0) {
+                                         qtype, error, error_capacity) != 0) {
             goto done;
         }
         for (size_t b = 0; b < batch; ++b) {
@@ -3261,10 +3405,11 @@ static int self_test_f16_lane_widths(char *error, size_t error_capacity) {
                 if (memcmp(&ref[at], &got[at], sizeof(float)) != 0) {
                     if (error != NULL && error_capacity > 0)
                         snprintf(error, error_capacity,
-                                 "qmat f16 batch=%zu differs from the row-at-a-time "
+                                 "qmat %s batch=%zu differs from the row-at-a-time "
                                  "reference at row %zu col %zu: %.9g vs %.9g -- a "
                                  "lane width changed a row's answer",
-                                 batch, b, i, (double)ref[at], (double)got[at]);
+                                 mynah_qmat_qtype_name(qtype), batch, b, i,
+                                 (double)ref[at], (double)got[at]);
                     goto done;
                 }
             }
@@ -4116,7 +4261,12 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_rows_blocked(QMAT_INT4, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT8, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_INT4, error, error_capacity) != 0) return -1;
-    if (self_test_f16_lane_widths(error, error_capacity) != 0) return -1;
+    /* Every lane width of every batched encoding that has one.  f16 and int8
+     * each have a four-wide kernel, a two-wide one and a three-remainder served
+     * by the four-wide kernel with an activation repeated; B=5 in the test above
+     * reaches two of those six paths. */
+    if (self_test_lane_widths(QMAT_F16, error, error_capacity) != 0) return -1;
+    if (self_test_lane_widths(QMAT_INT8, error, error_capacity) != 0) return -1;
     /* E8-5: a group that names its own encoding, with the batched call as the
      * tensor's first toucher.  Every cache profile the runtime ships crossed
      * with every encoding a group spec can name. */
