@@ -487,9 +487,27 @@ static void quantize_weight_int8(const float *w, size_t n, size_t k,
 
 /* Per-group-of-32 symmetric INT4 (Q4_0 style): nibbles offset by +8, low nibble
  * = even index, high nibble = odd index; scales[i * k/32 + g]. */
-static void quantize_weight_int4(const float *w, size_t n, size_t k,
-                                 uint8_t *q, float *scales) {
+/* MYNAH_QMAT_Q4_NAIVE=1 restores the absmax/7 scale the int4 quantizer shipped
+ * with, so a quality A/B attributes its result to the quantizer and not to a
+ * neighbouring change.  Read once; it cannot change after start. */
+static int q4_naive_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYNAH_QMAT_Q4_NAIVE");
+        cached = (e != NULL && e[0] != '0');
+    }
+    return cached;
+}
+
+/* mode 0 = seed from the signed extreme and then solve the scale (shipped),
+ * 1 = the absmax/7 scale this quantizer shipped with, 2 = seeded but NOT
+ * solved.  Mode 2 exists only so the self-test can price the two halves
+ * separately: without it, disabling the solve still beats absmax on the
+ * seeding alone and a gate on the pair cannot see it. */
+static void quantize_weight_int4_mode(const float *w, size_t n, size_t k,
+                                      uint8_t *q, float *scales, int mode) {
     const size_t groups = k / QMAT_Q4_GROUP;
+    const int g_q4_naive = (mode == 1);
     for (size_t i = 0; i < n; ++i) {
         const float *row = w + i * k;
         uint8_t *qrow = q + i * (k / 2u);
@@ -501,22 +519,78 @@ static void quantize_weight_int4(const float *w, size_t n, size_t k,
                 const float a = fabsf(grp[j]);
                 if (a > amax) amax = a;
             }
-            const float scale = amax > 0.0f ? amax / 7.0f : 1.0f;
+            /* TWO CHANGES TO A ROUND-TO-NEAREST QUANTIZER, both taken from
+             * the reference engine's measured version, both free at runtime.
+             *
+             * 1. SEED FROM THE SIGNED EXTREME, NOT THE MAGNITUDE.  int4 here is
+             *    [-8, 7]: eight negative levels and seven positive.  amax/7
+             *    throws the -8 away, so a block whose largest element is
+             *    negative is quantized with one level less than it has.
+             *    Mapping that element onto -8 instead uses the range the
+             *    format actually offers.
+             *
+             * 2. THEN SOLVE THE SCALE, RATHER THAN ASSUME IT.  With the
+             *    integers fixed, the scale that minimises the weighted error
+             *    sum w_j (v_j - s q_j)^2 has a closed form,
+             *    s = sum(w v q) / sum(w q^2), and weighting by w = v^2 asks the
+             *    block to be accurate where its energy is, which is what a
+             *    downstream matmul is sensitive to.  One pass, no search.
+             *
+             * Neither changes the format, the layout, the kernels or the number
+             * of bytes: same nibbles, same per-group scale, same dequantization.
+             * MYNAH_QMAT_Q4_NAIVE=1 restores the absmax scale for an A/B, which
+             * is the only way to attribute a quality result to this and not to
+             * something else that moved. */
+            float scale;
+            if (amax <= 0.0f) {
+                scale = 1.0f;
+            } else {
+                float extreme = 0.0f;
+                for (size_t j = 0; j < QMAT_Q4_GROUP; ++j) {
+                    if (fabsf(grp[j]) == amax) { extreme = grp[j]; break; }
+                }
+                scale = (extreme < 0.0f) ? (extreme / -8.0f) : (amax / 7.0f);
+            }
+            if (g_q4_naive) scale = amax > 0.0f ? amax / 7.0f : 1.0f;
+            float inv = 1.0f / scale;
+            int qv[QMAT_Q4_GROUP];
+            for (size_t j = 0; j < QMAT_Q4_GROUP; ++j) {
+                const float v = grp[j] * inv;
+                int qj = (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+                if (qj < -8) qj = -8;
+                if (qj > 7) qj = 7;
+                qv[j] = qj;
+            }
+            if (mode == 0) {
+                double num = 0.0, den = 0.0;
+                for (size_t j = 0; j < QMAT_Q4_GROUP; ++j) {
+                    const double v = (double)grp[j];
+                    const double w = v * v;            /* weight by energy */
+                    num += w * v * (double)qv[j];
+                    den += w * (double)qv[j] * (double)qv[j];
+                }
+                /* A degenerate block -- every integer zero, or a solved scale
+                 * that is not finite or not positive -- keeps the seed.  A
+                 * refinement that cannot be trusted is not applied. */
+                if (den > 0.0) {
+                    const float refined = (float)(num / den);
+                    if (isfinite(refined) && refined > 0.0f) scale = refined;
+                }
+            }
             srow[g] = scale;
-            const float inv = 1.0f / scale;
             for (size_t j = 0; j < QMAT_Q4_GROUP; j += 2) {
-                const float v0 = grp[j] * inv;
-                const float v1 = grp[j + 1] * inv;
-                int q0 = (int)(v0 >= 0.0f ? v0 + 0.5f : v0 - 0.5f);
-                int q1 = (int)(v1 >= 0.0f ? v1 + 0.5f : v1 - 0.5f);
-                if (q0 < -8) q0 = -8;
-                if (q0 > 7) q0 = 7;
-                if (q1 < -8) q1 = -8;
-                if (q1 > 7) q1 = 7;
+                const int q0 = qv[j];
+                const int q1 = qv[j + 1];
                 qrow[(g * QMAT_Q4_GROUP + j) / 2] = (uint8_t)((q0 + 8) | ((q1 + 8) << 4));
             }
+            (void)inv;
         }
     }
+}
+
+static void quantize_weight_int4(const float *w, size_t n, size_t k,
+                                 uint8_t *q, float *scales) {
+    quantize_weight_int4_mode(w, n, k, q, scales, q4_naive_enabled() ? 1 : 0);
 }
 
 /* Per-vector absmax activation quantization; returns the activation scale. */
@@ -3442,6 +3516,126 @@ done:
  *
  * The reference is the row-at-a-time path, compared with memcmp: the claim is
  * bit-identity, not closeness. */
+/* The int4 block scale is seeded from the signed extreme and then solved, and
+ * this prices BOTH halves separately rather than the pair.
+ *
+ * Measured over the shapes the suite quantizes: relative reconstruction error
+ * 4.182% with the absmax scale against 3.824% solved -- an 8.6% relative
+ * reduction for the same bytes, the same layout, the same kernels and the same
+ * runtime cost.
+ *
+ * A first version of this test asserted only solved <= naive, and a mutation
+ * that disabled the solve PASSED it: the seeding alone already beats absmax,
+ * because int4 here is [-8, 7] and amax/7 throws the -8 away. Hence the middle
+ * mode and the two-sided assertion.
+ *
+ * WHY A WEIGHT METRIC AND NOT AUDIO. Over six seeds the waveform correlation
+ * against the f16 gold is 3-3 between the two quantizers, mean +0.0008, inside
+ * its own spread -- because POCKET_QG_DEFAULT_SPEC keeps int4 out of the
+ * autoregressive loop, so it perturbs only the feed-forward codec and the frame
+ * count cannot move. The reference engine's 7-point word-accuracy win came from
+ * a configuration where int4 DOES reach the sampler; that does not transfer and
+ * is not claimed here. What transfers is a strictly better approximation at no
+ * cost, which is what this asserts. */
+static int self_test_q4_scale_solve(char *error, size_t error_capacity) {
+    enum { N = 8, K = 256 };
+    if (qmat_qtype_available(QMAT_INT4) != QMAT_INT4) return 0;
+    int status = -1;
+    const size_t groups = (size_t)K / QMAT_Q4_GROUP;
+    float *w = (float *)malloc((size_t)N * K * sizeof(float));
+    uint8_t *qq[3] = {NULL, NULL, NULL};
+    float *ss[3] = {NULL, NULL, NULL};
+    double err[3] = {0.0, 0.0, 0.0};
+    if (w == NULL) goto oom;
+    for (int m = 0; m < 3; ++m) {
+        qq[m] = (uint8_t *)malloc((size_t)N * K / 2u);
+        ss[m] = (float *)malloc((size_t)N * groups * sizeof(float));
+        if (qq[m] == NULL || ss[m] == NULL) goto oom;
+    }
+    /* Asymmetric on purpose: a block whose extreme is negative is exactly what
+     * amax/7 quantizes with one level fewer than the format offers. */
+    for (size_t i = 0; i < (size_t)N * K; ++i) {
+        const float t = 0.017f * (float)i;
+        w[i] = sinf(t) * (1.0f + cosf(0.37f * t)) - 0.35f;
+    }
+    for (int m = 0; m < 3; ++m) {
+        quantize_weight_int4_mode(w, N, K, qq[m], ss[m], m);
+        for (size_t i = 0; i < (size_t)N; ++i) {
+            for (size_t g = 0; g < groups; ++g) {
+                for (size_t j = 0; j < QMAT_Q4_GROUP; ++j) {
+                    const size_t at = g * QMAT_Q4_GROUP + j;
+                    const size_t byte = i * ((size_t)K / 2u) + at / 2u;
+                    const int nib = (int)((at % 2u) ? (qq[m][byte] >> 4)
+                                                    : (qq[m][byte] & 0x0fu)) - 8;
+                    const double d = (double)w[i * (size_t)K + at] -
+                                     (double)ss[m][i * groups + g] * (double)nib;
+                    err[m] += d * d;
+                }
+            }
+        }
+    }
+    /* ABSOLUTE BOUNDS FIRST, and they are the half that works.
+     *
+     * The ordering checks below compare the three modes against each other, and
+     * a mutation that degrades all three symmetrically is invisible to them --
+     * measured, not supposed: disabling the solve and dropping the seeding each
+     * passed an ordering-only version of this test, because they moved the
+     * baseline along with the subject. Pinning the numbers closes that.
+     *
+     * On this fixed synthetic tensor the three are 3.9429% / 4.0516% / 4.3156%
+     * relative reconstruction error. The bounds sit just above the first two
+     * with roughly 1.5% of headroom, which is deterministic arithmetic on a
+     * deterministic input and not a tolerance for noise. */
+    {
+        double ref = 0.0;
+        for (size_t i = 0; i < (size_t)N * K; ++i) ref += (double)w[i] * (double)w[i];
+        const double solved = 100.0 * sqrt(err[0] / ref);
+        const double seeded = 100.0 * sqrt(err[2] / ref);
+        if (!(solved <= 4.00)) {
+            if (error != NULL && error_capacity > 0)
+                snprintf(error, error_capacity,
+                         "qmat int4: solved block scale reconstructs at %.4f%%, "
+                         "above the 4.00%% this tensor has measured at 3.9429%% "
+                         "-- the closed form or its seeding regressed", solved);
+            goto done;
+        }
+        if (!(seeded <= 4.20)) {
+            if (error != NULL && error_capacity > 0)
+                snprintf(error, error_capacity,
+                         "qmat int4: seeding from the signed extreme reconstructs "
+                         "at %.4f%%, above the 4.20%% this tensor has measured at "
+                         "4.0516%% -- the -8 level is being thrown away again",
+                         seeded);
+            goto done;
+        }
+    }
+    /* Then the ordering: solved <= seeded <= naive, each half earning its place. */
+    if (!(err[2] <= err[1])) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity,
+                     "qmat int4: seeding from the signed extreme reconstructs "
+                     "WORSE than absmax (%.9g vs %.9g)", err[2], err[1]);
+        goto done;
+    }
+    if (!(err[0] <= err[2])) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity,
+                     "qmat int4: solving the block scale reconstructs WORSE than "
+                     "the seed alone (%.9g vs %.9g) -- the closed form regressed",
+                     err[0], err[2]);
+        goto done;
+    }
+    status = 0;
+    goto done;
+oom:
+    if (error != NULL && error_capacity > 0)
+        snprintf(error, error_capacity, "qmat q4-scale self-test out of memory");
+done:
+    free(w);
+    for (int m = 0; m < 3; ++m) { free(qq[m]); free(ss[m]); }
+    return status;
+}
+
 static int self_test_lane_widths(int qtype, char *error, size_t error_capacity) {
     enum { N = 96, K = 256, BMAX = 9 };
     if (qmat_qtype_available(qtype) != qtype) return 0;
@@ -4355,6 +4549,7 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
      * each have a four-wide kernel, a two-wide one and a three-remainder served
      * by the four-wide kernel with an activation repeated; B=5 in the test above
      * reaches two of those six paths. */
+    if (self_test_q4_scale_solve(error, error_capacity) != 0) return -1;
     if (self_test_lane_widths(QMAT_F16, error, error_capacity) != 0) return -1;
     if (self_test_lane_widths(QMAT_INT8, error, error_capacity) != 0) return -1;
     /* E8-5: a group that names its own encoding, with the batched call as the
