@@ -628,6 +628,12 @@ the x86 self-test that judges the two kernels written here and never executed
       EPYC, **2.03-2.10× on Graviton3 — and its self-test reports SMMLA int8 matmat
       L2 = 0.00e+00, bit-identical to B× SDOT matvec**, which is the property our per-row
       promise needs. No dependency; ~250 lines
+- [~] E10-5a **the ELU was the largest phase, and it was a scalar `expf` loop** — 33.6%
+      of the region, larger than both GEMMs the item named. Vectorised with a
+      bounded-range exp we own (max absolute error **5.96e-08** on [-88,0], gated and
+      mutation-tested): **elu 53.4 → 18.1 ms (2.96×), `codec.conv_stack` 164.6 → 128.5
+      (1.28×)**. Audio: 51-59 samples of ~120,000 differ, every one by exactly **1 LSB of
+      int16**, identical length. AVX2 twin still to write.
 - [ ] E10-5 **the SEANet conv stack is entirely f32** — `codec_conv` in our spec is only
       `mimi.quantizer.output_proj [512][32]`, so **25.6% of the wall has no quantized
       kernel at all**, and the depthwise upsample is *permanently scalar*
