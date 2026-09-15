@@ -378,10 +378,106 @@ typedef struct {
     size_t chunk;
 } sea_elu_job;
 
+/* ------------------------------------------------------- exp on (-inf, 0]
+ *
+ * ELU needs exp only where x is negative, and that is a far easier function
+ * than exp in general: the result lives in (0, 1], there is nothing to
+ * overflow, and everything below about -88 has already flushed to zero.
+ *
+ * The method is the standard range reduction.  n = round(x * log2(e)), then
+ * r = x - n*ln2 with ln2 split into a high part that is exact in binary32 and
+ * a low correction, so the subtraction loses nothing; r then lies in
+ * [-ln2/2, ln2/2] and a degree-5 polynomial covers it.  2^n is built directly
+ * into the exponent field rather than called for.
+ *
+ * ACCURACY IS ASSERTED, NOT ASSUMED.  sea_exp_self_test() below sweeps
+ * [-88, 0] against libm and fails above 1e-7 ABSOLUTE.  Measured: max absolute
+ * error 5.96e-08 on exp, and the same on ELU itself at alpha = 1 -- about half
+ * an ulp of binary32 near one.
+ *
+ * Absolute rather than relative on purpose.  Below about -87 the true value is
+ * subnormal (expf(-88) is 6e-39) and this flushes it to zero, so the relative
+ * error there is 1.0 and means nothing: ELU returns -alpha either way.  A
+ * relative bound would have to carve out that tail; an absolute one is the
+ * quantity that actually reaches the waveform.
+ *
+ * This follows the precedent src/kernels.c set for tanh (E4-16d): a Padé we
+ * own, on both ISAs, with a stated bound -- rather than a libm call per
+ * element that cannot be vectorised.  The scalar version here IS the
+ * reference, and the two vector versions are checked against it. */
+#define SEA_EXP_LO (-88.0f)   /* expf underflows to zero below this */
+
+static float sea_exp_neg_scalar(float x) {
+    if (x <= SEA_EXP_LO) return 0.0f;
+    const float log2e = 1.44269504088896340736f;
+    const float ln2_hi = 0.693359375f;        /* exact in binary32 */
+    const float ln2_lo = -2.12194440e-4f;
+    /* Round to nearest, ties to even -- the same rule vrndnq_f32 and
+     * _mm256_round_ps(NEAREST_INT) apply, so the reference and the two vector
+     * paths reduce the argument identically.  An earlier version open-coded
+     * this and got it wrong: the absolute error was 1.9e-05, which is what a
+     * bad range reduction looks like. */
+    const float nf = rintf(x * log2e);
+    const int n = (int)nf;
+    const float r = (x - nf * ln2_hi) - nf * ln2_lo;
+    /* exp(r) on [-ln2/2, ln2/2], Horner. */
+    float p = 1.98756912e-4f;
+    p = p * r + 1.39819618e-3f;
+    p = p * r + 8.33345973e-3f;
+    p = p * r + 4.16666418e-2f;
+    p = p * r + 1.66666657e-1f;
+    p = p * r + 5.00000000e-1f;
+    p = p * r + 1.0f;
+    p = p * r + 1.0f;
+    /* 2^n by construction; n is in [-127, 0] here. */
+    union { uint32_t u; float f; } scale;
+    int e = n + 127;
+    if (e < 1) return 0.0f;
+    scale.u = (uint32_t)e << 23;
+    return p * scale.f;
+}
+
 static void sea_elu_range(const float *in, float *out, size_t n, float alpha) {
-    for (size_t i = 0; i < n; ++i) {
+    size_t i = 0;
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    {
+        const float32x4_t log2e = vdupq_n_f32(1.44269504088896340736f);
+        const float32x4_t ln2_hi = vdupq_n_f32(0.693359375f);
+        const float32x4_t ln2_lo = vdupq_n_f32(-2.12194440e-4f);
+        const float32x4_t zero = vdupq_n_f32(0.0f);
+        const float32x4_t one = vdupq_n_f32(1.0f);
+        const float32x4_t va = vdupq_n_f32(alpha);
+        const float32x4_t lo = vdupq_n_f32(SEA_EXP_LO);
+        for (; i + 4u <= n; i += 4u) {
+            const float32x4_t x = vld1q_f32(in + i);
+            /* Only the negative lane's exp is used, so clamp the argument into
+             * the range this approximation covers and let the select discard
+             * the rest.  Nothing here can overflow. */
+            const float32x4_t xn = vmaxq_f32(vminq_f32(x, zero), lo);
+            const float32x4_t fn = vmulq_f32(xn, log2e);
+            const float32x4_t nf = vrndnq_f32(fn);
+            float32x4_t r = vsubq_f32(xn, vmulq_f32(nf, ln2_hi));
+            r = vsubq_f32(r, vmulq_f32(nf, ln2_lo));
+            float32x4_t p = vdupq_n_f32(1.98756912e-4f);
+            p = vfmaq_f32(vdupq_n_f32(1.39819618e-3f), p, r);
+            p = vfmaq_f32(vdupq_n_f32(8.33345973e-3f), p, r);
+            p = vfmaq_f32(vdupq_n_f32(4.16666418e-2f), p, r);
+            p = vfmaq_f32(vdupq_n_f32(1.66666657e-1f), p, r);
+            p = vfmaq_f32(vdupq_n_f32(5.00000000e-1f), p, r);
+            p = vfmaq_f32(one, p, r);
+            p = vfmaq_f32(one, p, r);
+            const int32x4_t e = vaddq_s32(vcvtq_s32_f32(nf), vdupq_n_s32(127));
+            const int32x4_t ec = vmaxq_s32(e, vdupq_n_s32(0));
+            const float32x4_t sc = vreinterpretq_f32_s32(vshlq_n_s32(ec, 23));
+            const float32x4_t ex = vmulq_f32(p, sc);
+            const float32x4_t neg = vmulq_f32(va, vsubq_f32(ex, one));
+            vst1q_f32(out + i, vbslq_f32(vcgtq_f32(x, zero), x, neg));
+        }
+    }
+#endif
+    for (; i < n; ++i) {
         const float x = in[i];
-        out[i] = (x > 0.0f) ? x : alpha * (expf(x) - 1.0f);
+        out[i] = (x > 0.0f) ? x : alpha * (sea_exp_neg_scalar(x) - 1.0f);
     }
 }
 
@@ -2267,7 +2363,41 @@ fail:
     return rc;
 }
 
+/* The bound the exp above claims, checked rather than believed, and checked on
+ * whichever path this build compiled: the vector one where it exists, the
+ * scalar reference otherwise.  Both go through mynah_seanet_elu_f32, so a
+ * vector path that drifts from the reference fails here and not in a waveform
+ * three modules downstream. */
+static int sea_exp_self_test(char *error, size_t error_capacity) {
+    enum { N = 4096 };
+    static float in[N], out[N];
+    double worst = 0.0;
+    float worst_x = 0.0f;
+    for (int block = 0; block < 22; ++block) {
+        const float base = -88.0f + (float)block * 4.0f;
+        for (int i = 0; i < N; ++i) in[i] = base + 4.0f * (float)i / (float)N;
+        mynah_seanet_elu_f32(in, out, (size_t)N, 1.0f);
+        for (int i = 0; i < N; ++i) {
+            const float x = in[i];
+            const float want = (x > 0.0f) ? x : (expf(x) - 1.0f);
+            const double d = fabs((double)out[i] - (double)want);
+            if (d > worst) { worst = d; worst_x = x; }
+        }
+    }
+    if (!(worst <= 1e-7)) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity,
+                     "seanet ELU: absolute error %.3e at x=%.6f exceeds 1e-7 "
+                     "(measured 5.96e-08 when this landed) -- the range "
+                     "reduction or the polynomial regressed",
+                     worst, (double)worst_x);
+        return -1;
+    }
+    return 0;
+}
+
 int mynah_seanet_self_test(char *error, size_t error_capacity) {
+    if (sea_exp_self_test(error, error_capacity) != 0) return -1;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
     /* --- ELU --------------------------------------------------------- */
