@@ -530,6 +530,14 @@ dtype conversions. Ordered by **(measured cost touched) ÷ (risk)**, and every
 item carries the measurement that justifies it. Numbers marked *(mac)* are
 development signals taken while the Axion was off and must be re-taken there.
 
+**Everything measured below is a macOS development signal while the Axion is off.**
+The box list, to be re-taken in one pass when it is back: E10-1 (conv gather),
+E10-3 (pre-fork footprint, and E10-3b's `smaps_rollup` question), E10-4/4c (int8
+batch widths), E10-4d (the default spec's 1.40×), E10-7 when it lands, plus the
+simultaneous-worker shape screen (E10-10), the closed-loop mini-soak (E10-9) and
+the x86 self-test that judges the two kernels written here and never executed
+(E10-4b, and the f16 x86 lanes in `8614117`/`a63d349`).
+
 - [x] E10-0 **the allocation gate skipped macOS for a reason that was not true**
       (`8919950`). `dlsym(RTLD_NEXT,"malloc")` returned the shim's own function and
       `shim_malloc` tail-called it: an infinite loop, read as "too slow to finish".
@@ -572,7 +580,16 @@ development signals taken while the Axion was off and must be re-taken there.
       **zero** in the PocketTTS path. **Still open:** the f16 pack (183 MB) is owned by the
       engine *state*, so it is still built per worker; sharing it means moving that cache to
       the model — a different ownership question. Original item text follows.
-- [ ] E10-3b **move the quantized weight cache to the model so the pack is shared too** —
+- [~] E10-3b **it may already be shared — and macOS cannot tell us.** Reading the code
+      after E10-3 landed: `state->qcache = model->qcache` (the cache is *already*
+      model-owned), `pocket_model_free()` does not free it, and `pocket_prepack_claim()`
+      memoises claimed caches in a **process-global** array — so the parent's warm builds
+      the pack, marks it, and children inherit both and skip prepack. If that holds, the
+      f16 pack is shared too and there is nothing left to move. **Unresolved here:**
+      per-worker physical footprint is flat at 216 MB whether W=2 or W=6, but that metric
+      does not separate inherited pages from private ones, and system-level deltas came
+      back 706 MB at W=2 against 482 MB at W=6 — noise, not signal. **Answer it on Linux
+      in one line:** `/proc/<worker>/smaps_rollup`, `Private_Dirty` against `Shared_Clean` —
       both are immutable after build and both are built **per worker, after the fork**.
       Measured per-worker private footprint: 582.1 MB (f16) / 414.1 MB (quant off), so
       **≈8.3 GB at W=16**. The blocker in `server/prefork.h` does not apply to PocketTTS:
