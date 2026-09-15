@@ -635,7 +635,14 @@ the x86 self-test that judges the two kernels written here and never executed
       of whole-request wall** from its int8 decoder conv on Neoverse-N1. **Skip the three
       convtranspose stages** — it measured those slower than f32 sgemm and ships them off.
       Needs its own quality gate (frame count, EOS step, log-mel corr)
-- [ ] E10-6 **weighted-LSQ int4 block scales** — the reference solves the block scale in
+- [x] E10-6 **int4 scale seeded from the signed extreme, then solved** — relative weight
+      reconstruction error **4.182% → 3.824%** (−8.6%), same bytes, same kernels, no
+      runtime cost. **No audio change, and the reason is ours:** the default spec keeps
+      int4 out of the AR loop, so it perturbs only the feed-forward codec — six seeds give
+      3-3 on waveform correlation and identical durations to the byte. The reference's
+      83.9→90.9% word accuracy came from int4 reaching their sampler; not transferable,
+      not claimed. Gated by absolute bounds after an ordering-only gate passed **two**
+      mutations. `MYNAH_QMAT_Q4_NAIVE=1` restores the old scale. Original text follows — the reference solves the block scale in
       closed form with `w = v²` instead of `amax/7`; same layout, same bytes, same
       kernels, ~10 lines. Measured there: word accuracy **83.9% → 90.9%**, utterance
       duration **+71% → +22%** against the gold. Ours is naive absmax RTN
