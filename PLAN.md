@@ -640,13 +640,19 @@ the x86 self-test that judges the two kernels written here and never executed
       kernels, ~10 lines. Measured there: word accuracy **83.9% → 90.9%**, utterance
       duration **+71% → +22%** against the gold. Ours is naive absmax RTN
       (`src/qmat.c:490`). For the codec only — **not** the AR loop
-- [ ] E10-7 **fuse the dispatches the pool cannot amortise** — at the production width of
-      **2 threads**, 62 regions/frame and **75.2% below the 200 µs break-even**. One site
-      dominates: `src/seanet.c:410` (`sea_elu_task`) dispatches `n=2`, pays **22% barrier**
-      on **86% sub-break-even** regions, where the qmat sites pay 2-3%. The reference's
-      mechanism is a persistent team with an intra-region spin barrier — one dispatch per
-      transformer block with ten internal phase barriers. **We have no barrier primitive
-      at all** in `src/threads.{c,h}`
+- [-] E10-7 **falsified at production width: the site named is making the right call.**
+      The audit pointed at `src/seanet.c:410` (`sea_elu_task`, `n=2`, **22% barrier**, 86%
+      of regions below break-even) as the worst-behaved dispatcher at two threads. Forcing
+      that ELU serial and measuring: `codec.conv_stack` **172.0-176.6 ms serial against
+      153.9-156.3 parallel**, audio identical either way. The region pays 12% for its
+      barrier and wins anyway — the thresholds at `SEA_ELU_MIN_PARALLEL` are measured
+      (~35 µs per region, ~2.5 ns per element) and they are right. The 22% is the price of
+      a correct decision, not a defect.
+      What is left of this item is **dispatch count**, not thresholds: 62 regions per frame,
+      and cutting them needs a persistent team with an intra-region barrier, which
+      `src/threads.{c,h}` has no primitive for. That is a structural change, and the
+      audit's own ceiling for the whole park/wake question at two threads is **0.8-2.7%**.
+      Not worth it before the box says the topology survives (E10-10)
 - [ ] E10-8 **the spin budget gate keys on the OS, not the ISA** — `#if defined(__linux__)
       && defined(__aarch64__)` → 65536, everything else 4096, and `src/threads.c:112-117`
       already admits the value is *"transferred from the reference's measurement, not
