@@ -172,7 +172,14 @@ static int tar_rows_reserve(tar_rows *rows,
     overflow |= tar_add(per, part, &per);
     overflow |= tar_mul(attn_dim, 4u, &part);        /* qkv (3) + attn */
     overflow |= tar_add(per, part, &per);
-    overflow |= tar_mul(config->ffn_dim, 2u, &part); /* ffn + gelu */
+    /* ffn only.  There used to be a second ffn_dim here for `gelu`, a scratch
+     * buffer mynah_gelu_tanh_array stopped reading -- src/kernels.c:1657,
+     * `(void)scratch`, ahead of every ISA variant -- so it was reserved, never
+     * written and never read.  For the backbone that is count * 4096 floats per
+     * live request: 256 KB at a 16-row tile, with another 128 KB for a
+     * codec-transformer state.  Nothing to do with latency; it is serving
+     * density, which is what a per-request buffer costs sixteen times over. */
+    overflow |= tar_mul(config->ffn_dim, 1u, &part); /* ffn */
     overflow |= tar_add(per, part, &per);
     overflow |= tar_mul(per, count, &total);
     if (overflow != 0) {
@@ -195,7 +202,7 @@ static int tar_rows_reserve(tar_rows *rows,
     rows->qkv = cursor;  cursor += count * 3u * attn_dim;
     rows->attn = cursor; cursor += count * attn_dim;
     rows->ffn = cursor;  cursor += count * config->ffn_dim;
-    rows->gelu = cursor;
+    rows->gelu = NULL;   /* see the reservation above: the callee ignores it */
     rows->rows_cap = count;
     return 0;
 }

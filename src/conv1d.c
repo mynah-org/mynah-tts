@@ -424,8 +424,17 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
     if (mynah_tensor_get(file, weight_name, &weight, error, error_capacity) != 0 ||
         mynah_tensor_get(file, bias_name, &bias, error, error_capacity) != 0) return -1;
     if (profile != NULL) profile->calls++;
-    const char *tap_env = getenv("MYNAH_CONV_TAP_GEMMS");
-    int use_tap_gemms = tap_env != NULL && strcmp(tap_env, "0") != 0;
+    /* Memoised, like mynah_conv1d_sgemm_enabled() twenty lines up and like
+     * src/seanet.c and src/codec_nanocodec.c: this runs on EVERY convolution,
+     * about ninety-seven times per decode, and a getenv plus a strcmp per call
+     * is a syscall-shaped cost to answer a question whose answer cannot change
+     * after start. */
+    static int use_tap_gemms_cached = -1;
+    if (use_tap_gemms_cached < 0) {
+        const char *tap_env = getenv("MYNAH_CONV_TAP_GEMMS");
+        use_tap_gemms_cached = (tap_env != NULL && strcmp(tap_env, "0") != 0);
+    }
+    int use_tap_gemms = use_tap_gemms_cached;
 #if MYNAH_HAVE_SGEMM && !defined(MYNAH_USE_ACCELERATE)
     /* On by default wherever a real GEMM exists and BNNS does not.  This was
      * keyed on MYNAH_USE_OPENBLAS, which stopped meaning "a GEMM exists" the
