@@ -188,7 +188,11 @@ Needs E1 and E2.
 - [ ] E3-9 WAV smoke for all 6 languages with explicit language/voice/seed
 - [ ] E3-10 **voice cloning from a wav — required, not optional** (see E7)
 - [ ] E3-11 one pack = one language; compute `time_embed.*.freqs` at load instead of storing
-- [ ] E3-12 NaN-as-BOS sentinel: reproduce it or track validity explicitly — never let NaN reach a matmul
+- [x] E3-12 **already done and gated, verified 2026-09-16** — validity is tracked
+      explicitly (`ctx->frames > 0` selects `bos_emb`, "BOS is a tracked fact, not a
+      NaN"), a pre-flight refuses a non-finite step input before any context is mutated,
+      and `POCKET_INJECT_LATENT_NAN` / `POCKET_INJECT_KV_NAN` force both refusal points
+      inside `mynah_engine_pocket_self_check`, which `--pocket-self-check` runs
 - [x] E3-13 **done** `a477b19` · pack refuses a voice KV from a different model/revision (upstream: it then never emits EOS)
 
 ### E7 — Voice cloning → [`.work/voice-cloning.md`](.work/voice-cloning.md)
@@ -697,7 +701,15 @@ the x86 self-test that judges the two kernels written here and never executed
       screen is written (scratchpad, `shape_screen.c`, 4096×1024 f16 = our `linear1`, sized
       so 16 workers exceed the 80 MiB L3); it needs ≥32 cores and cannot be answered on an
       8-core Mac
-- [ ] E10-11 **serving-loop observability** — we can say where wall time went but not how
+- [x] E10-11 **the loop can say how many slots were live, and why the rest were not**
+      (`f3f7ed3`). `MYNAH_SERVE_PROFILE=1`: live-slot histogram as a share of frames,
+      mean live width with 1.00 labelled "never batched", free-slot-found-nothing-queued
+      count, and the share of wall blocked waiting for an arrival — labelled, because
+      high there means **idle, not saturated**, which is what decides whether a level
+      failed on capacity or on variance. Verified against known shapes; the server at
+      five concurrent showed **B1=55.7% / B4=44.3%**, which is the kind of thing it
+      exists to surface. Original text follows
+- [-] E10-11-orig — we can say where wall time went but not how
       many slots were live per frame, nor *why* a free slot stayed free, nor the
       share-of-wall that was "blocked: no work queued" (the row that decides whether C80's
       1.120 is saturation or variance). The reference has all three plus a per-request
