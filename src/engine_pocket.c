@@ -3526,6 +3526,16 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     seanet.dilation_base = cfg->dilation_base;
     seanet.compress = cfg->compress;
     seanet.elu_alpha = cfg->elu_alpha;
+    /* THE `codec_conv` GROUP NOW MEANS THE WHOLE CONV STACK, not just
+     * mimi.quantizer.output_proj [512][32].  That projection is one matvec;
+     * the decoder's causal convolutions are 42% of `codec.conv_stack` in the
+     * configuration production ships, and before this they had no quantized
+     * kernel at all -- so a spec that said `codec_conv:int8` was quantizing
+     * 0.03% of what its name covers.  int4 and f16 are not offered here: the
+     * conv path has one int8 kernel (src/convq8.h says why the transposed
+     * convolutions are excluded), so anything else stays exact f32 rather
+     * than silently becoming a substitute. */
+    seanet.quantize_conv = (state->codec_conv_qtype == 1);
 
     mynah_resample_config upsample;
     upsample.stride = cfg->upsample_stride;

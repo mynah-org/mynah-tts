@@ -169,7 +169,7 @@ STAMP_WRITE := $(shell mkdir -p $(BUILD_DIR) && \
 	fi)
 
 
-CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
@@ -282,6 +282,8 @@ kernels-negative-control:
 #     also flips it in-process, but a run with the env variable set is what a
 #     deployment would actually do, and it is the only way the DEFAULT
 #     resolution gets exercised as a default.
+#   - MYNAH_QMAT_VNNI=scalar forces the PORTABLE unsigned kernel, which is the
+#     only way the x+128 / rowsum correction runs on an ARM machine at all.
 #   - MYNAH_QMAT_VNNI=256 / =512 ask for the VEX and EVEX VPDPBUSD kernels.
 #     On ARM both are unreachable and the run just re-reports the SDOT path,
 #     which costs milliseconds. On x86 they are the only way this project
@@ -297,8 +299,19 @@ qmat-test: $(QMAT_TEST_TARGET)
 	@$(QMAT_TEST_TARGET)
 	@MYNAH_QMAT_I8MM=0 $(QMAT_TEST_TARGET)
 	@MYNAH_QMAT_I8MM=1 $(QMAT_TEST_TARGET)
+	@MYNAH_QMAT_VNNI=scalar $(QMAT_TEST_TARGET)
 	@MYNAH_QMAT_VNNI=256 $(QMAT_TEST_TARGET)
 	@MYNAH_QMAT_VNNI=512 $(QMAT_TEST_TARGET)
+
+# The codec conv stack's int8 path against the SAME binary with it off, on real
+# weights (E10-5). The C self-test proves the kernel on synthetic data; this is
+# the only thing that can say what real weights -- which have outliers, unlike
+# uniform random data -- do to real audio, and whether the generated FRAME COUNT
+# moved. Needs a pack, so it is not in `make test`:
+#     make codec-int8-quality MODEL_DIR=models/pocket-en
+codec-int8-quality: $(TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make codec-int8-quality MODEL_DIR=models/pocket-en" >&2; exit 2)
+	@python3 tests/codec_int8_quality.py --binary $(TARGET) --model "$(MODEL_DIR)"
 
 # The negative control: break the epilogue the four ways it has actually been
 # broken, and require qmat-test to catch each one. Slow (rebuilds of the core
@@ -410,8 +423,17 @@ simd-auto-test:
 caps: $(TARGET)
 	@$(TARGET) --version; $(TARGET) --self-test
 
+# The second run is not a duplicate. MYNAH_QMAT_VNNI=scalar forces the PORTABLE
+# UNSIGNED int8 encoding -- x+128 with the -128*rowsum correction, which is what
+# VPDPBUSD needs and what the whole x86 half of production runs. On ARM the
+# signed SDOT path is the only one that ever resolves, so without this line the
+# unsigned algebra is compiled, shipped and never executed here: two mutations
+# of it (a dropped rowsum, a broken lane in the four-row unsigned block) pass
+# the default run and are caught only by this one. The level exists for exactly
+# this and had no gate using it.
 self-test: $(TARGET)
 	@$(TARGET) --self-test
+	@MYNAH_QMAT_VNNI=scalar $(TARGET) --self-test
 
 test: self-test kernels-test qmat-test driver-test window-test json-test playback-sim-test simd-auto-test
 	@python3 tests/test_python_tools.py

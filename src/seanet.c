@@ -6,6 +6,8 @@
  */
 #include "seanet.h"
 
+#include "convq8.h"
+
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
@@ -244,6 +246,7 @@ enum {
     SEA_PH_CONV_GATHER,     /* gather one kernel tap into a dense matrix      */
     SEA_PH_CONV_GEMM,       /* sea_sgemm, conv1d                              */
     SEA_PH_CONV_TAPS,       /* all taps fused into one pool region             */
+    SEA_PH_CONV_Q8,         /* the same region in int8 (src/convq8.c)         */
     SEA_PH_CONV_BIAS,       /* broadcast the bias over the output             */
     SEA_PH_CONV_CARRY,      /* save the new tail                              */
     SEA_PH_CONV_SCALAR,     /* the reference conv1d loop                      */
@@ -258,9 +261,10 @@ enum {
 
 static const char *const g_sea_phase_name[SEA_PH_COUNT] = {
     "decode.total",   "elu",            "residual_add",  "conv.window",
-    "conv.gather",    "conv.gemm",      "conv.taps",     "conv.bias",
-    "conv.carry",     "conv.scalar",    "convtr.fill",   "convtr.gemm",
-    "convtr.scatter", "convtr.scalar",  "convtr.tail",   "convtr.copy"
+    "conv.gather",    "conv.gemm",      "conv.taps",     "conv.q8",
+    "conv.bias",      "conv.carry",     "conv.scalar",   "convtr.fill",
+    "convtr.gemm",    "convtr.scatter", "convtr.scalar", "convtr.tail",
+    "convtr.copy"
 };
 
 /* 1 when the phase dispatches to the thread pool; 0 when it is a plain loop on
@@ -268,7 +272,7 @@ static const char *const g_sea_phase_name[SEA_PH_COUNT] = {
  * of the table is that split, and a reader should not have to know which name
  * means which. */
 static const int g_sea_phase_par[SEA_PH_COUNT] = {
-    0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0
+    0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0
 };
 
 typedef struct {
@@ -760,6 +764,9 @@ int mynah_causal_conv1d_init(mynah_causal_conv1d *conv,
     }
     memset(conv, 0, sizeof(*conv));
     conv->spec = *spec;
+    /* Off until the owner says otherwise: a caller that never heard of
+     * src/convq8.c gets exact f32. */
+    conv->quantize = 0;
     conv->tail = effective - spec->stride;
     conv->max_in_len = max_in_len;
     const size_t needed = mynah_causal_conv1d_scratch(spec, max_in_len);
@@ -890,6 +897,33 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
          * the loop below -- see the contract in sgemm.h -- and it refuses
          * rather than approximates, in which case the loop runs unchanged. */
         int fused = 0;
+        int bias_done = 0;
+        /* INT8 FIRST, when the engine's `codec_conv` group asked for it.
+         *
+         * Not guarded by MYNAH_SEANET_OWN_SGEMM, and the difference from the
+         * fused f32 path below is the point: that guard exists because routing
+         * taps through our kernels on an Accelerate build would be a NUMERICAL
+         * change wearing a scheduling change's clothes, invisible to anyone
+         * reading the diff.  This one IS a numerical change, it is asked for
+         * by name, and it has to be the same decision on macOS and on Linux or
+         * the development platform stops predicting the target.
+         *
+         * The bias is folded into the int8 epilogue, so the bias pass below is
+         * skipped -- one rounding instead of two, on a path that is already an
+         * approximation.  A refusal leaves `output` untouched and the f32 path
+         * runs exactly as before. */
+        if (conv->quantize) {
+            const unsigned long long t_q8 = sea_prof_now();
+            if (mynah_convq8_conv_taps(oc_count, out_len, in_channels, kernel,
+                                       weights->weight, win, window_len,
+                                       dilation, weights->bias, output,
+                                       out_len) == 0) {
+                fused = 1;
+                bias_done = 1;
+                sea_prof_add(SEA_PH_CONV_Q8, t_q8,
+                             oc_count * out_len * in_channels * kernel);
+            }
+        }
 #if defined(MYNAH_SEANET_OWN_SGEMM)
         /* ONLY when sea_sgemm above is mynah_sgemm_f32.  On a build that links
          * Accelerate or OpenBLAS, sea_sgemm is THAT library's cblas_sgemm, and
@@ -898,7 +932,7 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
          * change's clothes, on the one platform (macOS) where nobody would be
          * looking for it.  Production is Linux with BLAS=none, which is
          * exactly where this is compiled in. */
-        if (kernel > 1u) {
+        if (!fused && kernel > 1u) {
             const unsigned long long t_fused = sea_prof_now();
             if (mynah_sgemm_f32_conv_taps(oc_count, out_len, in_channels,
                                           kernel, weights->weight, conv->taps,
@@ -939,7 +973,7 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
             sea_prof_add(SEA_PH_CONV_GEMM, t_gemm,
                          oc_count * out_len * in_channels);
         }
-        if (weights->bias != NULL) {
+        if (weights->bias != NULL && !bias_done) {
             const unsigned long long t_bias = sea_prof_now();
             for (size_t oc = 0; oc < oc_count; ++oc) {
                 float *out_row = output + oc * out_len;
@@ -1728,6 +1762,7 @@ mynah_seanet_state *mynah_seanet_state_create(const mynah_seanet_config *config,
                 mynah_seanet_state_destroy(state);
                 return NULL;
             }
+            op->conv.quantize = state->config.quantize_conv;
             cursor += need;
         } else if (op->kind == SEA_OP_CONVTR) {
             const size_t need =
@@ -1750,6 +1785,7 @@ mynah_seanet_state *mynah_seanet_state_create(const mynah_seanet_config *config,
                 mynah_seanet_state_destroy(state);
                 return NULL;
             }
+            op->rb1.quantize = state->config.quantize_conv;
             cursor += need1;
             const size_t need2 =
                 mynah_causal_conv1d_scratch(&op->rb2_spec, op->in_len);
@@ -1760,6 +1796,7 @@ mynah_seanet_state *mynah_seanet_state_create(const mynah_seanet_config *config,
                 mynah_seanet_state_destroy(state);
                 return NULL;
             }
+            op->rb2.quantize = state->config.quantize_conv;
             cursor += need2;
         }
     }

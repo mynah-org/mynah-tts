@@ -192,6 +192,51 @@ int mynah_qmat_greedy_argmax_resolved(mynah_qmat_cache *cache, const char *name,
                                       int allow_extra, unsigned *argmax,
                                       char *error, size_t error_capacity);
 
+/* ------------------------------------------------- the int8 primitives
+ *
+ * Exported for a SECOND consumer with no tensor name to key a cache on: the
+ * SEANet conv stack (src/convq8.c).  The long comment in src/qmat.c says why
+ * they are exported rather than rewritten there -- in one line, the
+ * activation encoding is a property of the host (signed for SDOT, unsigned
+ * x+128 for VPDPBUSD) and a second copy of that dispatch would give up VNNI
+ * on the x86 half of production without saying so.
+ *
+ * The caller owns the float epilogue: these return exact int32, and
+ * mynah_qmat_epilogue() above is the one expression shape that turns one into
+ * a float. */
+
+/* Bytes of activation scratch one vector of length k needs.  It is k, and it
+ * is a function so a caller cannot assume the element type: above
+ * QMAT_U8_OFF the bytes are unsigned. */
+size_t mynah_qmat_act_bytes(size_t k);
+
+/* Quantizes one f32 vector into this host's activation encoding and returns
+ * its scale.  `dst` holds mynah_qmat_act_bytes(k) bytes. */
+float mynah_qmat_act_quantize(void *dst, const float *x, size_t k);
+
+/* Packs an f32 [rows][cols] block into per-row symmetric absmax int8 plus the
+ * row sums the unsigned encoding needs.  The row sums are written on every
+ * host, so a packed block does not depend on who packed it.  `cols` must be
+ * at most the k bound the row-sum's no-overflow argument assumes; -1 says so.
+ * Sizes: rows*cols int8, rows floats, rows int32. */
+int mynah_qmat_pack_q8(const float *w, size_t rows, size_t cols, int8_t *q,
+                       float *scale, int32_t *rowsum);
+
+/* Activation vectors one mynah_qmat_dots_i8 call may carry. */
+size_t mynah_qmat_dots_max_batch(void);
+
+/* out[b * out_stride + row] = exact int32 inner product of weight row `row`
+ * (int8, [rows][cols], contiguous in cols) with activation `xq[b]`, which was
+ * produced by mynah_qmat_act_quantize.  `rowsum` is mynah_qmat_pack_q8's and
+ * is read only where the host uses the unsigned encoding.
+ *
+ * The result does not depend on `batch`, on the ISA, or on the encoding:
+ * integer accumulation is exact, so every compiled path returns the same
+ * int32.  Asserted with == by the self-test, not with a tolerance. */
+void mynah_qmat_dots_i8(const int8_t *w, size_t rows, size_t cols,
+                        const int32_t *rowsum, const void *const *xq,
+                        size_t batch, int32_t *out, size_t out_stride);
+
 /* Model-free numeric check: int8 matvec vs an exact f32 dot on deterministic
  * data, asserting a bounded relative error.  0 = ok, -1 = error. */
 int mynah_qmat_self_test(char *error, size_t error_capacity);

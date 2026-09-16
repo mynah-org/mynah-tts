@@ -6,6 +6,7 @@
 #include "tokenizer.h"
 #include "tokenizer_sentencepiece.h"
 #include "flow_head.h"
+#include "convq8.h"
 #include "seanet.h"
 #include "transformer_ar.h"
 #include "dispatch.h"
@@ -552,6 +553,10 @@ int main(int argc, char **argv) {
         }
         if (mynah_seanet_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "SEANet self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_convq8_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "codec int8 conv self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_sp_self_test(error, sizeof(error)) != 0) {

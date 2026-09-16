@@ -87,6 +87,11 @@ typedef struct {
      * off, whenever the shape or the build does not qualify.  The scalar loop
      * below stays the reference and is what runs then. */
     float *taps;        /* [out_channels][in_channels] or NULL */
+    /* 1 = this convolution's tap GEMM may run in int8 (src/convq8.c).  Set by
+     * the SEANet state from mynah_seanet_config.quantize_conv, so a
+     * standalone conv1d built by a caller that zero-initialises defaults to
+     * exact f32.  A refusal there is a slower frame and never a crash. */
+    int quantize;
 } mynah_causal_conv1d;
 
 /* Number of floats the caller must provide to `_init`. */
@@ -153,6 +158,14 @@ typedef struct {
     size_t dilation_base;        /* 2                                    */
     size_t compress;             /* 2                                    */
     float elu_alpha;             /* 1.0f                                 */
+    /* 1 = the decoder's conv1d tap GEMMs may run in int8; 0 = exact f32.
+     * The engine sets it from the `codec_conv` quantization group, which is
+     * the same sentence that decides the codec transformer's encoding -- one
+     * vocabulary rather than a second environment variable.  See
+     * src/convq8.h.  ZERO IS THE SAFE DEFAULT and is what a zero-initialised
+     * config gets, so no existing caller changes behaviour by being
+     * recompiled against this field. */
+    int quantize_conv;
 } mynah_seanet_config;
 
 /* Mimi's ConvTrUpsample1d / ConvDownsample1d.  kernel_size is always

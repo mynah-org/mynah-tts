@@ -593,8 +593,18 @@ static void quantize_weight_int4(const float *w, size_t n, size_t k,
     quantize_weight_int4_mode(w, n, k, q, scales, q4_naive_enabled() ? 1 : 0);
 }
 
-/* Per-vector absmax activation quantization; returns the activation scale. */
-static float quantize_act_int8(int8_t *qx, const float *x, size_t k) {
+/* Per-vector absmax activation quantization; returns the activation scale.
+ *
+ * THE SCALAR FORM IS THE REFERENCE and stays compiled: the vector paths below
+ * are asserted BYTE-IDENTICAL to it, not close to it, because an activation
+ * byte that depended on the ISA would make a request's audio depend on which
+ * machine served it.  self_test_act_quantize() does that over both encodings.
+ *
+ * It is worth vectorising because it is not only the decode loop's pass: the
+ * codec conv stack (src/convq8.c) quantizes a whole window of activations per
+ * convolution, where this was measured at 40.8% of the int8 path's cost --
+ * more than the SDOT it feeds. */
+static float quantize_act_int8_scalar(int8_t *qx, const float *x, size_t k) {
     float amax = 0.0f;
     for (size_t i = 0; i < k; ++i) {
         const float a = fabsf(x[i]);
@@ -615,11 +625,81 @@ static float quantize_act_int8(int8_t *qx, const float *x, size_t k) {
     return amax / 127.0f;
 }
 
+/* The absmax, which is where half the scalar time went.  A tree reduction of
+ * a max is bit-identical to a sequential one -- max is associative and exact,
+ * with no rounding to reassociate -- so this is the one part of the pass that
+ * needs no argument beyond that sentence. */
+static float qmat_absmax(const float *x, size_t k) {
+    size_t i = 0;
+    float amax = 0.0f;
+#if defined(MYNAH_QMAT_DOTPROD) || defined(MYNAH_QMAT_F16_NEON)
+    float32x4_t m0 = vdupq_n_f32(0.0f), m1 = vdupq_n_f32(0.0f);
+    for (; i + 8u <= k; i += 8u) {
+        m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(x + i)));
+        m1 = vmaxq_f32(m1, vabsq_f32(vld1q_f32(x + i + 4u)));
+    }
+    amax = vmaxvq_f32(vmaxq_f32(m0, m1));
+#elif defined(MYNAH_QMAT_AVX2)
+    __m256 m = _mm256_setzero_ps();
+    const __m256 sign = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    for (; i + 8u <= k; i += 8u) {
+        m = _mm256_max_ps(m, _mm256_and_ps(_mm256_loadu_ps(x + i), sign));
+    }
+    float lanes[8];
+    _mm256_storeu_ps(lanes, m);
+    for (int l = 0; l < 8; ++l) if (lanes[l] > amax) amax = lanes[l];
+#endif
+    for (; i < k; ++i) {
+        const float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+    return amax;
+}
+
+static float quantize_act_int8(int8_t *qx, const float *x, size_t k) {
+    const float amax = qmat_absmax(x, k);
+    if (amax == 0.0f) {
+        memset(qx, 0, k);
+        return 0.0f;
+    }
+    const float inv = 127.0f / amax;
+    size_t i = 0;
+#if defined(MYNAH_QMAT_DOTPROD) || defined(MYNAH_QMAT_F16_NEON)
+    /* vcvtaq_s32_f32 rounds to nearest with TIES AWAY FROM ZERO, which is
+     * exactly what `(int)(v >= 0 ? v + 0.5f : v - 0.5f)` spells out; and for
+     * |v| < 128 the scalar form's `v + 0.5f` is exact, so the two agree on
+     * every input this function can see rather than on almost all of them. */
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    const int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
+    for (; i + 16u <= k; i += 16u) {
+        int32x4_t a = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i), vinv));
+        int32x4_t b2 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i + 4u), vinv));
+        int32x4_t c = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i + 8u), vinv));
+        int32x4_t d = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i + 12u), vinv));
+        a = vminq_s32(vmaxq_s32(a, lo), hi);
+        b2 = vminq_s32(vmaxq_s32(b2, lo), hi);
+        c = vminq_s32(vmaxq_s32(c, lo), hi);
+        d = vminq_s32(vmaxq_s32(d, lo), hi);
+        const int16x8_t p0 = vcombine_s16(vmovn_s32(a), vmovn_s32(b2));
+        const int16x8_t p1 = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
+        vst1q_s8(qx + i, vcombine_s8(vmovn_s16(p0), vmovn_s16(p1)));
+    }
+#endif
+    for (; i < k; ++i) {
+        const float v = x[i] * inv;
+        int q = (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        qx[i] = (int8_t)q;
+    }
+    return amax / 127.0f;
+}
+
 /* The same quantizer with the +128 already applied, so the VNNI loop never
  * pays for the bias.  It must agree with quantize_act_int8 element for element
  * -- qu[i] == (uint8_t)(qx[i] + 128) -- which is why the rounding and clamping
  * are written here identically rather than shared through a callback. */
-static float quantize_act_u8(uint8_t *qu, const float *x, size_t k) {
+static float quantize_act_u8_scalar(uint8_t *qu, const float *x, size_t k) {
     float amax = 0.0f;
     for (size_t i = 0; i < k; ++i) {
         const float a = fabsf(x[i]);
@@ -631,6 +711,47 @@ static float quantize_act_u8(uint8_t *qu, const float *x, size_t k) {
     }
     const float inv = 127.0f / amax;
     for (size_t i = 0; i < k; ++i) {
+        const float v = x[i] * inv;
+        int q = (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        qu[i] = (uint8_t)(q + 128);
+    }
+    return amax / 127.0f;
+}
+
+/* The unsigned twin.  It shares the absmax and then adds 128, which on ARM is
+ * one instruction on the narrowed bytes; the invariant it must keep is
+ * qu[i] == (uint8_t)(qx[i] + 128) for every i, and the self-test checks that
+ * against the scalar form rather than against its sibling. */
+static float quantize_act_u8(uint8_t *qu, const float *x, size_t k) {
+    const float amax = qmat_absmax(x, k);
+    if (amax == 0.0f) {
+        memset(qu, 128, k);
+        return 0.0f;
+    }
+    const float inv = 127.0f / amax;
+    size_t i = 0;
+#if defined(MYNAH_QMAT_DOTPROD) || defined(MYNAH_QMAT_F16_NEON)
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    const int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
+    const uint8x16_t bias = vdupq_n_u8(128u);
+    for (; i + 16u <= k; i += 16u) {
+        int32x4_t a = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i), vinv));
+        int32x4_t b2 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i + 4u), vinv));
+        int32x4_t c = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i + 8u), vinv));
+        int32x4_t d = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + i + 12u), vinv));
+        a = vminq_s32(vmaxq_s32(a, lo), hi);
+        b2 = vminq_s32(vmaxq_s32(b2, lo), hi);
+        c = vminq_s32(vmaxq_s32(c, lo), hi);
+        d = vminq_s32(vmaxq_s32(d, lo), hi);
+        const int16x8_t p0 = vcombine_s16(vmovn_s32(a), vmovn_s32(b2));
+        const int16x8_t p1 = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
+        const int8x16_t packed = vcombine_s8(vmovn_s16(p0), vmovn_s16(p1));
+        vst1q_u8(qu + i, vaddq_u8(vreinterpretq_u8_s8(packed), bias));
+    }
+#endif
+    for (; i < k; ++i) {
         const float v = x[i] * inv;
         int q = (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
         if (q > 127) q = 127;
@@ -1260,6 +1381,147 @@ static void matvec_q8_neon_x4(float *o0, float *o1, float *o2, float *o3,
     }
 }
 #endif /* MYNAH_QMAT_DOTPROD */
+
+
+/* ======================================================================
+ * THE INT8 PRIMITIVES, EXPORTED
+ *
+ * A second consumer exists: the SEANet conv stack (src/convq8.c, E10-5),
+ * whose tap GEMMs are 42% of `codec.conv_stack` in the configuration that
+ * ships.  It needs int8 arithmetic but not this file's cache -- it has no
+ * tensor name to key on, by design (src/seanet.h: "this module never formats
+ * a tensor name"), and its weight is a permutation of a weight this file
+ * never sees.
+ *
+ * WHY EXPORTED RATHER THAN REWRITTEN THERE.  The activation encoding is a
+ * property of the HOST, not of the caller: signed int8 where SDOT exists,
+ * unsigned x+128 with a row-sum correction where VPDPBUSD does.  A second
+ * copy of that dispatch is a second thing to get wrong, and it would get it
+ * wrong in the direction that matters -- a caller that assumed signed would
+ * silently give up VNNI on the x86 half of production, which is where the
+ * only committed int8 speedup we have was measured (0.427 vs 0.806 RTF on
+ * EPYC Zen 5).
+ *
+ * WHAT THE CALLER OWNS: the float epilogue.  These return exact int32, and
+ * mynah_qmat_epilogue() is the one expression shape that turns one into a
+ * float -- see the long comment above qmat_row_scale().  The conv stack
+ * accumulates over kernel taps, which this file has no concept of.
+ *
+ * DETERMINISM.  Integer accumulation is exact and order-independent, so every
+ * path below -- SDOT, VNNI, AVX2, scalar, any batch width -- produces the
+ * SAME int32 for the same (weight row, activation).  That is not a tolerance,
+ * it is an identity, and self_test_dots_i8() asserts it with ==.
+ * ====================================================================== */
+
+size_t mynah_qmat_act_bytes(size_t k) { return k; }
+
+float mynah_qmat_act_quantize(void *dst, const float *x, size_t k) {
+    if (dst == NULL || x == NULL || k == 0u) return 0.0f;
+    return quantize_act(dst, x, k, qmat_u8_level());
+}
+
+int mynah_qmat_pack_q8(const float *w, size_t rows, size_t cols, int8_t *q,
+                       float *scale, int32_t *rowsum) {
+    if (w == NULL || q == NULL || scale == NULL || rowsum == NULL) return -1;
+    if (rows == 0u || cols == 0u) return -1;
+    if (cols > QMAT_K_MAX) return -1;   /* the rowsum's overflow argument */
+    quantize_weight_int8(w, rows, cols, q, scale);
+    weight_rowsum_prefix(q, rows, cols, rowsum);
+    return 0;
+}
+
+size_t mynah_qmat_dots_max_batch(void) { return 4u; }
+
+void mynah_qmat_dots_i8(const int8_t *w, size_t rows, size_t cols,
+                        const int32_t *rowsum, const void *const *xq,
+                        size_t batch, int32_t *out, size_t out_stride) {
+    if (w == NULL || xq == NULL || out == NULL || rows == 0u || batch == 0u) {
+        return;
+    }
+    const int level = qmat_u8_level();
+    if (level != QMAT_U8_OFF) {
+        /* Activation-stationary, four weight rows at a time: the VNNI unroll.
+         * dot4_u8_i32 already folds the -128*rowsum correction, so the int32
+         * it returns is the signed kernel's, exactly. */
+        for (size_t b = 0; b < batch; ++b) {
+            const uint8_t *xu = (const uint8_t *)xq[b];
+            int32_t *ob = out + b * out_stride;
+            size_t row = 0;
+            for (; row + 4u <= rows; row += 4u) {
+                int32_t s[4];
+                dot4_u8_i32(xu, w, cols, rowsum, row, level, s);
+                ob[row] = s[0]; ob[row + 1u] = s[1];
+                ob[row + 2u] = s[2]; ob[row + 3u] = s[3];
+            }
+            for (; row < rows; ++row) {
+                ob[row] = dot_u8_i32(xu, w + row * cols, rowsum[row], cols, level);
+            }
+        }
+        return;
+    }
+#if defined(MYNAH_QMAT_DOTPROD)
+    if (batch == 4u) {
+        /* Two weight rows, four activations, one weight load -- the integer
+         * half of matvec_q8_neon_x4, which cannot be called here because it
+         * ends in that kernel's float epilogue. */
+        const int8_t *x0 = (const int8_t *)xq[0], *x1 = (const int8_t *)xq[1];
+        const int8_t *x2 = (const int8_t *)xq[2], *x3 = (const int8_t *)xq[3];
+        int32_t *o0 = out, *o1 = out + out_stride;
+        int32_t *o2 = out + 2u * out_stride, *o3 = out + 3u * out_stride;
+        size_t row = 0;
+        for (; row + 2u <= rows; row += 2u) {
+            const int8_t *wa = w + row * cols;
+            const int8_t *wb = wa + cols;
+            int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+            int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+            int32x4_t b0 = vdupq_n_s32(0), b1 = vdupq_n_s32(0);
+            int32x4_t b2 = vdupq_n_s32(0), b3 = vdupq_n_s32(0);
+            size_t j = 0;
+            for (; j + 16u <= cols; j += 16u) {
+                const int8x16_t va = vld1q_s8(wa + j);
+                const int8x16_t vb = vld1q_s8(wb + j);
+                const int8x16_t v0 = vld1q_s8(x0 + j);
+                a0 = vdotq_s32(a0, va, v0); b0 = vdotq_s32(b0, vb, v0);
+                const int8x16_t v1 = vld1q_s8(x1 + j);
+                a1 = vdotq_s32(a1, va, v1); b1 = vdotq_s32(b1, vb, v1);
+                const int8x16_t v2 = vld1q_s8(x2 + j);
+                a2 = vdotq_s32(a2, va, v2); b2 = vdotq_s32(b2, vb, v2);
+                const int8x16_t v3 = vld1q_s8(x3 + j);
+                a3 = vdotq_s32(a3, va, v3); b3 = vdotq_s32(b3, vb, v3);
+            }
+            int32_t sa0 = vaddvq_s32(a0), sa1 = vaddvq_s32(a1);
+            int32_t sa2 = vaddvq_s32(a2), sa3 = vaddvq_s32(a3);
+            int32_t sb0 = vaddvq_s32(b0), sb1 = vaddvq_s32(b1);
+            int32_t sb2 = vaddvq_s32(b2), sb3 = vaddvq_s32(b3);
+            for (; j < cols; ++j) {
+                const int32_t wav = wa[j], wbv = wb[j];
+                sa0 += wav * (int32_t)x0[j]; sb0 += wbv * (int32_t)x0[j];
+                sa1 += wav * (int32_t)x1[j]; sb1 += wbv * (int32_t)x1[j];
+                sa2 += wav * (int32_t)x2[j]; sb2 += wbv * (int32_t)x2[j];
+                sa3 += wav * (int32_t)x3[j]; sb3 += wbv * (int32_t)x3[j];
+            }
+            o0[row] = sa0; o1[row] = sa1; o2[row] = sa2; o3[row] = sa3;
+            o0[row + 1u] = sb0; o1[row + 1u] = sb1;
+            o2[row + 1u] = sb2; o3[row + 1u] = sb3;
+        }
+        for (; row < rows; ++row) {
+            const int8_t *wr = w + row * cols;
+            o0[row] = dot_q8_i32(x0, wr, 0, cols, QMAT_U8_OFF);
+            o1[row] = dot_q8_i32(x1, wr, 0, cols, QMAT_U8_OFF);
+            o2[row] = dot_q8_i32(x2, wr, 0, cols, QMAT_U8_OFF);
+            o3[row] = dot_q8_i32(x3, wr, 0, cols, QMAT_U8_OFF);
+        }
+        return;
+    }
+#endif
+    for (size_t b = 0; b < batch; ++b) {
+        const int8_t *xb = (const int8_t *)xq[b];
+        int32_t *ob = out + b * out_stride;
+        for (size_t row = 0; row < rows; ++row) {
+            ob[row] = dot_q8_i32(xb, w + row * cols, 0, cols, QMAT_U8_OFF);
+        }
+    }
+}
 
 static void matvec_q8(float *out, const void *qa, float sx,
                       const int8_t *weights, const float *scales,
@@ -3580,6 +3842,91 @@ done:
  * a configuration where int4 DOES reach the sampler; that does not transfer and
  * is not claimed here. What transfers is a strictly better approximation at no
  * cost, which is what this asserts. */
+/* The activation quantizer's vector paths against the scalar reference, BYTE
+ * FOR BYTE.  Not a tolerance: an activation byte that depended on the ISA
+ * would make a request's audio depend on which machine served it, and the
+ * rounding rules were chosen (vcvta = ties away from zero) so that equality is
+ * achievable rather than approximately true.
+ *
+ * The lengths straddle the 16-element vector body on both sides, and the data
+ * deliberately includes an exact .5 tie, a value that clamps, a zero vector
+ * and a vector whose amax is its last element -- the four inputs where a
+ * reduction or a rounding rule can differ and nothing else would show it. */
+static int self_test_act_quantize(char *error, size_t error_capacity) {
+    static const size_t lens[] = { 1, 4, 15, 16, 17, 31, 32, 33, 64, 127, 512 };
+    float x[512];
+    int8_t got_s[512], want_s[512];
+    uint8_t got_u[512], want_u[512];
+    for (size_t li = 0; li < sizeof lens / sizeof lens[0]; ++li) {
+        const size_t k = lens[li];
+        for (int variant = 0; variant < 4; ++variant) {
+            for (size_t i = 0; i < k; ++i) {
+                switch (variant) {
+                case 0: x[i] = (float)((int)(i % 37u) - 18) * 0.125f; break;
+                case 1: x[i] = 0.0f; break;
+                /* amax is the LAST element: a tree reduction that dropped the
+                 * tail would pass every other variant. */
+                case 2: x[i] = (i + 1u == k) ? 9.0f : 0.5f; break;
+                /* EXACT TIES.  One element is 127, so amax is 127 and the
+                 * scale is exactly 1.0; every other value is a half-integer
+                 * and therefore lands exactly on a rounding tie.  Without
+                 * this the ties-away-from-zero rule is never exercised and
+                 * swapping vcvta for vcvtn passes the whole suite -- it did,
+                 * the first time this test was written. */
+                default:
+                    x[i] = (i + 1u == k)
+                               ? 127.0f
+                               : ((float)((int)(i % 5u) - 2) + 0.5f);
+                    break;
+                }
+            }
+            const float ss = quantize_act_int8_scalar(want_s, x, k);
+            const float vs = quantize_act_int8(got_s, x, k);
+            if (memcmp(&ss, &vs, sizeof ss) != 0) {
+                snprintf(error, error_capacity,
+                         "qmat: int8 activation scale differs at k=%zu "
+                         "variant %d: scalar %.9g vector %.9g",
+                         k, variant, (double)ss, (double)vs);
+                return -1;
+            }
+            if (memcmp(got_s, want_s, k) != 0) {
+                size_t at = 0;
+                while (at < k && got_s[at] == want_s[at]) ++at;
+                snprintf(error, error_capacity,
+                         "qmat: int8 activation byte %zu of %zu differs "
+                         "(variant %d): scalar %d vector %d",
+                         at, k, variant, (int)want_s[at], (int)got_s[at]);
+                return -1;
+            }
+            const float su = quantize_act_u8_scalar(want_u, x, k);
+            const float vu = quantize_act_u8(got_u, x, k);
+            if (memcmp(&su, &vu, sizeof su) != 0 ||
+                memcmp(got_u, want_u, k) != 0) {
+                size_t at = 0;
+                while (at < k && got_u[at] == want_u[at]) ++at;
+                snprintf(error, error_capacity,
+                         "qmat: u8 activation differs at %zu of %zu "
+                         "(variant %d): scalar %u vector %u",
+                         at, k, variant, (unsigned)want_u[at],
+                         (unsigned)got_u[at]);
+                return -1;
+            }
+            /* And the invariant that ties the two encodings together, which
+             * is what the -128*rowsum correction assumes. */
+            for (size_t i = 0; i < k; ++i) {
+                if (got_u[i] != (uint8_t)((int)got_s[i] + 128)) {
+                    snprintf(error, error_capacity,
+                             "qmat: u8 is not int8+128 at %zu of %zu "
+                             "(variant %d): %d vs %u",
+                             i, k, variant, (int)got_s[i], (unsigned)got_u[i]);
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int self_test_q4_scale_solve(char *error, size_t error_capacity) {
     enum { N = 8, K = 256 };
     if (qmat_qtype_available(QMAT_INT4) != QMAT_INT4) return 0;
@@ -4592,6 +4939,7 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
      * each have a four-wide kernel, a two-wide one and a three-remainder served
      * by the four-wide kernel with an activation repeated; B=5 in the test above
      * reaches two of those six paths. */
+    if (self_test_act_quantize(error, error_capacity) != 0) return -1;
     if (self_test_q4_scale_solve(error, error_capacity) != 0) return -1;
     if (self_test_lane_widths(QMAT_F16, error, error_capacity) != 0) return -1;
     if (self_test_lane_widths(QMAT_INT8, error, error_capacity) != 0) return -1;

@@ -498,6 +498,7 @@ static void register_module_probes(void) {
     mynah_codec_dispatch_probes();
     mynah_seanet_dispatch_probes();
     mynah_sgemm_dispatch_probes();
+    mynah_convq8_dispatch_probes();
 }
 
 /* ======================================================================
@@ -1001,6 +1002,12 @@ static void collect_backends(row_sink *s) {
     add_unknown(s, "codec.seanet_convtr_path", "yes", "-", NULL,
                 "[UNKNOWN] src/seanet.c did not register its convtranspose "
                 "path counters");
+    add_unknown(s, "codec.conv_int8_host", "yes", "-", "MYNAH_CODEC_CONV_Q8",
+                "[UNKNOWN] src/convq8.c did not register "
+                "mynah_convq8_host_ok()");
+    add_unknown(s, "codec.conv_int8_path", "yes", "-", NULL,
+                "[UNKNOWN] src/convq8.c did not register its tap GEMM "
+                "counters");
     add_unknown(s, "codec.snake_vector", "yes", "-", "MYNAH_SNAKE_SCALAR",
                 "[UNKNOWN] src/codec_nanocodec.c did not register "
                 "mynah_snake_vector_enabled()");
