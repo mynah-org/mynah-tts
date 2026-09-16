@@ -2589,7 +2589,12 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
     e->n = n;
     e->k = k;
     e->name = (char *)malloc(strlen(name) + 1u);
-    if (e->name == NULL) return NULL;
+    /* `goto fail`, not `return NULL`: this is the one allocation failure here
+     * that used to leak the entry it had just calloc'd.  The label frees every
+     * member and the entry, and calloc left the rest NULL, so it is correct on
+     * the earliest failure as well as the latest.  Found by the same
+     * clang-analyzer unix.Malloc check the Code Quality job runs. */
+    if (e->name == NULL) goto fail;
     if (qtype == QMAT_INT8) {
         e->q8 = (int8_t *)malloc(n * k);
         e->scales = (float *)malloc(n * sizeof(float));
@@ -3972,8 +3977,11 @@ static int self_test_act_quantize(char *error, size_t error_capacity) {
                 return -1;
             }
             if (memcmp(got_s, want_s, k) != 0) {
+                /* memcmp said they differ, so this stops before `k` -- but the
+                 * bound is written down rather than reasoned about, because the
+                 * next line indexes with it. */
                 size_t at = 0;
-                while (at < k && got_s[at] == want_s[at]) ++at;
+                while (at + 1u < k && got_s[at] == want_s[at]) ++at;
                 snprintf(error, error_capacity,
                          "qmat: int8 activation byte %zu of %zu differs "
                          "(variant %d): scalar %d vector %d",
@@ -3985,7 +3993,7 @@ static int self_test_act_quantize(char *error, size_t error_capacity) {
             if (memcmp(&su, &vu, sizeof su) != 0 ||
                 memcmp(got_u, want_u, k) != 0) {
                 size_t at = 0;
-                while (at < k && got_u[at] == want_u[at]) ++at;
+                while (at + 1u < k && got_u[at] == want_u[at]) ++at;
                 snprintf(error, error_capacity,
                          "qmat: u8 activation differs at %zu of %zu "
                          "(variant %d): scalar %u vector %u",

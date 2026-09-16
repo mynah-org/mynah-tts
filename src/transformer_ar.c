@@ -498,7 +498,6 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
 
     float *cursor = state->block;
     state->scores = cursor;
-    cursor += kv_positions;
     if (shared_rope != NULL) {
         state->rope_cos = shared_rope;
         state->rope_sin = shared_rope + resolved.max_seq_len * state->half;
@@ -506,8 +505,8 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
         /* The RoPE table is position-only, so it is built once and the hot
          * loop contains no transcendental at all.  This arm only runs when the
          * shared table could not be allocated. */
-        float *cos_table = cursor;
-        float *sin_table = cursor + resolved.max_seq_len * state->half;
+        float *cos_table = cursor + kv_positions;
+        float *sin_table = cos_table + resolved.max_seq_len * state->half;
         for (size_t p = 0; p < resolved.max_seq_len; ++p) {
             mynah_transformer_ar_rope_angles_f32(cos_table + p * state->half,
                                                  sin_table + p * state->half,
@@ -756,8 +755,21 @@ static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
     if (keep_from < state->kv_base) keep_from = state->kv_base;
     const size_t shift = keep_from - state->kv_base;
     if (shift == 0u) return -1;
-    size_t keep = (state->offset > keep_from) ? state->offset - keep_from : 0u;
-    if (keep > state->kv_positions - shift) keep = state->kv_positions - shift;
+    /* How much of what is stored survives the move.
+     *
+     * `kv_positions - shift` is an UNSIGNED subtraction, and it is only safe
+     * because a caller advances positions by at most one tile per call, so
+     * `shift` stays under the slack.  That is four assumptions about the
+     * caller holding up a memmove length, which is not a thing to leave
+     * implicit: a `shift` at or past the capacity means the window has moved
+     * entirely past what we hold, and the answer to that is to keep nothing
+     * and rebase -- not to underflow into a memmove of about 2^64 bytes. */
+    size_t keep = 0u;
+    if (shift < state->kv_positions && state->offset > keep_from) {
+        keep = state->offset - keep_from;
+        const size_t room = state->kv_positions - shift;
+        if (keep > room) keep = room;
+    }
     if (keep > 0u) {
         const size_t row = state->attn_dim * sizeof(float);
         for (size_t l = 0; l < state->config.num_layers; ++l) {

@@ -117,3 +117,63 @@ Do it after Axion, not during.
       flapped, so one green proves nothing) — needs a push
 - [x] the AVX-512 coverage question answered in writing, above
 - [ ] `--self-test` added to the matrix, after the Axion work
+
+## 2026-09-16 — re-checked, and what the local gates say
+
+`gh run list` is **unchanged**: the same five `workflow_dispatch` runs on
+`lane/int8-*` from 2026-09-13, and **every `main` run is still green** (last
+one 2026-08-04, `724d677`, all three workflows). Nothing newer has run because
+nothing has been pushed: the local branch is **140 commits ahead of
+`origin/main`**, so none of E10's work has ever reached a runner.
+
+That answers the obvious first suspicion — the red is not the new code, and it
+cannot be: the new code has never been on GitHub.
+
+The job fix is still committed-and-unproven for the same reason. It needs a
+push plus two consecutive greens, and a push is never done without asking.
+
+### Running the CI jobs locally instead
+
+| CI job | run locally as | result |
+|---|---|---|
+| Memory Safety / ASan | `make asan` (Accelerate and `BLAS=none`) | clean, exit 0 |
+| Memory Safety / ASan, real workload | the ASan binary over a 17 s synthesis, default spec **and** `codec_convtr:int8` | clean — 220 frames, so ~13 KV compactions ran under ASan |
+| Memory Safety / UBSan | `make ubsan` + a real synthesis | clean |
+| Code Quality / clang-tidy | not installed; `cc --analyze` runs the same clang-analyzer engine | see below |
+| Build & Test | five BLAS/SIMD profiles, `make test`, goldens, batch parity, window-test, the server suite on the real pack | green |
+
+### What the analyzer found, and what was done
+
+The Code Quality job runs clang-tidy with **`-warnings-as-errors=''`**, so none
+of these can fail it — and the last `main` run was green with most of them
+already present. Treated as advisory, and triaged rather than swept:
+
+Fixed, because they are real:
+
+* `src/qmat.c` `cache_insert()` — `e->name == NULL` did `return NULL` instead of
+  `goto fail`, leaking the entry it had just `calloc`'d. A genuine leak on an
+  OOM path, pre-existing, exactly what `unix.Malloc` is for.
+* `src/qmat.c` `self_test_act_quantize()` — the "find the first differing byte"
+  loops could index `k` if the invariant that got them there ever broke. Mine;
+  the bound is written down now instead of reasoned about.
+* `src/transformer_ar.c` — a dead store left by the RoPE-sharing change. Mine.
+
+Not fixed, with the reason:
+
+* `src/engine_pocket.c:1506` "Attempt to free released memory" — **false
+  positive**. `pocket_call_init` takes four separate `calloc`s and
+  `pocket_call_release` frees each and then `memset`s the struct, so a double
+  release frees NULLs. The analyzer does not track the memset.
+* `src/transformer_ar.c:332` dead store — pre-existing, part of a uniform
+  `cursor +=` assignment chain where the last increment is naturally unread.
+  CI disables `deadcode.DeadStores` explicitly. Breaking the chain's symmetry
+  to silence a disabled check is a readability cost for nothing.
+* ~25 more across `server/`, `src/engine_magpie.c`, `src/json.c`, `src/sgemm.c`,
+  `src/costmap.c`, `src/threads.c`, `cli/main.c` — mostly `unix.Stream`,
+  `unix.Errno` and `core.uninitialized.Assign` on paths the analyzer cannot
+  prove. **Not swept**: they are pre-existing, advisory, and a 25-file
+  drive-by in the middle of E10 is how unrelated regressions get in. They are
+  worth their own pass, with each one judged rather than silenced.
+
+After the three fixes `src/qmat.c` and `src/convq8.c` analyze clean, and
+`src/transformer_ar.c`'s only remaining hit is the pre-existing disabled one.
