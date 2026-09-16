@@ -52,6 +52,20 @@ int mynah_convq8_conv_taps(size_t m, size_t n, size_t k, size_t taps,
                            size_t tap_stride, const float *bias, float *c,
                            size_t ldc);
 
+/* c[i][j] = sum_p weight[p * ldw + i] * b[p * ldb + j] -- the SAME product
+ * with op(A) transposed, which is the shape a causal ConvTranspose1d takes.
+ * PyTorch stores that weight as [in_channels][out_channels * kernel], so with
+ * groups == 1 the logical row i is a COLUMN of the stored tensor and `ldw` is
+ * out_channels * kernel.  No bias: the transposed path adds it when it fills
+ * the output buffer, before the scatter, and folding it in here would move a
+ * rounding the caller has already paid.
+ *
+ * Same return contract: 0 ran, 1 refused, -1 caller error.
+ */
+int mynah_convq8_gemm_tn(size_t m, size_t n, size_t k, const float *weight,
+                         size_t ldw, const float *b, size_t ldb, float *c,
+                         size_t ldc);
+
 /* Would this host run the path at all?  Separate from the shape gate above
  * because "this CPU has no int8 unit" and "this shape is too small" are
  * different facts.  `why` (optional) receives a static reason string. */

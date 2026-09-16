@@ -28,10 +28,12 @@ activation encoding is a property of the host — signed for SDOT, unsigned
 x+128 with a row-sum correction for VPDPBUSD — and a second copy of that
 dispatch would have silently given up VNNI on the x86 half of production.
 
-The three transposed convolutions are **not** included, per the item: the
-reference measured its int8 convtranspose slower than f32 sgemm and ships it
-off.  They are 48% of the region and are the obvious next question — see the
-open item at the bottom.
+The three transposed convolutions were **not** included in the first pass, per
+the item: the reference measured its int8 convtranspose slower than f32 sgemm
+and ships it off.  They were 48% of the region, so the next thing done was to
+stop inheriting that rejection and measure it — see "the transposed half"
+below.  They now have their own entry point, their own group, and are OFF by
+default.
 
 ## Per-shape, against the f32 path it replaces
 
@@ -154,14 +156,56 @@ an ordering-only gate passes mutations because a symmetric degradation moves
 the subject and the baseline together.  `MYNAH_CONVQ8_DEBUG=1` reprints the
 measured column so a bound is never a number someone remembered.
 
+## The transposed half — E10-14, measured rather than inherited
+
+`sea_sgemm(trans_a=1, ...)`: PyTorch stores a ConvTranspose1d weight as
+`[in_channels][out_channels * kernel]`, so with `groups == 1` the logical row
+is a COLUMN of the stored tensor.  That is the only structural difference, and
+it is a pack-time one: `mynah_convq8_gemm_tn()` shares the memo, the activation
+pass, the region and the kernel, and only gathers the weight differently.
+
+**The reference's rejection does not hold for our kernel.**  `convtr.gemm`
+**93.4 -> 44.8 ms, 2.09x**, and the three shapes are where this kernel is
+strongest — `3072x16x512` is the entry conv's k with six times the m.
+Inheriting a rejection measured on someone else's kernel is the same mistake
+as inheriting a spin iteration count (E10-8).
+
+Paired, five rounds, on top of the conv1d half:
+
+| | conv1d int8 | + transposed | ratio |
+|---|---|---|---|
+| `codec.conv_stack` | 167.8 ms | 116.5 ms | **1.44x** |
+| whole request | 0.558 s | 0.500 s | **1.12x** |
+
+Cumulative against f32: `codec.conv_stack` **1.76x**, whole request **1.19x**.
+
+**And it is OFF by default**, as its own group (`codec_convtr`), because it is
+a real trade rather than a free win:
+
+| | SNR | waveform corr | log-mel corr |
+|---|---|---|---|
+| conv1d int8 (ships on) | 36.4-37.9 dB | 0.999886-0.999920 | 0.996234-0.997161 |
+| + transposed (opt-in) | **28.9-32.9 dB** | 0.999350-0.999763 | 0.995142-0.996749 |
+
+Eight decibels on the waveform for almost nothing on log-mel — which is the
+*transformer's* failure mode (a different but spectrally equivalent signal),
+not the conv1d stack's (a broadband residual).  That is the more forgiving of
+the two, and it is still not a call to make from a Mac: the **quality** half of
+the trade transfers to Linux and the **speed** half does not, and CLAUDE.md is
+explicit that a performance claim about production comes from production
+hardware.  So it is one string away —
+`MYNAH_QUANT_GROUPS=...,codec_convtr:int8` — with both numbers written down,
+and E10-14 closes by re-taking the speed number on the box.
+
+One measurement lesson, again: the single utterance said **32.0 dB**; three
+texts said **28.9**.  A bound set from one utterance would have been wrong by
+three decibels in the direction that matters.
+
 ## Open, and what would close it
 
-* **The transposed convolutions are 57% of what is left.**  The item says skip
-  them on the reference's measurement, and that measurement was of *their*
-  kernel.  Ours gets 4.21x on `512x16x512x7`, and `convtr`'s biggest shape is
-  `3072x16x512` — the same k, six times the m, which is where this kernel is
-  strongest.  Worth re-deciding with our own number rather than inheriting
-  theirs.  `PLAN.md` E10-14.
+* **Whether `codec_convtr` should be on by default.**  Built, gated and
+  measured above; the decision needs the Linux speed number next to the
+  quality number that is already known.  `PLAN.md` E10-14.
 * **The two thresholds are from this machine.**  Their *shape* is structural —
   too shallow to amortise a kernel, too close to the output to hide a residual
   — but the constants are not.  Re-take the per-shape table on the Linux box;

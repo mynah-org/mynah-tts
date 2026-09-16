@@ -141,6 +141,8 @@ typedef struct {
     const float *weight;
     unsigned long long fingerprint;
     size_t m, k, taps;
+    size_t ldw;      /* transposed layout only: the source row stride */
+    int trans;       /* 0 = [m][k][taps], 1 = [k][ldw] with taps == 1 */
     int8_t *q;        /* [taps][m][k] */
     float *scale;     /* [taps][m]    */
     int32_t *rowsum;  /* [taps][m]    */
@@ -206,12 +208,14 @@ static void cq8_memo_release(void) {
 /* Builds [taps][m][k] int8 from the [m][k][taps] f32 tensor.  The gather is
  * the same permutation sea_taps_all() does, done once here and then thrown
  * away: what is kept is a quarter of its size. */
-static cq8_entry *cq8_pack(const float *weight, size_t m, size_t k, size_t taps) {
+static cq8_entry *cq8_pack(const float *weight, size_t m, size_t k, size_t taps,
+                           int trans, size_t ldw, size_t fp_elems) {
     cq8_entry *e = (cq8_entry *)calloc(1, sizeof(*e));
     if (e == NULL) return NULL;
     e->weight = weight;
-    e->fingerprint = cq8_fingerprint(weight, m * k * taps);
+    e->fingerprint = cq8_fingerprint(weight, fp_elems);
     e->m = m; e->k = k; e->taps = taps;
+    e->ldw = ldw; e->trans = trans;
     const size_t rows = m * taps;            /* checked by the caller */
     e->q = (int8_t *)malloc(rows * k);
     e->scale = (float *)malloc(rows * sizeof(float));
@@ -224,9 +228,14 @@ static cq8_entry *cq8_pack(const float *weight, size_t m, size_t k, size_t taps)
     }
     for (size_t t = 0; t < taps; ++t) {
         for (size_t i = 0; i < m; ++i) {
-            const float *src = weight + i * k * taps + t;
+            /* Two source layouts, one destination.  `trans` is the transposed
+             * convtranspose weight -- PyTorch stores ConvTranspose1d as
+             * [in_channels][out_channels * kernel], so the logical row i is a
+             * COLUMN there, strided by ldw. */
+            const float *src = trans ? weight + i : weight + i * k * taps + t;
+            const size_t step = trans ? ldw : taps;
             float *dst = gather + i * k;
-            for (size_t p = 0; p < k; ++p) dst[p] = src[p * taps];
+            for (size_t p = 0; p < k; ++p) dst[p] = src[p * step];
         }
         if (mynah_qmat_pack_q8(gather, m, k, e->q + t * m * k,
                                e->scale + t * m, e->rowsum + t * m) != 0) {
@@ -240,12 +249,14 @@ static cq8_entry *cq8_pack(const float *weight, size_t m, size_t k, size_t taps)
 }
 
 static const cq8_entry *cq8_memo_get(const float *weight, size_t m, size_t k,
-                                     size_t taps) {
-    const unsigned long long fp = cq8_fingerprint(weight, m * k * taps);
+                                     size_t taps, int trans, size_t ldw) {
+    const size_t fp_elems = trans ? k * ldw : m * k * taps;
+    const unsigned long long fp = cq8_fingerprint(weight, fp_elems);
     pthread_mutex_lock(&g_memo.mutex);
     for (size_t i = 0; i < g_memo.count; ++i) {
         cq8_entry *e = g_memo.entries[i];
-        if (e->weight == weight && e->m == m && e->k == k && e->taps == taps) {
+        if (e->weight == weight && e->m == m && e->k == k && e->taps == taps &&
+            e->trans == trans && e->ldw == ldw) {
             if (e->fingerprint == fp) {
                 pthread_mutex_unlock(&g_memo.mutex);
                 return e;
@@ -253,7 +264,7 @@ static const cq8_entry *cq8_memo_get(const float *weight, size_t m, size_t k,
             /* Same address, same shape, different contents: the tensor this
              * entry was built for is gone.  Re-quantize in place rather than
              * grow a second entry nothing will ever match. */
-            cq8_entry *made = cq8_pack(weight, m, k, taps);
+            cq8_entry *made = cq8_pack(weight, m, k, taps, trans, ldw, fp_elems);
             if (made == NULL) { pthread_mutex_unlock(&g_memo.mutex); return NULL; }
             g_memo.entries[i] = made;
             cq8_entry_free(e);
@@ -269,7 +280,7 @@ static const cq8_entry *cq8_memo_get(const float *weight, size_t m, size_t k,
         g_memo.entries = grown;
         g_memo.capacity = cap;
     }
-    cq8_entry *made = cq8_pack(weight, m, k, taps);
+    cq8_entry *made = cq8_pack(weight, m, k, taps, trans, ldw, fp_elems);
     if (made == NULL) { pthread_mutex_unlock(&g_memo.mutex); return NULL; }
     g_memo.entries[g_memo.count++] = made;
     if (!g_memo.atexit_registered) {
@@ -529,10 +540,9 @@ static int cq8_mul(size_t a, size_t b, size_t *out) {
     return 0;
 }
 
-int mynah_convq8_conv_taps(size_t m, size_t n, size_t k, size_t taps,
-                           const float *weight, const float *b, size_t ldb,
-                           size_t tap_stride, const float *bias, float *c,
-                           size_t ldc) {
+static int cq8_run(size_t m, size_t n, size_t k, size_t taps, int trans,
+                   const float *weight, size_t ldw, const float *b, size_t ldb,
+                   size_t tap_stride, const float *bias, float *c, size_t ldc) {
     if (weight == NULL || b == NULL || c == NULL || taps == 0u) return -1;
     cq8_bump(&g_cq8.calls);
     if (m == 0u || n == 0u || k == 0u) { cq8_bump(&g_cq8.refused_shape); return 1; }
@@ -551,10 +561,22 @@ int mynah_convq8_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     span += n;
     if (ldb < span) return -1;
 
-    size_t work = 0, rows_total = 0;
+    size_t work = 0, rows_total = 0, src_elems = 0;
     if (cq8_mul(m, n, &work) != 0 || cq8_mul(work, k, &work) != 0 ||
         cq8_mul(work, taps, &work) != 0 || cq8_mul(m, taps, &rows_total) != 0 ||
         rows_total > (size_t)-1 / k) {
+        cq8_bump(&g_cq8.refused_shape);
+        return 1;
+    }
+    /* The source tensor is walked by the fingerprint, so its extent has to be
+     * representable too -- and for the transposed layout that is k * ldw, not
+     * m * k. */
+    if (cq8_mul(trans ? k : m, trans ? ldw : k * taps, &src_elems) != 0 ||
+        src_elems == 0u) {
+        cq8_bump(&g_cq8.refused_shape);
+        return 1;
+    }
+    if (trans && (ldw < m || taps != 1u)) {
         cq8_bump(&g_cq8.refused_shape);
         return 1;
     }
@@ -592,7 +614,7 @@ int mynah_convq8_conv_taps(size_t m, size_t n, size_t k, size_t taps,
         return 1;
     }
 
-    const cq8_entry *e = cq8_memo_get(weight, m, k, taps);
+    const cq8_entry *e = cq8_memo_get(weight, m, k, taps, trans, ldw);
     if (e == NULL) { cq8_bump(&g_cq8.refused_pack); return 1; }
 
     cq8_scratch *sc = cq8_scratch_get(span, k);
@@ -664,6 +686,20 @@ int mynah_convq8_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     if (prof) cq8_prof_add(m, n, k, taps, t_gemm - t_quant, cq8_now() - t_gemm);
     cq8_bump(&g_cq8.ran);
     return 0;
+}
+
+int mynah_convq8_conv_taps(size_t m, size_t n, size_t k, size_t taps,
+                           const float *weight, const float *b, size_t ldb,
+                           size_t tap_stride, const float *bias, float *c,
+                           size_t ldc) {
+    return cq8_run(m, n, k, taps, 0, weight, 0u, b, ldb, tap_stride, bias, c,
+                   ldc);
+}
+
+int mynah_convq8_gemm_tn(size_t m, size_t n, size_t k, const float *weight,
+                         size_t ldw, const float *b, size_t ldb, float *c,
+                         size_t ldc) {
+    return cq8_run(m, n, k, 1u, 1, weight, ldw, b, ldb, 0u, NULL, c, ldc);
 }
 
 /* ======================================================================
@@ -880,10 +916,71 @@ static int cq8_test_gate(char *error, size_t error_capacity) {
     return 0;
 }
 
+/* The transposed entry point, against the same f64 oracle.
+ *
+ * It is a SEPARATE test and not another row in g_cq8_cases because the thing
+ * that can be wrong is the pack's gather -- reading a column of the stored
+ * tensor where it should read a row -- and a shape whose m and k are equal
+ * would not notice.  The shapes here are the three the decoder actually runs,
+ * shrunk on n, and none of them is square. */
+static int cq8_test_tn(char *error, size_t error_capacity) {
+    static const struct { size_t m, n, k; double bound; const char *what; } cases[] = {
+        { 3072, 8, 512, 0.0130, "convtr 1: 512ch in, kernel 12" },
+        { 1280, 8, 256, 0.0085, "convtr 2: 256ch in, kernel 10" },
+        {  512, 8, 128, 0.0330, "convtr 3: 128ch in, kernel 8" }
+    };
+    for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ++ci) {
+        const size_t m = cases[ci].m, n = cases[ci].n, k = cases[ci].k;
+        /* ldw > m on purpose: the stored tensor is wider than the block being
+         * read, which is what catches a pack that assumes ldw == m. */
+        const size_t ldw = m + 3u;
+        float *w = (float *)malloc(k * ldw * sizeof(float));
+        float *b = (float *)malloc(k * n * sizeof(float));
+        float *got = (float *)malloc(m * n * sizeof(float));
+        float *want = (float *)malloc(m * n * sizeof(float));
+        if (w == NULL || b == NULL || got == NULL || want == NULL) {
+            free(w); free(b); free(got); free(want);
+            return cq8_fail(error, error_capacity, "convq8: out of memory");
+        }
+        for (size_t i = 0; i < k * ldw; ++i) w[i] = cq8_fake(i, ci + 211u);
+        for (size_t i = 0; i < k * n; ++i) b[i] = cq8_fake(i, ci + 307u);
+        const int rc = mynah_convq8_gemm_tn(m, n, k, w, ldw, b, n, got, n);
+        if (rc != 0) {
+            free(w); free(b); free(got); free(want);
+            return cq8_fail(error, error_capacity,
+                            "convq8: transposed %zux%zux%zu (%s) refused "
+                            "(rc %d)", m, n, k, cases[ci].what, rc);
+        }
+        for (size_t i = 0; i < m; ++i) {
+            for (size_t j = 0; j < n; ++j) {
+                double acc = 0.0;
+                for (size_t p = 0; p < k; ++p)
+                    acc += (double)w[p * ldw + i] * (double)b[p * n + j];
+                want[i * n + j] = (float)acc;
+            }
+        }
+        const double rel = cq8_rel_l2(got, want, m * n);
+        if (getenv("MYNAH_CONVQ8_DEBUG") != NULL) {
+            fprintf(stderr, "[convq8] TN %5zux%4zux%4zu  relL2 %.5f  bound "
+                            "%.5f  %s\n", m, n, k, rel, cases[ci].bound,
+                    cases[ci].what);
+        }
+        free(w); free(b); free(got); free(want);
+        if (!(rel <= cases[ci].bound)) {
+            return cq8_fail(error, error_capacity,
+                            "convq8: transposed %zux%zux%zu (%s) relative L2 "
+                            "%.5f exceeds the measured bound %.5f",
+                            m, n, k, cases[ci].what, rel, cases[ci].bound);
+        }
+    }
+    return 0;
+}
+
 int mynah_convq8_self_test(char *error, size_t error_capacity) {
     const int before_force = mynah_convq8_force(1);
     int rc = cq8_test_dots(error, error_capacity);
     if (rc == 0) rc = cq8_test_gate(error, error_capacity);
+    if (rc == 0) rc = cq8_test_tn(error, error_capacity);
     if (rc != 0) { (void)mynah_convq8_force(before_force); return rc; }
 
     double worst = 0.0;

@@ -127,6 +127,9 @@ typedef struct {
      * NULL when the shape or the build does not qualify; the scalar loop then
      * runs unchanged. */
     float *taps;        /* [out_channels * kernel][max_in_len] or NULL */
+    /* 1 = this transposed convolution's GEMM may run in int8, exactly as
+     * mynah_causal_conv1d.quantize.  Zero-initialised callers get exact f32. */
+    int quantize;
 } mynah_causal_convtr1d;
 
 size_t mynah_causal_convtr1d_scratch(const mynah_convtr1d_spec *spec,
@@ -166,6 +169,11 @@ typedef struct {
      * config gets, so no existing caller changes behaviour by being
      * recompiled against this field. */
     int quantize_conv;
+    /* The same for the decoder's three TRANSPOSED convolutions, and separate
+     * because it is a separate trade: measured 2.09x on that GEMM against a
+     * 37.0 -> 32.0 dB SNR cost on the waveform, where quantize_conv costs
+     * almost nothing measurable.  Zero is the safe default here too. */
+    int quantize_convtr;
 } mynah_seanet_config;
 
 /* Mimi's ConvTrUpsample1d / ConvDownsample1d.  kernel_size is always

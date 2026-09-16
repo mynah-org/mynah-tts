@@ -252,6 +252,7 @@ enum {
     SEA_PH_CONV_SCALAR,     /* the reference conv1d loop                      */
     SEA_PH_CONVTR_FILL,     /* initialise `full` with the bias                */
     SEA_PH_CONVTR_GEMM,     /* sea_sgemm, convtranspose                       */
+    SEA_PH_CONVTR_Q8,       /* the same GEMM in int8 (src/convq8.c)           */
     SEA_PH_CONVTR_SCATTER,  /* taps -> full, stride-spaced                    */
     SEA_PH_CONVTR_SCALAR,   /* the reference scatter (grouped/depthwise)      */
     SEA_PH_CONVTR_TAIL,     /* fold the carried head, take the new tail       */
@@ -263,8 +264,8 @@ static const char *const g_sea_phase_name[SEA_PH_COUNT] = {
     "decode.total",   "elu",            "residual_add",  "conv.window",
     "conv.gather",    "conv.gemm",      "conv.taps",     "conv.q8",
     "conv.bias",      "conv.carry",     "conv.scalar",   "convtr.fill",
-    "convtr.gemm",    "convtr.scatter", "convtr.scalar", "convtr.tail",
-    "convtr.copy"
+    "convtr.gemm",    "convtr.q8",      "convtr.scatter", "convtr.scalar",
+    "convtr.tail",    "convtr.copy"
 };
 
 /* 1 when the phase dispatches to the thread pool; 0 when it is a plain loop on
@@ -272,7 +273,7 @@ static const char *const g_sea_phase_name[SEA_PH_COUNT] = {
  * of the table is that split, and a reader should not have to know which name
  * means which. */
 static const int g_sea_phase_par[SEA_PH_COUNT] = {
-    0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0
+    0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0
 };
 
 typedef struct {
@@ -1169,6 +1170,7 @@ int mynah_causal_convtr1d_init(mynah_causal_convtr1d *convtr,
     }
     memset(convtr, 0, sizeof(*convtr));
     convtr->spec = *spec;
+    convtr->quantize = 0;
     convtr->tail = spec->kernel_size - spec->stride;
     convtr->max_in_len = max_in_len;
     convtr->partial = scratch;
@@ -1296,11 +1298,28 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
     if (folded) {
         sea_bump(&g_sea.convtr_gemm);
         const size_t rows = gemm_rows;
-        const unsigned long long t_gemm = sea_prof_now();
-        sea_sgemm(1, rows, in_len, spec->in_channels, weights->weight, rows,
-                  input, in_len, 0.0f, convtr->taps, in_len);
-        sea_prof_add(SEA_PH_CONVTR_GEMM, t_gemm,
-                     rows * in_len * spec->in_channels);
+        /* int8 first, on the same terms as the conv1d above: asked for by
+         * name through the `codec_conv` group, refused back to the exact f32
+         * GEMM by shape.  No bias here -- `full` was already filled with it
+         * and the scatter accumulates into that. */
+        int q8 = 0;
+        if (convtr->quantize) {
+            const unsigned long long t_q8 = sea_prof_now();
+            if (mynah_convq8_gemm_tn(rows, in_len, spec->in_channels,
+                                     weights->weight, rows, input, in_len,
+                                     convtr->taps, in_len) == 0) {
+                q8 = 1;
+                sea_prof_add(SEA_PH_CONVTR_Q8, t_q8,
+                             rows * in_len * spec->in_channels);
+            }
+        }
+        if (!q8) {
+            const unsigned long long t_gemm = sea_prof_now();
+            sea_sgemm(1, rows, in_len, spec->in_channels, weights->weight, rows,
+                      input, in_len, 0.0f, convtr->taps, in_len);
+            sea_prof_add(SEA_PH_CONVTR_GEMM, t_gemm,
+                         rows * in_len * spec->in_channels);
+        }
         const unsigned long long t_scatter = sea_prof_now();
         for (size_t oc = 0; oc < spec->out_channels; ++oc) {
             float *row = full + oc * full_len;
@@ -1818,6 +1837,7 @@ mynah_seanet_state *mynah_seanet_state_create(const mynah_seanet_config *config,
                 mynah_seanet_state_destroy(state);
                 return NULL;
             }
+            op->convtr.quantize = state->config.quantize_convtr;
             cursor += need;
         } else {
             const size_t need1 =

@@ -309,9 +309,15 @@ qmat-test: $(QMAT_TEST_TARGET)
 # uniform random data -- do to real audio, and whether the generated FRAME COUNT
 # moved. Needs a pack, so it is not in `make test`:
 #     make codec-int8-quality MODEL_DIR=models/pocket-en
+# Two modes, because there are two trades. `conv` is the conv1d stack, which
+# ships on and costs almost nothing measurable. `convtr` is the transposed
+# convolutions, which are OFF in the default spec and are one string away
+# (`MYNAH_QUANT_GROUPS=...,codec_convtr:int8`): 1.44x more on the region for
+# eight decibels on the waveform. Its bounds are its own.
 codec-int8-quality: $(TARGET)
 	@test -n "$(MODEL_DIR)" || (echo "usage: make codec-int8-quality MODEL_DIR=models/pocket-en" >&2; exit 2)
-	@python3 tests/codec_int8_quality.py --binary $(TARGET) --model "$(MODEL_DIR)"
+	@python3 tests/codec_int8_quality.py --binary $(TARGET) --model "$(MODEL_DIR)" --mode conv
+	@python3 tests/codec_int8_quality.py --binary $(TARGET) --model "$(MODEL_DIR)" --mode convtr
 
 # The negative control: break the epilogue the four ways it has actually been
 # broken, and require qmat-test to catch each one. Slow (rebuilds of the core

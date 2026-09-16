@@ -96,9 +96,24 @@ def corr(a, b):
     return float(a @ b) / den if den else 0.0
 
 
-def synth(binary, model, text, seed, out, q8):
+# The default spec with the transposed convolutions named explicitly, which is
+# the only difference between the two arms of `--mode convtr`.  Spelled out
+# rather than composed, so the arm cannot drift from what the engine ships.
+SPEC_BASE = ("codec_transformer:int8,codec_conv:int8,"
+             "backbone:f16,flow_net:f16,conditioner:f16")
+SPEC_CONVTR = ("codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"
+               "backbone:f16,flow_net:f16,conditioner:f16")
+
+
+def synth(binary, model, text, seed, out, q8, mode):
     env = dict(os.environ)
-    env["MYNAH_CODEC_CONV_Q8"] = "1" if q8 else "0"
+    if mode == "convtr":
+        # Both arms keep the conv1d stack in int8: this isolates the
+        # transposed half, which is the thing being decided.
+        env["MYNAH_QUANT_GROUPS"] = SPEC_CONVTR if q8 else SPEC_BASE
+        env["MYNAH_CODEC_CONV_Q8"] = "1"
+    else:
+        env["MYNAH_CODEC_CONV_Q8"] = "1" if q8 else "0"
     env.setdefault("MYNAH_THREADS", "2")
     cmd = [binary, "--synthesize", model, "--text", text, "--lang", "en",
            "--seed", str(seed), "--output", out]
@@ -122,7 +137,27 @@ def main():
     ap.add_argument("--min-wave-corr", type=float, default=0.9995)
     ap.add_argument("--min-mel-corr", type=float, default=0.995)
     ap.add_argument("--min-snr-db", type=float, default=34.0)
+    ap.add_argument("--mode", choices=("conv", "convtr"), default="conv",
+                    help="conv: the conv1d stack against f32 (the shipped "
+                         "default). convtr: the transposed convolutions "
+                         "against f32, with the conv1d stack int8 on both "
+                         "sides, which is the opt-in codec_convtr group.")
     args = ap.parse_args()
+    if args.mode == "convtr":
+        # Its own bounds, because it is its own trade -- see the module
+        # docstring.  Measured over three texts x three seeds: SNR
+        # 28.9-32.9 dB, waveform 0.999350-0.999743, log-mel 0.995595-0.996749.
+        # Note the SHAPE of it against `--mode conv`: eight decibels worse on
+        # the waveform and barely different on log-mel, which is the
+        # transformer's failure mode (a different but spectrally equivalent
+        # signal) rather than the conv1d stack's (a broadband residual).  One
+        # utterance said 32.0 dB; three texts said 28.9.
+        if args.min_snr_db == 34.0:
+            args.min_snr_db = 27.5
+        if args.min_wave_corr == 0.9995:
+            args.min_wave_corr = 0.9990
+        if args.min_mel_corr == 0.995:
+            args.min_mel_corr = 0.9945
 
     worst_wave, worst_mel, worst_snr = 1.0, 1.0, 1e9
     failures = []
@@ -131,8 +166,8 @@ def main():
             for seed in range(1, args.seeds + 1):
                 a_path = os.path.join(tmp, "f32.wav")
                 b_path = os.path.join(tmp, "q8.wav")
-                synth(args.binary, args.model, text, seed, a_path, q8=False)
-                synth(args.binary, args.model, text, seed, b_path, q8=True)
+                synth(args.binary, args.model, text, seed, a_path, False, args.mode)
+                synth(args.binary, args.model, text, seed, b_path, True, args.mode)
                 a, rate = read_wav(a_path)
                 b, _ = read_wav(b_path)
                 tag = "text %d seed %d" % (ti, seed)
@@ -167,7 +202,7 @@ def main():
         for f in failures:
             print("FAIL: " + f, file=sys.stderr)
         return 1
-    print("codec int8 conv quality gate: PASS")
+    print("codec int8 %s quality gate: PASS" % args.mode)
     return 0
 
 

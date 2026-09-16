@@ -402,7 +402,17 @@ enum {
     POCKET_QG_FLOW_IO    = 1u << 9,  /* flow input_proj + final_linear (k/n=32) */
     POCKET_QG_COND_IN    = 1u << 10, /* flow_lm.input_linear   [1024][32]    */
     POCKET_QG_COND_EOS   = 1u << 11, /* flow_lm.out_eos        [1][1024]     */
-    POCKET_QG_CODEC_CONV = 1u << 12  /* mimi.quantizer.output_proj [512][32] */
+    POCKET_QG_CODEC_CONV = 1u << 12, /* quantizer.output_proj + the conv1d stack */
+    /* The SEANet decoder's three TRANSPOSED convolutions, and its own group
+     * rather than part of codec_conv because it is a different trade and the
+     * spec should be able to say so.  Measured here: `convtr.gemm` 93.4 ->
+     * 44.8 ms (2.09x) and `codec.conv_stack` 1.20x -> 1.67x, against SNR 37.0
+     * -> 32.0 dB and log-mel 0.9971 -> 0.9950 on the same utterance.  That is
+     * a real speed/quality trade rather than a free win, and the speed half is
+     * an Apple Silicon number while the quality half transfers -- so it is OFF
+     * in the default spec and one string away.  PLAN.md E10-14 closes it by
+     * re-taking the speed number on the Linux box. */
+    POCKET_QG_CODEC_CONVTR = 1u << 13
 };
 
 #define POCKET_QG_ATTENTION (POCKET_QG_BB_QKV | POCKET_QG_BB_OPROJ)
@@ -412,10 +422,11 @@ enum {
      POCKET_QG_CT_FFN2)
 #define POCKET_QG_FLOW_NET  (POCKET_QG_FLOW_CORE | POCKET_QG_FLOW_IO)
 #define POCKET_QG_COND      (POCKET_QG_COND_IN | POCKET_QG_COND_EOS)
-#define POCKET_QG_BITS 13u
+#define POCKET_QG_BITS 14u
 #define POCKET_QG_ALL                                                      \
     (POCKET_QG_ATTENTION | POCKET_QG_FFN | POCKET_QG_CODEC_TF |            \
-     POCKET_QG_FLOW_NET | POCKET_QG_COND | POCKET_QG_CODEC_CONV)
+     POCKET_QG_FLOW_NET | POCKET_QG_COND | POCKET_QG_CODEC_CONV |          \
+     POCKET_QG_CODEC_CONVTR)
 
 /* THE DEFAULT.  The only statement in this file that is an experimental result
  * rather than a definition, so it is written as the string an operator could
@@ -526,7 +537,8 @@ static const pocket_qgroup_name pocket_qgroup_names[] = {
     {"conditioner", POCKET_QG_COND},
     {"cond_in", POCKET_QG_COND_IN},
     {"cond_eos", POCKET_QG_COND_EOS},
-    {"codec_conv", POCKET_QG_CODEC_CONV}
+    {"codec_conv", POCKET_QG_CODEC_CONV},
+    {"codec_convtr", POCKET_QG_CODEC_CONVTR}
 };
 
 /* Parses `spec` into a mask, and -- when a token carries a `:qtype` suffix --
@@ -765,6 +777,7 @@ struct mynah_engine_state {
     signed char cond_in_qtype;
     signed char cond_eos_qtype;
     signed char codec_conv_qtype;
+    signed char codec_convtr_qtype;
     pocket_linear_hook backbone_hook;
     pocket_linear_hook codec_hook;
     pocket_flow_hook flow_hook;
@@ -3119,6 +3132,8 @@ static int pocket_model_init(const mynah_tts_model *model,
         (signed char)pocket_qtype_for(state->qgroup_qtype, POCKET_QG_COND_EOS);
     state->codec_conv_qtype =
         (signed char)pocket_qtype_for(state->qgroup_qtype, POCKET_QG_CODEC_CONV);
+    state->codec_convtr_qtype =
+        (signed char)pocket_qtype_for(state->qgroup_qtype, POCKET_QG_CODEC_CONVTR);
     {
         static const unsigned bb_kinds[4] = {POCKET_QG_BB_QKV, POCKET_QG_BB_OPROJ,
                                              POCKET_QG_BB_FFN1, POCKET_QG_BB_FFN2};
@@ -3536,6 +3551,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
      * convolutions are excluded), so anything else stays exact f32 rather
      * than silently becoming a substitute. */
     seanet.quantize_conv = (state->codec_conv_qtype == 1);
+    seanet.quantize_convtr = (state->codec_convtr_qtype == 1);
 
     mynah_resample_config upsample;
     upsample.stride = cfg->upsample_stride;

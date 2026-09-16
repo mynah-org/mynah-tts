@@ -763,14 +763,21 @@ the x86 self-test that judges the two kernels written here and never executed
       fingerprint in the key; this one does not. Safe **today** because weights are
       mmapped for the life of the process — and that is a property of the caller, not
       of the cache. ~10 lines, same fix
-- [ ] E10-14 **re-decide the transposed convolutions with our own number** — E10-5
-      skipped them because the reference measured *its* int8 convtranspose slower than
-      f32 sgemm. They are now **57% of what is left** of `codec.conv_stack`
-      (`convtr.gemm` 93 ms of 170), and our kernel's best shape is exactly theirs:
-      `3072x16x512` is the entry conv's k with six times the m, and the entry conv got
-      **4.21×**. Inheriting a rejection measured on someone else's kernel is the same
-      mistake as inheriting a spin count (E10-8). Needs the scatter to stay f32 and its
-      own quality row, since it is the stage nearest the waveform after the last conv
+- [~] E10-14 **built and measured; the default is the open half** — the reference's
+      "int8 convtranspose is slower than f32 sgemm" **does not hold for our kernel**:
+      `convtr.gemm` **93.4 → 44.8 ms (2.09×)**, and on top of the conv1d half
+      `codec.conv_stack` **1.44×** further, whole request **1.12×** (5/5 paired rounds).
+      Cumulative against f32: region **1.76×**, request **1.19×**. `mynah_convq8_gemm_tn`
+      shares the memo, the activation pass and the kernel — only the weight gather
+      differs, because PyTorch stores a ConvTranspose1d weight with the logical row as a
+      column. **OFF by default**, as its own `codec_convtr` group, because it is a trade:
+      SNR **28.9-32.9 dB** against the conv1d half's 36.4-37.9, for almost no log-mel
+      change — the *transformer's* failure mode (a different but equivalent signal), not
+      the conv1d stack's (a broadband residual). The quality half of that trade transfers
+      to Linux and the speed half does not, so the default waits for the box. One
+      utterance said 32.0 dB; three texts said 28.9 — a bound from one utterance would
+      have been three decibels wrong in the direction that matters.
+      **To close**: re-take the speed number on Linux and flip the default if it holds
 - [-] **rejected, with the reference's own numbers.** Do not build these: prefill helper
       thread (stall@250 20.1%→46.8%); token-range slicing (occupancy floor invariant at
       83-97 ms); per-layer prefill checkpointing (TTFA p95 223→1208 ms); fixed-target
