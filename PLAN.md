@@ -680,7 +680,16 @@ the x86 self-test that judges the two kernels written here and never executed
       `src/threads.{c,h}` has no primitive for. That is a structural change, and the
       audit's own ceiling for the whole park/wake question at two threads is **0.8-2.7%**.
       Not worth it before the box says the topology survives (E10-10)
-- [ ] E10-8 **the spin budget gate keys on the OS, not the ISA** — `#if defined(__linux__)
+- [x] E10-8 **the budget is a time now, derived on the host** — `yield` and `pause`
+      differ by two orders of magnitude, so one iteration count could never be right on
+      both, and the gate asked the OS a question about an instruction. Target 35 µs (a
+      cold wake costs 22-29), calibrated at startup; lands on **65536** here, which is the
+      Axion's measured knee. Three measurement traps found and fixed in the calibrator
+      itself: a `volatile` counter reported 2.25 ns/relax against ~0.5 real, the mean
+      folds in machine noise so it takes the **minimum of five**, and the raw quotient
+      moved 43750/70000/100000 across starts so it **snaps to a power of two**.
+      `--dispatch-map` reports source, measured ns and target. Original text follows
+- [-] E10-8-orig — `#if defined(__linux__)
       && defined(__aarch64__)` → 65536, everything else 4096, and `src/threads.c:112-117`
       already admits the value is *"transferred from the reference's measurement, not
       measured by us"*. Two consequences: macOS arm64 takes 4096 despite being the same
