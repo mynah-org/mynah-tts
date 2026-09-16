@@ -619,8 +619,23 @@ the x86 self-test that judges the two kernels written here and never executed
       and **the default spec shows no change at all** (374.0 → 375.8 at batch 3) although
       it names int8 for `codec_transformer` — unexplained, and the difference between a
       measured win and a production one
-- [ ] E10-4b **the x86 u8/VNNI batched int8 kernel** — still the fall-through-only path
-      there, and it cannot be executed or measured on an arm64 machine. Needs an x86 box
+- [~] E10-4b **the hole is closed; the number is the box's** — every weight-stationary
+      path (SMMLA, SDOT, the f16 lanes) gates on the SIGNED activation encoding, because
+      the unsigned x+128 form and its row-sum correction are x86's — so on the half of
+      production that runs VPDPBUSD the batch fell through to one weight pass per
+      activation, which is the exact defect the SDOT path was written to fix, left
+      standing on the other architecture. **No new kernel and no new instruction**: the
+      loop order is swapped, row block outer and batch inner, so four weight rows are
+      loaded once and stay in L1 for the whole batch. `dot4_u8_i32` is the same function
+      the per-activation path calls on the same bytes, so the int32 is identical by
+      construction. **Correctness is gated and the speed is not claimed**: two mutations
+      of the new block are caught, and *only* under `MYNAH_QMAT_VNNI=scalar` — the level
+      that forces this encoding on ARM, which E10-5 also found had no gate using it.
+      A/B'd here under that level: **1.050 / 1.022 / 1.004 — noise**, which is the
+      expected null result rather than a refutation (the scalar unsigned kernel is
+      arithmetic-bound, so reordering traffic cannot move it — the same reason a
+      key-stationary variant lost in `src/transformer_ar.c`). `MYNAH_QMAT_U8_BATCH=0`
+      restores the old loop so the box settles it in one command
 - [x] E10-4d **the default spec did not do what its own measured comment says** — a bare
       clause means "whatever `MYNAH_QUANT` says", and once `src/mynah_tts.c:402` began
       requesting f16 when `MYNAH_QUANT` is unset, the two codec clauses inherited f16 and

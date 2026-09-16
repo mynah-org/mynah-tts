@@ -2760,6 +2760,20 @@ typedef struct {
     int level;              /* QMAT_U8_* -- how qx is encoded, INT8 only */
 } qmat_batch_job;
 
+/* MYNAH_QMAT_U8_BATCH=0 restores the per-activation loop for the unsigned
+ * encoding, so the change below can be A/B'd in one command on the machine
+ * that can actually measure it.  Read ONCE -- a getenv here would run per row
+ * block per call, which is the exact defect memoised away in three other
+ * files. */
+static int qmat_u8_batch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYNAH_QMAT_U8_BATCH");
+        cached = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) {
     const qmat_entry *e = j->entry;
     const void *weights;
@@ -2914,6 +2928,74 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         }
     }
 #endif
+    /* ------------------------------------------------ the x86 batched hole
+     *
+     * Every weight-stationary path above -- SMMLA, SDOT, the f16 lanes -- is
+     * gated on the SIGNED activation encoding, because the unsigned x+128 form
+     * and its row-sum correction are x86's.  So on the half of production that
+     * runs VPDPBUSD the batch fell through to the loop below, which walks the
+     * activations and reads the whole weight block once for each: a 16-row
+     * prefill tile of the codec transformer read every block sixteen times.
+     * That is E10-4b, and it is the same defect the SDOT path was written to
+     * fix, left standing on the other architecture.
+     *
+     * This adds no instruction and no kernel.  It swaps the loop order -- row
+     * block outer, batch inner -- so four weight rows are loaded once and stay
+     * in L1 for the whole batch.  dot4_u8_i32 is the same function the
+     * per-activation path calls, on the same bytes, so the int32 is identical
+     * BY CONSTRUCTION rather than by tolerance, and the float epilogue is the
+     * shared helper.
+     *
+     * WHAT IS AND IS NOT CLAIMED.  Correctness is gated everywhere:
+     * MYNAH_QMAT_VNNI=scalar forces exactly this encoding and this access
+     * pattern on any host, self_test_lane_widths compares the result against
+     * the row-at-a-time reference with memcmp at every width from 1 to 9, and
+     * two mutations of this block are caught by it -- and by nothing else,
+     * since the default ARM run never reaches here.
+     *
+     * SPEED IS NOT CLAIMED.  A/B'd on this arm64 machine under
+     * MYNAH_QMAT_VNNI=scalar, batch 4: 1.050 / 1.022 / 1.004 -- noise.  That
+     * is the expected null result and not a refutation: the scalar unsigned
+     * kernel is arithmetic-bound, so reordering weight traffic cannot move it,
+     * which is the same reason a key-stationary variant lost in
+     * src/transformer_ar.c.  The reuse only pays where VPDPBUSD makes the
+     * arithmetic cheap enough for the traffic to matter, and that machine is
+     * not this one.  MYNAH_QMAT_U8_BATCH=0 restores the old loop so the box
+     * can settle it in one command. */
+    if (e->qtype == QMAT_INT8 && j->level != QMAT_U8_OFF && j->qx != NULL &&
+        j->batch >= 2u && qmat_u8_batch_enabled()) {
+        const unsigned char *qx = (const unsigned char *)j->qx;
+        const int8_t *wb = (const int8_t *)weights + row0 * j->cols;
+        const float *sc = e->scales + row0;
+        const int32_t *rs = e->rowsum + row0;
+        const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
+        size_t row = 0;
+        for (; row + 4u <= count; row += 4u) {
+            for (size_t b = 0; b < j->batch; ++b) {
+                int32_t acc[4];
+                dot4_u8_i32(qx + b * j->cols, wb, j->cols, rs, row, j->level,
+                            acc);
+                float *out = j->out[b] + row0;
+                for (size_t r = 0; r < 4u; ++r) {
+                    out[row + r] = qmat_row_epilogue(
+                        acc[r], qmat_row_scale(sc[row + r], j->sx[b]),
+                        bs == NULL ? 0.0f : bs[row + r]);
+                }
+            }
+        }
+        for (; row < count; ++row) {
+            for (size_t b = 0; b < j->batch; ++b) {
+                const int32_t acc = dot_u8_i32(qx + b * j->cols,
+                                               wb + row * j->cols, rs[row],
+                                               j->cols, j->level);
+                j->out[b][row0 + row] = qmat_row_epilogue(
+                    acc, qmat_row_scale(sc[row], j->sx[b]),
+                    bs == NULL ? 0.0f : bs[row]);
+            }
+        }
+        return;
+    }
+
     for (size_t b = 0; b < j->batch; ++b) {
         const qmat_rows_job rj = {
             j->out[b],
