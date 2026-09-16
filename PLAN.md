@@ -377,13 +377,11 @@ wants a 64-core box. With it, a 32-core box returns to the conversation.
 - [x] E8-6 **done** `a477b19` — pre-flight, ordered mutation, rollback; the gate was blind until a second injection reached it · **`pocket_step_batch` is not atomic**: it advances contexts `0..i-1` before
       refusing `i`. Harmless at its declared `max_batch` of 1, illegal once that widens —
       the driver's failure isolation depends on the atomicity the header now declares
-- [ ] E8-5 **`mynah_qmat_linear_batched_qt`** — the batched twin of
-      `mynah_qmat_linear_resolved_qt`. `mynah_qmat_linear_batched` takes no qtype: it
-      gates on the cache's own and creates a first-touch entry there, so a group
-      carrying an explicit encoding is kept off the weight-stationary path to avoid a
-      first-touch race deciding its precision. Consequence today: under
-      `MYNAH_QUANT=int8` the backbone and flow head (`:f16` in the default spec) fall
-      off the batched path. One function removes the restriction
+- [x] E8-5 **shipped** — `mynah_qmat_linear_batched_qt` exists and carries the
+      rationale in `src/qmat.h`: `qtype` decides both the gate and the cache entry, so a
+      group's precision comes from the group spec and never from whichever caller
+      arrived first. Gated by `self_test_lane_widths` over every cache profile crossed
+      with every encoding a group spec can name. The board entry was stale
 
 ### E9 — What the profiler found, and where to act next
 
@@ -473,10 +471,11 @@ does not.
       threads) ships OFF for that reason alone. It is the mirror of a documented trap,
       correct by the standard and clean over 120k regions on ARM with `MYNAH_POOL_SPIN=0`,
       but unrun where the trap actually bites. Validate on x86, then flip it
-- [ ] E9-9 **the spin budget default is wrong off aarch64** — the knee on the Axion is
-      **65536**, and **4096**, which is what this binary uses on every non-aarch64
-      target, costs **+16.7% at 32 threads**. Measure the knee on x86 and set it from a
-      number rather than from a constant nobody has re-derived
+- [-] E9-9 **superseded by E10-8** — the item asked for the x86 knee to be measured and
+      the constant set from it. E10-8 answered the question one level up: an iteration
+      count cannot be right on both ISAs (`yield` and `pause` differ by two orders of
+      magnitude), so the budget is a **time** now, calibrated on the host at startup.
+      There is no per-target constant left to measure. The board entry was stale
 - [x] E9-6 **one reader now, and empty means unset** — there were four readers and the
       fourth was mine (E10-4d chose its spec with a raw `getenv`). Verified: unset, empty
       and a typo give byte-identical audio, and the typo warns. Original text follows
@@ -512,16 +511,16 @@ does not.
       `memcmp` and both new paths were mutation-tested. **Re-take on the Axion before
       any of these numbers are quoted as production**, and run `--self-test` on x86 —
       the x86 kernels were written on arm64 and have never executed
-- [ ] E9-12 **int8 never reaches the prefill** — `MYNAH_QUANT=int8` leaves
-      `prep.prefill_proj` at 149.9 ms, identical to default, while taking
-      `request.total` 1848 → 1496. That is `POCKET_QG_DEFAULT_SPEC` working as designed:
-      the backbone is inside the AR loop where int8's per-step error compounds over ~50
-      steps into a different trajectory. The prefill is **not** inside that loop, so the
-      measurement that rules int8 out does not directly apply — but it does not clear it
-      either, because the prefill writes the KV every step attends to, a *static* error
-      rather than a compounding one, which is a different risk and not a smaller one.
-      Needs its own quality gate (frame count, EOS step, log-mel corr) and a second
-      quantized copy of the backbone, since the steps must stay f16
+- [-] E9-12 **not worth it, and the premise needed correcting** — `MYNAH_CENSUS=1`
+      says the prefill is **not** on an unquantized path: every backbone projection in it
+      runs `batched-q / f16 / neon` at 16 rows, so f16 does reach it and there is no f32
+      fallback to recover. What is left of the item is int8 *instead of* f16 there, and
+      the arithmetic decides it: `prep.prefill_proj` is **35.7 ms, 4.9%** of
+      `request.total` on this pack, so even a 1.5× on it is ~1.6% of a request — against
+      a **second quantized copy of the backbone** (~75 MB, since the steps must stay
+      f16) and a new quality risk that is not smaller than the AR loop's, only
+      differently shaped (a static error written into the KV every step then attends
+      to). Refused on the numbers. Original text follows
 - [-] E9-13 **moot after E9-11: the tile is not what sets weight traffic** — the sweep
       that called it a lever was invalid (the knob moved the accessor while
       `tar_rows_reserve` sizes the scratch from the macro and the prefill clamps to
@@ -800,6 +799,20 @@ the x86 self-test that judges the two kernels written here and never executed
       utterance said 32.0 dB; three texts said 28.9 — a bound from one utterance would
       have been three decibels wrong in the direction that matters.
       **To close**: re-take the speed number on Linux and flip the default if it holds
+- [~] E10-15 **`step.backbone` is a memory wall, and that is the finding** →
+      [`.work/backbone-bandwidth.md`](.work/backbone-bandwidth.md). It is **48.7%** of
+      `request.total` and gets **1.15× from eight cores** (220.6 → 191.8 ms, five-run
+      medians). One AR step reads every backbone weight once: 75.5M weights = **151 MB
+      at f16 per step**, measured at **32-38 GB/s** and flat in thread count. One MAC per
+      two bytes is a memory wall, not a parallelism problem. It independently confirms
+      the board's own "storing f32 instead of f16 is 2.22× slower on the backbone".
+      **Two levers, neither a kernel**: fewer weight bytes (int8, blocked on AR-loop
+      quality — E3-5c — and no kernel work moves that), or more activations per weight
+      read, which is the serving topology and makes E10-10 a *bandwidth* question.
+      Do not thread it harder, do not write a better f16 matvec, do not re-try a
+      packing. Also records the hazard: the first reading was 356 ms against a 227 ms
+      median on the same binary — a single cost-map run right after a build is not a
+      measurement, and this region's spread is 7-18%
 - [-] **rejected, with the reference's own numbers.** Do not build these: prefill helper
       thread (stall@250 20.1%→46.8%); token-range slicing (occupancy floor invariant at
       83-97 ms); per-layer prefill checkpointing (TTFA p95 223→1208 ms); fixed-target
