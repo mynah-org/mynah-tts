@@ -17,6 +17,19 @@
 #include <string.h>
 #include <time.h>
 
+/* The ELU's vector paths.  Gated the way src/kernels.c gates its tanh: a build
+ * flag, honoured by MYNAH_DISABLE_SIMD so SIMD=scalar really is scalar and the
+ * reference below is what runs.  seanet.c used to reach arm_neon.h only
+ * transitively through another header, which worked and should not have been
+ * relied on. */
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__aarch64__) || defined(__ARM_NEON))
+#include <arm_neon.h>
+#define SEA_ELU_NEON 1
+#elif !defined(MYNAH_DISABLE_SIMD) && defined(__AVX2__)
+#include <immintrin.h>
+#define SEA_ELU_AVX2 1
+#endif
+
 #include "dispatch.h"
 #include "kernels.h"
 #include "sgemm.h"
@@ -439,7 +452,7 @@ static float sea_exp_neg_scalar(float x) {
 
 static void sea_elu_range(const float *in, float *out, size_t n, float alpha) {
     size_t i = 0;
-#if defined(__aarch64__) || defined(__ARM_NEON)
+#if defined(SEA_ELU_NEON)
     {
         const float32x4_t log2e = vdupq_n_f32(1.44269504088896340736f);
         const float32x4_t ln2_hi = vdupq_n_f32(0.693359375f);
@@ -472,6 +485,46 @@ static void sea_elu_range(const float *in, float *out, size_t n, float alpha) {
             const float32x4_t ex = vmulq_f32(p, sc);
             const float32x4_t neg = vmulq_f32(va, vsubq_f32(ex, one));
             vst1q_f32(out + i, vbslq_f32(vcgtq_f32(x, zero), x, neg));
+        }
+    }
+#elif defined(SEA_ELU_AVX2)
+    {
+        /* The same reduction and the same polynomial as the scalar reference
+         * above, eight lanes at a time.  Written on arm64 and never executed:
+         * sea_exp_self_test() sweeps [-88, 0] through this function, so the
+         * first x86 host to run --self-test judges it against libm rather than
+         * against this comment. */
+        const __m256 log2e = _mm256_set1_ps(1.44269504088896340736f);
+        const __m256 ln2_hi = _mm256_set1_ps(0.693359375f);
+        const __m256 ln2_lo = _mm256_set1_ps(-2.12194440e-4f);
+        const __m256 zero = _mm256_setzero_ps();
+        const __m256 one = _mm256_set1_ps(1.0f);
+        const __m256 va = _mm256_set1_ps(alpha);
+        const __m256 lo = _mm256_set1_ps(SEA_EXP_LO);
+        for (; i + 8u <= n; i += 8u) {
+            const __m256 x = _mm256_loadu_ps(in + i);
+            const __m256 xn = _mm256_max_ps(_mm256_min_ps(x, zero), lo);
+            const __m256 fn = _mm256_mul_ps(xn, log2e);
+            const __m256 nf = _mm256_round_ps(
+                fn, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256 r = _mm256_sub_ps(xn, _mm256_mul_ps(nf, ln2_hi));
+            r = _mm256_sub_ps(r, _mm256_mul_ps(nf, ln2_lo));
+            __m256 p = _mm256_set1_ps(1.98756912e-4f);
+            p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.39819618e-3f));
+            p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.33345973e-3f));
+            p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.16666418e-2f));
+            p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.66666657e-1f));
+            p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.00000000e-1f));
+            p = _mm256_fmadd_ps(p, r, one);
+            p = _mm256_fmadd_ps(p, r, one);
+            __m256i e = _mm256_add_epi32(_mm256_cvtps_epi32(nf),
+                                         _mm256_set1_epi32(127));
+            e = _mm256_max_epi32(e, _mm256_setzero_si256());
+            const __m256 sc = _mm256_castsi256_ps(_mm256_slli_epi32(e, 23));
+            const __m256 ex = _mm256_mul_ps(p, sc);
+            const __m256 neg = _mm256_mul_ps(va, _mm256_sub_ps(ex, one));
+            const __m256 gt = _mm256_cmp_ps(x, zero, _CMP_GT_OQ);
+            _mm256_storeu_ps(out + i, _mm256_blendv_ps(neg, x, gt));
         }
     }
 #endif
