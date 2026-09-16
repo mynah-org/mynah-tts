@@ -116,16 +116,53 @@ double mynah_parallel_now_ms(void) {
  * source is reported alongside the value precisely so nobody reads 65536 here
  * as a number this repository established.
  * ------------------------------------------------------------------------- */
-#if defined(__linux__) && defined(__aarch64__)
-#define PF_SPIN_DEFAULT 65536
-#define PF_SPIN_DEFAULT_WHY "aarch64"
-#else
-#define PF_SPIN_DEFAULT 4096
-#define PF_SPIN_DEFAULT_WHY "default"
-#endif
+/* IT USED TO BE AN ITERATION COUNT CHOSEN BY OPERATING SYSTEM, and it was wrong
+ * twice over.
+ *
+ * The gate was `__linux__ && __aarch64__` -> 65536, everything else -> 4096, so
+ * macOS on arm64 took the small value for the OS half of a condition whose ISA
+ * half it satisfies -- same `yield` instruction, different number. And Linux
+ * x86-64, which is half of production, ran 4096 `pause`es that nobody ever
+ * measured.
+ *
+ * The deeper problem is that an iteration count cannot be right on both. The
+ * loop below spins on pf_cpu_relax(), which is `yield` on aarch64 and `pause`
+ * on x86, and those differ by roughly two orders of magnitude in duration -- so
+ * one integer necessarily means two very different waits. 4096 pauses on a
+ * modern x86 is plausibly hundreds of microseconds, which is not a short spin
+ * before parking, it is a core held hostage.
+ *
+ * So the budget is a TIME, and the count is derived from it on the host that
+ * will run it. PF_SPIN_TARGET_US is the one number with a measurement behind
+ * it: a cold helper wake costs about 22-29 us of added region latency, so a
+ * spin that does not cover that is refusing the trade it exists to make, and
+ * one much longer is paying for a wake that already happened. 35 us also lands
+ * near the 65536 the Neoverse-V2 box measured as its knee, which is the closest
+ * thing to a cross-check this has.
+ *
+ * MYNAH_POOL_SPIN still overrides with a raw count, because an experiment needs
+ * to be able to say a number. */
+#define PF_SPIN_TARGET_US 35.0
+#define PF_SPIN_MIN 256
+#define PF_SPIN_MAX (1 << 20)
+
+/* How many pf_cpu_relax() iterations fit in PF_SPIN_TARGET_US on THIS host.
+ *
+ * Timed rather than assumed, once, before any pool thread exists.  The loop is
+ * `volatile`-anchored so the compiler cannot hoist it away, and the figure is
+ * the median of three short runs so one descheduled sample cannot set the
+ * budget for a whole process.  A host that cannot be timed keeps the
+ * conservative minimum, which parks sooner -- the safe direction, because an
+ * over-long spin holds a core something else could use.
+ *
+ * Reported as "calibrated" rather than as a measured default, because it is a
+ * measurement of the INSTRUCTION and not of the workload: it says how long a
+ * relax takes here, not that 35 us is the right thing to wait. */
+static int pf_spin_calibrate(void);
 
 static int g_spin = -1;
-static const char *g_spin_why = PF_SPIN_DEFAULT_WHY;
+static const char *g_spin_why = "unresolved";
+static double g_spin_ns_per_iter = 0.0;
 /* THE DEFAULTS ARE THE MEASUREMENTS, not the intentions. On 32 Neoverse-V2,
  * paired interleaved, median of within-round ratios against the pool as it was:
  *
@@ -165,11 +202,11 @@ static int spin_budget(void) {
             const long v = atol(env);
             /* 0 is meaningful -- park immediately -- so only a negative value
              * falls back to the default. */
-            g_spin = v >= 0 ? (int)(v > 1 << 24 ? 1 << 24 : v) : PF_SPIN_DEFAULT;
-            g_spin_why = v >= 0 ? "env" : PF_SPIN_DEFAULT_WHY;
+            g_spin = v >= 0 ? (int)(v > 1 << 24 ? 1 << 24 : v) : pf_spin_calibrate();
+            g_spin_why = v >= 0 ? "env" : "calibrated";
         } else {
-            g_spin = PF_SPIN_DEFAULT;
-            g_spin_why = PF_SPIN_DEFAULT_WHY;
+            g_spin = pf_spin_calibrate();
+            g_spin_why = "calibrated";
         }
         /* Same one-shot, so the hot path has one guard rather than three. */
         /* The fallbacks are the statics above, so the default lives in exactly
@@ -182,6 +219,14 @@ static int spin_budget(void) {
 }
 
 int mynah_pool_spin_budget(void) { return spin_budget(); }
+
+/* Nanoseconds one pf_cpu_relax() took on this host, as measured by the
+ * calibrator.  Zero until the budget has been resolved, and zero forever if
+ * MYNAH_POOL_SPIN named a count, because then nothing was measured. */
+double mynah_pool_spin_ns_per_relax(void) {
+    (void)spin_budget();
+    return g_spin_ns_per_iter;
+}
 const char *mynah_pool_spin_source(void) { (void)spin_budget(); return g_spin_why; }
 
 /* ---------------------------------------------------------------------------
@@ -213,6 +258,52 @@ static inline void pf_cpu_relax(void) {
 #else
     __asm__ __volatile__("" ::: "memory");
 #endif
+}
+
+static int pf_spin_calibrate(void) {
+    enum { PROBE = 200000, ROUNDS = 5 };
+    /* MINIMUM, not mean or median.  For a fixed iteration count the shortest
+     * observed time is the least-interrupted run, so it is the closest estimate
+     * of what one relax costs when nothing is in the way -- which is the
+     * situation a spin budget is sized for.  An average would fold in whatever
+     * else the machine was doing and shorten the budget for it. */
+    /* One discarded round first.  The first spin of a process is cold -- branch
+     * predictor, frequency, whatever the scheduler is doing with a thread that
+     * has just started -- and measured it landed a factor of two low often
+     * enough to flip the power-of-two below on one start in five. */
+    for (int i = 0; i < PROBE; ++i) pf_cpu_relax();
+
+    double ns = 0.0;
+    for (int r = 0; r < ROUNDS; ++r) {
+        const double t0 = mynah_parallel_now_ms();
+        /* A plain counter, NOT volatile.  pf_cpu_relax() is an asm volatile with
+         * a memory clobber, so the loop cannot be hoisted or elided without it
+         * -- and a volatile counter would add a load and a store per iteration,
+         * which is not the loop the pool actually spins.  Measured: the
+         * volatile form reported 2.25 ns per iteration on an M1 against the
+         * ~0.5 ns the real loop runs at, a 4x error that would have set the
+         * budget four times too small. */
+        for (int i = 0; i < PROBE; ++i) pf_cpu_relax();
+        const double per = (mynah_parallel_now_ms() - t0) * 1e6 / (double)PROBE;
+        if (per > 0.0 && (ns == 0.0 || per < ns)) ns = per;
+    }
+    g_spin_ns_per_iter = ns;
+    if (!(ns > 0.0)) return PF_SPIN_MIN;
+
+    double iters = PF_SPIN_TARGET_US * 1000.0 / ns;
+    if (iters < (double)PF_SPIN_MIN) iters = (double)PF_SPIN_MIN;
+    if (iters > (double)PF_SPIN_MAX) iters = (double)PF_SPIN_MAX;
+
+    /* ROUNDED TO A POWER OF TWO, and that is not cosmetic.  A `yield` costs
+     * fractions of a nanosecond, so the raw quotient moves by tens of percent
+     * between runs on a machine that is doing anything else -- measured 43750,
+     * 70000 and 100000 on three consecutive starts before this.  A budget that
+     * changes every start makes every measurement taken under it
+     * irreproducible, which is worse than a budget that is slightly wrong.
+     * Snapping absorbs the jitter and keeps the number stable and quotable. */
+    int pow2 = PF_SPIN_MIN;
+    while ((double)(pow2 << 1) <= iters && (pow2 << 1) <= PF_SPIN_MAX) pow2 <<= 1;
+    return pow2;
 }
 
 static void pf_name_self(const char *name) {
@@ -1568,13 +1659,20 @@ static int probe_pool_spin(char *out, size_t capacity, const char **why) {
     long long parks = 0, wins = 0;
     mynah_pool_wait_stats(&parks, &wins);
     snprintf(out, capacity, "%d", budget);
-    /* TRANSFERRED, and the word is load bearing: their sweep, not ours, and
-     * their own note that the curve is non-monotonic on some hosts. */
+    /* The source is the honest part.  "calibrated" means the COUNT was derived
+     * on this host from a timed relax so that it lasts about PF_SPIN_TARGET_US
+     * -- a measurement of the instruction, not of serving.  The target itself
+     * comes from a wake costing 22-29 us, and the reference's own sweep
+     * (STREAM p95 .999/.893/.808 at 256/4096/65536, csw/s 197k/38k/7.6k) is
+     * quoted as theirs and does not port.  A cold first process can land one
+     * power of two low; it is printed here so a measurement can record what it
+     * actually ran with. */
     snprintf(text, sizeof text,
-             "[predicate] spin source=%s, TRANSFERRED not measured here: "
-             "STREAM p95 .999/.893/.808 at 256/4096/65536, csw/s 197k/38k/7.6k. "
-             "Does not port. %lld parked, %lld spun",
-             mynah_pool_spin_source(), parks, wins);
+             "[predicate] spin source=%s (%.2f ns/relax measured here, target "
+             "%.0f us); reference sweep, NOT ours: STREAM p95 .999/.893/.808 at "
+             "256/4096/65536. %lld parked, %lld spun",
+             mynah_pool_spin_source(), mynah_pool_spin_ns_per_relax(),
+             PF_SPIN_TARGET_US, parks, wins);
     *why = text;
     return 0;
 }

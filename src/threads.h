@@ -109,6 +109,9 @@ int mynah_pool_spin_budget(void);
 /* Where the budget came from, for the dispatch report: "env", "aarch64",
  * "default". Never NULL. */
 const char *mynah_pool_spin_source(void);
+/* ns per pf_cpu_relax() measured on this host, 0 when the budget came from
+ * MYNAH_POOL_SPIN rather than from the calibrator. */
+double mynah_pool_spin_ns_per_relax(void);
 /* Waits that reached the condvar, and waits the spin absorbed. The ratio is
  * the knob's own evidence; context switches per second is the external one. */
 void mynah_pool_wait_stats(long long *parks, long long *spin_wins);
