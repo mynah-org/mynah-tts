@@ -642,9 +642,37 @@ static int conv_validate(const mynah_conv1d_spec *spec, size_t *effective,
  * a cache that cannot be reclaimed is a leak with a good excuse. */
 typedef struct {
     const float *weight;
+    unsigned long long fingerprint;
     size_t in_channels, out_channels, kernel;
     float *permuted;        /* [kernel][out_channels][in_channels] */
 } sea_tap_entry;
+
+/* THE POINTER IS NOT THE IDENTITY.  The paragraph above says the key is the
+ * weight address "because that is what identifies the tensor", and that is
+ * true of a tensor which is mmapped for the life of the process -- which is
+ * what production does.  It is a property of the CALLER, not of this cache,
+ * and E10-5 proved it breakable in a gate that never touched a model file: it
+ * freed one tensor, allocated another of the same shape, the allocator handed
+ * back the same address, and the stale permutation came out.  Relative error
+ * 0.0046 -> 1.45, and nothing crashed.
+ *
+ * So the key is the address AND a fingerprint of up to 64 elements spread
+ * across the tensor.  That is O(1) per lookup -- 64 loads against a gather of
+ * millions -- and it is a recycled-address detector, not a hash: two different
+ * tensors agreeing on 64 spread samples AND on all three dimensions is not a
+ * failure mode worth a second pass over the weight every frame. */
+static unsigned long long sea_taps_fingerprint(const float *w, size_t elems) {
+    unsigned long long h = 1469598103934665603ull ^ (unsigned long long)elems;
+    const size_t probes = elems < 64u ? elems : 64u;
+    const size_t step = elems / probes;
+    for (size_t i = 0; i < probes; ++i) {
+        unsigned int bits;
+        memcpy(&bits, &w[i * step], sizeof bits);
+        h ^= (unsigned long long)bits;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
 
 static struct {
     sea_tap_entry *entries;
@@ -669,17 +697,31 @@ static const float *sea_taps_all(const float *weight, size_t in_channels,
                                  size_t out_channels, size_t kernel) {
     if (weight == NULL || in_channels == 0u || out_channels == 0u ||
         kernel <= 1u) return NULL;
+    /* Checked here as well as below, because the fingerprint walks the tensor
+     * and must not be handed a length that wrapped. */
+    if (out_channels > SIZE_MAX / in_channels) return NULL;
+    if (out_channels * in_channels > SIZE_MAX / kernel) return NULL;
+    const unsigned long long fp =
+        sea_taps_fingerprint(weight, out_channels * in_channels * kernel);
     pthread_mutex_lock(&g_sea_taps.mutex);
+    size_t reuse = SIZE_MAX;
     for (size_t i = 0; i < g_sea_taps.count; ++i) {
         const sea_tap_entry *e = &g_sea_taps.entries[i];
         if (e->weight == weight && e->in_channels == in_channels &&
             e->out_channels == out_channels && e->kernel == kernel) {
-            const float *p = e->permuted;
-            pthread_mutex_unlock(&g_sea_taps.mutex);
-            return p;
+            if (e->fingerprint == fp) {
+                const float *p = e->permuted;
+                pthread_mutex_unlock(&g_sea_taps.mutex);
+                return p;
+            }
+            /* Same address, same shape, different contents: the tensor this
+             * entry was built for is gone.  Rebuild into this slot rather than
+             * grow a second entry nothing will ever match. */
+            reuse = i;
+            break;
         }
     }
-    if (g_sea_taps.count == g_sea_taps.capacity) {
+    if (reuse == SIZE_MAX && g_sea_taps.count == g_sea_taps.capacity) {
         const size_t cap = (g_sea_taps.capacity == 0u) ? 16u : g_sea_taps.capacity * 2u;
         sea_tap_entry *grown = (sea_tap_entry *)realloc(g_sea_taps.entries,
                                                         cap * sizeof(*grown));
@@ -688,11 +730,7 @@ static const float *sea_taps_all(const float *weight, size_t in_channels,
         g_sea_taps.capacity = cap;
     }
     /* Checked, because these three come from a model file. */
-    size_t floats = 0u;
-    if (out_channels > SIZE_MAX / in_channels) goto refuse;
-    floats = out_channels * in_channels;
-    if (floats > SIZE_MAX / kernel) goto refuse;
-    floats *= kernel;
+    size_t floats = out_channels * in_channels * kernel;
     if (floats > SIZE_MAX / sizeof(float)) goto refuse;
     float *permuted = (float *)malloc(floats * sizeof(float));
     if (permuted == NULL) { pthread_mutex_unlock(&g_sea_taps.mutex); return NULL; }
@@ -704,8 +742,14 @@ static const float *sea_taps_all(const float *weight, size_t in_channels,
             for (size_t j = 0; j < in_channels; ++j) dst[j] = src[j * kernel];
         }
     }
-    g_sea_taps.entries[g_sea_taps.count++] = (sea_tap_entry){
-        weight, in_channels, out_channels, kernel, permuted };
+    if (reuse != SIZE_MAX) {
+        free(g_sea_taps.entries[reuse].permuted);
+        g_sea_taps.entries[reuse] = (sea_tap_entry){
+            weight, fp, in_channels, out_channels, kernel, permuted };
+    } else {
+        g_sea_taps.entries[g_sea_taps.count++] = (sea_tap_entry){
+            weight, fp, in_channels, out_channels, kernel, permuted };
+    }
     if (!g_sea_taps.atexit_registered) {
         g_sea_taps.atexit_registered = 1;
         atexit(sea_taps_release);
@@ -2486,8 +2530,61 @@ static int sea_exp_self_test(char *error, size_t error_capacity) {
     return 0;
 }
 
+/* The tap memo's key, which is an address plus a fingerprint.
+ *
+ * WHY IT IS TESTED BY MUTATING IN PLACE rather than by free-then-malloc: the
+ * hazard is "the key matches but the tensor behind it is a different one", and
+ * an allocator handing back the same block is only one way to reach that.
+ * Refilling the buffer reaches it on every platform, deterministically,
+ * without depending on malloc's behaviour -- and it is exactly what the cache
+ * sees when an address is recycled.
+ *
+ * Before the fingerprint this returned the FIRST tensor's permutation for the
+ * second one's data and nothing said so. */
+static int sea_taps_memo_self_test(char *error, size_t error_capacity) {
+    const size_t ic = 5u, oc = 7u, k = 3u;
+    const size_t elems = ic * oc * k;
+    float *w = (float *)malloc(elems * sizeof(float));
+    if (w == NULL) {
+        sea_set_error(error, error_capacity, "taps memo: out of memory");
+        return -1;
+    }
+    for (int round = 0; round < 2; ++round) {
+        for (size_t i = 0; i < elems; ++i) w[i] = sea_fake(i, round == 0 ? 3u : 91u);
+        const float *permuted = sea_taps_all(w, ic, oc, k);
+        if (permuted == NULL) {
+            free(w);
+            sea_set_error(error, error_capacity,
+                          "taps memo: refused a %zux%zux%zu weight it must "
+                          "accept, so round %d proves nothing",
+                          oc, ic, k, round);
+            return -1;
+        }
+        for (size_t t = 0; t < k; ++t) {
+            for (size_t o = 0; o < oc; ++o) {
+                for (size_t j = 0; j < ic; ++j) {
+                    const float got = permuted[t * oc * ic + o * ic + j];
+                    const float want = w[o * ic * k + j * k + t];
+                    if (memcmp(&got, &want, sizeof got) != 0) {
+                        free(w);
+                        sea_set_error(error, error_capacity,
+                                      "taps memo: round %d tap %zu oc %zu ic "
+                                      "%zu is %.9g, want %.9g -- a stale entry "
+                                      "keyed on a reused address",
+                                      round, t, o, j, (double)got, (double)want);
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
+    free(w);
+    return 0;
+}
+
 int mynah_seanet_self_test(char *error, size_t error_capacity) {
     if (sea_exp_self_test(error, error_capacity) != 0) return -1;
+    if (sea_taps_memo_self_test(error, error_capacity) != 0) return -1;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
     /* --- ELU --------------------------------------------------------- */
