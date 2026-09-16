@@ -5,6 +5,7 @@
 #include "transformer_ar.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,23 +125,150 @@ typedef struct {
     size_t position;
 } tar_row_ref;
 
+/* ------------------------------------------------- the shared RoPE tables
+ *
+ * cos/sin for a position are a pure function of (position, head_dim,
+ * max_period) -- no weight and no request enters them -- so every state with
+ * the same config was building and holding an identical copy.  On the pinned
+ * pack the codec transformer's table is 24016 positions x 32 halves x 2 x 4
+ * bytes = 6.1 MB, and there is one live context per slot per worker: at the
+ * shipping topology that is the same 6.1 MB dozens of times over, and after
+ * the windowed KV cache above it was the LARGEST per-context allocation left.
+ *
+ * Shared, immutable, and keyed on exactly what it is a function of.  Built
+ * under the lock and published whole, so a reader that holds the pointer needs
+ * no lock -- the same contract as qmat's weight cache and seanet's tap memo.
+ *
+ * Freed at exit rather than never, because `make leaks` is a gate here.  Not
+ * refcounted: the set of distinct (positions, half, period) triples in a
+ * process is the set of transformers the model has, which is two. */
+typedef struct {
+    size_t positions, half;
+    float max_period;
+    float *cos_sin;   /* [positions][half] cos, then [positions][half] sin */
+} tar_rope_entry;
+
+static struct {
+    tar_rope_entry *entries;
+    size_t count, capacity;
+    pthread_mutex_t mutex;
+    int atexit_registered;
+} g_tar_rope = { NULL, 0, 0, PTHREAD_MUTEX_INITIALIZER, 0 };
+
+static void tar_rope_release(void) {
+    pthread_mutex_lock(&g_tar_rope.mutex);
+    for (size_t i = 0; i < g_tar_rope.count; ++i) free(g_tar_rope.entries[i].cos_sin);
+    free(g_tar_rope.entries);
+    g_tar_rope.entries = NULL;
+    g_tar_rope.count = g_tar_rope.capacity = 0;
+    pthread_mutex_unlock(&g_tar_rope.mutex);
+}
+
+/* Returns the cos table; the sin table follows it at `positions * half`.
+ * NULL means the caller keeps its own copy, so a failure here is memory
+ * spent and never a different number. */
+static const float *tar_rope_shared(size_t positions, size_t half,
+                                    float max_period) {
+    if (positions == 0u || half == 0u) return NULL;
+    pthread_mutex_lock(&g_tar_rope.mutex);
+    for (size_t i = 0; i < g_tar_rope.count; ++i) {
+        const tar_rope_entry *e = &g_tar_rope.entries[i];
+        if (e->positions == positions && e->half == half &&
+            memcmp(&e->max_period, &max_period, sizeof max_period) == 0) {
+            const float *p = e->cos_sin;
+            pthread_mutex_unlock(&g_tar_rope.mutex);
+            return p;
+        }
+    }
+    if (g_tar_rope.count == g_tar_rope.capacity) {
+        const size_t cap = (g_tar_rope.capacity == 0u) ? 4u : g_tar_rope.capacity * 2u;
+        tar_rope_entry *grown =
+            (tar_rope_entry *)realloc(g_tar_rope.entries, cap * sizeof(*grown));
+        if (grown == NULL) { pthread_mutex_unlock(&g_tar_rope.mutex); return NULL; }
+        g_tar_rope.entries = grown;
+        g_tar_rope.capacity = cap;
+    }
+    size_t floats = 0;
+    if (tar_mul(positions, half, &floats) != 0 ||
+        tar_mul(floats, 2u, &floats) != 0) {
+        pthread_mutex_unlock(&g_tar_rope.mutex);
+        return NULL;
+    }
+    float *table = (float *)calloc(floats, sizeof(float));
+    if (table == NULL) { pthread_mutex_unlock(&g_tar_rope.mutex); return NULL; }
+    for (size_t p = 0; p < positions; ++p) {
+        mynah_transformer_ar_rope_angles_f32(table + p * half,
+                                             table + positions * half + p * half,
+                                             half, p, max_period);
+    }
+    g_tar_rope.entries[g_tar_rope.count++] =
+        (tar_rope_entry){ positions, half, max_period, table };
+    if (!g_tar_rope.atexit_registered) {
+        g_tar_rope.atexit_registered = 1;
+        (void)atexit(tar_rope_release);
+    }
+    pthread_mutex_unlock(&g_tar_rope.mutex);
+    return table;
+}
+
+/* TEST HOOK, not a runtime knob.  Forces the windowed cache off (0) or on (1)
+ * for states created after the call, or restores the resolution (-1).
+ *
+ * WHY IT IS PUBLIC: a windowed cache has to produce BIT-IDENTICAL output to
+ * the full-length one, or a request's audio would depend on how much memory
+ * the process felt like using.  Proving that needs both caches in ONE process
+ * over the same weights and the same inputs, and a compile-time or
+ * config-derived choice can only give one of them per run -- the same argument
+ * as mynah_qmat_i8mm_force(). */
+static int g_tar_kv_window_force = -1;
+
+int mynah_transformer_ar_kv_window_force(int mode) {
+    const int before = g_tar_kv_window_force;
+    g_tar_kv_window_force = (mode < 0) ? -1 : (mode != 0);
+    return before;
+}
+
 struct mynah_transformer_ar_state {
     mynah_transformer_ar_config config;
     size_t attn_dim; /* num_heads * head_dim */
     size_t half;     /* head_dim / 2         */
     size_t offset;   /* cached positions, i.e. the next absolute position */
 
-    float *kv;       /* [num_layers][2][max_seq_len][attn_dim] */
-    size_t kv_half;  /* max_seq_len * attn_dim                 */
-    size_t kv_layer; /* 2 * kv_half                            */
+    float *kv;       /* [num_layers][2][kv_positions][attn_dim] */
+    size_t kv_half;  /* kv_positions * attn_dim                 */
+    size_t kv_layer; /* 2 * kv_half                             */
+    /* THE CACHE IS NOT ALWAYS max_seq_len LONG.
+     *
+     * A windowed transformer -- `context > 0`, which is Mimi's decoder at 250
+     * -- can never read further back than `context` positions, but the cache
+     * was still allocated for every position the utterance could reach: on the
+     * pinned pack that is 24016 positions of a 250-position window, 196 MB of
+     * address space per request where 2 MB is reachable.  It never showed up
+     * as resident because calloc faults on use, which is exactly why it
+     * survived: the allocation is wrong, the RSS is not.
+     *
+     * So a windowed cache holds `context` plus slack, and slot 0 is the
+     * absolute position `kv_base` rather than 0.  When a write would run past
+     * the end, the still-reachable tail is moved down and `kv_base` advances:
+     * the attention loop keeps reading ONE CONTIGUOUS SPAN, which is why this
+     * is a compaction and not a ring buffer -- a ring would put a branch and a
+     * wrap in the hottest loop in the codec to save an amortised memmove of
+     * one position per step.
+     *
+     * `context == 0` (the backbone, and every voice-prefix path) keeps
+     * kv_positions == max_seq_len and kv_base == 0, so nothing there moves. */
+    size_t kv_positions; /* capacity in positions                       */
+    size_t kv_base;      /* absolute position held in slot 0            */
 
     tar_rows rows;      /* the prefill tile; row 0 is also the single step  */
     tar_row_ref *refs;  /* [rows.rows_cap]                                  */
 
-    float *block;     /* scores + the two RoPE tables */
-    float *scores;    /* [max_seq_len] */
-    float *rope_cos;  /* [max_seq_len][half]  */
-    float *rope_sin;  /* [max_seq_len][half]  */
+    float *block;     /* scores, and the RoPE tables when they are not shared */
+    float *scores;    /* [kv_positions] */
+    /* Shared when tar_rope_shared() could build them, owned inside `block`
+     * when it could not; either way immutable after construction. */
+    const float *rope_cos;  /* [max_seq_len][half]  */
+    const float *rope_sin;  /* [max_seq_len][half]  */
 };
 
 struct mynah_transformer_ar_batch {
@@ -276,9 +404,28 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
     }
     state->attn_dim = attn_dim;
 
-    /* KV: [layers][2][max_seq_len][attn_dim]. */
+    /* KV: [layers][2][kv_positions][attn_dim].
+     *
+     * The slack above `context` is what sets how often a compaction runs: with
+     * `context` of slack it runs at most once every `context` positions and
+     * moves at most `context` of them, i.e. an amortised one position moved
+     * per step.  It is floored at the prefill tile because a single tile must
+     * fit alongside the window, and capped at max_seq_len because there is
+     * nothing to gain beyond it. */
+    size_t kv_positions = resolved.max_seq_len;
+    if (resolved.context > 0u && g_tar_kv_window_force != 0) {
+        size_t slack = resolved.context;
+        if (slack < TAR_PREFILL_TILE) slack = TAR_PREFILL_TILE;
+        size_t want = 0;
+        if (tar_add(resolved.context, slack, &want) == 0 &&
+            want < kv_positions) {
+            kv_positions = want;
+        }
+    }
+    state->kv_positions = kv_positions;
+    state->kv_base = 0;
     size_t kv_half = 0, kv_layer = 0, kv_total = 0, kv_bytes = 0;
-    if (tar_mul(resolved.max_seq_len, attn_dim, &kv_half) != 0 ||
+    if (tar_mul(kv_positions, attn_dim, &kv_half) != 0 ||
         tar_mul(kv_half, 2u, &kv_layer) != 0 ||
         tar_mul(kv_layer, resolved.num_layers, &kv_total) != 0 ||
         tar_mul(kv_total, sizeof(float), &kv_bytes) != 0) {
@@ -316,13 +463,20 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
         return NULL;
     }
 
-    /* Position-only scratch: the attention scores and the two RoPE tables. */
+    /* Position-only scratch: the attention scores, and the two RoPE tables
+     * only when they could not be shared. */
+    const float *shared_rope =
+        tar_rope_shared(resolved.max_seq_len, state->half, resolved.max_period);
     size_t total = 0, part = 0;
     int overflow = 0;
-    overflow |= tar_add(total, resolved.max_seq_len, &total);
-    overflow |= tar_mul(resolved.max_seq_len, state->half, &part);
-    overflow |= tar_mul(part, 2u, &part);
-    overflow |= tar_add(total, part, &total);
+    /* `scores` holds one span, and a span is at most `context` when there is
+     * one -- so kv_positions bounds it exactly as it bounds the cache. */
+    overflow |= tar_add(total, kv_positions, &total);
+    if (shared_rope == NULL) {
+        overflow |= tar_mul(resolved.max_seq_len, state->half, &part);
+        overflow |= tar_mul(part, 2u, &part);
+        overflow |= tar_add(total, part, &total);
+    }
     if (overflow != 0) {
         tar_set_error(error, error_capacity,
                       "transformer_ar: scratch size overflow");
@@ -344,17 +498,24 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
 
     float *cursor = state->block;
     state->scores = cursor;
-    cursor += resolved.max_seq_len;
-    state->rope_cos = cursor;
-    cursor += resolved.max_seq_len * state->half;
-    state->rope_sin = cursor;
-
-    /* The RoPE table is position-only, so it is built once here and the hot
-     * loop contains no transcendental at all. */
-    for (size_t p = 0; p < resolved.max_seq_len; ++p) {
-        mynah_transformer_ar_rope_angles_f32(
-            state->rope_cos + p * state->half, state->rope_sin + p * state->half,
-            state->half, p, resolved.max_period);
+    cursor += kv_positions;
+    if (shared_rope != NULL) {
+        state->rope_cos = shared_rope;
+        state->rope_sin = shared_rope + resolved.max_seq_len * state->half;
+    } else {
+        /* The RoPE table is position-only, so it is built once and the hot
+         * loop contains no transcendental at all.  This arm only runs when the
+         * shared table could not be allocated. */
+        float *cos_table = cursor;
+        float *sin_table = cursor + resolved.max_seq_len * state->half;
+        for (size_t p = 0; p < resolved.max_seq_len; ++p) {
+            mynah_transformer_ar_rope_angles_f32(cos_table + p * state->half,
+                                                 sin_table + p * state->half,
+                                                 state->half, p,
+                                                 resolved.max_period);
+        }
+        state->rope_cos = cos_table;
+        state->rope_sin = sin_table;
     }
     return state;
 }
@@ -431,6 +592,10 @@ size_t mynah_transformer_ar_batch_capacity(
 void mynah_transformer_ar_state_reset(mynah_transformer_ar_state *state) {
     if (state == NULL) return;
     state->offset = 0;
+    /* The window slides with the positions, so a rewind to position 0 has to
+     * rewind the base with it, or the next step would compute a slot from a
+     * base the cache no longer holds. */
+    state->kv_base = 0;
 }
 
 const mynah_transformer_ar_config *mynah_transformer_ar_state_config(
@@ -446,6 +611,14 @@ size_t mynah_transformer_ar_state_offset(
 float *mynah_transformer_ar_state_kv(mynah_transformer_ar_state *state,
                                      size_t layer) {
     if (state == NULL || layer >= state->config.num_layers) return NULL;
+    /* The block this returns is documented as [2][max_seq_len][heads][dim]
+     * with slot 0 at position 0, which is what makes a voice prefix two
+     * memcpys.  A windowed cache is shorter and its slot 0 moves, so the
+     * contract does not hold and the honest answer is NULL rather than a
+     * pointer whose meaning silently changed.  Every caller in the tree --
+     * voice loading and the corruption probe -- is on the backbone, which is
+     * unwindowed. */
+    if (state->kv_positions < state->config.max_seq_len) return NULL;
     return state->kv + layer * state->kv_layer;
 }
 
@@ -468,10 +641,18 @@ int mynah_transformer_ar_state_load_kv(mynah_transformer_ar_state *state,
                       layer, state->config.num_layers);
         return -1;
     }
-    if (positions > state->config.max_seq_len) {
+    if (state->kv_positions < state->config.max_seq_len) {
         tar_set_error(error, error_capacity,
-                      "transformer_ar: voice prefix %zu exceeds max_seq_len %zu",
-                      positions, state->config.max_seq_len);
+                      "transformer_ar: this cache is windowed (context %zu, "
+                      "%zu slots) and a KV prefix assumes slot 0 is position 0",
+                      state->config.context, state->kv_positions);
+        return -1;
+    }
+    if (positions > state->kv_positions) {
+        tar_set_error(error, error_capacity,
+                      "transformer_ar: voice prefix %zu exceeds the cache's "
+                      "%zu positions",
+                      positions, state->kv_positions);
         return -1;
     }
     const size_t span = positions * state->attn_dim;
@@ -502,6 +683,13 @@ int mynah_transformer_ar_state_set_offset(mynah_transformer_ar_state *state,
         tar_set_error(error, error_capacity,
                       "transformer_ar: offset %zu exceeds max_seq_len %zu",
                       positions, state->config.max_seq_len);
+        return -1;
+    }
+    if (positions > state->kv_positions) {
+        tar_set_error(error, error_capacity,
+                      "transformer_ar: offset %zu exceeds the cache's %zu "
+                      "positions; a windowed cache has no slot for it",
+                      positions, state->kv_positions);
         return -1;
     }
     state->offset = positions;
@@ -552,6 +740,67 @@ static size_t tar_window_start(size_t position, size_t context) {
     if (context == 0 || position + 1u <= context) return 0;
     return position + 1u - context;
 }
+
+/* Make room for absolute position `hi`, keeping everything from `keep_from`
+ * up.  Returns 0 when the cache can serve [keep_from, hi], -1 when it cannot,
+ * which is a configuration error and not a runtime condition: kv_positions is
+ * built as context + slack, so a tile that does not fit would mean a tile
+ * wider than the slack.
+ *
+ * A no-op on an unwindowed cache, which is every path that predates this. */
+static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
+                          size_t hi) {
+    if (state->kv_positions >= state->config.max_seq_len) return 0;
+    if (hi < state->kv_base) return -1;   /* positions never rewind */
+    if (hi - state->kv_base < state->kv_positions) return 0;
+    if (keep_from < state->kv_base) keep_from = state->kv_base;
+    const size_t shift = keep_from - state->kv_base;
+    if (shift == 0u) return -1;
+    size_t keep = (state->offset > keep_from) ? state->offset - keep_from : 0u;
+    if (keep > state->kv_positions - shift) keep = state->kv_positions - shift;
+    if (keep > 0u) {
+        const size_t row = state->attn_dim * sizeof(float);
+        for (size_t l = 0; l < state->config.num_layers; ++l) {
+            float *k = state->kv + l * state->kv_layer;
+            float *v = k + state->kv_half;
+            memmove(k, k + shift * state->attn_dim, keep * row);
+            memmove(v, v + shift * state->attn_dim, keep * row);
+        }
+    }
+    state->kv_base = keep_from;
+    return (hi - state->kv_base < state->kv_positions) ? 0 : -1;
+}
+
+/* Every state in `refs` gets room for the whole tile before ANY row writes.
+ *
+ * The bound that matters is the LOWEST position in the tile, not the highest:
+ * row b reads [window_start(p_b), p_b], so compacting to the last row's window
+ * would drop what the first row still needs.  States appear once in a
+ * cross-request step and once per position in a prefill tile, so the scan is
+ * O(count^2) over at most TAR_PREFILL_TILE rows -- nothing against a layer. */
+static int tar_kv_prepare(const mynah_transformer_ar_config *config,
+                          const tar_row_ref *refs, size_t count) {
+    if (config->context == 0u) return 0;
+    for (size_t b = 0; b < count; ++b) {
+        mynah_transformer_ar_state *state = refs[b].state;
+        int first = 1;
+        for (size_t a = 0; a < b; ++a) {
+            if (refs[a].state == state) { first = 0; break; }
+        }
+        if (!first) continue;
+        size_t lo = refs[b].position, hi = refs[b].position;
+        for (size_t a = b + 1u; a < count; ++a) {
+            if (refs[a].state != state) continue;
+            if (refs[a].position < lo) lo = refs[a].position;
+            if (refs[a].position > hi) hi = refs[a].position;
+        }
+        if (tar_kv_reserve(state, tar_window_start(lo, config->context), hi) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 
 /*
  * One layer projection for `rows` stacked rows.
@@ -629,6 +878,10 @@ static int tar_forward_rows(const mynah_transformer_ar_weights *weights,
     const size_t ffn_dim = config->ffn_dim;
     const float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* Before layer 0 writes anything: a compaction moves every layer's cache
+     * at once, so it cannot happen between two layers of the same pass. */
+    if (tar_kv_prepare(config, refs, count) != 0) return -1;
+
     for (size_t l = 0; l < config->num_layers; ++l) {
         const mynah_transformer_ar_layer *layer = &weights->layers[l];
 
@@ -655,8 +908,9 @@ static int tar_forward_rows(const mynah_transformer_ar_weights *weights,
                                                 rope_sin);
             float *k_cache = state->kv + l * state->kv_layer;
             float *v_cache = k_cache + state->kv_half;
-            memcpy(k_cache + position * attn_dim, k, attn_dim * sizeof(float));
-            memcpy(v_cache + position * attn_dim, v, attn_dim * sizeof(float));
+            const size_t slot = position - state->kv_base;
+            memcpy(k_cache + slot * attn_dim, k, attn_dim * sizeof(float));
+            memcpy(v_cache + slot * attn_dim, v, attn_dim * sizeof(float));
         }
         /* A key-stationary variant of this loop -- key outer, tile positions
          * inner, so K and V are read once for the whole tile instead of once
@@ -675,6 +929,9 @@ static int tar_forward_rows(const mynah_transformer_ar_weights *weights,
             const size_t position = refs[b].position;
             const size_t lo = tar_window_start(position, config->context);
             const size_t span = position - lo + 1u;
+            /* Slot 0 is `kv_base`, not position 0: on an unwindowed cache the
+             * base is always 0 and this is the same arithmetic as before. */
+            const size_t lo_slot = lo - state->kv_base;
             const float *q = rows->qkv + b * 3u * attn_dim;
             const float *k_cache = state->kv + l * state->kv_layer;
             const float *v_cache = k_cache + state->kv_half;
@@ -682,7 +939,7 @@ static int tar_forward_rows(const mynah_transformer_ar_weights *weights,
             for (size_t h = 0; h < heads; ++h) {
                 const float *qh = q + h * head_dim;
                 for (size_t j = 0; j < span; ++j) {
-                    const float *kj = k_cache + (lo + j) * attn_dim + h * head_dim;
+                    const float *kj = k_cache + (lo_slot + j) * attn_dim + h * head_dim;
                     scores[j] = mynah_dot_f32(qh, kj, head_dim) * scale;
                 }
                 /* Rejects non-finite scores, which is the last line of defence
@@ -691,7 +948,7 @@ static int tar_forward_rows(const mynah_transformer_ar_weights *weights,
                 float *oh = rows->attn + b * attn_dim + h * head_dim;
                 memset(oh, 0, head_dim * sizeof(float));
                 for (size_t j = 0; j < span; ++j) {
-                    const float *vj = v_cache + (lo + j) * attn_dim + h * head_dim;
+                    const float *vj = v_cache + (lo_slot + j) * attn_dim + h * head_dim;
                     mynah_axpy_f32(oh, vj, scores[j], head_dim);
                 }
             }
@@ -1516,6 +1773,86 @@ int mynah_transformer_ar_self_test(char *error, size_t error_capacity) {
         if (!differs) {
             free(store);
             TAR_FAIL("the loaded voice prefix was not attended to");
+        }
+    }
+
+    /* 10. THE WINDOWED KV CACHE IS THE SAME TRANSFORMER.
+     *
+     *     A `context` window means the cache can be `context + slack` slots
+     *     with slot 0 at a moving absolute position, instead of one slot per
+     *     position the utterance could ever reach.  On the pinned pack that is
+     *     500 instead of 24016, i.e. 196 MB of address space that was never
+     *     reachable.  It is only allowed to be a memory change: the numbers
+     *     must be BIT-IDENTICAL, or a request's audio would depend on how much
+     *     memory the process felt like using.
+     *
+     *     Both caches run in one process over the same weights and inputs, and
+     *     the run is long enough to force several compactions -- without that
+     *     the two arms would be the same code and the test would be blind, so
+     *     the compaction count is asserted too, through the base having moved.
+     */
+    {
+        enum { TAR_CTX = 5u, TAR_LONG = 48u };
+        for (size_t l = 0; l < TAR_L; ++l) {
+            store->layers[l].layer_scale_1 = NULL;
+            store->layers[l].layer_scale_2 = NULL;
+        }
+        mynah_transformer_ar_config config;
+        tar_test_config(&config, TAR_CTX);
+        config.max_seq_len = TAR_LONG;
+        float full[TAR_LONG][TAR_D];
+        float windowed[TAR_LONG][TAR_D];
+        size_t kv_full = 0, kv_win = 0;
+        int failed = 0;
+        for (int arm = 0; arm < 2; ++arm) {
+            const int before = mynah_transformer_ar_kv_window_force(arm);
+            mynah_transformer_ar_state *state =
+                mynah_transformer_ar_state_new(&config, error, error_capacity);
+            if (state == NULL) {
+                (void)mynah_transformer_ar_kv_window_force(before);
+                free(store);
+                return -1;
+            }
+            const size_t slots =
+                mynah_transformer_ar_state_kv_half_floats(state) /
+                (TAR_H * TAR_HD);
+            if (arm == 0) kv_full = slots; else kv_win = slots;
+            float *out = (arm == 0) ? &full[0][0] : &windowed[0][0];
+            for (size_t t = 0; t < (size_t)TAR_LONG; ++t) {
+                float in[TAR_D];
+                for (size_t i = 0; i < TAR_D; ++i) in[i] = tar_fake(t * TAR_D + i, 77u);
+                failed |= mynah_transformer_ar_step(state, &store->weights, in,
+                                                    out + t * TAR_D) != 0;
+            }
+            mynah_transformer_ar_state_free(state);
+            (void)mynah_transformer_ar_kv_window_force(before);
+        }
+        if (failed) {
+            free(store);
+            TAR_FAIL("the windowed KV comparison failed to step");
+        }
+        /* Not vacuous: the windowed arm must really be shorter, and short
+         * enough that TAR_LONG positions cannot fit without compacting. */
+        if (kv_full != (size_t)TAR_LONG || kv_win >= (size_t)TAR_LONG) {
+            free(store);
+            TAR_FAIL("the two arms allocated the same cache (%zu vs %zu "
+                     "positions): the test is blind",
+                     kv_full, kv_win);
+        }
+        if (memcmp(full, windowed, sizeof full) != 0) {
+            size_t bad_t = 0, bad_i = 0;
+            for (size_t t = 0; t < (size_t)TAR_LONG && bad_t == 0; ++t) {
+                for (size_t i = 0; i < TAR_D; ++i) {
+                    if (memcmp(&full[t][i], &windowed[t][i], sizeof(float)) != 0) {
+                        bad_t = t + 1u; bad_i = i; break;
+                    }
+                }
+            }
+            free(store);
+            TAR_FAIL("the windowed KV cache changed the answer at position "
+                     "%zu dim %zu: %.9g vs %.9g (%zu slots vs %zu)",
+                     bad_t - 1u, bad_i, (double)full[bad_t - 1u][bad_i],
+                     (double)windowed[bad_t - 1u][bad_i], kv_full, kv_win);
         }
     }
 

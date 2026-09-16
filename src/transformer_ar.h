@@ -374,6 +374,18 @@ void mynah_transformer_ar_rope_apply_f32(float *values, size_t num_heads,
  * carries the f64 reference, the receptive field and RoPE's base at the
  * production `context = 250`.
  * Returns 0, or -1 with a message in `error`. */
+/* TEST HOOK, not a runtime knob: forces the windowed KV cache off (0) or on
+ * (1) for states created afterwards, or restores the resolution (-1), and
+ * returns the mode that was in effect before.
+ *
+ * A transformer with a sliding `context` cannot read further back than the
+ * window, so its cache is allocated as `context` plus slack with slot 0 at a
+ * moving absolute position, instead of one slot per position the utterance
+ * could reach -- on the pinned pack that is 500 positions rather than 24016,
+ * 196 MB of address space that was never reachable.  The two must produce
+ * bit-identical output, and proving it needs both in one process. */
+int mynah_transformer_ar_kv_window_force(int mode);
+
 int mynah_transformer_ar_self_test(char *error, size_t error_capacity);
 
 #ifdef __cplusplus

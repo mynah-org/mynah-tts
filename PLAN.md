@@ -761,21 +761,22 @@ the x86 self-test that judges the two kernels written here and never executed
       1.120 is saturation or variance). The reference has all three plus a per-request
       stage decomposition from admission to first audio. Our 585 ms burst model is
       arithmetic that lands within 4% of measurement — good, but a model
-- [~] E10-12 **two of four done; the third is a virtual number, not a resident one** —
-      the `getenv` per conv call and the never-written `rows->gelu` are both closed in
-      the tree. The **277 MB KV** is measured, and the item overstated it: those buffers
-      are `calloc`, so the pages are faulted on use, and RSS for one request grows
-      **754 → 834 MB from a 1-word utterance to a 96-word one** — +80 MB across 63× the
-      audio, not 277 MB per request. The real finding underneath is different and
-      sharper: the **codec transformer allocates `max_seq_len = 24016` positions for an
-      attention whose `context` window is 250** (`src/engine_pocket.c`, `codec.context =
-      cfg->codec_tf_context`), i.e. 196 MB of address space where 2 MB is reachable.
-      Bounding it needs the KV to stop being indexed by absolute position — a ring
-      buffer or a periodic compaction in `src/transformer_ar.c`, which is the module
-      carrying the byte-exact voice-file layout contract. Worth doing, **not** worth
-      doing for a figure that is not resident. What is left: that, and `serve()`
-      re-running `model_init` per one-shot `mynah_tts_synthesize` (~1.1 ms/request,
-      0.2% of a 580 ms TTFA — the streaming path serves many requests per `serve()`)
+- [~] E10-12 **three of four done** — [`.work/kv-window-allocation.md`](.work/kv-window-allocation.md).
+      The `getenv` per conv call and the never-written `rows->gelu` were already closed.
+      The **277 MB of KV** was measured and the item had it wrong in both directions: the
+      buffers are `calloc`, so RSS grows only **754 → 834 MB from a 1-word utterance to a
+      96-word one**, +80 MB across 63× the audio — *and* the real defect was worse than a
+      size, because the codec transformer allocated **24,016 KV positions for an attention
+      whose sliding window is 250**, 196.6 MB of which 2 MB was ever readable. Fixed with
+      a moving base and a compaction (not a ring: a ring puts a wrap in the hottest loop
+      in the codec to save an amortised one position moved per step). `context == 0`
+      keeps the old layout, so the backbone and every voice-prefix path are untouched.
+      The largest block left was then the **RoPE table**, 6.1 MB rebuilt identically per
+      context for a pure function of (position, head_dim, max_period) — now shared.
+      **−184.5 MB of address space per context, −6.1 MB per additional concurrent
+      context**, audio byte-identical, four mutations caught. What is left: `serve()`
+      re-running `model_init` per one-shot `mynah_tts_synthesize` (~1.1 ms/request, 0.2%
+      of a 580 ms TTFA; the streaming path serves many requests per `serve()`)
 - [x] E10-13 **`sea_taps_all()` keyed a cache on a pointer malloc can recycle** — fixed
       in `9cfa4fc` with the 64-sample content fingerprint `src/convq8.c` already carried,
       and gated by mutating the buffer in place rather than by free-then-malloc, so the
