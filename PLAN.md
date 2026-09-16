@@ -648,7 +648,29 @@ the x86 self-test that judges the two kernels written here and never executed
       configuration it is **1.08×** (335.3 → 309.2 ms), because the ELU is 5.6% of that
       region rather than 11.6% — see [`.work/measuring-the-codec.md`](.work/measuring-the-codec.md). Audio: 51-59 samples of ~120,000 differ, every one by exactly **1 LSB of
       int16**, identical length. AVX2 twin still to write.
-- [ ] E10-5 **the SEANet conv stack is entirely f32** — `codec_conv` in our spec is only
+- [x] E10-5 **the conv1d half is int8 now; the transposed half is still the open
+      question** — [`.work/seanet-int8-conv.md`](.work/seanet-int8-conv.md).
+      `codec_conv` meant one matvec (`mimi.quantizer.output_proj [512][32]`), so a spec
+      that said `codec_conv:int8` was quantizing ~0.03% of what its name covers; it now
+      means the decoder's causal convolutions. New `src/convq8.{c,h}`, int8 arithmetic
+      **exported from qmat** rather than rewritten (the activation encoding is a property
+      of the host, and a second copy would have dropped VNNI on the x86 half of
+      production without saying so). **`codec.conv_stack` 204.2 → 170.0 ms (1.20×, 5/5
+      paired rounds), whole request 1.06×**; the conv GEMM family itself 86.9 → 48.8 ms.
+      Gated by shape, `k*taps >= 128 && m >= 64`, each half a measured sign change.
+      **The quality finding decided the gate**: admitting the 32-channel stage costs
+      **8× on log-mel** (0.9976 → 0.9785) to save 6 ms of 44, and the waveform
+      correlation would not have shown it — the shipped `codec_transformer:int8` moves
+      *waveform* correlation to 0.99852 while leaving log-mel at 0.99953, and this does
+      the opposite. One number could not have caught it.
+      Sample count identical in 9/9 text×seed pairs. Four things found by measuring:
+      the activation quantizer was scalar and bigger than the SDOT it feeds (vectorised,
+      byte-identical, the decode loop gets it too); tiling the transpose is *slower*;
+      the memo keyed on a pointer malloc recycles; my own error path had a
+      use-after-free. Nine mutations, nine caught — **two only under
+      `MYNAH_QMAT_VNNI=scalar`**, the level that makes the x86 unsigned algebra
+      executable on ARM and that had no gate using it. Original text follows
+- [-] E10-5-orig **the SEANet conv stack is entirely f32** — `codec_conv` in our spec is only
       `mimi.quantizer.output_proj [512][32]`, so **25.6% of the wall has no quantized
       kernel at all**, and the depthwise upsample is *permanently scalar*
       (`groups == out_channels == 512` can never qualify). The reference measured **−18%
@@ -733,6 +755,22 @@ the x86 self-test that judges the two kernels written here and never executed
       mmaps and ~1.1 ms per request**, re-validating all 26 voice files each time; and
       **277 MB of KV `calloc`'d per request** sized from max steps rather than the
       admitted text
+- [ ] E10-13 **`sea_taps_all()` keys a cache on a pointer malloc can recycle** — the
+      f32 tap permutation memo in `src/seanet.c` is keyed on the weight address, and
+      E10-5 proved that key breakable: its own gate freed one tensor, allocated another
+      of the same shape at the same address and got the first one's bytes back
+      (relative error 0.0046 → 1.45). `src/convq8.c` now carries a 64-sample content
+      fingerprint in the key; this one does not. Safe **today** because weights are
+      mmapped for the life of the process — and that is a property of the caller, not
+      of the cache. ~10 lines, same fix
+- [ ] E10-14 **re-decide the transposed convolutions with our own number** — E10-5
+      skipped them because the reference measured *its* int8 convtranspose slower than
+      f32 sgemm. They are now **57% of what is left** of `codec.conv_stack`
+      (`convtr.gemm` 93 ms of 170), and our kernel's best shape is exactly theirs:
+      `3072x16x512` is the entry conv's k with six times the m, and the entry conv got
+      **4.21×**. Inheriting a rejection measured on someone else's kernel is the same
+      mistake as inheriting a spin count (E10-8). Needs the scatter to stay f32 and its
+      own quality row, since it is the stage nearest the waveform after the last conv
 - [-] **rejected, with the reference's own numbers.** Do not build these: prefill helper
       thread (stall@250 20.1%→46.8%); token-range slicing (occupancy floor invariant at
       83-97 ms); per-layer prefill checkpointing (TTFA p95 223→1208 ms); fixed-target
