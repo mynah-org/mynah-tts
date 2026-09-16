@@ -429,17 +429,26 @@ int mynah_conv1d_causal(const mynah_weights *file, const mynah_backend *backend,
      * about ninety-seven times per decode, and a getenv plus a strcmp per call
      * is a syscall-shaped cost to answer a question whose answer cannot change
      * after start. */
+    /* Both answers memoised together, because the second one reads the same
+     * variable and an earlier version of this memo captured only the first --
+     * which compiles on Accelerate, where the block below is preprocessed away,
+     * and breaks BLAS=none, which is the Linux production default.  -1 is
+     * "unresolved", so a 0 or 1 is a decision that was actually made. */
     static int use_tap_gemms_cached = -1;
+    static int tap_env_unset_cached = -1;
     if (use_tap_gemms_cached < 0) {
         const char *tap_env = getenv("MYNAH_CONV_TAP_GEMMS");
         use_tap_gemms_cached = (tap_env != NULL && strcmp(tap_env, "0") != 0);
+        tap_env_unset_cached = (tap_env == NULL);
     }
     int use_tap_gemms = use_tap_gemms_cached;
 #if MYNAH_HAVE_SGEMM && !defined(MYNAH_USE_ACCELERATE)
     /* On by default wherever a real GEMM exists and BNNS does not.  This was
      * keyed on MYNAH_USE_OPENBLAS, which stopped meaning "a GEMM exists" the
      * moment BLAS=none became the Linux default. */
-    if (tap_env == NULL) use_tap_gemms = 1;
+    if (tap_env_unset_cached) use_tap_gemms = 1;
+#else
+    (void)tap_env_unset_cached;
 #endif
     /* GPU fast path: im2col + sgemm in one backend call. */
     if (backend != NULL && in_channels <= (size_t)INT_MAX &&
