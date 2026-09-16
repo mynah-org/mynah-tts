@@ -746,23 +746,29 @@ the x86 self-test that judges the two kernels written here and never executed
       1.120 is saturation or variance). The reference has all three plus a per-request
       stage decomposition from admission to first audio. Our 585 ms burst model is
       arithmetic that lands within 4% of measurement — good, but a model
-- [ ] E10-12 **small, each real** — `getenv` + `strcmp` on **every** conv call
-      (`src/conv1d.c:427`, ~97 per decode) where three neighbouring sites memoize;
-      `rows->gelu` allocated `count * ffn_dim` floats and **never written**
-      (`src/transformer_ar.c:196`, `mynah_gelu_tanh_array` ignores its scratch argument),
-      256 KB dead per live request; `serve()` re-running `engine->model_init` per
-      `mynah_tts_synthesize` on the one-shot path — **1,933 allocations, 27 opens, 28
-      mmaps and ~1.1 ms per request**, re-validating all 26 voice files each time; and
-      **277 MB of KV `calloc`'d per request** sized from max steps rather than the
-      admitted text
-- [ ] E10-13 **`sea_taps_all()` keys a cache on a pointer malloc can recycle** — the
-      f32 tap permutation memo in `src/seanet.c` is keyed on the weight address, and
-      E10-5 proved that key breakable: its own gate freed one tensor, allocated another
-      of the same shape at the same address and got the first one's bytes back
-      (relative error 0.0046 → 1.45). `src/convq8.c` now carries a 64-sample content
-      fingerprint in the key; this one does not. Safe **today** because weights are
-      mmapped for the life of the process — and that is a property of the caller, not
-      of the cache. ~10 lines, same fix
+- [~] E10-12 **two of four done; the third is a virtual number, not a resident one** —
+      the `getenv` per conv call and the never-written `rows->gelu` are both closed in
+      the tree. The **277 MB KV** is measured, and the item overstated it: those buffers
+      are `calloc`, so the pages are faulted on use, and RSS for one request grows
+      **754 → 834 MB from a 1-word utterance to a 96-word one** — +80 MB across 63× the
+      audio, not 277 MB per request. The real finding underneath is different and
+      sharper: the **codec transformer allocates `max_seq_len = 24016` positions for an
+      attention whose `context` window is 250** (`src/engine_pocket.c`, `codec.context =
+      cfg->codec_tf_context`), i.e. 196 MB of address space where 2 MB is reachable.
+      Bounding it needs the KV to stop being indexed by absolute position — a ring
+      buffer or a periodic compaction in `src/transformer_ar.c`, which is the module
+      carrying the byte-exact voice-file layout contract. Worth doing, **not** worth
+      doing for a figure that is not resident. What is left: that, and `serve()`
+      re-running `model_init` per one-shot `mynah_tts_synthesize` (~1.1 ms/request,
+      0.2% of a 580 ms TTFA — the streaming path serves many requests per `serve()`)
+- [x] E10-13 **`sea_taps_all()` keyed a cache on a pointer malloc can recycle** — fixed
+      in `9cfa4fc` with the 64-sample content fingerprint `src/convq8.c` already carried,
+      and gated by mutating the buffer in place rather than by free-then-malloc, so the
+      hazard is reached deterministically on every platform. E10-5's own gate had found
+      it: freed one tensor, allocated another of the same shape at the same address,
+      relative error 0.0046 → 1.45 and nothing crashed. The test also gives
+      `sea_taps_all()` its first caller on a `BLAS=scalar` build, where it was compiled,
+      unreferenced and warned about
 - [~] E10-14 **built and measured; the default is the open half** — the reference's
       "int8 convtranspose is slower than f32 sgemm" **does not hold for our kernel**:
       `convtr.gemm` **93.4 → 44.8 ms (2.09×)**, and on top of the conv1d half

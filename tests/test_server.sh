@@ -76,7 +76,28 @@ echo "health      $(curl -s "$BASE/health")"
 curl -s "$BASE/health" | grep -q '"status":"ok"' || fail "/health"
 
 curl -s "$BASE/v1/voices" | grep -q '"voices"' || fail "/v1/voices"
-echo "voices      ok"
+
+# THE VOICE COMES FROM THE SERVER, not from this file.
+#
+# It used to be the literal "Sofia", which exists in models/fake-magpie and in
+# no other pack -- so running this suite against the real PocketTTS pack failed
+# at the first synthesis with `unknown 'voice'` and every serving check after
+# it never ran. A gate that can only be pointed at the synthetic pack does not
+# cover the thing that ships.
+# `name` and not `id`: /v1/voices returns both, the id is a NUMBER, and the
+# `voice` field of a request takes the name.
+VOICE="${VOICE:-$(curl -s "$BASE/v1/voices" \
+    | tr ',' '\n' | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 | sed 's/.*"\([^"]*\)"$/\1/')}"
+[ -n "$VOICE" ] || fail "/v1/voices listed no usable name"
+# A SECOND, DIFFERENT voice: several checks below depend on two requests being
+# distinguishable, and a pack with one voice would make them vacuous rather
+# than failing. Falls back to the first, and the checks that need two say so.
+VOICE2="${VOICE2:-$(curl -s "$BASE/v1/voices" \
+    | tr ',' '\n' | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | sed -n '2p' | sed 's/.*"\([^"]*\)"$/\1/')}"
+[ -n "$VOICE2" ] || VOICE2="$VOICE"
+echo "voices      ok (using \"$VOICE\" and \"$VOICE2\")"
 
 curl -s "$BASE/v1/models" | grep -q '"object":"list"' || fail "/v1/models"
 echo "models      ok"
@@ -86,7 +107,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/nope")
 echo "404         ok"
 
 code=$(curl -s -o "$TMP/err.json" -w '%{http_code}' -X POST "$BASE/v1/audio/speech" \
-    -H 'Content-Type: application/json' -d '{"voice":"Sofia"}')
+    -H 'Content-Type: application/json' -d '{"voice":"'"$VOICE"'"}')
 [ "$code" = "400" ] || fail "missing input returned $code, expected 400"
 grep -q 'invalid_request_error' "$TMP/err.json" || fail "error body not OpenAI-shaped"
 echo "missing in  ok (400)"
@@ -96,7 +117,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/audio/speech" \
 [ "$code" = "400" ] || fail "mp3 returned $code, expected 400"
 echo "mp3 reject  ok (400)"
 
-REQ='{"input":"server parity check","voice":"Sofia","seed":7}'
+REQ='{"input":"server parity check","voice":"'"$VOICE"'","seed":7}'
 
 curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
     -H 'Content-Type: application/json' -d "$REQ" -o "$TMP/batch.wav"
@@ -144,7 +165,7 @@ curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
 p1=$!
 curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
     -H 'Content-Type: application/json' \
-    -d '{"input":"a different concurrent request","voice":"Leo","seed":9}' -o "$TMP/c2.wav" &
+    -d '{"input":"a different concurrent request","voice":"'"$VOICE2"'","seed":9}' -o "$TMP/c2.wav" &
 p2=$!
 wait $p1 || fail "concurrent client 1 failed"
 wait $p2 || fail "concurrent client 2 failed"
@@ -157,7 +178,7 @@ echo "concurrent  ok (both complete; the repeated request is still identical)"
 # --- Native route ----------------------------------------------------------
 curl -s --max-time 600 -X POST "$BASE/v1/tts" \
     -H 'Content-Type: application/json' \
-    -d '{"text":"server parity check","speaker":"Sofia","seed":7}' -o "$TMP/native.wav"
+    -d '{"text":"server parity check","speaker":"'"$VOICE"'","seed":7}' -o "$TMP/native.wav"
 cmp -s "$TMP/native.wav" "$TMP/repro1.wav" || fail "/v1/tts differs from /v1/audio/speech"
 echo "native /tts ok (same audio as the OpenAI route)"
 
@@ -184,7 +205,7 @@ echo "native /tts ok (same audio as the OpenAI route)"
 for i in 1 2 3 4; do
     curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
         -H 'Content-Type: application/json' \
-        -d "{\"input\":\"batching under load check\",\"voice\":\"Sofia\",\"seed\":$i}" \
+        -d "{\"input\":\"batching under load check\",\"voice\":\"$VOICE\",\"seed\":$i}" \
         -o "$TMP/serial$i.wav" || fail "serial client $i failed"
 done
 
@@ -192,7 +213,7 @@ pids=""
 for i in 1 2 3 4; do
     curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
         -H 'Content-Type: application/json' \
-        -d "{\"input\":\"batching under load check\",\"voice\":\"Sofia\",\"seed\":$i}" \
+        -d "{\"input\":\"batching under load check\",\"voice\":\"$VOICE\",\"seed\":$i}" \
         -o "$TMP/p$i.wav" &
     pids="$pids $!"
 done
@@ -218,8 +239,8 @@ echo "batching    ok (4 concurrent == 4 serial, byte-identical and pairwise dist
 # scheduler, admitted into the next batch, and still return exactly the audio
 # it would get alone. The batching test above cannot see this path: there every
 # client arrives on an idle server, so nothing is running when they queue.
-LONG='{"input":"this deliberately longer sentence keeps the decoder busy for a while so that a later request truly arrives in the middle of a running synthesis","voice":"Sofia","seed":21}'
-SHORT='{"input":"late arrival","voice":"Leo","seed":22}'
+LONG='{"input":"this deliberately longer sentence keeps the decoder busy for a while so that a later request truly arrives in the middle of a running synthesis","voice":"'"$VOICE"'","seed":21}'
+SHORT='{"input":"late arrival","voice":"'"$VOICE2"'","seed":22}'
 curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
     -H 'Content-Type: application/json' -d "$LONG" -o "$TMP/adm_long_solo.wav"
 curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
@@ -243,8 +264,8 @@ echo "admission   ok (request arriving mid-synthesis is served and byte-identica
 # Streaming runs alone behind the synthesis lock by design; this asserts that
 # streams and batches interleaved under load neither deadlock nor perturb each
 # other: every client must get exactly the audio of the same request run alone.
-SREQ='{"input":"streaming under load","voice":"Leo","seed":31,"stream":true}'
-BREQ='{"input":"mixed load check","voice":"Sofia","seed":32}'
+SREQ='{"input":"streaming under load","voice":"'"$VOICE2"'","seed":31,"stream":true}'
+BREQ='{"input":"mixed load check","voice":"'"$VOICE"'","seed":32}'
 curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
     -H 'Content-Type: application/json' -d "$BREQ" -o "$TMP/mix_b_solo.wav"
 curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
@@ -302,7 +323,7 @@ grep -q "missing 'input'" "$TMP/j_nest.json" ||
 
 code=$(curl -s -o "$TMP/j_emoji.wav" -w '%{http_code}' -X POST "$J" \
     -H 'Content-Type: application/json' \
-    -d '{"input":"hello \ud83d\ude00 world","voice":"Sofia","seed":7}')
+    -d '{"input":"hello \ud83d\ude00 world","voice":"'"$VOICE"'","seed":7}')
 [ "$code" = "200" ] || fail "a surrogate pair was refused ($code)"
 head -c 4 "$TMP/j_emoji.wav" | grep -q RIFF || fail "the emoji request returned no audio"
 echo "json        ok (offset in the error, non-object refused, nested key is not"
@@ -374,8 +395,8 @@ if curl -sf --max-time 2 "http://127.0.0.1:$AUX_PORT/health" > /dev/null 2>&1; t
     fail "something is already serving on port $AUX_PORT"
 fi
 
-WREQ='{"input":"warm up parity","voice":"Sofia","seed":11}'
-WREQ_OTHER='{"input":"warm up parity control","voice":"Sofia","seed":11}'
+WREQ='{"input":"warm up parity","voice":"'"$VOICE"'","seed":11}'
+WREQ_OTHER='{"input":"warm up parity control","voice":"'"$VOICE"'","seed":11}'
 
 start_aux "$AUX_PORT" --warmup 1
 curl -s "http://127.0.0.1:$AUX_PORT/health" | grep -q '"warmups":{"requested":1,"done":1}' ||
