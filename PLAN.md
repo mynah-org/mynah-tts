@@ -213,7 +213,9 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 
 **No kernel is done until both ISAs exist and self-test. GPU deferred.**
 
-- [ ] E4-1 **correct the AVX-512 VNNI claim** in `README.md` — the code is AVX2 only
+- [x] E4-1 **the README understated x86, in the opposite direction** — `src/qmat.c` has
+      both an EVEX and a VEX VNNI kernel behind target attributes now; the text called the
+      lane unbuilt. 0.427 stays a floor because it predates them
 - [x] E4-2 `--dispatch-map` + costmap **done**; 8 rows resolve UNKNOWN and each names the
       predicate to add — that is E4's real to-do list
 - [x] E4-2a **done** `6ad9ada` — 0 UNKNOWN rows in every configuration · add the 8 named predicates so no row resolves UNKNOWN
@@ -448,7 +450,10 @@ does not.
       (−2.1/−2.3%), admission cap **measured and rejected** (+0.4 to +1.0%), `fastexit`
       **dark** (−1.9/−4.9%) until it runs on x86. All three −7.0% at 32 threads — and
       **production is narrow, where all three are noise**
-- [ ] E9-5 **the census and the dispatch report disagree about quantization**: a
+- [x] E9-5 **closed by E10-4d** — the row was not the defect; the default spec's bare
+      clauses were inheriting f16 from a base that had changed underneath them. Original
+      text follows
+- [-] E9-5-orig: a
       default run carries f16 on every projection while `quant.requested` reads `off`,
       because that row describes the cache default and not the per-group spec. Two
       reports, one truth — fix the row, not the census
@@ -468,7 +473,10 @@ does not.
       **65536**, and **4096**, which is what this binary uses on every non-aarch64
       target, costs **+16.7% at 32 threads**. Measure the knee on x86 and set it from a
       number rather than from a constant nobody has re-derived
-- [ ] E9-6 **`MYNAH_QUANT=` empty is not `MYNAH_QUANT` unset** — the empty value
+- [x] E9-6 **one reader now, and empty means unset** — there were four readers and the
+      fourth was mine (E10-4d chose its spec with a raw `getenv`). Verified: unset, empty
+      and a typo give byte-identical audio, and the typo warns. Original text follows
+- [-] E9-6-orig — the empty value
       produces different audio *and* a ~1.8x different wall on HEAD, which is how a
       lane's A/B harness measured the wrong workload on both sides of a pair and
       read it as contention. Pre-existing. Either treat empty as unset or refuse it
