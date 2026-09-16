@@ -631,8 +631,10 @@ the x86 self-test that judges the two kernels written here and never executed
 - [~] E10-5a **the ELU was the largest phase, and it was a scalar `expf` loop** — 33.6%
       of the region, larger than both GEMMs the item named. Vectorised with a
       bounded-range exp we own (max absolute error **5.96e-08** on [-88,0], gated and
-      mutation-tested): **elu 53.4 → 18.1 ms (2.96×), `codec.conv_stack` 164.6 → 128.5
-      (1.28×)**. Audio: 51-59 samples of ~120,000 differ, every one by exactly **1 LSB of
+      mutation-tested): **elu 53.4 → 18.1 ms (2.96×)**. The `codec.conv_stack` figure first reported as
+      1.28× was an **Accelerate** number; re-measured in the shipping `BLAS=none`
+      configuration it is **1.08×** (335.3 → 309.2 ms), because the ELU is 5.6% of that
+      region rather than 11.6% — see [`.work/measuring-the-codec.md`](.work/measuring-the-codec.md). Audio: 51-59 samples of ~120,000 differ, every one by exactly **1 LSB of
       int16**, identical length. AVX2 twin still to write.
 - [ ] E10-5 **the SEANet conv stack is entirely f32** — `codec_conv` in our spec is only
       `mimi.quantizer.output_proj [512][32]`, so **25.6% of the wall has no quantized
