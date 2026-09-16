@@ -3104,8 +3104,8 @@ static int pocket_model_init(const mynah_tts_model *model,
         if (strcmp(spec, "default") == 0) {
             /* With no MYNAH_QUANT to obey, the default names its own encodings
              * rather than inheriting a base that has changed underneath it. */
-            spec = (getenv("MYNAH_QUANT") == NULL) ? POCKET_QG_DEFAULT_SPEC_PINNED
-                                                   : POCKET_QG_DEFAULT_SPEC;
+            spec = (mynah_qmat_qtype_from_env() < 0) ? POCKET_QG_DEFAULT_SPEC_PINNED
+                                                      : POCKET_QG_DEFAULT_SPEC;
         }
         if (pocket_qgroups_parse(spec, &state->qgroups, state->qgroup_qtype, error,
                                  capacity) != 0) {

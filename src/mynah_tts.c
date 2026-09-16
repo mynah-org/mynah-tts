@@ -398,8 +398,11 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
      * bare 3, following the same precedent as src/dispatch.c; qmat.h should
      * export the enum so neither of us has to mirror it. */
     enum { QMAT_QTYPE_F16 = 3 };
+    /* mynah_qmat_qtype_from_env(), not getenv: `MYNAH_QUANT=` empty and a typo
+     * both mean "nothing was asked for" there, and this branch has to agree
+     * with that or the two of us reintroduce the third meaning between us. */
     int qtype_request = -1;
-    if (!is_magpie && getenv("MYNAH_QUANT") == NULL) {
+    if (!is_magpie && mynah_qmat_qtype_from_env() < 0) {
         qtype_request = QMAT_QTYPE_F16;
     }
     model->qcache = mynah_qmat_cache_new(qtype_request);

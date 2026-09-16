@@ -2188,15 +2188,58 @@ int mynah_qmat_qtype_from_name(const char *name) {
 
 int mynah_qmat_qtype_resolved(int qtype) { return qmat_qtype_available(qtype); }
 
+/* MYNAH_QUANT, resolved once, with no third meaning.
+ *
+ * It used to have one.  `MYNAH_QUANT` unset reaches src/mynah_tts.c:402, which
+ * asks for f16 on every non-Magpie engine.  `MYNAH_QUANT=` -- empty, which is
+ * what a shell writes for MYNAH_QUANT="$SOMETHING" when SOMETHING is not set --
+ * is a non-NULL string that matches none of the three names, so it fell through
+ * to f32.  Unset and empty therefore selected DIFFERENT encodings, ~1.8x apart
+ * in wall clock and different in audio, and a measurement harness that wrote the
+ * empty form put both arms of a paired A/B on the wrong workload and read the
+ * result as machine contention.  A typo -- `int-8` -- did the same thing
+ * silently.
+ *
+ * Now: empty means unset, because that is what a shell means by it, and an
+ * unrecognised value says so on stderr and then means unset too.  Neither can
+ * still select a third encoding nobody named.  The group-spec parser next door
+ * already fails a model load on an unknown group name, for the reason that
+ * applies here -- "a typo that silently quantizes nothing would show up as a
+ * quality result, which is the worst place to discover it".  This cannot fail
+ * the load from inside a cache constructor with no error channel, so it is loud
+ * instead of fatal, and it says it once.
+ *
+ * Returns a QMAT_* code, or -1 for "nothing was asked for". */
+int mynah_qmat_qtype_from_env(void) {
+    static int cached = -2;
+    if (cached != -2) return cached;
+    const char *env = getenv("MYNAH_QUANT");
+    if (env == NULL || env[0] == '\0') {
+        cached = -1;
+        return cached;
+    }
+    if (strcmp(env, "int8") == 0) cached = QMAT_INT8;
+    else if (strcmp(env, "int4") == 0) cached = QMAT_INT4;
+    else if (strcmp(env, "f16") == 0) cached = QMAT_F16;
+    else if (strcmp(env, "f32") == 0 || strcmp(env, "off") == 0) cached = QMAT_F32;
+    else {
+        fprintf(stderr,
+                "MYNAH_QUANT=\"%s\" is not an encoding (int8, int4, f16, f32/off). "
+                "Ignoring it and taking the default, which is NOT the same as "
+                "turning quantization off -- set MYNAH_QUANT=f32 if that is what "
+                "you meant.\n", env);
+        cached = -1;
+    }
+    return cached;
+}
+
 mynah_qmat_cache *mynah_qmat_cache_new(int enabled) {
     mynah_qmat_cache *c = (mynah_qmat_cache *)calloc(1, sizeof(*c));
     if (c == NULL) return NULL;
     int qtype = QMAT_F32;
     if (enabled < 0) {
-        const char *env = getenv("MYNAH_QUANT");
-        if (env != NULL && strcmp(env, "int8") == 0) qtype = QMAT_INT8;
-        else if (env != NULL && strcmp(env, "int4") == 0) qtype = QMAT_INT4;
-        else if (env != NULL && strcmp(env, "f16") == 0) qtype = QMAT_F16;
+        const int from_env = mynah_qmat_qtype_from_env();
+        if (from_env >= 0) qtype = from_env;
     } else if (enabled == QMAT_INT8 || enabled == QMAT_INT4 ||
                enabled == QMAT_F16) {
         qtype = enabled;

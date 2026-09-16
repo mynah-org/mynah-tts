@@ -23,6 +23,12 @@ typedef struct mynah_qmat_cache mynah_qmat_cache;
 
 /* enabled: 0 = always f32 (cache is a no-op passthrough), 1 = int8 for small
  * count.  Reads env MYNAH_QUANT ("int8"/"f32") when passed -1. */
+/* MYNAH_QUANT resolved to a QMAT_* code, or -1 when nothing was asked for.
+ * Empty is unset; an unrecognised value is reported once and is unset too.  Use
+ * this rather than reading the variable: two call sites reading it differently
+ * is what made `MYNAH_QUANT=` mean a third thing. */
+int mynah_qmat_qtype_from_env(void);
+
 mynah_qmat_cache *mynah_qmat_cache_new(int enabled);
 void mynah_qmat_cache_free(mynah_qmat_cache *cache);
 int mynah_qmat_cache_enabled(const mynah_qmat_cache *cache);
