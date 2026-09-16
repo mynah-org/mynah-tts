@@ -782,6 +782,26 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     size_t used = 0;      /* slots holding a request, live or just finished */
     int drained = 0;      /* the sink said there will be no more work */
 
+    /* ---- serving-loop occupancy (E10-11), MYNAH_SERVE_PROFILE=1 ----------
+     *
+     * The cost map answers "where did the wall go". It cannot answer "how many
+     * slots were live while it went there", and those are different questions:
+     * a worker at RTF 0.9 with one slot live is starved, and a worker at RTF
+     * 0.9 with sixteen live is full, and the fix for each is the opposite of
+     * the fix for the other. Our burst-TTFA model is arithmetic that lands
+     * within 4% of the measurement, which is a good model and still a model.
+     *
+     * Counters only, off unless asked, read once at the end. The row that
+     * matters most is `no work queued`: it is a share of WALL, not of work, so
+     * a large number there means the box was idle rather than saturated -- the
+     * distinction that decides whether a level failed on capacity or on
+     * variance. */
+    const int serve_profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
+    size_t occ_hist[MYNAH_GRAPH_MAX_JOBS + 1u];
+    size_t occ_frames = 0, occ_admits = 0, occ_free_nothing_queued = 0;
+    double occ_blocked_s = 0.0;
+    memset(occ_hist, 0, sizeof(occ_hist));
+
     for (;;) {
         /* ---- reap whatever the decoder lane finished --------------------
          * Non-blocking, and first, so that a unit that completed while the
@@ -813,12 +833,19 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             memset(&job, 0, sizeof(job));
             void *tag = NULL;
             const int block = (used == 0u);
-            if (sink->next_job(sink->ud, &job, &tag, block) != 1) {
+            const double t_block = (serve_profile && block) ? mynah_phase_seconds() : 0.0;
+            const int got = sink->next_job(sink->ud, &job, &tag, block);
+            if (serve_profile && block) occ_blocked_s += mynah_phase_seconds() - t_block;
+            if (got != 1) {
                 /* Nothing available. If we asked it to block and it still had
-                 * nothing, the service is over. */
+                 * nothing, the service is over.  A free slot that stayed free
+                 * because the queue was empty is the loop telling us the box is
+                 * ahead of its arrivals, which is the opposite of saturation. */
+                if (serve_profile) ++occ_free_nothing_queued;
                 if (block) drained = 1;
                 break;
             }
+            if (serve_profile) ++occ_admits;
             synth_slot *slot = &slots[index];
             memset(slot, 0, sizeof(*slot));
             slot->in_use = 1;
@@ -871,6 +898,10 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             step_ctxs[live] = slots[i].ctx;
             ++live;
         }
+        if (serve_profile) {
+            ++occ_frames;
+            occ_hist[live <= max_batch ? live : max_batch] += 1u;
+        }
         if (live > 0u) {
             step_live(engine, &caps, scratch, slots, step_ctxs, step_slot, results,
                       live, dump_all, lane_on);
@@ -892,6 +923,28 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             if (slot_retire(engine, sink, &slots[i], dump_all) != 0) result = -1;
             --used;
         }
+    }
+    if (serve_profile) {
+        const double wall = mynah_phase_seconds() - t_start;
+        size_t slot_frames = 0;
+        for (size_t b = 0; b <= max_batch; ++b) slot_frames += occ_hist[b] * b;
+        fprintf(stderr,
+                "[SERVE] frames=%zu admitted=%zu max_batch=%zu mean_live=%.2f "
+                "(1.00 = never batched)\n",
+                occ_frames, occ_admits, max_batch,
+                occ_frames ? (double)slot_frames / (double)occ_frames : 0.0);
+        fprintf(stderr, "[SERVE] live-slot histogram, share of frames:");
+        for (size_t b = 0; b <= max_batch; ++b) {
+            if (occ_hist[b] == 0u) continue;
+            fprintf(stderr, "  B%zu=%.1f%%", b,
+                    100.0 * (double)occ_hist[b] / (double)(occ_frames ? occ_frames : 1u));
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr,
+                "[SERVE] a free slot found no work queued %zu times; the loop "
+                "spent %.1f%% of wall blocked waiting for an arrival -- high "
+                "here means the box is IDLE, not saturated\n",
+                occ_free_nothing_queued, wall > 0.0 ? 100.0 * occ_blocked_s / wall : 0.0);
     }
     if (timing) {
         t_ar = mynah_phase_seconds();
