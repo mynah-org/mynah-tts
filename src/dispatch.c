@@ -2040,6 +2040,25 @@ int mynah_census_self_test(char *error, size_t error_capacity) {
      * cannot describe costs a round trip through CI for every guess. */
     mynah_census_reset();
     mynah_census_op(cs_block_a, cs_kind_a, 8, 8, 1, MYNAH_CENSUS_PATH_MATVEC_F32, -1);
+    /* AND AN INT8 OP ON THE BATCHED PATH, because "clean" is a property of the
+     * table RELATIVE TO THE HOST and the old table was only clean on some
+     * hosts.
+     *
+     * R3 refuses a census whose int8 kernel resolved to something and no int8
+     * projection carried it -- "the kernel named in this run's report never
+     * ran in it" -- and it is right to. A table holding one f32 matvec is
+     * exactly that census on any machine whose int8 kernel resolves: it
+     * failed on a GitHub x86 runner with `R3 quant.int8_kernel resolved to
+     * 'avx512vnni' and no int8 projection executed`, and passed on this arm64
+     * laptop and on the arm runner only because "neon-sdot" does not match the
+     * VNNI clause. Two runners of the same `ubuntu-latest` label differ in
+     * whether they have AVX-512 VNNI at all, so the old case was not merely
+     * platform-dependent, it was FLAKY BY MACHINE.
+     *
+     * The batched path specifically: it satisfies both R3 clauses at once, the
+     * VNNI one and the i8mm one (SMMLA is only reachable from the batched
+     * linear, so i8mm ON with no batched int8 call is its own refusal). */
+    mynah_census_op(cs_block_a, cs_kind_a, 8, 8, 1, MYNAH_CENSUS_PATH_BATCHED_Q, 1);
     {
         char why4[512];
         why4[0] = 0;
