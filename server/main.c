@@ -26,7 +26,7 @@
  *
  * STREAMING IS NOT A SECOND PATH. A streaming request is the same job with a
  * callback sink instead of a buffer sink, queued in the same queue and stepped
- * in the same batch (CLAUDE.md rule 7). That is what removed the global
+ * in the same batch (AGENTS.md rule 7). That is what removed the global
  * synthesis mutex: there is nothing left to serialize, because nothing but the
  * scheduler thread ever enters the model. The invariant is asserted rather
  * than commented -- see synth_assert_scheduler().

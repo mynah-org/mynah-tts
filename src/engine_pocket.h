@@ -40,7 +40,7 @@
  *     flow_net.in3.call{c-1}` to 0.0.
  *  3. **The noise is N(0, temperature)**, i.e. `std = sqrt(temperature)`
  *     (measured 0.539 over the dump's 128 draws at temperature 0.3, against
- *     sqrt(0.3) = 0.5477).  The generator is per context (CLAUDE.md rule 3);
+ *     sqrt(0.3) = 0.5477).  The generator is per context (AGENTS.md rule 3);
  *     there is no global RNG anywhere in this engine.
  *  4. **BOS is tracked explicitly, never as a NaN sentinel.**  Upstream marks
  *     the first audio position with NaN and substitutes `bos_emb` inside the
@@ -64,7 +64,7 @@
  *     (5.12 s) per chunk to be exact.  `decode_audio` therefore accepts only
  *     contiguous, monotonically increasing ranges, and it decodes one latent
  *     frame at a time so that offline and streaming are the same code path
- *     (CLAUDE.md rule 7).
+ *     (AGENTS.md rule 7).
  *
  * No dimension is compiled in.  Everything comes from the pack: `model.json`
  * for the declared numbers, `speakers.json` for the voice table, and the

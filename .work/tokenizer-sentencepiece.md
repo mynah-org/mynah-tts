@@ -26,7 +26,7 @@ real Italian model:
 
 **Policy**: reject a model whose normalizer is not `identity` or whose charsmap
 is non-empty, with a message naming both. Do not approximate it — that is the
-`CLAUDE.md` rule about not silently substituting a different normalizer. If one
+`AGENTS.md` rule about not silently substituting a different normalizer. If one
 is ever needed, the converter walks the darts trie offline and exports a sorted
 `src→dst` table into the pack (~80 LOC in C, inspectable data), rather than
 shipping 237 KB of opaque blob and a trie walker.
@@ -113,7 +113,7 @@ invalid `0xFF` yields `<0xEF> <0xBF> <0xBD>`. Consecutive UNKs are never merged.
 `max_sentencepiece_length = 6` is a **training** parameter in characters. The
 probe bound is in **bytes** and must be computed from the pieces: 9 or 10
 depending on language. Byte-token ids happen to be `4 + b` everywhere but must
-be built by scanning `type == BYTE` pieces (`CLAUDE.md` rule 6). `unk_id` comes
+be built by scanning `type == BYTE` pieces (`AGENTS.md` rule 6). `unk_id` comes
 from the piece of type UNKNOWN, not from TrainerSpec field 40 — that is what
 upstream's `InitializePieces` does.
 
@@ -250,7 +250,7 @@ and the pack bounds text length. The bound is documented so nobody later
 ### Deviations from the spec above, and why
 
 - **`remove_extra_whitespaces = 1` is rejected, not implemented.** Implementing
-  an untested normalizer branch is exactly the silent substitution `CLAUDE.md`
+  an untested normalizer branch is exactly the silent substitution `AGENTS.md`
   forbids. Same for `treat_whitespace_as_suffix` and a non-empty
   `pretokenization_delimiter` — **two guards this note did not list** but which
   would change tokenization without failing.

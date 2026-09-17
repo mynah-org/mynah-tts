@@ -71,7 +71,7 @@
  * Both fast paths below are the SAME arithmetic expressed as one GEMM per
  * kernel tap, which is what BLAS is for.  They are NOT bit-identical to the
  * scalar loops: the reduction over input channels is reassociated, so the two
- * agree to ~1e-6 relative, not exactly.  CLAUDE.md's numerical rule allows
+ * agree to ~1e-6 relative, not exactly.  AGENTS.md's numerical rule allows
  * that ("do not require byte-identical audio across different floating-point
  * orderings"); the parity gate against the oracle is what checks it, and the
  * scalar loop stays the reference implementation for every shape or build the

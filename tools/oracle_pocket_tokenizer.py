@@ -25,7 +25,7 @@ For the same reason the corpus is fed to `sp.encode(data, out_type=int)` with
 and `bytes` is the only entry point that reaches those paths.
 
 The corpus itself lives in `tools/corpus_pocket.py`, deterministic given --seed.
-Its output is generated, never committed (CLAUDE.md rule 8); `build/` is
+Its output is generated, never committed (AGENTS.md rule 8); `build/` is
 gitignored.
 
 Usage:

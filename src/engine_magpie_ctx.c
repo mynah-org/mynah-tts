@@ -71,7 +71,7 @@ struct mynah_engine_scratch {
 
 /* Everything one in-flight request owns. Nothing here is shared between
  * contexts except the read-only model, which is what makes the batched
- * projections safe (CLAUDE.md rule 3). */
+ * projections safe (AGENTS.md rule 3). */
 struct mynah_engine_ctx {
     const mynah_tts_model *model;
     const mynah_tts_request *request;

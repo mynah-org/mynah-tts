@@ -133,9 +133,9 @@ the ratio was internally consistent and looked like contention.  It was caught
 only by re-measuring on an idle box and finding the absolute still wrong.
 The `codec.conv_stack` conclusion was never affected (same env both sides, and
 the plain-invocation single runs agreed), but the end-to-end ratio was.
-Two lessons, both already in CLAUDE.md: a paired ratio does not protect you
-from measuring the wrong thing, and a green-looking harness has to be checked
-against a plain invocation.  The empty-vs-unset behaviour itself is
+Two lessons worth keeping: a paired ratio does not protect you from measuring
+the wrong thing, and a green-looking harness has to be checked against a plain
+invocation.  The empty-vs-unset behaviour itself is
 pre-existing, is not in these files, and will bite anyone else scripting an A/B.
 
 Note for whoever owns the pool: **HEAD gets nothing from 8 -> 16 cores on this

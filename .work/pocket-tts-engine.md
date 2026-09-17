@@ -71,7 +71,7 @@ The engine owns, per request: backbone KV cache (seeded from the voice file),
 SEANet conv ring buffers, decoder-transformer KV (context 250), current frame
 index, EOS state, and the text chunker position.
 
-**All of it must be per-context**, following `CLAUDE.md` rule 3. The streaming
+**All of it must be per-context**, following `AGENTS.md` rule 3. The streaming
 left-context constant comes from the E2 measurement, not from a guess, and it is
 an engine capability rather than a `#define`.
 
@@ -300,7 +300,7 @@ Magpie's, where RTF stayed at 0.3 and only TTFA collapsed under the mutex.
 
 **`RTF is 2.03 with f32 and 2.03 with int8, at one thread and at four.** The
 engine goes through neither `qmat` nor the thread pool: it is plain f32 with
-scalar matvecs. That is the correct order — `CLAUDE.md` requires correctness
+scalar matvecs. That is the correct order — `AGENTS.md` requires correctness
 against the oracle before SIMD, quantization or GPU — but it means the number
 above measures an unoptimized path, not the design.
 

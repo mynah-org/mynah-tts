@@ -269,7 +269,7 @@ malloc 2608  calloc 178  realloc 18  mmap 35  munmap 2      (all four runs)
 
 **The count does not move over an 8× range in frames**, while total bytes do.
 The allocations are per-request and per-stage; the autoregressive loop allocates
-nothing, which is what `CLAUDE.md` requires and what an arena would be built to
+nothing, which is what `AGENTS.md` requires and what an arena would be built to
 achieve. `BLAS=none` and `BLAS=scalar` are lower still (1,962 + 138, **2 mmap**);
 the 646 extra allocations and 33 extra mmaps under `BLAS=openblas` are
 OpenBLAS's own, and they leave with it under E4-16.

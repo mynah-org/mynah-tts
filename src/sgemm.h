@@ -163,7 +163,7 @@ void mynah_sgemm_f32_reference(int trans_a, int trans_b,
  * Families
  *
  * A family is a RESIDENCY STRATEGY, not a tuning constant.  The micro-kernel
- * is shared on purpose (CLAUDE.md coding rule 5: one formula, one reference);
+ * is shared on purpose (AGENTS.md coding rule 5: one formula, one reference);
  * what differs is which operand stays in registers and how many times the
  * other one is streamed.
  * ------------------------------------------------------------------------ */

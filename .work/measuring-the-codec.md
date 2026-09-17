@@ -34,7 +34,7 @@ it is:
 The ELU phase itself still improves about 3×. What changed is its share: 11.6%
 of the region under Accelerate, **5.6%** under the BLAS that ships.
 
-CLAUDE.md already says an Apple Silicon number is a development signal and not a
+An Apple Silicon number is a development signal and not a
 product claim, and the commit did label it as one. That was not enough. A scale
 factor between platforms is expected and survives being labelled; a change in
 **which phase dominates** does not, because it decides what to work on next.

@@ -174,7 +174,7 @@ All of them depend on ONNX Runtime or ggml; none is dependency-free C.
 ## 8. Known upstream limitations
 
 - The reference implementation is **not thread-safe** and its server does **not
-  support concurrent requests** (stated in the repo's `AGENTS.md`). Concurrency
+  support concurrent requests** (stated upstream). Concurrency
   is therefore a genuine differentiator for us, not a rewrite for its own sake.
 - On long inputs the model **skips parts of sentences**; upstream mitigation is
   chunking (`MAX_TOKEN_PER_CHUNK = 50`). This is a model property. Do not try to

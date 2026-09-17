@@ -2,7 +2,7 @@
 
 Status: **IN PROGRESS** — `tools/oracle_pocket.py` written and running (2026-09-12); `tests/parity_pocket.py` still to do
 
-`CLAUDE.md`: *"Every new stage gets a Python oracle dump before downstream work
+`AGENTS.md`: *"Every new stage gets a Python oracle dump before downstream work
 depends on it."* This epic is that dump, and it is cheap: the reference
 implementation is pip-installable and CPU-only.
 

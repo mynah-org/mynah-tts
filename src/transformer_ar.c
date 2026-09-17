@@ -287,7 +287,7 @@ static void tar_rows_release(tar_rows *rows) {
 }
 
 /* Sizes and carves one row-set scratch.  Everything a pass touches lives in the
- * single `block`, so a pass allocates nothing (CLAUDE.md rule 4). */
+ * single `block`, so a pass allocates nothing (AGENTS.md rule 4). */
 static int tar_rows_reserve(tar_rows *rows,
                             const mynah_transformer_ar_config *config,
                             size_t attn_dim, size_t count, char *error,

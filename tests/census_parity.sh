@@ -42,7 +42,7 @@ if [ ! -x "$BIN" ]; then
 fi
 if [ ! -d "$MODEL" ]; then
     echo "SKIP: no model pack at $MODEL — reporting the skip rather than"
-    echo "      substituting an unrecorded claim (CLAUDE.md testing checklist)"
+    echo "      substituting an unrecorded claim (AGENTS.md testing checklist)"
     exit 0
 fi
 
@@ -290,14 +290,14 @@ if not grew:
     raise SystemExit(0)
 
 # WHICH counter grew decides whether this is our defect or the platform's.
-# CLAUDE.md rule 4 is about the code in this repo. A BLAS that takes a
+# AGENTS.md rule 4 is about the code in this repo. A BLAS that takes a
 # workspace per gemm call is a fact about the build, not a rule violation --
 # but it is never silent, because it is the thing that made a 24-step and a
 # 96-step run differ and someone will chase it.
 ours = {k: v for k, v in grew.items() if k != "posix_memalign"}
 if ours:
     print(f"  FAIL: {grew} across 4x the steps. Something in the autoregressive")
-    print(f"        loop allocates (CLAUDE.md rule 4). Find it before shipping.")
+    print(f"        loop allocates (AGENTS.md rule 4). Find it before shipping.")
     raise SystemExit(1)
 
 n = grew["posix_memalign"]

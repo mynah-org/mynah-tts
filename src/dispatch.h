@@ -431,7 +431,7 @@ void mynah_census_reset(void);
  * (2,608 malloc + 178 calloc) with an LD_PRELOAD counter, and the decisive
  * part was not the number: it was that the number is CONSTANT across
  * --max-steps, which is the evidence that the autoregressive loop allocates
- * nothing (CLAUDE.md rule 4).  That property is worth a permanent check, so
+ * nothing (AGENTS.md rule 4).  That property is worth a permanent check, so
  * `make alloc-constant-test` asserts it rather than trusting the comment.
  *
  * The counter itself lives OUTSIDE the runtime, in tests/alloc_shim.c, which

@@ -9,7 +9,7 @@ hand and a measured plan.
 ## Problem
 
 There is no seam. `src/tts_engine.h` and `src/engine_magpie.c` are designed in
-the plan and named in `CLAUDE.md`, but do not exist. Everything lives in
+the plan and named in `AGENTS.md`, but do not exist. Everything lives in
 `src/graph.c` (4283 LOC, 68 functions), the public header carries Magpie's
 dimensions, and the JSON parser cannot represent a per-engine config.
 
@@ -142,7 +142,7 @@ capability — see E2-3), `STREAM_EMIT_FRAMES 16` (`:33`),
 `stacking == 2` (`:770`), the `4u` EOS floor (`:3971`), `layers <= 4`
 (`:834-847`), and the whole FSQ block (`:2653-2687`).
 
-## Shared mutable state — CLAUDE.md rule 3 violations found
+## Shared mutable state — AGENTS.md rule 3 violations found
 
 1. **`model->codec_cache`** (`mynah_tts_internal.h:16`) — mutable BNNS/tap cache
    hung off a `const mynah_tts_model *`, written by `codec_cached_taps`

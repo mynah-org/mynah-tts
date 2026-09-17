@@ -32,7 +32,7 @@
 /* Per-model engine state: weights resolved once, read-only afterwards. */
 typedef struct mynah_engine_state mynah_engine_state;
 /* Per-request state: KV caches, ring buffers, frame history, sampler position.
- * Exactly one per in-flight request (CLAUDE.md rule 3). */
+ * Exactly one per in-flight request (AGENTS.md rule 3). */
 typedef struct mynah_engine_ctx mynah_engine_ctx;
 /* Scratch for one batched step, owned by the driver and lent for the call. */
 typedef struct mynah_engine_scratch mynah_engine_scratch;

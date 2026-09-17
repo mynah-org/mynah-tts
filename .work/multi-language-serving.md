@@ -195,5 +195,5 @@ needs some language.
   admission wearing a different hat, and it was measured and lost
   ([`serving-design.md`](serving-design.md) §6).
 - **No in-process registry as a "low-concurrency mode".** Two serving shapes for
-  one job is the second implementation CLAUDE.md rule 7 forbids, and the one
+  one job is the second implementation AGENTS.md rule 7 forbids, and the one
   that gets less traffic is the one that rots.

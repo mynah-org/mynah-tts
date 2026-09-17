@@ -606,7 +606,7 @@ static int cq8_run(size_t m, size_t n, size_t k, size_t taps, int trans,
      *   That trade is refused; 64 channels costs nothing measurable.
      *
      * Both numbers are from THIS machine and are a development signal, not a
-     * product claim (CLAUDE.md).  What is not host-specific is their shape:
+     * product claim.  What is not host-specific is their shape:
      * too shallow to amortise a kernel, too close to the output to hide a
      * residual. */
     if (k * taps < 128u || m < 64u) {

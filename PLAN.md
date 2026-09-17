@@ -1107,7 +1107,6 @@ mynah-tts/
 ├── tests/
 ├── docs/
 ├── Makefile
-├── CLAUDE.md
 ├── AGENTS.md
 └── PLAN.md
 ```

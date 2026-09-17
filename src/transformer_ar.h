@@ -91,7 +91,7 @@
  *      only the weights are shared.  Here the arithmetic per row MUST NOT
  *      change with N — see `mynah_transformer_ar_linear_rows_fn`.
  *
- * Both are one graph, not two (CLAUDE.md rule 7): the layer body is written
+ * Both are one graph, not two (AGENTS.md rule 7): the layer body is written
  * once, over an array of rows, and the two entry points differ only in where a
  * row's KV cache and position come from.  With no hook installed both fall back
  * to the same per-row `mynah_matvec_bias_f32` the single `_step` uses, so the
@@ -223,7 +223,7 @@ typedef struct mynah_transformer_ar_state mynah_transformer_ar_state;
 /* Per-context state: KV cache, RoPE table and every scratch buffer `_step`
  * needs.  Weights are *not* captured; they stay owned read-only by the model
  * and are passed to each forward, so one weight set backs many contexts
- * (CLAUDE.md rule 3). */
+ * (AGENTS.md rule 3). */
 mynah_transformer_ar_state *mynah_transformer_ar_state_new(
     const mynah_transformer_ar_config *config, char *error,
     size_t error_capacity);

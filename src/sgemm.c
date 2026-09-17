@@ -70,7 +70,7 @@
  * One micro-kernel body, three instruction sets.  The scalar build is not a
  * separate algorithm: SG_LANES == 1 makes a "vector" one float, so the scalar
  * path executes the same loop nest with the same accumulation order.  That is
- * CLAUDE.md coding rule 5 expressed in code rather than in a comment -- there
+ * AGENTS.md coding rule 5 expressed in code rather than in a comment -- there
  * is no second formula to keep in sync.
  * ====================================================================== */
 #if !defined(MYNAH_DISABLE_SIMD) && (defined(__ARM_NEON) || defined(__aarch64__))

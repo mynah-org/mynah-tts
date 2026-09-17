@@ -5,7 +5,7 @@ Item: `PLAN.md` E10-5.  Files: `src/convq8.{c,h}` (new), `src/qmat.c`
 `src/engine_pocket.c`, `tests/codec_int8_quality.py`.
 
 All numbers on this Mac, `BLAS=none`, `MYNAH_THREADS=2`, `models/pocket-en`,
-seed 1 — a **development signal, not a product claim** (CLAUDE.md).  The
+seed 1 — a **development signal, not a product claim**.  The
 measurement rule from [`measuring-the-codec.md`](measuring-the-codec.md) is
 followed: everything here is `BLAS=none`, because that is what Linux ships and
 because the Accelerate numbers put the phases in a different order.
@@ -191,7 +191,7 @@ Eight decibels on the waveform for almost nothing on log-mel — which is the
 *transformer's* failure mode (a different but spectrally equivalent signal),
 not the conv1d stack's (a broadband residual).  That is the more forgiving of
 the two, and it is still not a call to make from a Mac: the **quality** half of
-the trade transfers to Linux and the **speed** half does not, and CLAUDE.md is
+the trade transfers to Linux and the **speed** half does not, and is
 explicit that a performance claim about production comes from production
 hardware.  So it is one string away —
 `MYNAH_QUANT_GROUPS=...,codec_convtr:int8` — with both numbers written down,

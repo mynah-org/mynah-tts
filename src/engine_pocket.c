@@ -660,7 +660,7 @@ static int pocket_qtype_for(const signed char *qtype_of_bit, unsigned group) {
  * `transformer_ar` owns no cache and knows no tensor name on purpose, so the
  * quantized projection path is installed from here: one hook per transformer,
  * carrying the model's shared int8/int4/f16 cache and a table of cache keys
- * built once at load.  Nothing is formatted or allocated per call (CLAUDE.md
+ * built once at load.  Nothing is formatted or allocated per call (AGENTS.md
  * rule 4): the key is a pointer into a flat table indexed by layer and kind.
  *
  * The cache is the model's, not the context's, so N concurrent requests share
@@ -709,7 +709,7 @@ typedef struct {
  * The scratch is deliberately NOT tied to a hook type: there is one per context
  * (for its own tiles) and one per driver batch (for the cross-request step), and
  * wiring a shared hook straight into `linear_user` would have made N requests
- * share one activation buffer -- CLAUDE.md rule 3 with a data race attached. */
+ * share one activation buffer -- AGENTS.md rule 3 with a data race attached. */
 typedef struct {
     size_t rows;   /* widest call this scratch can serve */
     size_t k_max;  /* widest reduction this scratch can serve */
@@ -956,7 +956,7 @@ struct mynah_engine_scratch {
  *
  * So the engine can write the same shape of dump.  It is OFF unless
  * MYNAH_POCKET_DUMP names a directory, every buffer is allocated once in
- * ctx_new (CLAUDE.md rule 4: the decode loop still allocates nothing, parses
+ * ctx_new (AGENTS.md rule 4: the decode loop still allocates nothing, parses
  * nothing and opens nothing), and the files are written when the context is
  * freed.  Steps are stacked into one array per tensor rather than one file per
  * call: the number of rows IS the frame count, so a group that changes how
@@ -982,7 +982,7 @@ struct pocket_dump {
 
 /* --------------------------------------------------------------- the RNG
  *
- * Per context, never global (CLAUDE.md rule 3): two requests in one process
+ * Per context, never global (AGENTS.md rule 3): two requests in one process
  * must not be able to consume each other's draws. splitmix64 plus Box-Muller;
  * the spare normal is kept so a frame costs one transcendental pair per two
  * values rather than per value. */
@@ -3452,7 +3452,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     }
 
     /* Sizes. Every buffer the AR loop and the codec touch is allocated here so
-     * that neither allocates again (CLAUDE.md rule 4). */
+     * that neither allocates again (AGENTS.md rule 4). */
     const size_t attn_dim = cfg->heads * cfg->head_dim;
     size_t backbone_capacity = 0;
     size_t voice_floats = 0;
@@ -3859,7 +3859,7 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     }
     if (count == 0u) return 0;
     /* The staging arrays below are fixed-size because the decode loop must not
-     * allocate (CLAUDE.md rule 4), so a batch wider than this engine declares
+     * allocate (AGENTS.md rule 4), so a batch wider than this engine declares
      * is refused rather than silently narrowed -- and refused before anything
      * has moved, which is the whole contract. */
     if (count > POCKET_MAX_BATCH) {
@@ -4242,7 +4242,7 @@ static void pocket_truncate(mynah_engine_ctx *ctx, size_t frame_count) {
  * This is the whole codec, and it exists as its own function because the engine
  * now decodes frames from two places -- one context's range, and a gang of
  * ranges belonging to different contexts.  Those are two schedules over one
- * body, not two implementations (CLAUDE.md rule 7), and writing it that way is
+ * body, not two implementations (AGENTS.md rule 7), and writing it that way is
  * what makes `decode_audio_batch`'s bit-identity STRUCTURAL rather than a
  * property the tests have to keep rediscovering: there is no second arithmetic
  * path for a frame to take when it happens to share a call.

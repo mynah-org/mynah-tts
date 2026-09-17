@@ -68,8 +68,8 @@ build, so the machine was neither quiet nor warm.
 
 Nothing was published from it, but it would have made "eight cores buy 15%"
 read as "eight cores buy 85%", which is the opposite conclusion and would have
-sent the next person to thread the region harder. `CLAUDE.md` already says to
-measure differences rather than absolutes on a noisy machine; the specific
+sent the next person to thread the region harder. Measuring differences rather
+than absolutes on a noisy machine is the standing practice; the specific
 lesson here is narrower — **a single cost-map reading right after a build is
 not a measurement**, and this region's spread is 7-18%, so anything under a
 five-run median is noise.

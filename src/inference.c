@@ -12,7 +12,7 @@
  * by an array-shaped sink that hands out its N requests and then says "no
  * more"; a server is served by a sink that keeps saying "here is another one".
  * Both walk the same admission block at the top of the same `for(;;)`, which is
- * why an offline batch and a live stream cannot drift apart (CLAUDE.md rule 7).
+ * why an offline batch and a live stream cannot drift apart (AGENTS.md rule 7).
  */
 #include "costmap.h"
 #include "graph.h"
@@ -110,7 +110,7 @@ static int emit_stream_samples(mynah_tts_audio_callback callback, void *user_dat
 /* One decode handed to the decoder lane -- E5-21.
  *
  * It lives inside the slot rather than being allocated per decode: nothing in
- * the AR loop may allocate (CLAUDE.md rule 4), and a unit the lane is reading
+ * the AR loop may allocate (AGENTS.md rule 4), and a unit the lane is reading
  * must outlive the call that submitted it. One per slot is also the bounded
  * contract made structural -- there is nowhere to put a second. */
 typedef struct {

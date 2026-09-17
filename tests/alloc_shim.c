@@ -15,7 +15,7 @@
  *     the count is CONSTANT across --max-steps
  *
  * which is the evidence that the autoregressive loop allocates nothing
- * (CLAUDE.md rule 4).  A comment claiming that can rot in a week.  `make
+ * (AGENTS.md rule 4).  A comment claiming that can rot in a week.  `make
  * alloc-constant-test` runs two synthesis lengths under this shim and fails if
  * the counts differ, so the property is checked instead of remembered.
  *

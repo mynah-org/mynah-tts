@@ -10,7 +10,7 @@ for what to do about the gaps found here.
 
 The runtime's *infrastructure* transfers almost completely. The runtime's
 *model core* transfers not at all, because mynah-tts today is a discrete-codec
-engine and PocketTTS is a continuous-latent one. `CLAUDE.md` already anticipated
+engine and PocketTTS is a continuous-latent one. `AGENTS.md` already anticipated
 exactly this case: *"Do not make Magpie's discrete codec API pretend to be a
 universal latent API."*
 
@@ -51,11 +51,11 @@ These are findings, each verified in the tree.
 
 1. **The engine seam does not exist.** `PLAN.md` §4 designs `src/tts_engine.h`
    and `src/engine_magpie.c` with `prepare/step/flush/reset`. Neither file
-   exists. `CLAUDE.md` names `src/engine_magpie.c` as a source of truth; it is
+   exists. `AGENTS.md` names `src/engine_magpie.c` as a source of truth; it is
    not there. `info.engine` is read in `src/mynah_tts.c:214` and used only to
    print a string — **zero dispatch**.
 
-2. **`graph.c` is the monolith `CLAUDE.md` forbids.** 4283 LOC, 51% of `src/`:
+2. **`graph.c` is the monolith `AGENTS.md` forbids.** 4283 LOC, 51% of `src/`:
    generic primitives, Magpie encoder/decoder, NanoCodec, KV cache and the slot
    driver all in one translation unit. `PLAN.md:1011-1024` already carries this
    as an open TODO ("Move request state, AR stepping and codec state out of
@@ -64,7 +64,7 @@ These are findings, each verified in the tree.
 3. **The public header is Magpie-shaped.** `src/mynah_tts.h:17-41` exposes
    `codebook_count`, `codebook_size`, `frame_stacking_factor`,
    `audio_bos_id`/`audio_eos_id`, `local_transformer_layers`; `mynah_tts_request`
-   carries `use_local_transformer`. This violates the `CLAUDE.md` rule "no Magpie
+   carries `use_local_transformer`. This violates the `AGENTS.md` rule "no Magpie
    dimensions in public headers" **today**, and a continuous-latent model has
    none of these fields.
 

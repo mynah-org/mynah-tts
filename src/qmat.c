@@ -1680,7 +1680,7 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
  * row's reduction order never depends on how the rows are partitioned.
  *
  * The three kernels below are NOT bit-identical to one another -- they reduce
- * in different orders, which CLAUDE.md's numerical rules allow across ISAs and
+ * in different orders, which AGENTS.md's numerical rules allow across ISAs and
  * which self_test_f16() bounds against an exact f64 dot.  What they ARE is
  * fed by bit-identical weights: see qmat_f16_pack(). */
 #if defined(MYNAH_QMAT_F16_NEON)
@@ -4490,7 +4490,7 @@ done:
  * 2 ULP is not a tolerance on the quantity being tested: a wrong row sum lands
  * ~1e5 int32 units away, which is millions of ULP.  It is a bound on
  * reassociation of a product that the language permits the compiler to
- * reorder.  CLAUDE.md's numerical rule allows exactly this ("do not require
+ * reorder.  AGENTS.md's numerical rule allows exactly this ("do not require
  * byte-identical audio across different floating-point orderings"), and no
  * process ever mixes the two kernels: qmat_u8_level() resolves once and is
  * immutable for the life of the process. */
