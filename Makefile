@@ -665,9 +665,19 @@ $(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o: gpu/cuda/backend_cuda.cu
 	@command -v nvcc >/dev/null 2>&1 || (echo "nvcc is required for CUDA; install the NVIDIA CUDA toolkit" >&2; exit 2)
 	nvcc -Isrc -O2 $(CUDA_ARCH_FLAGS) -Xcompiler "-Wall,-Wextra" -c $< -o $@
 
-$(CUDA_TARGET): $(CUDA_CORE_OBJECTS) $(CUDA_CLI_OBJECT) $(CUDA_HOST_OBJECT)
+# $(LDLIBS), not a hand-written `-lm`: the CPU and Metal targets both link
+# through LDLIBS, and this one spelled its libraries out instead -- so when
+# third_party/ingot became a dependency it was added to LDLIBS and this rule
+# never saw it. `make cuda` then failed to link on EVERY machine, with or
+# without a GPU:
+#
+#     undefined reference to `ingot_st_open'
+#
+# Nothing caught it because nothing built the CUDA target anywhere; the
+# compile-only CI job found it on its first run.
+$(CUDA_TARGET): $(CUDA_CORE_OBJECTS) $(CUDA_CLI_OBJECT) $(CUDA_HOST_OBJECT) | $(INGOT_LIB)
 	@mkdir -p $(@D)
-	nvcc $(CUDA_ARCH_FLAGS) $(filter %.o,$^) -lm -lcublas -o $@
+	nvcc $(CUDA_ARCH_FLAGS) $(filter %.o,$^) $(LDLIBS) -lcublas -o $@
 
 cuda: $(CUDA_TARGET)
 	@echo "CUDA build ready: $(CUDA_TARGET)"
