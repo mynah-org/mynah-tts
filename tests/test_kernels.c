@@ -843,20 +843,39 @@ static void tail_sweep(void) {
             memcpy(acc, a, sizeof(float) * n);
             mynah_residual_add_f32(acc, b, n);
             for (size_t i = 0; i < n; ++i) {
-                const double e = mynah_vecmath_ulp(
-                    acc[i], (double)a[i] + (double)b[i]);
-                if (e > worst) { worst = e; worst_elem = "residual_add"; }
+                /* CONDITIONED, not ULP -- the same argument the dot product
+                 * above is measured by, and for the same reason: `a + b` is a
+                 * two-term sum and it can cancel to nothing, so the scale it
+                 * lives on is |a| + |b| and not the size of what came out. */
+                const double e = rel_to_scale(acc[i],
+                                              (double)a[i] + (double)b[i],
+                                              fabs((double)a[i]) +
+                                                  fabs((double)b[i]));
+                if (e > worst_rel) { worst_rel = e; worst_name = "residual_add"; }
             }
         }
-        /* axpy */
+        /* axpy
+         *
+         * MEASURED IN ULP UNTIL NOW, AND THAT IS WHAT BROKE.  `a + 0.375*b`
+         * cancels exactly like the dot above, and a cancelled result has so
+         * few significant bits left that one rounding of an INPUT is a
+         * thousand ULP of the OUTPUT.  Which rounding you get is an ISA
+         * property: with FMA the kernel rounds once and lands near the double
+         * reference, without it the multiply and the add round separately.
+         *
+         * So this passed on aarch64, where FMA always exists, and on an x86
+         * build with -mfma -- and failed only on a baseline x86 build, at
+         * 1024.0 ULP, on a Linux sanitizer job. The absolute error was never
+         * more than about one ULP of the inputs. */
         if (n > 0) {
             float acc[M];
             memcpy(acc, a, sizeof(float) * n);
             mynah_axpy_f32(acc, b, 0.375f, n);
             for (size_t i = 0; i < n; ++i) {
-                const double e = mynah_vecmath_ulp(
-                    acc[i], (double)a[i] + 0.375 * (double)b[i]);
-                if (e > worst) { worst = e; worst_elem = "axpy"; }
+                const double e = rel_to_scale(
+                    acc[i], (double)a[i] + 0.375 * (double)b[i],
+                    fabs((double)a[i]) + fabs(0.375 * (double)b[i]));
+                if (e > worst_rel) { worst_rel = e; worst_name = "axpy"; }
             }
         }
         /* rmsnorm (mean square) */
