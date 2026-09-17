@@ -1853,6 +1853,7 @@ int main(int argc, char **argv) {
      * request one different from request two". */
     g.warmups = 1u;
     int prefork_workers = 0;
+    int workers_explicit = 0;
     int prefork_threads = 0;
     int prefork_plan_only = 0;
     /* E5-21. Off by default, and the default is not timidity: below four cpus
@@ -1875,6 +1876,7 @@ int main(int argc, char **argv) {
             host = argv[++i];
         } else if ((strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--workers") == 0) && i + 1 < argc) {
             g.worker_count = atoi(argv[++i]);
+            workers_explicit = 1;
         } else if (strcmp(argv[i], "--max-batch") == 0 && i + 1 < argc) {
             g.max_batch = (size_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-pending") == 0 && i + 1 < argc) {
@@ -1965,6 +1967,48 @@ int main(int argc, char **argv) {
     if (g.worker_count > 64) g.worker_count = 64;
     if (g.max_batch < 1u) g.max_batch = 1u;
     if (g.max_batch > mynah_tts_max_batch()) g.max_batch = mynah_tts_max_batch();
+
+    /* THE HTTP WORKER COUNT IS THE BATCH CEILING FOR NON-STREAMING REQUESTS,
+     * and it used to be one silently.
+     *
+     * A streaming request hands its job to the scheduler and goes straight
+     * back to accept() -- the comment on that path already says why: "a worker
+     * blocked here for the length of an utterance is a server whose
+     * parallelism is its worker count, not its batch width". A NON-streaming
+     * request cannot do that yet, because the worker owns the socket it must
+     * eventually write the WAV to, so it parks in job_wait() for the whole
+     * utterance. One parked thread per in-flight request means at most
+     * `worker_count` requests can ever be in the queue at once, whatever
+     * --max-batch says.
+     *
+     * Measured on this tree, eight concurrent non-streaming requests against
+     * `--max-batch 8`, from the MYNAH_SERVE_PROFILE census:
+     *
+     *     -w 4 (the old default):  mean_live 3.37, histogram capped at B4
+     *     -w 8:                    mean_live 5.94, B8 = 64.7% of frames
+     *
+     * The shipped default was `-w 4 --max-batch 8`: /health advertised 8, the
+     * banner printed 8, and the machine could not exceed 4. On an engine whose
+     * dominant region is memory-bandwidth bound -- `step.backbone` gets 1.15x
+     * from eight cores, see .work/backbone-bandwidth.md -- batch width is the
+     * only throughput lever there is, so this was halving the lever on the
+     * default configuration.
+     *
+     * So the default now follows --max-batch, and an explicit -w below it is
+     * reported rather than silently obeyed. The real fix is to stop parking a
+     * thread per request at all, which is a change to how the non-streaming
+     * response is written; PLAN.md E5-24. */
+    if (!workers_explicit && (size_t)g.worker_count < g.max_batch) {
+        g.worker_count = (int)g.max_batch;
+    }
+    if ((size_t)g.worker_count < g.max_batch) {
+        fprintf(stderr,
+                "note: -w %d is below --max-batch %zu, so non-streaming "
+                "requests can never batch wider than %d: a worker thread is "
+                "parked for each one until its WAV is written. Streaming "
+                "requests are not affected.\n",
+                g.worker_count, g.max_batch, g.worker_count);
+    }
 
     signal(SIGPIPE, SIG_IGN);   /* a client hanging up mid-stream is routine */
 

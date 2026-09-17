@@ -99,6 +99,21 @@ VOICE2="${VOICE2:-$(curl -s "$BASE/v1/voices" \
 [ -n "$VOICE2" ] || VOICE2="$VOICE"
 echo "voices      ok (using \"$VOICE\" and \"$VOICE2\")"
 
+# THE ADVERTISED BATCH WIDTH MUST BE REACHABLE.
+#
+# A non-streaming request parks an HTTP worker in job_wait() until its WAV is
+# written, so at most `workers` of them can be in the queue at once. With the
+# old default -- workers 4, max_batch 8 -- /health advertised 8 and the live
+# slot census never exceeded 4 (mean_live 3.37); with workers 8 the same eight
+# requests reached B8 for 64.7% of frames. That is the only throughput lever
+# this engine has, so the ceiling must not be advertised higher than it is.
+HEALTH="$(curl -s "$BASE/health")"
+hw=$(printf '%s' "$HEALTH" | grep -o '"workers":[0-9]*' | head -1 | cut -d: -f2)
+hb=$(printf '%s' "$HEALTH" | grep -o '"max_batch":[0-9]*' | head -1 | cut -d: -f2)
+[ -n "$hw" ] && [ -n "$hb" ] || fail "/health did not report workers and max_batch"
+[ "$hw" -ge "$hb" ] || fail "workers $hw is below max_batch $hb: non-streaming requests can never reach the advertised batch width"
+echo "batch ceiling ok (workers $hw >= max_batch $hb)"
+
 curl -s "$BASE/v1/models" | grep -q '"object":"list"' || fail "/v1/models"
 echo "models      ok"
 

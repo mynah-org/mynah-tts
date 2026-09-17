@@ -863,6 +863,21 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       been a silent no-op that reads as "prefork does not help". 15/15 server tests in
       prefork mode. **Not verified: real `sched_setaffinity`, a real `/sys` read, any
       many-core number** — E5-23
+- [ ] E5-24 **a non-streaming request parks a worker thread, so the HTTP worker count is
+      the batch ceiling** — the streaming path already hands its job to the scheduler and
+      goes back to `accept()`, and the comment there says why: *"a worker blocked here for
+      the length of an utterance is a server whose parallelism is its worker count, not
+      its batch width"*. The non-streaming path cannot, because the worker owns the socket
+      it must write the WAV to, so it sits in `job_wait()` for the whole utterance.
+      **Measured**, eight concurrent non-streaming requests at `--max-batch 8`:
+      `-w 4` → mean_live **3.37**, histogram capped at **B4**; `-w 8` → mean_live **5.94**,
+      **B8 = 64.7%** of frames. The shipped default was `-w 4 --max-batch 8`, so `/health`
+      advertised a width the machine could not reach — and on an engine whose dominant
+      region is bandwidth-bound (E10-15), batch width is the *only* throughput lever.
+      Mitigated: the default now follows `--max-batch` and an explicit `-w` below it is
+      reported, gated in `tests/test_server.sh`. **The fix is structural**: the completion
+      path should write the response the way the streaming path does, so no thread is
+      parked per in-flight request. qwen-tts's v2 server is the reference for the shape
 - [ ] E5-23 **verify prefork on real Linux hardware**: `sched_setaffinity` against the
       kernel, `/sys/devices/system/cpu` topology, and the four-step W/T procedure that
       `--prefork-plan` already prints. Nothing about capacity is claimed until this runs
