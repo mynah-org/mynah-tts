@@ -2031,12 +2031,25 @@ int mynah_census_self_test(char *error, size_t error_capacity) {
         }
     }
 
-    /* 4. a clean table does not refuse. */
+    /* 4. a clean table does not refuse.
+     *
+     * THE REASON IS CARRIED, not discarded.  This used to pass NULL, so when
+     * it failed on a Linux sanitizer build it could say "a clean table
+     * refused" and not which of R1..R4 did it -- the one fact needed to fix
+     * it, thrown away by the call itself.  A gate that detects a problem it
+     * cannot describe costs a round trip through CI for every guess. */
     mynah_census_reset();
     mynah_census_op(cs_block_a, cs_kind_a, 8, 8, 1, MYNAH_CENSUS_PATH_MATVEC_F32, -1);
-    if (mynah_census_refusals(NULL, 0) != 0) {
-        rc = cs_fail(error, error_capacity, "census: a clean table refused");
-        goto done;
+    {
+        char why4[512];
+        why4[0] = 0;
+        if (mynah_census_refusals(why4, sizeof why4) != 0) {
+            char msg4[600];
+            snprintf(msg4, sizeof msg4, "census: a clean table refused: %s",
+                     why4[0] ? why4 : "(no reason reported)");
+            rc = cs_fail(error, error_capacity, msg4);
+            goto done;
+        }
     }
 
     /* 5. two threads accumulate independently and merge exactly. */
