@@ -808,7 +808,14 @@ static void tail_sweep(void) {
     enum { M = 40 };
     float a[M], b[M], out[M], w[M], bias[M];
     double worst = 0.0, worst_rel = 0.0;
+    /* TWO METRICS, TWO NAMES.  These shared one `worst_name`, so whichever
+     * kernel updated last named BOTH lines of the report: the run that found
+     * this printed "worst reducing kernel: 1.05e-07 (axpy)" while axpy is an
+     * elementwise kernel, and the elementwise failure named no kernel at all.
+     * A report that can attribute a number to the wrong kernel is worse than
+     * one that says nothing, because it is acted on. */
     const char *worst_name = "none";
+    const char *worst_elem = "none";
 
     rng_seed(0x7A11);
     for (size_t n = 0; n <= M; ++n) {
@@ -838,7 +845,7 @@ static void tail_sweep(void) {
             for (size_t i = 0; i < n; ++i) {
                 const double e = mynah_vecmath_ulp(
                     acc[i], (double)a[i] + (double)b[i]);
-                if (e > worst) { worst = e; worst_name = "residual_add"; }
+                if (e > worst) { worst = e; worst_elem = "residual_add"; }
             }
         }
         /* axpy */
@@ -849,7 +856,7 @@ static void tail_sweep(void) {
             for (size_t i = 0; i < n; ++i) {
                 const double e = mynah_vecmath_ulp(
                     acc[i], (double)a[i] + 0.375 * (double)b[i]);
-                if (e > worst) { worst = e; worst_name = "axpy"; }
+                if (e > worst) { worst = e; worst_elem = "axpy"; }
             }
         }
         /* rmsnorm (mean square) */
@@ -862,7 +869,7 @@ static void tail_sweep(void) {
             for (size_t i = 0; i < n; ++i) {
                 const double e = mynah_vecmath_ulp(
                     out[i], (double)a[i] * scale * (double)w[i]);
-                if (e > worst) { worst = e; worst_name = "rmsnorm"; }
+                if (e > worst) { worst = e; worst_elem = "rmsnorm"; }
             }
         }
         /* layernorm, both forms, measured against the row scale -- see
@@ -952,10 +959,11 @@ static void tail_sweep(void) {
                       "sin length %zu differs at %zu", n, i);
         }
     }
-    printf("   worst elementwise kernel: %.1f ulp\n", worst);
+    printf("   worst elementwise kernel: %.1f ulp (%s)\n", worst, worst_elem);
     printf("   worst reducing kernel: %.2e relative to the sum of the "
            "magnitudes of its terms (%s)\n", worst_rel, worst_name);
-    CHECK(worst <= 8.0, "an elementwise kernel is %.1f ulp out", worst);
+    CHECK(worst <= 8.0, "the elementwise kernel %s is %.1f ulp out", worst_elem,
+          worst);
     CHECK(worst_rel <= 2.0e-6,
           "a reducing kernel is %.2e out relative to its own conditioning "
           "(%s)", worst_rel, worst_name);
