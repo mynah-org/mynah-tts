@@ -177,3 +177,80 @@ Not fixed, with the reason:
 
 After the three fixes `src/qmat.c` and `src/convq8.c` analyze clean, and
 `src/transformer_ar.c`'s only remaining hit is the pre-existing disabled one.
+
+## 2026-09-17 — GREEN, and what the runners found
+
+`docs/plan-board-pocket-tts` went up as PR #2 and all three workflows are
+green on it: **Build & Test 19/19 jobs, Memory Safety 4/4, Code Quality**.
+
+That closes the item this note opened. The `link-only: x86 SIMD=avx512` job
+that produced every red run of 2026-09-13 passes: the guard-aware step accepts
+a binary that refuses to start with the ISA guard's message, and fails on a
+SIGILL or any other exit. It had been committed and unproven since September
+because proving it needed a push.
+
+### Four defects, none reproducible on the development machine
+
+The branch was green locally on five BLAS/SIMD configurations, `make test`,
+goldens, leaks and UBSan before it was pushed. The runners found four things
+anyway, and the pattern in all four is the same: **a configuration that only
+exists somewhere else.**
+
+1. **x86 did not compile at all.** `QMAT_F16_BATCH_LANES` was defined inside
+   `#if defined(MYNAH_QMAT_F16_NEON)` while the loop using it is guarded by
+   `MYNAH_QMAT_F16`, which x86 satisfies through F16C. One bug, three red
+   workflows. The f16 batched lanes had been written on an arm64 laptop and
+   never built anywhere else.
+
+2. **A test that was flaky by machine.** The census self-test's "clean table"
+   case held one f32 matvec, which is exactly the census R3 refuses -- an int8
+   kernel resolved and nothing carried it. It passed wherever the int8 kernel
+   is `neon-sdot` and failed on a runner whose kernel is `avx512vnni`. **Two
+   runners behind the same `ubuntu-latest` label differ in whether they have
+   AVX-512 VNNI** (the same label reported `avx2 fma` on 2026-09-13 and
+   `avx512vnni` today), so Build & Test passed on one machine while Memory
+   Safety failed on another in the same push.
+
+3. **A report that named the wrong kernel.** `tail_sweep` tracked two metrics
+   through one `worst_name`, so the run printed "worst reducing kernel:
+   1.05e-07 (axpy)" -- axpy being elementwise -- and the elementwise failure
+   named no kernel at all.
+
+4. **A metric that measured the data, not the kernel.** `axpy` was checked in
+   ULP of `a + 0.375*b`, a sum that cancels; one rounding of an input is a
+   thousand ULP of a cancelled output, and whether you get one rounding or two
+   is whether the build has FMA. 1024.0 ULP on baseline x86, no defect behind
+   it. The file already carried the correct argument for the dot product two
+   cases earlier.
+
+Two of the four were *diagnostics that could not describe what they had
+found*, and each cost a round trip through CI to guess at. Both now carry the
+reason. That is the lesson worth keeping from this day: **on a configuration
+you cannot reproduce, the quality of the failure message is the iteration
+time.**
+
+### What the CI now covers that it did not
+
+- Both sanitizers on **both architectures**. ASan and UBSan ran on x86 only,
+  so the NEON, SDOT and SMMLA kernels -- the ones production executes -- were
+  never sanitized on Linux. The arm runner reports `dotprod` and `i8mm` **ON**,
+  so what is sanitized there is the shipped path.
+- The nine link-only profiles **run the kernels**, not just `--version` and
+  `--dispatch-map`. They are the only place `SIMD=portable`, `SIMD=scalar`,
+  `BLAS=scalar` and the armv8-a baseline are built at all, and defect 4 lived
+  in exactly that gap.
+- Every `start` in that step is **checked**. They were bare calls under
+  `set +e`, so only the last one could fail the job.
+- Each profile also runs the self-test under **`MYNAH_QMAT_VNNI=scalar`**,
+  which forces the portable unsigned int8 encoding -- what x86 executes and
+  what an arm runner never resolves on its own.
+
+### Still not covered, and honestly
+
+- **VPDPBUSD is executed only by luck.** Some `ubuntu-latest` runners have
+  AVX-512 VNNI and some do not, and which you get is not selectable. Good
+  enough to have caught defect 2; not something to build a claim on. A
+  measured x86 number still needs a real x86 box.
+- **No GPU anywhere**, and `gpu/cuda/backend_cuda.cu` and `gpu/metal/*` are
+  compiled by nobody, on no runner. `nvcc` and `xcrun metal` both compile
+  without a device, so this is a compile-only job away.
