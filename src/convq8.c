@@ -309,10 +309,14 @@ static const cq8_entry *cq8_memo_get(const float *weight, size_t m, size_t k,
  * scratch and the loop cannot disagree about the size. */
 #define CQ8_TILE_FLOATS 8192u
 
+/* Column-gather slices, one per quantization task: the pass below runs on the
+ * pool and two tasks must not share the vector they gather into. */
+#define CQ8_QUANT_TASKS_MAX 32u
+
 typedef struct {
     unsigned char *xq;  /* [span][k] in this host's activation encoding */
     float *sx;          /* [span] activation scales                     */
-    float *tmp;         /* one transposed tile, CQ8_TILE_FLOATS or k    */
+    float *tmp;         /* [CQ8_QUANT_TASKS_MAX][k] gather slices       */
     size_t span, k;
 } cq8_scratch;
 
@@ -350,8 +354,8 @@ static cq8_scratch *cq8_scratch_get(size_t span, size_t k) {
         float *ns = (float *)realloc(s->sx, sp * sizeof(float));
         if (ns == NULL) return NULL;
         s->sx = ns;
-        size_t tmp_floats = CQ8_TILE_FLOATS;
-        if (tmp_floats < kk * 8u) tmp_floats = kk * 8u;
+        if (kk > (size_t)-1 / CQ8_QUANT_TASKS_MAX) return NULL;
+        const size_t tmp_floats = kk * CQ8_QUANT_TASKS_MAX;
         float *nt = (float *)realloc(s->tmp, tmp_floats * sizeof(float));
         if (nt == NULL) return NULL;
         s->tmp = nt;
@@ -454,6 +458,33 @@ static void cq8_prof_report(void) {
     }
     fprintf(stderr, "  total quant %.3f ms, gemm %.3f ms, quant share %.1f%%\n",
             tq, tg, (tq + tg) > 0.0 ? 100.0 * tq / (tq + tg) : 0.0);
+}
+
+/* One block of activation columns: gather each column out of the window --
+ * which is strided by `ldb` -- and quantize it into this host's encoding. */
+#define CQ8_QUANT_MIN_WORK (1u << 13)
+
+typedef struct {
+    const float *b;
+    size_t ldb, k, span, cols;
+    unsigned char *xq;
+    float *sx;
+    float *tmp;      /* [CQ8_QUANT_TASKS_MAX][k] */
+} cq8_quant_job;
+
+static void cq8_quant_task(void *ctx, int index) {
+    const cq8_quant_job *j = (const cq8_quant_job *)ctx;
+    const size_t first = (size_t)index * j->cols;
+    if (first >= j->span) return;
+    size_t count = j->span - first;
+    if (count > j->cols) count = j->cols;
+    float *tmp = j->tmp + ((size_t)index % CQ8_QUANT_TASKS_MAX) * j->k;
+    for (size_t c = 0; c < count; ++c) {
+        const size_t col = first + c;
+        const float *src = j->b + col;
+        for (size_t p = 0; p < j->k; ++p) tmp[p] = src[p * j->ldb];
+        j->sx[col] = mynah_qmat_act_quantize(j->xq + col * j->k, tmp, j->k);
+    }
 }
 
 /* ------------------------------------------------------------- the region */
@@ -636,11 +667,37 @@ static int cq8_run(size_t m, size_t n, size_t k, size_t taps, int trans,
      * the memory pattern: it is the quantizer, which is two passes of scalar
      * float work per column.  Vectorising THAT is what moved the number
      * (see quantize_act_int8 in src/qmat.c). */
-    for (size_t col = 0; col < span; ++col) {
-        const float *src = b + col;
-        float *tmp = sc->tmp;
-        for (size_t p = 0; p < k; ++p) tmp[p] = src[p * ldb];
-        sc->sx[col] = mynah_qmat_act_quantize(sc->xq + col * k, tmp, k);
+    {
+        cq8_quant_job qj;
+        qj.b = b; qj.ldb = ldb; qj.k = k; qj.span = span;
+        qj.xq = sc->xq; qj.sx = sc->sx; qj.tmp = sc->tmp;
+        /* ON THE POOL, and this is not a micro-optimisation.
+         *
+         * It ran on the calling thread, and on the Axion that made it the
+         * serial fraction of this whole file: measured 3.766 ms at two
+         * threads and 3.805 ms at sixteen -- flat, while the GEMM it feeds
+         * went 16.7 -> 7.7 ms. Its share of the int8 path went 18.4% -> 33.0%
+         * with eight times the cores, which is Amdahl and nothing else.
+         *
+         * Every column is independent and the writes are disjoint (column
+         * `col` owns xq[col*k .. ) and sx[col]), so this is bit-identical by
+         * threads.h's own contract. Each task gathers into its own slice of
+         * `tmp` because two tasks sharing one gather vector would race. */
+        size_t tasks = 1u;
+        const int threads = mynah_num_threads();
+        if (threads > 1 && span * k >= CQ8_QUANT_MIN_WORK) {
+            tasks = (size_t)threads;
+            if (tasks > CQ8_QUANT_TASKS_MAX) tasks = CQ8_QUANT_TASKS_MAX;
+            if (tasks > span) tasks = span;
+        }
+        qj.cols = (span + tasks - 1u) / tasks;
+        if (qj.cols == 0u) qj.cols = 1u;
+        tasks = (span + qj.cols - 1u) / qj.cols;
+        if (tasks <= 1u || tasks > (size_t)0x7fffffff) {
+            cq8_quant_task(&qj, 0);
+        } else {
+            mynah_parallel_for((int)tasks, cq8_quant_task, &qj);
+        }
     }
     const unsigned long long t_gemm = prof ? cq8_now() : 0u;
 
