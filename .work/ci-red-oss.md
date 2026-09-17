@@ -181,7 +181,7 @@ After the three fixes `src/qmat.c` and `src/convq8.c` analyze clean, and
 ## 2026-09-17 — GREEN, and what the runners found
 
 `docs/plan-board-pocket-tts` went up as PR #2 and all three workflows are
-green on it: **Build & Test 19/19 jobs, Memory Safety 4/4, Code Quality**.
+green on it: **Build & Test 22/22 jobs, Memory Safety 4/4, Code Quality**.
 
 That closes the item this note opened. The `link-only: x86 SIMD=avx512` job
 that produced every red run of 2026-09-13 passes: the guard-aware step accepts
@@ -245,12 +245,43 @@ time.**
   which forces the portable unsigned int8 encoding -- what x86 executes and
   what an arm runner never resolves on its own.
 
+### The GPU backends are compiled now, and that found a fifth defect
+
+`gpu/cuda/backend_cuda.cu` and `gpu/metal/*` were built by nothing, anywhere,
+on a repo whose own contract calls them "optional build variants that must be
+validated on the target machine". They do not need the target machine to
+COMPILE: `nvcc` emits PTX and cubin with no device present and `xcrun metal`
+does the same for shaders. Two compile-only jobs, named so nobody reads them
+as "the GPU is tested" -- `nvidia/cuda:12.6.2-devel` at sm_70 and sm_90, and
+`make metal` on the macOS runner already in the matrix.
+
+**5. `make cuda` could not link on any machine.** The CUDA rule spelled its
+libraries out by hand (`-lm -lcublas`) where the CPU and Metal targets link
+through `$(LDLIBS)`, so when `third_party/ingot` became a dependency it was
+added to LDLIBS and that rule never saw it:
+
+    undefined reference to `ingot_st_open'
+
+Every `make cuda`, on every machine, with or without a GPU, since ingot
+landed. The job found it on its first run -- every object compiled, including
+the `.cu`, and it died at the link. **No GPU was needed to find a defect that
+made the GPU build unusable.**
+
+A second thing worth keeping: `CUDA_ARCH` defaults to `-arch=native`, and
+native means "ask the installed GPU", so `make cuda` cannot work on a machine
+without one. Every build farm is such a machine. CI names the architecture
+explicitly; a release build should too.
+
 ### Still not covered, and honestly
 
 - **VPDPBUSD is executed only by luck.** Some `ubuntu-latest` runners have
   AVX-512 VNNI and some do not, and which you get is not selectable. Good
   enough to have caught defect 2; not something to build a claim on. A
   measured x86 number still needs a real x86 box.
-- **No GPU anywhere**, and `gpu/cuda/backend_cuda.cu` and `gpu/metal/*` are
-  compiled by nobody, on no runner. `nvcc` and `xcrun metal` both compile
-  without a device, so this is a compile-only job away.
+- **Nothing runs on a GPU.** The two jobs above prove the sources compile and
+  link. They prove nothing about a kernel launching, being correct, or being
+  fast, and each job prints that in its own log so the distinction survives
+  being read by someone in a hurry.
+- **No model pack**, so every gate that needs weights -- the codec int8
+  quality gate, the oracle parity, the WAV smoke -- stays local. That is the
+  right trade: `models/` is gitignored and should stay so.
