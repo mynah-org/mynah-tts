@@ -1663,6 +1663,19 @@ static void matvec_q4(float *out, const int8_t *qx, float sx,
 }
 
 #if defined(MYNAH_QMAT_F16)
+/* Activations per weight load in the batched f16 lanes.
+ *
+ * DEFINED HERE, next to the F16 gate itself, and not inside the NEON block
+ * where it started.  Both the NEON and the F16C four-lane kernels use it, and
+ * the loop that uses it is guarded by MYNAH_QMAT_F16 -- which x86 satisfies
+ * through F16C.  So an x86 build saw the loop and not the macro, and did not
+ * compile at all: `error: 'QMAT_F16_BATCH_LANES' undeclared`.
+ *
+ * It was invisible for the same reason the whole x86 int8 half is: no machine
+ * in the fleet is x86, and the f16 lanes were written and never built there.
+ * Linux CI is what found it. */
+#define QMAT_F16_BATCH_LANES 4u
+
 /* Weights as IEEE half; activation and accumulation stay f32.  Decode is bound
  * by weight bytes, so halving them is close to halving the time -- measured
  * 2.4-2.8x against Accelerate sgemv on a working set too large to cache, and
@@ -1765,7 +1778,6 @@ static void matvec_f16_neon(float *out, const float *x, const __fp16 *weights,
  *
  * Register budget on aarch64 (32 vectors): 16 accumulators, 4 converted
  * weight vectors, 8 activation vectors. */
-#define QMAT_F16_BATCH_LANES 4u
 
 static void matvec_f16_neon_x4(float *o0, float *o1, float *o2, float *o3,
                                const float *x0, const float *x1,

@@ -1440,7 +1440,7 @@ static int probe_sgemm_family(char *out, size_t capacity, const char **why) {
 }
 
 static int probe_sgemm_selftest(char *out, size_t capacity, const char **why) {
-    static char text[240];
+    static char text[480];
     char err[192];
     err[0] = '\0';
     const int ok = mynah_sgemm_self_test(err, sizeof err) == 0;
