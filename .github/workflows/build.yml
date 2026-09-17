@@ -320,6 +320,60 @@ jobs:
           start env MYNAH_QMAT_VNNI=scalar ./build/cpu/mynah-tts --self-test || rc=1
           exit $rc
 
+  # ------------------------------------------------------------------ GPU
+  #
+  # COMPILE ONLY. No GPU exists on any of these runners and none of this
+  # proves a kernel is correct, fast, or even that it launches -- it proves
+  # the sources still compile and link, which is the thing that silently rots
+  # when nobody builds them. Before this, gpu/cuda/backend_cuda.cu and
+  # gpu/metal/* were compiled by no job on no runner: a CUDA backend that no
+  # longer built would have shipped that way until someone with a card tried
+  # it.
+  #
+  # nvcc turns .cu into PTX and cubin with no device present; only RUNNING
+  # needs one. Same for `xcrun metal` and the .metal shaders.
+  cuda-compile:
+    name: "compile-only: CUDA ${{ matrix.arch }} (no GPU)"
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two architectures, because an intrinsic or a __shfl variant can exist
+        # on one and not the other, and that is a compile error we can have for
+        # free. Neither needs the silicon to be present.
+        arch: [sm_70, sm_90]
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates
+
+      - uses: actions/checkout@v7
+
+      # CUDA_ARCH must be named. The Makefile defaults to `-arch=native`, and
+      # native means "ask the installed GPU", so `make cuda` cannot work on any
+      # machine without one -- which is every build farm.
+      - name: Compile and link the CUDA build
+        run: make cuda CUDA_ARCH=${{ matrix.arch }}
+
+      - name: Say what this did and did not prove
+        run: |
+          echo "::notice title=CUDA::Compiled and linked for ${{ matrix.arch }} with no GPU present. Nothing was executed: no kernel correctness, no performance, not even a launch."
+
+  metal-compile:
+    name: "compile-only: Metal (shaders + backend)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compile and link the Metal build
+        run: make metal
+
+      - name: Say what this did and did not prove
+        run: |
+          echo "::notice title=Metal::Shaders and the Objective-C backend compiled and linked. Nothing was executed on the GPU."
+
   release:
     needs: [build, link-only]
     runs-on: ubuntu-latest
