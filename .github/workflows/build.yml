@@ -299,8 +299,26 @@ jobs:
             echo "::error title=Unexpected exit::$* exited $rc without the ISA guard message"
             return 1
           }
-          start ./build/cpu/mynah-tts --version
-          start ./build/cpu/mynah-tts --dispatch-map
+          # EVERY `start` IS CHECKED. They used to be bare calls under
+          # `set +e`, so only the last one could fail the step: a refusal on
+          # --version was discarded by the next line.
+          rc=0
+          start ./build/cpu/mynah-tts --version     || rc=1
+          start ./build/cpu/mynah-tts --dispatch-map || rc=1
+          # AND RUN THE KERNELS, not just the report. These profiles are the
+          # only place SIMD=portable, SIMD=scalar, BLAS=scalar and the armv8-a
+          # baseline are ever compiled, and until now nothing executed them: a
+          # kernel wrong under SIMD=portable would link, print a dispatch
+          # table and ship. The self-tests are model-free and take seconds,
+          # and `start` keeps the ISA-guard contract -- a binary built for an
+          # ISA this runner lacks still refuses rather than SIGILLs.
+          start ./build/cpu/mynah-tts --self-test   || rc=1
+          # The portable unsigned int8 encoding (x+128 plus the row-sum
+          # correction) is what x86 runs and what an arm runner never
+          # resolves. `env` rather than a prefix on the shell function, whose
+          # assignment scope is not the same in every shell.
+          start env MYNAH_QMAT_VNNI=scalar ./build/cpu/mynah-tts --self-test || rc=1
+          exit $rc
 
   release:
     needs: [build, link-only]
