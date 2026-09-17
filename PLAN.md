@@ -591,23 +591,11 @@ the x86 self-test that judges the two kernels written here and never executed
       **zero** in the PocketTTS path. **Still open:** the f16 pack (183 MB) is owned by the
       engine *state*, so it is still built per worker; sharing it means moving that cache to
       the model — a different ownership question. Original item text follows.
-- [~] E10-3b **it may already be shared — and macOS cannot tell us.** Reading the code
-      after E10-3 landed: `state->qcache = model->qcache` (the cache is *already*
-      model-owned), `pocket_model_free()` does not free it, and `pocket_prepack_claim()`
-      memoises claimed caches in a **process-global** array — so the parent's warm builds
-      the pack, marks it, and children inherit both and skip prepack. If that holds, the
-      f16 pack is shared too and there is nothing left to move. **Unresolved here:**
-      per-worker physical footprint is flat at 216 MB whether W=2 or W=6, but that metric
-      does not separate inherited pages from private ones, and system-level deltas came
-      back 706 MB at W=2 against 482 MB at W=6 — noise, not signal. **Answer it on Linux
-      in one line:** `/proc/<worker>/smaps_rollup`, `Private_Dirty` against `Shared_Clean` —
-      both are immutable after build and both are built **per worker, after the fork**.
-      Measured per-worker private footprint: 582.1 MB (f16) / 414.1 MB (quant off), so
-      **≈8.3 GB at W=16**. The blocker in `server/prefork.h` does not apply to PocketTTS:
-      the pthread_t-keyed BNNS cache is in `conv1d.c`/`codec_nanocodec.c`, the Magpie
-      path, and `seanet.c` contains **zero** BNNS references. Warm conversions and prepack
-      only — never a synthesis. Also corrects the record: the 594/767 MB pair was RSS and
-      each contained the **same** 209 MB shared mmap of `tts.safetensors`
+- [x] E10-3b **answered on the box: the sharing is real** — `/proc/PID/smaps_rollup`
+      on four prefork workers gives **RSS 567 MB, PSS 124 MB, Private_Dirty 13 MB** each.
+      PSS is what a process actually owns, so the weights are shared after the fork and a
+      worker dirties 13 MB of its own: four workers cost about 300 + 3x124 MB rather than
+      4x567. E10-3's pre-fork warm does what it claimed, and macOS could not have told us
 - [~] E10-4 **batched int8 kernel landed (`ba2200d`), and the per-row GEMM loop is routed
       into it (`E10-4c`)** — `matvec_q8_neon_x4`, signed SDOT, bit-exact by arithmetic
       (int32 accumulation). `mynah_qmat_linear_resolved_qt` no longer runs a `[count][k]`
@@ -732,20 +720,30 @@ the x86 self-test that judges the two kernels written here and never executed
       ISA with the same `yield`; and **Linux x86-64 production runs 4096 `pause`es, never
       measured**. It is an iteration count, not a time budget, and `yield` vs `pause`
       differ 50-100× in duration — **one integer cannot be right on both**
-- [ ] E10-9 **our C64 is a wave result and the reference has the wave-vs-soak gap
-      measured** — their closed-loop runs push STREAM_RTF past 1.0 and make stalls
-      material at the same concurrency, with zero rejects or timeouts. Their regression
-      reproduces in **2-5 minutes at C6-C8**. We already have `--mode soak` (proper
-      closed loop, warm-up discarded, windowed drift gate, unit-tested) and **have never
-      run it**. Run it low and short before trusting C64
-- [ ] E10-10 **the topology claim comes from one machine** — `16x2` beats `1x32` by 2.2×
-      on RTF p95, measured only on the Axion. The reference ran the same class of question
-      across three Arm parts: on Graviton5 a **4×8** shape lost **4.45× per worker** with
-      aggregate bandwidth flat, against 1.57-1.81× on the V2 hosts. **Our 16×2 is four
-      times more aggressive than the shape that collapsed.** A standalone simultaneous-worker
-      screen is written (scratchpad, `shape_screen.c`, 4096×1024 f16 = our `linear1`, sized
-      so 16 workers exceed the 80 MiB L3); it needs ≥32 cores and cannot be answered on an
-      8-core Mac
+- [~] E10-9 **the soak has been run, and it says the screen was not capacity** →
+      [`.work/axion-c99-soak.md`](.work/axion-c99-soak.md). On the Axion, `16x2`, the
+      codec fully int8: **C99 on English `medium` for 10 minutes is GOOD** — 25014/25014,
+      RTF p95 **0.779**, TTFA p95 178 ms, prebuffer **0/0 ms**, stall 0%, and drift
+      **exactly +0.0000** over ten windows. Then **C99 on the MIXED bank for 30 minutes
+      is NOT STREAMABLE** — 54645/54645 completed, drift still passing, but
+      `stall_rate@500ms = 0.1%` against a mandatory zero. The mix is the difference:
+      audio 1.04-18.48 s, **sd 4.39** against the medium-only 0.298. The reference's
+      wave-vs-soak gap does **not** reproduce as drift here; what bites is the duration
+      spread. **A screen is never a qualification**, and we now have our own instance of
+      it, the two verdicts an hour apart. **To close**: the descending sweep on the mixed
+      bank (command in the note) to turn "not C99" into an operating point
+- [ ] E10-10 **the topology claim comes from one machine, and now has a prediction
+      against it** — `16x2` beats `1x32` by 2.2x on RTF p95, measured only on the Axion
+      and only at low concurrency. Every capacity number in
+      [`.work/axion-c99-soak.md`](.work/axion-c99-soak.md) is `16x2`, so it is assumed,
+      not tested. **The prediction now points the other way at high load**: `step.backbone`
+      is bandwidth-bound (E10-15), so sixteen workers are sixteen independent weight
+      streams against one memory roof — qwen-tts measured exactly this and concluded
+      *"two workers read the same weights twice per frame-time"*, i.e. prefork forecloses
+      the only large lever, which is amortising one weight pass over B slots. At C99 a
+      WIDER worker (`8x4`, `4x8`) should win. ~20 minutes on the box: the same soak
+      command with three shapes. Also still open: the reference's Graviton5 `4x8`
+      collapse (4.45x per worker) is a warning our 16x2 is four times more aggressive than
 - [x] E10-11 **the loop can say how many slots were live, and why the rest were not**
       (`f3f7ed3`). `MYNAH_SERVE_PROFILE=1`: live-slot histogram as a share of frames,
       mean live width with 1.00 labelled "never batched", free-slot-found-nothing-queued
@@ -784,35 +782,17 @@ the x86 self-test that judges the two kernels written here and never executed
       relative error 0.0046 → 1.45 and nothing crashed. The test also gives
       `sea_taps_all()` its first caller on a `BLAS=scalar` build, where it was compiled,
       unreferenced and warned about
-- [~] E10-14 **built and measured; the default is the open half** — the reference's
-      "int8 convtranspose is slower than f32 sgemm" **does not hold for our kernel**:
-      `convtr.gemm` **93.4 → 44.8 ms (2.09×)**, and on top of the conv1d half
-      `codec.conv_stack` **1.44×** further, whole request **1.12×** (5/5 paired rounds).
-      Cumulative against f32: region **1.76×**, request **1.19×**. `mynah_convq8_gemm_tn`
-      shares the memo, the activation pass and the kernel — only the weight gather
-      differs, because PyTorch stores a ConvTranspose1d weight with the logical row as a
-      column. **OFF by default**, as its own `codec_convtr` group, because it is a trade:
-      SNR **28.9-32.9 dB** against the conv1d half's 36.4-37.9, for almost no log-mel
-      change — the *transformer's* failure mode (a different but equivalent signal), not
-      the conv1d stack's (a broadband residual). The quality half of that trade transfers
-      to Linux and the speed half does not, so the default waits for the box. One
-      utterance said 32.0 dB; three texts said 28.9 — a bound from one utterance would
-      have been three decibels wrong in the direction that matters.
-      **To close**: re-take the speed number on Linux and flip the default if it holds
-- [~] E10-15 **`step.backbone` is a memory wall, and that is the finding** →
-      [`.work/backbone-bandwidth.md`](.work/backbone-bandwidth.md). It is **48.7%** of
-      `request.total` and gets **1.15× from eight cores** (220.6 → 191.8 ms, five-run
-      medians). One AR step reads every backbone weight once: 75.5M weights = **151 MB
-      at f16 per step**, measured at **32-38 GB/s** and flat in thread count. One MAC per
-      two bytes is a memory wall, not a parallelism problem. It independently confirms
-      the board's own "storing f32 instead of f16 is 2.22× slower on the backbone".
-      **Two levers, neither a kernel**: fewer weight bytes (int8, blocked on AR-loop
-      quality — E3-5c — and no kernel work moves that), or more activations per weight
-      read, which is the serving topology and makes E10-10 a *bandwidth* question.
-      Do not thread it harder, do not write a better f16 matvec, do not re-try a
-      packing. Also records the hazard: the first reading was 356 ms against a 227 ms
-      median on the same binary — a single cost-map run right after a build is not a
-      measurement, and this region's spread is 7-18%
+- [~] E10-14 **the box says turn it on; the quality half is still a product call** —
+      measured on the Axion at the thread counts serving actually uses, `codec.conv_stack`:
+      **2 threads/worker 224.8 → 120.8 ms (1.86x)**, 4 threads 129.7 → 83.9 (1.55x). At 16
+      threads it is a wash, which is why the laptop's reading was misleading — and why the
+      16-thread number must not be the one quoted for a serving decision. Since the codec
+      is the PER-SLOT term of `T_frame(B) = a + b*B`, that factor is capacity.
+      **Every capacity number in [`.work/axion-c99-soak.md`](.work/axion-c99-soak.md) was
+      measured with `codec_convtr:int8` ON, and it is OFF by default** — so those numbers
+      do not describe the shipped configuration until the default is flipped. The cost is
+      unchanged and known: SNR 28.9-32.9 dB against 36.4-37.9, log-mel nearly unchanged.
+      **To close**: take the decision, then flip the default and re-run the gate
 - [-] **rejected, with the reference's own numbers.** Do not build these: prefill helper
       thread (stall@250 20.1%→46.8%); token-range slicing (occupancy floor invariant at
       83-97 ms); per-layer prefill checkpointing (TTFA p95 223→1208 ms); fixed-target
