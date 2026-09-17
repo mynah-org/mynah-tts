@@ -119,7 +119,24 @@ import playback_sim as PB  # noqa: E402
 # --------------------------------------------------------------------------------------
 # defaults
 # --------------------------------------------------------------------------------------
-# A neutral bank: short, medium and long, so a level is not qualified on one length.
+# THE DEFAULT BANK IS A FILE, and the five lines below are only what is left when
+# that file is missing.
+#
+# What those five lines were qualifying: five sentences, in ITALIAN, fed to
+# whatever pack the run named -- which for models/pocket-en is an English pack.
+# A C100 measured that way is not false, but it is qualified on a workload
+# nobody will ever serve: five texts repeating, in the wrong language, with a
+# duration spread that comes out of how an English tokenizer digests Italian.
+#
+# tests/load_texts_en_v2.txt is 277 texts in five classes with a version and a
+# sha in its own header, so a number can name the corpus that produced it. It
+# comes from the qwen-tts project (MIT) and is kept byte-identical there and
+# here, which is what lets a number cross between them.
+DEFAULT_BANK_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tests", "load_texts_en_v2.txt")
+
+# The fallback: a neutral bank, short/medium/long, so a level is not qualified on one length.
 # Text length is only one of the two duration knobs; --max-steps is the other, and the
 # synthetic pack needs it (its model.json caps generation at 8 steps ~ 0.37 s of audio,
 # which is too short for any cadence to exist).
@@ -1236,7 +1253,12 @@ def main():
         bank = [("cli", args.text)]
     elif args.bank:
         bank = load_bank(args.bank)
+    elif os.path.exists(DEFAULT_BANK_FILE):
+        bank = load_bank(DEFAULT_BANK_FILE)
     else:
+        print("note: %s is missing, falling back to the five built-in texts -- "
+              "they are Italian and a level qualified on them says little"
+              % DEFAULT_BANK_FILE, file=sys.stderr)
         bank = list(DEFAULT_BANK)
 
     if args.quantum_sweep:
