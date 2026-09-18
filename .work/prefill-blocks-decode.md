@@ -217,3 +217,77 @@ language it does not hold instead of synthesising it badly. That is the
 The TTFA of those clips (0.9-1.4 s) is NOT the served TTFA. They are the 91st
 request against a server already saturated at C90, so they queue. The served
 number is the soak's: 435 ms at p95.
+
+---
+
+# The bound closed it: C90 is GOOD over thirty minutes
+
+    90  53265/53265  TTFB95 82.0  TTFA95 494.8  RTF p50 0.659 p95 0.734
+        preb50/95 0/10 ms  safe95 527  gap95 129  coal 13%
+        throughput 128.9 audio-s/s   bank 277 of 277 texts, each 192x
+        GOOD -- the operating point is C90
+
+    PASS mandatory completed == launched      53265 == 53265
+    PASS mandatory STREAM_RTF p95             0.734 < 1.000
+    PASS mandatory stall_rate@500ms           (0 of 53265 requests)
+    PASS preferred TTFB p95                   82.0 <= 100
+    PASS preferred TTFA p95                   494.8 <= 500
+    PASS preferred STREAM_RTF p95             0.734 <= 0.900
+    PASS preferred required_prebuffer p95     10.2 <= 500
+    PASS preferred safe_play_start p95        527.3 <= 1000
+    PASS preferred stall_rate@250ms           (0 of 53265 requests)
+    PASS drift rtf +0.0040, prebuffer +0.0000, over ten 3-minute windows
+
+Config: `16x2 --max-batch 8`, codec fully int8 including `codec_convtr`,
+`MYNAH_PREFILL_SLICE=32`, `MYNAH_PREFILL_STEP_MS=60`.
+
+## The cap's prediction, tested and confirmed
+
+The cap said small slices would win again, because the only reason they lost was
+the sum across slots. C90, ten minutes per arm:
+
+| slice / cap | stall@250 | max_gap p95 | max_gap MAX | TTFA p95 | verdict |
+|---|---|---|---|---|---|
+| 48 / none | 38 | 157 ms | 336 ms | 435 ms | MARGINAL |
+| 48 / 40 ms | 16 | 152 | 176 | 434 | MARGINAL |
+| 16 / 40 ms | **0** | 104 | **122** | 642 | MARGINAL (TTFA) |
+| 16 / 80 ms | 2 | 107 | 143 | 637 | MARGINAL (TTFA) |
+| **32 / 60 ms** | **0** | 129 | 173 | 496 | **GOOD** |
+
+The cap bounds TOTAL prefill throughput, so too tight a cap starves every prefill
+when several compete and first audio pays for it. That is the whole trade: the
+freeze and the time to first audio are the same resource seen from two ends.
+
+## What the fix bought, stated exactly
+
+It did NOT raise the concurrency ceiling. C99 already ran: 130 audio-s/s, RTF
+0.83, nothing dropped. What did not exist was a level that could be PROMOTED.
+
+| | before | after |
+|---|---|---|
+| highest qualified level, mixed bank | **none** | **C90 GOOD** |
+| `stall@500ms` | 5 of 53895 | **0 of 53265** |
+| `stall@250ms` | 233 of 53895 | **0 of 53265** |
+| worst freeze (`max_gap` max) | 707 ms | **177 ms** |
+| worst client prebuffer | 535 ms | **267 ms** |
+| throughput at equal C | 130.5 | 129.6 audio-s/s (-0.7%) |
+
+The client contract changed with it: the interim "600 ms prebuffer" is now
+**250 ms**, and it is a bound rather than a sample maximum.
+
+## What binds next, and it is not the machine
+
+At C90 `STREAM_RTF` p95 is **0.734**: the box delivers a third faster than
+realtime and has headroom. The gate that binds is **TTFA at 494.8 against 500**,
+which is the price of slicing. Raising C from here breaks first audio, not
+throughput, so the next lever is not another scheduling knob -- it is the
+ABSOLUTE cost of the prefill, still 190 ms for a long text and never optimised.
+
+## One prediction held, for a reason worth keeping
+
+I expected TTFA p95 to survive the move from ten minutes to thirty (496 -> 494.8)
+after being burned that morning by a 4.6 ms margin that did not survive. The
+difference is the STATISTIC, not the luck: a p95 is stable in sample size, a
+maximum is not. What failed that morning was `required_prebuffer` MAX; what held
+here was a percentile. Read the statistic before deciding whether a thin margin
+is fragile.

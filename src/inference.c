@@ -204,30 +204,35 @@ static int slot_fail(synth_slot *slot, const char *message) {
 /* How many tokens of prefill one slice may do, 0 = one shot (tts_engine.h,
  * `prepare_slice`).
  *
- * The default is three 16-token tiles, and it is measured rather than reasoned:
- * at C96 on the mixed bank, ten minutes per arm, 48 gave the SHORTEST freeze of
- * the series AND a better time to first audio than 32 did.
+ * The default is two 16-token tiles, and it is measured rather than reasoned.
+ * WITHOUT the per-step cap below, 48 beat it on both axes, because the slice pass
+ * walks every preparing slot and smaller slices keep more prefills in flight so
+ * one step's freeze becomes their SUM:
  *
- *     slice   stall@500  stall@250  max_gap p95  TTFA p95
+ *     slice   stall@500  stall@250  max_gap p95  TTFA p95     (no cap, C96)
  *     0             3/18007     81        358 ms    308 ms
  *     32                  0         21        170       497
  *     48                  0         24        158       444
  *     64                  0         34        186       401
  *
- * That 32 is dominated on BOTH axes refutes the obvious reading -- "smaller
- * slices buy a shorter freeze with first audio". The pass below walks every slot
- * still preparing, so a smaller budget keeps MORE prefills in flight at once and
- * one step's freeze becomes their sum. The shape that would fix it properly is a
- * per-step time budget shared across the preparing slots rather than a token
- * budget per slot; until that exists, 48 is the measured optimum.
+ * WITH the cap that sum cannot happen, and the ranking reverses -- which is what
+ * the cap predicted before it was measured (C90, ten minutes per arm):
  *
- * `MYNAH_PREFILL_SLICE=0` restores the one-shot prefill exactly, which is how
- * the arms above were run. */
+ *     slice/cap   stall@250   max_gap p95   max_gap MAX   TTFA p95
+ *     48 / none        38          157 ms        336 ms     435 ms
+ *     48 / 40          16          152           176        434
+ *     16 / 40           0          104           122        642   <- TTFA fails
+ *     16 / 80           2          107           143        637
+ *     32 / 60           0          129           173        496   <- GOOD
+ *
+ * 32 with a 60 ms cap is the qualified point: C90 for thirty minutes, 53265
+ * requests, every gate passed. `MYNAH_PREFILL_SLICE=0` restores the one-shot
+ * prefill exactly, which is how the first table was measured. */
 static size_t prefill_slice_budget(void) {
     static size_t cached = SIZE_MAX;
     if (cached != SIZE_MAX) return cached;
     const char *env = getenv("MYNAH_PREFILL_SLICE");
-    long v = 48;
+    long v = 32;
     if (env != NULL && *env != '\0') {
         char *end = NULL;
         const long parsed = strtol(env, &end, 10);
@@ -290,14 +295,20 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
  * A gate that demands ZERO of 53559 is not satisfied by a better distribution,
  * it is satisfied by an upper bound. This is the bound: prefill work per step is
  * capped, so the freeze cannot exceed the cap plus the slice that was already
- * running. The default is half a frame period at 12.5 Hz. One slice always runs
- * even when the budget is already spent, because a cap that can starve a prefill
- * forever is a deadlock, not a bound. */
+ * running. One slice always runs even when the budget is already spent, because
+ * a cap that can starve a prefill forever is a deadlock, not a bound.
+ *
+ * The default is 60 ms, three quarters of a frame period, and it is the measured
+ * optimum rather than the round number: the cap bounds TOTAL prefill throughput,
+ * so too tight a cap starves every prefill when several compete and time to first
+ * audio pays for it -- 40 ms with 16-token slices reached zero stalls and 642 ms
+ * of TTFA p95, which fails a different gate. 60 ms with 32-token slices is the
+ * point that passed all of them. */
 static double prefill_step_budget_s(void) {
     static double cached = -1.0;
     if (cached >= 0.0) return cached;
     const char *env = getenv("MYNAH_PREFILL_STEP_MS");
-    double v = 40.0;
+    double v = 60.0;
     if (env != NULL && *env != '\0') {
         char *end = NULL;
         const double parsed = strtod(env, &end);
