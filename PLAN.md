@@ -730,10 +730,85 @@ the x86 self-test that judges the two kernels written here and never executed
       audio 1.04-18.48 s, **sd 4.39** against the medium-only 0.298. The reference's
       wave-vs-soak gap does **not** reproduce as drift here; what bites is the duration
       spread. **A screen is never a qualification**, and we now have our own instance of
-      it, the two verdicts an hour apart. **To close**: the descending sweep on the mixed
-      bank (command in the note) to turn "not C99" into an operating point
-- [ ] E10-10 **the topology claim comes from one machine, and now has a prediction
-      against it** — `16x2` beats `1x32` by 2.2x on RTF p95, measured only on the Axion
+      it, the two verdicts an hour apart. **The descending sweep has since been run and
+      the answer is that concurrency does not close it**: C98 and C96 over thirty minutes
+      each are also NOT STREAMABLE on the same gate, with every other gate and both drift
+      gates passing. Three levels bought a factor of ten on the failing quantity --
+      `stall@500ms` 0.1% -> <0.05% -> **5 of 53895** -- and did not reach zero. What is
+      measured instead is the client-side number: over 53895 requests at C96 no request
+      needed more than **535 ms** of lead, so a **600 ms prebuffer** plays all of them.
+      A 10-minute screen had put that bound at 495.4 ms and the 30-minute run moved it
+      past 500: a screen cannot qualify a tail either. **To close**: E10-10, because the
+      tail is the long-request slot and the topology is the untested variable
+- [x] E10-16 **CLOSED — the stall had one cause, and the fix qualified C90 as GOOD, measured and read in the code: the prefill
+      runs inside the step loop** → [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md).
+      `slot_start()` calls `engine->prepare()` synchronously in the admission block at the
+      top of `mynah_graph_serve_continuous`, so **every resident slot freezes for the new
+      request's prefill**. At C1 with no contention a long text's prefill costs **190 ms**
+      against 28 ms of fixed cost -- 2.4 frame periods -- and under load `max_gap` is
+      **97 ms at p50 and 358 ms at p95** with a frame lasting 80 ms. It is an interruption,
+      not a slowdown. It explains why the `medium`-only bank was GOOD (every prefill ~53 ms,
+      under one frame) and why three concurrency levels could not clear it: the freeze
+      duration is a property of the TEXT, not of the load, so lowering C removes freezes at
+      3% a level while the cushion does all the work. Three ways out, priced:
+      **DONE, and it cleared its gate.** `prepare_slice` is an optional appended hook;
+      the driver alternates one slice with one step and carries a third slot state for a
+      prefill in flight. Bit-identical across `MYNAH_PREFILL_SLICE` 0/16/32/48/128 on two
+      architectures, single and batched. **C94, slice 48, thirty minutes: MARGINAL with
+      every mandatory gate passing** -- 53559/53559, `stall@500ms` **0**, RTF p95 0.761,
+      TTFA p95 443, `max_gap` p95 158 (was 358), throughput -0.7%. Against the same soak
+      before the fix: `stall@500` 5 -> 0, `stall@250` 233 -> 81. **The operating point is
+      C94.** **Concurrency is EXCLUDED as the lever**, by four levels that refuse to line
+      up: `stall@250ms` is 0.134% at C96, 0.151% at C94, **0.214% at C90** and 0.109% at
+      C80 -- C90 is the worst of the four while carrying less load than two of them, over a
+      17% span of load with no monotone trend. `max_gap` p95 across the same four is
+      **158 / 158 / 157 / 148 ms**, a near-constant: lowering C removes OCCASIONS and
+      leaves DURATION untouched, so the count drifts down noisily and never reaches zero.
+      A gate that demands zero is a statement about the WORST CASE, and a worst case needs
+      a bound. **Built, measuring**: `MYNAH_PREFILL_STEP_MS` (default 40 ms, half a frame
+      period) caps prefill work per STEP. The per-slot token budget bounded one slice and
+      never one step -- the pass walks every preparing slot, so prefills landing together
+      froze a worker for their SUM, which is the 441 ms `max_gap` maximum against a single
+      slice of ~60 ms. The pass now stops when the step's budget is spent and resumes next
+      step where it stopped, with a rotating cursor so no slot starves, and always runs one
+      slice so the cap cannot deadlock. The reversal it predicted was then measured: with
+      the cap, 16-token slices reach `stall@250ms` **0** and a worst freeze of 122 ms, and
+      the binding gate becomes TTFA instead. **QUALIFIED: C90, slice 32, cap 60 ms, thirty
+      minutes — GOOD, every gate passed.** 53265/53265, `stall@500ms` **0**, `stall@250ms`
+      **0**, RTF p95 0.734, TTFA p95 494.8, prebuffer p95 10.2 and max 267, `max_gap` max
+      **177 ms** (was 707), throughput 128.9 audio-s/s, drift +0.0040 over ten windows.
+      **The client contract is now a 250 ms prebuffer, and it is a bound rather than a
+      sample maximum.** What binds next is NOT the machine: RTF p95 0.734 leaves headroom
+      and the gate that stops a higher C is TTFA at 494.8 against 500, so the next lever is
+      the ABSOLUTE cost of the prefill -- still 190 ms for a long text, never optimised
+      - **(1) CHOSEN — chunked prefill.** Make `prepare` resumable and interleave the slices
+        with decode steps, so the longest freeze is one slice instead of one prefill. It
+        removes the cause. Costs an engine-seam API change and TTFA on the admitted request:
+        coarse slicing (two or three) puts the freeze **under one frame period** for ~110 ms
+        of TTFA. Gate: `stall_rate@500ms == 0` on a 30-minute mixed soak at C96 with
+        `RTF p95 <= 0.80` and `TTFA p95 <= 400 ms` -- the fix may not buy continuity with
+        throughput or with first audio, which is the whole point of doing it this way
+      - **(2) rejected, recorded so it is not re-proposed — lead-aware admission.** Defer
+        while the least-advanced resident slot has less cushion than the incoming prefill
+        needs. No API change, but the arithmetic refuses: a slot gains only
+        `(1 - RTF) x 80 ms` = 25 ms of lead per frame, so ~0.5 s of wall buys 250 ms of
+        cushion, and with an admission every ~0.5 s per worker there is nearly always a
+        vulnerable slot. A guard big enough to protect defers almost every admission; one
+        small enough not to protects almost nothing
+      - **(3) the interim contract, true today at zero cost — a 600 ms client prebuffer.**
+        No request in 53895 needed more than **535 ms** of lead at C96 over thirty minutes.
+        It ships until (1) lands, and it is a statement about a 30-minute sample of a tail
+- [ ] E10-10 **the topology is answered, and the answer is that it belongs to the MODEL** —
+      `8x4` with the same 32 threads and the same 128 slots is decisively WORSE at C96:
+      RTF p95 **1.052** against 0.784 (a mandatory gate), throughput 93.6 against 124.8
+      audio-s/s, `stall@250ms` **734/13511 against 84/17968**, prebuffer p95 235 ms against
+      0. qwen-tts prefers `4x8` on this same box and that is not a contradiction:
+      `T_frame(B) = a + b*B`, and a wider worker wins only when doubling the threads more
+      than halves `b`. For a 1.7B model `a` (the weight stream) dominates; for PocketTTS's
+      109.5M it does not, and the codec's `b` scales sublinearly (16.7 ms at 2 threads,
+      7.7 ms at 16). **The optimal shape is a property of the model's a/b ratio, not of the
+      machine** -- do not inherit it across engines. Still open below: the original claim
+- [ ] E10-10b **the low-concurrency half of the topology claim** — `16x2` beats `1x32` by 2.2x on RTF p95, measured only on the Axion
       and only at low concurrency. Every capacity number in
       [`.work/axion-c99-soak.md`](.work/axion-c99-soak.md) is `16x2`, so it is assumed,
       not tested. **The prediction now points the other way at high load**: `step.backbone`

@@ -564,7 +564,7 @@ class Profile:
 # aggregation and verdict
 # --------------------------------------------------------------------------------------
 def level_report(level, records, launched, wall, args, mode="wave", windows=None,
-                 warmup_s=0.0, warmup_n=0):
+                 warmup_s=0.0, warmup_n=0, bank_len=0):
     ok = [r for r in records if r.get("ok")]
     bad = [r for r in records if not r.get("ok")]
     rep = {"level": level, "launched": launched, "completed": len(ok),
@@ -601,7 +601,17 @@ def level_report(level, records, launched, wall, args, mode="wave", windows=None
     for r in records:
         mix[r.get("class", "?")] = mix.get(r.get("class", "?"), 0) + 1
     rep["mix"] = mix
-    rep["distinct_texts"] = len({r.get("index") for r in records})
+    # How much of the bank was actually SPOKEN.  The request index is a monotonic
+    # counter, so counting distinct indices only ever returns the request count --
+    # it says nothing about text diversity, which is the thing a bank exists to
+    # provide.  The text is bank[index % len(bank)], so that is what gets counted.
+    idx = [r.get("index") for r in records if r.get("index") is not None]
+    rep["request_slots"] = len(set(idx))
+    rep["bank_size"] = bank_len
+    rep["distinct_texts"] = (len({i % bank_len for i in idx}) if bank_len
+                             else rep["request_slots"])
+    rep["reuse_per_text"] = (len(idx) / rep["distinct_texts"]
+                             if rep["distinct_texts"] else float("nan"))
 
     # -- the refusal: may these cadence percentiles be quoted at all? -------------------
     status, share, reasons = PB.quotable(rep["summary"], args.coalesced_refuse,
@@ -796,11 +806,12 @@ def print_table(reports, args, meta):
         for kind in ("mandatory", "preferred"):
             for g in r["gates"][kind]:
                 mark = {True: "PASS", False: "FAIL", None: "n/a "}[g["pass"]]
-                print("       %s %-9s %-22s %s %s %s"
+                print("       %s %-9s %-22s %s %s %s%s"
                       % (mark, kind, g["name"],
                          ("n/a" if g["value"] != g["value"] else "%.3f%s"
                           % (g["value"], g["unit"])),
-                         g["op"], "%.3f%s" % (g["limit"], g["unit"])))
+                         g["op"], "%.3f%s" % (g["limit"], g["unit"]),
+                         ("   (%s)" % g["note"]) if g.get("note") else ""))
         print("       audio delivered %.1f s total, %.2f s/request (sd %.2f), "
               "%.0f chunks/request"
               % (r["audio_total_s"], r["audio_s"]["mean"], r["audio_s"]["sd"],
@@ -813,9 +824,13 @@ def print_table(reports, args, meta):
               "header is sent before synthesis, so TTFB alone is not a latency"
               % (fnum(r["header_to_audio_ms"]["p50"], 1, 0),
                  fnum(r["header_to_audio_ms"]["p95"], 1, 0)))
-        print("       mix: %s (%d distinct request slots)"
+        print("       mix: %s"
               % (", ".join("%s x%d" % (k, v) for k, v in sorted(r["mix"].items()))
-                 or "n/a", r["distinct_texts"]))
+                 or "n/a"))
+        print("       bank coverage: %d of %d texts spoken, each %.0fx on average"
+              "  (%d request slots)"
+              % (r["distinct_texts"], r["bank_size"] or r["distinct_texts"],
+                 r["reuse_per_text"], r["request_slots"]))
         # The distribution, not just the median: a serialized server produces bimodal
         # latencies whose p50 looks healthy and whose sd says otherwise.
         print("       DISTRIBUTION over %d completed requests" % r["completed"])
@@ -1346,14 +1361,14 @@ def run_arm(args, bank, levels, model_dir=None):
                 reports.append(level_report(
                     level, measured, len(measured), wall, args, mode="soak",
                     windows=windows, warmup_s=warm_s,
-                    warmup_n=len(records) - len(measured)))
+                    warmup_n=len(records) - len(measured), bank_len=len(bank)))
             else:
                 if not args.quiet:
                     print("screening C%d (%d waves)..." % (level, args.waves),
                           file=sys.stderr)
                 records, launched, wall = prof.run_level(level)
                 reports.append(level_report(level, records, launched, wall, args,
-                                            mode="wave"))
+                                            mode="wave", bank_len=len(bank)))
         health1 = http_get_json(args.host, args.port, "/health", timeout=10.0)
     except BaseException:
         stop_server(proc)

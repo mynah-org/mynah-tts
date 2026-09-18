@@ -890,6 +890,9 @@ struct mynah_engine_ctx {
     size_t frames_after_eos;
     size_t eos_step; /* SIZE_MAX until the logit first crosses the threshold */
     int prepared;
+    /* A resumable prefill is in flight: the prologue has run and the text is
+     * partly in the KV cache. Never 1 at the same time as `prepared`. */
+    int seeding;
     int eos;
     /* The step budget was reached before EOS.  Kept as a flag rather than
      * reported as an error: the driver has no budget check of its own, and a
@@ -3644,13 +3647,25 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
  *
  * `final` is the seal: emit the remainder too.
  */
-static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
-                             size_t capacity) {
+/* `limit` is the resumable-prefill budget in tokens; 0 means "no limit" and
+ * reproduces the one-shot behaviour exactly. A bounded flush always stops on a
+ * tile boundary, because a tile that starts anywhere else lands where a
+ * one-shot prefill did not put it -- the guard below is the same one E5-5
+ * wrote, keyed now on whether THIS flush finishes the text rather than on the
+ * caller's `final`, which is what it always meant. */
+static int pocket_text_flush_limited(mynah_engine_ctx *ctx, int final, size_t limit,
+                                     char *error, size_t capacity) {
     const pocket_config *cfg = &ctx->state->cfg;
     const size_t tile = mynah_transformer_ar_prefill_tile();
-    const size_t want = (final || tile == 0u)
-                            ? ctx->text_length
-                            : (ctx->text_length / tile) * tile;
+    size_t want = (final || tile == 0u)
+                      ? ctx->text_length
+                      : (ctx->text_length / tile) * tile;
+    if (limit != 0u && tile != 0u) {
+        size_t slice = (limit / tile) * tile;
+        if (slice == 0u) slice = tile;           /* never make no progress */
+        const size_t stop = ctx->text_prefilled + slice;
+        if (stop < want) want = (stop / tile) * tile;
+    }
     if (want <= ctx->text_prefilled) return 0;
     const size_t rows = want - ctx->text_prefilled;
     /* The invariant the paragraph above is about, asserted rather than assumed.
@@ -3658,7 +3673,7 @@ static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
      * postcondition, and it is what makes a future edit to that line fail here
      * -- loudly, on every quantization profile -- instead of failing as a one
      * ULP difference that only the f32 tile path can see. */
-    if (!final && tile != 0u &&
+    if (want != ctx->text_length && tile != 0u &&
         ((ctx->text_prefilled % tile) != 0u || (rows % tile) != 0u)) {
         pocket_error(error, capacity,
                      "pocket: a non-final text flush of %zu rows at offset %zu is "
@@ -3686,9 +3701,19 @@ static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
     return 0;
 }
 
-/* Voice KV, then the text prefix. Shared by `prepare` and `reset`, because a
- * rewind is exactly a re-entry into this state and nothing else. */
-static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capacity) {
+static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
+                             size_t capacity) {
+    return pocket_text_flush_limited(ctx, final, 0u, error, capacity);
+}
+
+/* Everything in the seed that does NOT scale with the text: the resets, the
+ * voice KV, the conditioner lookup. It ends with the text prefill at zero, so
+ * the caller decides whether to run that in one call or a tile at a time.
+ *
+ * The split is where it is because of the measurement: this part is ~15 ms and
+ * flat in text length, the part after it is 190 ms for a long text and linear
+ * in it. Only the linear part is worth interrupting. */
+static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capacity) {
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
 
@@ -3746,6 +3771,14 @@ static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capaci
      * OPEN one stops at the last whole tile, because the tokens that will share
      * its final tile have not arrived yet -- see `pocket_text_flush`. */
     ctx->text_prefilled = 0;
+    return 0;
+}
+
+/* Shared by `prepare` and `reset`, because a rewind is exactly a re-entry into
+ * this state and nothing else. */
+static int pocket_seed_context(mynah_engine_ctx *ctx, char *error, size_t capacity) {
+    ctx->seeding = 0;
+    if (pocket_seed_prologue(ctx, error, capacity) != 0) return -1;
     if (pocket_text_flush(ctx, !ctx->text_open, error, capacity) != 0) return -1;
     ctx->prepared = 1;
     return 0;
@@ -3759,6 +3792,51 @@ static int pocket_prepare(mynah_engine_ctx *ctx, char *error, size_t capacity) {
     mynah_region_begin(MYNAH_RGN_PREPARE);
     const int depth = mynah_region_depth();
     const int rc = pocket_seed_context(ctx, error, capacity);
+    mynah_region_unwind(depth);
+    mynah_region_end(MYNAH_RGN_PREPARE);
+    return rc;
+}
+
+/* The resumable half of `prepare` (tts_engine.h, `prepare_slice`).
+ *
+ * Call one: the prologue, which cannot be interrupted and does not need to be.
+ * Every call after it prefills at most `budget` tokens, stopping on a tile
+ * boundary so the tiles land exactly where one `prepare` would have put them --
+ * that is the bit-identity the seam promises, and `pocket_text_flush_limited`
+ * asserts the alignment rather than trusting this caller.
+ *
+ * `*done` is set when the context is ready for step 1, which is the only moment
+ * `prepared` becomes 1: a context that is half prefilled must not look ready to
+ * anything that checks that flag. */
+static int pocket_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
+                                char *error, size_t capacity) {
+    if (ctx == NULL || done == NULL) {
+        pocket_error(error, capacity, "pocket: null context or done flag");
+        return -1;
+    }
+    *done = 0;
+    mynah_region_begin(MYNAH_RGN_PREPARE);
+    const int depth = mynah_region_depth();
+    int rc = 0;
+    if (!ctx->seeding) {
+        rc = pocket_seed_prologue(ctx, error, capacity);
+        if (rc == 0) ctx->seeding = 1;
+    } else {
+        rc = pocket_text_flush_limited(ctx, !ctx->text_open, budget, error, capacity);
+    }
+    if (rc == 0 && ctx->seeding) {
+        const size_t target = ctx->text_open
+            ? (ctx->text_length / (mynah_transformer_ar_prefill_tile() > 0u
+                                   ? mynah_transformer_ar_prefill_tile() : 1u))
+              * (mynah_transformer_ar_prefill_tile() > 0u
+                 ? mynah_transformer_ar_prefill_tile() : 1u)
+            : ctx->text_length;
+        if (ctx->text_prefilled >= target) {
+            ctx->prepared = 1;
+            ctx->seeding = 0;
+            *done = 1;
+        }
+    }
     mynah_region_unwind(depth);
     mynah_region_end(MYNAH_RGN_PREPARE);
     return rc;
@@ -4735,6 +4813,7 @@ static const mynah_tts_engine pocket_engine = {
     pocket_scratch_free,
     NULL,                      /* debug_dump: the dump is written in ctx_free */
     pocket_decode_audio_batch, /* APPENDED, never inserted (tts_engine.h) */
+    pocket_prepare_slice,      /* APPENDED */
 };
 
 const mynah_tts_engine *mynah_engine_pocket(void) { return &pocket_engine; }

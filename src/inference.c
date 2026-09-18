@@ -180,6 +180,10 @@ typedef struct {
     void *tag;
     int in_use;
     int cancelled;
+    /* The prefill is resumable and unfinished: the slot holds a context that is
+     * NOT ready for step 1 and must not be stepped, and is not finished either
+     * so it must not be retired. Both loops below key on it. */
+    int preparing;
     /* decoder lane (E5-21). `lane_busy` means this slot owns mailbox entry
      * `index` -- a unit is running, or has finished and not been reaped.
      * `streamed_frames` is advanced at SUBMIT, not at delivery, so the range
@@ -197,8 +201,51 @@ static int slot_fail(synth_slot *slot, const char *message) {
     return -1;
 }
 
+/* How many tokens of prefill one slice may do, 0 = one shot (tts_engine.h,
+ * `prepare_slice`).
+ *
+ * The default is two 16-token tiles, and it is measured rather than reasoned.
+ * WITHOUT the per-step cap below, 48 beat it on both axes, because the slice pass
+ * walks every preparing slot and smaller slices keep more prefills in flight so
+ * one step's freeze becomes their SUM:
+ *
+ *     slice   stall@500  stall@250  max_gap p95  TTFA p95     (no cap, C96)
+ *     0             3/18007     81        358 ms    308 ms
+ *     32                  0         21        170       497
+ *     48                  0         24        158       444
+ *     64                  0         34        186       401
+ *
+ * WITH the cap that sum cannot happen, and the ranking reverses -- which is what
+ * the cap predicted before it was measured (C90, ten minutes per arm):
+ *
+ *     slice/cap   stall@250   max_gap p95   max_gap MAX   TTFA p95
+ *     48 / none        38          157 ms        336 ms     435 ms
+ *     48 / 40          16          152           176        434
+ *     16 / 40           0          104           122        642   <- TTFA fails
+ *     16 / 80           2          107           143        637
+ *     32 / 60           0          129           173        496   <- GOOD
+ *
+ * 32 with a 60 ms cap is the qualified point: C90 for thirty minutes, 53265
+ * requests, every gate passed. `MYNAH_PREFILL_SLICE=0` restores the one-shot
+ * prefill exactly, which is how the first table was measured. */
+static size_t prefill_slice_budget(void) {
+    static size_t cached = SIZE_MAX;
+    if (cached != SIZE_MAX) return cached;
+    const char *env = getenv("MYNAH_PREFILL_SLICE");
+    long v = 32;
+    if (env != NULL && *env != '\0') {
+        char *end = NULL;
+        const long parsed = strtol(env, &end, 10);
+        if (end != env && parsed >= 0 && parsed < 1000000L) v = parsed;
+    }
+    cached = (size_t)v;
+    return cached;
+}
+
 /* Validate the request and the sink, then hand everything else to the engine.
- * After this the context is ready for its first step. */
+ * After this the context is ready for its first step, UNLESS the engine has a
+ * resumable prefill and it was asked for one, in which case the slot comes back
+ * `preparing` and the driver finishes the prefill a slice at a time. */
 static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *model,
                       mynah_engine_state *state, const mynah_engine_caps *caps,
                       synth_slot *slot, int dump) {
@@ -218,6 +265,12 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
                         slot->error, slot->error_capacity) != 0) {
         return slot_fail(slot, NULL);
     }
+    if (engine->prepare_slice != NULL && prefill_slice_budget() != 0u) {
+        /* Not one byte of prefill here: the whole point is that admission stops
+         * being a place where the batch can lose several frame periods. */
+        slot->preparing = 1;
+        return 0;
+    }
     if (engine->prepare(slot->ctx, slot->error, slot->error_capacity) != 0) {
         return slot_fail(slot, NULL);
     }
@@ -227,6 +280,87 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
     }
     slot->active = 1;
     return 0;
+}
+
+/* How much wall time one step may spend on prefill, in milliseconds; 0 removes
+ * the cap.
+ *
+ * A PER-SLOT token budget bounds one slice, not one step. The pass below walks
+ * every slot still preparing, so seven prefills landing in one worker froze it
+ * for seven slices -- measured as a `max_gap` maximum of 441 ms against a single
+ * slice of about 60 ms. That is why `stall_rate@250ms` did not fall with
+ * concurrency between C96 and C94: lowering the load removes freezes, it does
+ * not shorten them.
+ *
+ * A gate that demands ZERO of 53559 is not satisfied by a better distribution,
+ * it is satisfied by an upper bound. This is the bound: prefill work per step is
+ * capped, so the freeze cannot exceed the cap plus the slice that was already
+ * running. One slice always runs even when the budget is already spent, because
+ * a cap that can starve a prefill forever is a deadlock, not a bound.
+ *
+ * The default is 60 ms, three quarters of a frame period, and it is the measured
+ * optimum rather than the round number: the cap bounds TOTAL prefill throughput,
+ * so too tight a cap starves every prefill when several compete and time to first
+ * audio pays for it -- 40 ms with 16-token slices reached zero stalls and 642 ms
+ * of TTFA p95, which fails a different gate. 60 ms with 32-token slices is the
+ * point that passed all of them. */
+static double prefill_step_budget_s(void) {
+    static double cached = -1.0;
+    if (cached >= 0.0) return cached;
+    const char *env = getenv("MYNAH_PREFILL_STEP_MS");
+    double v = 60.0;
+    if (env != NULL && *env != '\0') {
+        char *end = NULL;
+        const double parsed = strtod(env, &end);
+        if (end != env && parsed >= 0.0 && parsed < 100000.0) v = parsed;
+    }
+    cached = v / 1000.0;
+    return cached;
+}
+
+/* One slice of prefill, for as many waiting slots as the step's budget allows.
+ *
+ * Runs between admission and the step, so a slice and a step alternate and no
+ * resident slot waits more than the budget for its next frame. A slot that
+ * finishes here becomes active and is stepped in the SAME iteration, which keeps
+ * the added time-to-first-audio to the slicing itself rather than to a round trip
+ * through the loop.
+ *
+ * `*rr` rotates the starting slot so that when the budget cannot serve everyone,
+ * it is a different prefill that waits each time. Without it the lowest slot
+ * index would always be served and a request unlucky in its slot could be
+ * starved for as long as its neighbours keep arriving. */
+static void slots_prefill_slice(const mynah_tts_engine *engine, synth_slot *slots,
+                                size_t max_batch, int dump, size_t *rr) {
+    const size_t budget = prefill_slice_budget();
+    const double step_budget = prefill_step_budget_s();
+    const double t0 = (step_budget > 0.0) ? mynah_phase_seconds() : 0.0;
+    size_t served = 0;
+    for (size_t n = 0; n < max_batch; ++n) {
+        const size_t i = (*rr + n) % max_batch;
+        synth_slot *slot = &slots[i];
+        if (!slot->in_use || !slot->preparing) continue;
+        if (step_budget > 0.0 && served > 0u &&
+            (mynah_phase_seconds() - t0) >= step_budget) {
+            *rr = i;                      /* resume here next step */
+            break;
+        }
+        ++served;
+        int done = 0;
+        if (engine->prepare_slice(slot->ctx, budget, &done,
+                                  slot->error, slot->error_capacity) != 0) {
+            slot->preparing = 0;
+            (void)slot_fail(slot, NULL);
+            continue;
+        }
+        if (!done) continue;
+        slot->preparing = 0;
+        if (dump && engine->debug_dump != NULL) {
+            engine->debug_dump(slot->ctx, "encoder");
+            engine->debug_dump(slot->ctx, "prefill");
+        }
+        slot->active = 1;
+    }
 }
 
 /* How many frames this slot is waiting to accumulate before it delivers.
@@ -771,6 +905,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     const double t_start = timing ? mynah_phase_seconds() : 0.0;
     double t_prep = t_start, t_ar = t_start;
     size_t admitted = 0;
+    /* Rotating cursor for the prefill pass; see slots_prefill_slice. */
+    size_t prefill_rr = 0;
 
     synth_slot slots[MYNAH_GRAPH_MAX_JOBS];
     mynah_engine_ctx *step_ctxs[MYNAH_GRAPH_MAX_JOBS];
@@ -882,12 +1018,21 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         /* ---- cancellation --------------------------------------------- */
         if (sink->cancelled != NULL) {
             for (size_t i = 0; i < max_batch; ++i) {
-                if (!slots[i].in_use || !slots[i].active) continue;
+                /* A slot still prefilling is cancellable too, and has to be:
+                 * otherwise a client that disconnects during a long prefill
+                 * keeps a slot slicing to completion before anyone notices. */
+                if (!slots[i].in_use || (!slots[i].active && !slots[i].preparing)) continue;
                 if (sink->cancelled(sink->ud, slots[i].tag) != 0) {
                     slots[i].cancelled = 1;
                     slots[i].active = 0;
+                    slots[i].preparing = 0;
                 }
             }
+        }
+
+        /* ---- finish the prefills that are in flight -------------------- */
+        if (engine->prepare_slice != NULL) {
+            slots_prefill_slice(engine, slots, max_batch, dump_all, &prefill_rr);
         }
 
         /* ---- one step over everything still live ---------------------- */
@@ -912,7 +1057,11 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * holding a finished one until its neighbours catch up is exactly the
          * wait continuous admission exists to remove. */
         for (size_t i = 0; i < max_batch; ++i) {
-            if (!slots[i].in_use || slots[i].active) continue;
+            /* `preparing` is the third state this loop has to know about: not
+             * active, and not finished either. Without it a sliced prefill
+             * would be retired one iteration after it was admitted, which is a
+             * request silently returning no audio. */
+            if (!slots[i].in_use || slots[i].active || slots[i].preparing) continue;
             /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates the
              * frame history and frees the context; a unit still reading it
              * would be reading freed memory and writing into a slot that no

@@ -223,6 +223,34 @@ typedef struct {
                                float **out_samples, size_t *out_count, int *failed,
                                mynah_engine_scratch *scratch,
                                char *error, size_t error_capacity);
+
+    /* ---- resumable prefill (APPENDED; see the note above about order) ----
+     *
+     * OPTIONAL; NULL means "my prefill is not resumable" and the driver calls
+     * `prepare` instead. It exists because a prefill is not a small cost paid
+     * once by the request that pays it: the driver admits at the top of a step,
+     * and for as long as `prepare` runs, every request ALREADY in that batch is
+     * frozen. Measured on PocketTTS on the Axion, a long text's prefill is
+     * 190 ms against a frame period of 80 ms, and the resident slots show it as
+     * a `max_gap` p95 of 358 ms against a p50 of 97 ms -- an interruption, not
+     * a slowdown (.work/prefill-blocks-decode.md).
+     *
+     * Each call does at most `budget` units -- units are the engine's own, and
+     * for a text prefill they are tokens -- and sets `*done` to 1 when the
+     * context is ready for step 1. `budget == 0` means no limit, which makes a
+     * single call equivalent to `prepare`. The driver keeps calling until
+     * `*done`, steps the rest of the batch in between, and never steps a
+     * context whose prefill has not finished.
+     *
+     * THE CONTRACT THAT MAKES IT SAFE: the audio produced must be exactly the
+     * audio one `prepare` would have produced. An engine whose slicing is only
+     * approximately equivalent MUST leave this NULL -- the driver cannot detect
+     * the difference, and a cadence fix that quietly changes the output is not
+     * a fix. PocketTTS can honour it because its prefill is already tiled at a
+     * fixed width and a tile-aligned split is bit-identical to one call; the
+     * alignment is asserted inside `pocket_text_flush`, not assumed here. */
+    int  (*prepare_slice)(mynah_engine_ctx *ctx, size_t budget, int *done,
+                          char *error, size_t error_capacity);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only
