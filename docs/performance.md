@@ -548,3 +548,66 @@ this width. The queue does.
 
 Untested here: x86, other topologies on this build, mixed-language load, and
 sustained load at any level.
+
+## 2026-09-18 · The first qualified operating point — GCP Axion, 32 cores
+
+Host: GCP Axion, 32x Neoverse-V2, 62 GB, Linux 7.0, gcc 15.2, `BLAS=none`.
+Pack `models/pocket-en`, 24000 Hz. Bank `tests/load_texts_en_v2.txt`
+(`bank-sha256 55b286369ef8dd44`, 277 texts, all five classes, audio 1.04-19.04 s
+with sd 4.45). Load generator on the same box, 13% coalesced reads.
+
+**C90, thirty minutes, 53265 requests, every gate passed — GOOD.**
+
+    TTFB p95   82.0 ms      TTFA p95  494.8 ms     STREAM_RTF p50/p95  0.659/0.734
+    prebuffer p50/p95 0/10 ms (max 267)            safe_play_start p95  527 ms
+    max_gap p50/p95 91/129 ms (max 177)            throughput  128.9 audio-s/s
+    stall_rate@500ms  0 of 53265                   stall_rate@250ms  0 of 53265
+    drift: rtf +0.0040, prebuffer +0.0000, over ten 3-minute windows
+
+### The exact configuration
+
+    server:  --prefork 16 --prefork-threads 2 --max-batch 8
+
+    MYNAH_QUANT_GROUPS=codec_transformer:int8,codec_conv:int8,codec_convtr:int8,\
+                       backbone:f16,flow_net:f16,conditioner:f16
+    MYNAH_PREFILL_SLICE=32        # tokens of prefill per slice (default)
+    MYNAH_PREFILL_STEP_MS=60      # ms of prefill work per step  (default)
+
+`codec_convtr:int8` is NOT the shipped default. Every number above was measured
+with it ON; it is worth 1.86x on the per-slot term at serving thread counts and
+costs SNR 28.9-32.9 dB against 36.4-37.9, log-mel nearly unchanged. Until that
+default is flipped, this table describes a configuration the binary does not pick
+on its own.
+
+### What each knob is for
+
+| knob | what it bounds | measured effect |
+|---|---|---|
+| `MYNAH_PREFILL_SLICE` | tokens per slice of a resumable prefill | 0 restores the one-shot prefill; bit-identical audio at any value |
+| `MYNAH_PREFILL_STEP_MS` | total prefill work per AR step | 0 removes the cap; the cap is what makes zero stalls a bound rather than a statistic |
+| `--prefork N --prefork-threads T` | worker shape | `16x2` beats `8x4` decisively here; the optimum is a property of the model's a/b ratio, not of the machine |
+| `--max-batch` | slots per worker | capped at 16 by `MYNAH_GRAPH_MAX_JOBS`; not binding at C90 (~6 live per worker) |
+
+### Against the same soak before the work
+
+| | before | after |
+|---|---|---|
+| highest qualified level, mixed bank | **none** (C99/C98/C96 all NOT STREAMABLE) | **C90 GOOD** |
+| `stall_rate@500ms` | 5 of 53895 | **0 of 53265** |
+| `stall_rate@250ms` | 233 of 53895 | **0 of 53265** |
+| worst freeze (`max_gap` max) | 707 ms | **177 ms** |
+| worst client prebuffer | 535 ms | **267 ms** |
+| throughput at equal concurrency | 130.5 | 129.6 audio-s/s (-0.7%) |
+
+The client contract that was an interim "600 ms prebuffer" is now **250 ms**, and
+it is a scheduler bound rather than a sample maximum.
+
+### What binds next
+
+Not the machine. `STREAM_RTF` p95 is **0.734** at C90, so the box delivers a third
+faster than realtime with headroom to spare. The gate that stops a higher
+concurrency is **TTFA at 494.8 ms against 500**, which is the price of slicing the
+prefill. The lever behind it is the ABSOLUTE cost of a prefill -- 190 ms for a
+long text at C1 with no contention, against 28 ms of fixed cost -- and nobody has
+optimised it. The detail, including the three predictions of mine that the box
+refuted, is in `.work/prefill-blocks-decode.md`.
