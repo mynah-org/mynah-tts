@@ -740,19 +740,34 @@ the x86 self-test that judges the two kernels written here and never executed
       A 10-minute screen had put that bound at 495.4 ms and the 30-minute run moved it
       past 500: a screen cannot qualify a tail either. **To close**: E10-10, because the
       tail is the long-request slot and the topology is the untested variable
-- [ ] E10-16 **the stall has one cause, measured and read in the code: the prefill runs
-      inside the step loop** → [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md).
+- [ ] E10-16 **NEXT — the stall has one cause, measured and read in the code: the prefill
+      runs inside the step loop** → [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md).
       `slot_start()` calls `engine->prepare()` synchronously in the admission block at the
       top of `mynah_graph_serve_continuous`, so **every resident slot freezes for the new
       request's prefill**. At C1 with no contention a long text's prefill costs **190 ms**
       against 28 ms of fixed cost -- 2.4 frame periods -- and under load `max_gap` is
       **97 ms at p50 and 358 ms at p95** with a frame lasting 80 ms. It is an interruption,
-      not a slowdown. It also explains why the `medium`-only bank was GOOD (every prefill
-      ~53 ms, under one frame) and why three concurrency levels could not clear it: the
-      freeze duration is a property of the TEXT, not of the load. **Fix**: make `prepare`
-      resumable and interleave the slices with decode steps; coarse slicing puts the freeze
-      under one frame period for ~110 ms of TTFA on the admitted request. Until then the
-      shipped contract is a **600 ms client prebuffer**, which covered all 53895 requests
+      not a slowdown. It explains why the `medium`-only bank was GOOD (every prefill ~53 ms,
+      under one frame) and why three concurrency levels could not clear it: the freeze
+      duration is a property of the TEXT, not of the load, so lowering C removes freezes at
+      3% a level while the cushion does all the work. Three ways out, priced:
+      - **(1) CHOSEN — chunked prefill.** Make `prepare` resumable and interleave the slices
+        with decode steps, so the longest freeze is one slice instead of one prefill. It
+        removes the cause. Costs an engine-seam API change and TTFA on the admitted request:
+        coarse slicing (two or three) puts the freeze **under one frame period** for ~110 ms
+        of TTFA. Gate: `stall_rate@500ms == 0` on a 30-minute mixed soak at C96 with
+        `RTF p95 <= 0.80` and `TTFA p95 <= 400 ms` -- the fix may not buy continuity with
+        throughput or with first audio, which is the whole point of doing it this way
+      - **(2) rejected, recorded so it is not re-proposed — lead-aware admission.** Defer
+        while the least-advanced resident slot has less cushion than the incoming prefill
+        needs. No API change, but the arithmetic refuses: a slot gains only
+        `(1 - RTF) x 80 ms` = 25 ms of lead per frame, so ~0.5 s of wall buys 250 ms of
+        cushion, and with an admission every ~0.5 s per worker there is nearly always a
+        vulnerable slot. A guard big enough to protect defers almost every admission; one
+        small enough not to protects almost nothing
+      - **(3) the interim contract, true today at zero cost — a 600 ms client prebuffer.**
+        No request in 53895 needed more than **535 ms** of lead at C96 over thirty minutes.
+        It ships until (1) lands, and it is a statement about a 30-minute sample of a tail
 - [ ] E10-10 **the topology is answered, and the answer is that it belongs to the MODEL** —
       `8x4` with the same 32 threads and the same 128 slots is decisively WORSE at C96:
       RTF p95 **1.052** against 0.784 (a mandatory gate), throughput 93.6 against 124.8
