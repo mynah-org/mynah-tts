@@ -740,7 +740,7 @@ the x86 self-test that judges the two kernels written here and never executed
       A 10-minute screen had put that bound at 495.4 ms and the 30-minute run moved it
       past 500: a screen cannot qualify a tail either. **To close**: E10-10, because the
       tail is the long-request slot and the topology is the untested variable
-- [ ] E10-16 **NEXT — the stall has one cause, measured and read in the code: the prefill
+- [~] E10-16 **BUILT AND MEASURED — the stall had one cause, measured and read in the code: the prefill
       runs inside the step loop** → [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md).
       `slot_start()` calls `engine->prepare()` synchronously in the admission block at the
       top of `mynah_graph_serve_continuous`, so **every resident slot freezes for the new
@@ -751,6 +751,19 @@ the x86 self-test that judges the two kernels written here and never executed
       under one frame) and why three concurrency levels could not clear it: the freeze
       duration is a property of the TEXT, not of the load, so lowering C removes freezes at
       3% a level while the cushion does all the work. Three ways out, priced:
+      **DONE, and it cleared its gate.** `prepare_slice` is an optional appended hook;
+      the driver alternates one slice with one step and carries a third slot state for a
+      prefill in flight. Bit-identical across `MYNAH_PREFILL_SLICE` 0/16/32/48/128 on two
+      architectures, single and batched. **C94, slice 48, thirty minutes: MARGINAL with
+      every mandatory gate passing** -- 53559/53559, `stall@500ms` **0**, RTF p95 0.761,
+      TTFA p95 443, `max_gap` p95 158 (was 358), throughput -0.7%. Against the same soak
+      before the fix: `stall@500` 5 -> 0, `stall@250` 233 -> 81. **The operating point is
+      C94.** Still open, and it is NOT concurrency: `stall@250ms` is flat at 0.13%/0.15%
+      between C96 and C94, so the 81 survivors are the freeze that remains (158 ms, two
+      frame periods), not a capacity tail. **Next**: a per-step TIME budget shared across
+      the preparing slots instead of a token budget per slot -- the slice pass walks every
+      preparing slot, so a smaller budget keeps more prefills in flight and one step's
+      freeze becomes their sum, which is why 32 is dominated by 48 on BOTH axes
       - **(1) CHOSEN — chunked prefill.** Make `prepare` resumable and interleave the slices
         with decode steps, so the longest freeze is one slice instead of one prefill. It
         removes the cause. Costs an engine-seam API change and TTFA on the admitted request:

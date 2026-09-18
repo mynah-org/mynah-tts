@@ -204,16 +204,30 @@ static int slot_fail(synth_slot *slot, const char *message) {
 /* How many tokens of prefill one slice may do, 0 = one shot (tts_engine.h,
  * `prepare_slice`).
  *
- * The default is two 16-token tiles. The cost being bounded is the freeze every
- * OTHER request in the batch takes while this one is admitted, and the budget
- * that matters is one frame period: a slice shorter than a frame cannot make a
- * resident slot miss one. `MYNAH_PREFILL_SLICE=0` restores the one-shot prefill
- * exactly, which is how the A/B is run. */
+ * The default is three 16-token tiles, and it is measured rather than reasoned:
+ * at C96 on the mixed bank, ten minutes per arm, 48 gave the SHORTEST freeze of
+ * the series AND a better time to first audio than 32 did.
+ *
+ *     slice   stall@500  stall@250  max_gap p95  TTFA p95
+ *     0             3/18007     81        358 ms    308 ms
+ *     32                  0         21        170       497
+ *     48                  0         24        158       444
+ *     64                  0         34        186       401
+ *
+ * That 32 is dominated on BOTH axes refutes the obvious reading -- "smaller
+ * slices buy a shorter freeze with first audio". The pass below walks every slot
+ * still preparing, so a smaller budget keeps MORE prefills in flight at once and
+ * one step's freeze becomes their sum. The shape that would fix it properly is a
+ * per-step time budget shared across the preparing slots rather than a token
+ * budget per slot; until that exists, 48 is the measured optimum.
+ *
+ * `MYNAH_PREFILL_SLICE=0` restores the one-shot prefill exactly, which is how
+ * the arms above were run. */
 static size_t prefill_slice_budget(void) {
     static size_t cached = SIZE_MAX;
     if (cached != SIZE_MAX) return cached;
     const char *env = getenv("MYNAH_PREFILL_SLICE");
-    long v = 32;
+    long v = 48;
     if (env != NULL && *env != '\0') {
         char *end = NULL;
         const long parsed = strtol(env, &end, 10);
