@@ -151,3 +151,69 @@ capacity tail either -- they are what is left of the freeze, which is still
 158 ms at p95, about two frame periods. Lowering concurrency further will not
 close them; shortening the freeze will. That points straight at the per-step time
 budget above, and it is the next thing to build, not a lower C.
+
+---
+
+# Concurrency is excluded, by four levels that refuse to line up
+
+The question after the fix was whether the residual `stall_rate@250ms` could be
+driven to zero by serving fewer requests. It cannot, and the shape of the data
+says so more clearly than a trend would have.
+
+All at `slice 48`, mixed v2 bank, `16x2 --max-batch 8`, ten minutes each except
+C94 which is the thirty-minute qualification:
+
+| C | stall@250 | rate | max_gap p95 | max_gap max | TTFA p95 | RTF p95 |
+|---|---|---|---|---|---|---|
+| 96 | 24 / 17922 | 0.134% | 158 ms | 349 ms | 444 ms | 0.770 |
+| 94 | 81 / 53559 | 0.151% | 158 | 441 | 443 | 0.761 |
+| **90** | 38 / 17729 | **0.214%** | 157 | 336 | 435 | 0.743 |
+| 80 | 19 / 17474 | 0.109% | 148 | 327 | 396 | 0.668 |
+
+**C90 is the worst of the four while carrying less load than C96 and C94.** The
+rate wanders between 0.11% and 0.21% with no monotone trend across a 17% span of
+load. A capacity tail does not behave like that.
+
+`max_gap` p95 is the reason, and it is a near-constant: **158, 158, 157, 148**.
+The freeze duration does not know the load exists, and the freeze is what stalls
+a player. Lowering C removes OCCASIONS and leaves DURATION untouched, so the
+count drifts down noisily and never reaches zero. With 53559 attempts the
+unlucky request is always found.
+
+**A gate that demands zero is a statement about the worst case, and the worst
+case needs a bound, not a better distribution.** That is why the next change is a
+cap and not a lower operating point.
+
+## The bound: a per-step prefill budget
+
+`MYNAH_PREFILL_STEP_MS`, default 40 ms -- half a frame period. The per-slot token
+budget bounded one slice; it never bounded one STEP, because the slice pass walks
+every slot still preparing and seven prefills landing together froze a worker for
+seven slices. The cap stops the pass when the step's budget is spent and resumes
+next step from where it left off, with a rotating cursor so that when the budget
+cannot serve everyone it is a different prefill that waits each time -- without
+it the lowest slot index is always served and an unlucky request can be starved
+for as long as its neighbours keep arriving. One slice always runs even when the
+budget is already spent: a cap that can starve a prefill forever is a deadlock,
+not a bound.
+
+It also predicts a reversal. The reason small slices lost (32 dominated by 48)
+was that they kept more prefills in flight and a step's freeze became their sum.
+Under the cap that sum cannot happen, so small slices should win again.
+
+Bit-identity re-verified with the cap in place, across `slice` 0/16/48 x
+`step_ms` 0/40, on both architectures. `make test` 23/23.
+
+## An artefact, and a language refusal that is correct
+
+Twelve streamed clips were captured from the live C90 soak -- three per class,
+English, all-int8 including `codec_convtr`, seed 11 -- with the texts, the
+configuration and the per-clip cadence in a manifest beside them. The two Italian
+texts returned **HTTP 400**: `models/pocket-en` declares
+`languages.resident = [english]` with `bound: true`, so the server refuses a
+language it does not hold instead of synthesising it badly. That is the
+`language_refused` counter which reads zero in every soak, doing its job.
+
+The TTFA of those clips (0.9-1.4 s) is NOT the served TTFA. They are the 91st
+request against a server already saturated at C90, so they queue. The served
+number is the soak's: 435 ms at p95.

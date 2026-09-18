@@ -277,19 +277,64 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
     return 0;
 }
 
-/* One slice of prefill for every slot still carrying one.
+/* How much wall time one step may spend on prefill, in milliseconds; 0 removes
+ * the cap.
+ *
+ * A PER-SLOT token budget bounds one slice, not one step. The pass below walks
+ * every slot still preparing, so seven prefills landing in one worker froze it
+ * for seven slices -- measured as a `max_gap` maximum of 441 ms against a single
+ * slice of about 60 ms. That is why `stall_rate@250ms` did not fall with
+ * concurrency between C96 and C94: lowering the load removes freezes, it does
+ * not shorten them.
+ *
+ * A gate that demands ZERO of 53559 is not satisfied by a better distribution,
+ * it is satisfied by an upper bound. This is the bound: prefill work per step is
+ * capped, so the freeze cannot exceed the cap plus the slice that was already
+ * running. The default is half a frame period at 12.5 Hz. One slice always runs
+ * even when the budget is already spent, because a cap that can starve a prefill
+ * forever is a deadlock, not a bound. */
+static double prefill_step_budget_s(void) {
+    static double cached = -1.0;
+    if (cached >= 0.0) return cached;
+    const char *env = getenv("MYNAH_PREFILL_STEP_MS");
+    double v = 40.0;
+    if (env != NULL && *env != '\0') {
+        char *end = NULL;
+        const double parsed = strtod(env, &end);
+        if (end != env && parsed >= 0.0 && parsed < 100000.0) v = parsed;
+    }
+    cached = v / 1000.0;
+    return cached;
+}
+
+/* One slice of prefill, for as many waiting slots as the step's budget allows.
  *
  * Runs between admission and the step, so a slice and a step alternate and no
- * resident slot waits more than one slice for the next frame. A slot that
- * finishes here becomes active and is stepped in the SAME iteration, which is
- * what keeps the added time-to-first-audio to the slicing itself rather than to
- * a round trip through the loop. */
+ * resident slot waits more than the budget for its next frame. A slot that
+ * finishes here becomes active and is stepped in the SAME iteration, which keeps
+ * the added time-to-first-audio to the slicing itself rather than to a round trip
+ * through the loop.
+ *
+ * `*rr` rotates the starting slot so that when the budget cannot serve everyone,
+ * it is a different prefill that waits each time. Without it the lowest slot
+ * index would always be served and a request unlucky in its slot could be
+ * starved for as long as its neighbours keep arriving. */
 static void slots_prefill_slice(const mynah_tts_engine *engine, synth_slot *slots,
-                                size_t max_batch, int dump) {
+                                size_t max_batch, int dump, size_t *rr) {
     const size_t budget = prefill_slice_budget();
-    for (size_t i = 0; i < max_batch; ++i) {
+    const double step_budget = prefill_step_budget_s();
+    const double t0 = (step_budget > 0.0) ? mynah_phase_seconds() : 0.0;
+    size_t served = 0;
+    for (size_t n = 0; n < max_batch; ++n) {
+        const size_t i = (*rr + n) % max_batch;
         synth_slot *slot = &slots[i];
         if (!slot->in_use || !slot->preparing) continue;
+        if (step_budget > 0.0 && served > 0u &&
+            (mynah_phase_seconds() - t0) >= step_budget) {
+            *rr = i;                      /* resume here next step */
+            break;
+        }
+        ++served;
         int done = 0;
         if (engine->prepare_slice(slot->ctx, budget, &done,
                                   slot->error, slot->error_capacity) != 0) {
@@ -849,6 +894,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     const double t_start = timing ? mynah_phase_seconds() : 0.0;
     double t_prep = t_start, t_ar = t_start;
     size_t admitted = 0;
+    /* Rotating cursor for the prefill pass; see slots_prefill_slice. */
+    size_t prefill_rr = 0;
 
     synth_slot slots[MYNAH_GRAPH_MAX_JOBS];
     mynah_engine_ctx *step_ctxs[MYNAH_GRAPH_MAX_JOBS];
@@ -974,7 +1021,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
 
         /* ---- finish the prefills that are in flight -------------------- */
         if (engine->prepare_slice != NULL) {
-            slots_prefill_slice(engine, slots, max_batch, dump_all);
+            slots_prefill_slice(engine, slots, max_batch, dump_all, &prefill_rr);
         }
 
         /* ---- one step over everything still live ---------------------- */
