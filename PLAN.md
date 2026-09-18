@@ -740,7 +740,7 @@ the x86 self-test that judges the two kernels written here and never executed
       A 10-minute screen had put that bound at 495.4 ms and the 30-minute run moved it
       past 500: a screen cannot qualify a tail either. **To close**: E10-10, because the
       tail is the long-request slot and the topology is the untested variable
-- [~] E10-16 **BUILT AND MEASURED — the stall had one cause, measured and read in the code: the prefill
+- [x] E10-16 **CLOSED — the stall had one cause, and the fix qualified C90 as GOOD, measured and read in the code: the prefill
       runs inside the step loop** → [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md).
       `slot_start()` calls `engine->prepare()` synchronously in the admission block at the
       top of `mynah_graph_serve_continuous`, so **every resident slot freezes for the new
@@ -771,8 +771,16 @@ the x86 self-test that judges the two kernels written here and never executed
       froze a worker for their SUM, which is the 441 ms `max_gap` maximum against a single
       slice of ~60 ms. The pass now stops when the step's budget is spent and resumes next
       step where it stopped, with a rotating cursor so no slot starves, and always runs one
-      slice so the cap cannot deadlock. It predicts a reversal: small slices lost only
-      because they summed across slots, so under the cap 16 should beat 48
+      slice so the cap cannot deadlock. The reversal it predicted was then measured: with
+      the cap, 16-token slices reach `stall@250ms` **0** and a worst freeze of 122 ms, and
+      the binding gate becomes TTFA instead. **QUALIFIED: C90, slice 32, cap 60 ms, thirty
+      minutes — GOOD, every gate passed.** 53265/53265, `stall@500ms` **0**, `stall@250ms`
+      **0**, RTF p95 0.734, TTFA p95 494.8, prebuffer p95 10.2 and max 267, `max_gap` max
+      **177 ms** (was 707), throughput 128.9 audio-s/s, drift +0.0040 over ten windows.
+      **The client contract is now a 250 ms prebuffer, and it is a bound rather than a
+      sample maximum.** What binds next is NOT the machine: RTF p95 0.734 leaves headroom
+      and the gate that stops a higher C is TTFA at 494.8 against 500, so the next lever is
+      the ABSOLUTE cost of the prefill -- still 190 ms for a long text, never optimised
       - **(1) CHOSEN — chunked prefill.** Make `prepare` resumable and interleave the slices
         with decode steps, so the longest freeze is one slice instead of one prefill. It
         removes the cause. Costs an engine-seam API change and TTFA on the admitted request:
