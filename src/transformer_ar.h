@@ -1,0 +1,395 @@
+/*
+ * Shared causal autoregressive transformer (E3).
+ *
+ * This is the backbone shape used by PocketTTS' `flow_lm.transformer` and by
+ * Mimi's `decoder_transformer`.  It exists because the transformer helpers in
+ * `graph.c` are not actually shared: they take a name prefix and then format
+ * NeMo tensor names, so a second engine cannot use them
+ * (`.work/engine-seam-refactor.md`, risk 6).  **Every weight here arrives as an
+ * already-resolved `const float *`.  This module never formats, parses or
+ * looks up a tensor name, and never sees a model pack.**
+ *
+ * Reference (kyutai-labs/pocket-tts, `modules/transformer.py`,
+ * `modules/attention.py`, `modules/rope.py`):
+ *
+ *     x = x + layer_scale_1(self_attn(norm1(x)))
+ *     x = x + layer_scale_2(linear2(gelu_tanh(linear1(norm2(x)))))
+ *
+ * The details that a from-scratch implementation gets wrong silently:
+ *
+ *   - **QKV is pre-fused.**  `self_attn.in_proj.weight` is `[3 * attn_dim,
+ *     d_model]`, packed as `view(b, t, 3, heads, head_dim)`, so one matvec
+ *     produces q, k and v and each third is head-major.
+ *   - **The FFN is not gated**: `linear1` -> GELU(approximate="tanh") ->
+ *     `linear2`.  No SwiGLU, no third projection.
+ *   - **LayerNorm has weight *and* bias and eps is 1e-5**, against the flow
+ *     head's affine-free 1e-6 (`src/flow_head.h`).  Getting the epsilon from
+ *     the wrong neighbour is a plausible-looking, entirely wrong output.
+ *     Unlike the flow head this module does *not* grow its own normalisation
+ *     kernel: `mynah_layernorm_f32` already computes exactly this (biased
+ *     variance, optional bias, SIMD), it only insists on a non-NULL weight —
+ *     which every norm in this family has.  A weight-less LayerNorm is
+ *     therefore rejected here rather than silently approximated.
+ *   - **RoPE is interleaved** (adjacent pairs `(2i, 2i+1)` of each head), not
+ *     split-halves, with `freqs[i] = exp(i * -log(max_period) * 2 / head_dim)`
+ *     and the *absolute* position as the angle multiplier.
+ *   - **`layer_scale` is per-model, not per-architecture.**  The PocketTTS
+ *     backbone builds `nn.Identity()`; Mimi's decoder transformer builds
+ *     `LayerScale(d_model, 0.01)` and ships `layer_scale_{1,2}.scale [512]`.
+ *     A NULL pointer here means identity.
+ *   - **`context` is a sliding window.**  The backbone passes `None`
+ *     (unlimited); Mimi's decoder transformer passes 250.  Zero means
+ *     unlimited.
+ *
+ * ## KV cache layout — chosen to match the voice files byte for byte
+ *
+ * `mynah_transformer_ar_state_kv()` hands back one contiguous block per layer
+ * shaped `[2][max_seq_len][num_heads][head_dim]`, K first then V, holding
+ * **post-RoPE** keys.  That is exactly `_LinearKVCacheBackend.init_state`'s
+ * `[2, B, T, H, D]` at B = 1, verified against
+ * `languages/english_2026-04/embeddings/alba.safetensors`
+ * (`transformer.layers.N.self_attn/cache`, F32 `[2, 1, 126, 16, 64]`, plus
+ * `offset` I64 `[1]` = 126).  So a predefined voice loads with two memcpys per
+ * layer and **no layout conversion**: only the T capacity differs, the
+ * per-position `[heads][head_dim]` interior is identical.
+ *
+ * ## NaN as a sentinel — how it is handled here
+ *
+ * Upstream uses NaN twice: `flow_lm.forward` replaces NaN rows of the latent
+ * sequence with `bos_emb`, and `_expand_kv_cache` fills the unused tail of a
+ * grown KV cache with NaN.  Neither sentinel exists inside this module:
+ *
+ *   1. **Validity is explicit.**  The state carries an integer `offset`, the
+ *      number of cached positions.  Attention only ever reads `[lo, offset+i]`,
+ *      so the uninitialised tail is unreachable by construction rather than by
+ *      arithmetic.  The backing store is `calloc`ed, so even a bug reads zeros,
+ *      not NaN.
+ *   2. **NaN is rejected at every entrance.**  `_load_kv` refuses a
+ *      non-finite voice cache, `_prefill`/`_step` refuse a non-finite input,
+ *      and the attention softmax (`mynah_softmax_f32`) refuses non-finite
+ *      scores.  A NaN therefore fails loudly at the boundary instead of
+ *      reaching a matmul and turning the whole utterance into silence.
+ *   3. The BOS substitution stays where it belongs: the caller applies
+ *      `bos_emb` before `input_linear`, so this module only ever sees a real
+ *      `[d_model]` vector.
+ *
+ * ## Prefill, and the two kinds of "batch"
+ *
+ * There are two independent axes along which rows can be run together, and
+ * confusing them is how a batched engine ends up producing audio that depends
+ * on its neighbours:
+ *
+ *   1. **Positions of one sequence** (`_prefill`).  Token i writes its own K/V
+ *      and attends to `[0, offset+i]`, which is what a batched masked SDPA
+ *      computes, so the whole tile can be normalised, projected and fed forward
+ *      together as long as every K/V is written before any attention reads it.
+ *      The row count here is a property of the request's own text (or of the
+ *      codec's fixed stride), never of who else is in flight, so a hook may use
+ *      a GEMM whose reassociation differs from a matvec.
+ *   2. **One position of N different requests** (`_step_batch`).  Each row has
+ *      its own KV cache, its own absolute position and its own sliding window;
+ *      only the weights are shared.  Here the arithmetic per row MUST NOT
+ *      change with N — see `mynah_transformer_ar_linear_rows_fn`.
+ *
+ * Both are one graph, not two (AGENTS.md rule 7): the layer body is written
+ * once, over an array of rows, and the two entry points differ only in where a
+ * row's KV cache and position come from.  With no hook installed both fall back
+ * to the same per-row `mynah_matvec_bias_f32` the single `_step` uses, so the
+ * default numerics of all three paths are bit-identical.
+ *
+ * Nothing is allocated after `_state_new` / `_batch_new`: `_step`, `_prefill`
+ * and `_step_batch` all run out of scratch owned by the state or by the
+ * caller-provided batch object.
+ */
+#ifndef MYNAH_TTS_TRANSFORMER_AR_H
+#define MYNAH_TTS_TRANSFORMER_AR_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    size_t d_model;     /* residual width, e.g. 1024                        */
+    size_t num_heads;   /* e.g. 16                                          */
+    size_t head_dim;    /* e.g. 64; 0 means d_model / num_heads             */
+    size_t num_layers;  /* e.g. 6                                           */
+    size_t ffn_dim;     /* e.g. 4096                                        */
+    size_t max_seq_len; /* KV capacity in positions, voice prefix included  */
+    size_t context;     /* sliding attention window; 0 = unlimited          */
+    float max_period;   /* RoPE, 10000.0f                                   */
+    float layernorm_eps; /* 1e-5f for this family                           */
+} mynah_transformer_ar_config;
+
+/* Fills in the values that are architecture constants rather than model
+ * dimensions (max_period, eps, unlimited context).  The caller still has to
+ * take every dimension from `model.json`. */
+void mynah_transformer_ar_config_defaults(mynah_transformer_ar_config *config);
+
+/*
+ * One layer's weights, already resolved.  `attn_dim` below is
+ * `num_heads * head_dim`.  A NULL bias means "no bias", which is the
+ * PocketTTS case for every projection in this block.
+ */
+typedef struct {
+    const float *in_proj_weight;  /* [3 * attn_dim][d_model], q|k|v head-major */
+    const float *in_proj_bias;    /* [3 * attn_dim]  or NULL                   */
+    const float *out_proj_weight; /* [d_model][attn_dim]                       */
+    const float *out_proj_bias;   /* [d_model]       or NULL                   */
+    const float *norm1_weight;    /* [d_model], required                       */
+    const float *norm1_bias;      /* [d_model] or NULL                         */
+    const float *norm2_weight;    /* [d_model], required                       */
+    const float *norm2_bias;      /* [d_model] or NULL                         */
+    const float *linear1_weight;  /* [ffn_dim][d_model]                        */
+    const float *linear1_bias;    /* [ffn_dim]  or NULL                        */
+    const float *linear2_weight;  /* [d_model][ffn_dim]                        */
+    const float *linear2_bias;    /* [d_model]  or NULL                        */
+    const float *layer_scale_1;   /* [d_model] or NULL = nn.Identity()         */
+    const float *layer_scale_2;   /* [d_model] or NULL = nn.Identity()         */
+} mynah_transformer_ar_layer;
+
+/* Which of a layer's four linear projections a hook call is for. */
+typedef enum {
+    MYNAH_TAR_LINEAR_IN_PROJ = 0, /* [3*attn_dim][d_model], fused q|k|v */
+    MYNAH_TAR_LINEAR_OUT_PROJ,    /* [d_model][attn_dim]               */
+    MYNAH_TAR_LINEAR_FFN1,        /* [ffn_dim][d_model]                */
+    MYNAH_TAR_LINEAR_FFN2         /* [d_model][ffn_dim]                */
+} mynah_transformer_ar_linear_kind;
+
+/*
+ * Optional replacement for the four linear projections.
+ *
+ * The default is `mynah_matvec_bias_f32`, which reads the whole f32 weight per
+ * position: on an M1 the PocketTTS backbone step measured 14.6 ms for 302 MB of
+ * weights, i.e. ~21 GB/s, which is one core's streaming limit rather than an
+ * arithmetic limit.  Quantization is how that gets smaller, and quantization
+ * needs a cache keyed per tensor -- which this module must not have, because it
+ * never sees a model pack or a tensor name (see the header comment).
+ *
+ * So the engine supplies it.  `kind` and `layer` name the projection; the
+ * engine maps that pair to its own cache key.  The contract is exactly
+ * `out[count][n] = in[count][k] @ weight[n][k]^T + bias`, i.e. what
+ * `mynah_matvec_bias_f32` computes for count == 1.  Returning non-zero fails
+ * the step.  NULL (the default, and what a calloc'd weights struct has) keeps
+ * the f32 matvec, so nothing about this module's numerics changes until an
+ * engine opts in.
+ */
+typedef int (*mynah_transformer_ar_linear_fn)(void *user, size_t layer,
+                                              mynah_transformer_ar_linear_kind kind,
+                                              const float *weight,
+                                              const float *bias, const float *in,
+                                              float *out, size_t count, size_t k,
+                                              size_t n);
+
+/*
+ * The same projection for rows that belong to DIFFERENT sequences.
+ *
+ * `in_rows[b]` and `out_rows[b]` are one `[k]` / `[n]` row each and need not be
+ * contiguous with one another, because each row lives in its own request's
+ * scratch.  The contract is stricter than the one above: row `b`'s result MUST
+ * be identical, bit for bit, to what `linear` would have produced for that row
+ * alone with `count == 1`.  Without that a request's audio would depend on
+ * which requests happened to be in flight beside it, which `mynah_tts.h`
+ * promises never happens.  `mynah_qmat_linear_batched` is the implementation
+ * this exists for: it quantizes each activation row on its own, so the batch
+ * width never enters the arithmetic.
+ *
+ * NULL (the default) makes `_step_batch` fall back to `linear` per row, which
+ * is exact but reads the weight once per row.
+ */
+typedef int (*mynah_transformer_ar_linear_rows_fn)(
+    void *user, size_t layer, mynah_transformer_ar_linear_kind kind,
+    const float *weight, const float *bias, const float *const *in_rows,
+    float *const *out_rows, size_t batch, size_t k, size_t n);
+
+typedef struct {
+    const mynah_transformer_ar_layer *layers; /* [num_layers] */
+    /* Optional final LayerNorm applied to the stack output, at the same eps.
+     * PocketTTS' `flow_lm.out_norm` is this; Mimi's decoder transformer has no
+     * such tensor, so both pointers are NULL there. */
+    const float *out_norm_weight;
+    const float *out_norm_bias;
+    /* Optional; NULL keeps the built-in f32 matvec. */
+    mynah_transformer_ar_linear_fn linear;
+    /* Optional; NULL makes the cross-request batched step fall back to
+     * `linear` per row.  Must be bit-exact per row (see above). */
+    mynah_transformer_ar_linear_rows_fn linear_rows;
+    void *linear_user;
+} mynah_transformer_ar_weights;
+
+typedef struct mynah_transformer_ar_state mynah_transformer_ar_state;
+
+/* Per-context state: KV cache, RoPE table and every scratch buffer `_step`
+ * needs.  Weights are *not* captured; they stay owned read-only by the model
+ * and are passed to each forward, so one weight set backs many contexts
+ * (AGENTS.md rule 3). */
+mynah_transformer_ar_state *mynah_transformer_ar_state_new(
+    const mynah_transformer_ar_config *config, char *error,
+    size_t error_capacity);
+void mynah_transformer_ar_state_free(mynah_transformer_ar_state *state);
+
+/* Rewinds to position 0.  The cache memory is left alone: nothing past the
+ * offset is ever read, and it is overwritten before it becomes readable. */
+void mynah_transformer_ar_state_reset(mynah_transformer_ar_state *state);
+
+const mynah_transformer_ar_config *mynah_transformer_ar_state_config(
+    const mynah_transformer_ar_state *state);
+
+/* Number of cached positions, i.e. the absolute position the next token gets. */
+size_t mynah_transformer_ar_state_offset(const mynah_transformer_ar_state *state);
+
+/* The raw KV block for one layer: `[2][max_seq_len][num_heads][head_dim]`,
+ * K then V, post-RoPE.  Exposed so a converter can write a voice prefix
+ * straight into it; prefer `_load_kv`, which bounds-checks and rejects NaN. */
+float *mynah_transformer_ar_state_kv(mynah_transformer_ar_state *state,
+                                     size_t layer);
+
+/* Floats in one half (K or V) of a layer's block: max_seq_len*heads*head_dim. */
+size_t mynah_transformer_ar_state_kv_half_floats(
+    const mynah_transformer_ar_state *state);
+
+/*
+ * Copies a voice prefix into layer `layer`.  `kv` is
+ * `[2][positions][num_heads][head_dim]` — the voice safetensors layout with
+ * the batch axis dropped.  Rejects a non-finite entry, which is the one place
+ * upstream's NaN padding could get in.  Does not move the offset: call
+ * `_set_offset(positions)` once all layers are loaded.
+ */
+int mynah_transformer_ar_state_load_kv(mynah_transformer_ar_state *state,
+                                       size_t layer, const float *kv,
+                                       size_t positions, char *error,
+                                       size_t error_capacity);
+
+/* Declares `positions` cached positions valid, i.e. the voice file's
+ * `current_end` / `offset`. */
+int mynah_transformer_ar_state_set_offset(mynah_transformer_ar_state *state,
+                                          size_t positions, char *error,
+                                          size_t error_capacity);
+
+/* Validates that every pointer the configuration requires is present.
+ * Returns 0, or -1 with a message in `error`. */
+int mynah_transformer_ar_check_weights(
+    const mynah_transformer_ar_state *state,
+    const mynah_transformer_ar_weights *weights, char *error,
+    size_t error_capacity);
+
+/*
+ * Runs `n_tokens` consecutive positions starting at the current offset and
+ * advances the offset by `n_tokens`.
+ *
+ *   x    [n_tokens][d_model]  row-major input
+ *   out  [n_tokens][d_model]  row-major output, or NULL to discard
+ *
+ * The positions are run as tiles of at most `mynah_transformer_ar_prefill_tile()`
+ * rows: every linear projection in a tile is presented to the hook as ONE call
+ * with `count == rows`, so a hook that is weight-stationary reads the weight
+ * once per tile instead of once per position.  With no hook installed the tile
+ * is still computed one row at a time, so the default numerics are unchanged
+ * and prefill stays bit-identical to the same positions run through `_step`.
+ *
+ * `n_tokens == 0` is a no-op.  Returns 0, or -1 on a bad argument, an overflow
+ * of `max_seq_len`, or a non-finite value reaching the attention.
+ */
+int mynah_transformer_ar_prefill(mynah_transformer_ar_state *state,
+                                 const mynah_transformer_ar_weights *weights,
+                                 const float *x, size_t n_tokens, float *out);
+
+/* One autoregressive position.  `x` and `out` are `[d_model]`; `out` may not
+ * be NULL.  Allocates nothing. */
+int mynah_transformer_ar_step(mynah_transformer_ar_state *state,
+                              const mynah_transformer_ar_weights *weights,
+                              const float *x, float *out);
+
+/* How many positions one prefill tile covers.  Exposed so an engine can size
+ * the scratch its hook needs for a tile-wide call. */
+size_t mynah_transformer_ar_prefill_tile(void);
+
+/*
+ * Cross-request batching.
+ *
+ * The scratch for one batched step: the stacked residual stream and the stacked
+ * projection outputs for up to `max_rows` requests.  It is NOT per request --
+ * one belongs to the driver, is lent to `_step_batch` for the call, and must
+ * not be shared between threads that step concurrently.  `config` must be the
+ * configuration every state in the batch was built with.
+ */
+typedef struct mynah_transformer_ar_batch mynah_transformer_ar_batch;
+
+mynah_transformer_ar_batch *mynah_transformer_ar_batch_new(
+    const mynah_transformer_ar_config *config, size_t max_rows, char *error,
+    size_t error_capacity);
+void mynah_transformer_ar_batch_free(mynah_transformer_ar_batch *batch);
+size_t mynah_transformer_ar_batch_capacity(
+    const mynah_transformer_ar_batch *batch);
+
+/*
+ * One autoregressive position for each of `count` independent states, with one
+ * pass over the weights instead of `count` passes.
+ *
+ *   states  [count]  distinct states, all built from the same configuration
+ *   x       [count]  one `[d_model]` input row each
+ *   out     [count]  one `[d_model]` output row each; no entry may be NULL
+ *
+ * Each state advances its own offset by one.  Every row is computed exactly as
+ * `_step` would have computed it alone: the states share no buffer, and the
+ * only shared object is the read-only weight set plus `batch`'s scratch.
+ *
+ * `count == 0` is a no-op; `count == 1` is `_step`.  Returns 0, or -1 on a bad
+ * argument, a state whose configuration differs, an overflow of `max_seq_len`,
+ * or a non-finite value reaching the attention.  A failure leaves the batch
+ * unusable: it is a failure of shared code, not of one request's data.
+ */
+int mynah_transformer_ar_step_batch(mynah_transformer_ar_state *const *states,
+                                    size_t count,
+                                    const mynah_transformer_ar_weights *weights,
+                                    mynah_transformer_ar_batch *batch,
+                                    const float *const *x, float *const *out);
+
+/* ---- kernels, exported because they are new and separately testable ---- */
+
+/* cos/sin of `position * freqs[i]` for i in [0, half), with
+ * `freqs[i] = exp(i * -log(max_period) * 2 / (2 * half))`.  Computed in f32 to
+ * match the reference, which builds the table from a float32 arange. */
+void mynah_transformer_ar_rope_angles_f32(float *cosines, float *sines,
+                                          size_t half, size_t position,
+                                          float max_period);
+
+/* Rotates `[num_heads][head_dim]` in place, interleaved: each adjacent pair
+ * `(2i, 2i+1)` is one complex number turned by `(cosines[i], sines[i])`. */
+void mynah_transformer_ar_rope_apply_f32(float *values, size_t num_heads,
+                                         size_t head_dim, const float *cosines,
+                                         const float *sines);
+
+/* Model-free self test: RoPE, LayerNorm with bias, GELU-tanh, causal attention
+ * with and without a `context` window, KV-cache continuity (prefill of N plus
+ * one step equals prefill of N+1), layer_scale NULL against an explicit unit
+ * vector, a prefill that spans more than one tile against the same positions
+ * stepped one at a time, the same equality over 300 positions with the window
+ * engaged and a hard refusal past `max_seq_len`, and `_step_batch` of N states
+ * against those same N states stepped alone -- the tile and batch cases are
+ * bit-equality assertions, because the whole point of both paths is that the
+ * row count must not reach the numbers.  The long windowed case is the shipped
+ * half of `tests/test_transformer_ar_window.c` (`make window-test`), which
+ * carries the f64 reference, the receptive field and RoPE's base at the
+ * production `context = 250`.
+ * Returns 0, or -1 with a message in `error`. */
+/* TEST HOOK, not a runtime knob: forces the windowed KV cache off (0) or on
+ * (1) for states created afterwards, or restores the resolution (-1), and
+ * returns the mode that was in effect before.
+ *
+ * A transformer with a sliding `context` cannot read further back than the
+ * window, so its cache is allocated as `context` plus slack with slot 0 at a
+ * moving absolute position, instead of one slot per position the utterance
+ * could reach -- on the pinned pack that is 500 positions rather than 24016,
+ * 196 MB of address space that was never reachable.  The two must produce
+ * bit-identical output, and proving it needs both in one process. */
+int mynah_transformer_ar_kv_window_force(int mode);
+
+int mynah_transformer_ar_self_test(char *error, size_t error_capacity);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MYNAH_TTS_TRANSFORMER_AR_H */

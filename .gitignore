@@ -1,5 +1,4 @@
-# Local planning/agent notes
-/PLAN.md
+# Local agent notes (PLAN.md and .work/ are tracked)
 /CLAUDE.md
 
 # Model packs and downloaded checkpoints
@@ -26,3 +25,7 @@ __pycache__/
 # OS/editor noise
 .DS_Store
 
+
+# agent worktrees
+.claude/
+/verify/

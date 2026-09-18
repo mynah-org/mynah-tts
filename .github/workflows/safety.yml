@@ -6,10 +6,24 @@ on:
   push:
     branches: [main]
 
+# BOTH SANITIZERS RUN ON BOTH ARCHITECTURES.
+#
+# They used to run on x86 only, which left the NEON, SDOT and SMMLA kernels --
+# the ones production actually executes on Graviton and Axion -- never
+# sanitized on Linux at all. The arm runner reports dotprod and i8mm ON, so
+# the int8 paths under test there are the shipped ones and not a fallback.
 jobs:
   ubsan:
-    name: UBSan
-    runs-on: ubuntu-latest
+    name: UBSan (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
 
     steps:
       - uses: actions/checkout@v7
@@ -27,8 +41,16 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
 
   asan:
-    name: ASan
-    runs-on: ubuntu-latest
+    name: ASan (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
 
     steps:
       - uses: actions/checkout@v7

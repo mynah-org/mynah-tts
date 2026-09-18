@@ -4,6 +4,14 @@
 #include "mynah_tts.h"
 #include "qmat.h"
 #include "tokenizer.h"
+#include "tokenizer_sentencepiece.h"
+#include "flow_head.h"
+#include "convq8.h"
+#include "seanet.h"
+#include "transformer_ar.h"
+#include "dispatch.h"
+#include "voice_clone.h"
+#include "engine_pocket.h"
 
 #include <math.h>
 #include <errno.h>
@@ -23,6 +31,7 @@ static void usage(const char *program) {
     printf("Usage:\n");
     printf("  %s --self-test\n", program);
     printf("  %s --inspect MODEL_DIR\n", program);
+    printf("  %s --pocket-self-check MODEL_DIR\n", program);
     printf("  %s --write-test-wav OUTPUT.wav\n", program);
     printf("  %s --synthesize MODEL_DIR --tokens IDS --output OUTPUT.wav [options]\n", program);
     printf("  %s --synthesize MODEL_DIR --text \"hello world\" --lang en --output OUTPUT.wav [options]\n", program);
@@ -264,21 +273,11 @@ static int synthesize(int argc, char **argv) {
         fprintf(stderr, "invalid token list\n");
         return 2;
     }
-    if (raw_text != NULL) {
-        char tok_err[256];
-        mynah_tokenizer *tok = mynah_tokenizer_open(model_dir, tok_err, sizeof(tok_err));
-        if (tok == NULL) {
-            fprintf(stderr, "tokenizer error: %s\n", tok_err);
-            return 2;
-        }
-        if (mynah_tokenizer_encode(tok, lang, raw_text, &tokens, &token_count,
-                                   tok_err, sizeof(tok_err)) != 0) {
-            fprintf(stderr, "tokenization error: %s\n", tok_err);
-            mynah_tokenizer_close(tok);
-            return 2;
-        }
-        mynah_tokenizer_close(tok);
-    }
+    /* Raw text is tokenized after the model is open, because which tokenizer
+     * applies is a property of the engine: Magpie has per-language G2P and
+     * character vocabularies under tokenizer/, PocketTTS a single SentencePiece
+     * Unigram model per pack. --tokens and --normalized stay before, since they
+     * bypass the tokenizer by definition. */
     mynah_tts_model *model = NULL;
     char error[256];
     const double load_start = now_seconds();
@@ -290,6 +289,43 @@ static int synthesize(int argc, char **argv) {
     const double load_seconds = now_seconds() - load_start;
     mynah_tts_model_info info;
     mynah_tts_model_get_info(model, &info);
+    if (raw_text != NULL) {
+        char tok_err[256];
+        if (strcmp(info.engine, "pocket") == 0) {
+            char sp_path[4096];
+            const int n = snprintf(sp_path, sizeof(sp_path), "%s/tokenizer.model", model_dir);
+            mynah_sp *sp = NULL;
+            if (n <= 0 || (size_t)n >= sizeof(sp_path) ||
+                mynah_sp_open(sp_path, &sp, tok_err, sizeof(tok_err)) != 0) {
+                fprintf(stderr, "tokenizer error: %s\n", tok_err);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            if (mynah_sp_encode(sp, raw_text, strlen(raw_text), &tokens, &token_count,
+                                tok_err, sizeof(tok_err)) != 0) {
+                fprintf(stderr, "tokenization error: %s\n", tok_err);
+                mynah_sp_close(sp);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            mynah_sp_close(sp);
+        } else {
+            mynah_tokenizer *tok = mynah_tokenizer_open(model_dir, tok_err, sizeof(tok_err));
+            if (tok == NULL) {
+                fprintf(stderr, "tokenizer error: %s\n", tok_err);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            if (mynah_tokenizer_encode(tok, lang, raw_text, &tokens, &token_count,
+                                       tok_err, sizeof(tok_err)) != 0) {
+                fprintf(stderr, "tokenization error: %s\n", tok_err);
+                mynah_tokenizer_close(tok);
+                mynah_tts_model_close(model);
+                return 2;
+            }
+            mynah_tokenizer_close(tok);
+        }
+    }
     if (normalized_text != NULL) {
         int *next = (int *)realloc(tokens, (token_count + 1u) * sizeof(*tokens));
         if (next == NULL) {
@@ -456,6 +492,18 @@ static int write_test_wav(const char *path) {
 }
 
 int main(int argc, char **argv) {
+    /* PLAN.md E4-12.  Before argument parsing, before any allocation and before
+     * any model is opened: if this binary contains instructions this CPU does
+     * not have, the next thing that happens is SIGILL with no message.  The
+     * guard fires only on a definite absence, so a CPU we cannot probe still
+     * runs. */
+    {
+        char isa_error[512];
+        if (mynah_dispatch_isa_guard(isa_error, sizeof(isa_error)) != 0) {
+            fprintf(stderr, "fatal: %s\n", isa_error);
+            return 1;
+        }
+    }
     if (argc == 1 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
         usage(argv[0]);
@@ -463,6 +511,14 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "--version") == 0) {
         puts(MYNAH_TTS_VERSION);
+        return 0;
+    }
+    if (strcmp(argv[1], "--dispatch-map") == 0) {
+        /* Every ISA claim in this repo has to survive this report: it resolves
+         * each feature by calling the runtime predicate, never by re-deriving
+         * compiled && supported. See .work/cpu-kernels-arm-x86.md. */
+        const int as_json = argc == 3 && strcmp(argv[2], "--json") == 0;
+        mynah_dispatch_report(stdout, as_json);
         return 0;
     }
     if (strcmp(argv[1], "--self-test") == 0) {
@@ -475,16 +531,50 @@ int main(int argc, char **argv) {
             fprintf(stderr, "qmat self-test failed: %s\n", error);
             return 1;
         }
-        if (mynah_graph_self_test(error, sizeof(error)) != 0) {
-            fprintf(stderr, "graph self-test failed: %s\n", error);
+        if (mynah_gelu_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "GELU self-test failed: %s\n", error);
             return 1;
         }
         if (mynah_graph_bnns_self_test(error, sizeof(error)) != 0) {
             fprintf(stderr, "BNNS graph self-test failed: %s\n", error);
             return 1;
         }
+        if (mynah_voice_clone_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "voice clone self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_transformer_ar_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "AR transformer self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_flow_head_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "flow head self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_seanet_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "SEANet self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_convq8_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "codec int8 conv self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_sp_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "sentencepiece self-test failed: %s\n", error);
+            return 1;
+        }
         if (mynah_tts_device_self_test(MYNAH_TTS_DEVICE_CPU, error, sizeof(error)) != 0) {
             fprintf(stderr, "CPU backend self-test failed: %s\n", error);
+            return 1;
+        }
+        /* This one had no caller anywhere in the tree. `census-test` claims to
+         * exercise it (Makefile) but runs `--dispatch-map`, which only calls
+         * mynah_dispatch_report(): the census self-test, the id-collision check
+         * and the thread-pool litmus inside it had never run in a gate. A test
+         * that passes while nothing calls it is worse than no test, because it
+         * licenses writing PASS in a commit. */
+        if (mynah_dispatch_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "dispatch/census self-test failed: %s\n", error);
             return 1;
         }
         puts("CPU SIMD/scalar backend self-test: PASS");
@@ -505,9 +595,40 @@ int main(int argc, char **argv) {
         printf("%s backend self-test: PASS\n", mynah_tts_device_name(device));
         return 0;
     }
-    if (strcmp(argv[1], "--synthesize") == 0) return synthesize(argc, argv);
+    if (strcmp(argv[1], "--synthesize") == 0) {
+        /* The dispatch rows that count what RAN -- codec.seanet_conv_path and
+         * codec.seanet_convtr_path -- are necessarily empty in a bare
+         * `--dispatch-map`, which loads no model.  This is the only place that
+         * can read them with something behind them.  A no-op unless
+         * MYNAH_DISPATCH_JSON names a file, so the default path is unchanged
+         * and nothing is printed to a pipe that expects audio. */
+        const int rc = synthesize(argc, argv);
+        mynah_dispatch_report_json_path(NULL);
+        return rc;
+    }
     if (strcmp(argv[1], "--write-test-wav") == 0 && argc == 3) {
         return write_test_wav(argv[2]);
+    }
+    /* The two seam properties that need real weights: `step_batch` is atomic
+     * over the batch and `decode_audio_batch` is bit-identical per context.
+     * Separate from `--self-test` because it needs a pack, which `--self-test`
+     * deliberately does not. */
+    if (strcmp(argv[1], "--pocket-self-check") == 0 && argc == 3) {
+        mynah_tts_model *model = NULL;
+        char error[512];
+        if (mynah_tts_model_open(argv[2], &model, error, sizeof(error)) != 0) {
+            fprintf(stderr, "pocket self-check: %s\n", error);
+            return 1;
+        }
+        const int bad =
+            mynah_engine_pocket_self_check(model, error, sizeof(error)) != 0;
+        mynah_tts_model_close(model);
+        if (bad) {
+            fprintf(stderr, "pocket batching self-check failed: %s\n", error);
+            return 1;
+        }
+        puts("pocket batching self-check: PASS");
+        return 0;
     }
     if (strcmp(argv[1], "--inspect") == 0 && argc == 3) {
         mynah_tts_model *model = NULL;

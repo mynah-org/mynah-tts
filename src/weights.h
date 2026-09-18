@@ -19,13 +19,16 @@
 
 typedef struct mynah_weights mynah_weights;
 
-/* The graph's view of one tensor. Rank is capped at 4 because that is what the
- * graph declares; a deeper tensor is an error with a message, never a silent
- * truncation. */
+/* The graph's view of one tensor. Rank is capped, and a deeper tensor is an
+ * error with a message, never a silent truncation.
+ *
+ * The cap used to be 4, which was true when only Magpie's weights were loaded.
+ * A PocketTTS voice file is a KV cache of rank 5 ([K/V, batch, T, heads,
+ * head_dim]), so a rank-4 cap rejected the pack's own voices. */
 typedef struct {
     const float *data;
     size_t rank;
-    size_t shape[4];
+    size_t shape[6];
     size_t count;
 } mynah_tensor;
 

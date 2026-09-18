@@ -141,7 +141,8 @@ int mynah_weights_get(const mynah_weights *weights, const char *name,
 
     /* The view carries four dimensions. A deeper tensor is refused rather than
      * folded into something that would look plausible downstream. */
-    if (t->rank > 4) return -1;
+    /* Must match mynah_tensor::shape. A PocketTTS voice KV cache is rank 5. */
+    if (t->rank > 6) return -1;
 
     memset(out, 0, sizeof(*out));
     out->rank = (size_t)t->rank;

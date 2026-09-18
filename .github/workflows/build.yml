@@ -23,8 +23,11 @@ jobs:
             os: linux
             arch: x86_64
             blas: openblas
-            # Linux x86 already defaults to portable -mavx2 -mfma.
-            simd: ''
+            # EXPLICIT, not `auto`. Since E4-15 `SIMD=auto` resolves against the
+            # BUILD host's /proc/cpuinfo, which for a release artifact is the
+            # wrong host: a runner with AVX-512 would stamp a binary that
+            # SIGILLs on half the fleet. avx2 is the portable x86 profile.
+            simd: 'SIMD=avx2'
           - runner: ubuntu-24.04-arm
             os: linux
             arch: aarch64
@@ -56,8 +59,56 @@ jobs:
       - name: Toolchain and ISA report
         run: make info
 
+      # The only x86 host this project can observe. `SIMD=auto` is not what we
+      # build the artifact with (see above), but its resolution on a real x86
+      # runner is the one piece of E4-15 evidence no ARM box can produce.
+      - name: SIMD=auto resolution on this runner
+        run: make simd-auto
+
+      - name: Dispatch report
+        run: ./build/cpu/mynah-tts --dispatch-map
+
       - name: Kernel self-test
         run: ./build/cpu/mynah-tts --self-test
+
+      # THE ONLY x86 SILICON THIS PROJECT CAN OBSERVE (PLAN.md E4-20b).
+      #
+      # src/qmat.c compiles two VPDPBUSD kernels -- VEX (AVX-VNNI) and EVEX
+      # (AVX-512 VNNI) -- through target attributes, selects between them with
+      # CPUID, and until now NEITHER HAD EVER EXECUTED. There is no x86 host in
+      # this fleet; every int8 number in docs/performance.md that is not from
+      # the EPYC bench came off ARM. So this step is not belt-and-braces, it is
+      # the first and only execution.
+      #
+      # MYNAH_QMAT_VNNI=256/512 REQUEST a level; qmat_u8_level() grants it only
+      # if CPUID says the unit is there, and falls back otherwise. That
+      # fallback is why the level is not asserted here: a hosted runner may
+      # well be pre-Ice-Lake and have no VNNI at all, and failing the build
+      # over that would say nothing about the kernel. What IS asserted is the
+      # int32 identity -- `sum w*x == sum w*(x+128) - 128*sum w` over the VNNI
+      # prefix plus the signed tail -- which is integer algebra with no
+      # rounding in it, so a failure names a genuine kernel bug and the message
+      # says which of the three terms is wrong.
+      #
+      # §1 of tests/test_qmat.c prints, for each level, whether the request
+      # RESOLVED. Read that line before quoting any of this as a VNNI result:
+      # "NOT RESOLVED" means the run exercised the scalar or AVX2 path and is
+      # evidence about those, not about VPDPBUSD.
+      - name: VNNI on real x86 silicon
+        if: matrix.arch == 'x86_64'
+        run: |
+          echo "::group::what this runner is"
+          grep -m1 'model name' /proc/cpuinfo || true
+          echo -n "vnni flags: "; grep -o -m1 -E 'avx512_vnni|avx_vnni|avx512f|avx2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "::endgroup::"
+          for level in off scalar 256 512; do
+            echo "::group::MYNAH_QMAT_VNNI=$level"
+            MYNAH_QMAT_VNNI=$level ./build/cpu/mynah-tts --dispatch-map | grep -E 'quant.int8_kernel|avx512vnni|avxvnni'
+            MYNAH_QMAT_VNNI=$level ./build/cpu/mynah-tts --self-test
+            echo "::endgroup::"
+          done
+          # The numeric gate, which is what a failure here would actually mean.
+          make qmat-test
 
       - name: Full test target
         run: make test
@@ -87,8 +138,244 @@ jobs:
           name: mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
           path: mynah-tts-${{ matrix.os }}-${{ matrix.arch }}
 
+  # ---------------------------------------------------------------------------
+  # PLAN.md E4-13. LINK-ONLY ON PURPOSE: this job guards the guard.
+  #
+  # It is not theoretical. This tree shipped a Linux build that did not link --
+  # mynah_conv1d_sgemm_enabled() was trapped inside `#if defined(MYNAH_USE_ACCELERATE)`
+  # while two callers referenced it unconditionally -- and it survived because
+  # every build anyone here runs is an Accelerate build on macOS, and the one
+  # Linux job built the single default configuration. It was found by hand
+  # (.work/dtype-and-fallbacks.md, E4-19). The reference codebase lost days to
+  # the identical shape: seven symbols declared and called unconditionally,
+  # defined inside an ISA guard whose #else was inside the same guard, breaking
+  # exactly SIMD=portable.
+  #
+  # So: no tests, no model, no runtime. It is the CONFIGURATIONS that catch this
+  # class of defect, and each one costs about a minute. A configuration missing
+  # from this matrix is a configuration nobody compiles until a user does.
+  # ---------------------------------------------------------------------------
+  link-only:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux x86_64 -------------------------------------------------
+          - runner: ubuntu-latest
+            name: "x86 SIMD=scalar"
+            flags: "SIMD=scalar"
+          - runner: ubuntu-latest
+            name: "x86 SIMD=portable"
+            flags: "SIMD=portable"
+          - runner: ubuntu-latest
+            name: "x86 SIMD=avx2"
+            flags: "SIMD=avx2"
+          - runner: ubuntu-latest
+            name: "x86 SIMD=avx512"
+            flags: "SIMD=avx512"
+          - runner: ubuntu-latest
+            name: "x86 BLAS=scalar"
+            flags: "BLAS=scalar"
+          - runner: ubuntu-latest
+            name: "x86 BLAS=none"
+            flags: "BLAS=none"
+          - runner: ubuntu-latest
+            name: "x86 BLAS=openblas"
+            flags: "BLAS=openblas"
+          # The corner the E4-19 break lived in: no Accelerate, no external
+          # BLAS, no AVX2. Nothing is compiled in that could hide a missing
+          # definition behind a platform #if.
+          - runner: ubuntu-latest
+            name: "x86 SIMD=portable BLAS=none"
+            flags: "SIMD=portable BLAS=none"
+          - runner: ubuntu-latest
+            name: "x86 SIMD=scalar BLAS=scalar"
+            flags: "SIMD=scalar BLAS=scalar"
+          # --- Linux aarch64 ------------------------------------------------
+          # The armv8-a baseline: no dotprod, no i8mm, no fp16 arithmetic, so
+          # every ARM kernel behind a __ARM_FEATURE_* gate is compiled out and
+          # its callers must still resolve.
+          - runner: ubuntu-24.04-arm
+            name: "arm baseline -march=armv8-a"
+            flags: "SIMD=portable EXTRA_CFLAGS=-march=armv8-a"
+          - runner: ubuntu-24.04-arm
+            name: "arm SIMD=scalar"
+            flags: "SIMD=scalar"
+          - runner: ubuntu-24.04-arm
+            name: "arm SIMD=neon"
+            flags: "SIMD=neon"
+          - runner: ubuntu-24.04-arm
+            name: "arm BLAS=scalar"
+            flags: "BLAS=scalar"
+          - runner: ubuntu-24.04-arm
+            name: "arm BLAS=none"
+            flags: "BLAS=none"
+          - runner: ubuntu-24.04-arm
+            name: "arm BLAS=openblas"
+            flags: "BLAS=openblas"
+          - runner: ubuntu-24.04-arm
+            name: "arm baseline BLAS=none"
+            flags: "SIMD=portable BLAS=none EXTRA_CFLAGS=-march=armv8-a"
+
+    runs-on: ${{ matrix.runner }}
+    name: "link-only: ${{ matrix.name }}"
+    # Every entry is a hard gate. Three of them were allowed to fail for as long
+    # as SIMD=scalar did not compile (src/qmat.c:1798, fixed in 57596b3); the
+    # exemption came out in the same change that confirmed the fix, which is the
+    # only way an exemption ever stays honest.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
+      # Each configuration gets its own tree state. `make clean` rather than
+      # trusting the flag stamp: the stamp (E4-14) is what protects a developer
+      # who forgets, and a CI job that leaned on it would stop testing it.
+      - name: Compile and link ${{ matrix.name }}
+        run: |
+          make clean
+          make ${{ matrix.flags }} -j"$(nproc)"
+          make ${{ matrix.flags }} lib
+          make ${{ matrix.flags }} server
+
+      - name: Report what was built
+        run: make ${{ matrix.flags }} info
+
+      # Deliberately NOT `--self-test`. The reason used to be a live defect:
+      # on Linux/gcc 15.2/aarch64 every profile WITHOUT -march=native failed
+      # `mynah_qmat_self_test` with a strict-aliasing miscompile in src/qmat.c
+      # (66088.4844 packed to 0xb01a where the reference says 0x7c00 -- not a
+      # rounding disagreement at the f16 overflow boundary, a structurally
+      # unrelated number). That is fixed: d95773e. Adding `--self-test` to this
+      # matrix is now the right follow-through and is tracked in
+      # `.work/ci-red-oss.md`; it is not in this commit because every profile
+      # here would have to be proven green on real aarch64 and x86 hosts first,
+      # and doing that on the project's ARM box right now would perturb the
+      # concurrency measurements running on it. These profiles link and start
+      # today; they do not yet compute.
+
+      # A binary compiled for an ISA the runner does not have MUST NOT start,
+      # and mynah-tts checks its own requirement before the first guarded
+      # instruction instead of taking a SIGILL (src/dispatch.c:402). The GitHub
+      # x86 runners report `avx2 fma` with no AVX-512F, so `SIMD=avx512` reaches
+      # exactly that refusal and exits non-zero. That is the guard working. The
+      # job used to read it as a build failure, which is why this matrix entry
+      # flapped red while the code under test was fine.
+      #
+      # So this step accepts two outcomes and nothing else:
+      #
+      #   the binary starts and prints what was asked of it, or
+      #   it exits non-zero carrying the ISA guard's own message.
+      #
+      # Every other ending still fails: a different non-zero exit, and in
+      # particular a SIGILL (128+4 = 132, with no message) if the guard ever
+      # stops firing. Written this way the refusal itself stays under test
+      # rather than being papered over with `continue-on-error`, which would
+      # have hidden a real crash in the same breath.
+      - name: Start, and collect the dispatch table
+        shell: bash
+        run: |
+          # `shell: bash` runs this with -eo pipefail, and under -e a failing
+          # command substitution kills the script before we can read its exit
+          # code -- which is the exact case this step exists to inspect.
+          set +e
+          set -uo pipefail
+          start() {
+            local out rc
+            out=$("$@" 2>&1)
+            rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -eq 0 ]; then
+              return 0
+            fi
+            if printf '%s' "$out" | grep -q 'this CPU does not have it'; then
+              echo "::notice title=ISA guard::$* refused to run on this runner, as it should: built for an ISA this CPU lacks."
+              return 0
+            fi
+            echo "::error title=Unexpected exit::$* exited $rc without the ISA guard message"
+            return 1
+          }
+          # EVERY `start` IS CHECKED. They used to be bare calls under
+          # `set +e`, so only the last one could fail the step: a refusal on
+          # --version was discarded by the next line.
+          rc=0
+          start ./build/cpu/mynah-tts --version     || rc=1
+          start ./build/cpu/mynah-tts --dispatch-map || rc=1
+          # AND RUN THE KERNELS, not just the report. These profiles are the
+          # only place SIMD=portable, SIMD=scalar, BLAS=scalar and the armv8-a
+          # baseline are ever compiled, and until now nothing executed them: a
+          # kernel wrong under SIMD=portable would link, print a dispatch
+          # table and ship. The self-tests are model-free and take seconds,
+          # and `start` keeps the ISA-guard contract -- a binary built for an
+          # ISA this runner lacks still refuses rather than SIGILLs.
+          start ./build/cpu/mynah-tts --self-test   || rc=1
+          # The portable unsigned int8 encoding (x+128 plus the row-sum
+          # correction) is what x86 runs and what an arm runner never
+          # resolves. `env` rather than a prefix on the shell function, whose
+          # assignment scope is not the same in every shell.
+          start env MYNAH_QMAT_VNNI=scalar ./build/cpu/mynah-tts --self-test || rc=1
+          exit $rc
+
+  # ------------------------------------------------------------------ GPU
+  #
+  # COMPILE ONLY. No GPU exists on any of these runners and none of this
+  # proves a kernel is correct, fast, or even that it launches -- it proves
+  # the sources still compile and link, which is the thing that silently rots
+  # when nobody builds them. Before this, gpu/cuda/backend_cuda.cu and
+  # gpu/metal/* were compiled by no job on no runner: a CUDA backend that no
+  # longer built would have shipped that way until someone with a card tried
+  # it.
+  #
+  # nvcc turns .cu into PTX and cubin with no device present; only RUNNING
+  # needs one. Same for `xcrun metal` and the .metal shaders.
+  cuda-compile:
+    name: "compile-only: CUDA ${{ matrix.arch }} (no GPU)"
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two architectures, because an intrinsic or a __shfl variant can exist
+        # on one and not the other, and that is a compile error we can have for
+        # free. Neither needs the silicon to be present.
+        arch: [sm_70, sm_90]
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates
+
+      - uses: actions/checkout@v7
+
+      # CUDA_ARCH must be named. The Makefile defaults to `-arch=native`, and
+      # native means "ask the installed GPU", so `make cuda` cannot work on any
+      # machine without one -- which is every build farm.
+      - name: Compile and link the CUDA build
+        run: make cuda CUDA_ARCH=${{ matrix.arch }}
+
+      - name: Say what this did and did not prove
+        run: |
+          echo "::notice title=CUDA::Compiled and linked for ${{ matrix.arch }} with no GPU present. Nothing was executed: no kernel correctness, no performance, not even a launch."
+
+  metal-compile:
+    name: "compile-only: Metal (shaders + backend)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compile and link the Metal build
+        run: make metal
+
+      - name: Say what this did and did not prove
+        run: |
+          echo "::notice title=Metal::Shaders and the Objective-C backend compiled and linked. Nothing was executed on the GPU."
+
   release:
-    needs: build
+    needs: [build, link-only]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
     permissions:

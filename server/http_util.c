@@ -1,8 +1,38 @@
+/* glibc hides pthread_setname_np behind _GNU_SOURCE; without it the call
+ * compiles as an implicit declaration and the build breaks under gcc 15's
+ * default -Werror=implicit-function-declaration.  macOS declares it in
+ * <pthread.h> unconditionally, which is why this only ever failed on Linux.
+ * server/prefork.c already carries the same guard. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "http_util.h"
 
+#include "json.h"
+
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The Linux cap, which is the tighter of the two and the one that fails the
+ * call rather than truncating for us. */
+#define MYNAH_THREAD_NAME_MAX 16u
+
+void mynah_thread_set_name(const char *name) {
+    if (name == NULL || name[0] == '\0') return;
+    char buf[MYNAH_THREAD_NAME_MAX];
+    snprintf(buf, sizeof(buf), "%s", name);
+#if defined(__APPLE__)
+    /* Darwin names the calling thread and takes no handle. */
+    (void)pthread_setname_np(buf);
+#elif defined(__linux__)
+    (void)pthread_setname_np(pthread_self(), buf);
+#else
+    (void)buf;   /* no portable spelling: leave the thread unnamed */
+#endif
+}
 
 const char *mynah_memmem(const char *hay, size_t hay_len,
                          const char *needle, size_t needle_len) {
@@ -51,102 +81,63 @@ int mynah_http_header(const char *headers, size_t headers_len,
     return -1;
 }
 
-/* Locate the value for "key" at the top level of a small JSON object. This
- * does not track nesting: the server's request bodies are flat, and anything
- * richer is rejected upstream rather than guessed at here. */
-static const char *json_value(const char *json, const char *key) {
-    if (json == NULL || key == NULL) return NULL;
-    char pattern[96];
-    const int written = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    if (written <= 0 || (size_t)written >= sizeof(pattern)) return NULL;
-    const char *at = strstr(json, pattern);
-    if (at == NULL) return NULL;
-    at += (size_t)written;
-    while (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r') ++at;
-    if (*at != ':') return NULL;
-    ++at;
-    while (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r') ++at;
-    return at;
-}
-
-static size_t utf8_encode(unsigned cp, char *out) {
-    if (cp < 0x80u) { out[0] = (char)cp; return 1; }
-    if (cp < 0x800u) {
-        out[0] = (char)(0xC0u | (cp >> 6));
-        out[1] = (char)(0x80u | (cp & 0x3Fu));
-        return 2;
-    }
-    out[0] = (char)(0xE0u | (cp >> 12));
-    out[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
-    out[2] = (char)(0x80u | (cp & 0x3Fu));
-    return 3;
-}
+/* ------------------------------------------------------------------- JSON
+ *
+ * These three are the shapes server/main.c has always called. What changed is
+ * underneath: they used to find a key with strstr and then eat whitespace and a
+ * colon, which meant a body could name its own keys inside a value it supplied.
+ * `{"voice":"say \"input\": fake","input":"real"}` served the fake one. They
+ * now PARSE the body -- src/json.c -- and answer only from a real top-level
+ * member of a real JSON object.
+ *
+ * Three consequences worth stating, because each is a behaviour change:
+ *
+ *   A MALFORMED BODY ANSWERS NOTHING. Every lookup on it fails, rather than
+ *   some keys working and others not depending on where the document broke.
+ *   http_precheck() already refuses a body that does not start with '{'; a body
+ *   that starts well and ends badly now gets the same answer instead of a
+ *   half-reading.
+ *
+ *   A NESTED KEY IS NOT A TOP-LEVEL KEY. `{"options":{"input":"x"}}` has no
+ *   top-level "input" and no longer pretends to.
+ *
+ *   SURROGATE PAIRS DECODE. The old reader refused every \uXXXX in the
+ *   surrogate range, so no emoji and nothing outside the BMP could reach the
+ *   tokenizer at all. "\ud83d\ude00" is now one codepoint, as it always was.
+ *
+ * Each call parses the body again. That is two linear passes over at most
+ * MAX_BODY bytes per lookup and no allocation whatsoever; for a handful of
+ * fields on a request body it is not worth a cache. A caller that wants the
+ * body read once can parse it itself with mynah_json_parse() and use
+ * mynah_json_object_get() -- which is also the only way to see WHERE a bad body
+ * broke, since these three return nothing but success or failure. */
 
 int mynah_json_string(const char *json, const char *key,
                       char *out, size_t capacity) {
-    const char *at = json_value(json, key);
-    if (at == NULL || *at != '"' || capacity == 0) return -1;
-    ++at;
-    size_t n = 0;
-    while (*at != '\0' && *at != '"') {
-        if (n + 4u >= capacity) return -1;   /* leave room for UTF-8 + NUL */
-        if (*at == '\\') {
-            ++at;
-            switch (*at) {
-                case '"':  out[n++] = '"';  ++at; break;
-                case '\\': out[n++] = '\\'; ++at; break;
-                case '/':  out[n++] = '/';  ++at; break;
-                case 'b':  out[n++] = '\b'; ++at; break;
-                case 'f':  out[n++] = '\f'; ++at; break;
-                case 'n':  out[n++] = '\n'; ++at; break;
-                case 'r':  out[n++] = '\r'; ++at; break;
-                case 't':  out[n++] = '\t'; ++at; break;
-                case 'u': {
-                    unsigned cp = 0;
-                    ++at;
-                    for (int i = 0; i < 4; ++i) {
-                        const char c = at[i];
-                        unsigned d;
-                        if (c >= '0' && c <= '9') d = (unsigned)(c - '0');
-                        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
-                        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
-                        else return -1;
-                        cp = (cp << 4) | d;
-                    }
-                    at += 4;
-                    /* Surrogates are not reassembled; reject rather than emit
-                     * a malformed sequence. */
-                    if (cp >= 0xD800u && cp <= 0xDFFFu) return -1;
-                    n += utf8_encode(cp, out + n);
-                    break;
-                }
-                default: return -1;
-            }
-        } else {
-            out[n++] = *at++;
-        }
-    }
-    if (*at != '"') return -1;
-    out[n] = '\0';
-    return 0;
+    mynah_json_value root, value;
+    if (json == NULL || key == NULL || out == NULL || capacity == 0) return -1;
+    if (mynah_json_parse(json, strlen(json), &root, NULL) != 0) return -1;
+    if (root.type != MYNAH_JSON_OBJECT) return -1;
+    if (mynah_json_object_get(&root, key, &value) != 0) return -1;
+    return mynah_json_as_string(&value, out, capacity);
 }
 
 int mynah_json_number(const char *json, const char *key, double *out) {
-    const char *at = json_value(json, key);
-    if (at == NULL || out == NULL) return -1;
-    char *end = NULL;
-    const double value = strtod(at, &end);
-    if (end == at) return -1;
-    *out = value;
-    return 0;
+    mynah_json_value root, value;
+    if (json == NULL || key == NULL || out == NULL) return -1;
+    if (mynah_json_parse(json, strlen(json), &root, NULL) != 0) return -1;
+    if (root.type != MYNAH_JSON_OBJECT) return -1;
+    if (mynah_json_object_get(&root, key, &value) != 0) return -1;
+    return mynah_json_as_number(&value, out);
 }
 
 int mynah_json_bool(const char *json, const char *key, int *out) {
-    const char *at = json_value(json, key);
-    if (at == NULL || out == NULL) return -1;
-    if (strncmp(at, "true", 4) == 0)  { *out = 1; return 0; }
-    if (strncmp(at, "false", 5) == 0) { *out = 0; return 0; }
-    return -1;
+    mynah_json_value root, value;
+    if (json == NULL || key == NULL || out == NULL) return -1;
+    if (mynah_json_parse(json, strlen(json), &root, NULL) != 0) return -1;
+    if (root.type != MYNAH_JSON_OBJECT) return -1;
+    if (mynah_json_object_get(&root, key, &value) != 0) return -1;
+    return mynah_json_as_bool(&value, out);
 }
 
 size_t mynah_json_escape(const char *in, char *out, size_t capacity) {
@@ -180,4 +171,60 @@ size_t mynah_json_escape(const char *in, char *out, size_t capacity) {
     if (n >= capacity) return (size_t)-1;
     out[n] = '\0';
     return n;
+}
+
+/* A request line is exactly three tokens separated by single spaces. Anything
+ * else -- a missing version, an embedded space, a token that does not fit -- is
+ * rejected rather than guessed at: the caller answers 400 and closes, which is
+ * the only safe reading of a line we do not understand. */
+int mynah_http_request_line(const char *buf, size_t len,
+                            char *method, size_t method_capacity,
+                            char *path, size_t path_capacity) {
+    if (buf == NULL || method == NULL || path == NULL ||
+        method_capacity == 0 || path_capacity == 0) return -1;
+    method[0] = '\0';
+    path[0] = '\0';
+
+    size_t line_end = 0;
+    while (line_end < len && buf[line_end] != '\r' && buf[line_end] != '\n') ++line_end;
+    if (line_end == len) return -1;          /* no terminator inside the buffer */
+
+    size_t i = 0;
+    while (i < line_end && buf[i] != ' ') ++i;
+    if (i == 0 || i == line_end) return -1;
+    if (i >= method_capacity) return -1;
+    memcpy(method, buf, i);
+    method[i] = '\0';
+
+    const size_t target = i + 1u;
+    size_t end = target;
+    while (end < line_end && buf[end] != ' ') ++end;
+    if (end == target) return -1;
+    if (end == line_end) return -1;          /* no HTTP version: not a request we serve */
+
+    /* Require the version token, and require it to be HTTP. A proxy-style
+     * absolute target ("http://host/x") is legal HTTP but this server does not
+     * serve one, so the path must be origin-form. */
+    if (line_end - (end + 1u) < 5u || memcmp(buf + end + 1u, "HTTP/", 5) != 0) return -1;
+
+    size_t stop = target;
+    while (stop < end && buf[stop] != '?' && buf[stop] != '#') ++stop;
+    const size_t path_len = stop - target;
+    if (path_len == 0 || path_len >= path_capacity) return -1;
+    if (buf[target] != '/') return -1;
+    memcpy(path, buf + target, path_len);
+    path[path_len] = '\0';
+    return 0;
+}
+
+int mynah_http_media_type_is(const char *value, const char *media) {
+    if (value == NULL || media == NULL) return 0;
+    while (*value == ' ' || *value == '\t') ++value;
+    size_t i = 0;
+    while (media[i] != '\0') {
+        if (ascii_lower((unsigned char)value[i]) != ascii_lower((unsigned char)media[i])) return 0;
+        ++i;
+    }
+    const char c = value[i];
+    return c == '\0' || c == ';' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }

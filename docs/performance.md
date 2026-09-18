@@ -19,14 +19,14 @@ number alone, and do not carry these figures over to a future engine.
 | Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f16 | 0.495 | 2026-07-29 |
 | Magpie 357M v2607 | Apple M1 | ARM64 + Accelerate | f32 | 0.662 | 2026-07-29 |
 | Magpie 357M v2607 | Apple M1 | Metal | f32 | 0.723 | 2026-07-29 |
-| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX-512 VNNI | **int8** | 0.427¹ | 2026-08-04 |
-| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX-512 VNNI | f32 | 0.806¹ | 2026-08-04 |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX2 | **int8** | 0.427¹ | 2026-08-04 |
+| Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | x86-64 + OpenBLAS, AVX2 | f32 | 0.806¹ | 2026-08-04 |
 | Magpie 357M v2607 | ARM64 server (Grace, Graviton) | NEON / SVE | — | not measured | server-class ARM only |
 
 ¹ Single warm `--synthesize` run of a short utterance, not the `make bench`
 protocol above — treat the absolute values as indicative. The robust part is
-the ordering: the int8 lane is a **1.9×** speedup over f32 on real AVX-512
-VNNI silicon, consistent with the bandwidth-bound analysis below.
+the ordering: the int8 lane is a **1.9×** speedup over f32, consistent with the
+bandwidth-bound analysis below.
 
 On a longer 6.0 s utterance the M1 numbers improve, because the fixed prep and
 codec cost amortizes: int8 **0.243**, f16 0.376, f32 0.532.
@@ -40,12 +40,29 @@ is *server-class* ARM (Grace, Graviton), which has different cache and bandwidth
 behaviour and would need its own run.
 
 The x86 rows were filled on 2026-08-04, on a rented **AMD EPYC 9555P** (Zen 5)
-cloud instance — 4 vCPU, 15 GB RAM, gcc 15.2, Linux/OpenBLAS — with real AVX2,
-AVX-512 F/DQ/BW/VL and **AVX512-VNNI** (until then the x86 kernels had been
-written and optimized but never run on x86 hardware). The same pass verified
-*correctness*, not just speed: `make self-test` green on that ISA, the pack
-converted on the box, and the f32/int8 WAVs validated by ear against the
-Apple-Silicon output. Server-class ARM remains the one unmeasured column.
+cloud instance — 4 vCPU, 15 GB RAM, gcc 15.2, Linux/OpenBLAS — until then the
+x86 kernels had been written and optimized but never run on x86 hardware. The
+same pass verified *correctness*, not just speed: `make self-test` green on that
+ISA, the pack converted on the box, and the f32/int8 WAVs validated by ear
+against the Apple-Silicon output. Server-class ARM remains the one unmeasured
+column.
+
+**Which ISA those numbers actually ran on — corrected 2026-09-12.** An earlier
+revision of this table credited them to AVX-512 VNNI. The host has AVX2,
+AVX-512 F/DQ/BW/VL and AVX512-VNNI; the binary does not. Linux x86 builds
+default to `-mavx2 -mfma` (`Makefile:22-46`), so AVX-512 was not even enabled,
+and the int8 kernel is `dot_q8_i32_avx2` (`src/qmat.c:117-134`), which widens
+int8 to int16 and accumulates with `_mm256_madd_epi16`. There is no `_mm512_*`
+and no `vpdpbusd` anywhere in `src/`, and hand-written AVX2 intrinsics are never
+promoted to VNNI by a compiler — `VPDPBUSD` is u8×s8 while the loop is s8×s8,
+and the `-128·Σw` correction is not something a compiler invents. `SIMD=avx512`
+adds compiler flags and selects no different kernel. The one AVX-512 consumer in
+the run is OpenBLAS, which dispatches its own sgemm at runtime, so the f32
+prefill uses it and the int8 decode lane does not.
+
+The measurements stand; the attribution did not. **0.427 is what AVX2 alone
+buys**, which makes it a floor for x86 rather than a ceiling. A VNNI/AMX lane is
+unbuilt work (`PLAN.md` E4-5, E4-7).
 
 Do not fill these rows from a sibling project: `qwen-tts` figures describe a
 different model and say nothing about Magpie.
@@ -279,6 +296,127 @@ f32 greedy synthesis: sampling requests need the full logits and already used
 the threaded batched projection, and quantized modes route through the
 threaded qmat row split.
 
+## The serving measurement protocol
+
+Serving numbers are not synthesis numbers. A single-request RTF says nothing
+about whether a listener's player stops, and this repo does not let the two be
+confused.
+
+**The metrics are defined once**, in `tests/playback_sim.py`: TTFB, TTFA,
+STREAM_RTF, `required_prebuffer`, `safe_play_start`, `stall_rate` at
+100/250/500/1000 ms, `max_gap` and the coalesced-read share. Every harness
+imports them; nothing recomputes them. `python3 tests/playback_sim.py` (or
+`make playback-sim-test`) runs 122 known-answer checks over synthetic timelines
+in under a second and needs no model, no server and no network.
+
+**Which metric gates.** STREAM_RTF is a *capacity* metric: mandatory `< 1`,
+preferred `<= 0.90`, and never allowed to promote anything on its own.
+`required_prebuffer` p95 and `stall_rate@250ms` are what *qualify*. The
+self-test carries the case that forces the distinction — a timeline whose
+STREAM_RTF is 0.800, passing the mandatory, preferred *and* strong RTF gates,
+on which a player with a 250 ms jitter buffer still runs dry. Its verdict is
+NOT STREAMABLE. If STREAM_RTF could promote, that configuration would ship.
+
+**WAVE and SOAK are different measurements and the tool refuses to conflate
+them.**
+
+| | WAVE | SOAK |
+|---|---|---|
+| shape | C requests fired at t=0, repeated | C in flight continuously for minutes |
+| warm-up | none | `--warmup-seconds`, discarded |
+| drift gate | none | last window vs best, per metric |
+| authority | **screen: may disqualify, never promote** | **qualification: the only mode that may promote** |
+
+The gap is not cosmetic. In the qwen-tts reference a configuration passed the
+wave screen at STREAM_RTF 0.919 and failed a 30-minute soak at 1.004 with 596
+rejects and 111 broken pipes: *"the hard-capacity boundary, not a product
+point."* Capacity is the highest GOOD concurrency with no gap below it —
+discovered, not prescribed, and a GOOD level sitting above a MARGINAL one is a
+measurement to explain rather than a product point.
+
+**The tool declares its refusals and exits non-zero.**
+
+- **Coalesced reads (exit 3).** A client mark is stamped when `read()` returns.
+  A late reader finds several chunks already queued and returns them
+  microseconds apart, so N server emissions become N marks in one instant.
+  Above a 15% coalesced share the cadence percentiles describe the *client*, and
+  the harness refuses to print them. The reference declared a run at 33-37% not
+  quotable.
+- **Dispatch resolution (exit 4).** Two arms may only be differenced when
+  engine, ISA, SIMD, backend, quantization, thread count, build flags, route and
+  sink all match. A fact that is *unrecorded in every arm* also refuses: equality
+  of two unknowns is not sameness. `/health` today reports none of ISA, SIMD,
+  backend or build flags, so that caveat is printed by name on every sweep.
+
+### The decoder quantum
+
+The emit quantum is a first-class serving parameter and is chosen on prebuffer
+and stall, never on RTF. It lives in the **model pack**, not the CLI:
+`model.json: audio_emit_frames`, read at load time
+(`src/engine_pocket.c`, default 1; the gate is `src/inference.c:128`). It is not
+a flag, not an environment variable and not a request field, so
+`--quantum-sweep` materialises one pack variant per value — `model.json`
+rewritten, every other file symlinked — and restarts the server per arm. Arms
+run **interleaved** (`q1 q4 q16 q16 q4 q1`), because drift between two identical
+runs on a shared box can exceed the effect under test.
+
+We pay no correctness penalty for a small quantum: the codec carries state, so
+chunked-vs-one-shot error stays at 1e-7 down to a one-frame chunk (`.work`
+E2-3). The cadence knob is free for us in a way it was not for the reference,
+where the smallest quantum *failed* on RTF and the largest *passed* on RTF while
+stalling half the time.
+
+**What the sweep cannot reach.** `server/main.c` `STREAM_CHUNK` (4096 samples)
+bounds each enqueue, but `server/stream_out.c:169` drains the *whole* queued
+span into one HTTP chunk, so it is not a delivery ceiling — delivery
+granularity follows the decode quantum. Delivering increments *smaller* than the
+decode quantum, or pacing them, would need a capped or paced writer span in
+`server/stream_out.c` and `STREAM_CHUNK` as a runtime parameter. Both are in
+`server/`.
+
+### Running the campaign on Linux
+
+No serving numbers are recorded here yet. **Every number this protocol produces
+on macOS is a development signal, not a production claim** — Accelerate and the
+P-core thread-pool default do not exist on Linux, and `SIMD=auto` on Linux x86
+compiles plain AVX2 with no runtime dispatch. Production is Linux x86-64 and
+ARM64, and the campaign belongs there. The harness prints the platform caveat on
+every report.
+
+Note that the quantization default changed at `d1ffd01`: per-tensor groups,
+codec in int8 and backbone/flow in f16. Any earlier serving number in this repo
+was taken against a different configuration and is not comparable.
+
+```bash
+# 0. build, and prove the metric definitions before trusting any of them
+make server
+make playback-sim-test                     # 122 known-answer checks, no model needed
+
+# 1. SCREEN the levels (minutes). Drops levels that cannot work.
+make serving-wave MODEL_DIR=models/pocket-en LEVELS=1,2,4,8 WAVES=3 \
+  PROFILE_ARGS="--json build/wave.json"
+
+# 2. SWEEP the decoder quantum at the best screened level, interleaved.
+#    Chosen on prebuffer and stall@250, never on STREAM_RTF.
+make serving-quantum-sweep MODEL_DIR=models/pocket-en \
+  QUANTA=1,2,4,8,16 SWEEP_LEVEL=4 SWEEP_REPEATS=2
+
+# 3. QUALIFY with a soak at each surviving level. Only this may promote.
+#    Bake the chosen quantum into the pack's model.json first.
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=1 SOAK_SECONDS=1800
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=2 SOAK_SECONDS=1800
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=4 SOAK_SECONDS=1800 \
+  PROFILE_ARGS="--json build/soak-c4.json"
+make serving-soak MODEL_DIR=models/pocket-en LEVELS=8 SOAK_SECONDS=1800
+
+# 4. A/B two configurations. REFUSES (exit 4) if the dispatch differs.
+python3 tools/serving_profile.py --compare build/soak-c4.json build/soak-c4-b.json
+```
+
+Record with every cell: model revision, thread count (`MYNAH_THREADS`), ISA,
+backend, build flags, quantization, CPU mask, machine, and the exit code. A
+NOT QUOTABLE level is not a slow level — it is a level that was not measured.
+
 ## Benchmark your own box
 
 ```bash
@@ -290,3 +428,123 @@ make self-test                                           # kernels correct on th
 
 Report ISA, thread count, backend and model revision with any number.
 Single-request latency and batched throughput are different metrics.
+
+## First production-hardware capacity screen — 2026-09-13
+
+**Host** GCP Axion, 32x Neoverse-V2, SMT off, 80 MiB L3 (one instance), one NUMA
+node, gcc 15.2, `BLAS=none/mynah-sgemm`, `SIMD=auto`.
+**Build** `565e5c9`. **Pack** `models/pocket-en`, PocketTTS, default quantization
+(codec int8, backbone and flow f16). **Topology** `--prefork 4 --prefork-threads 8
+--max-batch 16`. **Mode** WAVE, three synchronised waves per level.
+
+| C | completed | TTFB p95 | TTFA p95 | STREAM_RTF p95 | prebuffer p95 | max gap p95 | stall@250 |
+|---|---|---|---|---|---|---|---|
+| 1 | 3/3 | 0.2 ms | 62 ms | 0.124 | 0 | 10 ms | 0% |
+| 4 | 12/12 | 0.2 ms | 137 ms | 0.130 | 0 | 11 ms | 0% |
+| 8 | 24/24 | 125 ms | 207 ms | 0.240 | 0 | 20 ms | 0% |
+| 16 | 48/48 | 200 ms | 331 ms | 0.468 | 0 | 39 ms | 0% |
+| 20 | 60/60 | 269 ms | 509 ms | 0.581 | 0 | 48 ms | 0% |
+| 24 | 72/72 | 337 ms | 591 ms | 0.691 | 0 | 57 ms | 0% |
+| 30 | 90/90 | 500 ms | 683 ms | **0.922** | 0 | 76 ms | 0% |
+
+**Every mandatory gate passes at every level through C30**: completed equals
+launched, STREAM_RTF p95 below 1.0, and no stall at any buffer depth. No request
+was rejected, timed out or disconnected, and required prebuffer was zero
+throughout — the server never made a player wait.
+
+**Nothing here is promoted.** A wave is a screen: it may disqualify a
+configuration and may never promote one. The operating point needs a SOAK at the
+candidate level with a drift gate across windows, and that has not been run.
+
+**The cadence percentiles are not quotable** and the harness says so rather than
+printing them as fact: 27% to 100% of client reads returned already-queued data,
+because generation outruns the reader. The share falls monotonically as
+concurrency rises (100% at C1, 54% at C8, 27% at C30), which is itself the
+evidence that the server is running well above real time. The columns that *are*
+quotable — completion, STREAM_RTF, TTFA, TTFB — do not depend on read granularity.
+
+### What stops C20 and C30 from being GOOD, and it is not synthesis
+
+The preferred gates that fail are **TTFB p95** and **TTFA p95**, not RTF and not
+stalls. TTFB is the time to the response header, which this server sends at
+admission, before any audio is generated — so a TTFB of 500 ms at C30 is
+**admission latency**, not synthesis. With four workers at sixteen slots each
+there are 64 slots for 30 arrivals, so nothing is queueing for capacity.
+
+The suspect is the serialised admission the engine inherits: one pending
+admission per worker, installed inside the frame loop. Thirty simultaneous
+arrivals then queue behind one admission per iteration per worker. That is a
+known lever with a known shape — the reference implementation reached for sliced
+admission and for a prefill helper, and measured the helper making TTFA five times
+worse — so it needs measuring here, not copying.
+
+STREAM_RTF p95 0.922 at C30 also sits above the preferred 0.90 while under the
+mandatory 1.0, which is the ordinary shape of a level that is at its edge.
+
+### Reading this against the target
+
+C20 is comfortably inside every mandatory gate with STREAM_RTF p95 0.581 — a
+stream generated at better than one and a half times real time while twenty run
+together. C30 still completes every request with no stall, at 0.922. The honest
+statement is that **C20 is reached and C30 is at the edge**, and that the next
+work is admission latency rather than kernels.
+
+Untested: any other topology (2x16, 1x32, 8x4 were not swept), any other text
+length distribution, x86, and sustained load.
+
+## 2026-09-13 · PocketTTS after the three profile lanes — GCP Axion, 32 cores
+
+Same host and same topology as the topology sweep above (`--prefork 16
+--prefork-threads 2 --max-batch 16`, `BLAS=none`, `SIMD=auto`), so the two are
+comparable. Build: the merged tree carrying the prefill prepack, the conv-stack
+fusion and the pool meter. FAST screen, three waves per level, quiet box.
+
+| C | done/launched | TTFB p95 | TTFA p95 | STREAM_RTF p95 | prebuffer p95 | **safe-to-play p95** | stall@500 |
+|---|---|---|---|---|---|---|---|
+| 1 | 3/3 | 0.3 ms | 155 ms | 0.229 | 0 | **155 ms** | 0% |
+| 48 | 144/144 | 489 ms | 890 ms | 0.680 | 0 | **890 ms** | 0% |
+| 64 | 192/192 | 662 ms | 1001 ms | 0.895 | 0 | **1001 ms** | 0% |
+| 80 | 240/240 | 805 ms | 1230 ms | **1.120** | 434 ms | **1638 ms** | 8% |
+| 100 | 300/300 | 974 ms | 1490 ms | **1.537** | 1539 ms | **2994 ms** | 100% |
+
+Every request completes at every level, including C100. What fails is cadence,
+not completion.
+
+### What the three lanes bought, and what they did not
+
+| level | STREAM_RTF p95 before | after | |
+|---|---|---|---|
+| C48 | 0.736 | **0.680** | −7.6% |
+| C64 | 0.954 | **0.895** | −6.2% |
+
+C64 moves from the edge of the mandatory gate to inside it with margin, and C80
+becomes the first level that fails. That is one level of capacity, bought
+without a kernel rewrite and without touching the arithmetic.
+
+**Latency did not move at all.** Safe-to-play p95 at C48 was 908 ms before and
+is 890 ms now. The single-stream wall fell 17% and the served latency fell 2%,
+which is the entire story of this screen: the lanes removed *work*, and what
+gates a served request at this concurrency is *waiting*.
+
+TTFB p95 — the response header, which this server sends at admission, before a
+single sample exists — is 489 ms at C48 and 974 ms at C100. Synthesis has not
+started when that clock stops. With sixteen workers at sixteen slots there are
+256 slots for 100 arrivals, so nothing is queueing for capacity, and the warm
+prefill measured on this build is ~122 ms. The gap between 122 ms of work and
+890 ms of safe-to-play is admission and scheduling.
+
+### Reading this against C100
+
+**C100 is not reached and this build does not get there.** The honest statement
+is C64 with margin on the mandatory gates, C80 as the first failure, and
+STREAM_RTF 1.537 at C100 — a stream generated at two thirds of real time, which
+no player can absorb. Nothing here is promoted: a wave screen may disqualify a
+configuration and may never promote one, so C64 needs a SOAK before it is an
+operating point.
+
+The next lever is not the kernels. At `16x2` each worker has two threads, where
+the pool meter puts the barrier at 1.2% — the pool has nothing left to give at
+this width. The queue does.
+
+Untested here: x86, other topologies on this build, mixed-language load, and
+sustained load at any level.
