@@ -758,12 +758,21 @@ the x86 self-test that judges the two kernels written here and never executed
       every mandatory gate passing** -- 53559/53559, `stall@500ms` **0**, RTF p95 0.761,
       TTFA p95 443, `max_gap` p95 158 (was 358), throughput -0.7%. Against the same soak
       before the fix: `stall@500` 5 -> 0, `stall@250` 233 -> 81. **The operating point is
-      C94.** Still open, and it is NOT concurrency: `stall@250ms` is flat at 0.13%/0.15%
-      between C96 and C94, so the 81 survivors are the freeze that remains (158 ms, two
-      frame periods), not a capacity tail. **Next**: a per-step TIME budget shared across
-      the preparing slots instead of a token budget per slot -- the slice pass walks every
-      preparing slot, so a smaller budget keeps more prefills in flight and one step's
-      freeze becomes their sum, which is why 32 is dominated by 48 on BOTH axes
+      C94.** **Concurrency is EXCLUDED as the lever**, by four levels that refuse to line
+      up: `stall@250ms` is 0.134% at C96, 0.151% at C94, **0.214% at C90** and 0.109% at
+      C80 -- C90 is the worst of the four while carrying less load than two of them, over a
+      17% span of load with no monotone trend. `max_gap` p95 across the same four is
+      **158 / 158 / 157 / 148 ms**, a near-constant: lowering C removes OCCASIONS and
+      leaves DURATION untouched, so the count drifts down noisily and never reaches zero.
+      A gate that demands zero is a statement about the WORST CASE, and a worst case needs
+      a bound. **Built, measuring**: `MYNAH_PREFILL_STEP_MS` (default 40 ms, half a frame
+      period) caps prefill work per STEP. The per-slot token budget bounded one slice and
+      never one step -- the pass walks every preparing slot, so prefills landing together
+      froze a worker for their SUM, which is the 441 ms `max_gap` maximum against a single
+      slice of ~60 ms. The pass now stops when the step's budget is spent and resumes next
+      step where it stopped, with a rotating cursor so no slot starves, and always runs one
+      slice so the cap cannot deadlock. It predicts a reversal: small slices lost only
+      because they summed across slots, so under the cap 16 should beat 48
       - **(1) CHOSEN — chunked prefill.** Make `prepare` resumable and interleave the slices
         with decode steps, so the longest freeze is one slice instead of one prefill. It
         removes the cause. Costs an engine-seam API change and TTFA on the admitted request:
