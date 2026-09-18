@@ -740,8 +740,30 @@ the x86 self-test that judges the two kernels written here and never executed
       A 10-minute screen had put that bound at 495.4 ms and the 30-minute run moved it
       past 500: a screen cannot qualify a tail either. **To close**: E10-10, because the
       tail is the long-request slot and the topology is the untested variable
-- [ ] E10-10 **the topology claim comes from one machine, and now has a prediction
-      against it** — `16x2` beats `1x32` by 2.2x on RTF p95, measured only on the Axion
+- [ ] E10-16 **the stall has one cause, measured and read in the code: the prefill runs
+      inside the step loop** → [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md).
+      `slot_start()` calls `engine->prepare()` synchronously in the admission block at the
+      top of `mynah_graph_serve_continuous`, so **every resident slot freezes for the new
+      request's prefill**. At C1 with no contention a long text's prefill costs **190 ms**
+      against 28 ms of fixed cost -- 2.4 frame periods -- and under load `max_gap` is
+      **97 ms at p50 and 358 ms at p95** with a frame lasting 80 ms. It is an interruption,
+      not a slowdown. It also explains why the `medium`-only bank was GOOD (every prefill
+      ~53 ms, under one frame) and why three concurrency levels could not clear it: the
+      freeze duration is a property of the TEXT, not of the load. **Fix**: make `prepare`
+      resumable and interleave the slices with decode steps; coarse slicing puts the freeze
+      under one frame period for ~110 ms of TTFA on the admitted request. Until then the
+      shipped contract is a **600 ms client prebuffer**, which covered all 53895 requests
+- [ ] E10-10 **the topology is answered, and the answer is that it belongs to the MODEL** —
+      `8x4` with the same 32 threads and the same 128 slots is decisively WORSE at C96:
+      RTF p95 **1.052** against 0.784 (a mandatory gate), throughput 93.6 against 124.8
+      audio-s/s, `stall@250ms` **734/13511 against 84/17968**, prebuffer p95 235 ms against
+      0. qwen-tts prefers `4x8` on this same box and that is not a contradiction:
+      `T_frame(B) = a + b*B`, and a wider worker wins only when doubling the threads more
+      than halves `b`. For a 1.7B model `a` (the weight stream) dominates; for PocketTTS's
+      109.5M it does not, and the codec's `b` scales sublinearly (16.7 ms at 2 threads,
+      7.7 ms at 16). **The optimal shape is a property of the model's a/b ratio, not of the
+      machine** -- do not inherit it across engines. Still open below: the original claim
+- [ ] E10-10b **the low-concurrency half of the topology claim** — `16x2` beats `1x32` by 2.2x on RTF p95, measured only on the Axion
       and only at low concurrency. Every capacity number in
       [`.work/axion-c99-soak.md`](.work/axion-c99-soak.md) is `16x2`, so it is assumed,
       not tested. **The prediction now points the other way at high load**: `step.backbone`
