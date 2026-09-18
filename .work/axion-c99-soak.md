@@ -150,3 +150,94 @@ a time budget; on the machine the constant came from, the budget lands on it.
    recorded (SNR 28.9-32.9 dB against 36.4-37.9, log-mel nearly unchanged),
    and that is a product decision, not a measurement. Until it is taken, the
    numbers above do not describe the shipped configuration.
+
+---
+
+# Second session, 2026-09-18: the tail does not close by lowering concurrency
+
+Same box (new address), `main` at `8aa714a` cloned fresh, same pack, same
+`16x2 --max-batch 8`, codec fully int8 including `codec_convtr`. Everything
+below is from that machine.
+
+## Two numbers in the instrument could not be read, and were fixed first
+
+**The mandatory gate printed `FAIL stall_rate@500ms 0.000 == 0.000`.** Over
+54360 requests a rate rounds to zero from one stalling request and from
+twenty-seven, and those are different verdicts about the same server.
+`summarize()` now carries `stall_n@<buffer>`, `gate()` carries a note and
+`qualify()` fills it, so the line reads `(5 of 53895 requests)`. Every number
+in this section depends on that fix: the whole finding below is a count of
+five.
+
+**Bank coverage was wrong, not merely unreadable.** `distinct_texts` counted
+distinct request *indices*, and the index is a monotonic counter, so it always
+returned the request count -- a 30-minute soak reported "54360 distinct request
+slots" whatever the bank held. The text is `bank[index % len(bank)]`, so that
+is what is counted now. Verified against the run that prompted it: the
+round-robin cursor predicts `short 12805 / medium 24699 / conversational 9604 /
+long 6468 / italian 784` over 54360 requests on the v2 bank, and the server
+measured `12783 / 24696 / 9604 / 6489 / 788`, the difference being requests in
+flight at the cut. The bank is fully exercised: **277 of 277 texts, each ~195x**
+over thirty minutes.
+
+## A contaminated hour, thrown away
+
+An ASR benchmark started on the same machine at 10:14:20 taking ~10.5 of 32
+cores. It overlapped the last minute of a C92 screen and all of a C96 screen.
+Both were discarded: a capacity soak on a shared machine measures the other
+workload. Recorded because the temptation to keep a number that "looks about
+right" is exactly the failure this board exists to prevent.
+
+## The three levels, one variable apart
+
+| | C99 (30 min) | C98 (30 min) | C96 (30 min) |
+|---|---|---|---|
+| completed | 54645/54645 | 54360/54360 | 53895/53895 |
+| stall@500ms | 0.1% (~55) | < 27 | **5** |
+| stall@250ms | 0.8% | 0.7% | **233 (0.43%)** |
+| RTF p95 | 0.831 | 0.817 | **0.783** |
+| prebuffer p95 | 21 ms | 7 ms | **0 ms** |
+| TTFA p95 | 310 ms | 308 ms | 308 ms |
+| drift RTF | +0.0176 | +0.0025 | +0.0033 |
+
+All three are NOT STREAMABLE on the same mandatory gate, and all three pass
+every other gate including both drift gates. Three levels bought a factor of
+ten on the failing quantity and did not reach zero. **The tail is not a
+capacity problem in this range**: it is the duration spread (audio 1.04-19.04 s,
+sd 4.45) and it would take a much lower level to close, if concurrency closes
+it at all.
+
+## A hypothesis, stated at 10 minutes and falsified at 30
+
+The C96 screen showed `required_prebuffer` max **495.4 ms** over 17968 requests
+while `stall_rate@500ms` failed on 3. Those are not contradictory: the gate
+simulates a buffer of 500 ms **of audio**, and the server delivers at RTF 0.68,
+so half a second of audio accumulates in ~340 ms and that player starts
+*earlier* than the worst request needs. The reading was that a client waiting
+500 ms **of wall clock** would have had zero stalls, with 4.6 ms of margin.
+
+The 30-minute run refuses it: **`required_prebuffer` max 535.0 ms** over 53895
+requests. The margin was 4.6 ms on a 10-minute sample of a tail; at three times
+the sample the tail moved past the threshold, exactly as a 4.6 ms margin
+deserves. A ten-minute screen cannot qualify a tail, which is the same lesson
+as "a screen is never a qualification", now demonstrated on a *statistic*
+rather than on a workload.
+
+**What survives.** Over 53895 requests at C96 on the mixed bank, no request
+needed more than 535 ms of lead. A client with a **600 ms** prebuffer plays all
+of them without a single underrun. That is a product number and it is measured,
+not extrapolated -- but it is a statement about a 30-minute sample of a tail,
+and it is the kind of number that moves when the sample grows.
+
+## What this leaves owed
+
+1. **E10-10, the topology, is now the first experiment, not the third.**
+   Every number above is `16x2`. `step.backbone` is bandwidth-bound, so
+   sixteen workers are sixteen weight streams against one memory roof. If a
+   wider worker (`8x4`, `4x8`) shortens the long-request tail, it moves the
+   only quantity still failing. Two 10-minute screens at C96, ~22 minutes.
+2. **The load generator is still on the server's cores** -- 13.6% coalesced
+   reads, under the 15% refusal but not by much, and it is the client competing
+   with the thing it measures.
+3. **`codec_convtr` is still OFF by default and every number here was measured
+   with it ON.** Unchanged from the first session, and still a product call.

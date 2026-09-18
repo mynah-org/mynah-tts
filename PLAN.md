@@ -730,8 +730,16 @@ the x86 self-test that judges the two kernels written here and never executed
       audio 1.04-18.48 s, **sd 4.39** against the medium-only 0.298. The reference's
       wave-vs-soak gap does **not** reproduce as drift here; what bites is the duration
       spread. **A screen is never a qualification**, and we now have our own instance of
-      it, the two verdicts an hour apart. **To close**: the descending sweep on the mixed
-      bank (command in the note) to turn "not C99" into an operating point
+      it, the two verdicts an hour apart. **The descending sweep has since been run and
+      the answer is that concurrency does not close it**: C98 and C96 over thirty minutes
+      each are also NOT STREAMABLE on the same gate, with every other gate and both drift
+      gates passing. Three levels bought a factor of ten on the failing quantity --
+      `stall@500ms` 0.1% -> <0.05% -> **5 of 53895** -- and did not reach zero. What is
+      measured instead is the client-side number: over 53895 requests at C96 no request
+      needed more than **535 ms** of lead, so a **600 ms prebuffer** plays all of them.
+      A 10-minute screen had put that bound at 495.4 ms and the 30-minute run moved it
+      past 500: a screen cannot qualify a tail either. **To close**: E10-10, because the
+      tail is the long-request slot and the topology is the untested variable
 - [ ] E10-10 **the topology claim comes from one machine, and now has a prediction
       against it** — `16x2` beats `1x32` by 2.2x on RTF p95, measured only on the Axion
       and only at low concurrency. Every capacity number in
