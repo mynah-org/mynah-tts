@@ -384,6 +384,10 @@ def summarize(records, buffers_ms=DEFAULT_BUFFERS_MS):
     for b in buffers_ms:
         key = "stalls@%d" % b
         stalled = [r for r in cadence if (r.get(key) or 0) > 0]
+        # The COUNT as well as the rate.  A mandatory gate that reads "0.000 == 0.000
+        # FAIL" is unreadable: at 54360 requests a rate rounds to zero from 1 stall and
+        # from 27, and those are different verdicts about the same server.
+        out["stall_n@%d" % b] = len(stalled)
         out["stall_rate@%d" % b] = (len(stalled) / len(cadence)) if cadence else float("nan")
         out["stall_ms@%d" % b] = spread(col("stall_ms@%d" % b))
         out["stall_max_ms@%d" % b] = spread(col("stall_max_ms@%d" % b))
@@ -476,7 +480,7 @@ COALESCED_REFUSE_SHARE = 0.15
 COALESCED_WARN_SHARE = 0.05
 
 
-def gate(name, value, op, limit, unit="", kind="preferred"):
+def gate(name, value, op, limit, unit="", kind="preferred", note=""):
     """One comparison, carrying everything needed to re-check it by hand.
 
     ``pass`` is None when the value is NaN -- not measured is not the same as failed,
@@ -496,7 +500,7 @@ def gate(name, value, op, limit, unit="", kind="preferred"):
     else:
         raise ValueError("unknown comparison %r" % op)
     return {"name": name, "value": v, "op": op, "limit": float(limit),
-            "unit": unit, "kind": kind, "pass": passed}
+            "unit": unit, "kind": kind, "pass": passed, "note": note}
 
 
 def qualify(summary, completed, launched, env=None):
@@ -519,13 +523,21 @@ def qualify(summary, completed, launched, env=None):
         v = sp(key, field)
         return v * 1000.0 if v == v else v
 
+    def stall_note(b):
+        n = s.get("stall_n@%d" % b)
+        total = s.get("n_cadence")
+        if n is None or not total:
+            return ""
+        return "%d of %d requests" % (n, total)
+
     mandatory = [
         gate("completed == launched", float(completed), "==", float(launched),
              kind="mandatory"),
         gate("STREAM_RTF p95", sp("stream_rtf"), "<", e["rtf_hard"], kind="mandatory"),
         gate("stall_rate@%dms" % e["stall_mandatory_ms"],
              s.get("stall_rate@%d" % e["stall_mandatory_ms"], float("nan")),
-             "==", 0.0, kind="mandatory"),
+             "==", 0.0, kind="mandatory",
+             note=stall_note(e["stall_mandatory_ms"])),
     ]
     preferred = [
         gate("TTFB p95", ms("ttfb_s"), "<=", e["ttfb_pref_ms"], "ms"),
@@ -536,7 +548,8 @@ def qualify(summary, completed, launched, env=None):
         gate("safe_play_start p95", ms("safe_play_start_s"), "<=",
              e["safe_start_pref_ms"], "ms"),
         gate("stall_rate@%dms" % e["stall_pref_ms"],
-             s.get("stall_rate@%d" % e["stall_pref_ms"], float("nan")), "==", 0.0),
+             s.get("stall_rate@%d" % e["stall_pref_ms"], float("nan")), "==", 0.0,
+             note=stall_note(e["stall_pref_ms"])),
     ]
     strong = [
         gate("STREAM_RTF p95", sp("stream_rtf"), "<=", e["rtf_strong"], kind="strong"),
@@ -937,6 +950,8 @@ def _selftest():
     s = summarize(recs)
     check("summary/n_cadence", s["n_cadence"], 4)
     check("summary/stall_rate@250", s["stall_rate@250"], 2 / 4.0)
+    check("summary/stall_n@250", s["stall_n@250"], 2)
+    check("summary/stall_n@1000", s["stall_n@1000"], 0)
     check("summary/stall_rate@1000", s["stall_rate@1000"], 0.0)
     check("summary/prebuffer_le_rate@250", s["prebuffer_le_rate@250"], 2 / 4.0)
     check("summary/sd is reported", s["required_prebuffer_s"]["sd"] > 0.0, True)
