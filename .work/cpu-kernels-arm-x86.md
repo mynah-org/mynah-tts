@@ -155,3 +155,49 @@ objects, every `#if defined(__x86_64__)` actually compiled, CPUID and XGETBV
 included) plus a forced compile of the aarch64-Linux branch. A true
 `--target=x86_64-linux-gnu` build is not possible on this machine — there is no
 Linux sysroot — so **Linux coverage needs CI or a sysroot**, and is not claimed.
+
+## 2026-09-19 — `MYNAH_QMAT_VNNI=256` could grant a feature the CPU lacks
+
+CI died with **`Illegal instruction (core dumped)`** in the x86 UBSan job, in the
+fourth of `qmat-test`'s five invocations. Not a sanitiser diagnostic: a real
+SIGILL, and a bug that had been in the file for months.
+
+```c
+enum { QMAT_U8_OFF = 0, QMAT_U8_SCALAR = 1, QMAT_U8_VEX = 2, QMAT_U8_EVEX = 3 };
+
+if (strcmp(env, "256") == 0) return detected >= QMAT_U8_VEX ? QMAT_U8_VEX
+                                                            : detected;
+```
+
+The comparison treats the enum as a ladder. **The block twenty lines above says
+in as many words that it is not one**: "EVEX and VEX are INDEPENDENT features,
+not a ladder. Ice Lake server has AVX512-VNNI and no AVX-VNNI; Alder Lake has
+AVX-VNNI and no AVX-512; Zen 4/5 have both."
+
+On a host with EVEX and no VEX, `detected` is `QMAT_U8_EVEX` (3), which is
+numerically above `QMAT_U8_VEX` (2), so the request was granted and the process
+executed a VEX `VPDPBUSD` the silicon does not implement. That breaks the
+invariant the same function documents: *"A level the CPU cannot run is clamped
+down, never up."*
+
+`qmat_u8_vex_level()` already existed and answers the VEX question **alone** —
+it was written for exactly this and used only by the self test. The clamp now
+calls it. A host with EVEX and no VEX gets `QMAT_U8_OFF`, the AVX2 madd path:
+slower, correct, and executable.
+
+### Why it surfaced now
+
+Nothing in the change that exposed it touches VNNI. GitHub's x86 runner pool is
+heterogeneous: the invocation had been passing on runners that happen to have
+AVX-VNNI, and this push landed on one that does not. That is worth writing down
+on its own — **a green CI on a heterogeneous runner pool is a statement about the
+machine that ran, not about the code.** The dispatch report prints what resolved
+on each run for this reason; what was missing was anyone reading it when the
+answer changed.
+
+### The shape of the mistake
+
+An enum whose ORDER encodes capability, next to a comment explaining that the
+order means nothing. Both were written by the same hand on the same day. The
+comment was right and the code did not follow it, which is the failure mode a
+comment cannot prevent — only a call to a predicate that cannot be misread can.

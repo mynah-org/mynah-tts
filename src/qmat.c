@@ -280,8 +280,23 @@ static int qmat_u8_level_uncached(void) {
     if (env == NULL || strcmp(env, "auto") == 0) return detected;
     if (strcmp(env, "off") == 0 || strcmp(env, "0") == 0) return QMAT_U8_OFF;
     if (strcmp(env, "scalar") == 0) return QMAT_U8_SCALAR;
-    if (strcmp(env, "256") == 0) return detected >= QMAT_U8_VEX ? QMAT_U8_VEX
-                                                               : detected;
+    /* "256" means the VEX kernel, and it may only be granted when this CPU
+     * actually has AVX-VNNI.
+     *
+     * This used to read `detected >= QMAT_U8_VEX ? QMAT_U8_VEX : detected`,
+     * which treats the enum as a ladder -- and the block above says in as many
+     * words that it is not one: EVEX and VEX are independent features, and Ice
+     * Lake server has AVX512-VNNI with no AVX-VNNI. On such a host `detected`
+     * is EVEX, EVEX is numerically above VEX, and the request was granted: the
+     * process then executed a VEX VPDPBUSD the CPU does not implement and died
+     * with SIGILL. Found by CI on a runner without AVX-VNNI; the same test had
+     * passed for months on runners that happen to have it.
+     *
+     * qmat_u8_vex_level() is the probe that answers the VEX question alone, so
+     * the clamp asks it rather than comparing enum values. A host with EVEX and
+     * no VEX gets QMAT_U8_OFF, which is the AVX2 madd path -- slower, correct,
+     * and executable, which is what "clamped down, never up" has to mean. */
+    if (strcmp(env, "256") == 0) return qmat_u8_vex_level();
     if (strcmp(env, "512") == 0) return detected;
     return detected;
 }
