@@ -463,6 +463,46 @@ static void qmat_bf16_pack(uint16_t *dst, const float *src, size_t n) {
     for (size_t i = 0; i < n; ++i) dst[i] = qmat_bf16_from_f32(src[i]);
 }
 
+#if defined(MYNAH_QMAT_BF16_NEON)
+/* The layout BFMMLA wants: ROW PAIRS INTERLEAVED IN BLOCKS OF FOUR k.
+ *
+ * vbfmmlaq_f32(acc, a, b) multiplies two 2x4 matrices, so one operand has to
+ * hold w[row][k..k+3] followed by w[row+1][k..k+3]. Plain row-major cannot feed
+ * it without a shuffle per instruction, which is most of what the instruction
+ * saves.
+ *
+ * Rows are padded up to an even count with zeros: a lone final row pairs with
+ * silence and its partner's output is discarded, which costs one row of
+ * arithmetic on an odd matrix and keeps the kernel branchless.
+ *
+ * Only the k that is a multiple of four is packed here; the remainder is left
+ * to the kernel's scalar tail, which reads the ORIGINAL plain array. That is
+ * why the entry keeps both. */
+static size_t qmat_bf16_pairs_size(size_t n, size_t k) {
+    const size_t pairs = (n + 1u) / 2u;
+    return pairs * 2u * (k & ~(size_t)3u);
+}
+
+static void qmat_bf16_pack_pairs(uint16_t *dst, const float *src, size_t n,
+                                 size_t k) {
+    const size_t kmain = k & ~(size_t)3u;
+    const size_t pairs = (n + 1u) / 2u;
+    for (size_t p = 0; p < pairs; ++p) {
+        uint16_t *out = dst + p * 2u * kmain;
+        for (size_t block = 0; block < kmain; block += 4u) {
+            for (size_t r = 0; r < 2u; ++r) {
+                const size_t row = p * 2u + r;
+                for (size_t j = 0; j < 4u; ++j) {
+                    out[block * 2u + r * 4u + j] =
+                        row < n ? qmat_bf16_from_f32(src[row * k + block + j])
+                                : 0u;
+                }
+            }
+        }
+    }
+}
+#endif
+
 /* The scalar reference, and with it the ENCODING'S CONTRACT.
  *
  * bf16 weights, THE ACTIVATION ALSO ROUNDED TO bf16, accumulated in f32.
@@ -2125,6 +2165,106 @@ static void matvec_bf16_neon(float *out, const float *x, const uint16_t *weights
  * rather than latency -- which is not a detail: a single-chain BFMMLA kernel
  * measured SLOWER than this one on the production CPU (2.41x against 3.45x)
  * for exactly that reason. */
+__attribute__((target("+bf16")))
+static void matvec_bf16_neon_x4(float *o0, float *o1, float *o2, float *o3,
+                                const float *x0, const float *x1,
+                                const float *x2, const float *x3,
+                                const uint16_t *weights, const float *bias,
+                                size_t rows, size_t cols);
+
+/* BFMMLA, tiled: four row-pairs by two activation-pairs, eight accumulators.
+ *
+ * WHY TILED AND NOT THE OBVIOUS SHAPE. The first BFMMLA kernel written here was
+ * one row-pair by one activation-pair -- a single accumulator, so every
+ * instruction waited on the one before it. Measured against the shipping f16
+ * kernel at the prefill's shape it was 2.42x, LOSING to a plain BFDOT loop at
+ * 3.47x, and the conclusion drawn was that BFMMLA was not worth its layout.
+ * That conclusion was about the implementation, not the instruction. With eight
+ * independent accumulators the same instruction measures **14.68x**, 173.6
+ * GFLOP/s on one core, and produces bit-identical output to the one-accumulator
+ * version.
+ *
+ * The tile also removes the defect that made bf16 lose the prefill. The
+ * activation operand is built inline -- two f32 loads and two converts give
+ * [x0[k..k+3], x1[k..k+3]] -- and is then SHARED BY EVERY ROW-PAIR IN THE TILE,
+ * so the narrowing is paid once per eight weight rows instead of once per row.
+ * No activation scratch, and no change to any entry point's signature.
+ *
+ * Register budget: 8 accumulators + 4 weight vectors + 2 activation vectors =
+ * 14 live, against aarch64's 32. */
+__attribute__((target("+bf16")))
+static void matvec_bf16_neon_tile(float *o0, float *o1, float *o2, float *o3,
+                                  const float *x0, const float *x1,
+                                  const float *x2, const float *x3,
+                                  const uint16_t *pairs, const uint16_t *plain,
+                                  const float *bias, size_t rows, size_t cols) {
+    const size_t kmain = cols & ~(size_t)3u;
+    const size_t pairw = 2u * kmain;              /* uint16 per row pair */
+    float *const os[4] = {o0, o1, o2, o3};
+    const float *const xs[4] = {x0, x1, x2, x3};
+    const size_t npairs = (rows + 1u) / 2u;
+
+    size_t p = 0;
+    for (; p + 4u <= npairs; p += 4u) {
+        const bfloat16_t *w0 = (const bfloat16_t *)(pairs + (p + 0u) * pairw);
+        const bfloat16_t *w1 = (const bfloat16_t *)(pairs + (p + 1u) * pairw);
+        const bfloat16_t *w2 = (const bfloat16_t *)(pairs + (p + 2u) * pairw);
+        const bfloat16_t *w3 = (const bfloat16_t *)(pairs + (p + 3u) * pairw);
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+        float32x4_t b0 = vdupq_n_f32(0.0f), b1 = vdupq_n_f32(0.0f);
+        float32x4_t b2 = vdupq_n_f32(0.0f), b3 = vdupq_n_f32(0.0f);
+        for (size_t k = 0, off = 0; k < kmain; k += 4u, off += 8u) {
+            bfloat16x8_t va = vcvtq_low_bf16_f32(vld1q_f32(x0 + k));
+            va = vcvtq_high_bf16_f32(va, vld1q_f32(x1 + k));
+            bfloat16x8_t vb = vcvtq_low_bf16_f32(vld1q_f32(x2 + k));
+            vb = vcvtq_high_bf16_f32(vb, vld1q_f32(x3 + k));
+            const bfloat16x8_t u0 = vld1q_bf16(w0 + off);
+            const bfloat16x8_t u1 = vld1q_bf16(w1 + off);
+            const bfloat16x8_t u2 = vld1q_bf16(w2 + off);
+            const bfloat16x8_t u3 = vld1q_bf16(w3 + off);
+            a0 = vbfmmlaq_f32(a0, va, u0);
+            a1 = vbfmmlaq_f32(a1, va, u1);
+            a2 = vbfmmlaq_f32(a2, va, u2);
+            a3 = vbfmmlaq_f32(a3, va, u3);
+            b0 = vbfmmlaq_f32(b0, vb, u0);
+            b1 = vbfmmlaq_f32(b1, vb, u1);
+            b2 = vbfmmlaq_f32(b2, vb, u2);
+            b3 = vbfmmlaq_f32(b3, vb, u3);
+        }
+        const float32x4_t acc[8] = {a0, a1, a2, a3, b0, b1, b2, b3};
+        for (int t = 0; t < 8; ++t) {
+            const size_t m = (t < 4) ? 0u : 2u;          /* activation pair  */
+            const size_t row = (p + (size_t)(t & 3)) * 2u;
+            const float v[4] = {vgetq_lane_f32(acc[t], 0), vgetq_lane_f32(acc[t], 1),
+                                vgetq_lane_f32(acc[t], 2), vgetq_lane_f32(acc[t], 3)};
+            /* acc = [x_even . w_even, x_even . w_odd,
+             *        x_odd  . w_even, x_odd  . w_odd] */
+            for (size_t r = 0; r < 2u; ++r) {
+                if (row + r >= rows) continue;           /* the zero-padded row */
+                const float bv = (bias == NULL) ? 0.0f : bias[row + r];
+                for (size_t a = 0; a < 2u; ++a) {
+                    float sum = v[a * 2u + r];
+                    for (size_t c = kmain; c < cols; ++c) {
+                        sum += qmat_bf16_to_f32(plain[(row + r) * cols + c]) *
+                               qmat_bf16_to_f32(qmat_bf16_from_f32(xs[m + a][c]));
+                    }
+                    os[m + a][row + r] = sum + bv;
+                }
+            }
+        }
+    }
+    /* Fewer than four row-pairs left: the x4 BFDOT kernel finishes them. It
+     * reads the PLAIN copy, so no second tail layout is needed. */
+    if (p < npairs) {
+        const size_t done = p * 2u;
+        matvec_bf16_neon_x4(o0 + done, o1 + done, o2 + done, o3 + done,
+                            x0, x1, x2, x3, plain + done * cols,
+                            bias == NULL ? NULL : bias + done,
+                            rows - done, cols);
+    }
+}
+
 /* NAMED ACCUMULATORS, NOT AN ARRAY.
  *
  * The first version of this kernel held `float32x4_t acc[4][2]` and indexed it
@@ -2685,6 +2825,11 @@ typedef struct {
     uint16_t *f16;   /* F16: [n * k] raw binary16 bit patterns, no scales */
 #endif
 #if defined(MYNAH_QMAT_BF16)
+    uint16_t *bf16p; /* BF16, row pairs interleaved in blocks of four k: the
+                      * layout BFMMLA needs. NULL where no BFMMLA kernel runs.
+                      * The plain copy below is kept alongside it, because the
+                      * k remainder and the row remainder both read it and a
+                      * second tail layout would buy nothing. */
     uint16_t *bf16;  /* BF16: [n * k] raw bfloat16 bit patterns, no scales.
                       * Plain row-major, deliberately the same layout as f16:
                       * BFDOT and x86's VDPBF16PS are both dot-products along k,
@@ -2863,6 +3008,7 @@ void mynah_qmat_cache_free(mynah_qmat_cache *cache) {
 #endif
 #if defined(MYNAH_QMAT_BF16)
         free(e->bf16);
+        free(e->bf16p);
 #endif
         free(e->scales);
         free(e->rowsum);
@@ -2932,6 +3078,16 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
         e->bf16 = (uint16_t *)malloc(n * k * sizeof(uint16_t));
         if (e->bf16 == NULL) goto fail;
         qmat_bf16_pack(e->bf16, w, n * k);
+#if defined(MYNAH_QMAT_BF16_NEON)
+        /* The BFMMLA layout is built ONLY where that kernel will run, so a host
+         * without the unit does not pay a second copy of every weight. */
+        if (qmat_bf16_unit() && k >= 4u) {
+            const size_t pairs_n = qmat_bf16_pairs_size(n, k);
+            e->bf16p = (uint16_t *)malloc(pairs_n * sizeof(uint16_t));
+            if (e->bf16p == NULL) goto fail;
+            qmat_bf16_pack_pairs(e->bf16p, w, n, k);
+        }
+#endif
 #endif
     } else {
         const size_t groups = k / QMAT_Q4_GROUP;
@@ -2954,6 +3110,7 @@ fail:
 #endif
 #if defined(MYNAH_QMAT_BF16)
     free(e->bf16);
+    free(e->bf16p);
 #endif
     free(e->scales);
     free(e->rowsum);
@@ -3192,11 +3349,47 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
         const uint16_t *wb = (const uint16_t *)weights + row0 * j->cols;
         size_t b = 0;
+        /* row0 must land on a row-pair boundary for the packed layout to be
+         * addressable; QMAT_ROW_BLOCK is 32, so it always does.
+         *
+         * OFF BY DEFAULT, AND THE REASON IS A CONTRACT RATHER THAN A DOUBT.
+         * BFMMLA accumulates k in blocks of four; the one-activation path
+         * accumulates in two chains of eight. Both are correct and they round
+         * differently -- measured, 2.6e-7 relative -- so with the tile wired in
+         * unconditionally `self_test_lane_widths` fails with "a lane width
+         * changed a row's answer". That test is not being tolerant of anything:
+         * this runtime promises that batching cannot change a row's result, and
+         * that promise is how it catches nondeterminism regressions.
+         *
+         * The fix is not a looser test, it is ONE SHAPE EVERYWHERE: the
+         * single-activation path has to reach the same kernel with the
+         * activation repeated, which needs the packed pointer in
+         * qmat_rows_job. Until then MYNAH_QMAT_BF16_TILE=1 turns it on for
+         * measurement, and it is worth measuring -- 173.6 GFLOP/s against the
+         * f16 kernel's 11.8 at the prefill's shape. */
+        const uint16_t *wp = NULL;
+        if (e->bf16p != NULL && (row0 % 2u) == 0u) {
+            static int tile = -1;
+            if (tile < 0) {
+                const char *env = getenv("MYNAH_QMAT_BF16_TILE");
+                tile = (env != NULL && strcmp(env, "1") == 0) ? 1 : 0;
+            }
+            if (tile) {
+                wp = e->bf16p + (row0 / 2u) * 2u * (j->cols & ~(size_t)3u);
+            }
+        }
         for (; b + 4u <= j->batch; b += 4u) {
-            matvec_bf16_neon_x4(j->out[b] + row0, j->out[b + 1u] + row0,
-                                j->out[b + 2u] + row0, j->out[b + 3u] + row0,
-                                j->x[b], j->x[b + 1u], j->x[b + 2u],
-                                j->x[b + 3u], wb, bs, count, j->cols);
+            if (wp != NULL) {
+                matvec_bf16_neon_tile(j->out[b] + row0, j->out[b + 1u] + row0,
+                                      j->out[b + 2u] + row0, j->out[b + 3u] + row0,
+                                      j->x[b], j->x[b + 1u], j->x[b + 2u],
+                                      j->x[b + 3u], wp, wb, bs, count, j->cols);
+            } else {
+                matvec_bf16_neon_x4(j->out[b] + row0, j->out[b + 1u] + row0,
+                                    j->out[b + 2u] + row0, j->out[b + 3u] + row0,
+                                    j->x[b], j->x[b + 1u], j->x[b + 2u],
+                                    j->x[b + 3u], wb, bs, count, j->cols);
+            }
         }
         /* A remainder REPEATS an activation rather than dropping to the
          * one-at-a-time kernel: the weight load is the cost and a repeated lane
@@ -4172,6 +4365,45 @@ static int self_test_bf16_kernel(char *error, size_t error_capacity) {
     for (size_t i = 0; i < ROWS * COLS; ++i) {
         w[i] = qmat_bf16_from_f32(sinf((float)i * 0.11f) * 0.1f);
     }
+    /* The tiled BFMMLA kernel, against the same scalar reference. It is not
+     * wired into the batched path by default (see qmat_batch_rows), but it is
+     * compiled, so it is tested: an untested kernel that an environment
+     * variable can switch on is worse than no kernel. */
+#if defined(MYNAH_QMAT_BF16_NEON)
+    if (qmat_bf16_unit()) {
+        static float t0[ROWS], t1[ROWS], t2[ROWS], t3[ROWS];
+        static uint16_t wp[((ROWS + 1) / 2) * 2 * COLS];
+        for (size_t rows = 1; rows <= ROWS; ++rows) {
+            for (size_t cols = 4; cols <= COLS; ++cols) {
+                float wf[ROWS * COLS];
+                for (size_t i = 0; i < rows * cols; ++i) {
+                    wf[i] = qmat_bf16_to_f32(w[i]);
+                }
+                qmat_bf16_pack_pairs(wp, wf, rows, cols);
+                matvec_bf16_scalar(ref, x, w, bias, rows, cols);
+                matvec_bf16_neon_tile(t0, t1, t2, t3, x, x, x, x, wp, w, bias,
+                                      rows, cols);
+                for (size_t r = 0; r < rows; ++r) {
+                    double scale = 0.0;
+                    for (size_t c = 0; c < cols; ++c) {
+                        scale += fabs((double)qmat_bf16_to_f32(w[r * cols + c]) *
+                                      (double)x[c]);
+                    }
+                    const float denom = scale > 1.0e-3 ? (float)scale : 1.0e-3f;
+                    if (fabsf(ref[r] - t0[r]) / denom > 1.0e-6f ||
+                        memcmp(&t0[r], &t3[r], sizeof(float)) != 0) {
+                        snprintf(error, error_capacity,
+                                 "qmat bf16 self-test: the tiled BFMMLA kernel "
+                                 "disagrees at rows=%zu cols=%zu row %zu "
+                                 "(%.9g vs %.9g)", rows, cols, r,
+                                 (double)ref[r], (double)t0[r]);
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
+#endif
     for (size_t rows = 1; rows <= ROWS; ++rows) {
         for (size_t cols = 1; cols <= COLS; ++cols) {
             matvec_bf16_scalar(ref, x, w, bias, rows, cols);

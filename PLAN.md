@@ -307,7 +307,25 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       quality, except bf16 keeps the frame count. Available, NOT default. The promising
       experiment needs no new code: the CODEC groups are not autoregressive, so
       `MYNAH_QUANT_GROUPS=codec_*:bf16` is additive noise measurable against f32 exactly as
-      int8's was -- and int8, far coarser, was accepted there
+      int8's was -- and int8, far coarser, was accepted there.
+      **THE BFMMLA VERDICT WAS WRONG AND THE CORRECTION IS THE BIGGEST NUMBER HERE.**
+      "BFMMLA loses to BFDOT" judged a kernel with ONE accumulator. Tiled -- four
+      row-pairs x two activation-pairs, eight independent chains -- the same instruction
+      measures **173.6 GFLOP/s, 14.68x** the shipping f16 kernel (f16 11.8, BFDOT 41.1),
+      at ~90% of the core's peak, and is **bit-identical** to the one-accumulator version,
+      so the tiling is scheduling and not a shortcut. It also fixes the prefill by
+      construction: the activation operand is built inline and SHARED by every row-pair,
+      so narrowing costs once per eight rows instead of once per row -- no scratch, no
+      signature change. In the engine: `prep.prefill_proj` **6.186 ms f16 -> 9.308 bf16
+      BFDOT -> 4.500 bf16 tiled**, RTF 0.162 -> 0.124 -> 0.121. **OFF BY DEFAULT**, and for
+      a contract rather than a doubt: wired in unconditionally `self_test_lane_widths`
+      fails at 2.6e-7 -- "a lane width changed a row's answer" -- because BFMMLA
+      accumulates k in fours and the one-activation path in two chains of eight. Both are
+      right; this runtime promises batching cannot change a row's result, and a 14x kernel
+      does not get to be the exception. **To close**: ONE SHAPE EVERYWHERE -- the
+      single-activation path reaches the same kernel with the activation repeated, which
+      needs the packed pointer in `qmat_rows_job`. `MYNAH_QMAT_BF16_TILE=1` measures it
+      meanwhile, and `--self-test` covers it against the scalar reference
 - [ ] E4-7 AMX-INT8 (Linux/x86 only), last
 - [ ] E4-10 **remove useless dtype conversions** — called out by name as one of the two
       profiling wins. `src/qmat.c` holds 15 conversion sites and every other hot-path

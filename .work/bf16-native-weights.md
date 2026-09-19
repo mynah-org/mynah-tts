@@ -264,3 +264,58 @@ works today.
 * The x86 AVX512-BF16 kernel is unwritten. bf16 WEIGHTS work there — half the
   bytes of f32, multiplied by the scalar kernel — but the arithmetic is scalar,
   and `--dispatch-map` says so rather than implying a win.
+
+## The BFMMLA verdict was wrong, and the correction is the biggest number here
+
+"BFMMLA is 2.41x and loses to BFDOT" was a verdict on a kernel with **one
+accumulator**, where every instruction waits on the one before it. Tiled — four
+row-pairs by two activation-pairs, eight independent accumulators — the same
+instruction measures:
+
+| kernel | time | GFLOP/s | vs the shipping f16 |
+|---|---|---|---|
+| f16 + `vcvt` + `vfmaq_f32` | 11.347 ms | 11.8 | — |
+| bf16 BFMMLA, one accumulator | 4.688 ms | 28.6 | 2.42x |
+| bf16 BFDOT | 3.267 ms | 41.1 | 3.47x |
+| **bf16 BFMMLA, tiled** | **0.773 ms** | **173.6** | **14.68x** |
+
+173.6 GFLOP/s is about 90% of this core's peak, and the tiled kernel is
+**bit-identical** to the one-accumulator version, so the tiling is a scheduling
+change and not a shortcut.
+
+The tile also removes the defect that made bf16 lose the prefill, by
+construction rather than by a new mechanism: the activation operand is built
+inline from two f32 loads and two converts and is then **shared by every
+row-pair in the tile**, so narrowing is paid once per eight weight rows instead
+of once per row. No scratch, no signature change.
+
+In the engine, on the real prefill:
+
+    prep.prefill_proj      RTF
+      6.186 ms             0.162    backbone:f16
+      9.308 ms             0.124    backbone:bf16, BFDOT
+      4.500 ms             0.121    backbone:bf16, BFMMLA tiled
+
+**1.37x over f16 on the projections**, and the regression is gone.
+
+### And it is off by default, because of a contract rather than a doubt
+
+Wired in unconditionally, `self_test_lane_widths` fails:
+
+    qmat bf16 batch=4 differs from the row-at-a-time reference at row 0 col 0:
+      -87.6985626 vs -87.6985397 -- a lane width changed a row's answer
+
+2.6e-7 relative, and both answers are correct: BFMMLA accumulates k in blocks of
+four, the one-activation path in two chains of eight. This runtime promises that
+**batching cannot change a row's result**, and that promise is how it catches
+nondeterminism regressions — `self_test_batched`'s own comment calls it "a
+nondeterminism regression no tolerance can excuse". A 14x kernel does not get to
+be the exception.
+
+The fix is not a looser test. It is **one shape everywhere**: the
+single-activation path must reach the same kernel with the activation repeated,
+which needs the packed pointer to travel in `qmat_rows_job`. That is the next
+commit, and until it lands `MYNAH_QMAT_BF16_TILE=1` turns the tile on for
+measurement while `--self-test` covers it against the scalar reference with a
+tolerance — an untested kernel that an environment variable can switch on would
+be worse than no kernel.
