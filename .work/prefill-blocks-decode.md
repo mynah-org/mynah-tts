@@ -326,3 +326,46 @@ wider `--max-batch` or a nineteenth/twentieth worker, not another prefill knob.
 A second reading of the same table: `STREAM_RTF` p95 0.817 at C100 means the box
 still has a fifth of a realtime budget in hand at a level it cannot qualify.
 Capacity is not what stops us — continuity is, and it always has been.
+
+## 2026-09-19 — a fourth prediction of mine, refuted the same day I wrote it
+
+Earlier today this note and `docs/performance.md` both said that above C96 the
+thing overrunning the 80 ms frame was "the AR step itself, as slots per worker
+rise". It was stated as mechanism on the strength of an arithmetic story, and it
+is wrong.
+
+`MYNAH_SERVE_PROFILE=1` was extended to time each step and bucket it by width.
+C94, sixteen workers, 195303 steps:
+
+| B | steps | mean | worst | late | per-slot |
+|---|---|---|---|---|---|
+| 1 | 981 | 10.8 ms | 13.8 ms | 0.000% | 10.8 ms |
+| 4 | 8293 | 33.6 | 44.3 | 0.000% | 8.4 |
+| 5 | 53210 | 43.7 | 56.0 | 0.000% | 8.7 |
+| 6 | 130739 | 50.0 | 66.8 | 0.000% | 8.3 |
+
+Not one step crossed the deadline; the worst was 66.8 ms against 80. `a = 3.0 ms`
+and `b = 7.8 ms` put the crossing at **B ≈ 9.9**, and `--max-batch` is 8 — the
+width is already bounded below the deadline. The histogram also stops at B6
+(`mean_live` 5.58): a closed-loop load of 94 over 16 workers is much narrower
+than a Poisson arrival, so `--max-batch` is not even an active knob here. The
+`--max-batch 6` arm was run as a control for exactly this reason.
+
+**What the number actually says.** `max_gap` p95 is 130 ms while the worst step
+is 66.8, so the gap is a sum and not a step: one prefill-slice pass (cap 60 ms)
+plus one typical step (50 ms) is 110 ms against a frame of 80. The slack per
+frame is `80 - 50 = 30`; the cap is 60. Every frame carrying a prefill pass costs
+each slot in that worker ~30 ms, and at RTF 0.746 a slot earns 20 ms of lead per
+frame, so one pass takes ~1.5 frames to repay. Several arriving close together on
+one worker exhaust the cushion — one stall in 54000.
+
+`MYNAH_PREFILL_STEP_MS = 60` was chosen by trying values yesterday. The measured
+principle is `cap = deadline - T_frame(B typical)`, ~30 ms on this host at this
+concurrency. Whether it can be lowered is a TTFA question, not a continuity one:
+the gate stands at 494.9 against 500, and halving the cap doubles the steps a
+prefill takes.
+
+**The lesson is the same one as the other three.** Every refuted prediction in
+this note shared a shape: an arithmetic story about where the time must be
+going, written down as if it had been measured. The instrumentation that settled
+this one is fifteen lines and should have existed before the claim did.

@@ -638,7 +638,7 @@ hand while the binary shipped it OFF.** That gap is closed, and the machinery
 that makes it a validation failure rather than a footnote is in
 `configs/perf/` — see `.work/serving-profiles.md`.
 
-### 2. The ceiling is C96, and above it the failure changes character
+### 2. The ceiling is C96
 
 | C, convtr ON | 10 min | 30 min | TTFA p95 | RTF p95 | stall@250 |
 |---|---|---|---|---|---|
@@ -658,18 +658,58 @@ same statistic lesson as 2026-09-18, from the other side: a rate that is zero in
 chances yet.
 
 **From C96 to C100, TTFA drifts 28 ms while stalls go 0 → 13 → 22.** The
-per-step prefill cap is doing exactly what it promises, so what overruns the 80 ms
-frame at the top of the range is no longer the prefill: it is the AR step itself,
-as slots per worker rise from ~5.6 at C90 to ~6.25 at C100. Any further work on
-"zero stalls at a higher C" belongs to the decode step or to the slot count per
-worker, not to another prefill knob.
+per-step prefill cap is doing exactly what it promises. The obvious next guess —
+that the AR step itself now overruns the frame as slots per worker rise — was
+stated here first and then **refuted by measuring it**, which is the subsection
+below.
 
 And the third reading, which is the useful one for capacity planning:
 `STREAM_RTF` p95 is **0.817 at C100**, a level that cannot be qualified. The box
 still has a fifth of a realtime budget in hand where continuity has already run
 out. **Capacity is not what limits this engine; continuity is.**
 
-### 3. The shipped binary reproduces the operating point on its own
+### 3. It is not the batch width. T_frame(B), read off the serving loop
+
+`MYNAH_SERVE_PROFILE=1` now reports what a step COST at each width, not only how
+many slots were live. C94, sixteen workers, 195303 steps, deadline 80 ms:
+
+| B | steps | mean | worst | late | per-slot |
+|---|---|---|---|---|---|
+| 1 | 981 | 10.8 ms | 13.8 ms | 0.000% | 10.8 ms |
+| 2 | 774 | 20.7 | 23.1 | 0.000% | 10.3 |
+| 3 | 1273 | 27.9 | 33.6 | 0.000% | 9.3 |
+| 4 | 8293 | 33.6 | 44.3 | 0.000% | 8.4 |
+| 5 | 53210 | 43.7 | 56.0 | 0.000% | 8.7 |
+| 6 | 130739 | 50.0 | 66.8 | 0.000% | 8.3 |
+
+**Not one step of 195303 crossed the deadline**, and the worst was 13 ms short of
+it. The fit is `a = 3.0 ms, b = 7.8 ms`, so the frame period would be crossed at
+**B ≈ 9.9** while `--max-batch` is 8: the width cannot overrun the frame, the
+bound is already there. And 8 is never reached anyway — the histogram stops at
+B6 with `mean_live` 5.58, because a closed-loop load of 94 requests over 16
+workers is far narrower than a Poisson arrival would be. At this concurrency
+`--max-batch` is not an active knob.
+
+So where does `max_gap` p95 = 130 ms come from, when the worst step is 66.8?
+It is not one slow step, it is a **sum**:
+
+    one prefill-slice pass (capped at 60 ms) + one typical step (50 ms) = 110 ms
+
+against a frame of 80. The slack per frame is `80 - 50 = 30 ms` and the prefill
+cap is 60, so on a frame that carries a prefill pass every slot in that worker
+loses about 30 ms. At RTF 0.746 a slot earns `(1 - 0.746) x 80 = 20 ms` of lead
+per frame, so one pass takes about one and a half frames to repay; several
+landing close together on the same worker exhaust the cushion, and that is the
+one stall in 54000. `MYNAH_PREFILL_STEP_MS = 60` was chosen empirically
+yesterday; the measured principle is that the cap should be the SLACK,
+`deadline - T_frame(B typical)`, which is ~30 ms here.
+
+Lowering it is not free: halving the cap doubles the steps a prefill needs and
+therefore raises TTFA, which stands at 494.9 ms against a 500 ms gate. The lever
+that would buy both is the one recorded and never pulled — the absolute cost of a
+prefill, still 190 ms for a long text against 28 ms of fixed cost.
+
+### 4. The shipped binary reproduces the operating point on its own
 
 C94, thirty minutes, **no `MYNAH_QUANT_GROUPS` in the environment at all**:
 TTFA p95 494.9 ms, RTF p95 0.746, throughput 130.8 audio-s/s, `stall@500ms` 0 —
