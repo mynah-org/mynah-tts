@@ -369,3 +369,54 @@ prefill takes.
 this note shared a shape: an arithmetic story about where the time must be
 going, written down as if it had been measured. The instrumentation that settled
 this one is fifteen lines and should have existed before the claim did.
+
+## 2026-09-19 (later) — two more things the box said, one of them about the instrument
+
+### The cap is the slack, and it is free
+
+Three ten-minute soaks at C94, shipped quantization, only `MYNAH_PREFILL_STEP_MS`
+moving:
+
+| cap | `max_gap` p95 | `max_gap` max | TTFA p95 | stall@250 |
+|---|---|---|---|---|
+| 60 (default) | 131 ms | 179 ms | 495-500 | 0-1 |
+| 40 | 121 | 148.6 | 494 | 1 |
+| 30 | 119 | 142.9 | 498 | 0 |
+| 20 | 119 | 133.9 | 496 | 1 |
+
+The cap bounds the worst case monotonically -- the MAXIMUM falls 179 → 134 --
+and **TTFA does not pay for it**. That refutes the tension predicted one message
+earlier ("halving the cap doubles the steps a prefill needs and raises TTFA"),
+and the reason it was wrong is worth keeping: the per-slice budget is already
+32 tokens, so one slot's prefill rarely reaches 30 ms by itself. The cap only
+binds when several prefills coincide on one worker. **It bounds the tail without
+touching the median path**, which is the property one wants from a limit and
+rarely gets for free.
+
+The stall column says nothing, deliberately: 1/0/1 is the same coin toss as
+below. `max_gap` is a statistic over the whole distribution and moves cleanly;
+a gate cut through the middle of a distribution does not.
+
+### The same configuration, measured twice, got two different verdicts
+
+The `--max-batch 8` and `--max-batch 6` arms were meant as an experiment and an
+arm. The step-cost table shows they were the same experiment twice over: B6 mean
+50.0 vs 49.8 ms, 130739 vs 131363 frames at that width, because the loop never
+reached 7 or 8 in either. The verdicts:
+
+    --max-batch 8    TTFA p95 500.136 ms    MARGINAL   (failed by 136 microseconds)
+    --max-batch 6    TTFA p95 496.0         GOOD
+
+**C94 and C96 do not sit near the TTFA gate, they sit ON it.** TTFA p95 is
+495 ± 5 ms against a threshold of 500, so a ten-minute verdict at these levels is
+a coin toss, and the difference between "qualified" and "not" was 136 µs of a
+percentile. Nothing about the server is unstable -- the instrument is being read
+past its resolution.
+
+Consequences, all of them operational:
+
+* a single ten-minute run may not decide anything at C94-C96, not even an A/B,
+  when the deciding quantity is TTFA. Thirty minutes, or repeats;
+* this morning's `codec_convtr` A/B survives only because its delta was 52 ms,
+  ten times the noise. That was luck, not method;
+* `--max-batch` is measured and closed as a lever at this concurrency.
