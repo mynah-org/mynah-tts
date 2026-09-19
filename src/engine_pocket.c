@@ -24,6 +24,7 @@
 #include "qmat.h"
 #include "seanet.h"
 #include "tokenizer_sentencepiece.h"
+#include "voice_clone.h"
 #include "transformer_ar.h"
 #include "weights.h"
 
@@ -315,6 +316,9 @@ typedef struct {
     size_t ratios[POCKET_MAX_RATIOS];
     size_t n_ratios;
     size_t upsample_stride;
+    /* The ENCODER's stride, for cloning only. The decoder never needs it, so it
+     * is optional and defaults to the upsample stride it mirrors. */
+    size_t downsample_stride;
     size_t codec_tf_dim;
     size_t codec_tf_ffn;
     size_t codec_tf_heads;
@@ -1867,6 +1871,8 @@ static int pocket_config_load(const char *manifest, pocket_config *cfg,
     cfg_opt_size(manifest, "text_padding_id", &cfg->padding_id, cfg->vocab_size);
     cfg_opt_size(manifest, "max_tokens_per_chunk", &cfg->max_tokens_per_chunk, 0u);
     cfg_opt_size(manifest, "flow_decode_steps", &cfg->flow_decode_steps, 1u);
+    cfg_opt_size(manifest, "codec_downsample_stride", &cfg->downsample_stride,
+                 cfg->upsample_stride);
     cfg_opt_size(manifest, "speaker_proj_input_dim", &cfg->speaker_proj_input_dim,
                  cfg->latent_dim);
     cfg_opt_bool(manifest, "insert_bos_before_voice", &cfg->insert_bos_before_voice, 0);
@@ -6112,6 +6118,174 @@ done:
     free(base);
     free(got);
     free(control);
+    return rc;
+}
+
+/* ------------------------------------------------------------ cloning
+ *
+ * The glue E7 was missing. `src/voice_clone.c` has had the arithmetic since
+ * 2026-09-12, checked against the PyTorch oracle to 6.4e-06 and covered by a
+ * model-free self-test -- but nothing ever built a `mynah_voice_clone_config`
+ * from a real pack, so no caller could reach it and `PLAN.md` carried an
+ * `export-voice` command that did not exist. This is that one function.
+ *
+ * Every dimension below comes from `model.json` and none is new. Three of the
+ * four sub-configurations are already built elsewhere in this file for the
+ * decoder; the encoder mirrors them because upstream's encoder IS the decoder
+ * mirrored (`.work/voice-cloning.md`):
+ *
+ *   seanet              the decoder's, verbatim: same ratios (decoder order,
+ *                       reversed internally), filters, kernels, compression
+ *   encoder_transformer the codec transformer's shape -- 2 layers, d512,
+ *                       context 250 -- which is what the pack declares
+ *   downsample          stride 16, [codec_dim] -> [latent_dim], groups 1; the
+ *                       mirror of the decoder's depthwise upsample
+ *   backbone            the LM's, because the voice IS its KV cache
+ *
+ * `max_seq_len` is left at zero in both transformers on purpose: the module
+ * sizes them from `max_seconds`, and a number invented here could only disagree.
+ *
+ * The output is a voice file in the pack's own format, so a cloned voice is not
+ * a second kind of voice: add it to `speakers.json` and every path that serves a
+ * predefined voice serves it, with no code aware of where it came from. */
+int mynah_engine_pocket_clone_voice(const mynah_tts_model *model,
+                                    const char *wav_path, const char *out_path,
+                                    const char *affirmation,
+                                    mynah_pocket_clone_report *report,
+                                    char *error, size_t capacity) {
+    if (model == NULL || wav_path == NULL || out_path == NULL) {
+        pocket_error(error, capacity, "clone-voice: model, reference and output "
+                                      "are all required");
+        return -1;
+    }
+    if (report != NULL) memset(report, 0, sizeof(*report));
+
+    mynah_engine_state *state = NULL;
+    if (pocket_model_init(model, &state, error, capacity) != 0) return -1;
+    const pocket_config *cfg = &state->cfg;
+
+    int rc = -1;
+    mynah_voice_clone_weights_owner *owner = NULL;
+    mynah_voice_encoder *encoder = NULL;
+    mynah_transformer_ar_state *voice = NULL;
+    mynah_audio_clip clip;
+    memset(&clip, 0, sizeof(clip));
+
+    mynah_voice_clone_config vc;
+    mynah_voice_clone_config_defaults(&vc);
+
+    vc.seanet.channels = cfg->audio_channels;
+    vc.seanet.dimension = cfg->codec_dim;
+    vc.seanet.n_filters = cfg->n_filters;
+    vc.seanet.n_residual_layers = cfg->n_residual_layers;
+    vc.seanet.ratios = cfg->ratios;
+    vc.seanet.n_ratios = cfg->n_ratios;
+    vc.seanet.kernel_size = cfg->kernel_size;
+    vc.seanet.residual_kernel_size = cfg->residual_kernel_size;
+    vc.seanet.last_kernel_size = cfg->last_kernel_size;
+    vc.seanet.dilation_base = cfg->dilation_base;
+    vc.seanet.compress = cfg->compress;
+    vc.seanet.elu_alpha = cfg->elu_alpha;
+
+    vc.encoder_transformer.d_model = cfg->codec_tf_dim;
+    vc.encoder_transformer.num_heads = cfg->codec_tf_heads;
+    vc.encoder_transformer.head_dim = cfg->codec_tf_dim / cfg->codec_tf_heads;
+    vc.encoder_transformer.num_layers = cfg->codec_tf_layers;
+    vc.encoder_transformer.ffn_dim = cfg->codec_tf_ffn;
+    vc.encoder_transformer.context = cfg->codec_tf_context;
+    vc.encoder_transformer.layernorm_eps = cfg->layernorm_eps;
+
+    vc.downsample.stride = cfg->downsample_stride;
+    vc.downsample.in_channels = cfg->codec_dim;
+    vc.downsample.out_channels = cfg->latent_dim;
+    vc.downsample.groups = 1u;
+
+    vc.backbone.d_model = cfg->hidden_dim;
+    vc.backbone.num_heads = cfg->heads;
+    vc.backbone.head_dim = cfg->head_dim;
+    vc.backbone.num_layers = cfg->layers;
+    vc.backbone.ffn_dim = cfg->ffn_dim;
+    vc.backbone.context = 0u;
+    vc.backbone.layernorm_eps = cfg->layernorm_eps;
+
+    vc.sample_rate = cfg->sample_rate;
+    vc.samples_per_frame = cfg->samples_per_frame;
+    vc.insert_bos_before_voice = cfg->insert_bos_before_voice;
+
+    mynah_voice_clone_consent consent;
+    consent.affirmed = (affirmation != NULL && *affirmation != '\0');
+    consent.source = wav_path;
+    consent.affirmation = affirmation;
+    if (mynah_voice_clone_consent_check(&consent, error, capacity) != 0) goto done;
+
+    if (mynah_voice_clone_weights_load(state->weights, &vc, &owner, error,
+                                       capacity) != 0) {
+        goto done;
+    }
+    const mynah_voice_clone_weights *weights = mynah_voice_clone_weights_view(owner);
+    const mynah_transformer_ar_weights *backbone =
+        mynah_voice_clone_backbone_view(owner);
+
+    if (mynah_wav_read_mono(wav_path, &clip, error, capacity) != 0) goto done;
+    if (report != NULL) {
+        report->input_sample_rate = clip.sample_rate;
+        report->input_seconds = clip.sample_rate != 0u
+            ? (double)clip.count / (double)clip.sample_rate : 0.0;
+    }
+    /* Truncate at the clip's OWN rate, which is where upstream truncates:
+     * before resampling, not after. */
+    mynah_audio_clip_truncate(&clip, vc.max_seconds);
+    if (mynah_audio_clip_resample(&clip, vc.sample_rate, error, capacity) != 0) {
+        goto done;
+    }
+
+    encoder = mynah_voice_encoder_create(&vc, error, capacity);
+    if (encoder == NULL) goto done;
+    if (mynah_voice_clone_check_weights(encoder, weights, error, capacity) != 0) {
+        goto done;
+    }
+    if (mynah_voice_encoder_encode(encoder, weights, &consent, clip.samples,
+                                   clip.count, error, capacity) != 0) {
+        goto done;
+    }
+
+    const size_t frames = mynah_voice_encoder_frames(encoder);
+    if (frames == 0u) {
+        pocket_error(error, capacity,
+                     "clone-voice: the reference produced no frames; it is "
+                     "shorter than one %zu-sample frame", cfg->samples_per_frame);
+        goto done;
+    }
+    /* One position per voice frame, plus the BOS this pack inserts before it. */
+    vc.backbone.max_seq_len = frames + 1u;
+    voice = mynah_transformer_ar_state_new(&vc.backbone, error, capacity);
+    if (voice == NULL) goto done;
+    if (mynah_voice_clone_prefill(voice, backbone,
+                                  cfg->insert_bos_before_voice
+                                      ? weights->bos_before_voice : NULL,
+                                  mynah_voice_encoder_conditioning(encoder),
+                                  frames, error, capacity) != 0) {
+        goto done;
+    }
+    if (mynah_voice_export(voice, out_path, MYNAH_VOICE_DTYPE_F16, &consent,
+                           cfg->revision, error, capacity) != 0) {
+        goto done;
+    }
+    if (report != NULL) {
+        report->voice_frames = frames;
+        report->voice_positions = frames + (cfg->insert_bos_before_voice ? 1u : 0u);
+        report->voice_seconds = cfg->frame_rate > 0.0
+            ? (double)frames / cfg->frame_rate : 0.0;
+        snprintf(report->revision, sizeof(report->revision), "%s", cfg->revision);
+    }
+    rc = 0;
+
+done:
+    mynah_transformer_ar_state_free(voice);
+    mynah_voice_encoder_destroy(encoder);
+    mynah_voice_clone_weights_free(owner);
+    mynah_audio_clip_free(&clip);
+    pocket_model_free(state);
     return rc;
 }
 

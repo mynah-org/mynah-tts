@@ -90,10 +90,10 @@
  *     five words with eight spaces.  The seam hands this engine token ids, so
  *     that belongs to whoever holds the text, and skipping it changes what the
  *     model is asked to say - the same place `frames_after_eos` comes from.
- *   - Voice cloning from a wav is not implemented.  `speaker_proj_weight`,
- *     `bos_before_voice` and `insert_bos_before_voice` are read and validated
- *     so the version difference is visible, but a predefined voice needs none
- *     of them.
+ *   - Voice cloning from a wav went from "not implemented" to one call on
+ *     2026-09-19: `mynah_engine_pocket_clone_voice` below. What was missing was
+ *     never the arithmetic -- `src/voice_clone.c` had it, oracle-checked -- but
+ *     a `mynah_voice_clone_config` built from a real pack.
  *   - The codec transformer's KV cache is sized for every position the request
  *     may reach (`max_steps * codec_upsample_stride`), because
  *     `transformer_ar` has no ring cache.  With `context: 250` all but the
@@ -225,6 +225,51 @@ size_t mynah_engine_pocket_text_capacity(const mynah_engine_ctx *ctx);
  */
 int mynah_engine_pocket_set_frames_after_eos(mynah_engine_ctx *ctx, size_t frames);
 size_t mynah_engine_pocket_frames_after_eos(const mynah_engine_ctx *ctx);
+
+/* --------------------------------------------------------------- cloning */
+
+/*
+ * Zero-shot voice cloning from a reference recording, E7's missing glue.
+ *
+ * `src/voice_clone.h` has had every piece since 2026-09-12 -- the mirrored
+ * SEANet encoder, the encoder transformer, the replicate-padded downsample,
+ * `speaker_proj`, the backbone prefill and the voice serialiser, checked
+ * against the PyTorch oracle to 6.4e-06 -- but nothing built a
+ * `mynah_voice_clone_config` from a real pack, so the path was unreachable
+ * from the CLI, from the server and from the library. This is the one call
+ * that closes it.
+ *
+ * What comes out is an ORDINARY voice file in the pack's own format. Add it to
+ * `speakers.json` and every path that serves a predefined voice serves it; no
+ * code anywhere becomes aware that a voice was cloned. That is a property of
+ * the model rather than a design choice here: on a continuous-latent model the
+ * voice condition and the generated output live in the same 32-dimensional
+ * space, so a "voice" is just the KV cache left behind by having read some
+ * audio. There is no speaker encoder and no adapter.
+ *
+ * `affirmation` is the consent record and is NOT optional: it is checked before
+ * any audio is read and is written verbatim into the exported file's metadata.
+ * Cloning a voice from supplied audio without a statement of permission is a
+ * refusal here, not a warning (`.work/licensing-and-voice-policy.md`).
+ *
+ * Reference audio may be any WAV the reader accepts -- PCM 8/16/24/32 or IEEE
+ * float, any channel count, any rate -- and is downmixed, truncated to the
+ * pack's 30 s cap at its own rate, then resampled to 24 kHz.
+ */
+typedef struct {
+    unsigned input_sample_rate; /* of the reference file, before resampling  */
+    double input_seconds;       /* of the reference file, before truncation  */
+    size_t voice_frames;        /* latent frames the encoder produced        */
+    size_t voice_positions;     /* KV positions written, BOS included        */
+    double voice_seconds;       /* voice_frames / frame_rate                 */
+    char revision[64];          /* the checkpoint the voice belongs to       */
+} mynah_pocket_clone_report;
+
+int mynah_engine_pocket_clone_voice(const mynah_tts_model *model,
+                                    const char *wav_path, const char *out_path,
+                                    const char *affirmation,
+                                    mynah_pocket_clone_report *report,
+                                    char *error, size_t error_capacity);
 
 /* ------------------------------------------------------ parity and debug */
 

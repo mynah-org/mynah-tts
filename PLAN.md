@@ -210,7 +210,25 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [x] E7-7 polyphase resampler to 24 kHz matching `scipy.signal.resample_poly`
       within tolerance — needed for arbitrary input files
 - [x] E7-8 truncate reference audio to 30 s, as upstream does
-- [x] E7-9 `mynah-tts export-voice`: serialize the KV so reload is instant
+- [x] E7-9 serialize the KV so reload is instant — `mynah_voice_export`.
+      **This line said `mynah-tts export-voice` until 2026-09-19 and no such command
+      existed**: the serialiser was written and self-tested, the CLI never grew the verb,
+      and `grep export-voice` over the whole repo returned nothing. Found by being asked
+      to actually clone a voice rather than to trust the board
+- [x] E7-11 **the glue, which was the only thing missing** — `mynah_engine_pocket_clone_voice`
+      builds a `mynah_voice_clone_config` from a real pack and walks encoder → prefill →
+      export; `mynah-tts --clone-voice MODEL_DIR --reference R.wav --output V.safetensors
+      --consent "..."`. Nothing in `src/voice_clone.c` changed: it had been oracle-checked
+      to 6.4e-06 since 09-12 and unreachable ever since, because no caller assembled the
+      configuration. Three of the four sub-configs are the decoder's (the encoder mirrors
+      it); only `codec_downsample_stride` had to be parsed. **Verified on both platforms**,
+      cloning the pack's own `alba` output (CC-BY-4.0) and speaking a DIFFERENT sentence:
+      F0 mean 127.4 against the source's 127.0 and LTAS correlation **0.9861** on
+      Neoverse/`BLAS=none`, 127.2 and 0.9839 on M1, against **0.9222 and 86.3 Hz** for a
+      different voice as the control. 10.32 s of reference costs 6.73 s on the box. The
+      voice files are NOT bit-identical across platforms (6 of 12 tensors match; the KV
+      caches differ by up to 6.4% of max, f16 storage and different BLAS), which the
+      project's numerical policy allows and which is recorded rather than glossed
 - [ ] E7-10 consent gate and notice before cloning — see E6
 
 ### E4 — CPU kernels, ARM and x86 in one step → [`.work/cpu-kernels-arm-x86.md`](.work/cpu-kernels-arm-x86.md)

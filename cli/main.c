@@ -38,6 +38,7 @@ static void usage(const char *program) {
     printf("      options: --speaker N --max-steps N --temperature F --topk N --seed N\n");
     printf("               --parallel --device cpu|metal|cuda --warmup N --runs N\n");
     printf("               --batch N (step N requests together, seeds N..N+batch-1)\n");
+    printf("  %s --clone-voice MODEL_DIR --reference REF.wav --output VOICE.safetensors --consent \"...\"\n", program);
     printf("  %s --gpu-self-test metal|cuda\n", program);
     printf("\nNative Magpie inference is CPU-first; Metal/CUDA are explicit build variants.\n");
 }
@@ -628,6 +629,62 @@ int main(int argc, char **argv) {
             return 1;
         }
         puts("pocket batching self-check: PASS");
+        return 0;
+    }
+    /* Zero-shot cloning: a reference recording in, an ordinary voice file out.
+     * The consent string is required and is written into the file, because a
+     * voice built from someone's recording carries a claim about permission
+     * that belongs with the artefact rather than in a shell history. */
+    if (strcmp(argv[1], "--clone-voice") == 0) {
+        const char *model_dir = (argc > 2) ? argv[2] : NULL;
+        const char *ref = NULL, *out = NULL, *consent = NULL;
+        for (int i = 3; i + 1 < argc; i += 2) {
+            if (strcmp(argv[i], "--reference") == 0) ref = argv[i + 1];
+            else if (strcmp(argv[i], "--output") == 0) out = argv[i + 1];
+            else if (strcmp(argv[i], "--consent") == 0) consent = argv[i + 1];
+            else {
+                fprintf(stderr, "clone-voice: unknown option %s\n", argv[i]);
+                return 2;
+            }
+        }
+        if (model_dir == NULL || ref == NULL || out == NULL) {
+            fprintf(stderr,
+                    "usage: %s --clone-voice MODEL_DIR --reference REF.wav "
+                    "--output VOICE.safetensors --consent \"...\"\n", argv[0]);
+            return 2;
+        }
+        if (consent == NULL) {
+            fprintf(stderr, "clone-voice: --consent is required.\n\n%s\n",
+                    mynah_voice_clone_consent_notice);
+            return 2;
+        }
+        mynah_tts_model *model = NULL;
+        char error[512];
+        if (mynah_tts_model_open(model_dir, &model, error, sizeof(error)) != 0) {
+            fprintf(stderr, "clone-voice: %s\n", error);
+            return 1;
+        }
+        mynah_pocket_clone_report report;
+        const double t0 = now_seconds();
+        const int bad = mynah_engine_pocket_clone_voice(model, ref, out, consent,
+                                                        &report, error,
+                                                        sizeof(error)) != 0;
+        const double took = now_seconds() - t0;
+        mynah_tts_model_close(model);
+        if (bad) {
+            fprintf(stderr, "clone-voice failed: %s\n", error);
+            return 1;
+        }
+        printf("cloned %s -> %s\n", ref, out);
+        printf("  reference   %.2f s at %u Hz\n", report.input_seconds,
+               report.input_sample_rate);
+        printf("  voice       %zu frames (%.2f s), %zu KV positions\n",
+               report.voice_frames, report.voice_seconds, report.voice_positions);
+        printf("  revision    %s\n", report.revision);
+        printf("  took        %.2f s\n", took);
+        printf("\nAdd it to the pack to use it: copy into MODEL_DIR/voices/ and\n"
+               "append an entry to speakers.json with \"file\" and \"frames\": %zu\n",
+               report.voice_positions);
         return 0;
     }
     if (strcmp(argv[1], "--inspect") == 0 && argc == 3) {

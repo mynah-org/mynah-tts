@@ -152,3 +152,53 @@ the README and the API error text.
 Breaking three things on purpose — the pre-ELU, replicate padding changed to
 zero, and a one-sample group delay — is caught by the self-test in all three
 cases. A test that passes under a deliberate break is worse than no test.
+
+## 2026-09-19 — reachable at last, and what the gap actually was
+
+Status moves from IMPLEMENTED to **USABLE**. Nothing in `src/voice_clone.c`
+changed: every number in this note still stands, and the module had been
+oracle-checked to 6.4e-06 since 2026-09-12. What was missing was that **no
+caller ever built a `mynah_voice_clone_config` from a real pack**, so the whole
+2555-line module was unreachable from the CLI, from the server and from the
+library. It was found by being asked to clone a voice for a customer report
+rather than by reading the board — which said `[x] mynah-tts export-voice`, a
+command that returned nothing to `grep` over the entire repository.
+
+The glue is `mynah_engine_pocket_clone_voice` plus `--clone-voice`. It is small
+because three of the four sub-configurations already exist in
+`engine_pocket.c` for the decoder and the encoder mirrors them; the only value
+that had never been parsed is `codec_downsample_stride`. `max_seq_len` is left
+at zero in both transformers: the module sizes them from `max_seconds`, and a
+number invented at the call site could only disagree.
+
+### The verification, since "it ran" is not a result
+
+Cloned from the pack's own `alba` voice (CC-BY-4.0, commercial use allowed) —
+10.32 s of its output — then made to speak a **different** sentence, against
+the same sentence from the real `alba` and from an unrelated voice as control:
+
+| | F0 mean | F0 median | LTAS corr. vs `alba` |
+|---|---|---|---|
+| cloned, Neoverse-V2 / `BLAS=none` | 127.4 Hz | 121.8 | **0.9861** |
+| cloned, M1 / Accelerate | 127.2 | 122.4 | 0.9839 |
+| `alba` itself | 127.0 | 121.5 | — |
+| a different voice (control) | 86.3 | 77.7 | 0.9222 |
+
+Both the pitch and the long-term average spectrum track the source, and the
+control separates cleanly on both. Cost: 6.73 s on the box, 6.63 s on the Mac,
+for 10.32 s of reference — 129 latent frames, 130 KV positions with the BOS.
+
+**The two platforms do not produce the same voice file.** Six of twelve tensors
+match (the integer offsets); the six KV caches differ by up to 6.4% of max.
+That is f16 storage plus a different BLAS plus `-ffast-math`, it is what the
+project's numerical policy explicitly allows across backends, and it is written
+here rather than left for someone to discover with a checksum.
+
+### One property worth stating plainly
+
+A cloned voice is **not a second kind of voice**. What comes out is an ordinary
+pack voice file; drop it in `voices/`, add the row to `speakers.json`, and every
+path that serves a predefined voice serves it — the streaming server included,
+with no code anywhere aware of where it came from. The pack's own cross-check
+caught the incomplete edit on the first try: `model.json` said 26 speakers while
+`speakers.json` listed 27, and the loader refused.
