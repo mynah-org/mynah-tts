@@ -2746,6 +2746,7 @@ static void matvec_f16(float *out, const float *x, const uint16_t *weights,
  * loop.  MYNAH_QMAT_BF16 narrows only, exactly like MYNAH_QMAT_I8MM: it can
  * turn a present unit off so the scalar reference can be exercised on hardware
  * that has the kernel, and it can never claim a unit the CPU lacks. */
+#if defined(MYNAH_QMAT_BF16_NEON) || defined(MYNAH_QMAT_BF16_X86)
 static int qmat_bf16_unit(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -2772,6 +2773,7 @@ static int qmat_bf16_unit(void) {
     }
     return cached;
 }
+#endif /* a vector bf16 kernel exists on this target */
 
 static void matvec_bf16(float *out, const float *x, const uint16_t *weights,
                         const uint16_t *pairs, const float *bias, size_t rows,
@@ -4525,14 +4527,15 @@ done:
     return status;
 }
 
-#if defined(MYNAH_QMAT_F16)
-/* The weights a host produces must not depend on which convert instruction it
- * has.  A scalar-only x86 box and an F16C one load the same checkpoint; if
- * their rounding disagreed, the same pack would quantize two ways and a parity
- * run would chase a phantom.  So this asserts BIT equality between
- * qmat_f16_pack() and the scalar reference, over a sweep chosen for the places
- * naive converters break: the subnormal band, the 2^-25 flush point, the
- * 65504/65520 overflow cliff and exact ties. */
+/* The bf16 self tests live OUTSIDE the f16 block on purpose.
+ *
+ * They were nested inside it, which compiles everywhere the two encodings
+ * happen to be available together and breaks where they are not: with
+ * SIMD=scalar there is no MYNAH_QMAT_F16, so the definitions vanished while
+ * the calls -- guarded by MYNAH_QMAT_BF16, which is unconditional because bf16
+ * is a storage format as well as an instruction -- remained, and the link
+ * failed. Found by the 21-combination link matrix, which is exactly the class
+ * of bug it exists for. */
 #if defined(MYNAH_QMAT_BF16)
 /* Round-half-to-even, spelled OUT rather than folded.
  *
@@ -4715,6 +4718,14 @@ static int self_test_bf16_kernel(char *error, size_t error_capacity) {
     return 0;
 }
 #endif /* MYNAH_QMAT_BF16 */
+#if defined(MYNAH_QMAT_F16)
+/* The weights a host produces must not depend on which convert instruction it
+ * has.  A scalar-only x86 box and an F16C one load the same checkpoint; if
+ * their rounding disagreed, the same pack would quantize two ways and a parity
+ * run would chase a phantom.  So this asserts BIT equality between
+ * qmat_f16_pack() and the scalar reference, over a sweep chosen for the places
+ * naive converters break: the subnormal band, the 2^-25 flush point, the
+ * 65504/65520 overflow cliff and exact ties. */
 
 static int self_test_f16_convert(char *error, size_t error_capacity) {
     static const float cases[] = {
