@@ -1786,10 +1786,16 @@ static int probe_gelu_vector(const char **why) {
  * The ISA kernel inventory (kernels.h)
  *
  * This is a fact about this translation unit and its siblings, so it is
- * written once, here, and the report calls it.  Today every bit is 0: there
- * is no `svfloat32_t` anywhere under src/, no `svmmla`, no `bfdot`/`bfmmla`,
- * and src/qmat.c stores weights as f32, f16, int8 or int4 but never bf16
- * (src/weights.c converts bf16 to f32 once at load).
+ * written once, here, and the report calls it.  Every bit is 0: there is no
+ * `svfloat32_t` anywhere under src/ and no `svmmla`.
+ *
+ * `bfdot` is no longer among them.  src/qmat.c grew a BFDOT kernel and a bf16
+ * weight encoding on 2026-09-19, and it registers its own probe over
+ * `isa.arm.bf16` -- so that row is answered by the file that owns the kernel
+ * and this inventory no longer speaks for it.  What remains true here is the
+ * SVE half: no kernel under src/ is predicated, and on the production CPU that
+ * costs nothing, because its SVE vector measures 128 bits (see
+ * sve_vector_bits() below).
  *
  * Note what is deliberately NOT tested here: __ARM_FEATURE_SVE.  That macro
  * says the compiler was allowed to emit SVE -- which -march=native does on the
@@ -1893,7 +1899,9 @@ static int probe_sve(const char **why)     { return probe_isa_bit(MYNAH_KERNELS_
 static int probe_sve2(const char **why)    { return probe_isa_bit(MYNAH_KERNELS_ISA_SVE2, why); }
 static int probe_svei8mm(const char **why) { return probe_isa_bit(MYNAH_KERNELS_ISA_SVEI8MM, why); }
 static int probe_svebf16(const char **why) { return probe_isa_bit(MYNAH_KERNELS_ISA_SVEBF16, why); }
-static int probe_bf16(const char **why)    { return probe_isa_bit(MYNAH_KERNELS_ISA_BF16, why); }
+/* No probe_bf16 here: src/qmat.c owns that row now (see
+ * mynah_kernels_dispatch_probes). The BIT stays defined in kernels.h because
+ * the SVE form, MYNAH_KERNELS_ISA_SVEBF16, still belongs to this inventory. */
 
 void mynah_kernels_dispatch_probes(void) {
     /* NOTE FOR THE DISPATCH LANE (src/dispatch.c is not this lane's file):
@@ -1913,5 +1921,8 @@ void mynah_kernels_dispatch_probes(void) {
     mynah_dispatch_register_probe("isa.arm.sve2", probe_sve2);
     mynah_dispatch_register_probe("isa.arm.svei8mm", probe_svei8mm);
     mynah_dispatch_register_probe("isa.arm.svebf16", probe_svebf16);
-    mynah_dispatch_register_probe("isa.arm.bf16", probe_bf16);
+    /* isa.arm.bf16 is NOT registered here any more. src/qmat.c grew the BFDOT
+     * kernel and registers its own probe over this id, which is what the
+     * header above asks a module to do; registering both would mean the last
+     * one to run decides, and that is not a fact about the binary. */
 }

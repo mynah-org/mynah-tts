@@ -104,10 +104,28 @@ Two more effects, smaller but free:
 * **the f32 intermediate disappears.** E9-1 measured the first-call pack
   converting "302 MB of f32 into 151 MB of f16" for the backbone. A bf16-native
   path reads the mapped file directly: no malloc'd f32 copy, no pack pass.
-* **no re-encoding.** Today is `bf16 -> f32 -> f16`. It is lossless (f16's 10
-  mantissa bits hold bf16's 7, and no weight in this pack leaves f16's exponent
-  range) so this is *not* a quality argument — it is two conversions that a
-  bf16-native path simply does not perform.
+* **no re-encoding.** Today is `bf16 -> f32 -> f16`, two conversions a
+  bf16-native path does not perform. **This is not a quality argument, and the
+  measurement is here so that nobody turns it into one.**
+
+  `PLAN.md` E3-5a calls the f16 default "lossless on a bf16 checkpoint" and the
+  first draft of this note repeated it. Measured over all 214 tensors of
+  `models/pocket-en/tts.safetensors` — 109,502,146 bf16 weights, which is the
+  parameter count exactly:
+
+      changed by the f16 round trip :  387,339  (0.3537%)
+      flushed to ZERO by f16        :    7,138  (0.0065%)
+      worst RELATIVE error          :  1.0      (on weights already <= 6e-8)
+      worst ABSOLUTE error          :  2.98e-08
+      largest |w| anywhere in pack  :  4.875
+
+  So it is **not** strictly lossless, and the reasoning behind the claim is the
+  trap: f16's 10 mantissa bits do hold bf16's 7, but only while the value is
+  NORMAL. Below 6.1e-5 an f16 goes subnormal and sheds a mantissa bit per
+  halving; 1.74% of this pack's weights are under that line. What the numbers
+  then say is that it does not matter — a worst absolute error of 3e-8 against a
+  largest weight of 4.875 is far below anything the model resolves. Keep the
+  default, drop the word "lossless".
 
 ## What would have to be written
 
@@ -154,3 +172,95 @@ The transfer from qwen-tts is the **idea** that a bf16 checkpoint on a bf16 CPU
 should not be doing f32 arithmetic, not the dependency. qwen-tts states the cost
 in its own profile notes: "vnni-product pins f32 prefill, which on a BF16 CPU
 costs ~600 ms per admission".
+
+---
+
+# What was built, and what the box said about it — 2026-09-19
+
+Implemented the same day: the `bf16` encoding, a scalar reference, a NEON BFDOT
+matvec, a four-activation batched BFDOT kernel, self tests, and the dispatch row.
+`--dispatch-map` now answers `isa.arm.bf16` from `src/qmat.c` rather than from
+`src/kernels.c`, because the file that owns a kernel owns its row.
+
+## Three predictions, three corrections
+
+**1. "BFMMLA is the 4x, BFDOT the fallback."** Measured at the prefill's own
+shape — `[4096][1024]` against 16 activations, Neoverse-V2, both operands
+pre-converted:
+
+| kernel | time | GFLOP/s | vs f16 |
+|---|---|---|---|
+| f16 + `vcvt` + `vfmaq_f32` (shipping) | 11.343 ms | 11.8 | — |
+| bf16 + `vbfmmlaq_f32` | 4.703 ms | 28.5 | 2.41x |
+| **bf16 + `vbfdotq_f32`** | **3.284 ms** | **40.9** | **3.45x** |
+
+BFMMLA has twice the MACs per instruction and came LAST. The likely cause is
+that the BFMMLA variant carries a single accumulator, so every instruction
+depends on the one before it and the kernel is latency-bound; BFDOT's has two
+independent chains. That makes this a verdict on **these two implementations**,
+not on the two instructions — but it removes any urgency from the interleaved
+layout, since the simple kernel that x86 can share is already ahead.
+
+**2. "bf16 will not help the AR step, which is memory-bound."** It helps a lot:
+`request.total` RTF **0.160 -> 0.119** on the same utterance, reproducible across
+runs. Both encodings are two bytes so the traffic is identical — but the f16 path
+also pays `vcvt_f32_f16` on every weight block, and BFDOT skips it while doing
+twice the MACs. Memory-bound was not the whole story.
+
+**3. "The batched kernel will fix the prefill."** It did not, and the reason is
+the one thing the microbenchmark could not see.
+
+    prep.prefill_proj, 26-token prefill, cost map
+      backbone:f16                       6.1 ms
+      backbone:bf16, BFDOT               9.0 ms
+      backbone:bf16, unit forced off    15.9 ms   (so BFDOT is 1.76x over scalar)
+
+BFDOT beats its own scalar path by 1.76x and still loses to f16. **The activation
+arrives f32 and is converted inside the row loop**, so with 32 weight rows per
+block the same activation is narrowed 32 times. The f16 kernel does the opposite:
+it converts the WEIGHTS, which it must read once per row anyway, and amortises
+that over four activations. The benchmark handed both kernels pre-converted
+operands and so measured a cost that the real one pays.
+
+**The fix is named and has a precedent in the same file.** int8 already narrows
+its activations once per call into `qx_scratch` via `quantize_act`. bf16 needs
+the same pass into a `batch * k * 2` byte scratch, which is a change to the
+batched entry point's signature rather than to any kernel. Until it lands, bf16
+is a win on the decode step and a loss on the prefill.
+
+## The thing that decides whether any of it ships
+
+    f16 vs bf16, same text, same seed, same speaker
+      length        115200 samples both -- same frame count, same EOS step
+      SNR           1.7 dB
+      correlation   0.667
+
+**bf16 in the backbone changes the audio.** Not as added noise: as a different
+rendition. The model is autoregressive, so the 2^-8 activation rounding enters
+the sampled latent and feeds back, the way a different seed would. Identical
+length and EOS step say it is not broken; the correlation says it is not the same
+output.
+
+That puts `backbone:bf16` in the same category as `backbone:int8`, which this
+project already refused on quality (PLAN.md E3: "600-1400x over tolerance, an
+extra generated frame") — except bf16 keeps the frame count, which int8 did not.
+
+**So: available, not default, and not proposed for the backbone without a
+quality gate against the oracle.** The 29% is real and it is not free.
+
+Where bf16 may be free is the CODEC groups: `codec_transformer`, `codec_conv`
+and `codec_convtr` are not autoregressive, so a rounding error there is additive
+noise with an SNR that can be measured against the f32 path exactly as int8's
+was — and int8, which is far coarser, was accepted there. That is the experiment
+worth running next, and it needs no new code: `MYNAH_QUANT_GROUPS=codec_*:bf16`
+works today.
+
+## State
+
+* `MYNAH_QUANT_GROUPS=<group>:bf16` and `MYNAH_QUANT=bf16` work.
+* Self tests pass on the production CPU **with the unit on and with
+  `MYNAH_QMAT_BF16=0` forcing the scalar path**, which is how the reference gets
+  exercised on hardware that has the kernel.
+* The x86 AVX512-BF16 kernel is unwritten. bf16 WEIGHTS work there — half the
+  bytes of f32, multiplied by the scalar kernel — but the arithmetic is scalar,
+  and `--dispatch-map` says so rather than implying a win.

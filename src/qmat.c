@@ -97,6 +97,54 @@
 #define MYNAH_QMAT_F16_X86 1
 #endif
 
+/* BF16 WEIGHT STORAGE, and why it is a separate encoding rather than a flag on
+ * f16.
+ *
+ * Every current checkpoint in this project is stored bf16 (measured: all 214
+ * tensors of models/pocket-en/tts.safetensors), and the pipeline today converts
+ * bf16 -> f32 at load (src/weights.c) and then f32 -> f16 at cache-insert, so
+ * the multiply runs on a THIRD representation of the same number. Keeping the
+ * weights bf16 lets the hardware multiply them directly: BFDOT is two products
+ * per f32 lane -- 8 MACs per 128-bit instruction against the f16 path's 4 --
+ * and it accumulates in f32, which is why the standing FMLAL rejection
+ * (PLAN.md E10's rejected list: "needs the activation narrowed to f16") does
+ * not apply here.
+ *
+ * ACCURACY IS NOT THE ARGUMENT, and must not be claimed as one. bf16 carries 8
+ * mantissa bits against f16's 11, so for the normal range this is a LESS precise
+ * weight store than the f16 default. Measured on the English pack: the f16 round
+ * trip changes 0.354% of weights with a worst ABSOLUTE error of 2.98e-08 against
+ * a largest weight of 4.875 -- both encodings are far inside what the model
+ * resolves. The case for bf16 is throughput, and .work/bf16-native-weights.md
+ * carries the numbers.
+ *
+ * Storage is uint16_t for the same reason as f16: __bf16 needs a recent
+ * compiler and the raw bit pattern is portable. */
+#if !defined(MYNAH_DISABLE_SIMD) && defined(__aarch64__) && \
+    (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 10))
+#define MYNAH_QMAT_BF16_NEON 1
+#endif
+
+/* x86 HAS NO VECTOR KERNEL HERE YET, AND THE ENCODING STILL WORKS THERE.
+ *
+ * bf16 is a storage format as well as an instruction: on a host with no bf16
+ * unit the weights are still half the bytes of f32 and the scalar kernel below
+ * multiplies them correctly. So MYNAH_QMAT_BF16 is defined everywhere and only
+ * the ARM kernel is conditional. `--dispatch-map` reports which one ran, so a
+ * scalar fallback can never be mistaken for a vector win.
+ *
+ * WHAT THE x86 KERNEL WILL HAVE TO SOLVE, written down so it is not
+ * rediscovered: VDPBF16PS multiplies PAIRWISE WITHIN A LANE, so two k-adjacent
+ * values must land in the same 32-bit lane. Weights loaded straight from this
+ * cache already do. The activation does not: _mm512_cvtne2ps_pbh(a, b)
+ * INTERLEAVES its two sources (dst[2i] = b[i], dst[2i+1] = a[i]), which pairs
+ * x[j+i] with x[j+16+i] rather than x[2i] with x[2i+1]. The two ways out are a
+ * scratch buffer for the converted activation -- which this file may not
+ * allocate in a kernel -- or concatenating two _mm512_cvtneps_pbh results, whose
+ * type juggling between __m256bh and __m256i differs across compiler versions.
+ * Either is fine; neither should be written without a machine to run it on. */
+#define MYNAH_QMAT_BF16 1
+
 #if defined(MYNAH_QMAT_F16_NEON) || defined(MYNAH_QMAT_F16_X86)
 #define MYNAH_QMAT_F16 1
 #endif
@@ -133,7 +181,7 @@ enum {
     QMAT_U8_EVEX = 3
 };
 
-enum { QMAT_F32 = 0, QMAT_INT8 = 1, QMAT_INT4 = 2, QMAT_F16 = 3 };
+enum { QMAT_F32 = 0, QMAT_INT8 = 1, QMAT_INT4 = 2, QMAT_F16 = 3, QMAT_BF16 = 4 };
 
 /* ------------------------------------------------------- runtime ISA gates
  *
@@ -383,6 +431,66 @@ static void qmat_f16_pack(uint16_t *dst, const float *src, size_t n) {
 #endif
 }
 #endif /* MYNAH_QMAT_F16 */
+
+#if defined(MYNAH_QMAT_BF16)
+/* f32 -> bf16, round half to even.
+ *
+ * The same arithmetic as mynah_flow_round_bf16_f32() (src/flow_head.c), which
+ * already has a self test, written here against uint16_t storage instead of
+ * rounding in place. A NaN keeps a non-zero mantissa: adding the rounding term
+ * to a NaN cannot carry into the exponent, so the quiet bit survives. Infinity
+ * and zero are exact.
+ *
+ * There is no vector form and there should not be: this runs once per tensor at
+ * cache-insert time, never in a decode loop, and the scalar spelling is the one
+ * that cannot develop a per-platform disagreement -- which the f16 packer next
+ * to it learned the hard way. */
+static uint16_t qmat_bf16_from_f32(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    const uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)((bits + rounding) >> 16);
+}
+
+static float qmat_bf16_to_f32(uint16_t h) {
+    const uint32_t bits = (uint32_t)h << 16;
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static void qmat_bf16_pack(uint16_t *dst, const float *src, size_t n) {
+    for (size_t i = 0; i < n; ++i) dst[i] = qmat_bf16_from_f32(src[i]);
+}
+
+/* The scalar reference, and with it the ENCODING'S CONTRACT.
+ *
+ * bf16 weights, THE ACTIVATION ALSO ROUNDED TO bf16, accumulated in f32.
+ *
+ * The activation rounding is not an implementation detail to be hidden in the
+ * vector path: BFDOT and VDPBF16PS both multiply bf16 by bf16, so a scalar
+ * reference that kept the activation in f32 would be computing something the
+ * hardware cannot, and the two would disagree by about 2^-8 -- a real
+ * difference, not a rounding one. The first run of self_test_bf16_kernel on a
+ * CPU that actually has the unit caught exactly that, which is the whole reason
+ * the reference exists.
+ *
+ * This is also what separates bf16 from f16 here: the f16 path widens its
+ * weights to f32 and multiplies an untouched f32 activation, so it loses
+ * nothing on the activation side. bf16 trades that for the instruction. */
+static void matvec_bf16_scalar(float *out, const float *x, const uint16_t *w,
+                               const float *bias, size_t rows, size_t cols) {
+    for (size_t r = 0; r < rows; ++r) {
+        const uint16_t *row = w + r * cols;
+        float acc = 0.0f;
+        for (size_t c = 0; c < cols; ++c) {
+            acc += qmat_bf16_to_f32(row[c]) *
+                   qmat_bf16_to_f32(qmat_bf16_from_f32(x[c]));
+        }
+        out[r] = bias != NULL ? acc + bias[r] : acc;
+    }
+}
+#endif /* MYNAH_QMAT_BF16 */
 
 /* ARM i8mm (SMMLA).  Unlike SDOT this is a 2x2 outer kernel: it is worth an
  * instruction only when TWO activation vectors share the weight rows, which in
@@ -1953,6 +2061,132 @@ static void matvec_f16_neon_x2(float *o0, float *o1,
 
 #endif /* MYNAH_QMAT_F16_NEON */
 
+#if defined(MYNAH_QMAT_BF16_NEON)
+/* BFDOT: two bf16 products per f32 lane, eight MACs per 128-bit instruction
+ * against the f16 path's four, accumulating in f32.
+ *
+ * WHY BFDOT AND NOT BFMMLA. BFMMLA is sixteen MACs, but it is a 2x2 outer
+ * product and wants the weights as row PAIRS interleaved in blocks of four k --
+ * a second layout in the cache, and one that x86 cannot share, because
+ * VDPBF16PS is a dot product along k exactly like BFDOT. One pack that serves
+ * both ISAs is worth more than the second factor of two until something
+ * measures otherwise; .work/bf16-native-weights.md carries the comparison and
+ * BFMMLA is its own item.
+ *
+ * The accumulator layout mirrors matvec_f16_neon deliberately: a lo/hi pair per
+ * row, reduced with vaddvq_f32(vaddq_f32(a, b)), so the two kernels associate
+ * their sums the same way and a row's answer does not depend on which one ran.
+ */
+__attribute__((target("+bf16")))
+static void matvec_bf16_neon(float *out, const float *x, const uint16_t *weights,
+                             const float *bias, size_t rows, size_t cols) {
+    const bfloat16_t *w16 = (const bfloat16_t *)weights;
+    /* The activation arrives f32 and is converted once per call, not once per
+     * row: at these shapes it is rows x cheaper, and it is the same rounding
+     * the weights already took. */
+    for (size_t row = 0; row < rows; ++row) {
+        const bfloat16_t *w = w16 + row * cols;
+        float32x4_t a = vdupq_n_f32(0.0f), b = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 16u <= cols; j += 16u) {
+            const bfloat16x8_t xa = vcvtq_low_bf16_f32(vld1q_f32(x + j));
+            const bfloat16x8_t xa2 =
+                vcvtq_high_bf16_f32(xa, vld1q_f32(x + j + 4u));
+            const bfloat16x8_t xb = vcvtq_low_bf16_f32(vld1q_f32(x + j + 8u));
+            const bfloat16x8_t xb2 =
+                vcvtq_high_bf16_f32(xb, vld1q_f32(x + j + 12u));
+            a = vbfdotq_f32(a, xa2, vld1q_bf16(w + j));
+            b = vbfdotq_f32(b, xb2, vld1q_bf16(w + j + 8u));
+        }
+        float acc = vaddvq_f32(vaddq_f32(a, b));
+        /* The tail rounds the activation exactly as BFDOT does above, so a
+         * column count that is not a multiple of sixteen cannot change the
+         * arithmetic of the columns that are. */
+        for (; j < cols; ++j) {
+            acc += qmat_bf16_to_f32(weights[row * cols + j]) *
+                   qmat_bf16_to_f32(qmat_bf16_from_f32(x[j]));
+        }
+        out[row] = bias != NULL ? acc + bias[row] : acc;
+    }
+}
+
+/* Four activations per weight load.
+ *
+ * The same reason the f16 and SMMLA pair kernels exist, and the measurement
+ * that proves it: without this, a bf16 weight walks the batch one activation at
+ * a time, so a 16-row prefill tile reads every weight block SIXTEEN times.
+ * Measured before it existed -- prep.prefill_proj went 6.24 ms (f16) to 10.05
+ * (bf16), a regression, while the single-activation decode step improved. The
+ * weights are the traffic; the activations are free.
+ *
+ * Accumulator budget: four activations x two halves = eight float32x4_t, plus
+ * one weight vector, against aarch64's thirty-two. The k loop keeps two
+ * independent BFDOT chains per activation so the unit is fed by throughput
+ * rather than latency -- which is not a detail: a single-chain BFMMLA kernel
+ * measured SLOWER than this one on the production CPU (2.41x against 3.45x)
+ * for exactly that reason. */
+/* NAMED ACCUMULATORS, NOT AN ARRAY.
+ *
+ * The first version of this kernel held `float32x4_t acc[4][2]` and indexed it
+ * with a runtime lane count. It measured no faster than the one-activation
+ * path, because an array of vectors indexed by a variable cannot live in
+ * registers: every BFDOT round-tripped through the stack. Eight named
+ * accumulators is the same code the f16 x4 kernel writes, for the same reason,
+ * and the comment is here so the shortcut is not taken again. */
+__attribute__((target("+bf16")))
+static void matvec_bf16_neon_x4(float *o0, float *o1, float *o2, float *o3,
+                                const float *x0, const float *x1,
+                                const float *x2, const float *x3,
+                                const uint16_t *weights, const float *bias,
+                                size_t rows, size_t cols) {
+    const bfloat16_t *w16 = (const bfloat16_t *)weights;
+    for (size_t row = 0; row < rows; ++row) {
+        const bfloat16_t *w = w16 + row * cols;
+        float32x4_t a0 = vdupq_n_f32(0.0f), b0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = vdupq_n_f32(0.0f), b1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), b2 = vdupq_n_f32(0.0f);
+        float32x4_t a3 = vdupq_n_f32(0.0f), b3 = vdupq_n_f32(0.0f);
+        size_t j = 0;
+        for (; j + 16u <= cols; j += 16u) {
+            const bfloat16x8_t wa = vld1q_bf16(w + j);
+            const bfloat16x8_t wb = vld1q_bf16(w + j + 8u);
+            bfloat16x8_t t;
+            t = vcvtq_low_bf16_f32(vld1q_f32(x0 + j));
+            a0 = vbfdotq_f32(a0, vcvtq_high_bf16_f32(t, vld1q_f32(x0 + j + 4u)), wa);
+            t = vcvtq_low_bf16_f32(vld1q_f32(x0 + j + 8u));
+            b0 = vbfdotq_f32(b0, vcvtq_high_bf16_f32(t, vld1q_f32(x0 + j + 12u)), wb);
+            t = vcvtq_low_bf16_f32(vld1q_f32(x1 + j));
+            a1 = vbfdotq_f32(a1, vcvtq_high_bf16_f32(t, vld1q_f32(x1 + j + 4u)), wa);
+            t = vcvtq_low_bf16_f32(vld1q_f32(x1 + j + 8u));
+            b1 = vbfdotq_f32(b1, vcvtq_high_bf16_f32(t, vld1q_f32(x1 + j + 12u)), wb);
+            t = vcvtq_low_bf16_f32(vld1q_f32(x2 + j));
+            a2 = vbfdotq_f32(a2, vcvtq_high_bf16_f32(t, vld1q_f32(x2 + j + 4u)), wa);
+            t = vcvtq_low_bf16_f32(vld1q_f32(x2 + j + 8u));
+            b2 = vbfdotq_f32(b2, vcvtq_high_bf16_f32(t, vld1q_f32(x2 + j + 12u)), wb);
+            t = vcvtq_low_bf16_f32(vld1q_f32(x3 + j));
+            a3 = vbfdotq_f32(a3, vcvtq_high_bf16_f32(t, vld1q_f32(x3 + j + 4u)), wa);
+            t = vcvtq_low_bf16_f32(vld1q_f32(x3 + j + 8u));
+            b3 = vbfdotq_f32(b3, vcvtq_high_bf16_f32(t, vld1q_f32(x3 + j + 12u)), wb);
+        }
+        float s0 = vaddvq_f32(vaddq_f32(a0, b0));
+        float s1 = vaddvq_f32(vaddq_f32(a1, b1));
+        float s2 = vaddvq_f32(vaddq_f32(a2, b2));
+        float s3 = vaddvq_f32(vaddq_f32(a3, b3));
+        for (size_t c = j; c < cols; ++c) {
+            const float wv = qmat_bf16_to_f32(weights[row * cols + c]);
+            s0 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x0[c]));
+            s1 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x1[c]));
+            s2 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x2[c]));
+            s3 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x3[c]));
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        o0[row] = s0 + bv; o1[row] = s1 + bv;
+        o2[row] = s2 + bv; o3[row] = s3 + bv;
+    }
+}
+
+#endif /* MYNAH_QMAT_BF16_NEON */
+
 #if defined(MYNAH_QMAT_F16_X86)
 __attribute__((target("avx2,f16c,fma")))
 static float qmat_hsum256(__m256 v) {
@@ -2210,6 +2444,46 @@ static void matvec_f16(float *out, const float *x, const uint16_t *weights,
 }
 #endif /* MYNAH_QMAT_F16 */
 
+#if defined(MYNAH_QMAT_BF16)
+/* Does this CPU have the bf16 unit?  Memoised once; never consulted in a decode
+ * loop.  MYNAH_QMAT_BF16 narrows only, exactly like MYNAH_QMAT_I8MM: it can
+ * turn a present unit off so the scalar reference can be exercised on hardware
+ * that has the kernel, and it can never claim a unit the CPU lacks. */
+static int qmat_bf16_unit(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int detected = 0;
+#if defined(MYNAH_QMAT_BF16_NEON) && defined(__APPLE__)
+        int value = 0;
+        size_t size = sizeof(value);
+        if (sysctlbyname("hw.optional.arm.FEAT_BF16", &value, &size, NULL, 0) == 0)
+            detected = value != 0;
+#elif defined(MYNAH_QMAT_BF16_NEON) && defined(MYNAH_QMAT_HAVE_AUXV) && \
+      defined(AT_HWCAP2)
+        detected = (getauxval(AT_HWCAP2) & (1UL << 14)) != 0;   /* HWCAP2_BF16 */
+#endif
+        const char *env = getenv("MYNAH_QMAT_BF16");
+        if (env != NULL && (strcmp(env, "0") == 0 || strcmp(env, "off") == 0 ||
+                            strcmp(env, "scalar") == 0)) {
+            detected = 0;
+        }
+        cached = detected;
+    }
+    return cached;
+}
+
+static void matvec_bf16(float *out, const float *x, const uint16_t *weights,
+                        const float *bias, size_t rows, size_t cols) {
+#if defined(MYNAH_QMAT_BF16_NEON)
+    if (qmat_bf16_unit()) {
+        matvec_bf16_neon(out, x, weights, bias, rows, cols);
+        return;
+    }
+#endif
+    matvec_bf16_scalar(out, x, weights, bias, rows, cols);
+}
+#endif /* MYNAH_QMAT_BF16 */
+
 /* Quantized decode is memory bound on the packed weights exactly like the f32
  * path, and one core only reaches a fraction of DRAM bandwidth.  Every output
  * row is an independent dot product, so splitting the row range over the pool
@@ -2249,6 +2523,12 @@ static void qmat_rows_dispatch(const qmat_rows_job *j, size_t row0, size_t count
                    (const uint16_t *)j->weights + row0 * j->cols,
                    bias, count, j->cols);
 #endif
+#if defined(MYNAH_QMAT_BF16)
+    } else if (j->qtype == QMAT_BF16) {
+        matvec_bf16(j->out + row0, j->x,
+                    (const uint16_t *)j->weights + row0 * j->cols,
+                    bias, count, j->cols);
+#endif
     } else {
         matvec_q4(j->out + row0, (const int8_t *)j->qx, j->sx,
                   (const uint8_t *)j->weights + row0 * (j->cols / 2u),
@@ -2272,7 +2552,7 @@ static void matvec_q_rows(float *out, const void *qx, const float *x, float sx,
                           size_t rows, size_t cols, int qtype, int level) {
     size_t weight_bytes;
     if (qtype == QMAT_INT8) weight_bytes = rows * cols;
-    else if (qtype == QMAT_F16) weight_bytes = rows * cols * 2u;
+    else if (qtype == QMAT_F16 || qtype == QMAT_BF16) weight_bytes = rows * cols * 2u;
     else weight_bytes = rows * cols / 2u;
     const qmat_rows_job job = {out, qx, x, sx, weights, scales, rowsum, bias,
                                rows, cols, qtype, level};
@@ -2404,6 +2684,13 @@ typedef struct {
 #if defined(MYNAH_QMAT_F16)
     uint16_t *f16;   /* F16: [n * k] raw binary16 bit patterns, no scales */
 #endif
+#if defined(MYNAH_QMAT_BF16)
+    uint16_t *bf16;  /* BF16: [n * k] raw bfloat16 bit patterns, no scales.
+                      * Plain row-major, deliberately the same layout as f16:
+                      * BFDOT and x86's VDPBF16PS are both dot-products along k,
+                      * so ONE pack serves both ISAs. BFMMLA would want row pairs
+                      * interleaved in blocks of four and is a separate item. */
+#endif
     float *scales;   /* INT8: [n]; INT4: [n * k/32] */
     /* INT8 only: sum of each weight row over the prefix the VNNI loop covers.
      * It is the whole cost of the u8 x s8 constraint, paid once per tensor at
@@ -2445,7 +2732,11 @@ static int qmat_qtype_available(int qtype) {
 #if !defined(MYNAH_QMAT_F16)
     if (qtype == QMAT_F16) return QMAT_F32;
 #endif
-    if (qtype != QMAT_INT8 && qtype != QMAT_INT4 && qtype != QMAT_F16) {
+#if !defined(MYNAH_QMAT_BF16)
+    if (qtype == QMAT_BF16) return QMAT_F32;
+#endif
+    if (qtype != QMAT_INT8 && qtype != QMAT_INT4 && qtype != QMAT_F16 &&
+        qtype != QMAT_BF16) {
         return QMAT_F32;
     }
     return qtype;
@@ -2457,6 +2748,7 @@ int mynah_qmat_qtype_from_name(const char *name) {
     if (strcmp(name, "int8") == 0) return QMAT_INT8;
     if (strcmp(name, "int4") == 0) return QMAT_INT4;
     if (strcmp(name, "f16") == 0) return QMAT_F16;
+    if (strcmp(name, "bf16") == 0) return QMAT_BF16;
     return -1;
 }
 
@@ -2495,10 +2787,12 @@ int mynah_qmat_qtype_from_env(void) {
     if (strcmp(env, "int8") == 0) cached = QMAT_INT8;
     else if (strcmp(env, "int4") == 0) cached = QMAT_INT4;
     else if (strcmp(env, "f16") == 0) cached = QMAT_F16;
+    else if (strcmp(env, "bf16") == 0) cached = QMAT_BF16;
     else if (strcmp(env, "f32") == 0 || strcmp(env, "off") == 0) cached = QMAT_F32;
     else {
         fprintf(stderr,
-                "MYNAH_QUANT=\"%s\" is not an encoding (int8, int4, f16, f32/off). "
+                "MYNAH_QUANT=\"%s\" is not an encoding (int8, int4, f16, bf16, "
+                "f32/off). "
                 "Ignoring it and taking the default, which is NOT the same as "
                 "turning quantization off -- set MYNAH_QUANT=f32 if that is what "
                 "you meant.\n", env);
@@ -2515,12 +2809,15 @@ mynah_qmat_cache *mynah_qmat_cache_new(int enabled) {
         const int from_env = mynah_qmat_qtype_from_env();
         if (from_env >= 0) qtype = from_env;
     } else if (enabled == QMAT_INT8 || enabled == QMAT_INT4 ||
-               enabled == QMAT_F16) {
+               enabled == QMAT_F16 || enabled == QMAT_BF16) {
         qtype = enabled;
     }
 #if !defined(MYNAH_QMAT_F16)
     /* No half converts on this target: stay on the exact f32 path. */
     if (qtype == QMAT_F16) qtype = QMAT_F32;
+#endif
+#if !defined(MYNAH_QMAT_BF16)
+    if (qtype == QMAT_BF16) qtype = QMAT_F32;
 #endif
     c->qtype = qtype;
     c->use_row4 = getenv("MYNAH_QMAT_SINGLE_ROW") == NULL;
@@ -2544,6 +2841,7 @@ const char *mynah_qmat_qtype_name(int qtype) {
     case QMAT_INT8: return "int8";
     case QMAT_INT4: return "int4";
     case QMAT_F16:  return "f16";
+    case QMAT_BF16: return "bf16";
     default:        return "f32";
     }
 }
@@ -2562,6 +2860,9 @@ void mynah_qmat_cache_free(mynah_qmat_cache *cache) {
         free(e->q4);
 #if defined(MYNAH_QMAT_F16)
         free(e->f16);
+#endif
+#if defined(MYNAH_QMAT_BF16)
+        free(e->bf16);
 #endif
         free(e->scales);
         free(e->rowsum);
@@ -2625,6 +2926,13 @@ static const qmat_entry *cache_insert(mynah_qmat_cache *cache, const char *name,
         if (e->f16 == NULL) goto fail;
         qmat_f16_pack(e->f16, w, n * k);
 #endif
+#if defined(MYNAH_QMAT_BF16)
+    } else if (qtype == QMAT_BF16) {
+        if (n > SIZE_MAX / k / sizeof(uint16_t)) goto fail;
+        e->bf16 = (uint16_t *)malloc(n * k * sizeof(uint16_t));
+        if (e->bf16 == NULL) goto fail;
+        qmat_bf16_pack(e->bf16, w, n * k);
+#endif
     } else {
         const size_t groups = k / QMAT_Q4_GROUP;
         e->q4 = (uint8_t *)malloc(n * (k / 2u));
@@ -2643,6 +2951,9 @@ fail:
     free(e->q4);
 #if defined(MYNAH_QMAT_F16)
     free(e->f16);
+#endif
+#if defined(MYNAH_QMAT_BF16)
+    free(e->bf16);
 #endif
     free(e->scales);
     free(e->rowsum);
@@ -2798,6 +3109,13 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
 #if defined(MYNAH_QMAT_F16)
     else if (e->qtype == QMAT_F16) weights = (const void *)e->f16;
 #endif
+#if defined(MYNAH_QMAT_BF16)
+    /* Without this arm a bf16 entry falls into the int4 branch and hands the
+     * kernel e->q4, which is NULL for this encoding. The chain is silent: the
+     * selector is an if/else ladder with no default, so a new qtype inherits
+     * the last branch rather than failing. */
+    else if (e->qtype == QMAT_BF16) weights = (const void *)e->bf16;
+#endif
     else weights = (const void *)e->q4;
 #if defined(MYNAH_QMAT_ARM_I8MM)
     /* Two activations per SMMLA: only INT8, only the signed encoding (the
@@ -2861,6 +3179,37 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         for (; b < j->batch; ++b) {
             matvec_q8(j->out[b] + row0, qx + b * j->cols, j->sx[b], wb, sc,
                       NULL, bs, count, j->cols, QMAT_U8_OFF);
+        }
+        return;
+    }
+#endif
+#if defined(MYNAH_QMAT_BF16_NEON)
+    /* The bf16 counterpart, and the reason it exists is in its own comment:
+     * without it the prefill tile reads every weight block once per activation,
+     * which measured as a regression against f16 rather than a win. */
+    if (e->qtype == QMAT_BF16 && j->x != NULL && j->batch >= 2u &&
+        qmat_bf16_unit()) {
+        const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
+        const uint16_t *wb = (const uint16_t *)weights + row0 * j->cols;
+        size_t b = 0;
+        for (; b + 4u <= j->batch; b += 4u) {
+            matvec_bf16_neon_x4(j->out[b] + row0, j->out[b + 1u] + row0,
+                                j->out[b + 2u] + row0, j->out[b + 3u] + row0,
+                                j->x[b], j->x[b + 1u], j->x[b + 2u],
+                                j->x[b + 3u], wb, bs, count, j->cols);
+        }
+        /* A remainder REPEATS an activation rather than dropping to the
+         * one-at-a-time kernel: the weight load is the cost and a repeated lane
+         * writes the same address twice with the same value, which is what the
+         * f16 and int8 paths already do for a remainder of three. */
+        if (b < j->batch) {
+            const size_t left = j->batch - b;
+            const size_t i1 = left > 1u ? b + 1u : b;
+            const size_t i2 = left > 2u ? b + 2u : b;
+            matvec_bf16_neon_x4(j->out[b] + row0, j->out[i1] + row0,
+                                j->out[i2] + row0, j->out[b] + row0,
+                                j->x[b], j->x[i1], j->x[i2], j->x[b],
+                                wb, bs, count, j->cols);
         }
         return;
     }
@@ -3165,6 +3514,10 @@ static double qmat_weight_rel(const qmat_entry *e, const float *w, size_t n,
             } else if (e->qtype == QMAT_F16) {
                 got = (double)qmat_f16_to_f32(e->f16[i * k + j]);
 #endif
+#if defined(MYNAH_QMAT_BF16)
+            } else if (e->qtype == QMAT_BF16) {
+                got = (double)qmat_bf16_to_f32(e->bf16[i * k + j]);
+#endif
             }
             num += (ref - got) * (ref - got);
             den += ref * ref;
@@ -3352,6 +3705,14 @@ int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
             continue;
         }
 #endif
+#if defined(MYNAH_QMAT_BF16)
+        /* Same for BF16, and for the same reason. */
+        if (e->qtype == QMAT_BF16) {
+            matvec_q_rows(orow, NULL, xr, 0.0f, e->bf16, NULL, NULL, bias, n, k,
+                          QMAT_BF16, QMAT_U8_OFF);
+            continue;
+        }
+#endif
         if (qmat_stats_enabled()) {
             qmat_stats_record(name, e, weight_data, xr, k, n);
         }
@@ -3461,10 +3822,16 @@ int mynah_qmat_linear_batched_qt(mynah_qmat_cache *cache,
         }
         return 0;
     }
+    /* "Float encoding": one that carries its own exponent, so the activation
+     * stays f32 and no quantization pass runs. Named for the property rather
+     * than for f16, because bf16 has it too and a second `is_f16`-shaped flag
+     * is how the two would drift apart. */
+    int is_f16 = 0;
 #if defined(MYNAH_QMAT_F16)
-    const int is_f16 = e->qtype == QMAT_F16;
-#else
-    const int is_f16 = 0;
+    if (e->qtype == QMAT_F16) is_f16 = 1;
+#endif
+#if defined(MYNAH_QMAT_BF16)
+    if (e->qtype == QMAT_BF16) is_f16 = 1;
 #endif
     /* The same resolution the unbatched path makes, so a row cannot change
      * encoding just because it was batched. */
@@ -3618,9 +3985,15 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
     void *h16 = NULL;
     const int h16_ok = 1;   /* unused on targets without half converts */
 #endif
+#if defined(MYNAH_QMAT_BF16)
+    uint16_t *b16 = malloc((size_t)N * K * sizeof(uint16_t));
+    const int b16_ok = b16 != NULL;
+#else
+    const int b16_ok = 1;
+#endif
     if (w == NULL || x == NULL || bias == NULL || serial == NULL || blocked == NULL ||
         qx == NULL || q8 == NULL || q4 == NULL || scales8 == NULL || scales4 == NULL ||
-        !h16_ok) {
+        !h16_ok || !b16_ok) {
         if (error != NULL && error_capacity > 0)
             snprintf(error, error_capacity, "qmat blocked self-test out of memory");
         goto done;
@@ -3643,6 +4016,13 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
         weights = h16;
         scales = NULL;
         matvec_f16(serial, x, h16, bias, N, K);
+#endif
+#if defined(MYNAH_QMAT_BF16)
+    } else if (qtype == QMAT_BF16) {
+        qmat_bf16_pack(b16, w, (size_t)N * K);
+        weights = b16;
+        scales = NULL;
+        matvec_bf16(serial, x, b16, bias, N, K);
 #endif
     } else {
         quantize_weight_int4(w, N, K, q4, scales4);
@@ -3670,8 +4050,7 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
                 snprintf(error, error_capacity,
                          "qmat %s blocked matvec differs from serial at row %zu"
                          " (%.9g vs %.9g)",
-                         qtype == QMAT_INT8 ? "int8"
-                             : (qtype == QMAT_F16 ? "f16" : "int4"), i,
+                         mynah_qmat_qtype_name(qtype), i,
                          (double)serial[i], (double)blocked[i]);
             }
             goto done;
@@ -3681,6 +4060,9 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
 done:
     free(w); free(x); free(bias); free(serial); free(blocked);
     free(qx); free(q8); free(q4); free(scales8); free(scales4); free(h16);
+#if defined(MYNAH_QMAT_BF16)
+    free(b16);
+#endif
     return status;
 }
 
@@ -3692,6 +4074,150 @@ done:
  * qmat_f16_pack() and the scalar reference, over a sweep chosen for the places
  * naive converters break: the subnormal band, the 2^-25 flush point, the
  * 65504/65520 overflow cliff and exact ties. */
+#if defined(MYNAH_QMAT_BF16)
+/* Round-half-to-even, spelled OUT rather than folded.
+ *
+ * qmat_bf16_from_f32 uses the standard trick: add 0x7fff plus the low bit of
+ * the survivor and shift. It is right, and it is unreadable enough that a test
+ * asserting the same trick would assert nothing. This reference decides the
+ * round explicitly -- guard bit, sticky bits, tie to even -- so the two are
+ * genuinely different derivations of the same rule.
+ *
+ * (src/flow_head.c carries a third spelling, for checkpoint fidelity. It is not
+ * called from here on purpose: a kernel primitive must not include a model
+ * component to run its own test.) */
+static uint16_t bf16_reference(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    const uint32_t keep   = bits >> 16;          /* what bf16 stores      */
+    const uint32_t guard  = (bits >> 15) & 1u;   /* the first bit dropped */
+    const uint32_t sticky = bits & 0x7fffu;      /* anything below it     */
+    if (guard == 0u) return (uint16_t)keep;                 /* round down */
+    if (sticky != 0u) return (uint16_t)(keep + 1u);         /* round up   */
+    return (uint16_t)(keep + (keep & 1u));                  /* tie: to even */
+}
+
+/* The bf16 packer against that reference, then the round trip.
+ *
+ * bf16 keeps f32's exponent, so the only loss is mantissa and a normal value's
+ * relative error is bounded by 2^-8. Infinities and zeroes survive exactly. */
+static int self_test_bf16_convert(char *error, size_t error_capacity) {
+    static const float cases[] = {
+        0.0f, -0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 2.0f, 65504.0f, -65504.0f,
+        1.0e-8f, -1.0e-8f, 3.4e38f, -3.4e38f, 1.0e-38f, 4.875f, -4.875f,
+        1.0e30f, 1.0e-30f, 0.1f, -0.1f, 123456.0f, 1.0f / 3.0f
+    };
+    const size_t n = sizeof cases / sizeof cases[0];
+    for (size_t i = 0; i < n; ++i) {
+        const uint16_t packed = qmat_bf16_from_f32(cases[i]);
+        const uint16_t want = bf16_reference(cases[i]);
+        const float back = qmat_bf16_to_f32(packed);
+        if (packed != want) {
+            snprintf(error, error_capacity,
+                     "qmat bf16 self-test: packer says 0x%04x for %g, the "
+                     "explicit rounding reference says 0x%04x",
+                     (unsigned)packed, (double)cases[i], (unsigned)want);
+            return -1;
+        }
+        /* The overflow band is real and is not an error: bf16's largest finite
+         * value is 3.3895e38 against f32's 3.4028e38, so round-to-nearest sends
+         * the sliver between them to infinity. It cannot be reached by this
+         * project's weights -- the largest magnitude anywhere in the English
+         * pack is 4.875 -- but the encoder must still do the IEEE thing rather
+         * than saturate, and the mantissa bound below only applies where the
+         * result stayed finite. */
+        if (cases[i] != 0.0f && isfinite(cases[i]) && isfinite(back)) {
+            const double rel = fabs(((double)back - (double)cases[i]) /
+                                    (double)cases[i]);
+            if (rel > 1.0 / 256.0) {
+                snprintf(error, error_capacity,
+                         "qmat bf16 self-test: %g round-trips to %g, relative "
+                         "error %.4g is above the 2^-8 mantissa bound",
+                         (double)cases[i], (double)back, rel);
+                return -1;
+            }
+        }
+        if (isfinite(cases[i]) && !isfinite(back) &&
+            fabsf(cases[i]) < 3.3895e38f) {
+            snprintf(error, error_capacity,
+                     "qmat bf16 self-test: %g overflowed to infinity below the "
+                     "bf16 maximum", (double)cases[i]);
+            return -1;
+        }
+    }
+    /* Infinity survives; the sweep covers 14 decades in both signs. */
+    for (int sign = 0; sign < 2; ++sign) {
+        for (int e = -40; e <= 38; ++e) {
+            const float v = (sign ? -1.0f : 1.0f) * powf(10.0f, (float)e);
+            if (qmat_bf16_from_f32(v) != bf16_reference(v)) {
+                snprintf(error, error_capacity,
+                         "qmat bf16 self-test: sweep disagrees at %g", (double)v);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* The NEON kernel against the scalar reference, at every shape the row and
+ * column tails can take. memcmp, not a tolerance: the two must associate their
+ * sums identically, and a difference here is a kernel bug rather than
+ * rounding. */
+static int self_test_bf16_kernel(char *error, size_t error_capacity) {
+    enum { ROWS = 7, COLS = 61 };
+    static float x[COLS], bias[ROWS], got[ROWS], ref[ROWS];
+    static uint16_t w[ROWS * COLS];
+    for (size_t i = 0; i < COLS; ++i) x[i] = sinf((float)i * 0.37f) * 1.5f;
+    for (size_t i = 0; i < ROWS; ++i) bias[i] = cosf((float)i) * 0.25f;
+    for (size_t i = 0; i < ROWS * COLS; ++i) {
+        w[i] = qmat_bf16_from_f32(sinf((float)i * 0.11f) * 0.1f);
+    }
+    for (size_t rows = 1; rows <= ROWS; ++rows) {
+        for (size_t cols = 1; cols <= COLS; ++cols) {
+            matvec_bf16_scalar(ref, x, w, bias, rows, cols);
+#if defined(MYNAH_QMAT_BF16_NEON)
+            if (qmat_bf16_unit()) {
+                matvec_bf16_neon(got, x, w, bias, rows, cols);
+            } else {
+                matvec_bf16_scalar(got, x, w, bias, rows, cols);
+            }
+#else
+            matvec_bf16_scalar(got, x, w, bias, rows, cols);
+#endif
+            /* NOT memcmp, and NOT relative to the RESULT.
+             *
+             * These are two different functions and the build carries
+             * -ffast-math, so the compiler may contract or reassociate one and
+             * not the other; the project does not claim bit-identity across
+             * code paths. But a dot product cancels: at rows=2 cols=26 this
+             * sum lands on -0.0034 out of terms an order of magnitude larger,
+             * so dividing by the result measures the cancellation rather than
+             * the kernel, and a correct kernel fails. The scale a reassociation
+             * error is actually proportional to is the sum of |a_i * b_i|, so
+             * that is the denominator. 1e-6 of it is far tighter than the 2^-8
+             * the encoding costs and far looser than any wrong kernel. */
+            for (size_t r = 0; r < rows; ++r) {
+                double scale = 0.0;
+                for (size_t c = 0; c < cols; ++c) {
+                    scale += fabs((double)qmat_bf16_to_f32(w[r * cols + c]) *
+                                  (double)x[c]);
+                }
+                const float denom = scale > 1.0e-3 ? (float)scale : 1.0e-3f;
+                if (fabsf(ref[r] - got[r]) / denom > 1.0e-6f) {
+                    snprintf(error, error_capacity,
+                             "qmat bf16 self-test: the vector kernel disagrees "
+                             "with the scalar reference at rows=%zu cols=%zu "
+                             "row %zu (%.9g vs %.9g)",
+                             rows, cols, r, (double)ref[r], (double)got[r]);
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+#endif /* MYNAH_QMAT_BF16 */
+
 static int self_test_f16_convert(char *error, size_t error_capacity) {
     static const float cases[] = {
         0.0f, -0.0f, 1.0f, -1.0f, 0.5f, 2.0f, 65504.0f, -65504.0f,
@@ -5044,6 +5570,7 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_act_quantize(error, error_capacity) != 0) return -1;
     if (self_test_q4_scale_solve(error, error_capacity) != 0) return -1;
     if (self_test_lane_widths(QMAT_F16, error, error_capacity) != 0) return -1;
+    if (self_test_lane_widths(QMAT_BF16, error, error_capacity) != 0) return -1;
     if (self_test_lane_widths(QMAT_INT8, error, error_capacity) != 0) return -1;
     /* E8-5: a group that names its own encoding, with the batched call as the
      * tensor's first toucher.  Every cache profile the runtime ships crossed
@@ -5084,6 +5611,13 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_rows_blocked(QMAT_F16, error, error_capacity) != 0) return -1;
     if (self_test_batched(QMAT_F16, error, error_capacity) != 0) return -1;
     if (self_test_batch_membership(QMAT_F16, error, error_capacity) != 0) return -1;
+#endif
+#if defined(MYNAH_QMAT_BF16)
+    if (self_test_bf16_convert(error, error_capacity) != 0) return -1;
+    if (self_test_bf16_kernel(error, error_capacity) != 0) return -1;
+    if (self_test_rows_blocked(QMAT_BF16, error, error_capacity) != 0) return -1;
+    if (self_test_batched(QMAT_BF16, error, error_capacity) != 0) return -1;
+    if (self_test_batch_membership(QMAT_BF16, error, error_capacity) != 0) return -1;
 #endif
     return 0;
 }
@@ -5400,7 +5934,40 @@ static int probe_quant_groups(char *out, size_t capacity, const char **reason) {
     return 0;
 }
 
+/* The bf16 row, owned by this file rather than by src/kernels.c, exactly as
+ * kernels.h asks: "a module that grows its own kernel for one of these
+ * registers its own probe over the same row id". Three states, and the middle
+ * one is the one worth distinguishing -- a compiled kernel on a CPU that has
+ * the unit but was told to stand down is not the same fact as no kernel. */
+int mynah_qmat_bf16_enabled(const char **why) {
+#if defined(MYNAH_QMAT_BF16_NEON)
+    const int on = qmat_bf16_unit();
+    if (why != NULL) {
+        *why = on ? "[predicate] src/qmat.c matvec_bf16_neon: BFDOT "
+                    "(vbfdotq_f32), two bf16 products per f32 lane -- eight MACs "
+                    "per instruction against the f16 path's four, accumulating "
+                    "in f32. Weights are kept bf16 in the cache in plain "
+                    "row-major, the same layout x86's VDPBF16PS will want"
+                  : "[predicate] src/qmat.c compiled the BFDOT kernel, but this "
+                    "CPU reports no FEAT_BF16 (or MYNAH_QMAT_BF16 turned it "
+                    "off), so a bf16 weight runs the scalar reference";
+    }
+    return on;
+#else
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c: no BFDOT kernel compiled for this "
+               "target. bf16 WEIGHTS still work here -- they are half the bytes "
+               "of f32 and the scalar kernel multiplies them correctly -- but "
+               "the arithmetic is scalar. The x86 VDPBF16PS kernel is unwritten; "
+               ".work/bf16-native-weights.md says what it has to solve";
+    return 0;
+#endif
+}
+
+static int probe_bf16(const char **why) { return mynah_qmat_bf16_enabled(why); }
+
 void mynah_qmat_dispatch_probes(void) {
+    mynah_dispatch_register_probe("isa.arm.bf16", probe_bf16);
     mynah_dispatch_register_probe("quant.row4", probe_row4);
     mynah_dispatch_register_probe("quant.argmax_mt", probe_argmax_mt);
     mynah_dispatch_register_probe("isa.x86.avx512vnni", probe_avx512vnni);

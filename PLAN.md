@@ -168,7 +168,12 @@ Needs E1 and E2.
       so E2-3's carried-state decision holds in C
 - [x] E3-5 `src/engine_pocket.c` **done** — CLI and server both generate audio; full
       utterance parity mel corr 1.000000 with the oracle's noise injected
-- [x] E3-5a **performance: RTF 2.03 → 0.245** (f16 default, lossless on a bf16 checkpoint);
+- [x] E3-5a **performance: RTF 2.03 → 0.245** (f16 default, and "lossless on a bf16
+      checkpoint" is **almost** true -- measured 2026-09-19 over all 109,502,146 weights
+      of the English pack: 0.354% change through the f16 round trip and 7,138 flush to
+      zero, because f16 goes subnormal below 6.1e-5 and 1.74% of the pack is under that
+      line. Worst ABSOLUTE error 2.98e-08 against a largest weight of 4.875, so the
+      default stands and the word does not);
       conv stack 36× via a GEMM fast path. int8 reaches 0.191 but breaks parity, so it stays opt-in
 - [ ] E3-5c **int8 is the bet, and today it breaks parity on this engine** — hidden
       `rel_l2` 5.9e-02…1.4e-01 against 1e-4, an extra frame, log-mel 0.921. The
@@ -246,7 +251,7 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-4 thread pool upgrade: lane split, deadline priority, `after_fork` (prereq for E5-6)
 - [ ] E4-5 the kernel the profile names — scalar reference, then NEON/SDOT/i8mm **and** AVX2/AVX-512/VNNI in one change
 - [ ] E4-6 int8 weight prepack with persistent cache, both ISAs
-- [ ] E4-8 **the checkpoint is bf16, the CPU has bf16, and we use neither** →
+- [~] E4-8 **BUILT AND MEASURED; not a default, and the prefill half is not done** →
       [`.work/bf16-native-weights.md`](.work/bf16-native-weights.md). `--dispatch-map` on
       the box has been printing this for days: five units the CPU has and this binary has
       no kernel for, with `isa.arm.bf16` reading *"no bfdot/bfmmla and no bf16 weight type;
@@ -276,7 +281,33 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       never re-taken, and this item must not repeat that), then a 30-minute C98 soak,
       which is the level that should move if the prefill gets cheaper. **Not KleidiAI**:
       that stays rejected on its own grounds; what transfers from qwen-tts is the idea,
-      not the dependency
+      not the dependency.
+      **WHAT LANDED (same day)**: the `bf16` encoding, a scalar reference, a NEON BFDOT
+      matvec, a four-activation batched kernel, self tests that pass on the production CPU
+      both with the unit and with `MYNAH_QMAT_BF16=0` forcing the scalar path, and the
+      `isa.arm.bf16` row moved from `src/kernels.c` to `src/qmat.c`, because the file that
+      owns a kernel owns its row. **THREE PREDICTIONS CORRECTED BY THE BOX**: (1) BFDOT
+      **3.45x** over the shipping f16 kernel at the prefill's shape and **BFMMLA only
+      2.41x** -- the instruction with twice the MACs came last, almost certainly because
+      that variant carries one accumulator and is latency-bound, so it is a verdict on two
+      implementations rather than two instructions; (2) bf16 was predicted NOT to help the
+      memory-bound AR step and it helps most -- RTF **0.160 -> 0.119** -- because the f16
+      path also pays `vcvt_f32_f16` per weight block and BFDOT skips it; (3) the batched
+      kernel did NOT fix the prefill: `prep.prefill_proj` is 6.1 ms f16, 9.0 bf16, 15.9
+      bf16-scalar, so BFDOT beats its own scalar path 1.76x and still loses, because **the
+      activation is narrowed inside the row loop** and gets converted once per weight row
+      while f16 converts weights and amortises over four activations. The microbenchmark
+      handed both kernels pre-converted operands and could not see it. **To close**: narrow
+      the activation ONCE per call into a `batch * k * 2` scratch, exactly as `quantize_act`
+      already does for int8 -- a signature change at the batched entry point, not a kernel
+      change. **AND THE GATE THAT DECIDES SHIPPING**: `backbone:bf16` **changes the audio**
+      -- same length, same EOS step, but SNR 1.7 dB and correlation 0.667 against f16,
+      because an autoregressive model feeds the 2^-8 activation rounding back into the
+      sampled latent. That is the same category as `backbone:int8`, already refused on
+      quality, except bf16 keeps the frame count. Available, NOT default. The promising
+      experiment needs no new code: the CODEC groups are not autoregressive, so
+      `MYNAH_QUANT_GROUPS=codec_*:bf16` is additive noise measurable against f32 exactly as
+      int8's was -- and int8, far coarser, was accepted there
 - [ ] E4-7 AMX-INT8 (Linux/x86 only), last
 - [ ] E4-10 **remove useless dtype conversions** — called out by name as one of the two
       profiling wins. `src/qmat.c` holds 15 conversion sites and every other hot-path

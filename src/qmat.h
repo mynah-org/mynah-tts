@@ -239,6 +239,11 @@ void mynah_qmat_dots_i8(const int8_t *w, size_t rows, size_t cols,
 
 /* Model-free numeric check: int8 matvec vs an exact f32 dot on deterministic
  * data, asserting a bounded relative error.  0 = ok, -1 = error. */
+/* Is the BFDOT kernel the one that will run?  `why` receives a [predicate]
+ * string for the dispatch report.  See src/qmat.c and
+ * .work/bf16-native-weights.md. */
+int mynah_qmat_bf16_enabled(const char **why);
+
 int mynah_qmat_self_test(char *error, size_t error_capacity);
 
 #endif
