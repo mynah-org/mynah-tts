@@ -420,3 +420,59 @@ Consequences, all of them operational:
 * this morning's `codec_convtr` A/B survives only because its delta was 52 ms,
   ten times the noise. That was luck, not method;
 * `--max-batch` is measured and closed as a lever at this concurrency.
+
+## 2026-09-19 (evening) — the ceiling moved, and the knob that set it is now stale
+
+With `backbone:bf16` and the tiled BFMMLA kernel, screens on the shipped default
+(nothing exported):
+
+| C | TTFB p95 | TTFA p95 | RTF p95 | stall@250 | verdict |
+|---|---|---|---|---|---|
+| 100 | 62.5 ms | 386.6 ms | 0.702 | 0 of 20888 | **GOOD** |
+| 110 | 68.3 | 478 | 0.721 | 0 of 21176 | **GOOD** |
+| 120 | 74.8 | 514 | 0.788 | 0 of 21435 | MARGINAL — TTFA only, by 14 ms |
+| 130 | **200.7** | 581 | 0.802 | 2 of 21620 | MARGINAL — TTFB and TTFA |
+
+Against the same soak before bf16, at C100: MARGINAL, TTFA p95 526, RTF 0.820,
+19 stalls of 18018, 124.4 audio-s/s. Now GOOD, TTFA 386.6, 0 stalls, 144.5
+audio-s/s — **+16% throughput and 139 ms off first audio**.
+
+**Two readings that matter more than the levels.**
+
+*The bottleneck moved and then moved again.* At C100 the gates sit at 62% (TTFB),
+77% (TTFA) and 78% (RTF) of their thresholds — balanced, where this morning TTFA
+was at 105% and failing alone. At C120 only TTFA fails, with stalls still at
+zero: continuity is no longer the limit, first audio is. At C130 **TTFB jumps
+74.8 → 200.7 ms**, which is not synthesis at all — it is the admission queue.
+16 workers x 8 slots is 128, and 130 requests is the first level that fills it.
+
+*So `--max-batch` stops being inert exactly there.* It was measured this morning
+as a non-lever because the loop never reached 7 live slots; at C130 it saturates.
+Above C120 it becomes a real knob again and is the first place to look.
+
+### The cap is stale, and nobody re-derived it
+
+`MYNAH_PREFILL_STEP_MS = 30` came from `slack = 80 - T_frame(B6) = 80 - 50`,
+where the 50 ms was measured with the **f16** kernel. bf16 made the step cheaper,
+so the slack is now LARGER than 30 and the cap is rationing prefill work that the
+frame could absorb — against TTFA, which is the only gate still failing at C120.
+
+Re-deriving it costs no code: `MYNAH_SERVE_PROFILE=1` re-measures `T_frame(B)`,
+and the cap sweep is the same four ten-minute runs as this morning.
+
+### And a scheduling idea that does need code
+
+`slots_prefill_slice()` serves preparing slots **round-robin**, with a rotating
+cursor so none starves. That is processor sharing, and processor sharing is the
+policy that maximises the number of jobs in flight — every prefill finishes at
+roughly the time the LAST one would have, rather than in turn.
+
+FIFO-to-completion should beat it on the mean immediately (the k-th request
+finishes after the k ahead of it, not after all of them) and on the tail through
+Little's law: a lower mean prefill time means fewer prefills resident, which
+means less competition, which lowers the mean again. The worst case in a single
+step is unchanged, because `MYNAH_PREFILL_STEP_MS` already bounds it.
+
+Risk to measure rather than assume: head-of-line blocking, where a long text's
+prefill delays a short one behind it. The mixed bank is the right instrument —
+`short` is 24% of it and `long` 12%, and per-class TTFA is already reported.

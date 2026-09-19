@@ -927,6 +927,31 @@ the x86 self-test that judges the two kernels written here and never executed
       ten-minute verdict at C94-C96 is a coin toss -- those same two arms returned MARGINAL
       and GOOD, separated by 136 microseconds. **Next**: C98/C100 are stale, measured at the
       old cap
+- [ ] E10-19 **the prefill cap is stale and the prefill ORDER has never been questioned** —
+      [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md). Two levers on the
+      one gate that still fails, and the first needs no code. **(a) Re-derive the cap.**
+      `MYNAH_PREFILL_STEP_MS = 30` came from `slack = 80 - T_frame(B6) = 80 - 50` with the
+      **f16** kernel; bf16 made the step cheaper, so the slack is now larger and the cap is
+      rationing work the frame could absorb. `MYNAH_SERVE_PROFILE=1` re-measures
+      `T_frame(B)` and the sweep is four ten-minute runs. **(b) FIFO instead of round-robin.**
+      `slots_prefill_slice()` is processor sharing -- the policy that maximises jobs in
+      flight, so every prefill finishes near the time the LAST one would. FIFO-to-completion
+      wins the mean by construction and the tail through Little's law (lower mean -> fewer
+      resident prefills -> less competition). The per-step worst case is unchanged because
+      the cap already bounds it. **To measure, not assume**: head-of-line blocking, a long
+      text delaying a short one. The mixed bank is the instrument and per-class TTFA is
+      already reported. **Where this is going**: at C120 only TTFA fails, by **14 ms**, with
+      stalls at zero
+- [ ] E10-20 **above C120 the admission queue becomes the limit, and `--max-batch` wakes up** —
+      at C130 TTFB jumps **74.8 -> 200.7 ms**, which is not synthesis: 16 workers x 8 slots
+      is 128 places and 130 requests is the first level that fills them. This morning's
+      finding that `--max-batch` is inert (the loop never reached 7 live slots) expires
+      exactly there. Fail-fast is already correct and verified in the code -- `job_enqueue`
+      refuses at `pending >= max_pending` under the mutex and answers **503** with
+      `rejected++` before any synthesis, so a rejection costs an accept and a write
+      (`server/main.c:376,1208`), `--max-pending` defaults to 256, and `/health` publishes
+      `queued`/`rejected`/`queue_capacity` for an autoscaler. **Gap**: no `Retry-After`
+      header on the 503, so every client invents its own backoff
 - [x] E10-17 **the configuration of a qualifying run no longer lives in shell history** —
       [`.work/serving-profiles.md`](.work/serving-profiles.md). `configs/perf/*.json` carries
       the deployment shape, the gates AND the operating point measured on that hardware;
