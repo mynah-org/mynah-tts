@@ -601,6 +601,20 @@ def level_report(level, records, launched, wall, args, mode="wave", windows=None
     for r in records:
         mix[r.get("class", "?")] = mix.get(r.get("class", "?"), 0) + 1
     rep["mix"] = mix
+    # TTFA PER CLASS, because an aggregate percentile can improve while the
+    # classes that carry most of the traffic get worse.
+    #
+    # The case that made this necessary: a scheduling change took TTFA p95 from
+    # 445 ms to 318 at fixed concurrency. That is either a real win or a policy
+    # that finishes long texts sooner by making short ones wait -- head-of-line
+    # blocking -- and the aggregate cannot tell the two apart, because `long` is
+    # 12% of this bank and `short` plus `medium` are 70%. A per-class row can.
+    by_class = {}
+    for r in records:
+        if r.get("ttfa_s") is None:
+            continue
+        by_class.setdefault(r.get("class", "?"), []).append(r["ttfa_s"] * 1e3)
+    rep["ttfa_by_class"] = {k: PB.spread(v) for k, v in sorted(by_class.items())}
     # How much of the bank was actually SPOKEN.  The request index is a monotonic
     # counter, so counting distinct indices only ever returns the request count --
     # it says nothing about text diversity, which is the thing a bank exists to
@@ -826,6 +840,13 @@ def print_table(reports, args, meta):
               "header is sent before synthesis, so TTFB alone is not a latency"
               % (fnum(r["header_to_audio_ms"]["p50"], 1, 0),
                  fnum(r["header_to_audio_ms"]["p95"], 1, 0)))
+        if r.get("ttfa_by_class"):
+            print("       TTFA BY CLASS -- an aggregate p95 can improve while the "
+                  "classes carrying the traffic get worse")
+            print("         %-16s %8s %10s %10s" % ("class", "n", "p50 ms", "p95 ms"))
+            for cls, v in r["ttfa_by_class"].items():
+                print("         %-16s %8d %10.1f %10.1f"
+                      % (cls, v["n"], v["p50"], v["p95"]))
         print("       mix: %s"
               % (", ".join("%s x%d" % (k, v) for k, v in sorted(r["mix"].items()))
                  or "n/a"))

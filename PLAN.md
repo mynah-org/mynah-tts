@@ -961,7 +961,19 @@ the x86 self-test that judges the two kernels written here and never executed
       minutes, 64205/64205, `stall@250ms` and `stall@500ms` both **0**, TTFA p95 447.4,
       RTF p95 0.794, required prebuffer 2.8 ms, throughput 155.3 audio-s/s, drift +0.0022.
       **C96 -> C120 in one day, +25% on the same hardware.** What is left of this item is
-      **(b)**, FIFO instead of round-robin, still unmeasured
+      **(b) MEASURED AND SHIPPED**: FIFO takes TTFA p95 **445 -> 318 ms at C120** (-29%) and
+      **521 -> 407 at C130**, where it stops being the failing gate entirely. The check that
+      came first: an aggregate p95 cannot tell "everyone starts sooner" from "long texts
+      finish by making short ones wait", and `tools/serving_profile.py` reported only the
+      class MIX -- so per-class TTFA was ADDED to the instrument before the decision, not
+      after. It says the suspicion was wrong: **short -30%, medium -25%, conversational
+      -25%, long -22%** -- every class improves and the two carrying 70% of the traffic
+      improve most in proportion. Required prebuffer moves 2 -> 28 ms, which is not
+      congestion but prefills finishing in groups (RTF p95 0.796 -> 0.807), against a 250 ms
+      contract with stalls at zero. `MYNAH_PREFILL_ORDER=rr` restores the old policy.
+      **Worth noting where the win came from**: the tiled BFMMLA kernel is 14.68x on the
+      isolated GEMM and bought fourteen points of concurrency; FIFO touches no multiply at
+      all and took more off TTFA than the cap did
 - [ ] E10-20 **above C120 the admission queue becomes the limit, and `--max-batch` wakes up** —
       at C130 TTFB jumps **74.8 -> 200.7 ms**, which is not synthesis: 16 workers x 8 slots
       is 128 places and 130 requests is the first level that fills them. This morning's

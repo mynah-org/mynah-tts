@@ -523,3 +523,58 @@ saturate their eight slots, which is also why TTFB starts climbing at C130.
 
 Per-slot cost fell with the kernel: `b` goes 7.8 -> 6.8 ms, 13% off the term
 that sets capacity in `T_frame(B) = a + b*B`.
+
+## 2026-09-19 (night) — the order of the queue was worth more than the kernel
+
+`slots_prefill_slice()` served waiting prefills **round-robin**. That is processor
+sharing, and processor sharing is the policy that maximises the number of jobs in
+flight: every prefill finishes near the time the LAST one would, instead of in
+turn. FIFO to completion — keep giving the oldest admitted prefill its slices
+until it finishes, then move on — should win the mean by construction and the
+tail through Little's law.
+
+Paired ten-minute soaks, shipped default, only `MYNAH_PREFILL_ORDER` moving:
+
+| | TTFA p50 | TTFA p95 | prebuffer p95 | max_gap p95 | verdict |
+|---|---|---|---|---|---|
+| C120 round-robin | 176 ms | 445 | 2 ms | 121 | GOOD |
+| **C120 FIFO** | **127** | **318** | 28 | 130 | **GOOD** |
+| C130 round-robin | 233 | 521 | 7 | 124 | MARGINAL (TTFB) |
+| **C130 FIFO** | **179** | **407** | 44 | 131 | MARGINAL (TTFB) |
+
+**-127 ms of TTFA p95 at C120**, and at C130 first audio goes from 521 — failing —
+to 407, so TTFA stops being the limit there at all. What still fails at C130 is
+TTFB at 202 ms, which is the admission queue and which this policy does not touch.
+
+### The check that had to come first, and the instrument that did not exist
+
+An aggregate p95 cannot distinguish "everyone starts sooner" from "long texts
+finish sooner by making short ones wait". `long` is 12% of this bank and `short`
+plus `medium` are 70%, so head-of-line blocking would have looked like a win.
+`tools/serving_profile.py` reported only the class MIX, never per-class latency,
+so the question could not be answered from any existing output. Adding it was
+the precondition for the decision, not a footnote to it:
+
+| class | rr p50/p95 | FIFO p50/p95 | delta p95 |
+|---|---|---|---|
+| short | 165.2 / 191.6 | 116.8 / 134.8 | **-57 ms (-30%)** |
+| medium | 179.5 / 209.0 | 129.8 / 156.5 | **-53 ms (-25%)** |
+| conversational | 175.4 / 200.6 | 126.0 / 150.2 | -50 ms (-25%) |
+| long | 430.7 / 627.8 | 282.4 / 488.8 | -139 ms (-22%) |
+| italian | 285.5 / 630.5 | 177.6 / 526.3 | -104 ms |
+
+**Every class improves, and the two carrying 70% of the traffic improve by more
+in proportion than the long ones.** The suspicion was wrong and nobody pays.
+
+The required prebuffer does move the wrong way, 2 -> 28 ms at p95, and it is not
+congestion: prefills now finish sooner and in groups, so more slots go active
+together and the step widens slightly (RTF p95 0.796 -> 0.807). Twenty-eight
+milliseconds against a 250 ms contract, stalls still zero.
+
+### What this says about where to look
+
+The tiled BFMMLA kernel is 14.68x on the isolated GEMM and bought fourteen points
+of concurrency. FIFO does not touch a single multiply — it changes only the ORDER
+in which waiting prefills are served — and took more off TTFA than the cap did.
+Round-robin looked like the neutral, fair choice. It was the policy that makes
+everyone finish when the last one would.

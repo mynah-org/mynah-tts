@@ -184,6 +184,9 @@ typedef struct {
      * NOT ready for step 1 and must not be stepped, and is not finished either
      * so it must not be retired. Both loops below key on it. */
     int preparing;
+    /* Admission order, for the FIFO prefill policy. Monotone per serve loop;
+     * only compared, never used as an index. */
+    unsigned long long prep_seq;
     /* decoder lane (E5-21). `lane_busy` means this slot owns mailbox entry
      * `index` -- a unit is running, or has finished and not been reaped.
      * `streamed_frames` is advanced at SUBMIT, not at delivery, so the range
@@ -246,9 +249,14 @@ static size_t prefill_slice_budget(void) {
  * After this the context is ready for its first step, UNLESS the engine has a
  * resumable prefill and it was asked for one, in which case the slot comes back
  * `preparing` and the driver finishes the prefill a slice at a time. */
+/* `prep_seq_next` hands each admitted request its place in the prefill queue.
+ * Passed rather than static because a static counter would be shared by every
+ * serve loop in the process, and prefork or not, two loops must not interleave
+ * their ordering. */
 static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *model,
                       mynah_engine_state *state, const mynah_engine_caps *caps,
-                      synth_slot *slot, int dump) {
+                      synth_slot *slot, int dump,
+                      unsigned long long *prep_seq_next) {
     const mynah_tts_request *request = slot->request;
 
     if (slot->samples != NULL) *slot->samples = NULL;
@@ -269,6 +277,7 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
         /* Not one byte of prefill here: the whole point is that admission stops
          * being a place where the batch can lose several frame periods. */
         slot->preparing = 1;
+        slot->prep_seq = (*prep_seq_next)++;
         return 0;
     }
     if (engine->prepare(slot->ctx, slot->error, slot->error_capacity) != 0) {
@@ -368,14 +377,84 @@ static double prefill_step_budget_s(void) {
  * it is a different prefill that waits each time. Without it the lowest slot
  * index would always be served and a request unlucky in its slot could be
  * starved for as long as its neighbours keep arriving. */
+/* WHICH waiting prefill gets the step's budget.
+ *
+ * Round-robin -- the original -- is processor sharing, and processor sharing is
+ * the policy that MAXIMISES the number of jobs in flight: every prefill finishes
+ * near the time the last one would have, instead of in turn. FIFO to completion
+ * should win the mean by construction, and the tail through Little's law, since
+ * a lower mean means fewer prefills resident means less competition. The
+ * per-step worst case is identical either way, because MYNAH_PREFILL_STEP_MS
+ * bounds it.
+ *
+ * MEASURED, C120, paired ten-minute soaks on the shipped default:
+ *
+ *   TTFA p95   round-robin  445 ms   ->  FIFO  318 ms      -127 ms, -29%
+ *
+ * The suspicion that had to be checked first was head-of-line blocking -- a long
+ * text's prefill delaying a short one admitted behind it -- because an aggregate
+ * p95 cannot tell that apart from a real win when `long` is 12% of the bank and
+ * `short` plus `medium` are 70%. The per-class report was added to
+ * tools/serving_profile.py for exactly this decision, and it says the suspicion
+ * was wrong:
+ *
+ *   class            rr p50/p95      fifo p50/p95     delta p95
+ *   short            165.2/191.6     116.8/134.8      -57 ms  (-30%)
+ *   medium           179.5/209.0     129.8/156.5      -53 ms  (-25%)
+ *   conversational   175.4/200.6     126.0/150.2      -50 ms  (-25%)
+ *   long             430.7/627.8     282.4/488.8     -139 ms  (-22%)
+ *
+ * EVERY class improves, and the two that carry 70% of the traffic improve by
+ * more in proportion than the long ones do. Nobody pays.
+ *
+ * The one thing that does move the wrong way is the required client prebuffer,
+ * 2 ms -> 28 ms at p95, and it is not congestion: prefills now finish sooner
+ * and in groups, so more slots go active together and the step widens slightly
+ * (RTF p95 0.796 -> 0.807). Twenty-eight milliseconds against a 250 ms contract,
+ * with stalls still at zero.
+ *
+ * MYNAH_PREFILL_ORDER=rr restores the old policy exactly. */
+static int prefill_fifo(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("MYNAH_PREFILL_ORDER");
+        cached = (env != NULL && strcmp(env, "rr") == 0) ? 0 : 1;
+    }
+    return cached;
+}
+
 static void slots_prefill_slice(const mynah_tts_engine *engine, synth_slot *slots,
                                 size_t max_batch, int dump, size_t *rr) {
     const size_t budget = prefill_slice_budget();
     const double step_budget = prefill_step_budget_s();
     const double t0 = (step_budget > 0.0) ? mynah_phase_seconds() : 0.0;
+    const int fifo = prefill_fifo();
     size_t served = 0;
-    for (size_t n = 0; n < max_batch; ++n) {
-        const size_t i = (*rr + n) % max_batch;
+    /* FIFO keeps picking the SAME oldest prefill until it finishes, which is
+     * the whole point: serving each waiting slot once per step in a different
+     * order would still be processor sharing, just with the turns renamed. The
+     * loop bound is generous rather than exact -- the step budget is what
+     * actually stops this, and a slot that completes clears its `preparing`
+     * flag so the next pick moves on by itself. */
+    const size_t passes = fifo ? max_batch * 4u : max_batch;
+    for (size_t n = 0; n < passes; ++n) {
+        size_t i;
+        if (fifo) {
+            size_t best = max_batch;
+            unsigned long long best_seq = 0ull;
+            for (size_t k = 0; k < max_batch; ++k) {
+                const synth_slot *c = &slots[k];
+                if (!c->in_use || !c->preparing) continue;
+                if (best == max_batch || c->prep_seq < best_seq) {
+                    best = k;
+                    best_seq = c->prep_seq;
+                }
+            }
+            if (best == max_batch) break;   /* nothing left to prefill */
+            i = best;
+        } else {
+            i = (*rr + n) % max_batch;
+        }
         synth_slot *slot = &slots[i];
         if (!slot->in_use || !slot->preparing) continue;
         if (step_budget > 0.0 && served > 0u &&
@@ -945,6 +1024,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     size_t admitted = 0;
     /* Rotating cursor for the prefill pass; see slots_prefill_slice. */
     size_t prefill_rr = 0;
+    unsigned long long prep_seq_next = 0;
 
     synth_slot slots[MYNAH_GRAPH_MAX_JOBS];
     mynah_engine_ctx *step_ctxs[MYNAH_GRAPH_MAX_JOBS];
@@ -1050,7 +1130,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             slot->error_capacity = job.error_capacity;
             ++used;
             ++admitted;
-            if (slot_start(engine, model, state, &caps, slot, dump_all) != 0) {
+            if (slot_start(engine, model, state, &caps, slot, dump_all,
+                           &prep_seq_next) != 0) {
                 /* A request that cannot start never occupies the batch. */
                 if (slot_retire(engine, sink, slot, dump_all) != 0) result = -1;
                 --used;
