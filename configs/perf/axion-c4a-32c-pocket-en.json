@@ -2,16 +2,16 @@
   "schema_version": 1,
   "profile": {
     "id": "axion-c4a-32c-pocket-en",
-    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English streaming. C96 is the qualified operating point, measured on the shipped default with nothing exported. Host-scoped: this is not a generic Arm profile and makes no claim about a 16-core host or about Magpie.",
+    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English streaming. C110 is the qualified operating point, measured on the shipped default with nothing exported. Host-scoped: not a generic Arm profile and no claim about Magpie.",
     "engine": "pocket",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
       "concurrency_range": [
         1,
-        100
+        130
       ],
-      "preferred_concurrency": 96,
+      "preferred_concurrency": 110,
       "quality_changes_allowed": false
     }
   },
@@ -53,7 +53,7 @@
       "codec_transformer": "int8",
       "codec_conv": "int8",
       "codec_convtr": "int8",
-      "backbone": "f16",
+      "backbone": "bf16",
       "flow_net": "f16",
       "conditioner": "f16"
     },
@@ -100,7 +100,7 @@
     },
     "client_contract": {
       "prebuffer_ms": 250,
-      "why": "At the operating point the worst client prebuffer measured 228.9 ms and max_gap never exceeded 142.8 ms against an 80 ms frame, so the 250 ms contract is covered by the sample maximum as well as by the bound. MYNAH_PREFILL_STEP_MS caps the prefill work one AR step may absorb at the measured slack, which is what makes it a bound rather than a statistic."
+      "why": "At the operating point the required prebuffer is 0.000 ms at p95 -- no client ever had to buffer before starting -- and max_gap p95 is 98 ms against an 80 ms frame. The 250 ms contract is covered with room to spare, and MYNAH_PREFILL_STEP_MS is what makes it a bound rather than a statistic."
     }
   },
   "qualification": {
@@ -111,51 +111,53 @@
       "date": "2026-09-19",
       "version": "1.4.0",
       "configuration": "shipped-default",
-      "concurrency": 96,
+      "concurrency": 110,
       "verdict": "GOOD",
       "soak_seconds": 1800,
-      "requests": 53886,
-      "ttfb_p95_ms": 82.8,
-      "ttfa_p95_ms": 492.5,
-      "rtf_p95": 0.759,
-      "prebuffer_p95_ms": 10.7,
-      "safe_start_p95_ms": 508.7,
-      "max_gap_p95_ms": 119.5,
+      "requests": 63120,
+      "ttfb_p95_ms": 68.7,
+      "ttfa_p95_ms": 482.3,
+      "rtf_p95": 0.726,
+      "prebuffer_p95_ms": 0.0,
+      "safe_start_p95_ms": 485.2,
+      "max_gap_p95_ms": 98.0,
       "stalls_250ms": 0,
       "stalls_500ms": 0,
-      "throughput_audio_s_per_s": 130.2,
-      "evidence": "reports/20260919-c96-axion/c96-cap30-20260919-1307.log"
+      "throughput_audio_s_per_s": 152.7,
+      "evidence": "reports/20260919-c96-axion/c110-30min-20260919-1728.log"
     },
     "ceiling": [
       {
         "date": "2026-09-19",
         "version": "1.4.0",
-        "configuration": "environment-override",
-        "concurrency": 98,
+        "configuration": "shipped-default",
+        "concurrency": 120,
         "verdict": "MARGINAL",
         "soak_seconds": 600,
-        "requests": 18067,
-        "ttfa_p95_ms": 499.5,
-        "rtf_p95": 0.8,
-        "stalls_250ms": 13,
+        "requests": 21435,
+        "ttfb_p95_ms": 74.8,
+        "ttfa_p95_ms": 513.6,
+        "rtf_p95": 0.788,
+        "stalls_250ms": 0,
         "stalls_500ms": 0,
-        "evidence": "reports/20260919-c96-axion/ab-sweep-c90ab-c96-c98-c100.log",
-        "why_not_promoted": "Thirteen stalls in ten minutes, while the TTFA gate still passed by half a millisecond. Measured at the OLD 60 ms prefill cap and not re-measured at 30, which is the change that promoted C96 -- so this is a stale ceiling and the first level to re-screen."
+        "evidence": "reports/20260919-c96-axion/ceiling-bf16-20260919-1653.log",
+        "why_not_promoted": "TTFA p95 misses by 14 ms and NOTHING ELSE does -- stalls are zero at both buffers and the required prebuffer is zero. Continuity is no longer the limit here, first audio is. PLAN.md E10-19 carries the two levers aimed at exactly this."
       },
       {
         "date": "2026-09-19",
         "version": "1.4.0",
-        "configuration": "environment-override",
-        "concurrency": 100,
+        "configuration": "shipped-default",
+        "concurrency": 130,
         "verdict": "MARGINAL",
         "soak_seconds": 600,
-        "requests": 18056,
-        "ttfa_p95_ms": 522.6,
-        "rtf_p95": 0.817,
-        "stalls_250ms": 22,
+        "requests": 21620,
+        "ttfb_p95_ms": 200.7,
+        "ttfa_p95_ms": 580.9,
+        "rtf_p95": 0.802,
+        "stalls_250ms": 2,
         "stalls_500ms": 0,
-        "evidence": "reports/20260919-c96-axion/ab-sweep-c90ab-c96-c98-c100.log",
-        "why_not_promoted": "Both preferred gates fail: TTFA p95 522.6 and 22 stalls in ten minutes. RTF p95 0.817 means the box still has a fifth of a realtime budget in hand at a level it cannot qualify -- capacity is not what stops us here, continuity is. Measured at the OLD 60 ms prefill cap."
+        "evidence": "reports/20260919-c96-axion/ceiling-bf16-20260919-1653.log",
+        "why_not_promoted": "TTFB jumps 74.8 -> 200.7 ms, which is not synthesis: 16 workers x 8 slots is 128 places and 130 requests is the first level that fills them, so requests wait for a slot before they begin. This is also where --max-batch stops being the inert knob it was measured to be at C100 and becomes a real lever again."
       }
     ],
     "history": [
@@ -208,8 +210,27 @@
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 130.2,
         "evidence": "reports/20260919-c96-axion/c96-cap30-20260919-1307.log"
+      },
+      {
+        "date": "2026-09-19",
+        "version": "1.4.0",
+        "configuration": "shipped-default",
+        "concurrency": 110,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 63120,
+        "ttfb_p95_ms": 68.7,
+        "ttfa_p95_ms": 482.3,
+        "rtf_p95": 0.726,
+        "prebuffer_p95_ms": 0.0,
+        "safe_start_p95_ms": 485.2,
+        "max_gap_p95_ms": 98.0,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 152.7,
+        "evidence": "reports/20260919-c96-axion/c110-30min-20260919-1728.log"
       }
     ],
-    "notes": "The operating point moved C90 -> C96 on 2026-09-19 by setting the per-step prefill cap to the measured slack: T_frame(B) = 3.0 + 7.8*B ms puts a typical step at B6 at 50 ms of an 80 ms frame, leaving 30. Before that change C94 and C96 were both MARGINAL over thirty minutes by exactly one stall, in 53980 and 54186 requests. This is also the first point measured on a plain binary -- codec_convtr:int8 became the shipped default the same day, so nothing is exported. CAUTION for whoever reads the ceiling: C98 and C100 were measured at the old cap and are stale. A second caution about the instrument: TTFA p95 sits at 492 +/- 5 against a 500 ms gate, so a ten-minute verdict at these levels is a coin toss -- the same configuration returned MARGINAL and GOOD in two ten-minute runs separated by 136 microseconds of percentile."
+    "notes": "The operating point moved C96 -> C110 on 2026-09-19 evening, on the same host and bank, by two changes made the same day: the per-step prefill cap set to the measured slack, and backbone:bf16 with a tiled BFMMLA kernel. Against C100 before bf16: MARGINAL with 19 stalls and 124.4 audio-s/s, now GOOD with none and 144.5. The gates are balanced for the first time -- at C100 they sit at 62%, 77% and 78% of threshold where TTFA alone was at 105% that morning. CAUTION: MYNAH_PREFILL_STEP_MS=30 was derived as the slack left by a 50 ms step measured with the f16 kernel; bf16 made the step cheaper, so the cap is stale and is being re-derived (E10-19)."
   }
 }

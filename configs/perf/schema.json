@@ -101,7 +101,7 @@
         "quant_groups": {
           "type": "object",
           "description": "The intended encoding per group, as documentation. It is NOT serialized into MYNAH_QUANT_GROUPS unless runtime.environment says so: a profile that matches the shipped default must leave the variable out, so that what is measured is what a plain binary does.",
-          "additionalProperties": { "enum": ["int8", "int4", "f16", "f32"] }
+          "additionalProperties": { "enum": ["int8", "int4", "f16", "bf16", "f32"] }
         },
         "matches_shipped_default": {
           "type": "boolean",

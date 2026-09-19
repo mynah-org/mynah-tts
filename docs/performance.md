@@ -779,3 +779,54 @@ delta was 52 ms.
 and the levels above it that were measured and not promoted. It exports **nothing**:
 all three environment knobs are declared *must be absent*, because the shipped
 default now covers them, and a run that exports one of them refuses to start.
+
+## 2026-09-19 (evening) · C110 — bf16 weights and a tiled BFMMLA kernel
+
+Same host, same bank, same protocol. Two changes made the same day moved the
+operating point from C96 to C110: the per-step prefill cap set to the measured
+slack, and `backbone:bf16` multiplied by a tiled BFMMLA kernel.
+
+**C110, thirty minutes, 63120 requests, every gate passed — GOOD.**
+
+    TTFB p95   68.7 ms      TTFA p95  482.3 ms     STREAM_RTF p50/p95  0.675/0.726
+    required prebuffer p95  0.000 ms  (no client ever had to buffer)
+    max_gap p95 98 ms                 safe_play_start p95  485 ms
+    stall_rate@500ms  0 of 63120      stall_rate@250ms  0 of 63120
+    throughput 152.7 audio-s/s        drift +0.0018 over ten 3-minute windows
+
+Ten windows of TTFA p95: 487, 482, 485, 472, 481, 493, 491, 481, 478, 478. The
+margin is stable rather than lucky.
+
+### Where the ceiling is now, and what changes at each step
+
+| C | TTFB p95 | TTFA p95 | RTF p95 | stall@250 | verdict |
+|---|---|---|---|---|---|
+| 100 | 62.5 ms | 386.6 | 0.702 | 0 of 20888 | GOOD |
+| **110** | **68.7** | **482.3** | **0.726** | **0 of 63120** (30 min) | **GOOD** |
+| 120 | 74.8 | 513.6 | 0.788 | 0 of 21435 | MARGINAL — TTFA only, by 14 ms |
+| 130 | **200.7** | 580.9 | 0.802 | 2 of 21620 | MARGINAL — TTFB and TTFA |
+
+At C120 **only** first audio fails, by fourteen milliseconds, with stalls at zero
+and the required prebuffer at zero. Continuity is not the limit any more.
+
+At C130 **TTFB triples**, and that is not synthesis at all: 16 workers x 8 slots
+is 128 places, and 130 requests is the first level that fills them, so a request
+waits for a slot before it begins. It is also where `--max-batch` stops being
+the inert knob it measured as at C100 and becomes a lever again.
+
+### The same level before and after
+
+| C100 | before bf16 | after |
+|---|---|---|
+| verdict | MARGINAL | **GOOD** |
+| TTFA p95 | 526.0 ms | **386.6 ms** |
+| `stall_rate@250ms` | 19 of 18018 | **0 of 20888** |
+| throughput | 124.4 | **144.5 audio-s/s** |
+
+### What is stale in this table
+
+`MYNAH_PREFILL_STEP_MS = 30` was derived as `80 - T_frame(B6)` with a 50 ms step
+**measured on the f16 kernel**. bf16 made the step cheaper, so the slack is now
+larger than 30 and the cap is rationing prefill work the frame could absorb —
+against TTFA, the only gate still failing at C120. Re-deriving it costs no code
+and is `PLAN.md` E10-19.
