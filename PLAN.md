@@ -941,7 +941,11 @@ the x86 self-test that judges the two kernels written here and never executed
       the cap already bounds it. **To measure, not assume**: head-of-line blocking, a long
       text delaying a short one. The mixed bank is the instrument and per-class TTFA is
       already reported. **Where this is going**: at C120 only TTFA fails, by **14 ms**, with
-      stalls at zero
+      stalls at zero. **THE OPERATING POINT IS NOW C110** -- thirty minutes, 63120/63120,
+      `stall@250ms` and `stall@500ms` both **0**, TTFA p95 482.3, RTF p95 0.726, required
+      prebuffer **0.000 ms**, throughput 152.7 audio-s/s, drift +0.0018 over ten windows,
+      on the shipped default with nothing exported. Ten window percentiles run 472-493, so
+      the margin is stable rather than lucky
 - [ ] E10-20 **above C120 the admission queue becomes the limit, and `--max-batch` wakes up** —
       at C130 TTFB jumps **74.8 -> 200.7 ms**, which is not synthesis: 16 workers x 8 slots
       is 128 places and 130 requests is the first level that fills them. This morning's
