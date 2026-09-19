@@ -476,3 +476,50 @@ step is unchanged, because `MYNAH_PREFILL_STEP_MS` already bounds it.
 Risk to measure rather than assume: head-of-line blocking, where a long text's
 prefill delays a short one behind it. The mixed bank is the right instrument —
 `short` is 24% of it and `long` 12%, and per-class TTFA is already reported.
+
+## 2026-09-19 (late) — the cap was stale, and "cap = slack" was never a law
+
+Three ten-minute soaks at C120, shipped default, only `MYNAH_PREFILL_STEP_MS`
+moving:
+
+| cap | TTFA p95 | `max_gap` p95 | prebuffer p95 | verdict |
+|---|---|---|---|---|
+| 30 (shipped) | 510.3 ms | 103 ms | 0 ms | MARGINAL — TTFA |
+| **40** | **450** | 121 | 3 | **GOOD** |
+| 50 | 448 | 124 | 3 | GOOD |
+
+Raising the cap from 30 to 40 takes **60 ms off first audio** — four times the
+14 ms that separated C120 from a pass — and 50 buys nothing more, so the curve
+flattens at 40 and that is the value.
+
+### The correction, and it is to something written here this morning
+
+This note said "the measured principle is `cap = deadline - T_frame(B typical)`".
+**That is not a principle.** `T_frame(B)` re-measured with bf16:
+
+    B1  9.7 ms    B4 30.9    B7 51.7      fit 2.9 + 6.8*B
+    B2 19.8       B5 39.2    B8 57.6      (f16 was 3.0 + 7.8*B)
+    B3 26.3       B6 45.4
+
+At B7 — the modal width now — the slack is `80 - 51.7 = 28 ms`, so the rule
+would say to LOWER the cap from 30. The box says raising it to 40 is better.
+
+The rule is wrong because a frame that overruns is not a stall, it is a debt: at
+RTF 0.798 each slot earns `(1 - 0.798) x 80 = 16 ms` of lead per frame, so ten
+milliseconds of overrun are repaid inside one frame. The slack is a good first
+guess and it produced a good value once; promoting it to a law after a single
+confirmation was the error, and it is the same shape as the other mistakes in
+this note — an arithmetic story told with more confidence than its evidence.
+
+**The cap is a measured quantity. Re-measure it whenever the step cost moves**,
+and the step cost moves whenever a kernel does.
+
+### `--max-batch` is a live knob again, and the histogram says so
+
+The width histogram at C120 reaches **B7 with 92015 frames and B8 with 62154**.
+This morning's finding — "`--max-batch` is not an active knob, the loop never
+reaches 7 live slots" — was true at C100 and expired at C120. The workers now
+saturate their eight slots, which is also why TTFB starts climbing at C130.
+
+Per-slot cost fell with the kernel: `b` goes 7.8 -> 6.8 ms, 13% off the term
+that sets capacity in `T_frame(B) = a + b*B`.

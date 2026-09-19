@@ -945,7 +945,18 @@ the x86 self-test that judges the two kernels written here and never executed
       `stall@250ms` and `stall@500ms` both **0**, TTFA p95 482.3, RTF p95 0.726, required
       prebuffer **0.000 ms**, throughput 152.7 audio-s/s, drift +0.0018 over ten windows,
       on the shipped default with nothing exported. Ten window percentiles run 472-493, so
-      the margin is stable rather than lucky
+      the margin is stable rather than lucky.
+      **(a) IS DONE AND IT WORKED**: at C120, cap 30 -> 40 takes TTFA p95 **510 -> 450 ms**
+      and turns MARGINAL into GOOD; 50 gives 448, so the curve flattens at 40. It cost
+      `max_gap` p95 103 -> 121 ms, still far inside the 250 ms contract. **And it corrected
+      a claim made here this morning**: "cap = deadline - T_frame" is NOT a law. `T_frame(B)`
+      with bf16 is **2.9 + 6.8*B** (f16 was 3.0 + 7.8*B), so at the modal width B7 the slack
+      is 28 ms and the rule would say LOWER it. A frame that overruns is a debt, not a
+      stall: at RTF 0.798 a slot earns 16 ms of lead per frame and repays ten in one. The
+      slack is a first guess; the cap is a measured quantity and must be re-measured
+      whenever a kernel changes the step cost. **Also expired**: `--max-batch` is a live
+      knob again -- the width histogram at C120 reaches **B7 (92015 frames) and B8 (62154)**,
+      where at C100 the loop never passed 6
 - [ ] E10-20 **above C120 the admission queue becomes the limit, and `--max-batch` wakes up** —
       at C130 TTFB jumps **74.8 -> 200.7 ms**, which is not synthesis: 16 workers x 8 slots
       is 128 places and 130 requests is the first level that fills them. This morning's
