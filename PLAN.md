@@ -956,7 +956,12 @@ the x86 self-test that judges the two kernels written here and never executed
       slack is a first guess; the cap is a measured quantity and must be re-measured
       whenever a kernel changes the step cost. **Also expired**: `--max-batch` is a live
       knob again -- the width histogram at C120 reaches **B7 (92015 frames) and B8 (62154)**,
-      where at C100 the loop never passed 6
+      where at C100 the loop never passed 6.
+      **QUALIFIED: the default cap is now 40 and the operating point is C120** -- thirty
+      minutes, 64205/64205, `stall@250ms` and `stall@500ms` both **0**, TTFA p95 447.4,
+      RTF p95 0.794, required prebuffer 2.8 ms, throughput 155.3 audio-s/s, drift +0.0022.
+      **C96 -> C120 in one day, +25% on the same hardware.** What is left of this item is
+      **(b)**, FIFO instead of round-robin, still unmeasured
 - [ ] E10-20 **above C120 the admission queue becomes the limit, and `--max-batch` wakes up** —
       at C130 TTFB jumps **74.8 -> 200.7 ms**, which is not synthesis: 16 workers x 8 slots
       is 128 places and 130 requests is the first level that fills them. This morning's

@@ -830,3 +830,52 @@ the inert knob it measured as at C100 and becomes a lever again.
 larger than 30 and the cap is rationing prefill work the frame could absorb —
 against TTFA, the only gate still failing at C120. Re-deriving it costs no code
 and is `PLAN.md` E10-19.
+
+## 2026-09-19 (late) · C120 — the cap re-measured after the kernel changed
+
+`MYNAH_PREFILL_STEP_MS` moves from 30 to 40 and the operating point from C110 to
+**C120**. The sweep, at C120 on the shipped default:
+
+| cap | TTFA p95 | `max_gap` p95 | verdict |
+|---|---|---|---|
+| 30 | 510.3 ms | 103 ms | MARGINAL — TTFA |
+| **40** | **450** | 121 | **GOOD** |
+| 50 | 448 | 124 | GOOD (flat) |
+
+**C120, thirty minutes, 64205 requests, every gate passed — GOOD.**
+
+    TTFB p95   75.1 ms      TTFA p95  447.4 ms     STREAM_RTF p50/p95  0.734/0.794
+    required prebuffer p95  2.8 ms    max_gap p95  121 ms
+    stall_rate@500ms  0 of 64205      stall_rate@250ms  0 of 64205
+    throughput 155.3 audio-s/s        drift +0.0022 over ten 3-minute windows
+
+### The day, in one table
+
+| | C96 (morning) | C110 | C120 |
+|---|---|---|---|
+| what changed | cap 30, codec int8 | + `backbone:bf16`, tiled BFMMLA | + cap re-measured to 40 |
+| TTFA p95 | 492.5 ms | 482.3 | **447.4** |
+| RTF p95 | 0.759 | 0.726 | 0.794 |
+| throughput | 130.2 audio-s/s | 152.7 | **155.3** |
+| stalls | 0 of 53886 | 0 of 63120 | 0 of 64205 |
+
+**+25% concurrency on the same hardware, in one day, without touching the model.**
+
+### Two things written here that expired the same day
+
+Both are kept rather than edited away, because a reader who quotes the old line
+should find the correction next to it.
+
+**"cap = deadline − T_frame(B typical)" is not a law.** It produced 30 ms for the
+f16 kernel and it was right then. `T_frame(B)` with bf16 is **2.9 + 6.8·B**
+(f16: 3.0 + 7.8·B), so at the modal width B7 the slack reads 28 ms and the rule
+says to *lower* the cap — while 40 beats 30 by sixty milliseconds of first audio.
+A frame that overruns is a **debt, not a stall**: at RTF 0.79 a slot earns 16 ms
+of lead per frame and repays ten inside one. The cap is a measured quantity and
+must be re-measured whenever a kernel changes what a step costs.
+
+**"`--max-batch` is not an active knob"** was true at C100, where the loop never
+reached 7 live slots. At C120 the width histogram reaches **B7 with 92015 frames
+and B8 with 62154**: the workers saturate their eight slots. It is a lever again,
+and it is why TTFB triples at C130 — 16 workers × 8 slots is 128 places, and 130
+requests is the first level that fills them.

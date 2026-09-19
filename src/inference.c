@@ -298,11 +298,35 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
  * running. One slice always runs even when the budget is already spent, because
  * a cap that can starve a prefill forever is a deadlock, not a bound.
  *
- * The default is 30 ms, and it is derived rather than tried. Timing the serving
- * loop per batch width (MYNAH_SERVE_PROFILE=1) gives T_frame(B) = 3.0 + 7.8*B ms
- * on the reference host, so a typical step at B6 costs 50 ms of an 80 ms frame
- * and the SLACK a prefill may use without making the frame late is 30. Setting
- * the cap to the slack is what the arithmetic asks for, and the box agrees:
+ * The default is 40 ms, and it is MEASURED rather than derived. That distinction
+ * cost a retraction, so it is written here rather than in a note.
+ *
+ * This comment used to say the cap "is derived rather than tried": time the loop
+ * per batch width, subtract a typical step from the frame period, and the
+ * remainder is the slack a prefill may use. That produced 30 ms and 30 ms was a
+ * good value -- for the kernel it was measured on. When bf16 made the AR step
+ * cheaper the rule pointed the WRONG WAY: T_frame(B) became 2.9 + 6.8*B, so at
+ * the modal width B7 the slack reads 28 ms and the rule says lower the cap,
+ * while the box says 40 is better than 30 by sixty milliseconds of TTFA.
+ *
+ * The rule is wrong because a frame that overruns is a DEBT, not a stall. At
+ * RTF 0.79 a slot earns (1 - 0.79) * 80 = 16 ms of lead per frame, so ten
+ * milliseconds of overrun are repaid inside one frame. Slack is a fine first
+ * guess; the cap is a measured quantity, and it must be re-measured whenever a
+ * kernel changes what a step costs.
+ *
+ * The sweep that set 40, at C120 on the shipped default:
+ *
+ *   cap ms   TTFA p95   max_gap p95   verdict
+ *      30      510.3       103 ms     MARGINAL -- TTFA
+ *      40      450         121        GOOD
+ *      50      448         124        GOOD  (the curve has flattened)
+ *
+ * Qualified at 40: C120, thirty minutes, 64205 requests, stall@250ms and
+ * stall@500ms both zero, TTFA p95 447.4, RTF p95 0.794, required prebuffer p95
+ * 2.8 ms, drift +0.0022 over ten windows.
+ *
+ * The superseded 30 ms sweep, kept because it is the evidence for the shape:
  *
  *   cap ms   max_gap p95   max_gap max   TTFA p95   (C94, ten minutes each)
  *      60        131 ms        179 ms     495-500
@@ -317,15 +341,12 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
  * rarely reaches 30 ms on its own; the cap binds only when several coincide on
  * one worker. It bounds the tail and leaves the median path alone.
  *
- * Qualified at this value: C96, thirty minutes, 53886 requests, shipped
- * quantization and nothing exported -- every gate passed, stall@250ms and
- * stall@500ms both zero, worst client prebuffer 228.9 ms against a declared
- * 250 ms contract (it was 316 at 60 ms), max_gap max 142.8 (was 179.2). */
+ * (that sweep was taken at C94 with the f16 backbone, and it qualified C96.) */
 static double prefill_step_budget_s(void) {
     static double cached = -1.0;
     if (cached >= 0.0) return cached;
     const char *env = getenv("MYNAH_PREFILL_STEP_MS");
-    double v = 30.0;
+    double v = 40.0;
     if (env != NULL && *env != '\0') {
         char *end = NULL;
         const double parsed = strtod(env, &end);

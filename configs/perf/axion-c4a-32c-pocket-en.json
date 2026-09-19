@@ -11,7 +11,7 @@
         1,
         130
       ],
-      "preferred_concurrency": 110,
+      "preferred_concurrency": 120,
       "quality_changes_allowed": false
     }
   },
@@ -68,7 +68,7 @@
       },
       "MYNAH_PREFILL_STEP_MS": {
         "value": null,
-        "why": "Must be ABSENT. The shipped default is 60 ms of prefill work per AR step. This cap is what makes zero stalls a scheduler bound instead of a lucky distribution; 0 removes it."
+        "why": "Must be ABSENT. The shipped default is 40 ms of prefill work per AR step, MEASURED at C120 (30 gives TTFA p95 510 and MARGINAL, 40 gives 450 and GOOD, 50 gives 448 and buys nothing). It is not derived from the frame's slack: that rule produced 30 for the f16 kernel and points the wrong way now that bf16 made the step cheaper. 0 removes the cap, which is what makes zero stalls a scheduler bound instead of a lucky distribution."
       }
     }
   },
@@ -100,7 +100,7 @@
     },
     "client_contract": {
       "prebuffer_ms": 250,
-      "why": "At the operating point the required prebuffer is 0.000 ms at p95 -- no client ever had to buffer before starting -- and max_gap p95 is 98 ms against an 80 ms frame. The 250 ms contract is covered with room to spare, and MYNAH_PREFILL_STEP_MS is what makes it a bound rather than a statistic."
+      "why": "At the operating point the required prebuffer is 2.8 ms at p95 and max_gap p95 is 121 ms against an 80 ms frame, so the 250 ms contract holds with room. Raising MYNAH_PREFILL_STEP_MS from 30 to 40 moved max_gap p95 from 103 to 121 and bought 60 ms of TTFA: that trade is the reason the cap is a measured quantity rather than a derived one."
     }
   },
   "qualification": {
@@ -111,38 +111,22 @@
       "date": "2026-09-19",
       "version": "1.4.0",
       "configuration": "shipped-default",
-      "concurrency": 110,
+      "concurrency": 120,
       "verdict": "GOOD",
       "soak_seconds": 1800,
-      "requests": 63120,
-      "ttfb_p95_ms": 68.7,
-      "ttfa_p95_ms": 482.3,
-      "rtf_p95": 0.726,
-      "prebuffer_p95_ms": 0.0,
-      "safe_start_p95_ms": 485.2,
-      "max_gap_p95_ms": 98.0,
+      "requests": 64205,
+      "ttfb_p95_ms": 75.1,
+      "ttfa_p95_ms": 447.4,
+      "rtf_p95": 0.794,
+      "prebuffer_p95_ms": 2.8,
+      "safe_start_p95_ms": 458.0,
+      "max_gap_p95_ms": 121.0,
       "stalls_250ms": 0,
       "stalls_500ms": 0,
-      "throughput_audio_s_per_s": 152.7,
-      "evidence": "reports/20260919-c96-axion/c110-30min-20260919-1728.log"
+      "throughput_audio_s_per_s": 155.3,
+      "evidence": "reports/20260919-c96-axion/c120-cap40-30min-20260919-1838.log"
     },
     "ceiling": [
-      {
-        "date": "2026-09-19",
-        "version": "1.4.0",
-        "configuration": "shipped-default",
-        "concurrency": 120,
-        "verdict": "MARGINAL",
-        "soak_seconds": 600,
-        "requests": 21435,
-        "ttfb_p95_ms": 74.8,
-        "ttfa_p95_ms": 513.6,
-        "rtf_p95": 0.788,
-        "stalls_250ms": 0,
-        "stalls_500ms": 0,
-        "evidence": "reports/20260919-c96-axion/ceiling-bf16-20260919-1653.log",
-        "why_not_promoted": "TTFA p95 misses by 14 ms and NOTHING ELSE does -- stalls are zero at both buffers and the required prebuffer is zero. Continuity is no longer the limit here, first audio is. PLAN.md E10-19 carries the two levers aimed at exactly this."
-      },
       {
         "date": "2026-09-19",
         "version": "1.4.0",
@@ -157,7 +141,7 @@
         "stalls_250ms": 2,
         "stalls_500ms": 0,
         "evidence": "reports/20260919-c96-axion/ceiling-bf16-20260919-1653.log",
-        "why_not_promoted": "TTFB jumps 74.8 -> 200.7 ms, which is not synthesis: 16 workers x 8 slots is 128 places and 130 requests is the first level that fills them, so requests wait for a slot before they begin. This is also where --max-batch stops being the inert knob it was measured to be at C100 and becomes a real lever again."
+        "why_not_promoted": "TTFB jumps 74.8 -> 200.7 ms, which is not synthesis: 16 workers x 8 slots is 128 places and 130 requests is the first level that fills them, so requests wait for a slot before they begin. This is also where --max-batch stops being the inert knob it was measured to be at C100 and becomes a real lever again. Measured at the OLD 30 ms prefill cap; the cap is now 40, which is what promoted C120, so this level is stale and is the first to re-screen."
       }
     ],
     "history": [
@@ -229,8 +213,27 @@
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 152.7,
         "evidence": "reports/20260919-c96-axion/c110-30min-20260919-1728.log"
+      },
+      {
+        "date": "2026-09-19",
+        "version": "1.4.0",
+        "configuration": "shipped-default",
+        "concurrency": 120,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 64205,
+        "ttfb_p95_ms": 75.1,
+        "ttfa_p95_ms": 447.4,
+        "rtf_p95": 0.794,
+        "prebuffer_p95_ms": 2.8,
+        "safe_start_p95_ms": 458.0,
+        "max_gap_p95_ms": 121.0,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 155.3,
+        "evidence": "reports/20260919-c96-axion/c120-cap40-30min-20260919-1838.log"
       }
     ],
-    "notes": "The operating point moved C96 -> C110 on 2026-09-19 evening, on the same host and bank, by two changes made the same day: the per-step prefill cap set to the measured slack, and backbone:bf16 with a tiled BFMMLA kernel. Against C100 before bf16: MARGINAL with 19 stalls and 124.4 audio-s/s, now GOOD with none and 144.5. The gates are balanced for the first time -- at C100 they sit at 62%, 77% and 78% of threshold where TTFA alone was at 105% that morning. CAUTION: MYNAH_PREFILL_STEP_MS=30 was derived as the slack left by a 50 ms step measured with the f16 kernel; bf16 made the step cheaper, so the cap is stale and is being re-derived (E10-19)."
+    "notes": "The operating point moved C96 -> C110 -> C120 across 2026-09-19, on one host and one bank, by three changes made that day: the per-step prefill cap, backbone:bf16 with a tiled BFMMLA kernel, and the cap re-measured after that kernel made the step cheaper. +25% concurrency and TTFA p95 492 -> 447 ms. TWO FINDINGS THAT EXPIRED THE SAME DAY THEY WERE WRITTEN, kept here so nobody quotes them: 'cap = deadline - T_frame' is not a law (at the modal width it now points the wrong way, because a frame that overruns is a debt a slot repays from its lead, not a stall), and '--max-batch is inert' was true at C100 and false at C120, where the width histogram reaches B7 with 92015 frames and B8 with 62154. The next limit is admission: at C130 TTFB triples because 16 workers x 8 slots is 128 places."
   }
 }
