@@ -481,7 +481,8 @@ enum {
  * the base is, which is what a default that calls itself an experimental
  * result has to do. */
 #define POCKET_QG_DEFAULT_SPEC                                                 \
-    "codec_transformer,codec_conv,backbone:f16,flow_net:f16,conditioner:f16"
+    "codec_transformer,codec_conv,codec_convtr,"                               \
+    "backbone:f16,flow_net:f16,conditioner:f16"
 
 /* The same sentence with the codec clauses PINNED, used when MYNAH_QUANT is
  * unset -- which is the shipped configuration and the one the paragraph above
@@ -507,8 +508,27 @@ enum {
  * `MYNAH_QUANT=int4` would silently no longer reach the codec, which is
  * precisely the configuration int4 is wanted for. So the pin applies only where
  * there is no MYNAH_QUANT to obey. */
+/* codec_convtr joined both strings on 2026-09-19, and the reason is a serving
+ * A/B rather than a kernel microbenchmark. Two ten-minute soaks on the Axion at
+ * C90, identical in every other respect, differing only in this clause:
+ *
+ *   OFF (what this string used to say)  MARGINAL  TTFA p95 544 ms, RTF p95
+ *                                       0.842, 5 stalls of 15380, 106.5 audio-s/s
+ *   ON                                  GOOD      TTFA p95 492 ms, RTF p95
+ *                                       0.728, 0 stalls of 17904, 124.3 audio-s/s
+ *
+ * So this is not 17% of throughput on top of a qualified configuration: with the
+ * clause absent there is NO qualified concurrency on that machine, because the
+ * TTFA gate and the stall gate both fail. The three transposed convolutions are
+ * the per-slot term b of T_frame(B) = a + b*B, and 1.86x on b at two threads per
+ * worker is capacity, not latency.
+ *
+ * What it costs, unchanged and known: SNR 28.9-32.9 dB against 36.4-37.9 on the
+ * codec's own quality gate, log-mel nearly unchanged. The audio the decision was
+ * taken on is kept under campioni/ -- captured from the streaming server under
+ * C90 of real load, with this clause ON. */
 #define POCKET_QG_DEFAULT_SPEC_PINNED                                          \
-    "codec_transformer:int8,codec_conv:int8,"                                  \
+    "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"                \
     "backbone:f16,flow_net:f16,conditioner:f16"
 
 typedef struct {

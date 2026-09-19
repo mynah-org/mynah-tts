@@ -291,3 +291,38 @@ difference is the STATISTIC, not the luck: a p95 is stable in sample size, a
 maximum is not. What failed that morning was `required_prebuffer` MAX; what held
 here was a percentile. Read the statistic before deciding whether a thin margin
 is fragile.
+
+## 2026-09-19 — the ceiling was never measured, and it is higher than C90
+
+C90 was promoted yesterday because it was the level being *investigated*, not
+because anything had said it was the top. Five ten-minute soaks on a freshly
+rebuilt v1.4.0 (box repo reset to `origin/main` at 77187b6, both binaries
+rebuilt — `make` alone does not rebuild the server, and the stale one was nearly
+measured) settle where the top actually is:
+
+| C (10 min, convtr ON) | verdict | TTFA p95 | RTF p95 | stall@250 | stall@500 |
+|---|---|---|---|---|---|
+| 90 | **GOOD** | 492 ms | 0.728 | 0 of 17904 | 0 |
+| 96 | **GOOD** | 494 ms | 0.756 | 0 of 18032 | 0 |
+| 98 | MARGINAL | 499.5 ms | 0.800 | **13** of 18067 | 0 |
+| 100 | MARGINAL | 522.6 ms | 0.817 | **22** of 18056 | 0 |
+
+**The failure changes character above C96, and that is the finding.** Between
+C96 and C100 the TTFA p95 moves 28 ms — the prefill cost is behaving exactly as
+the per-step cap promises, a slow linear drift. What does not behave is the
+stall count: 0 → 13 → 22, roughly doubling every two levels of concurrency,
+while `max_gap` p95 stays at 130-134 ms against an 80 ms frame. At C98 the TTFA
+gate still passes, by half a millisecond, and the run is MARGINAL *only* because
+of stalls.
+
+So the bound built yesterday is a bound on **prefill work per step**, and above
+C96 the thing that overruns the frame is no longer prefill. Sixteen workers at
+C100 carry 6.25 live slots each against 5.6 at C90; the AR step itself starts
+missing the 80 ms deadline. Any further work on "zero stalls at a higher C" has
+to attack the decode step or the slot count per worker, not the admission path.
+The next knob to try is therefore `--prefork 16 --prefork-threads 2` against a
+wider `--max-batch` or a nineteenth/twentieth worker, not another prefill knob.
+
+A second reading of the same table: `STREAM_RTF` p95 0.817 at C100 means the box
+still has a fifth of a realtime budget in hand at a level it cannot qualify.
+Capacity is not what stops us — continuity is, and it always has been.

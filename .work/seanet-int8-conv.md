@@ -212,3 +212,52 @@ three decibels in the direction that matters.
   it is eight numbers and one command.
 * **The x86 kernel is unexecuted**, as ever.  `MYNAH_QMAT_VNNI=scalar` now
   covers its *algebra* on any host; it does not cover VPDPBUSD itself.
+
+## 2026-09-19 — the decision, taken by an A/B on the serving path
+
+The open question above ("whether `codec_convtr` should be on by default") was
+answered and the default is flipped. What answered it is **not** the per-shape
+kernel table: it is two ten-minute soaks on the Axion at C90, identical in every
+respect but this one clause, run against the same 277-text mixed bank on
+v1.4.0 built on the box.
+
+| C90, ten minutes | `codec_convtr` OFF (the old default) | ON |
+|---|---|---|
+| verdict | **MARGINAL** | **GOOD** |
+| TTFA p95 | 544.2 ms — FAIL against 500 | 492 ms |
+| `STREAM_RTF` p95 | 0.842 | 0.728 |
+| `stall_rate@250ms` | 5 of 15380 — FAIL | **0 of 17904** |
+| `stall_rate@500ms` | 0 | 0 |
+| throughput | 106.5 audio-s/s | 124.3 audio-s/s |
+| completed requests | 15380 | 17904 |
+
+Read the verdict column first. This is not "17% more throughput on top of a
+qualified configuration" — with the clause absent **there is no qualified
+concurrency at all** on that machine, because two preferred gates fail at the
+only level that had ever passed. The kernel table said 1.86x on `conv_stack` at
+two threads per worker; the serving path says that factor is the difference
+between a product point and none, which is what it means for the codec to be the
+per-slot term `b` of `T_frame(B) = a + b*B`.
+
+The cost did not change and is not hidden: **SNR 28.9-32.9 dB against
+36.4-37.9**, log-mel nearly unchanged, i.e. a broadband residual eight decibels
+up that the mel bands barely see. The decision also rests on an ear test rather
+than only on a number: the clips under `campioni/campioni-20260918-1528-c90-int8/`
+were captured from the streaming server *under C90 of real load* with this clause
+ON, and were judged good.
+
+Both spec strings moved, keeping their existing division of labour: the bare
+clause in `POCKET_QG_DEFAULT_SPEC` (follows `MYNAH_QUANT`, so `int4` still
+reaches the codec) and `codec_convtr:int8` pinned in
+`POCKET_QG_DEFAULT_SPEC_PINNED` (the shipped path, where there is no
+`MYNAH_QUANT` to obey).
+
+### What this closes and what it opens
+
+Closed: every capacity number recorded since 2026-09-13 was measured with this
+clause ON while the binary shipped it OFF. That gap between the measured
+configuration and the shipped one is now zero, which was the real defect — a
+documented operating point the product could not reach by itself.
+
+Open, and cheap: the per-shape threshold table in this note is still from the
+Mac. Its *shape* is structural, its constants are not.
