@@ -190,7 +190,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test qmat-test qmat-negative-control server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -441,7 +441,7 @@ self-test: $(TARGET)
 	@$(TARGET) --self-test
 	@MYNAH_QMAT_VNNI=scalar $(TARGET) --self-test
 
-test: self-test kernels-test qmat-test driver-test window-test json-test playback-sim-test simd-auto-test
+test: self-test kernels-test qmat-test driver-test window-test json-test playback-sim-test perf-profile-test simd-auto-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
@@ -517,6 +517,11 @@ PROFILE_ARGS ?= --max-steps 64
 PORT ?= 8123
 playback-sim-test:
 	python3 tests/playback_sim.py
+
+# The serving profiles under configs/perf: every committed profile validates, and the
+# refusals that keep a qualifying run honest actually refuse.
+perf-profile-test:
+	python3 tests/test_perf_profile.py
 
 serving-profile: serving-wave
 

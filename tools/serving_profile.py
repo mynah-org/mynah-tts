@@ -732,6 +732,8 @@ def print_table(reports, args, meta):
           % (args.route, "stream" if args.stream else "batch",
              len(meta["bank"]), args.max_steps or "-"))
     print("  dispatch   %s" % meta.get("dispatch_desc", "<unrecorded>"))
+    if getattr(args, "profile_doc", None):
+        print(profile_banner(args.profile_doc, args.profile_path))
     print("  host       %s" % meta["host_desc"])
     print("  PLATFORM   %s" % meta.get("platform_caveat", ""))
     print("=" * W)
@@ -1110,6 +1112,105 @@ def host_description():
     return ", ".join(bits)
 
 
+# --------------------------------------------------------------------------------------
+# Serving profiles -- a configuration that cannot be got wrong by hand
+# --------------------------------------------------------------------------------------
+def apply_profile(args, ap):
+    """Fill args from configs/perf/<name>.json, and refuse rather than silently disagree.
+
+    Three things happen here, and the third is the point:
+
+      1. every knob the profile pins is written into args, so the run is the profile;
+      2. a flag the caller ALSO passed is a conflict, not an override -- a profile whose
+         values can be quietly replaced from the command line qualifies nothing;
+      3. a variable the profile declares absent must be absent from os.environ.
+
+    (3) is what this file exists for. Between 2026-09-13 and 2026-09-19 every capacity
+    number in docs/ was measured with MYNAH_QUANT_GROUPS exported by hand while the
+    shipped binary chose something slower, and nothing in the harness could see the
+    difference: the run passed, the product could not reproduce it.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import perf_profile as PP
+
+    try:
+        prof, path = PP.load(args.profile)
+    except PP.Bad as exc:
+        raise PB.Refusal([str(exc)])
+    errs = PP.semantic(prof, path)
+    if errs:
+        raise PB.Refusal(["%s is not a valid profile:" % path] + ["  " + e for e in errs])
+
+    given = set()
+    for tok in sys.argv[1:]:
+        if tok.startswith("--"):
+            given.add(tok.split("=", 1)[0])
+
+    reasons = []
+    for var in PP.forbidden_env(prof):
+        if var in os.environ:
+            reasons.append("%s is in the environment (=%r) and the profile declares it "
+                           "must be ABSENT: %s"
+                           % (var, os.environ[var],
+                              prof["runtime"]["environment"][var]["why"]))
+    wanted = PP.environ(prof)
+    for var, value in sorted(wanted.items()):
+        have = os.environ.get(var)
+        if have is not None and have != value:
+            reasons.append("%s is %r in the environment but the profile pins %r"
+                           % (var, have, value))
+    if reasons:
+        raise PB.Refusal(reasons)
+    os.environ.update(wanted)
+
+    pinned = {"--server-args": " ".join(PP.server_args(prof))}
+    for flag, value in zip(PP.gate_args(prof)[0::2], PP.gate_args(prof)[1::2]):
+        pinned[flag] = value
+    obj = prof["profile"].get("objective", {})
+    if obj.get("preferred_concurrency"):
+        pinned["--levels"] = str(obj["preferred_concurrency"])
+    pinned["--mode"] = "soak"
+
+    conflict = sorted(f for f in pinned if f in given)
+    if conflict:
+        raise PB.Refusal(
+            ["the profile %s pins these, and they were also given on the command line:"
+             % prof["profile"]["id"]]
+            + ["  %s (profile says %s)" % (f, pinned[f]) for f in conflict]
+            + ["a profile whose values can be overridden from the shell qualifies "
+               "nothing. Drop the flag, or run without --profile and own the numbers."])
+
+    for flag, value in pinned.items():
+        dest = flag[2:].replace("-", "_")
+        cur = getattr(args, dest, None)
+        setattr(args, dest, type(cur)(value) if isinstance(cur, (int, float)) else value)
+
+    args.profile_doc = prof
+    args.profile_path = path
+    return args
+
+
+def profile_banner(prof, path):
+    q = prof["qualification"]
+    op = q.get("operating_point") or {}
+    out = ["  PROFILE    %s  (%s)" % (prof["profile"]["id"], os.path.relpath(path, "."))]
+    out.append("             %s" % prof["profile"]["description"])
+    out.append("             status %s%s" % (
+        q["status"],
+        ("  --  the qualified point is C%d, %s, %ds, %d requests"
+         % (op["concurrency"], op["verdict"], op.get("soak_seconds", 0),
+            op.get("requests", 0))) if op else ""))
+    env = PBENV(prof)
+    out.append("             env    %s" % (env or "(none -- the shipped default)"))
+    return "\n".join(out)
+
+
+def PBENV(prof):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import perf_profile as PP
+    return " ".join("%s=%s" % kv for kv in sorted(PP.environ(prof).items()))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1123,6 +1224,12 @@ def main():
     srv.add_argument("--server-args", default="", help="extra argv for the server")
     srv.add_argument("--server-log", default="", help="file for the server's output")
     srv.add_argument("--server-timeout", type=float, default=300.0)
+    srv.add_argument("--profile", default="",
+                     help="a serving profile from configs/perf: it supplies the server "
+                          "topology, the environment, the bank and every gate, and "
+                          "REFUSES the run if the environment contradicts it. This is the "
+                          "way to reproduce a qualified operating point without retyping "
+                          "it -- see tools/perf_profile.py")
 
     load = ap.add_argument_group("load")
     load.add_argument("--mode", choices=("wave", "soak"), default="wave",
@@ -1228,6 +1335,14 @@ def main():
     out.add_argument("--quiet", action="store_true")
 
     args = ap.parse_args()
+    if args.profile:
+        try:
+            apply_profile(args, ap)
+        except PB.Refusal as exc:
+            print("REFUSING TO RUN THE PROFILE:", file=sys.stderr)
+            for why in exc.reasons:
+                print("  %s" % why, file=sys.stderr)
+            return 4
     args.buffers = tuple(int(x) for x in args.buffers.split(",") if x.strip())
     if args.compare:
         try:

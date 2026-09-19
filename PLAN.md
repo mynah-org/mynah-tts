@@ -798,6 +798,22 @@ the x86 self-test that judges the two kernels written here and never executed
       - **(3) the interim contract, true today at zero cost — a 600 ms client prebuffer.**
         No request in 53895 needed more than **535 ms** of lead at C96 over thirty minutes.
         It ships until (1) lands, and it is a statement about a 30-minute sample of a tail
+- [x] E10-17 **the configuration of a qualifying run no longer lives in shell history** —
+      [`.work/serving-profiles.md`](.work/serving-profiles.md). `configs/perf/*.json` carries
+      the deployment shape, the gates AND the operating point measured on that hardware;
+      `tools/serving_profile.py --profile <id>` applies all of it and **refuses** when the
+      world disagrees -- a variable the profile declares absent that is present in the
+      environment, or a flag also given on the command line (a conflict, not an override).
+      Built because of a specific six-day failure: every capacity number between 09-13 and
+      09-19 was measured with `MYNAH_QUANT_GROUPS` exported by hand while the shipped binary
+      chose something 1.86x slower, both facts written down, and nothing in the harness could
+      see the difference. The validator encodes the mistakes actually made -- `qualified`
+      needs a 30-minute soak (a screen may not promote), GOOD with zero stalls,
+      `history` ending at the operating point, no GOOD level parked in `ceiling`. Every point
+      must also declare `shipped-default` or `environment-override`, because that difference
+      is invisible in every other field. `tools/perf_profile.py detect` answers "what is this
+      box and where do I start" in one command, with architecture as a wall and an explicit
+      refusal to inherit a topology. Gate: `make perf-profile-test`, 29 checks
 - [ ] E10-10 **the topology is answered, and the answer is that it belongs to the MODEL** —
       `8x4` with the same 32 threads and the same 128 slots is decisively WORSE at C96:
       RTF p95 **1.052** against 0.784 (a mandatory gate), throughput 93.6 against 124.8
@@ -857,7 +873,7 @@ the x86 self-test that judges the two kernels written here and never executed
       relative error 0.0046 → 1.45 and nothing crashed. The test also gives
       `sea_taps_all()` its first caller on a `BLAS=scalar` build, where it was compiled,
       unreferenced and warned about
-- [~] E10-14 **the box says turn it on; the quality half is still a product call** —
+- [~] E10-14 **decided and flipped; one confirmation run left** —
       measured on the Axion at the thread counts serving actually uses, `codec.conv_stack`:
       **2 threads/worker 224.8 → 120.8 ms (1.86x)**, 4 threads 129.7 → 83.9 (1.55x). At 16
       threads it is a wash, which is why the laptop's reading was misleading — and why the
@@ -867,7 +883,16 @@ the x86 self-test that judges the two kernels written here and never executed
       measured with `codec_convtr:int8` ON, and it is OFF by default** — so those numbers
       do not describe the shipped configuration until the default is flipped. The cost is
       unchanged and known: SNR 28.9-32.9 dB against 36.4-37.9, log-mel nearly unchanged.
-      **To close**: take the decision, then flip the default and re-run the gate
+      **DECIDED 2026-09-19 and the default is flipped** (`ea7ddd7`). What decided it was a
+      serving A/B, not the kernel table: two ten-minute soaks at C90 differing only in this
+      clause gave **MARGINAL with it OFF** (TTFA p95 544 against a 500 ms gate, 5 stalls of
+      15380, RTF p95 0.842, 106.5 audio-s/s) and **GOOD with it ON** (TTFA p95 492, 0 stalls
+      of 17904, RTF p95 0.728, 124.3). So it is not 17% on top of a qualified configuration:
+      without it there is NO qualified concurrency on that machine. The quality half was
+      judged by ear on clips captured from the streaming server under C90 of real load.
+      **Remaining**: the closing gate -- one soak with NO `MYNAH_QUANT_GROUPS` in the
+      environment, so the shipped binary reproduces the point on its own. The profile that
+      makes that checkable rather than remembered is E10-17
 - [-] **rejected, with the reference's own numbers.** Do not build these: prefill helper
       thread (stall@250 20.1%→46.8%); token-range slicing (occupancy floor invariant at
       83-97 ms); per-layer prefill checkpointing (TTFA p95 223→1208 ms); fixed-target

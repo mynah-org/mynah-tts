@@ -1,0 +1,247 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "mynah-tts/configs/perf/schema.json",
+  "title": "Serving profile",
+  "description": "One question: given this hardware, this engine and this objective, how should the server be run? A profile is a DEPLOYMENT configuration plus the gates that qualify it. It carries the operating point that was measured on this hardware and the evidence pointer, but not the provenance of one run (binary hash, seed, timestamp): those belong to the run artifact, which names a profile by id. That split is what lets a recommendation survive a new binary. A profile is either COMPLETE (every section present) or an ALIAS (profile.alias_of set and nothing else).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile"],
+  "properties": {
+    "schema_version": { "const": 1 },
+
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+        "description": { "type": "string" },
+        "alias_of": {
+          "type": "string",
+          "description": "When present this file is a pointer and every other section must be absent. An alias that repeats values is a second copy that will drift."
+        },
+        "engine": { "enum": ["pocket", "magpie"] },
+        "objective": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["primary", "concurrency_range", "quality_changes_allowed"],
+          "properties": {
+            "primary": { "enum": ["ttfa", "throughput", "realtime_factor", "memory"] },
+            "secondary": { "enum": ["ttfa", "throughput", "realtime_factor", "memory", "none"] },
+            "concurrency_range": {
+              "type": "array", "items": { "type": "integer", "minimum": 1 },
+              "minItems": 2, "maxItems": 2
+            },
+            "preferred_concurrency": { "type": "integer", "minimum": 1 },
+            "quality_changes_allowed": {
+              "type": "boolean",
+              "description": "false means this profile may not trade audio quality for speed beyond what runtime.quant_groups already declares."
+            }
+          }
+        }
+      }
+    },
+
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "logical_cpus"],
+      "properties": {
+        "architecture": { "enum": ["arm64", "x86_64"] },
+        "cpu_family": { "type": "string" },
+        "logical_cpus": { "type": "integer", "minimum": 1 },
+        "physical_cores": { "type": "integer", "minimum": 1 },
+        "threads_per_core": { "type": "integer", "minimum": 1 },
+        "numa_nodes": { "type": "integer", "minimum": 1 },
+        "ram_gib": { "type": "integer", "minimum": 1 },
+        "l3_mib": { "type": "integer", "minimum": 1 },
+        "isa_features_used": { "type": "array", "items": { "type": "string" } },
+        "smt_policy": { "type": "string" },
+        "canonical_topology": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blas", "simd"],
+      "properties": {
+        "target": { "type": "string" },
+        "blas": {
+          "enum": ["none", "openblas", "scalar", "accelerate"],
+          "description": "Linux production is BLAS=none unless a profile says otherwise; a codec number taken under Accelerate is not comparable with one taken here."
+        },
+        "simd": { "type": "string" },
+        "compiler": { "type": "string" },
+        "requirements": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prefork_workers", "threads_per_worker", "max_batch"],
+      "properties": {
+        "prefork_workers": { "type": "integer", "minimum": 1 },
+        "threads_per_worker": { "type": "integer", "minimum": 1 },
+        "max_batch": { "type": "integer", "minimum": 1 },
+        "max_pending": { "type": "integer", "minimum": 0 },
+        "request_timeout_ms": { "type": "integer", "minimum": 0 },
+        "extra_arguments": { "type": "array", "items": { "type": "string" } },
+        "why": { "type": "string" }
+      }
+    },
+
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["environment"],
+      "properties": {
+        "quant_groups": {
+          "type": "object",
+          "description": "The intended encoding per group, as documentation. It is NOT serialized into MYNAH_QUANT_GROUPS unless runtime.environment says so: a profile that matches the shipped default must leave the variable out, so that what is measured is what a plain binary does.",
+          "additionalProperties": { "enum": ["int8", "int4", "f16", "f32"] }
+        },
+        "matches_shipped_default": {
+          "type": "boolean",
+          "description": "true asserts that quant_groups is exactly what the binary picks with no MYNAH_QUANT_GROUPS in the environment. The validator cannot check this against C source; a run against the profile can, and must."
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "why"],
+            "properties": {
+              "value": {
+                "type": ["string", "null"],
+                "description": "null means the variable must be ABSENT from the environment of a qualifying run, not merely equal to something."
+              },
+              "why": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mandatory", "preferred", "soak"],
+      "properties": {
+        "mandatory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rtf_p95_below", "stall_ms"],
+          "properties": {
+            "rtf_p95_below": { "type": "number" },
+            "stall_ms": { "type": "integer", "minimum": 0 },
+            "completed_equals_launched": { "type": "boolean" }
+          }
+        },
+        "preferred": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ttfb_p95_ms": { "type": "number" },
+            "ttfa_p95_ms": { "type": "number" },
+            "rtf_p95": { "type": "number" },
+            "prebuffer_p95_ms": { "type": "number" },
+            "safe_start_p95_ms": { "type": "number" },
+            "stall_ms": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "drift": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rtf_tolerance": { "type": "number" },
+            "prebuffer_tolerance_ms": { "type": "number" },
+            "min_windows": { "type": "integer", "minimum": 2 }
+          }
+        },
+        "soak": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bank", "seconds", "warmup_seconds", "window_seconds"],
+          "properties": {
+            "bank": { "type": "string" },
+            "bank_version": { "type": "string" },
+            "seconds": {
+              "type": "integer", "minimum": 600,
+              "description": "A ten-minute soak screens; it does not promote. The 2026-09-18 lesson: a required_prebuffer MAX moved 495 -> 535 ms between ten minutes and thirty while its p95 did not move at all."
+            },
+            "warmup_seconds": { "type": "number", "minimum": 0 },
+            "window_seconds": { "type": "number", "minimum": 1 }
+          }
+        },
+        "client_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prebuffer_ms": { "type": "integer", "minimum": 0 },
+            "why": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "model"],
+      "properties": {
+        "status": {
+          "enum": ["qualified", "unqualified", "provisional"],
+          "description": "qualified means a soak of gates.soak.seconds at operating_point.concurrency met every mandatory AND preferred gate on THIS hardware. Nothing else may set it."
+        },
+        "model": { "type": "string" },
+        "voice": { "type": "string" },
+        "workload": { "type": "string" },
+        "operating_point": { "$ref": "#/definitions/point" },
+        "ceiling": {
+          "type": "array", "items": { "$ref": "#/definitions/point" },
+          "description": "Levels measured ABOVE the operating point and not promoted. Keeping them is what stops the next campaign from re-discovering the same edge."
+        },
+        "history": {
+          "type": "array", "items": { "$ref": "#/definitions/point" },
+          "description": "Every qualified point this profile has had, oldest first. The best is the last; the rest are what makes a regression visible."
+        },
+        "notes": { "type": "string" }
+      }
+    }
+  },
+
+  "definitions": {
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date", "concurrency", "verdict", "configuration"],
+      "properties": {
+        "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "commit": { "type": "string" },
+        "version": { "type": "string" },
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "verdict": { "enum": ["GOOD", "MARGINAL", "NOT STREAMABLE", "NOT QUOTABLE", "INCONCLUSIVE"] },
+        "configuration": {
+          "enum": ["shipped-default", "environment-override"],
+          "description": "Whether this point was measured by a plain binary or by a binary plus exported variables. Required, and required to be answered for every point, because the difference is invisible in every other field: between 2026-09-13 and 2026-09-19 every capacity number here was 'environment-override' while the docs read as if it were the product."
+        },
+        "soak_seconds": { "type": "integer", "minimum": 1 },
+        "requests": { "type": "integer", "minimum": 1 },
+        "ttfb_p95_ms": { "type": "number" },
+        "ttfa_p95_ms": { "type": "number" },
+        "rtf_p95": { "type": "number" },
+        "prebuffer_p95_ms": { "type": "number" },
+        "safe_start_p95_ms": { "type": "number" },
+        "max_gap_p95_ms": { "type": "number" },
+        "stalls_250ms": { "type": "integer", "minimum": 0 },
+        "stalls_500ms": { "type": "integer", "minimum": 0 },
+        "throughput_audio_s_per_s": { "type": "number" },
+        "evidence": { "type": "string", "description": "Path to the full report, relative to the repo root." },
+        "why_not_promoted": { "type": "string" }
+      }
+    }
+  }
+}

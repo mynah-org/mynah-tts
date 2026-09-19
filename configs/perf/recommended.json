@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "recommended",
+    "description": "Stable entry point. Points at the current recommendation so a script, a deployment or an agent can name one thing and follow it when the recommendation moves. It carries no values of its own: an alias that repeats them is a second copy that will drift.",
+    "alias_of": "axion-c4a-32c-pocket-en"
+  }
+}

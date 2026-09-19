@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "axion-c4a-32c-pocket-en",
+    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English streaming. C90 is the qualified operating point; C96 is the measured edge and is MARGINAL by one stall in 54186. Host-scoped: this is not a generic Arm profile and makes no claim about a 16-core host or about Magpie.",
+    "engine": "pocket",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [1, 100],
+      "preferred_concurrency": 90,
+      "quality_changes_allowed": false
+    }
+  },
+
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_family": "Google Axion / Arm Neoverse-V2",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "ram_gib": 62,
+    "isa_features_used": ["asimddp", "i8mm"],
+    "smt_policy": "OFF; one thread per physical core",
+    "canonical_topology": "16 workers x 2 threads, no pinning",
+    "notes": "GCP c4a, no SMT. The load generator ran on the same box for every number here, which costs ~13% coalesced client reads: the cadence percentiles are upper bounds on server lateness, not the server's true emission."
+  },
+
+  "build": {
+    "target": "make && make server",
+    "blas": "none",
+    "simd": "auto (arm64/native)",
+    "compiler": "gcc 15.2",
+    "requirements": {
+      "blas": "BLAS=none is the Linux default and the only setting these numbers describe. A codec measurement taken under Accelerate puts the phases in a different order and is not comparable.",
+      "isa": "ASIMDDP for the int8 codec kernels"
+    }
+  },
+
+  "server": {
+    "prefork_workers": 16,
+    "threads_per_worker": 2,
+    "max_batch": 8,
+    "why": "16x2 beats 8x4 decisively here: at equal threads and equal slots, RTF p95 0.784 against 1.052, throughput -25%, stall@250 84/17968 against 734/13511. The optimum is a property of the model's T_frame(B) = a + b*B ratio, not of the machine -- qwen-tts at 1.7B prefers 4x8 on this same host. max_batch is capped at 16 by MYNAH_GRAPH_MAX_JOBS and is not binding at C90 (about 6 live slots per worker)."
+  },
+
+  "runtime": {
+    "matches_shipped_default": true,
+    "quant_groups": {
+      "codec_transformer": "int8",
+      "codec_conv": "int8",
+      "codec_convtr": "int8",
+      "backbone": "f16",
+      "flow_net": "f16",
+      "conditioner": "f16"
+    },
+    "environment": {
+      "MYNAH_QUANT_GROUPS": {
+        "value": null,
+        "why": "Must be ABSENT. quant_groups above is exactly POCKET_QG_DEFAULT_SPEC_PINNED since 2026-09-19, so a run that exports this variable is measuring a shell line rather than the product -- which is precisely the gap that went unnoticed for six days. An export also refuses the run rather than passing quietly."
+      },
+      "MYNAH_PREFILL_SLICE": {
+        "value": null,
+        "why": "Must be ABSENT. The shipped default is 32 tokens per slice; setting it to 0 restores the one-shot prefill that froze the whole batch on every admission."
+      },
+      "MYNAH_PREFILL_STEP_MS": {
+        "value": null,
+        "why": "Must be ABSENT. The shipped default is 60 ms of prefill work per AR step. This cap is what makes zero stalls a scheduler bound instead of a lucky distribution; 0 removes it."
+      }
+    }
+  },
+
+  "gates": {
+    "mandatory": {
+      "rtf_p95_below": 1.0,
+      "stall_ms": 500,
+      "completed_equals_launched": true
+    },
+    "preferred": {
+      "ttfb_p95_ms": 100.0,
+      "ttfa_p95_ms": 500.0,
+      "rtf_p95": 0.9,
+      "prebuffer_p95_ms": 500.0,
+      "safe_start_p95_ms": 1000.0,
+      "stall_ms": 250
+    },
+    "drift": {
+      "rtf_tolerance": 0.05,
+      "prebuffer_tolerance_ms": 150.0,
+      "min_windows": 3
+    },
+    "soak": {
+      "bank": "tests/load_texts_en_v2.txt",
+      "bank_version": "v2 / bank-sha256 55b286369ef8dd44 / 277 texts",
+      "seconds": 1800,
+      "warmup_seconds": 40,
+      "window_seconds": 180
+    },
+    "client_contract": {
+      "prebuffer_ms": 250,
+      "why": "At the operating point the worst client prebuffer measured 267 ms and max_gap never exceeded 177 ms against an 80 ms frame. 250 ms is a scheduler bound, not a sample maximum: MYNAH_PREFILL_STEP_MS caps the prefill work one AR step may absorb."
+    }
+  },
+
+  "qualification": {
+    "status": "qualified",
+    "model": "models/pocket-en",
+    "workload": "Mixed v2 bank, streaming route /v1/audio/speech, PCM, one language pack, load generator on the same host.",
+    "operating_point": {
+      "date": "2026-09-18",
+      "version": "1.4.0",
+      "configuration": "environment-override",
+      "concurrency": 90,
+      "verdict": "GOOD",
+      "soak_seconds": 1800,
+      "requests": 53265,
+      "ttfb_p95_ms": 82.0,
+      "ttfa_p95_ms": 494.8,
+      "rtf_p95": 0.734,
+      "prebuffer_p95_ms": 10.2,
+      "safe_start_p95_ms": 527.3,
+      "max_gap_p95_ms": 129.2,
+      "stalls_250ms": 0,
+      "stalls_500ms": 0,
+      "throughput_audio_s_per_s": 128.9,
+      "evidence": "docs/performance.md#2026-09-18"
+    },
+    "ceiling": [
+      {
+        "date": "2026-09-19",
+        "version": "1.4.0",
+        "configuration": "environment-override",
+        "concurrency": 96,
+        "verdict": "MARGINAL",
+        "soak_seconds": 1800,
+        "requests": 54186,
+        "ttfb_p95_ms": 83.0,
+        "ttfa_p95_ms": 490.4,
+        "rtf_p95": 0.754,
+        "prebuffer_p95_ms": 10.2,
+        "safe_start_p95_ms": 506.3,
+        "max_gap_p95_ms": 130.2,
+        "stalls_250ms": 1,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 131.2,
+        "evidence": "reports/20260919-c96-axion/c96-30min.log",
+        "why_not_promoted": "ONE stall in 54186 requests at a 250 ms client buffer. Every other gate passed with room, including TTFA p95 490.4 against 500, and the drift was flat over ten windows. The same level was GOOD over ten minutes with 0 of 18032 -- which is the whole reason a screen may not promote. Not 'C96 does not work': C96 is not GUARANTEED, and zero is a statement about the worst case."
+      },
+      {
+        "date": "2026-09-19",
+        "version": "1.4.0",
+        "configuration": "environment-override",
+        "concurrency": 98,
+        "verdict": "MARGINAL",
+        "soak_seconds": 600,
+        "requests": 18067,
+        "ttfa_p95_ms": 499.5,
+        "rtf_p95": 0.8,
+        "stalls_250ms": 13,
+        "stalls_500ms": 0,
+        "evidence": "reports/20260919-c96-axion/ab-sweep-c90ab-c96-c98-c100.log",
+        "why_not_promoted": "Thirteen stalls in ten minutes, while the TTFA gate still passed by half a millisecond. Above C96 the binding failure changes character: TTFA drifts only 28 ms from C96 to C100 while stalls roughly double every two levels, so what overruns the 80 ms frame is the AR step itself, not the prefill."
+      },
+      {
+        "date": "2026-09-19",
+        "version": "1.4.0",
+        "configuration": "environment-override",
+        "concurrency": 100,
+        "verdict": "MARGINAL",
+        "soak_seconds": 600,
+        "requests": 18056,
+        "ttfa_p95_ms": 522.6,
+        "rtf_p95": 0.817,
+        "stalls_250ms": 22,
+        "stalls_500ms": 0,
+        "evidence": "reports/20260919-c96-axion/ab-sweep-c90ab-c96-c98-c100.log",
+        "why_not_promoted": "Both preferred gates fail. RTF p95 0.817 means the box still has a fifth of a realtime budget in hand at a level it cannot qualify: capacity is not what stops us here, continuity is."
+      }
+    ],
+    "history": [
+      {
+        "date": "2026-09-13",
+        "configuration": "environment-override",
+        "concurrency": 99,
+        "verdict": "NOT STREAMABLE",
+        "soak_seconds": 1800,
+        "requests": 53895,
+        "stalls_250ms": 233,
+        "stalls_500ms": 5,
+        "evidence": ".work/axion-c99-soak.md",
+        "why_not_promoted": "Before the prefill was sliced, admitting a request froze every resident slot: worst freeze 707 ms against an 80 ms frame. No level on the mixed bank could be promoted at all."
+      },
+      {
+        "date": "2026-09-18",
+        "version": "1.4.0",
+        "configuration": "environment-override",
+        "concurrency": 90,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 53265,
+        "ttfb_p95_ms": 82.0,
+        "ttfa_p95_ms": 494.8,
+        "rtf_p95": 0.734,
+        "prebuffer_p95_ms": 10.2,
+        "safe_start_p95_ms": 527.3,
+        "max_gap_p95_ms": 129.2,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 128.9,
+        "evidence": "docs/performance.md#2026-09-18"
+      }
+    ],
+    "notes": "Every point here was measured with codec_convtr:int8 exported by hand; from 2026-09-19 that encoding IS the shipped default, so runtime.matches_shipped_default is true and future points must read 'shipped-default'. The re-run that confirms the default reproduces the operating point on a plain binary is the closing gate of PLAN.md E10-14."
+  }
+}
