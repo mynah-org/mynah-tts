@@ -324,8 +324,17 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       right; this runtime promises batching cannot change a row's result, and a 14x kernel
       does not get to be the exception. **To close**: ONE SHAPE EVERYWHERE -- the
       single-activation path reaches the same kernel with the activation repeated, which
-      needs the packed pointer in `qmat_rows_job`. `MYNAH_QMAT_BF16_TILE=1` measures it
-      meanwhile, and `--self-test` covers it against the scalar reference
+      needs the packed pointer in `qmat_rows_job`. **DONE, and the trade did not exist**:
+      every bf16 multiply now takes the tile -- a batch of four, a short group with its last
+      activation repeated, a row-pair remainder inside the same call, and a SINGLE
+      activation repeated into all four lanes. Three quarters of the arithmetic is
+      discarded at batch one and costs nothing, because the kernel is memory-bound there.
+      `self_test_lane_widths` PASSES with the kernel on, two consecutive runs give the same
+      sha256, and `prep.prefill_proj` is **8.571 ms f16 -> 6.338 bf16** with RTF 0.151 ->
+      0.121. `MYNAH_QMAT_BF16_TILE` is gone. **Still open, and it is a product question not
+      an engineering one**: against an f32 backbone, f16 holds SNR 33.6 dB / corr 0.9998
+      while bf16 sits at 3.0-5.4 dB / 0.76-0.85, so bf16 DEVIATES from what the model would
+      have said. Decided by listening
 - [ ] E4-7 AMX-INT8 (Linux/x86 only), last
 - [ ] E4-10 **remove useless dtype conversions** — called out by name as one of the two
       profiling wins. `src/qmat.c` holds 15 conversion sites and every other hot-path

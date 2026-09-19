@@ -319,3 +319,50 @@ commit, and until it lands `MYNAH_QMAT_BF16_TILE=1` turns the tile on for
 measurement while `--self-test` covers it against the scalar reference with a
 tolerance — an untested kernel that an environment variable can switch on would
 be worse than no kernel.
+
+## The trade did not exist: one shape everywhere
+
+The tile was off because it broke `self_test_lane_widths` — a batch of four
+rounded differently from a request served alone, so the same seed rendered
+differently on a busy server than on an idle one. The fix was not to loosen the
+test. It was to notice that the conflict came from **wiring two accumulation
+orders into one engine**, not from the kernel.
+
+Now every bf16 multiply takes the same path:
+
+* a batch of four or more: the tiled BFMMLA kernel;
+* a short group: the SAME kernel with its last activation repeated into the
+  spare lanes;
+* fewer than four row-pairs left inside a call: the same tile, one pair at a
+  time, off the same packed layout — not the BFDOT kernel, which would have
+  given those rows a different order from the rows above them in the very same
+  call;
+* a SINGLE activation, from `matvec_bf16`: the same tile again, activation
+  repeated into all four lanes.
+
+Three quarters of the arithmetic is discarded at batch one and it costs nothing:
+the kernel is memory-bound there, so the wasted lanes were already idle. What it
+buys is that a row's answer no longer depends on how many requests happened to
+share the worker.
+
+Where the packed layout does not exist — no bf16 unit, or `k < 4` — every width
+falls back together to BFDOT, which keeps the property for the same reason.
+
+### Measured after
+
+    prep.prefill_proj      RTF        reproducibility
+      8.571 ms             0.151      backbone:f16
+      6.338 ms             0.121      backbone:bf16, tiled, DEFAULT
+
+1.35x on the projections, -20% on the request, and two consecutive runs of the
+same request produce **the same sha256**. `self_test_lane_widths` passes with the
+kernel on, which is the assertion that was failing and the reason it was off.
+
+`MYNAH_QMAT_BF16_TILE` is gone; there is nothing left to opt into.
+
+**What has NOT changed**: `backbone:bf16` still departs from the f32 reference
+far more than f16 does — measured against a no-quantization backbone, f16 holds
+SNR 33.6 dB and correlation 0.9998 while bf16 sits at 3.0-5.4 dB and 0.76-0.85.
+Reproducibility was the engineering blocker and it is gone; fidelity is the
+product question and it is open, and it is decided by listening, not by this
+note. The samples are in `~/Desktop/PocketTTS-ab-kernel-2026-09-19/`.

@@ -2254,14 +2254,41 @@ static void matvec_bf16_neon_tile(float *o0, float *o1, float *o2, float *o3,
             }
         }
     }
-    /* Fewer than four row-pairs left: the x4 BFDOT kernel finishes them. It
-     * reads the PLAIN copy, so no second tail layout is needed. */
-    if (p < npairs) {
-        const size_t done = p * 2u;
-        matvec_bf16_neon_x4(o0 + done, o1 + done, o2 + done, o3 + done,
-                            x0, x1, x2, x3, plain + done * cols,
-                            bias == NULL ? NULL : bias + done,
-                            rows - done, cols);
+    /* Fewer than four row-pairs left. They go through the SAME tile, one pair
+     * at a time, reading the same packed layout -- not through the BFDOT
+     * kernel, which would give those rows a different accumulation order from
+     * the rows above them in the very same call. */
+    for (; p < npairs; ++p) {
+        const bfloat16_t *w0 = (const bfloat16_t *)(pairs + p * pairw);
+        float32x4_t a0 = vdupq_n_f32(0.0f), b0 = vdupq_n_f32(0.0f);
+        for (size_t k = 0, off = 0; k < kmain; k += 4u, off += 8u) {
+            bfloat16x8_t va = vcvtq_low_bf16_f32(vld1q_f32(x0 + k));
+            va = vcvtq_high_bf16_f32(va, vld1q_f32(x1 + k));
+            bfloat16x8_t vb = vcvtq_low_bf16_f32(vld1q_f32(x2 + k));
+            vb = vcvtq_high_bf16_f32(vb, vld1q_f32(x3 + k));
+            const bfloat16x8_t u0 = vld1q_bf16(w0 + off);
+            a0 = vbfmmlaq_f32(a0, va, u0);
+            b0 = vbfmmlaq_f32(b0, vb, u0);
+        }
+        const float32x4_t acc[2] = {a0, b0};
+        for (int t = 0; t < 2; ++t) {
+            const size_t m = (t == 0) ? 0u : 2u;
+            const size_t row = p * 2u;
+            const float v[4] = {vgetq_lane_f32(acc[t], 0), vgetq_lane_f32(acc[t], 1),
+                                vgetq_lane_f32(acc[t], 2), vgetq_lane_f32(acc[t], 3)};
+            for (size_t r = 0; r < 2u; ++r) {
+                if (row + r >= rows) continue;
+                const float bv = (bias == NULL) ? 0.0f : bias[row + r];
+                for (size_t a = 0; a < 2u; ++a) {
+                    float sum = v[a * 2u + r];
+                    for (size_t c = kmain; c < cols; ++c) {
+                        sum += qmat_bf16_to_f32(plain[(row + r) * cols + c]) *
+                               qmat_bf16_to_f32(qmat_bf16_from_f32(xs[m + a][c]));
+                    }
+                    os[m + a][row + r] = sum + bv;
+                }
+            }
+        }
     }
 }
 
@@ -2613,13 +2640,36 @@ static int qmat_bf16_unit(void) {
 }
 
 static void matvec_bf16(float *out, const float *x, const uint16_t *weights,
-                        const float *bias, size_t rows, size_t cols) {
+                        const uint16_t *pairs, const float *bias, size_t rows,
+                        size_t cols) {
 #if defined(MYNAH_QMAT_BF16_NEON)
     if (qmat_bf16_unit()) {
+        /* ONE SHAPE FOR EVERY WIDTH.
+         *
+         * A single activation goes through the SAME tiled kernel a batch of
+         * four does, with the activation repeated into the other three lanes.
+         * Three quarters of the arithmetic is thrown away and it is still the
+         * right thing: the kernel is memory-bound at one activation, so the
+         * wasted lanes are free, and what it buys is that a row's answer no
+         * longer depends on how many requests happened to share the worker.
+         *
+         * That is not a nicety. Without it, the same request with the same seed
+         * renders differently on a busy server than on an idle one, because
+         * BFMMLA accumulates k in blocks of four and BFDOT in chains of eight,
+         * and an autoregressive model turns a 1e-7 difference into a different
+         * take. The repeated lanes write the same address with the same value,
+         * which is the trick the int8 and f16 paths already use for a remainder
+         * of three. */
+        if (pairs != NULL) {
+            matvec_bf16_neon_tile(out, out, out, out, x, x, x, x, pairs,
+                                  weights, bias, rows, cols);
+            return;
+        }
         matvec_bf16_neon(out, x, weights, bias, rows, cols);
         return;
     }
 #endif
+    (void)pairs;
     matvec_bf16_scalar(out, x, weights, bias, rows, cols);
 }
 #endif /* MYNAH_QMAT_BF16 */
@@ -2640,6 +2690,11 @@ typedef struct {
     const float *x;     /* F16: the activation is not quantized */
     float sx;
     const void *weights;
+    /* BF16 only: the row-pair-interleaved copy, or NULL. It travels with the
+     * job so that a SINGLE activation reaches the same BFMMLA kernel a batch of
+     * four does -- which is what makes a row's answer independent of how many
+     * requests happened to share the worker. See matvec_bf16. */
+    const void *weights_pairs;
     const float *scales;
     const int32_t *rowsum; /* INT8 + unsigned activation: the +128 correction */
     const float *bias;
@@ -2665,8 +2720,13 @@ static void qmat_rows_dispatch(const qmat_rows_job *j, size_t row0, size_t count
 #endif
 #if defined(MYNAH_QMAT_BF16)
     } else if (j->qtype == QMAT_BF16) {
+        const uint16_t *pairs = NULL;
+        if (j->weights_pairs != NULL && (row0 % 2u) == 0u) {
+            pairs = (const uint16_t *)j->weights_pairs +
+                    (row0 / 2u) * 2u * (j->cols & ~(size_t)3u);
+        }
         matvec_bf16(j->out + row0, j->x,
-                    (const uint16_t *)j->weights + row0 * j->cols,
+                    (const uint16_t *)j->weights + row0 * j->cols, pairs,
                     bias, count, j->cols);
 #endif
     } else {
@@ -2687,15 +2747,16 @@ static void qmat_rows_block(void *opaque, int block_index) {
 }
 
 static void matvec_q_rows(float *out, const void *qx, const float *x, float sx,
-                          const void *weights, const float *scales,
-                          const int32_t *rowsum, const float *bias,
-                          size_t rows, size_t cols, int qtype, int level) {
+                          const void *weights, const void *weights_pairs,
+                          const float *scales, const int32_t *rowsum,
+                          const float *bias, size_t rows, size_t cols,
+                          int qtype, int level) {
     size_t weight_bytes;
     if (qtype == QMAT_INT8) weight_bytes = rows * cols;
     else if (qtype == QMAT_F16 || qtype == QMAT_BF16) weight_bytes = rows * cols * 2u;
     else weight_bytes = rows * cols / 2u;
-    const qmat_rows_job job = {out, qx, x, sx, weights, scales, rowsum, bias,
-                               rows, cols, qtype, level};
+    const qmat_rows_job job = {out, qx, x, sx, weights, weights_pairs, scales,
+                               rowsum, bias, rows, cols, qtype, level};
     if (mynah_num_threads() > 1 && weight_bytes >= QMAT_THREAD_MIN_BYTES &&
         rows > QMAT_ROW_BLOCK) {
         const size_t blocks = (rows + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK;
@@ -3349,35 +3410,26 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
         const uint16_t *wb = (const uint16_t *)weights + row0 * j->cols;
         size_t b = 0;
-        /* row0 must land on a row-pair boundary for the packed layout to be
-         * addressable; QMAT_ROW_BLOCK is 32, so it always does.
+        /* ONE SHAPE FOR EVERY WIDTH, which is what makes the answer
+         * reproducible.
          *
-         * OFF BY DEFAULT, AND THE REASON IS A CONTRACT RATHER THAN A DOUBT.
-         * BFMMLA accumulates k in blocks of four; the one-activation path
-         * accumulates in two chains of eight. Both are correct and they round
-         * differently -- measured, 2.6e-7 relative -- so with the tile wired in
-         * unconditionally `self_test_lane_widths` fails with "a lane width
-         * changed a row's answer". That test is not being tolerant of anything:
-         * this runtime promises that batching cannot change a row's result, and
-         * that promise is how it catches nondeterminism regressions.
+         * Every activation goes through the tiled BFMMLA kernel in groups of
+         * four, and a short group REPEATS its last activation rather than
+         * dropping to a different kernel. That is the whole point: BFMMLA
+         * accumulates k in blocks of four and BFDOT in chains of eight, so
+         * mixing them would make a row's answer depend on how many requests
+         * happened to share the worker -- the same seed rendering differently
+         * on a busy server than on an idle one. The single-activation path
+         * takes the same kernel too, in matvec_bf16.
          *
-         * The fix is not a looser test, it is ONE SHAPE EVERYWHERE: the
-         * single-activation path has to reach the same kernel with the
-         * activation repeated, which needs the packed pointer in
-         * qmat_rows_job. Until then MYNAH_QMAT_BF16_TILE=1 turns it on for
-         * measurement, and it is worth measuring -- 173.6 GFLOP/s against the
-         * f16 kernel's 11.8 at the prefill's shape. */
-        const uint16_t *wp = NULL;
-        if (e->bf16p != NULL && (row0 % 2u) == 0u) {
-            static int tile = -1;
-            if (tile < 0) {
-                const char *env = getenv("MYNAH_QMAT_BF16_TILE");
-                tile = (env != NULL && strcmp(env, "1") == 0) ? 1 : 0;
-            }
-            if (tile) {
-                wp = e->bf16p + (row0 / 2u) * 2u * (j->cols & ~(size_t)3u);
-            }
-        }
+         * row0 must land on a row-pair boundary for the packed layout to be
+         * addressable; QMAT_ROW_BLOCK is 32, so it always does. Where the pack
+         * does not exist -- no bf16 unit, or k < 4 -- every width falls back
+         * together to the BFDOT kernels, which keeps the property. */
+        const uint16_t *wp =
+            (e->bf16p != NULL && (row0 % 2u) == 0u)
+                ? e->bf16p + (row0 / 2u) * 2u * (j->cols & ~(size_t)3u)
+                : NULL;
         for (; b + 4u <= j->batch; b += 4u) {
             if (wp != NULL) {
                 matvec_bf16_neon_tile(j->out[b] + row0, j->out[b + 1u] + row0,
@@ -3391,18 +3443,21 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
                                     j->x[b + 3u], wb, bs, count, j->cols);
             }
         }
-        /* A remainder REPEATS an activation rather than dropping to the
-         * one-at-a-time kernel: the weight load is the cost and a repeated lane
-         * writes the same address twice with the same value, which is what the
-         * f16 and int8 paths already do for a remainder of three. */
         if (b < j->batch) {
             const size_t left = j->batch - b;
             const size_t i1 = left > 1u ? b + 1u : b;
             const size_t i2 = left > 2u ? b + 2u : b;
-            matvec_bf16_neon_x4(j->out[b] + row0, j->out[i1] + row0,
-                                j->out[i2] + row0, j->out[b] + row0,
-                                j->x[b], j->x[i1], j->x[i2], j->x[b],
-                                wb, bs, count, j->cols);
+            if (wp != NULL) {
+                matvec_bf16_neon_tile(j->out[b] + row0, j->out[i1] + row0,
+                                      j->out[i2] + row0, j->out[b] + row0,
+                                      j->x[b], j->x[i1], j->x[i2], j->x[b],
+                                      wp, wb, bs, count, j->cols);
+            } else {
+                matvec_bf16_neon_x4(j->out[b] + row0, j->out[i1] + row0,
+                                    j->out[i2] + row0, j->out[b] + row0,
+                                    j->x[b], j->x[i1], j->x[i2], j->x[b],
+                                    wb, bs, count, j->cols);
+            }
         }
         return;
     }
@@ -3478,8 +3533,8 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
             for (; b < j->batch; ++b) {
                 const qmat_rows_job rj = {
                     j->out[b], NULL, j->x[b], 0.0f,
-                    weights, e->scales, e->rowsum, j->bias, j->rows, j->cols,
-                    e->qtype, j->level
+                    weights, NULL, e->scales, e->rowsum, j->bias, j->rows,
+                    j->cols, e->qtype, j->level
                 };
                 qmat_rows_dispatch(&rj, row0, count);
             }
@@ -3562,7 +3617,13 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
                                                   b * j->cols),
             j->x == NULL ? NULL : j->x[b],
             j->sx == NULL ? 0.0f : j->sx[b],
-            weights, e->scales, e->rowsum, j->bias, j->rows, j->cols,
+            weights,
+#if defined(MYNAH_QMAT_BF16)
+            e->qtype == QMAT_BF16 ? (const void *)e->bf16p : NULL,
+#else
+            NULL,
+#endif
+            e->scales, e->rowsum, j->bias, j->rows, j->cols,
             e->qtype, j->level
         };
         qmat_rows_dispatch(&rj, row0, count);
@@ -3893,16 +3954,16 @@ int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
         /* F16 carries its own exponent, so the activation stays f32 and there
          * is no activation-quantization pass at all. */
         if (e->qtype == QMAT_F16) {
-            matvec_q_rows(orow, NULL, xr, 0.0f, e->f16, NULL, NULL, bias, n, k,
-                          QMAT_F16, QMAT_U8_OFF);
+            matvec_q_rows(orow, NULL, xr, 0.0f, e->f16, NULL, NULL, NULL, bias,
+                          n, k, QMAT_F16, QMAT_U8_OFF);
             continue;
         }
 #endif
 #if defined(MYNAH_QMAT_BF16)
         /* Same for BF16, and for the same reason. */
         if (e->qtype == QMAT_BF16) {
-            matvec_q_rows(orow, NULL, xr, 0.0f, e->bf16, NULL, NULL, bias, n, k,
-                          QMAT_BF16, QMAT_U8_OFF);
+            matvec_q_rows(orow, NULL, xr, 0.0f, e->bf16, e->bf16p, NULL, NULL,
+                          bias, n, k, QMAT_BF16, QMAT_U8_OFF);
             continue;
         }
 #endif
@@ -3922,10 +3983,10 @@ int mynah_qmat_linear_resolved_qt(mynah_qmat_cache *cache,
                                          k, b);
             }
         } else if (e->qtype == QMAT_INT8) {
-            matvec_q_rows(orow, qx, xr, sx, e->q8, e->scales, e->rowsum, bias,
+            matvec_q_rows(orow, qx, xr, sx, e->q8, NULL, e->scales, e->rowsum, bias,
                           n, k, QMAT_INT8, level);
         } else {
-            matvec_q_rows(orow, qx, xr, sx, e->q4, e->scales, NULL, bias,
+            matvec_q_rows(orow, qx, xr, sx, e->q4, NULL, e->scales, NULL, bias,
                           n, k, QMAT_INT4, QMAT_U8_OFF);
         }
     }
@@ -4184,9 +4245,17 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
 #else
     const int b16_ok = 1;
 #endif
+#if defined(MYNAH_QMAT_BF16_NEON)
+    uint16_t *b16p = malloc(qmat_bf16_pairs_size((size_t)N, (size_t)K) *
+                            sizeof(uint16_t));
+    const int b16p_ok = b16p != NULL;
+#else
+    const int b16p_ok = 1;
+#endif
+    const void *pairs = NULL;
     if (w == NULL || x == NULL || bias == NULL || serial == NULL || blocked == NULL ||
         qx == NULL || q8 == NULL || q4 == NULL || scales8 == NULL || scales4 == NULL ||
-        !h16_ok || !b16_ok) {
+        !h16_ok || !b16_ok || !b16p_ok) {
         if (error != NULL && error_capacity > 0)
             snprintf(error, error_capacity, "qmat blocked self-test out of memory");
         goto done;
@@ -4215,7 +4284,15 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
         qmat_bf16_pack(b16, w, (size_t)N * K);
         weights = b16;
         scales = NULL;
-        matvec_bf16(serial, x, b16, bias, N, K);
+#if defined(MYNAH_QMAT_BF16_NEON)
+        /* The packed copy travels with the job as well as into the reference,
+         * so both sides of this comparison take the same kernel. Handing the
+         * serial side the tile and the blocked side BFDOT would be comparing
+         * two kernels while claiming to test a row split. */
+        qmat_bf16_pack_pairs(b16p, w, (size_t)N, (size_t)K);
+        pairs = b16p;
+#endif
+        matvec_bf16(serial, x, b16, (const uint16_t *)pairs, bias, N, K);
 #endif
     } else {
         quantize_weight_int4(w, N, K, q4, scales4);
@@ -4224,7 +4301,7 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
         matvec_q4(serial, qx, sx, q4, scales4, bias, N, K);
     }
     for (size_t i = 0; i < (size_t)N; ++i) blocked[i] = 0.0f;
-    const qmat_rows_job job = {blocked, qx, x, sx, weights, scales, NULL, bias,
+    const qmat_rows_job job = {blocked, qx, x, sx, weights, pairs, scales, NULL, bias,
                                (size_t)N, (size_t)K, qtype, QMAT_U8_OFF};
     const int blocks = (int)(((size_t)N + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK);
     for (int b = 0; b < blocks; ++b) qmat_rows_block((void *)&job, b);
@@ -4255,6 +4332,9 @@ done:
     free(qx); free(q8); free(q4); free(scales8); free(scales4); free(h16);
 #if defined(MYNAH_QMAT_BF16)
     free(b16);
+#endif
+#if defined(MYNAH_QMAT_BF16_NEON)
+    free(b16p);
 #endif
     return status;
 }
