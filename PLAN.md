@@ -927,6 +927,13 @@ the x86 self-test that judges the two kernels written here and never executed
       ten-minute verdict at C94-C96 is a coin toss -- those same two arms returned MARGINAL
       and GOOD, separated by 136 microseconds. **Next**: C98/C100 are stale, measured at the
       old cap
+- [ ] E10-21 **START HERE** → [`.work/next-2026-09-20.md`](.work/next-2026-09-20.md).
+      Seventeen commits sit on `main` unpushed and CI has seen none of them, including an
+      x86 bf16 kernel no machine here can execute -- **push first**. Then the two runs the
+      box was stopped in the middle of: a C125 screen and a thirty-minute C120, ~45 minutes,
+      which close the only open capacity question. After that the lever is no longer the
+      prefill at all: at C130 TTFB triples because 16 workers x 8 slots is 128 places, so it
+      is `--max-batch`, the worker count, or admission
 - [ ] E10-19 **the prefill cap is stale and the prefill ORDER has never been questioned** —
       [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md). Two levers on the
       one gate that still fails, and the first needs no code. **(a) Re-derive the cap.**
