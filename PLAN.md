@@ -246,10 +246,45 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
 - [ ] E4-4 thread pool upgrade: lane split, deadline priority, `after_fork` (prereq for E5-6)
 - [ ] E4-5 the kernel the profile names — scalar reference, then NEON/SDOT/i8mm **and** AVX2/AVX-512/VNNI in one change
 - [ ] E4-6 int8 weight prepack with persistent cache, both ISAs
+- [ ] E4-8 **the checkpoint is bf16, the CPU has bf16, and we use neither** →
+      [`.work/bf16-native-weights.md`](.work/bf16-native-weights.md). `--dispatch-map` on
+      the box has been printing this for days: five units the CPU has and this binary has
+      no kernel for, with `isa.arm.bf16` reading *"no bfdot/bfmmla and no bf16 weight type;
+      src/weights.c widens bf16 to f32 at load and f32 paths stay f32"*. Today a bf16
+      checkpoint goes **bf16 -> f32 (malloc'd copy) -> f16 (packed copy) -> `vcvt_f32_f16`
+      + `vfmaq_f32`**, three representations to return to the width it started at, and
+      **4 MACs per 128-bit instruction**. `BFMMLA` is **16**, accumulating in f32 -- which
+      is why the `FMLAL` rejection does not cover it: that one narrows the accumulator,
+      this one does not. **Four of the five idle units are not worth writing and one
+      measurement says so**: `svcntb()` on Neoverse-V2 reports a **128-bit** SVE vector,
+      the same width as NEON, so sve/sve2/svei8mm would buy predication and VLA
+      portability, not throughput. Where it pays is the PREFILL, not the step: the step is
+      memory-bound at 1-6 rows (E9-11 measured it and exploits it), while the prefill at
+      16 rows is ~8.4 MACs/byte and compute-bound by roughly 6x. Size of the prize, with
+      E9-12's discipline applied: that item refused int8-in-the-prefill because
+      `prep.prefill_proj` is 4.9% of `request.total`, but what binds the product now is
+      TTFA under load, set by a LONG text's **190 ms** prefill of which the projections are
+      order 110 ms -- so 2-4x there is **55-80 ms** against a TTFA p95 of 492 ms with a
+      500 ms gate. It also pays twice, since less prefill work per request is less prefill
+      work per step, which is what `MYNAH_PREFILL_STEP_MS` rations and what stops C98.
+      Free on the side: the f32 intermediate and the pack pass both disappear (E9-1 measured
+      that conversion at 302 MB -> 151 MB for the backbone). **To close**: a bf16 weight
+      type in `src/weights.c`, a scalar reference, the NEON kernel behind a runtime probe
+      like i8mm's, the AVX512-BF16 counterpart, the inventory row, and the gate --
+      `--self-test` at widths 1-17 against the scalar reference, then
+      `prep.prefill_proj` re-taken **on the Axion** (E9-11's 1.62-1.71x is a macOS number
+      never re-taken, and this item must not repeat that), then a 30-minute C98 soak,
+      which is the level that should move if the prefill gets cheaper. **Not KleidiAI**:
+      that stays rejected on its own grounds; what transfers from qwen-tts is the idea,
+      not the dependency
 - [ ] E4-7 AMX-INT8 (Linux/x86 only), last
 - [ ] E4-10 **remove useless dtype conversions** — called out by name as one of the two
       profiling wins. `src/qmat.c` holds 15 conversion sites and every other hot-path
-      module holds zero; the suspicion is `bf16 -> f32 -> f16` where one step would do
+      module holds zero; the suspicion is `bf16 -> f32 -> f16` where one step would do.
+      **The suspicion is confirmed** (2026-09-19, E4-8): `src/weights.c:122` converts the
+      mapped bf16 to a malloc'd f32 copy, `src/qmat.c:354` packs that to f16, and the
+      kernel then widens back to f32 to multiply. E4-8 is the version of this item that
+      also buys arithmetic, and subsumes it
 - [x] E4-11 **done** `6ad9ada` · **no silently-chosen scalar BLAS** — a scalar path taken without anyone
       knowing is worse than a slow one that announces itself. `blas.accelerate` is ON
       here and absent on the target, and the 36x conv-stack win goes through BLAS

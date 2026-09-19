@@ -9,6 +9,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 /* No <Accelerate/Accelerate.h> here any more.  The array GELU used to call
  * vvtanhf, which exists only on macOS, so the production target ran a scalar
  * libm loop instead and the two platforms executed different arithmetic.  The
@@ -1819,12 +1823,36 @@ const char *mynah_kernels_isa_missing_reason(unsigned bit) {
     }
 }
 
+/* How wide this CPU's SVE vector actually is, in bits, or 0 when it cannot be
+ * asked.  Read with prctl rather than svcntb() so that querying the width costs
+ * nothing at build time: svcntb() would require the translation unit to be
+ * compiled with SVE enabled, which is a bigger commitment than a report line
+ * deserves.
+ *
+ * WHY THE REPORT NEEDS IT.  "supported=yes and we idle it" invites the reader to
+ * assume idle width.  On Neoverse-V2 -- this project's production CPU -- the SVE
+ * vector measures 128 bits, exactly NEON's, so an SVE kernel there would buy
+ * predication and vector-length-agnostic code and NOT throughput.  Three of the
+ * five idle rows are that case, and a reader who cannot see the width has no way
+ * to tell them from the one that is a real 4x (bf16 -> BFMMLA).  See
+ * .work/bf16-native-weights.md. */
+static unsigned sve_vector_bits(void) {
+#if defined(__aarch64__) && defined(__linux__)
+    /* PR_SVE_GET_VL; the length in bytes is the low 16 bits of the result. */
+    const int vl = prctl(51);
+    if (vl < 0) return 0u;
+    return (unsigned)(vl & 0xffff) * 8u;
+#else
+    return 0u;
+#endif
+}
+
 /* One probe body for all five rows.  It answers from the inventory above, so
  * `resolved` can never disagree with what the binary contains. */
 static int probe_isa_bit(unsigned bit, const char **why) {
     const int on = (mynah_kernels_isa_kernels() & bit) != 0u;
     if (why != NULL) {
-        static char text[5][240];
+        static char text[5][360];
         static const unsigned bits[5] = {
             MYNAH_KERNELS_ISA_SVE, MYNAH_KERNELS_ISA_SVE2,
             MYNAH_KERNELS_ISA_SVEI8MM, MYNAH_KERNELS_ISA_SVEBF16,
@@ -1832,11 +1860,30 @@ static int probe_isa_bit(unsigned bit, const char **why) {
         };
         int slot = 0;
         for (int i = 0; i < 5; ++i) if (bits[i] == bit) slot = i;
+        /* The width note goes on the SVE rows only: bf16 is reachable from NEON
+         * (BFMMLA), so its width is not the question there. */
+        const int is_sve = (bit == MYNAH_KERNELS_ISA_SVE ||
+                            bit == MYNAH_KERNELS_ISA_SVE2 ||
+                            bit == MYNAH_KERNELS_ISA_SVEI8MM ||
+                            bit == MYNAH_KERNELS_ISA_SVEBF16);
+        const unsigned vl = is_sve ? sve_vector_bits() : 0u;
+        char width[160];
+        width[0] = '\0';
+        if (vl == 128u) {
+            snprintf(width, sizeof width,
+                     " This CPU's SVE vector is 128 bits -- the same width as "
+                     "NEON -- so a kernel here buys predication and "
+                     "vector-length-agnostic code, NOT throughput");
+        } else if (vl > 128u) {
+            snprintf(width, sizeof width,
+                     " This CPU's SVE vector is %u bits against NEON's 128, so "
+                     "a kernel here is a %ux widening", vl, vl / 128u);
+        }
         snprintf(text[slot], sizeof text[slot],
                  "[predicate] mynah_kernels_isa_kernels(): %s -- %s. "
-                 "supported=yes here means the CPU has the unit and we idle it",
+                 "supported=yes here means the CPU has the unit and we idle it.%s",
                  on ? "kernel present" : "NOT IMPLEMENTED",
-                 mynah_kernels_isa_missing_reason(bit));
+                 mynah_kernels_isa_missing_reason(bit), width);
         *why = text[slot];
     }
     return on;
