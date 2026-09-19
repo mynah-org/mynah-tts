@@ -298,17 +298,34 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
  * running. One slice always runs even when the budget is already spent, because
  * a cap that can starve a prefill forever is a deadlock, not a bound.
  *
- * The default is 60 ms, three quarters of a frame period, and it is the measured
- * optimum rather than the round number: the cap bounds TOTAL prefill throughput,
- * so too tight a cap starves every prefill when several compete and time to first
- * audio pays for it -- 40 ms with 16-token slices reached zero stalls and 642 ms
- * of TTFA p95, which fails a different gate. 60 ms with 32-token slices is the
- * point that passed all of them. */
+ * The default is 30 ms, and it is derived rather than tried. Timing the serving
+ * loop per batch width (MYNAH_SERVE_PROFILE=1) gives T_frame(B) = 3.0 + 7.8*B ms
+ * on the reference host, so a typical step at B6 costs 50 ms of an 80 ms frame
+ * and the SLACK a prefill may use without making the frame late is 30. Setting
+ * the cap to the slack is what the arithmetic asks for, and the box agrees:
+ *
+ *   cap ms   max_gap p95   max_gap max   TTFA p95   (C94, ten minutes each)
+ *      60        131 ms        179 ms     495-500
+ *      40        121           148.6      494
+ *      30        119           142.9      498
+ *      20        119           133.9      496
+ *
+ * The earlier claim in this comment -- that too tight a cap starves prefills and
+ * time to first audio pays for it -- was measured at 16-token slices and does NOT
+ * survive at 32: TTFA is flat across the whole column. The reason is that the
+ * per-slice budget already bounds one slot at 32 tokens, so a single prefill
+ * rarely reaches 30 ms on its own; the cap binds only when several coincide on
+ * one worker. It bounds the tail and leaves the median path alone.
+ *
+ * Qualified at this value: C96, thirty minutes, 53886 requests, shipped
+ * quantization and nothing exported -- every gate passed, stall@250ms and
+ * stall@500ms both zero, worst client prebuffer 228.9 ms against a declared
+ * 250 ms contract (it was 316 at 60 ms), max_gap max 142.8 (was 179.2). */
 static double prefill_step_budget_s(void) {
     static double cached = -1.0;
     if (cached >= 0.0) return cached;
     const char *env = getenv("MYNAH_PREFILL_STEP_MS");
-    double v = 60.0;
+    double v = 30.0;
     if (env != NULL && *env != '\0') {
         char *end = NULL;
         const double parsed = strtod(env, &end);

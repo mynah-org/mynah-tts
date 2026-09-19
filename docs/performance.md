@@ -638,15 +638,19 @@ hand while the binary shipped it OFF.** That gap is closed, and the machinery
 that makes it a validation failure rather than a footnote is in
 `configs/perf/` — see `.work/serving-profiles.md`.
 
-### 2. The ceiling is C96
+### 2. The ceiling, at the cap the binary shipped this morning
 
-| C, convtr ON | 10 min | 30 min | TTFA p95 | RTF p95 | stall@250 |
+| C, prefill cap 60 ms | 10 min | 30 min | TTFA p95 | RTF p95 | stall@250 |
 |---|---|---|---|---|---|
 | 90 | GOOD | **GOOD** (09-18) | 494.8 | 0.734 | 0 of 53265 |
 | 94 | — | MARGINAL | 494.9 | 0.746 | **1** of 53980 |
 | 96 | GOOD | MARGINAL | 490.4 | 0.754 | **1** of 54186 |
 | 98 | MARGINAL | — | 499.5 | 0.800 | 13 of 18067 |
 | 100 | MARGINAL | — | 522.6 | 0.817 | 22 of 18056 |
+
+The cap column matters: subsection 5 promotes C96 by changing it, so this table
+describes the configuration that *preceded* the current default, and C98/C100
+have not been re-measured since.
 
 Two things to read here, and neither is the obvious one.
 
@@ -716,6 +720,54 @@ TTFA p95 494.9 ms, RTF p95 0.746, throughput 130.8 audio-s/s, `stall@500ms` 0 �
 statistically the same run as the env-override arm (490.4 / 0.754 / 131.2). What
 the documentation describes and what a plain binary does are now the same thing.
 
+### 5. The prefill cap should be the slack, and setting it there promotes C96
+
+`T_frame(B) = 3.0 + 7.8 B` puts a typical step at B6 at 50 ms of an 80 ms frame,
+so the slack a prefill pass may use without making the frame late is **30 ms**.
+The shipped cap was 60, chosen by trying values. Four ten-minute soaks at C94,
+only `MYNAH_PREFILL_STEP_MS` moving:
+
+| cap | `max_gap` p95 | `max_gap` max | TTFA p95 |
+|---|---|---|---|
+| 60 | 131 ms | 179 ms | 495-500 |
+| 40 | 121 | 148.6 | 494 |
+| 30 | 119 | 142.9 | 498 |
+| 20 | 119 | 133.9 | 496 |
+
+The worst case falls monotonically and **TTFA does not pay for it**. The earlier
+claim — that a tighter cap starves prefills and first audio pays — was measured
+at 16-token slices and does not survive at 32: the per-slice budget already
+bounds one slot, so a single prefill rarely reaches 30 ms alone and the cap binds
+only when several coincide on one worker. It bounds the tail and leaves the
+median path alone.
+
+**Qualified at the new value — C96, thirty minutes, shipped default, nothing
+exported:**
+
+    53886/53886     stall@250ms  0        stall@500ms  0
+    TTFB p95  82.8 ms            TTFA p95    492.5 ms
+    STREAM_RTF p50/p95 0.669/0.759         throughput  130.2 audio-s/s
+    prebuffer p95 10.7 ms, max  228.9      safe_play_start p95  508.7 ms
+    max_gap p95 119.5 ms,  max  142.8      drift flat over ten windows
+
+The operating point is **C96**, up from C90, and `MYNAH_PREFILL_STEP_MS` now
+defaults to 30. The line to read twice is the prebuffer maximum: **228.9 ms
+against a declared 250 ms client contract** (it was 316 at the old cap). The
+contract is now covered by the sample maximum as well as by the scheduler bound.
+
+### What the instrument can and cannot resolve here
+
+The `--max-batch 8` and `--max-batch 6` arms of the step-cost experiment turned
+out to be the same experiment twice, since the loop never reaches 7 slots at this
+concurrency. They returned **MARGINAL and GOOD**, separated by TTFA p95 500.136
+against 500.000 — 136 microseconds.
+
+So at C94-C96 the TTFA percentile does not sit near the gate, it sits **on** it:
+492 ± 5 ms against 500. A ten-minute verdict at these levels is a coin toss.
+Thirty minutes, or repeats, and treat any ten-minute A/B whose delta is under
+~20 ms as unresolved. This morning's `codec_convtr` A/B survives only because its
+delta was 52 ms.
+
 ### The configuration, and where it lives now
 
     tools/perf_profile.py best recommended
@@ -723,7 +775,7 @@ the documentation describes and what a plain binary does are now the same thing.
             --model models/pocket-en --server-bin build/cpu/mynah-tts-server
 
 `configs/perf/axion-c4a-32c-pocket-en.json` carries the topology
-(`--prefork 16 --prefork-threads 2 --max-batch 8`), the gates, the operating point
+(`--prefork 16 --prefork-threads 2 --max-batch 8`), the gates, the C96 operating point
 and the levels above it that were measured and not promoted. It exports **nothing**:
 all three environment knobs are declared *must be absent*, because the shipped
 default now covers them, and a run that exports one of them refuses to start.

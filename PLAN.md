@@ -798,6 +798,24 @@ the x86 self-test that judges the two kernels written here and never executed
       - **(3) the interim contract, true today at zero cost — a 600 ms client prebuffer.**
         No request in 53895 needed more than **535 ms** of lead at C96 over thirty minutes.
         It ships until (1) lands, and it is a statement about a 30-minute sample of a tail
+- [x] E10-18 **the operating point is C96, and the cap that got it there was derived rather than tried** —
+      [`.work/prefill-blocks-decode.md`](.work/prefill-blocks-decode.md). Timing the serving
+      loop per batch width gives `T_frame(B) = 3.0 + 7.8*B` ms, so a typical step at B6 costs
+      50 ms of an 80 ms frame and the SLACK a prefill may use is **30**. `MYNAH_PREFILL_STEP_MS`
+      now defaults to that instead of the 60 that was chosen by trying values. Four soaks at
+      C94 move `max_gap` max 179 -> 148.6 -> 142.9 -> 133.9 for 60/40/30/20 with **TTFA flat**,
+      refuting the tension predicted when the cap was proposed: the per-slice budget already
+      bounds one slot at 32 tokens, so the cap binds only when several prefills coincide --
+      it bounds the tail and leaves the median path alone. **QUALIFIED: C96, thirty minutes,
+      shipped default, nothing exported** -- 53886/53886, `stall@250ms` **0**, `stall@500ms`
+      **0**, TTFA p95 492.5, RTF p95 0.759, throughput 130.2 audio-s/s, worst client prebuffer
+      **228.9 ms against a declared 250 ms contract** (316 at the old cap), `max_gap` max 142.8.
+      Two things this also settled: **`--max-batch` is not a lever** here (the loop never
+      reaches 7 slots at this concurrency, and its two arms were the same experiment twice),
+      and **the instrument's resolution**: TTFA p95 is 492 +/- 5 against a 500 ms gate, so a
+      ten-minute verdict at C94-C96 is a coin toss -- those same two arms returned MARGINAL
+      and GOOD, separated by 136 microseconds. **Next**: C98/C100 are stale, measured at the
+      old cap
 - [x] E10-17 **the configuration of a qualifying run no longer lives in shell history** —
       [`.work/serving-profiles.md`](.work/serving-profiles.md). `configs/perf/*.json` carries
       the deployment shape, the gates AND the operating point measured on that hardware;

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile": {
     "id": "axion-c4a-32c-pocket-en",
-    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English streaming. C90 is the qualified operating point; C96 is the measured edge and is MARGINAL by one stall in 54186. Host-scoped: this is not a generic Arm profile and makes no claim about a 16-core host or about Magpie.",
+    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English streaming. C96 is the qualified operating point, measured on the shipped default with nothing exported. Host-scoped: this is not a generic Arm profile and makes no claim about a 16-core host or about Magpie.",
     "engine": "pocket",
     "objective": {
       "primary": "realtime_factor",
@@ -11,7 +11,7 @@
         1,
         100
       ],
-      "preferred_concurrency": 90,
+      "preferred_concurrency": 96,
       "quality_changes_allowed": false
     }
   },
@@ -100,7 +100,7 @@
     },
     "client_contract": {
       "prebuffer_ms": 250,
-      "why": "At the operating point the worst client prebuffer measured 267 ms and max_gap never exceeded 177 ms against an 80 ms frame. 250 ms is a scheduler bound, not a sample maximum: MYNAH_PREFILL_STEP_MS caps the prefill work one AR step may absorb."
+      "why": "At the operating point the worst client prebuffer measured 228.9 ms and max_gap never exceeded 142.8 ms against an 80 ms frame, so the 250 ms contract is covered by the sample maximum as well as by the bound. MYNAH_PREFILL_STEP_MS caps the prefill work one AR step may absorb at the measured slack, which is what makes it a bound rather than a statistic."
     }
   },
   "qualification": {
@@ -108,65 +108,25 @@
     "model": "models/pocket-en",
     "workload": "Mixed v2 bank, streaming route /v1/audio/speech, PCM, one language pack, load generator on the same host.",
     "operating_point": {
-      "date": "2026-09-18",
+      "date": "2026-09-19",
       "version": "1.4.0",
-      "configuration": "environment-override",
-      "concurrency": 90,
+      "configuration": "shipped-default",
+      "concurrency": 96,
       "verdict": "GOOD",
       "soak_seconds": 1800,
-      "requests": 53265,
-      "ttfb_p95_ms": 82.0,
-      "ttfa_p95_ms": 494.8,
-      "rtf_p95": 0.734,
-      "prebuffer_p95_ms": 10.2,
-      "safe_start_p95_ms": 527.3,
-      "max_gap_p95_ms": 129.2,
+      "requests": 53886,
+      "ttfb_p95_ms": 82.8,
+      "ttfa_p95_ms": 492.5,
+      "rtf_p95": 0.759,
+      "prebuffer_p95_ms": 10.7,
+      "safe_start_p95_ms": 508.7,
+      "max_gap_p95_ms": 119.5,
       "stalls_250ms": 0,
       "stalls_500ms": 0,
-      "throughput_audio_s_per_s": 128.9,
-      "evidence": "docs/performance.md#2026-09-18"
+      "throughput_audio_s_per_s": 130.2,
+      "evidence": "reports/20260919-c96-axion/c96-cap30-20260919-1307.log"
     },
     "ceiling": [
-      {
-        "date": "2026-09-19",
-        "version": "1.4.0",
-        "configuration": "shipped-default",
-        "concurrency": 94,
-        "verdict": "MARGINAL",
-        "soak_seconds": 1800,
-        "requests": 53980,
-        "ttfb_p95_ms": 83.1,
-        "ttfa_p95_ms": 494.9,
-        "rtf_p95": 0.746,
-        "prebuffer_p95_ms": 10.2,
-        "safe_start_p95_ms": 523.7,
-        "max_gap_p95_ms": 130.2,
-        "stalls_250ms": 1,
-        "stalls_500ms": 0,
-        "throughput_audio_s_per_s": 130.8,
-        "evidence": "reports/20260919-c96-axion/c94-30min-shipped-default.log",
-        "why_not_promoted": "ONE stall in 53980, the same signature as C96 (1 in 54186) while C90 had 0 in 53265. Not a curve in concurrency: a rare event at nearly constant frequency, so lowering C does not remove it. This run also closes PLAN.md E10-14: it exported NOTHING, and the shipped binary reproduced the env-override arm to within the noise (TTFA 494.9 against 490.4, RTF 0.746 against 0.754)."
-      },
-      {
-        "date": "2026-09-19",
-        "version": "1.4.0",
-        "configuration": "environment-override",
-        "concurrency": 96,
-        "verdict": "MARGINAL",
-        "soak_seconds": 1800,
-        "requests": 54186,
-        "ttfb_p95_ms": 83.0,
-        "ttfa_p95_ms": 490.4,
-        "rtf_p95": 0.754,
-        "prebuffer_p95_ms": 10.2,
-        "safe_start_p95_ms": 506.3,
-        "max_gap_p95_ms": 130.2,
-        "stalls_250ms": 1,
-        "stalls_500ms": 0,
-        "throughput_audio_s_per_s": 131.2,
-        "evidence": "reports/20260919-c96-axion/c96-30min.log",
-        "why_not_promoted": "ONE stall in 54186 requests at a 250 ms client buffer. Every other gate passed with room, including TTFA p95 490.4 against 500, and the drift was flat over ten windows. The same level was GOOD over ten minutes with 0 of 18032 -- which is the whole reason a screen may not promote. Not 'C96 does not work': C96 is not GUARANTEED, and zero is a statement about the worst case."
-      },
       {
         "date": "2026-09-19",
         "version": "1.4.0",
@@ -180,7 +140,7 @@
         "stalls_250ms": 13,
         "stalls_500ms": 0,
         "evidence": "reports/20260919-c96-axion/ab-sweep-c90ab-c96-c98-c100.log",
-        "why_not_promoted": "Thirteen stalls in ten minutes, while the TTFA gate still passed by half a millisecond. Above C96 the binding failure changes character: TTFA drifts only 28 ms from C96 to C100 while stalls roughly double every two levels, so what overruns the 80 ms frame is the AR step itself, not the prefill."
+        "why_not_promoted": "Thirteen stalls in ten minutes, while the TTFA gate still passed by half a millisecond. Measured at the OLD 60 ms prefill cap and not re-measured at 30, which is the change that promoted C96 -- so this is a stale ceiling and the first level to re-screen."
       },
       {
         "date": "2026-09-19",
@@ -195,7 +155,7 @@
         "stalls_250ms": 22,
         "stalls_500ms": 0,
         "evidence": "reports/20260919-c96-axion/ab-sweep-c90ab-c96-c98-c100.log",
-        "why_not_promoted": "Both preferred gates fail. RTF p95 0.817 means the box still has a fifth of a realtime budget in hand at a level it cannot qualify: capacity is not what stops us here, continuity is."
+        "why_not_promoted": "Both preferred gates fail: TTFA p95 522.6 and 22 stalls in ten minutes. RTF p95 0.817 means the box still has a fifth of a realtime budget in hand at a level it cannot qualify -- capacity is not what stops us here, continuity is. Measured at the OLD 60 ms prefill cap."
       }
     ],
     "history": [
@@ -229,8 +189,27 @@
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 128.9,
         "evidence": "docs/performance.md#2026-09-18"
+      },
+      {
+        "date": "2026-09-19",
+        "version": "1.4.0",
+        "configuration": "shipped-default",
+        "concurrency": 96,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 53886,
+        "ttfb_p95_ms": 82.8,
+        "ttfa_p95_ms": 492.5,
+        "rtf_p95": 0.759,
+        "prebuffer_p95_ms": 10.7,
+        "safe_start_p95_ms": 508.7,
+        "max_gap_p95_ms": 119.5,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 130.2,
+        "evidence": "reports/20260919-c96-axion/c96-cap30-20260919-1307.log"
       }
     ],
-    "notes": "Every point here was measured with codec_convtr:int8 exported by hand; from 2026-09-19 that encoding IS the shipped default, so runtime.matches_shipped_default is true and future points must read 'shipped-default'. The re-run that confirms the default reproduces the operating point on a plain binary is the closing gate of PLAN.md E10-14."
+    "notes": "The operating point moved C90 -> C96 on 2026-09-19 by setting the per-step prefill cap to the measured slack: T_frame(B) = 3.0 + 7.8*B ms puts a typical step at B6 at 50 ms of an 80 ms frame, leaving 30. Before that change C94 and C96 were both MARGINAL over thirty minutes by exactly one stall, in 53980 and 54186 requests. This is also the first point measured on a plain binary -- codec_convtr:int8 became the shipped default the same day, so nothing is exported. CAUTION for whoever reads the ceiling: C98 and C100 were measured at the old cap and are stale. A second caution about the instrument: TTFA p95 sits at 492 +/- 5 against a 500 ms gate, so a ten-minute verdict at these levels is a coin toss -- the same configuration returned MARGINAL and GOOD in two ten-minute runs separated by 136 microseconds of percentile."
   }
 }
