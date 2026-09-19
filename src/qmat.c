@@ -143,6 +143,24 @@
  * allocate in a kernel -- or concatenating two _mm512_cvtneps_pbh results, whose
  * type juggling between __m256bh and __m256i differs across compiler versions.
  * Either is fine; neither should be written without a machine to run it on. */
+/* x86: AVX2 + FMA, and it is a better fit than it looks.
+ *
+ * There is no bf16 multiply below AVX512-BF16, but bf16 does not need one to be
+ * cheap here: WIDENING bf16 TO f32 IS A SHIFT. The bits of a bf16 are the top
+ * sixteen of the f32 it represents, so `_mm256_slli_epi32(x, 16)` is the whole
+ * conversion -- against the f16 path, which needs F16C's vcvtph_ps. The kernel
+ * below is therefore not a fallback: on a host with AVX2 it does the same work
+ * as the f16 kernel with a cheaper widening.
+ *
+ * VNNI IS NOT RELEVANT HERE and the name invites the mistake: VPDPBUSD and its
+ * AVX-VNNI sibling are INT8 dot products. The bf16 instruction is VDPBF16PS
+ * (AVX512-BF16), which is a separate feature bit and is NOT implemented yet --
+ * see the trap recorded below its probe. */
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11))
+#define MYNAH_QMAT_BF16_X86 1
+#endif
+
 #define MYNAH_QMAT_BF16 1
 
 #if defined(MYNAH_QMAT_F16_NEON) || defined(MYNAH_QMAT_F16_X86)
@@ -2354,6 +2372,118 @@ static void matvec_bf16_neon_x4(float *o0, float *o1, float *o2, float *o3,
 
 #endif /* MYNAH_QMAT_BF16_NEON */
 
+#if defined(MYNAH_QMAT_BF16_X86)
+/* Does this host have AVX2 and FMA?  __builtin_cpu_supports is used here where
+ * it was refused for AVX-VNNI: the objection there was that GCC did not learn
+ * the `avxvnni` name until 11, which is not true of avx2 or fma. Memoised, so
+ * no probe ever runs in a decode loop. */
+static int qmat_bf16_x86_probe(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = (__builtin_cpu_supports("avx2") &&
+                  __builtin_cpu_supports("fma")) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Round eight f32 to bf16 and leave them WIDENED, which is the contract this
+ * encoding carries: the multiply is bf16 x bf16 accumulated in f32, so the
+ * activation is narrowed even though the register stays 32-bit. Round half to
+ * even, the same rule as qmat_bf16_from_f32 -- and the same reason it is
+ * spelled with integer ops: it has to agree with the scalar reference bit for
+ * bit or self_test_bf16_kernel says so. */
+__attribute__((target("avx2,fma")))
+static __m256 qmat_bf16_round_ps(__m256 v) {
+    const __m256i bits = _mm256_castps_si256(v);
+    const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(bits, 16),
+                                         _mm256_set1_epi32(1));
+    const __m256i r = _mm256_add_epi32(_mm256_add_epi32(bits, lsb),
+                                       _mm256_set1_epi32(0x7fff));
+    return _mm256_castsi256_ps(
+        _mm256_and_si256(r, _mm256_set1_epi32((int)0xffff0000u)));
+}
+
+/* Widen eight bf16 to f32. THE WHOLE CONVERSION IS A SHIFT: a bf16 is the top
+ * sixteen bits of the f32 it stands for. This is the reason bf16 is worth
+ * having on x86 even with no bf16 multiply -- the f16 path has to run
+ * vcvtph_ps here, and this does not. */
+__attribute__((target("avx2,fma")))
+static __m256 qmat_bf16_widen(const uint16_t *w) {
+    const __m128i raw = _mm_loadu_si128((const __m128i *)(const void *)w);
+    return _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+}
+
+/* Its own horizontal sum rather than the f16 path's: that one carries
+ * target("avx2,f16c,fma"), and calling it from a function that only promises
+ * avx2+fma would let the compiler emit an F16C instruction on a host this
+ * kernel is allowed to run on. Same arithmetic, narrower promise. */
+__attribute__((target("avx2,fma")))
+static float qmat_bf16_hsum(__m256 v) {
+    const __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 t = _mm_add_ps(_mm256_castps256_ps128(v), hi);
+    t = _mm_add_ps(t, _mm_movehl_ps(t, t));
+    t = _mm_add_ss(t, _mm_shuffle_ps(t, t, 0x55));
+    return _mm_cvtss_f32(t);
+}
+
+/* Four activations per weight row, the same shape the ARM side uses, and for
+ * the same reason: ONE kernel for every batch width, so a row's answer does not
+ * depend on how many requests shared the worker. A single activation reaches
+ * this with x repeated into all four arguments. */
+__attribute__((target("avx2,fma")))
+static void matvec_bf16_avx2_x4(float *o0, float *o1, float *o2, float *o3,
+                                const float *x0, const float *x1,
+                                const float *x2, const float *x3,
+                                const uint16_t *weights, const float *bias,
+                                size_t rows, size_t cols) {
+    for (size_t row = 0; row < rows; ++row) {
+        const uint16_t *w = weights + row * cols;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u) {
+            const __m256 wv = qmat_bf16_widen(w + j);
+            a0 = _mm256_fmadd_ps(wv, qmat_bf16_round_ps(_mm256_loadu_ps(x0 + j)), a0);
+            a1 = _mm256_fmadd_ps(wv, qmat_bf16_round_ps(_mm256_loadu_ps(x1 + j)), a1);
+            a2 = _mm256_fmadd_ps(wv, qmat_bf16_round_ps(_mm256_loadu_ps(x2 + j)), a2);
+            a3 = _mm256_fmadd_ps(wv, qmat_bf16_round_ps(_mm256_loadu_ps(x3 + j)), a3);
+        }
+        float s0 = qmat_bf16_hsum(a0), s1 = qmat_bf16_hsum(a1);
+        float s2 = qmat_bf16_hsum(a2), s3 = qmat_bf16_hsum(a3);
+        for (; j < cols; ++j) {
+            const float wv = qmat_bf16_to_f32(w[j]);
+            s0 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x0[j]));
+            s1 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x1[j]));
+            s2 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x2[j]));
+            s3 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x3[j]));
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        o0[row] = s0 + bv; o1[row] = s1 + bv;
+        o2[row] = s2 + bv; o3[row] = s3 + bv;
+    }
+}
+
+/* NOT IMPLEMENTED, and the reason is written here rather than discovered later.
+ *
+ * AVX512-BF16's VDPBF16PS is the x86 counterpart of BFDOT and would roughly
+ * double this kernel's arithmetic. It multiplies PAIRWISE WITHIN A LANE, so two
+ * k-adjacent values must share a 32-bit lane. Weights loaded straight from this
+ * cache already do. The activation does not: _mm512_cvtne2ps_pbh INTERLEAVES
+ * its two sources -- dst[2i] = b[i], dst[2i+1] = a[i] -- which pairs x[j+i]
+ * with x[j+16+i] instead of x[2i] with x[2i+1]. The ways out are a scratch
+ * buffer for the converted activation, which a kernel in this file may not
+ * allocate, or concatenating two _mm512_cvtneps_pbh results, whose casts
+ * between __m256bh and __m256i differ across compiler versions.
+ *
+ * Neither is hard. Both need a machine with the unit to run on, and this
+ * project has none: the x86 CI runner executes --self-test, which is what makes
+ * the AVX2 kernel above a tested kernel rather than a hopeful one, but it
+ * cannot be relied on to have AVX512-BF16. Writing VDPBF16PS blind would put an
+ * unexecuted vector kernel on the default path, which is the thing the
+ * dispatch report exists to prevent. */
+#endif /* MYNAH_QMAT_BF16_X86 */
+
 #if defined(MYNAH_QMAT_F16_X86)
 __attribute__((target("avx2,f16c,fma")))
 static float qmat_hsum256(__m256 v) {
@@ -2628,6 +2758,10 @@ static int qmat_bf16_unit(void) {
 #elif defined(MYNAH_QMAT_BF16_NEON) && defined(MYNAH_QMAT_HAVE_AUXV) && \
       defined(AT_HWCAP2)
         detected = (getauxval(AT_HWCAP2) & (1UL << 14)) != 0;   /* HWCAP2_BF16 */
+#elif defined(MYNAH_QMAT_BF16_X86)
+        /* No bf16 MULTIPLY is required on x86: the kernel widens with a shift
+         * and multiplies in f32, so what it needs is AVX2 and FMA. */
+        detected = qmat_bf16_x86_probe();
 #endif
         const char *env = getenv("MYNAH_QMAT_BF16");
         if (env != NULL && (strcmp(env, "0") == 0 || strcmp(env, "off") == 0 ||
@@ -2666,6 +2800,15 @@ static void matvec_bf16(float *out, const float *x, const uint16_t *weights,
             return;
         }
         matvec_bf16_neon(out, x, weights, bias, rows, cols);
+        return;
+    }
+#endif
+#if defined(MYNAH_QMAT_BF16_X86)
+    if (qmat_bf16_unit()) {
+        /* Same discipline as the ARM side: one activation takes the x4 kernel
+         * with itself repeated, so width never changes a row's answer. */
+        matvec_bf16_avx2_x4(out, out, out, out, x, x, x, x, weights, bias,
+                            rows, cols);
         return;
     }
 #endif
@@ -2935,6 +3078,22 @@ struct mynah_qmat_cache {
  * fallback -- it needs NEON's half converts -- so asking for it where it is not
  * compiled resolves to exact f32 rather than to a silent approximation. */
 static int qmat_qtype_available(int qtype) {
+    /* BF16 WITHOUT A VECTOR KERNEL DOWNGRADES TO F16, NOT TO SCALAR BF16.
+     *
+     * bf16 and f16 are the same two bytes. Where a bf16 multiply exists in
+     * hardware, bf16 wins on throughput; where it does not, scalar bf16 is
+     * worse than vector f16 on every axis at once -- slower arithmetic AND
+     * three fewer mantissa bits -- so nobody would ever choose it. Today that
+     * is every x86 host, because the AVX512-BF16 kernel is unwritten.
+     *
+     * The test is the COMPILED kernel, not the runtime probe, so
+     * MYNAH_QMAT_BF16=0 still reaches the scalar path: that is how the
+     * reference gets exercised on hardware that has the unit, and it must keep
+     * working. A CPU that simply lacks FEAT_BF16 lands on the scalar kernel
+     * too, which is correct and slow and reported as such by --dispatch-map. */
+#if !defined(MYNAH_QMAT_BF16_NEON) && !defined(MYNAH_QMAT_BF16_X86)
+    if (qtype == QMAT_BF16) qtype = QMAT_F16;
+#endif
 #if !defined(MYNAH_QMAT_F16)
     if (qtype == QMAT_F16) return QMAT_F32;
 #endif
@@ -3397,6 +3556,33 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         for (; b < j->batch; ++b) {
             matvec_q8(j->out[b] + row0, qx + b * j->cols, j->sx[b], wb, sc,
                       NULL, bs, count, j->cols, QMAT_U8_OFF);
+        }
+        return;
+    }
+#endif
+#if defined(MYNAH_QMAT_BF16_X86)
+    /* The x86 batched arm. Same rule as everywhere else in this encoding: every
+     * width takes the x4 kernel, and a short group repeats its last activation
+     * rather than dropping to a different one. */
+    if (e->qtype == QMAT_BF16 && j->x != NULL && j->batch >= 2u &&
+        qmat_bf16_unit()) {
+        const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
+        const uint16_t *wb = (const uint16_t *)weights + row0 * j->cols;
+        size_t b = 0;
+        for (; b + 4u <= j->batch; b += 4u) {
+            matvec_bf16_avx2_x4(j->out[b] + row0, j->out[b + 1u] + row0,
+                                j->out[b + 2u] + row0, j->out[b + 3u] + row0,
+                                j->x[b], j->x[b + 1u], j->x[b + 2u],
+                                j->x[b + 3u], wb, bs, count, j->cols);
+        }
+        if (b < j->batch) {
+            const size_t left = j->batch - b;
+            const size_t i1 = left > 1u ? b + 1u : b;
+            const size_t i2 = left > 2u ? b + 2u : b;
+            matvec_bf16_avx2_x4(j->out[b] + row0, j->out[i1] + row0,
+                                j->out[i2] + row0, j->out[b] + row0,
+                                j->x[b], j->x[i1], j->x[i2], j->x[b],
+                                wb, bs, count, j->cols);
         }
         return;
     }

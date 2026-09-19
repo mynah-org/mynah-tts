@@ -1159,6 +1159,15 @@ static int write_report(FILE *f, int as_json, mynah_dispatch_row *rows, int n) {
         }
         if (strcmp(rows[i].supported, "yes") != 0) continue;
         if (strcmp(rows[i].compiled, "no") != 0) continue;
+        /* A row that RESOLVED ON is not idle hardware, whatever the `compiled`
+         * column inherited. That column is filled by whoever seeded the row;
+         * `resolved` is filled by the module that owns the kernel, through its
+         * registered predicate, and it wins. Without this test the summary
+         * contradicted the row directly beneath it -- isa.arm.bf16 printed
+         * `resolved ON ... BFDOT` and was then listed as a unit with no kernel,
+         * which is exactly the kind of silence-to-be-interpreted this report
+         * exists to remove. */
+        if (strcmp(rows[i].resolved, "ON") == 0) continue;
         ++idle;
         if (idle_used + 1 < sizeof idle_list) {
             const int k = snprintf(idle_list + idle_used,

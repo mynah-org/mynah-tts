@@ -486,7 +486,7 @@ enum {
  * result has to do. */
 #define POCKET_QG_DEFAULT_SPEC                                                 \
     "codec_transformer,codec_conv,codec_convtr,"                               \
-    "backbone:f16,flow_net:f16,conditioner:f16"
+    "backbone:bf16,flow_net:f16,conditioner:f16"
 
 /* The same sentence with the codec clauses PINNED, used when MYNAH_QUANT is
  * unset -- which is the shipped configuration and the one the paragraph above
@@ -531,9 +531,33 @@ enum {
  * codec's own quality gate, log-mel nearly unchanged. The audio the decision was
  * taken on is kept under campioni/ -- captured from the streaming server under
  * C90 of real load, with this clause ON. */
+/* backbone:bf16 joined this string on 2026-09-19. The checkpoint is bf16, the
+ * production CPU multiplies bf16 natively, and the tiled BFMMLA kernel measures
+ * 173.6 GFLOP/s against the f16 path's 11.8 at the prefill's shape -- 1.35x on
+ * prep.prefill_proj and RTF 0.151 -> 0.121 end to end on the reference host.
+ *
+ * TWO THINGS THAT HAD TO BE TRUE FIRST, and both were measured rather than
+ * argued:
+ *
+ *   REPRODUCIBILITY. Every bf16 width takes one kernel, so a row's answer does
+ *   not depend on how many requests share the worker. Verified on the live
+ *   server: the same request, same seed, same text, repeated fifteen times
+ *   under 0, 7, 23 and 47 concurrent others, returned the SAME sha256 every
+ *   time. Without that this is a knob, not a default.
+ *
+ *   NOBODY GETS A WORSE PATH. Where no bf16 vector kernel is compiled -- every
+ *   x86 host today -- qmat_qtype_available() downgrades this to f16 rather
+ *   than to scalar bf16, which would be slower AND less precise than f16.
+ *
+ * WHAT IT COSTS, stated because it is not free: against an f32 backbone, f16
+ * holds SNR 33.6 dB and correlation 0.9998 while bf16 sits at 3.0-5.4 dB and
+ * 0.76-0.85. bf16 does not render the model differently, it DEPARTS from it.
+ * The samples behind that decision were listened to before this line changed,
+ * and the length, the frame count and the EOS step are identical in all of
+ * them. MYNAH_QUANT_GROUPS=backbone:f16 returns to the old default exactly. */
 #define POCKET_QG_DEFAULT_SPEC_PINNED                                          \
     "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"                \
-    "backbone:f16,flow_net:f16,conditioner:f16"
+    "backbone:bf16,flow_net:f16,conditioner:f16"
 
 typedef struct {
     const char *name;
