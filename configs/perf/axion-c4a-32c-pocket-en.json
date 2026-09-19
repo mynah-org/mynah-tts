@@ -7,12 +7,14 @@
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
-      "concurrency_range": [1, 100],
+      "concurrency_range": [
+        1,
+        100
+      ],
       "preferred_concurrency": 90,
       "quality_changes_allowed": false
     }
   },
-
   "hardware": {
     "architecture": "arm64",
     "cpu_family": "Google Axion / Arm Neoverse-V2",
@@ -21,12 +23,14 @@
     "threads_per_core": 1,
     "numa_nodes": 1,
     "ram_gib": 62,
-    "isa_features_used": ["asimddp", "i8mm"],
+    "isa_features_used": [
+      "asimddp",
+      "i8mm"
+    ],
     "smt_policy": "OFF; one thread per physical core",
     "canonical_topology": "16 workers x 2 threads, no pinning",
     "notes": "GCP c4a, no SMT. The load generator ran on the same box for every number here, which costs ~13% coalesced client reads: the cadence percentiles are upper bounds on server lateness, not the server's true emission."
   },
-
   "build": {
     "target": "make && make server",
     "blas": "none",
@@ -37,14 +41,12 @@
       "isa": "ASIMDDP for the int8 codec kernels"
     }
   },
-
   "server": {
     "prefork_workers": 16,
     "threads_per_worker": 2,
     "max_batch": 8,
     "why": "16x2 beats 8x4 decisively here: at equal threads and equal slots, RTF p95 0.784 against 1.052, throughput -25%, stall@250 84/17968 against 734/13511. The optimum is a property of the model's T_frame(B) = a + b*B ratio, not of the machine -- qwen-tts at 1.7B prefers 4x8 on this same host. max_batch is capped at 16 by MYNAH_GRAPH_MAX_JOBS and is not binding at C90 (about 6 live slots per worker)."
   },
-
   "runtime": {
     "matches_shipped_default": true,
     "quant_groups": {
@@ -70,7 +72,6 @@
       }
     }
   },
-
   "gates": {
     "mandatory": {
       "rtf_p95_below": 1.0,
@@ -102,7 +103,6 @@
       "why": "At the operating point the worst client prebuffer measured 267 ms and max_gap never exceeded 177 ms against an 80 ms frame. 250 ms is a scheduler bound, not a sample maximum: MYNAH_PREFILL_STEP_MS caps the prefill work one AR step may absorb."
     }
   },
-
   "qualification": {
     "status": "qualified",
     "model": "models/pocket-en",
@@ -127,6 +127,26 @@
       "evidence": "docs/performance.md#2026-09-18"
     },
     "ceiling": [
+      {
+        "date": "2026-09-19",
+        "version": "1.4.0",
+        "configuration": "shipped-default",
+        "concurrency": 94,
+        "verdict": "MARGINAL",
+        "soak_seconds": 1800,
+        "requests": 53980,
+        "ttfb_p95_ms": 83.1,
+        "ttfa_p95_ms": 494.9,
+        "rtf_p95": 0.746,
+        "prebuffer_p95_ms": 10.2,
+        "safe_start_p95_ms": 523.7,
+        "max_gap_p95_ms": 130.2,
+        "stalls_250ms": 1,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 130.8,
+        "evidence": "reports/20260919-c96-axion/c94-30min-shipped-default.log",
+        "why_not_promoted": "ONE stall in 53980, the same signature as C96 (1 in 54186) while C90 had 0 in 53265. Not a curve in concurrency: a rare event at nearly constant frequency, so lowering C does not remove it. This run also closes PLAN.md E10-14: it exported NOTHING, and the shipped binary reproduced the env-override arm to within the noise (TTFA 494.9 against 490.4, RTF 0.746 against 0.754)."
+      },
       {
         "date": "2026-09-19",
         "version": "1.4.0",

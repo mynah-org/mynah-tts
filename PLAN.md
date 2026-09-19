@@ -873,7 +873,7 @@ the x86 self-test that judges the two kernels written here and never executed
       relative error 0.0046 → 1.45 and nothing crashed. The test also gives
       `sea_taps_all()` its first caller on a `BLAS=scalar` build, where it was compiled,
       unreferenced and warned about
-- [~] E10-14 **decided and flipped; one confirmation run left** —
+- [x] E10-14 **decided, flipped and confirmed on the shipped binary** —
       measured on the Axion at the thread counts serving actually uses, `codec.conv_stack`:
       **2 threads/worker 224.8 → 120.8 ms (1.86x)**, 4 threads 129.7 → 83.9 (1.55x). At 16
       threads it is a wash, which is why the laptop's reading was misleading — and why the
@@ -890,9 +890,11 @@ the x86 self-test that judges the two kernels written here and never executed
       of 17904, RTF p95 0.728, 124.3). So it is not 17% on top of a qualified configuration:
       without it there is NO qualified concurrency on that machine. The quality half was
       judged by ear on clips captured from the streaming server under C90 of real load.
-      **Remaining**: the closing gate -- one soak with NO `MYNAH_QUANT_GROUPS` in the
-      environment, so the shipped binary reproduces the point on its own. The profile that
-      makes that checkable rather than remembered is E10-17
+      **CLOSED.** The closing gate ran: C94, thirty minutes, **nothing exported** --
+      TTFA p95 494.9, RTF p95 0.746, throughput 130.8 audio-s/s, `stall@500ms` 0, which is
+      the env-override arm to within the noise (490.4 / 0.754 / 131.2). What the docs
+      describe and what a plain binary does are now the same thing, and E10-17 is what keeps
+      them that way
 - [-] **rejected, with the reference's own numbers.** Do not build these: prefill helper
       thread (stall@250 20.1%→46.8%); token-range slicing (occupancy floor invariant at
       83-97 ms); per-layer prefill checkpointing (TTFA p95 223→1208 ms); fixed-target

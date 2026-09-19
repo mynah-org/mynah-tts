@@ -937,6 +937,22 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     size_t occ_frames = 0, occ_admits = 0, occ_free_nothing_queued = 0;
     double occ_blocked_s = 0.0;
     memset(occ_hist, 0, sizeof(occ_hist));
+    /* The histogram says how many slots were live; it cannot say what a step at
+     * that width COST, and above a certain concurrency that is the only question
+     * left. A step must finish inside one frame period or every slot in it falls
+     * behind playback together, so what decides a stall at high C is not the mean
+     * width but the width at which T_frame crosses the deadline. Time and lateness
+     * per width, same counters-only discipline. */
+    double occ_time[MYNAH_GRAPH_MAX_JOBS + 1u];
+    size_t occ_late[MYNAH_GRAPH_MAX_JOBS + 1u];
+    double occ_worst[MYNAH_GRAPH_MAX_JOBS + 1u];
+    memset(occ_time, 0, sizeof(occ_time));
+    memset(occ_late, 0, sizeof(occ_late));
+    memset(occ_worst, 0, sizeof(occ_worst));
+    const double occ_deadline_s =
+        (caps.frame_rate > 0.0)
+            ? (double)(caps.frames_per_step ? caps.frames_per_step : 1u) / caps.frame_rate
+            : 0.0;
 
     for (;;) {
         /* ---- reap whatever the decoder lane finished --------------------
@@ -1048,8 +1064,16 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             occ_hist[live <= max_batch ? live : max_batch] += 1u;
         }
         if (live > 0u) {
+            const double t_step = serve_profile ? mynah_phase_seconds() : 0.0;
             step_live(engine, &caps, scratch, slots, step_ctxs, step_slot, results,
                       live, dump_all, lane_on);
+            if (serve_profile) {
+                const double took = mynah_phase_seconds() - t_step;
+                const size_t b = live <= max_batch ? live : max_batch;
+                occ_time[b] += took;
+                if (took > occ_worst[b]) occ_worst[b] = took;
+                if (occ_deadline_s > 0.0 && took > occ_deadline_s) ++occ_late[b];
+            }
         }
 
         /* ---- retire, per slot, as soon as it stops ---------------------
@@ -1089,6 +1113,26 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                     100.0 * (double)occ_hist[b] / (double)(occ_frames ? occ_frames : 1u));
         }
         fprintf(stderr, "\n");
+        /* T_frame(B) = a + b*B, read off the serving loop rather than modelled.
+         * `late` is the share of steps at that width that overran the frame
+         * period: a width whose MEAN is inside the deadline can still be the
+         * one producing every stall, so both columns are printed. */
+        if (occ_deadline_s > 0.0) {
+            fprintf(stderr,
+                    "[SERVE] step cost per width (deadline %.1f ms = %u frame(s) "
+                    "at %.2f Hz)\n", occ_deadline_s * 1e3,
+                    caps.frames_per_step ? caps.frames_per_step : 1u, caps.frame_rate);
+            for (size_t b = 1; b <= max_batch; ++b) {
+                if (occ_hist[b] == 0u) continue;
+                fprintf(stderr,
+                        "[SERVE]   B%-2zu  n=%-8zu mean %6.1f ms  worst %7.1f ms  "
+                        "late %5.2f%%  per-slot %5.1f ms\n",
+                        b, occ_hist[b], 1e3 * occ_time[b] / (double)occ_hist[b],
+                        1e3 * occ_worst[b],
+                        100.0 * (double)occ_late[b] / (double)occ_hist[b],
+                        1e3 * occ_time[b] / (double)occ_hist[b] / (double)b);
+            }
+        }
         fprintf(stderr,
                 "[SERVE] a free slot found no work queued %zu times; the loop "
                 "spent %.1f%% of wall blocked waiting for an arrival -- high "

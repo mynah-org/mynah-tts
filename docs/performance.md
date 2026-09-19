@@ -611,3 +611,79 @@ prefill. The lever behind it is the ABSOLUTE cost of a prefill -- 190 ms for a
 long text at C1 with no contention, against 28 ms of fixed cost -- and nobody has
 optimised it. The detail, including the three predictions of mine that the box
 refuted, is in `.work/prefill-blocks-decode.md`.
+
+## 2026-09-19 · The ceiling, and the configuration that reaches it — GCP Axion, 32 cores
+
+Same host, same bank, same protocol as the section above. Three questions were
+asked and all three were answered by measurement rather than by argument.
+
+### 1. `codec_convtr:int8` is not an optimisation, it is the difference between a product point and none
+
+Two ten-minute soaks at C90, identical in every respect but this one clause:
+
+| C90, ten minutes | `codec_convtr` OFF (the shipped default until today) | ON |
+|---|---|---|
+| verdict | **MARGINAL** | **GOOD** |
+| TTFA p95 | 544.2 ms — FAIL against 500 | 492 ms |
+| `STREAM_RTF` p95 | 0.842 | 0.728 |
+| `stall_rate@250ms` | 5 of 15380 — FAIL | **0 of 17904** |
+| throughput | 106.5 audio-s/s | 124.3 audio-s/s |
+
+With the clause absent there is **no qualified concurrency at all** on this
+machine. The default is now ON (`POCKET_QG_DEFAULT_SPEC_PINNED`), and the cost is
+unchanged and known: SNR 28.9-32.9 dB against 36.4-37.9, log-mel nearly unchanged.
+
+**Every number in the section above was measured with this clause exported by
+hand while the binary shipped it OFF.** That gap is closed, and the machinery
+that makes it a validation failure rather than a footnote is in
+`configs/perf/` — see `.work/serving-profiles.md`.
+
+### 2. The ceiling is C96, and above it the failure changes character
+
+| C, convtr ON | 10 min | 30 min | TTFA p95 | RTF p95 | stall@250 |
+|---|---|---|---|---|---|
+| 90 | GOOD | **GOOD** (09-18) | 494.8 | 0.734 | 0 of 53265 |
+| 94 | — | MARGINAL | 494.9 | 0.746 | **1** of 53980 |
+| 96 | GOOD | MARGINAL | 490.4 | 0.754 | **1** of 54186 |
+| 98 | MARGINAL | — | 499.5 | 0.800 | 13 of 18067 |
+| 100 | MARGINAL | — | 522.6 | 0.817 | 22 of 18056 |
+
+Two things to read here, and neither is the obvious one.
+
+**A ten-minute screen promoted C96 and a thirty-minute soak refused it**, by one
+stall in 54186 requests. The rule this repository already carried — *a screen may
+not promote* — met its first real case within hours of being written down. The
+same statistic lesson as 2026-09-18, from the other side: a rate that is zero in
+18000 samples is not a bound, it is a small number that has not been given enough
+chances yet.
+
+**From C96 to C100, TTFA drifts 28 ms while stalls go 0 → 13 → 22.** The
+per-step prefill cap is doing exactly what it promises, so what overruns the 80 ms
+frame at the top of the range is no longer the prefill: it is the AR step itself,
+as slots per worker rise from ~5.6 at C90 to ~6.25 at C100. Any further work on
+"zero stalls at a higher C" belongs to the decode step or to the slot count per
+worker, not to another prefill knob.
+
+And the third reading, which is the useful one for capacity planning:
+`STREAM_RTF` p95 is **0.817 at C100**, a level that cannot be qualified. The box
+still has a fifth of a realtime budget in hand where continuity has already run
+out. **Capacity is not what limits this engine; continuity is.**
+
+### 3. The shipped binary reproduces the operating point on its own
+
+C94, thirty minutes, **no `MYNAH_QUANT_GROUPS` in the environment at all**:
+TTFA p95 494.9 ms, RTF p95 0.746, throughput 130.8 audio-s/s, `stall@500ms` 0 —
+statistically the same run as the env-override arm (490.4 / 0.754 / 131.2). What
+the documentation describes and what a plain binary does are now the same thing.
+
+### The configuration, and where it lives now
+
+    tools/perf_profile.py best recommended
+    python3 tools/serving_profile.py --profile axion-c4a-32c-pocket-en \
+            --model models/pocket-en --server-bin build/cpu/mynah-tts-server
+
+`configs/perf/axion-c4a-32c-pocket-en.json` carries the topology
+(`--prefork 16 --prefork-threads 2 --max-batch 8`), the gates, the operating point
+and the levels above it that were measured and not promoted. It exports **nothing**:
+all three environment knobs are declared *must be absent*, because the shipped
+default now covers them, and a run that exports one of them refuses to start.
