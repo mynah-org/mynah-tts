@@ -1,6 +1,6 @@
 # E11 — Is PocketTTS ternarizable? (W1.58 post-training)
 
-Status: **IN PROGRESS** — opened 2026-09-20, measured the same day. Tool: `tools/ternary_feasibility.py`.
+Status: **DONE 2026-09-20** — no-go on a ternary backbone; the harness is kept, and the int8 lever it found is now E12 ([`int8-backbone.md`](int8-backbone.md)). Tool: `tools/ternary_feasibility.py`.
 Report: `docs/ternary-feasibility.md`. Results land in `build/ternary/*.json`.
 
 ## The question, and why it is asked in this order

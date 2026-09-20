@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "axion-c4a-32c-pocket-en-int8-backbone",
+    "description": "E12 CANDIDATE, not a promoted profile. Same host and topology as axion-c4a-32c-pocket-en, one group changed: backbone bf16 -> int8. Exists so the A/B arm is a file rather than a shell line -- MYNAH_QUANT_GROUPS replaces the WHOLE spec, so the codec groups have to be respelled and getting that wrong changes two variables at once. Unqualified until a 30-minute soak and a listening pass say otherwise; see .work/int8-backbone.md for the gates and for the prediction recorded before the run.",
+    "engine": "pocket",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [
+        1,
+        130
+      ],
+      "preferred_concurrency": 120,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_family": "Google Axion / Arm Neoverse-V2",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "ram_gib": 62,
+    "isa_features_used": [
+      "asimddp",
+      "i8mm"
+    ],
+    "smt_policy": "OFF; one thread per physical core",
+    "canonical_topology": "16 workers x 2 threads, no pinning",
+    "notes": "GCP c4a, no SMT. The load generator ran on the same box for every number here, which costs ~13% coalesced client reads: the cadence percentiles are upper bounds on server lateness, not the server's true emission."
+  },
+  "build": {
+    "target": "make && make server",
+    "blas": "none",
+    "simd": "auto (arm64/native)",
+    "compiler": "gcc 15.2",
+    "requirements": {
+      "blas": "BLAS=none is the Linux default and the only setting these numbers describe. A codec measurement taken under Accelerate puts the phases in a different order and is not comparable.",
+      "isa": "ASIMDDP for the int8 codec kernels"
+    }
+  },
+  "server": {
+    "prefork_workers": 16,
+    "threads_per_worker": 2,
+    "max_batch": 8,
+    "why": "16x2 beats 8x4 decisively here: at equal threads and equal slots, RTF p95 0.784 against 1.052, throughput -25%, stall@250 84/17968 against 734/13511. The optimum is a property of the model's T_frame(B) = a + b*B ratio, not of the machine -- qwen-tts at 1.7B prefers 4x8 on this same host. max_batch is capped at 16 by MYNAH_GRAPH_MAX_JOBS and is not binding at C90 (about 6 live slots per worker)."
+  },
+  "runtime": {
+    "matches_shipped_default": false,
+    "quant_groups": {
+      "codec_transformer": "int8",
+      "codec_conv": "int8",
+      "codec_convtr": "int8",
+      "backbone": "int8",
+      "flow_net": "f16",
+      "conditioner": "f16"
+    },
+    "environment": {
+      "MYNAH_QUANT_GROUPS": {
+        "value": "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,backbone:int8,flow_net:f16,conditioner:f16",
+        "why": "REQUIRED for this profile and FORBIDDEN for the shipped one -- that is the whole point of keeping them in two files. The variable replaces the entire spec rather than patching one group, so every codec group is respelled here at its shipped value and only `backbone` differs from POCKET_QG_DEFAULT_SPEC_PINNED. A run that sets only `backbone:int8` would silently drop the codec to the MYNAH_QUANT default and measure two changes as one."
+      },
+      "MYNAH_PREFILL_SLICE": {
+        "value": null,
+        "why": "Must be ABSENT. The shipped default is 32 tokens per slice; setting it to 0 restores the one-shot prefill that froze the whole batch on every admission."
+      },
+      "MYNAH_PREFILL_STEP_MS": {
+        "value": null,
+        "why": "Must be ABSENT. The shipped default is 40 ms of prefill work per AR step, MEASURED at C120 (30 gives TTFA p95 510 and MARGINAL, 40 gives 450 and GOOD, 50 gives 448 and buys nothing). It is not derived from the frame's slack: that rule produced 30 for the f16 kernel and points the wrong way now that bf16 made the step cheaper. 0 removes the cap, which is what makes zero stalls a scheduler bound instead of a lucky distribution."
+      }
+    }
+  },
+  "gates": {
+    "mandatory": {
+      "rtf_p95_below": 1.0,
+      "stall_ms": 500,
+      "completed_equals_launched": true
+    },
+    "preferred": {
+      "ttfb_p95_ms": 100.0,
+      "ttfa_p95_ms": 500.0,
+      "rtf_p95": 0.9,
+      "prebuffer_p95_ms": 500.0,
+      "safe_start_p95_ms": 1000.0,
+      "stall_ms": 250
+    },
+    "drift": {
+      "rtf_tolerance": 0.05,
+      "prebuffer_tolerance_ms": 150.0,
+      "min_windows": 3
+    },
+    "soak": {
+      "bank": "tests/load_texts_en_v2.txt",
+      "bank_version": "v2 / bank-sha256 55b286369ef8dd44 / 277 texts",
+      "seconds": 1800,
+      "warmup_seconds": 40,
+      "window_seconds": 180
+    },
+    "client_contract": {
+      "prebuffer_ms": 250,
+      "why": "At the operating point the required prebuffer is 2.8 ms at p95 and max_gap p95 is 121 ms against an 80 ms frame, so the 250 ms contract holds with room. Raising MYNAH_PREFILL_STEP_MS from 30 to 40 moved max_gap p95 from 103 to 121 and bought 60 ms of TTFA: that trade is the reason the cap is a measured quantity rather than a derived one."
+    }
+  },
+  "qualification": {
+    "status": "unqualified",
+    "model": "models/pocket-en",
+    "workload": "Mixed v2 bank, streaming route /v1/audio/speech, PCM, one language pack, load generator on the same host.",
+    "ceiling": [],
+    "history": [],
+    "notes": "No runtime measurement exists yet. The only evidence is E11's Python screen against the reference implementation: backbone int8 output NMSE 1.1e-4 mean / 6.4e-4 worst, and 0/7 termination failures at temperature 0 and 0.3 with the level correct and duration inside the FP-vs-FP spread. That is enough to justify spending a box; it is not enough to change a default.\n\nThe operating point moved C96 -> C110 -> C120 across 2026-09-19, on one host and one bank, by three changes made that day: the per-step prefill cap, backbone:bf16 with a tiled BFMMLA kernel, and the cap re-measured after that kernel made the step cheaper. +25% concurrency and TTFA p95 492 -> 447 ms. TWO FINDINGS THAT EXPIRED THE SAME DAY THEY WERE WRITTEN, kept here so nobody quotes them: 'cap = deadline - T_frame' is not a law (at the modal width it now points the wrong way, because a frame that overruns is a debt a slot repays from its lead, not a stall), and '--max-batch is inert' was true at C100 and false at C120, where the width histogram reaches B7 with 92015 frames and B8 with 62154. The next limit is admission: at C130 TTFB triples because 16 workers x 8 slots is 128 places."
+  }
+}
