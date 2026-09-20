@@ -119,3 +119,165 @@ implementation, seven sentences, one voice, one language — **not** against
 `engine_pocket.c` and not under load. It is enough to justify spending a box on
 this. It is not enough to change a default, and the two must not be confused
 when this note is read back.
+
+---
+
+# Measured, 2026-09-20, GCP Axion c4a-highcpu-32 (Neoverse-V2)
+
+Host has **both** units the Mac lacked: `isa.arm.i8mm` ON (SMMLA, wired into the
+weight-stationary batched linear) and `isa.arm.bf16` ON. `BLAS=none/mynah-sgemm`,
+`SIMD=auto (arm64/native)`, clean rebuild at `e7b2a9d`.
+
+## E12-3: the prediction held, and the numbers are cleaner than expected
+
+`MYNAH_COST_MAP=2`, CLI, single thread, `step.backbone` over 77 steps, the same
+utterance and seed on both arms:
+
+| B | bf16 ms/step | int8 ms/step | delta |
+|---|---|---|---|
+| 1 | 2.427 | 2.157 | **−11.1%** |
+| 2 | 3.335 | 3.167 | −5.0% |
+| 4 | 5.245 | 4.893 | −6.7% |
+| 8 | 8.285 | 8.262 | **−0.3%** |
+
+Least-squares over all four points:
+
+```
+bf16:  T_backbone(B) = 1.691 + 0.835*B  ms
+int8:  T_backbone(B) = 1.377 + 0.865*B  ms
+```
+
+**int8 moves `a` by −18.6% and `b` by +3.6%.** That is the prediction recorded in
+E12-3 before the run, confirmed on both coefficients and in the right direction
+on each: the weight pass is once per step and lives in `a`; the per-slot term is
+compute, and int8 does not help it because SMMLA and BFMMLA are both 16 MACs per
+instruction. `b` is very slightly *worse*, which is what paying to quantize the
+activation once per step looks like.
+
+**Consequence for the operating point.** C120–C130 runs at B ≈ 7–8, where the
+two arms are within 0.3% of each other. There is no throughput win there, and
+this was knowable from `T_frame(B) = a + b·B` before a single soak was run. The
+win is at B=1: prefill, TTFA, a lightly loaded box.
+
+## One thing the prediction got wrong, and it matters
+
+`a` fell by **18.6%, not by half**, while the weight bytes fell by half
+(151.0 → 75.7 MB). So `a` is **not purely the weight pass**. Something fixed
+lives in there — per-step setup, the activation quantization, the epilogue,
+pool dispatch — and a bandwidth model that assumes `a` is all bytes will
+over-predict every future weight-shrinking change by roughly 2.7x.
+
+That is worth more than the int8 result itself: it is a correction to the
+instrument that `backbone-bandwidth.md` reasons with. The next weight-format
+change should be predicted against `a_bytes ≈ 0.31 ms per 75 MB` and a fixed
+remainder of ≈ 1.06 ms, not against `a` as a whole.
+
+## Reporting gap found on the way
+
+`--dispatch-map`'s `isa.arm.bf16` row describes **BFDOT** ("eight MACs per
+instruction"), but `matvec_bf16_neon_tile` — BFMMLA, sixteen MACs, eight
+accumulators — is what `qmat_rows_job` actually calls for the batched path
+(`src/qmat.c:3638,3654`). The row is true of the single-vector decode matvec and
+understates the batched one. Anyone reading the dispatch map to decide whether
+bf16 is competitive at batch would conclude it is half as wide as it is.
+
+## E12 serving-level A/B at C130: int8 is a no-op under load
+
+Same build `e7b2a9d`, same box, 10-minute screens back to back, ~21,700
+requests each, 0 failed and 0 rejected on both arms.
+
+| C130, 10 min | int8 | bf16 (shipped) | delta |
+|---|---|---|---|
+| TTFB p95 | 199.0 ms | 203.5 ms | −2.2% |
+| **TTFA p95** | 409.2 ms | **402.8 ms** | **+1.6%, int8 worse** |
+| STREAM_RTF p95 | 0.822 | 0.820 | +0.2% |
+| prebuffer p95 | 44.3 ms | 43.0 ms | +3% |
+| requests | 21,702 | 21,742 | −0.2% |
+| stall@250 / @500 | 0% / 0% | 0% / 0% | = |
+| verdict | MARGINAL | MARGINAL | = |
+
+Both MARGINAL for the same single reason: **TTFB p95 ≈ 200 ms against the
+100 ms preferred gate**. Every mandatory gate passed on both. That is the
+128-slot wall — 16 workers × `--max-batch 8` — and it is identical on the two
+arms, which is what "the dtype is not the constraint here" looks like.
+
+This is the serving-level confirmation of the batch sweep: at B ≈ 8 the two
+arms differ by 0.3% in `step.backbone`, and 0.3% of a region is not visible in
+an end-to-end percentile.
+
+**An attribution error I made and had to retract mid-run.** On seeing int8's
+TTFA p95 of 409.2 I compared it against yesterday's C130 bf16 number (580.9 ms)
+and reported a 29.5% win. Today's bf16 arm returns **402.8 ms**. The improvement
+is the *build*, not the dtype. Yesterday's run was a different commit and a
+different binary; the only admissible control is the arm measured beside it, on
+the same build, on the same box, in the same hour. The control existed
+specifically to prevent this and it still nearly went out as a finding.
+
+## Two operational traps, both mine, both worth keeping
+
+**`tmux kill-session` does not kill what the session started.** The C140 screen
+outlived its session and ran concurrently with the first soak attempt. A soak
+that shared the box with another 16-worker server is not a soak.
+
+**`pkill -x mynah-tts-server` matches nothing and reports success.** Linux
+truncates `/proc/<pid>/comm` to 15 characters, so the process name is
+`mynah-tts-serve` (15) and an exact match on the 16-character name silently
+finds nobody. `pgrep -c -x` then returns 0 and the script prints "servers still
+alive: 0" while three are running — `ps -C mynah-tts-server` lists them because
+it does not truncate. **Kill by PID from `ps -C`, and prove the box is empty
+with a different tool than the one that did the killing.** A cleanup that
+self-certifies is not evidence.
+
+## C128, thirty minutes: MARGINAL by three stalls in 65,295
+
+Run on the int8 arm, 20 Sep, `e7b2a9d`, box proven empty before the start.
+65,295 requests, 1845 s wall, ten 180-second windows all flat.
+
+```
+PASS mandatory  completed == launched    65295 == 65295
+PASS mandatory  STREAM_RTF p95           0.818 < 1.000
+PASS mandatory  stall_rate@500ms         0 of 65295
+PASS preferred  TTFB p95                  77.4 ms  <= 100
+PASS preferred  TTFA p95                 336.3 ms  <= 500
+PASS preferred  STREAM_RTF p95           0.818 <= 0.900
+PASS preferred  required_prebuffer p95    40.3 ms  <= 500
+PASS preferred  safe_play_start p95      372.5 ms  <= 1000
+FAIL preferred  stall_rate@250ms         3 of 65,295          <- the only miss
+PASS drift      prebuffer  last vs best  +0.0083 (tol +0.1500)
+PASS drift      stream_rtf last vs best  +0.0000 (tol +0.0500)
+```
+
+Throughput **158.2 audio-s per wall-s**. Three stalls is 0.005% of requests. The
+gate is written as exactly zero deliberately and the verdict stands, but the
+distance from qualifying is three interruptions, not a margin.
+
+## The ceiling is a slot count, and the measurement matches the arithmetic
+
+16 workers x `--max-batch 8` = **128 places**. Time to accept a request:
+
+| level | places | TTFB p95 | verdict |
+|---|---|---|---|
+| C120 | 8 spare | 75.1 ms | GOOD, 30 min |
+| C128 | exactly full | **77.4 ms** | MARGINAL, 30 min, 3 stalls |
+| C130 | 2 over | **203.5 ms** | MARGINAL, 10 min |
+
+Flat at 75–77 ms right up to the 128th stream, then nearly triples with two
+more. **The next capacity increase is a configuration change — worker count or
+`--max-batch` — not a kernel.** Nothing in E12 touched that, and it is now the
+cheapest lever on the board.
+
+## E12 verdict: int8 backbone NOT promoted
+
+Gate 2 of this note's own list — "TTFA p95 no worse than the bf16 arm" — is
+missed: 409.2 against 402.8 at C130 on the same build. Gates 1 and 3 pass, gates
+4 and 5 were never reached because there is no reason to spend a listening pass
+and a determinism sweep on a change measured at 0.3% where it would ship.
+
+`POCKET_QG_DEFAULT_SPEC` stays as it is. The negative goes to
+`docs/performance.md`.
+
+What int8 *is* good for, unmeasured here: **memory**. 151.0 → 75.7 MB of backbone
+weights, and at 16 prefork workers that is worth checking if the quantized cache
+is per-process rather than shared. No RSS was captured — the server log does not
+emit it — so this is a hypothesis, not a result, and it is the only remaining
+reason to revisit int8.

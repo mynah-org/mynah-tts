@@ -1130,11 +1130,25 @@ measures the runtime side in C, on the box, under load. Needs **no code**:
 
 - [x] E12-1 the A/B is reachable today — `MYNAH_QUANT_GROUPS` replaces the whole spec, so arm B must respell the codec groups; both arms go in as `configs/perf` entries so the configuration cannot live in shell history
 - [x] E12-2 **this Mac cannot answer it, demonstrated not assumed** — M1 is ARMv8.4 with **neither FEAT_BF16 nor FEAT_I8MM** (`--dispatch-map` says so in two rows), so the local A/B compares a degraded f16 path against SDOT-only int8 and came out 23% *slower*. On Neoverse-V2 it is BFMMLA against SMMLA. Discard the local number
-- [ ] E12-3 **prediction on the record before the run**: int8 is a **TTFA / low-concurrency** win, not a throughput win. `T_frame(B) = a + b·B` is `2.9 + 6.8·B` at bf16; the weight pass is once per step so it lives in **`a`**, which is ~5% of a 57 ms step at B=8. And f16→bf16 moved **`b` by −13% with `a` untouched**, which was a kernel change at equal bytes — so `b` is compute. On Neoverse-V2 **SMMLA and BFMMLA are both 16 MACs/instruction**, so int8 buys bytes and no arithmetic. If throughput rises at C120, this reasoning is wrong and the reason matters more than the result
-- [ ] E12-4 measure what discriminates, not just RTF: `step.backbone` ms/frame via `MYNAH_COST_MAP=2`; **`a` and `b` re-fitted** over a `--batch 1,2,4,8` sweep; effective GB/s; TTFA/TTFB p95; prebuffer and stall@250/500; throughput; per-worker CPU utilisation; peak RSS
-- [ ] E12-5 **cache misses need `perf stat` on the box** — we have **no in-process perf counters**, `src/costmap.h` is wall-clock regions only. Do not claim a cache effect without it
-- [ ] E12-6 gates for promotion: E5 mandatory set, TTFA p95 no worse, **30-min soak** (a screen may not promote), a listening pass on the v2 corpus, and determinism unchanged — identical sha256 over N repetitions under 0/7/23/47 load on a clean rebuild
-- [ ] E12-7 any single failure leaves `POCKET_QG_DEFAULT_SPEC` alone and the negative goes to `docs/performance.md`
+- [x] E12-3 **prediction confirmed on both coefficients.** Measured on the box: `T_backbone(B)` is **1.691 + 0.835·B** at bf16 and **1.377 + 0.865·B** at int8 — `a` **−18.6%**, `b` **+3.6%**. −11.1% at B=1, **−0.3% at B=8**. int8 attacks the once-per-step weight pass and nothing else, exactly as SMMLA≡BFMMLA at 16 MACs/instruction predicts
+- [x] E12-4 **serving-level A/B at C130, same build, back to back**: int8 vs bf16 within 2% on every percentile (TTFB 199.0/203.5, TTFA 409.2/402.8, RTF 0.822/0.820), both MARGINAL, both on the same missed gate. int8 is a **no-op under load**
+- [x] E12-6 **NOT PROMOTED.** Gate 2 of `.work/int8-backbone.md` — TTFA p95 no worse than bf16 — is missed (409.2 vs 402.8). `POCKET_QG_DEFAULT_SPEC` unchanged; gates 4 and 5 never reached because a listening pass and a determinism sweep are not worth spending on a 0.3% change
+- [x] E12-8 **`a` is not all bytes.** It fell 18.6% while the bytes fell 50%, so ≈1.06 ms of the 1.69 ms is fixed cost (per-step setup, activation quantization, epilogue, pool dispatch). A bandwidth model that treats `a` as pure weight traffic over-predicts every future weight-format change by ~2.7×. That is a correction to the instrument `backbone-bandwidth.md` reasons with, and it outlives the int8 result
+- [x] E12-9 **attribution error, caught by the control.** int8's TTFA of 409.2 was first reported as −29.5% against *yesterday's* 580.9. Today's bf16 arm returns 402.8: the gain is the **build**, not the dtype. Only the arm measured beside it, same build same box same hour, is admissible
+- [x] E12-10 **two operational traps, both mine.** `tmux kill-session` does not kill what the session started — a C140 screen ran concurrently with the first soak attempt. And **`pkill -x mynah-tts-server` matches nothing and reports success**: Linux truncates `/proc/<pid>/comm` to 15 chars, so the name is `mynah-tts-serve`; `pgrep -c -x` then says 0 while `ps -C` lists three. Kill by PID from `ps -C`, and prove the box is empty with a different tool than the one that killed
+- [ ] E12-11 the only surviving reason to revisit int8 is **memory**: 151.0 → 75.7 MB of backbone weights, times 16 prefork workers if the quantized cache is per-process. No RSS was captured — the server log does not emit one — so this is a hypothesis
+
+### E13 — The ceiling is 128 request slots, not a speed limit → [`.work/int8-backbone.md`](.work/int8-backbone.md)
+
+16 workers x `--max-batch 8` = **128 places**. TTFB p95 is flat at 75-77 ms up to
+the 128th stream and nearly triples with two more (203.5 ms at C130). Audio is
+still produced ~20% faster than it plays at C130: the queue is the limit, not
+compute.
+
+- [x] E13-1 **C128, 30 min, 65,295 requests: MARGINAL by 3 stalls@250ms** — every other gate passed, TTFB 77.4, TTFA 336.3, RTF p95 0.818, throughput **158.2 audio-s/s**, ten windows flat, both drift checks PASS. 0.005% of requests
+- [ ] E13-2 **the next capacity increase is a config change, not a kernel**: raise worker count or `--max-batch`. Untried, and now the cheapest lever on the board
+- [ ] E13-3 find the three stalls at C128. Smaller job than finding throughput, and it would promote the level
+- [x] E13-4 C120 remains the qualified operating point; nothing here changes it
 
 ### E5 — Streaming server v2 → [`.work/streaming-server-v2.md`](.work/streaming-server-v2.md)
 Design reference: [`.work/serving-design.md`](.work/serving-design.md) ·

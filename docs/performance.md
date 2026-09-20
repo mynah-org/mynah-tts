@@ -879,3 +879,59 @@ reached 7 live slots. At C120 the width histogram reaches **B7 with 92015 frames
 and B8 with 62154**: the workers saturate their eight slots. It is a lever again,
 and it is why TTFB triples at C130 — 16 workers × 8 slots is 128 places, and 130
 requests is the first level that fills them.
+
+## PocketTTS on Axion, 2026-09-20 — int8 backbone measured and rejected; the ceiling is a slot count
+
+GCP Axion `c4a-highcpu-32`, Neoverse-V2, `BLAS=none/mynah-sgemm`, `SIMD=auto`,
+clean rebuild at `e7b2a9d`. Host has FEAT_BF16 and FEAT_I8MM; both dispatch rows
+resolve ON. Logs: `reports/20260920-e12-axion/`.
+
+### `step.backbone` against batch width, bf16 vs int8
+
+`MYNAH_COST_MAP=2`, CLI, single thread, 77 steps, same utterance and seed:
+
+| B | bf16 | int8 | delta |
+|---|---|---|---|
+| 1 | 2.427 ms | 2.157 ms | −11.1% |
+| 2 | 3.335 ms | 3.167 ms | −5.0% |
+| 4 | 5.245 ms | 4.893 ms | −6.7% |
+| 8 | 8.285 ms | 8.262 ms | −0.3% |
+
+```
+bf16:  T_backbone(B) = 1.691 + 0.835*B  ms
+int8:  T_backbone(B) = 1.377 + 0.865*B  ms
+```
+
+int8 moves `a` by **−18.6%** and `b` by **+3.6%**. The weight pass is once per
+step and lives in `a`; the per-slot term is compute and int8 cannot help it,
+because SMMLA and BFMMLA are both 16 MACs per instruction. At the C120–C130
+operating point B reaches 7–8 and the two arms are within 0.3%.
+
+**`a` is not all bytes**: it fell 18.6% while the weight bytes fell 50%
+(151.0 → 75.7 MB), so ≈1.06 ms of the 1.69 ms is fixed cost. A bandwidth model
+that treats `a` as pure weight traffic over-predicts a weight-format change by
+about 2.7x.
+
+### Serving A/B at C130, same build, back to back, 10 min each
+
+| | int8 | bf16 (shipped) |
+|---|---|---|
+| requests | 21,702 | 21,742 |
+| TTFB p95 | 199.0 ms | 203.5 ms |
+| TTFA p95 | 409.2 ms | 402.8 ms |
+| STREAM_RTF p95 | 0.822 | 0.820 |
+| stall@250 / @500 | 0 / 0 | 0 / 0 |
+| verdict | MARGINAL | MARGINAL |
+
+**int8 backbone is not promoted.** `POCKET_QG_DEFAULT_SPEC` unchanged.
+
+### The ceiling is 128 request slots
+
+16 workers x `--max-batch 8`. TTFB p95: **75.1 ms at C120, 77.4 ms at C128,
+203.5 ms at C130** — flat to the slot count, then nearly triple. Audio is still
+produced ~20% faster than it plays at C130, so this is the queue and not compute.
+
+**C128, 30 minutes, 65,295 requests: MARGINAL**, missing only
+`stall_rate@250ms == 0` with **3 stalls (0.005%)**. TTFA p95 336.3 ms, TTFB p95
+77.4 ms, RTF p95 0.818, throughput **158.2 audio-s/s**, ten 180 s windows flat,
+both drift checks PASS. C120 remains the qualified operating point.
