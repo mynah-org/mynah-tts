@@ -190,7 +190,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -441,7 +441,7 @@ self-test: $(TARGET)
 	@$(TARGET) --self-test
 	@MYNAH_QMAT_VNNI=scalar $(TARGET) --self-test
 
-test: self-test kernels-test qmat-test driver-test window-test json-test playback-sim-test perf-profile-test simd-auto-test
+test: self-test kernels-test qmat-test driver-test window-test json-test playback-sim-test perf-profile-test ternary-test simd-auto-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
@@ -522,6 +522,14 @@ playback-sim-test:
 # refusals that keep a qualifying run honest actually refuse.
 perf-profile-test:
 	python3 tests/test_perf_profile.py
+
+# The ternary feasibility analysis (E11) is closed-form solves transcribed from
+# papers. A transcription error would not crash and would not obviously corrupt
+# audio -- it would quietly make one method look worse than another, which is
+# how a wrong number becomes a finding. So the solves are checked against lstsq
+# and the orderings the report claims are asserted. No model needed.
+ternary-test:
+	python3 tools/ternary_feasibility.py self-test
 
 serving-profile: serving-wave
 
