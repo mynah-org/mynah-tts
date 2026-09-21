@@ -46,8 +46,13 @@ echo "server up: $(cat "$OUT/health-before.json")"
 
 # Saturate the box for the whole capture. --url attaches to the server we just
 # started rather than launching a second one.
+# C-1, not C. The capture pulls one stream of its own, so a generator at C
+# would make the real instantaneous concurrency C+1 -- above the level the
+# bundle claims to represent. The first run of this script did exactly that and
+# the generator came back NOT STREAMABLE, which is the correct verdict for C127
+# and the wrong condition for the bundle.
 python3 tools/serving_profile.py --url "http://127.0.0.1:$PORT" \
-    --mode soak --bank tests/load_texts_en_v2.txt --levels "$C" \
+    --mode soak --bank tests/load_texts_en_v2.txt --levels "$((C-1))" \
     --soak-seconds "$SECONDS_OF_LOAD" --warmup-seconds 20 --window-seconds 180 \
     >"$HOME/loadgen.log" 2>&1 &
 LOADPID=$!
@@ -83,6 +88,25 @@ PY
 )
 echo "selected ${#ROWS[@]} sentences from a bank of $(grep -v '^#' tests/load_texts_en_v2.txt | grep -cv '^[[:space:]]*$')"
 
+# Build every JSON body NOW, in one python process, before a single sample is
+# pulled. The first version spawned two python3 interpreters per sample inside
+# the capture loop -- on a box already saturated at C126 that is CPU stolen from
+# the thing being measured, and it showed up as stalls the server did not cause.
+BODYDIR=$(mktemp -d)
+python3 - "$BODYDIR" <<'PY'
+import json, sys, os
+d = sys.argv[1]
+for i, row in enumerate(sys.stdin.read().splitlines()):
+    if not row.strip():
+        continue
+    cls, text = row.split("\t", 1)
+    with open(os.path.join(d, f"{i:02d}.json"), "w", encoding="utf-8") as f:
+        json.dump({"model": "pocket-en", "input": text,
+                   "voice": "alba", "response_format": "wav"}, f)
+PY
+<<< "$(printf '%s\n' "${ROWS[@]}")"
+echo "prebuilt $(ls "$BODYDIR" | wc -l) request bodies"
+
 printf 'file|class|bytes|seconds|http_s|text\n' > "$OUT/manifest.psv"
 i=0
 for row in "${ROWS[@]}"; do
@@ -90,17 +114,18 @@ for row in "${ROWS[@]}"; do
   t=${row#*$'\t'}
   n=$(printf '%02d' "$i")
   f="$OUT/streaming-under-load/${n}_${cls}.wav"
-  body=$(python3 -c 'import json,sys;print(json.dumps({"model":"pocket-en","input":sys.argv[1],"voice":"alba","response_format":"wav"}))' "$t")
-  t0=$(date +%s.%N)
+  t0=$EPOCHREALTIME                    # bash builtin: no process spawned
   curl -sf -m 180 -X POST "localhost:$PORT/v1/audio/speech" \
-       -H 'content-type: application/json' -d "$body" -o "$f"
-  rc=$?; t1=$(date +%s.%N)
+       -H 'content-type: application/json' --data-binary "@$BODYDIR/$n.json" -o "$f"
+  rc=$?; t1=$EPOCHREALTIME
   sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
-  secs=$(python3 -c "print(f'{max(0,($sz-44))/48000:.2f}')")
-  http=$(python3 -c "print(f'{$t1-$t0:.2f}')")
-  printf '%s|%s|%s|%s|%s|%s\n' "${n}_${cls}.wav" "$cls" "$sz" "$secs" "$http" "$t" >> "$OUT/manifest.psv"
+  # Integer arithmetic in the shell; the manifest is rewritten exactly once at
+  # the end, so nothing but curl runs while the box is under load.
+  secs=$(( (sz > 44 ? sz - 44 : 0) / 48000 ))
+  printf '%s|%s|%s|%s|%s|%s\n' "${n}_${cls}.wav" "$cls" "$sz" "$secs" \
+         "$(( ${t1%%.*} - ${t0%%.*} ))" "$t" >> "$OUT/manifest.psv"
   [ "$rc" -ne 0 ] && echo "  WARN $n rc=$rc"
-  echo "  $n $cls ${secs}s (${http}s wall, $sz B)"
+  echo "  $n $cls ~${secs}s ($sz B)"
   i=$((i+1))
 done
 
@@ -112,5 +137,6 @@ curl -sf "localhost:$PORT/health" >"$OUT/health-after.json" 2>/dev/null || true
   echo "----------------------------------------"
   grep -E "^ *$C |PASS (mandatory|preferred)|FAIL " "$HOME/loadgen.log" | tail -14
 } > "$OUT/load-conditions.txt" 2>/dev/null || true
+rm -rf "$BODYDIR"
 clear_box
 echo "CAPTURE DONE $(date -Is)  files=$(ls "$OUT/streaming-under-load" | wc -l)  -> $OUT"
