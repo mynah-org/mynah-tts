@@ -344,3 +344,40 @@ certify.
 Between a clean 126 and a 128 that lost on three interruptions in 65,295 there
 is only 127 — and the open question of whether C128's three were luck. Note the
 two MARGINALs fail for *different* reasons: C128 on stalls, C130 on the queue.
+
+## C126, thirty minutes: GOOD — the certified point moves 120 -> 126
+
+21 Sep, fresh Axion, clean rebuild at `e7b2a9d`, shipped default, box proven
+empty before the run.
+
+```
+65,039 requests   completed == launched   0 failed
+PASS all nine gates
+  TTFB p95        79.1 ms   <= 100
+  TTFA p95       329.5 ms   <= 500
+  STREAM_RTF p95   0.815    <= 0.900
+  prebuffer p95   40.7 ms   <= 500
+  safe_start p95 367.4 ms   <= 1000
+  stall@250ms      0 of 65,039      <- the gate C128 lost
+  stall@500ms      0 of 65,039
+drift stream_rtf  +0.0000 over ten 180 s windows
+throughput       157.4 audio-s per wall-s
+```
+
+**+5% on the certified figure, and the frontier is now tight**: 126 clean over
+65,039 requests, 128 stopped by 3 stalls over 65,295. Only 127 lies between them.
+
+The ladder that produced this promoted the first GOOD screen to thirty minutes
+without a human round trip, which is the shape worth reusing: a screen may not
+promote, but it can *choose what to soak*, and that turns a 40-minute question
+into one unattended run.
+
+| level | soak | requests | TTFB p95 | TTFA p95 | stall@250 | verdict |
+|---|---|---|---|---|---|---|
+| C120 | 30 min | 64,205 | 75.1 ms | 447.4 ms | 0 | GOOD (19 Sep build) |
+| **C126** | **30 min** | **65,039** | **79.1 ms** | **329.5 ms** | **0** | **GOOD — certified** |
+| C128 | 30 min | 65,295 | 77.4 ms | 336.3 ms | 3 | MARGINAL |
+| C130 | 10 min | 21,742 | 203.5 ms | 402.8 ms | 0 | MARGINAL (queue) |
+
+Note the two MARGINALs fail for **different** reasons — C128 on stalls, C130 on
+the queue — so they are not one wall seen twice.
