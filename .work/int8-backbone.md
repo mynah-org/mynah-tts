@@ -281,3 +281,66 @@ weights, and at 16 prefork workers that is worth checking if the quantized cache
 is per-process rather than shared. No RSS was captured — the server log does not
 emit it — so this is a hypothesis, not a result, and it is the only remaining
 reason to revisit int8.
+
+---
+
+# E13: finding the certifiable level, 2026-09-21
+
+Fresh Axion `c4a-highcpu-32`, `136.112.223.214`. Synced and **clean-rebuilt**
+before measuring, verified rather than assumed:
+
+```
+remote        https://github.com/mynah-org/mynah-tts.git
+HEAD          e7b2a9d == origin/main
+tracked mods  0
+git diff origin/main -- src server cli tools tests Makefile   ->  empty
+binary        build/cpu/mynah-tts-server  2026-09-21_13:14   (rebuilt, not reused)
+isa.arm.bf16 ON   isa.arm.i8mm ON   BLAS=none/mynah-sgemm   SIMD=auto (arm64/native)
+```
+
+The empty diff is stronger evidence than a fresh clone would be: a clone proves
+the files *came from* origin, the diff proves the files *are* origin, byte for
+byte, on every source path.
+
+## Method: a ladder that walks itself down
+
+One unattended script: screen a level for 10 minutes, and **promote the first
+GOOD straight to 30 minutes** rather than round-tripping through a human. Walk
+126 -> 124 -> 122 and stop at the first that qualifies. Shipped default
+throughout — int8 was measured and rejected on 20 September, and only the
+shipped configuration is quotable anyway.
+
+Each level is preceded by a kill-and-prove: PIDs from `ps -C`, then a printed
+count of what survived. That is there because on 20 September a screen outlived
+its tmux session and competed with a soak for the box.
+
+## C126, 10-minute screen: GOOD on all nine gates
+
+```
+PASS mandatory  completed == launched   21641 == 21641
+PASS mandatory  STREAM_RTF p95          0.815 < 1.000
+PASS mandatory  stall_rate@500ms        0 of 21641
+PASS preferred  TTFB p95                 78.8 ms <= 100
+PASS preferred  TTFA p95                330.7 ms <= 500
+PASS preferred  STREAM_RTF p95          0.815 <= 0.900
+PASS preferred  required_prebuffer p95   38.0 ms <= 500
+PASS preferred  safe_play_start p95     365.5 ms <= 1000
+PASS preferred  stall_rate@250ms        0 of 21641      <- the gate C128 lost
+```
+
+Not a squeak-through: TTFB uses 79% of its budget, TTFA 66%, RTF 91%. The
+30-minute confirmation was promoted automatically and is the run that may
+certify.
+
+## The frontier is narrow, and that is the useful part
+
+| level | soak | requests | stall@250 | verdict |
+|---|---|---|---|---|
+| C120 | 30 min | 64,205 | 0 | GOOD (certified 19 Sep) |
+| C126 | 10 min | 21,641 | **0** | **GOOD** |
+| C128 | 30 min | 65,295 | 3 | MARGINAL |
+| C130 | 10 min | 21,742 | 0 | MARGINAL (TTFB 203 ms, queue full) |
+
+Between a clean 126 and a 128 that lost on three interruptions in 65,295 there
+is only 127 — and the open question of whether C128's three were luck. Note the
+two MARGINALs fail for *different* reasons: C128 on stalls, C130 on the queue.
