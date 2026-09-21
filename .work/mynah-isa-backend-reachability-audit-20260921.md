@@ -210,13 +210,45 @@ specific thing*: f32 kernel selection on x86. That is a much more tractable
 statement than "it was tuned for Axion", and it is why §4's P1 is worth doing
 rather than despairing of.
 
+## 4c. The Arm ladder, measured on one host so the ISA is the only variable
+
+Axion has dotprod + i8mm + bf16. Turning the top two off in the dispatcher
+simulates the older tiers **on identical silicon**, which isolates the
+instruction set from every other difference between generations.
+
+| tier | `step.backbone` B=1 | B=8 | RTF (B=1) |
+|---|---|---|---|
+| **A5** dotprod+i8mm+bf16 — Axion today | 2.343 ms | **8.642 ms** | 0.087 |
+| **A3** dotprod+i8mm, no bf16 — ~Graviton3 | 2.479 ms (+5.8%) | **11.501 ms (+33%)** | 0.090 |
+| **A2** dotprod only — ~Graviton2 / Neoverse-N1 | 2.558 ms (+9.2%) | 11.687 ms (+35%) | 0.092 |
+
+Three things fall out:
+
+**All of the value is in bf16, and only at batch.** BFMMLA is worth **+33% at
+B=8** and only +5.8% at B=1 — the tiled kernel is a batched-GEMM win, exactly as
+`matvec_bf16_neon_tile`'s comment claims, and single-stream barely notices it.
+
+**i8mm is worth almost nothing here (+1.6% at B=8).** Not because SMMLA is weak,
+but because the shipped default puts the backbone on `bf16`, so the batched
+linear goes through BFMMLA and never reaches the SMMLA path. i8mm only serves
+the int8 codec, which is a small share of the step. A host with dotprod but no
+i8mm loses very little of *this* configuration.
+
+**The economic answer: older Arm does not fall off a cliff.** At B=8 the
+backbone is ~8.6 ms inside an 80 ms frame budget, so a Graviton3-class host's
++2.86 ms is about **3.6% of the frame budget**, not a collapse. The engine is
+usable on dotprod-only Arm.
+
+**Caveat, and it is not small.** This varies *instruction availability only*. A
+real Graviton2 also has a narrower pipeline, smaller caches and a lower clock,
+and none of that is simulated here. **Treat these as a lower bound on the
+penalty**, and as evidence that nothing in the code path *requires* the newer
+instructions — which is the question the ladder was built to answer.
+
 ## 5. Still to do in this track
 
-- [ ] threading audit (§8 of the brief) — `pool.threads`, `pool.decoder_lane`,
-      `pool.spin`, worker/thread topology, and whether the 16x2 optimum is a
-      property of the model's `a + b·B` or of Neoverse-V2;
-- [ ] the Arm capability ladder A1–A5 using `MYNAH_QMAT_I8MM=0/1` and
-      `MYNAH_QMAT_BF16` to simulate tiers on this box;
+- [ ] whether the 16x2 worker/thread optimum is a property of the model's
+      `a + b·B` or of Neoverse-V2 — the rest of the threading audit is §4b;
 - [ ] the per-stage reachability matrix for the Mimi decoder ops;
 - [ ] the one-command qualification harness (§15);
 - [ ] memory/cache classification per stage (§9) — E12 already established that
