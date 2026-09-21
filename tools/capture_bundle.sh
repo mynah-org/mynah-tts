@@ -93,19 +93,27 @@ echo "selected ${#ROWS[@]} sentences from a bank of $(grep -v '^#' tests/load_te
 # the capture loop -- on a box already saturated at C126 that is CPU stolen from
 # the thing being measured, and it showed up as stalls the server did not cause.
 BODYDIR=$(mktemp -d)
-python3 - "$BODYDIR" <<'PY'
-import json, sys, os
-d = sys.argv[1]
-for i, row in enumerate(sys.stdin.read().splitlines()):
-    if not row.strip():
-        continue
+ROWFILE="$BODYDIR/rows.tsv"
+printf '%s\n' "${ROWS[@]}" > "$ROWFILE"
+# The rows go in through a FILE, not stdin. `python3 - <<PY` already uses stdin
+# for the program itself, so a second stdin redirect silently replaces the
+# program with the data: the first attempt printed "prebuilt 0 request bodies"
+# and every curl then failed on a body file that was never written.
+python3 - "$BODYDIR" "$ROWFILE" <<'PY'
+import json, os, sys
+outdir, rowfile = sys.argv[1], sys.argv[2]
+with open(rowfile, encoding="utf-8") as fh:
+    rows = [r for r in fh.read().splitlines() if r.strip()]
+for i, row in enumerate(rows):
     cls, text = row.split("\t", 1)
-    with open(os.path.join(d, f"{i:02d}.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(outdir, f"{i:02d}.json"), "w", encoding="utf-8") as f:
         json.dump({"model": "pocket-en", "input": text,
                    "voice": "alba", "response_format": "wav"}, f)
+print(f"prebuilt {len(rows)} request bodies", file=sys.stderr)
 PY
-<<< "$(printf '%s\n' "${ROWS[@]}")"
-echo "prebuilt $(ls "$BODYDIR" | wc -l) request bodies"
+built=$(ls "$BODYDIR"/[0-9][0-9].json 2>/dev/null | wc -l)
+echo "prebuilt $built request bodies"
+[ "$built" -eq "${#ROWS[@]}" ] || { echo "REFUSING: $built bodies for ${#ROWS[@]} sentences"; clear_box; exit 1; }
 
 printf 'file|class|bytes|seconds|http_s|text\n' > "$OUT/manifest.psv"
 i=0
@@ -115,7 +123,14 @@ for row in "${ROWS[@]}"; do
   n=$(printf '%02d' "$i")
   f="$OUT/streaming-under-load/${n}_${cls}.wav"
   t0=$EPOCHREALTIME                    # bash builtin: no process spawned
-  curl -sf -m 180 -X POST "localhost:$PORT/v1/audio/speech" \
+  # --limit-rate paces the read at 24 kHz x 16-bit = 48000 B/s, i.e. realtime,
+  # which is what an actual listener does. WITHOUT IT THE CAPTURE PERTURBS THE
+  # THING IT RECORDS: a reader that drains the socket flat out never applies
+  # backpressure, so its worker produces as fast as it can instead of pacing,
+  # and one such stream costs the other 125 real capacity. Measured -- same
+  # parameters, same box, one greedy reader added: stall@250 went from
+  # 4/23,212 to 46/23,078, and stall@500 from 0 to 30.
+  curl -sf -m 300 --limit-rate 48k -X POST "localhost:$PORT/v1/audio/speech" \
        -H 'content-type: application/json' --data-binary "@$BODYDIR/$n.json" -o "$f"
   rc=$?; t1=$EPOCHREALTIME
   sz=$(stat -c%s "$f" 2>/dev/null || echo 0)

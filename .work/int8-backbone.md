@@ -381,3 +381,65 @@ into one unattended run.
 
 Note the two MARGINALs fail for **different** reasons — C128 on stalls, C130 on
 the queue — so they are not one wall seen twice.
+
+---
+
+# A client that does not pace its reads costs the server ~11x its own slot
+
+Found while building the C126 listening bundle, 21 Sep. Worth recording because
+it is a property of the *client*, it is invisible from the server's own metrics,
+and it nearly went into a client deliverable as a server defect.
+
+## The observation
+
+Capturing 48 samples through `curl` while a load generator held the box at the
+certified concurrency produced a NOT STREAMABLE verdict. Three hypotheses were
+tested and two were wrong:
+
+| hypothesis | test | result |
+|---|---|---|
+| the capture adds a 127th stream, over the 128-place cap | generator at C-1 so the total is C | **refuted** — 32 stalls vs 29 |
+| `python3` spawned per sample steals CPU | bodies prebuilt, loop runs curl only | **refuted** — no change |
+| headroom: C126 is at the cap, C120 has 8 spare places | same capture at C120 | **refuted, and backwards** — 46 stalls, *worse* with more headroom |
+
+Stalls did not track concurrency at all: 0.122% at C127, 0.135% at C126, 0.199%
+at C120. An effect that ignores the variable is not caused by it.
+
+## The control settled it
+
+Same parameters — C120, 660 s, 20 s warm-up, same server, same box — with **no
+capture stream**:
+
+| run | capture | stall@250 | rate | stall@500 |
+|---|---|---|---|---|
+| **control** | **no** | **4 / 23,212** | **0.017%** | **0** |
+| capture C120 | yes | 46 / 23,078 | 0.199% | 30 |
+| capture C126 | yes | 32 / 23,737 | 0.135% | 26 |
+| capture C127 | yes | 29 / 23,708 | 0.122% | 19 |
+
+**One greedy reader multiplies the stall rate by eleven** and takes stalls at
+500 ms from zero to thirty. The short run parameters contribute 4 stalls in
+23,212 — noise.
+
+## Why
+
+`curl` drains the socket as fast as the server writes. That stream never applies
+backpressure, so its worker produces flat out instead of pacing to realtime, and
+one such slot does several slots' worth of work — stealing CPU from the other
+streams sharing that worker. `--limit-rate 48k` (24 kHz x 16-bit = 48,000 B/s)
+makes the capture read like an actual listener.
+
+## What it means beyond the bundle
+
+**The C126 certification is intact.** The stalls were the recorder's, not the
+server's, and the control proves the server is clean at these parameters.
+
+**It is a capacity fact worth telling an operator**: a client that buffers
+aggressively rather than playing at realtime does not merely use its own slot,
+it degrades its neighbours. Nothing in `/health` or the serving profile would
+show this — the server sees a well-behaved fast consumer. The only reason it
+surfaced is that the bundle put one unusual client beside 125 normal ones.
+
+It also nearly became a false claim in a client deliverable: the first bundle
+README carried the honest but wrong-headed note that "the server recorded 32
+interruptions at this level", when the server had done nothing of the sort.
