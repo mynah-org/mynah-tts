@@ -1334,6 +1334,10 @@ static void handle_health(int fd) {
         snprintf(fallback, sizeof(fallback), "null");
     }
 
+    /* 0 when this process is not preforked, which is a real configuration and
+     * not a missing value: a single process holds max_batch places. */
+    const int prefork_total = mynah_prefork_worker_total();
+
     char body[2048];
     const int n = snprintf(body, sizeof(body),
                            "{\"status\":\"ok\",\"model\":\"%s\",\"engine\":\"%s\","
@@ -1354,8 +1358,17 @@ static void handle_health(int fd) {
                             * that frees slots on hangup from one that does
                             * not -- and the two behave identically until a
                             * client actually goes away. */
+                           /* `workers` is this PROCESS's HTTP thread count and
+                            * always was; `prefork` and `request_places` are the
+                            * group. Without them /health could not express the
+                            * limit that actually decides the operating point --
+                            * a 16x2 server reported `workers: 8` and a reader
+                            * computing capacity from it got 64 places instead
+                            * of 128. `workers` keeps its meaning so existing
+                            * consumers do not silently change behaviour. */
                            "\"limits\":{\"max_batch\":%zu,\"queue_capacity\":%zu,"
-                           "\"workers\":%d,\"request_timeout_ms\":%u,"
+                           "\"workers\":%d,\"prefork\":%d,\"request_places\":%zu,"
+                           "\"request_timeout_ms\":%u,"
                            "\"cancel_on_disconnect\":%s,"
                            /* E5-20. `requested` is the configuration and `done`
                             * is the fact. They differ when a warm-up failed,
@@ -1398,6 +1411,9 @@ static void handle_health(int fd) {
                            atomic_load(&g_stats.streams_active),
                            atomic_load(&g_stats.streams_total),
                            g.max_batch, g.max_pending, g.worker_count,
+                           prefork_total, prefork_total > 0
+                               ? (size_t)prefork_total * g.max_batch
+                               : g.max_batch,
                            g.request_timeout_ms,
                            g.cancel_on_disconnect ? "true" : "false",
                            g.warmups, g.warmups_done,

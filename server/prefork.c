@@ -624,6 +624,7 @@ static int recv_fd(int chan) {
 
 static int g_worker_index = -1;
 static int g_worker_threads = 0;
+static int g_worker_total = 0;   /* W, inherited through the fork */
 static int g_worker_chan = -1;
 static volatile sig_atomic_t g_dump_request = 0;
 
@@ -636,6 +637,7 @@ static char g_language_plan[512];
 
 int mynah_prefork_worker_index(void) { return g_worker_index; }
 int mynah_prefork_worker_threads(void) { return g_worker_threads; }
+int mynah_prefork_worker_total(void) { return g_worker_total; }
 int mynah_prefork_worker_language(void) { return g_worker_language; }
 const char *mynah_prefork_language_plan(void) { return g_language_plan; }
 
@@ -1750,6 +1752,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
             close(local.listen_fd);  /* a worker must never accept: the parent routes */
 
             g_worker_index = i;
+            g_worker_total = workers;
             g_worker_chan = sp[1];
             *chan_fd = sp[1];
             /* Which pack this worker owns, decided in the parent and carried

@@ -406,6 +406,18 @@ int mynah_prefork_worker_index(void);
 /* The threads-per-worker actually in force, or 0 outside a worker. */
 int mynah_prefork_worker_threads(void);
 
+/* How many workers the group has, readable from inside any of them.
+ *
+ * WHY THIS EXISTS. `mynah_prefork_worker_index()` answers "which am I" and
+ * `mynah_prefork_worker_threads()` answers "how wide am I", but nothing
+ * answered "how many of us are there" -- so /health could report this process's
+ * HTTP thread count and its own index while the one number an operator needs,
+ * W x max_batch = the request places the group can hold, was not derivable from
+ * the endpoint at all. On a 16x2 server /health said `workers: 8` and a reader
+ * computing capacity from it got 64 places instead of 128, which is exactly the
+ * ceiling that decides the operating point. Returns 0 when not preforked. */
+int mynah_prefork_worker_total(void);
+
 /* ------------------------------------------------------- language groups */
 
 /* Which language group this worker was assigned -- an index into the
