@@ -227,16 +227,16 @@ def build(path):
     # ---------------------------------------------------------------- title
     A(Paragraph("PocketTTS on Arm", H1))
     A(Paragraph("Streaming capacity on a single 32-core Arm server &mdash; "
-                "GCP Axion c4a &middot; 19-20 September 2026", SUB))
+                "GCP Axion c4a &middot; 19-21 September 2026", SUB))
     A(Spacer(1, 4))
     A(Rule(fw, 1.2, ACCENT))
     A(Spacer(1, 8))
 
     A(Callout(fw, [
-        ("120", ["concurrent streams", "qualified over 30 minutes"]),
-        ("0", ["stalls in 64,205", "requests"]),
-        ("128", ["reached, 30 min,", "3 stalls in 65,295"]),
-        ("158x", ["realtime aggregate", "audio seconds per second"]),
+        ("126", ["concurrent streams", "certified over 30 minutes"]),
+        ("0", ["stalls in 65,039", "requests"]),
+        ("330 ms", ["to first audio", "95th percentile"]),
+        ("157x", ["realtime aggregate", "audio seconds per second"]),
     ]))
     A(Spacer(1, 8))
 
@@ -251,14 +251,14 @@ def build(path):
     A(Spacer(1, 6))
     A(Paragraph("Where it started and where it is now", H3))
     A(table([
-        ["", "19 Sep start", "19 Sep end", "20 Sep", "Change"],
-        ["Certified simultaneous streams", "96", "120", "120", "+25%"],
-        ["Highest level reached", "96", "130 (screen)", "128 (30 min)", "+33%"],
-        ["Time to first audio, 95th pct", "492 ms", "447 ms", "336 ms", "32% faster"],
-        ["Speech produced per second", "130x", "155x", "158x", "+22%"],
-        ["Interruptions heard by a listener", "0", "0", "3 in 65,295", "\u2014"],
-    ], [56*mm, 22*mm, 22*mm, 24*mm, fw-124*mm],
-       align={1:"RIGHT",2:"RIGHT",3:"RIGHT",4:"RIGHT"}, size=8.2))
+        ["", "19 Sep\nstart", "19 Sep\nend", "20 Sep", "21 Sep", "Change"],
+        ["Certified streams", "96", "120", "120", "126", "+31%"],
+        ["Highest level tested", "96", "130", "128", "128", "\u2014"],
+        ["First audio, 95th pct", "492 ms", "447 ms", "336 ms", "330 ms", "33% faster"],
+        ["Speech per second", "130x", "155x", "158x", "157x", "+21%"],
+        ["Interruptions, certified level", "0", "0", "0", "0", "\u2014"],
+    ], [44*mm, 21*mm, 21*mm, 21*mm, 21*mm, fw-128*mm],
+       align={1:"RIGHT",2:"RIGHT",3:"RIGHT",4:"RIGHT",5:"RIGHT"}, size=8.2))
     A(Spacer(1, 4))
     A(Paragraph("Same virtual machine, same model, same test corpus throughout. Nothing in "
                 "the table comes from better hardware or from lowering audio quality; the "
@@ -333,9 +333,10 @@ def build(path):
     A(LevelChart(fw, [
         ("C96", 30, "GOOD",     "19 Sep build"),
         ("C110", 30, "GOOD",    "19 Sep build"),
-        ("C120", 30, "GOOD",    "operating point"),
+        ("C120", 30, "GOOD",    "19 Sep build"),
+        ("C126", 30, "GOOD",    "CERTIFIED"),
         ("C128", 30, "MARGINAL", "3 stalls / 65,295"),
-        ("C130", 10, "MARGINAL", "screen, both arms"),
+        ("C130", 10, "MARGINAL", "queue, not speed"),
     ]))
     A(Spacer(1, 3))
     A(Paragraph("Green cleared every target; amber cleared all the essential ones and missed "
@@ -352,8 +353,9 @@ def build(path):
          "Stalls 250ms", "Build", "Verdict"],
         ["C96",  "30 min", "53,886", "492.5 ms", "\u2014",  "0", "19 Sep", "GOOD"],
         ["C110", "30 min", "63,120", "482.3 ms", "\u2014",  "0", "19 Sep", "GOOD"],
-        ["C120", "30 min", "64,205", "447.4 ms", "75.1 ms",  "0", "19 Sep",
-         "GOOD (operating point)"],
+        ["C120", "30 min", "64,205", "447.4 ms", "75.1 ms",  "0", "19 Sep", "GOOD"],
+        ["C126", "30 min", "65,039", "329.5 ms", "79.1 ms",  "0", "21 Sep",
+         "GOOD (certified)"],
         ["C128", "30 min", "65,295", "336.3 ms", "77.4 ms",  "3", "20 Sep", "MARGINAL"],
         ["C130", "10 min", "21,742", "402.8 ms", "203.5 ms", "0", "20 Sep", "MARGINAL"],
         ["C130", "10 min", "21,620", "580.9 ms", "200.7 ms", "2", "19 Sep", "MARGINAL"],
@@ -376,8 +378,8 @@ def build(path):
     A(Spacer(1, 10))
     A(TtfaChart(fw, [
         (96, 492.5, "GOOD", "30 min"), (110, 482.3, "GOOD", "30 min"),
-        (120, 447.4, "GOOD", "30 min"), (128, 336.3, "MARGINAL", "30 min"),
-        (130, 402.8, "MARGINAL", "10 min"),
+        (120, 447.4, "GOOD", "30 min"), (126, 329.5, "GOOD", "certified"),
+        (128, 336.3, "MARGINAL", "30 min"), (130, 402.8, "MARGINAL", "10 min"),
     ]))
     A(Spacer(1, 3))
     A(Paragraph("<b>First audio gets faster as the load goes up</b>, which is the opposite "
@@ -487,7 +489,43 @@ def build(path):
                 "which everyone finishes at roughly the moment the last one would have.",
                 SMALL))
     A(Spacer(1, 6))
-    A(Paragraph("6. Where the limit is, and what it costs to move it", H2))
+    A(Paragraph("6. What to run on this machine", H2))
+    A(Paragraph("For a 32-core Arm server of this class &mdash; GCP Axion c4a-highcpu-32, "
+                "or equivalent &mdash; running the English PocketTTS pack, the "
+                "recommendation is:", BODY))
+    A(Spacer(1, 4))
+    A(table([
+        ["Recommended concurrency", "126 simultaneous streams",
+         "Certified: 30 minutes, 65,039 requests, zero interruptions"],
+        ["Server layout", "16 workers &times; 2 threads, batch 8",
+         "128 request places; measured better than 8&times;4 at equal threads"],
+        ["Expected first audio", "330 ms at the 95th percentile",
+         "Target is 500 ms; median is 132 ms"],
+        ["Expected throughput", "157&times; realtime",
+         "157 seconds of speech produced per second of wall clock"],
+        ["Hard ceiling of this layout", "128 streams",
+         "16 &times; 8 request places; beyond it callers queue"],
+        ["Headroom above the recommendation", "2 streams",
+         "Deliberately small: 128 was measured and did not qualify"],
+    ], [42*mm, 40*mm, fw-82*mm], header=False, size=8.2))
+    A(Spacer(1, 5))
+    A(Paragraph("<b>Why 126 and not 128.</b> 128 was measured over a full thirty minutes "
+                "and delivered 65,295 requests with three brief interruptions &mdash; "
+                "99.995% clean. Our bar for a certified figure is zero, so the recommended "
+                "number is the highest one that met it. If your own tolerance is "
+                "\u201cunder one interruption in ten thousand requests\u201d rather than "
+                "zero, 128 is available and measured, and the difference is 1.6% more "
+                "capacity.", BODY))
+    A(Spacer(1, 4))
+    A(Paragraph("<b>Sizing by demand.</b> At 126 streams per machine, a service expecting "
+                "a peak of 1,000 concurrent listeners needs 8 machines of this class; "
+                "2,500 needs 20. Because each stream is produced about 22% faster than it "
+                "plays, a machine at its recommended load still has compute in reserve for "
+                "bursts &mdash; what it does not have is spare request places, which is the "
+                "subject of the rest of this section.", BODY))
+    A(Spacer(1, 10))
+
+    A(Paragraph("6.1 Where the limit is, and what it costs to move it", H2))
     A(Paragraph("Knowing the capacity of a server is worth less than knowing <i>what sets</i> "
                 "it. Two days of measurement have now answered that, and the answer is a "
                 "good one: <b>the limit is a setting, not the hardware.</b>", BODY))
@@ -501,6 +539,7 @@ def build(path):
     A(table([
         ["Simultaneous streams", "Time to accept a request", "What is happening"],
         ["120",  "75 ms",  "8 places spare"],
+        ["126  (recommended)",  "79 ms",  "2 places spare &mdash; certified"],
         ["128",  "77 ms",  "exactly full &mdash; still immediate"],
         ["130",  "204 ms", "two callers waiting for a place"],
     ], [38*mm, 40*mm, fw-78*mm], align={1:"RIGHT"}))
@@ -514,7 +553,7 @@ def build(path):
                 "the cheapest improvement still available.", BODY))
     A(Spacer(1, 6))
 
-    A(Paragraph("6.1 How efficient the system already is", H3))
+    A(Paragraph("6.2 How efficient the system already is", H3))
     A(Paragraph("A further optimisation was tested on 20 September: storing the largest part "
                 "of the model in 8-bit instead of 16-bit, halving how much data is read from "
                 "memory for every frame of audio. On a quiet machine it does exactly what "
@@ -633,12 +672,9 @@ def build(path):
                                            "language packs and on dedicated fine-tunes."],
         ["Move the load generator off the host", "A second machine, so the measurement stops "
                                                  "competing with the thing it measures."],
-        ["Certify the exact figure between 120 and 128", "120 is certified and 128 was held "
-                                 "for thirty minutes with three interruptions. The true "
-                                 "certified number is one of 122, 124 or 126, and each is a "
-                                 "thirty-minute run. This is the most valuable next "
-                                 "measurement: it converts a capacity we have already "
-                                 "demonstrated into one we can quote."],
+        ["Settle 127", "126 is certified and 128 missed by three interruptions, so only "
+                       "one number is still open. One thirty-minute run answers it, and "
+                       "would also tell us whether 128's three were bad luck."],
         ["The same campaign on x86", "Every figure in this report is from an Arm server. The "
                                  "identical thirty-minute protocol on AMD and Intel hosts "
                                  "would tell a customer which processor to buy, and how many. "
