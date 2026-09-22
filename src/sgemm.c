@@ -1,3 +1,46 @@
+/* E14-4.  THIS TRANSLATION UNIT IS COMPILED MORE THAN ONCE ON x86.
+ *
+ * Every other runtime kernel choice in this project is one function with a
+ * target attribute and a CPUID probe.  That does not work here, and the reason
+ * is in the file rather than in the loop: SG_LANES is not confined to the inner
+ * kernel.  It reaches SG_NV_MAX, SG_NARROW_MAX, the packed panel geometry and
+ * the PUBLIC mynah_sgemm_narrow_max(), so an AVX2 micro-kernel wearing a target
+ * attribute would still be fed panels packed for the baseline shape.  The ISA
+ * is in the DATA LAYOUT here, not only in the instructions.
+ *
+ * So on x86 the whole file is built twice -- once at the build's baseline and
+ * once with -mavx2 -mfma -- and src/sgemm_rt.c owns the public names and picks
+ * between them once per process.  Each variant's constants are its own, its
+ * packing matches its own kernel, and no panel crosses from one to the other.
+ * Everything that made the single-TU design good survives: one micro-kernel
+ * body, one accumulation order, scalar as the reference rather than a second
+ * algorithm.
+ *
+ * On aarch64 nothing changes and nothing is built twice.  AdvSIMD is
+ * architecturally guaranteed, so the compile-time choice is the right one and
+ * there is no second variant to select.
+ *
+ * MYNAH_SGEMM_VARIANT renames the twelve public symbols.  It is defined for
+ * BOTH x86 variants -- `base` and `avx2` -- because if the baseline build kept
+ * the plain names it would collide with the dispatcher that has to own them. */
+#if defined(MYNAH_SGEMM_VARIANT)
+#define MYNAH_SGEMM_J2(a, b) a##_##b
+#define MYNAH_SGEMM_J1(a, b) MYNAH_SGEMM_J2(a, b)
+#define MYNAH_SGEMM_SYM(n)   MYNAH_SGEMM_J1(n, MYNAH_SGEMM_VARIANT)
+#define mynah_sgemm_f32                    MYNAH_SGEMM_SYM(mynah_sgemm_f32)
+#define mynah_sgemm_self_test              MYNAH_SGEMM_SYM(mynah_sgemm_self_test)
+#define mynah_sgemm_f32_conv_taps          MYNAH_SGEMM_SYM(mynah_sgemm_f32_conv_taps)
+#define mynah_sgemm_f32_reference          MYNAH_SGEMM_SYM(mynah_sgemm_f32_reference)
+#define mynah_sgemm_narrow_max             MYNAH_SGEMM_SYM(mynah_sgemm_narrow_max)
+#define mynah_sgemm_family_for             MYNAH_SGEMM_SYM(mynah_sgemm_family_for)
+#define mynah_sgemm_family_name            MYNAH_SGEMM_SYM(mynah_sgemm_family_name)
+#define mynah_sgemm_isa_name               MYNAH_SGEMM_SYM(mynah_sgemm_isa_name)
+#define mynah_sgemm_stats_get              MYNAH_SGEMM_SYM(mynah_sgemm_stats_get)
+#define mynah_sgemm_stats_reset            MYNAH_SGEMM_SYM(mynah_sgemm_stats_reset)
+#define mynah_sgemm_f32_forced             MYNAH_SGEMM_SYM(mynah_sgemm_f32_forced)
+#define mynah_sgemm_dispatch_probes        MYNAH_SGEMM_SYM(mynah_sgemm_dispatch_probes)
+#endif
+
 /*
  * mynah_sgemm_f32 -- our own f32 GEMM.  See sgemm.h for why it exists and for
  * the measured shape histogram that shaped it.

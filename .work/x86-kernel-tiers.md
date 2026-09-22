@@ -87,17 +87,24 @@ kernels this project cannot execute on any machine it owns today.
 
 ## Acceptance gate
 
-- [ ] every new kernel compiles for x86_64 from this Mac (`/usr/bin/clang -arch
-      x86_64`) and the disassembly contains the instruction it was written for
-- [ ] every new kernel has a self-test against the scalar reference, and that
-      test **reports NOT RESOLVED rather than passing** when the host lacks the
-      unit — a green tick that executed nothing is the failure mode here
-- [ ] `make x86-cross` still passes: the new tiers must not change what a
-      no-AVX2 host does
-- [ ] the dispatch map names the new tiers, with `compiled` / `supported` /
-      `resolved` distinct, so "we have the kernel" and "it ran" cannot be
-      confused
-- [ ] CI green, including the x86 job's VNNI step
+- [x] every new kernel compiles for x86_64 from this Mac and the disassembly
+      carries the instruction it was written for: **`vpmaddwd` on `zmm` x6** in
+      `dot_q8_i32_avx512bw`, **`vdpbf16ps` x4** and **`vcvtneps2bf16` x8** in
+      the bf16 path. The ISA guard, in an avx2 build: **0 AVX registers inside
+      it, 131 elsewhere in the same object**
+- [x] every new kernel is gated on having EXECUTED against the scalar reference
+      — `qmat_int8_avx512bw_verify` (bit-identical; the product is exact) and
+      `qmat_bf16_dpbf16_verify` (within `C*FLT_EPSILON`; same products, different
+      summation order). A host that lacks the unit never reaches the check and
+      the row reads `resolved=OFF` with the reason
+- [x] `make x86-cross` passes: a no-AVX-512 host is unchanged and reads the new
+      rows correctly
+- [x] the dispatch map names the new tiers. `isa.x86.avx512f` and `.avx512bw`
+      stopped being "COMPILER FLAG ONLY" — that text was true until these
+      kernels existed and would have been a lie the moment they landed;
+      `isa.x86.avx512bf16` is new; `isa.arm.bf16` distinguishes the three x86
+      tiers instead of answering yes for two of them
+- [ ] CI green, including the x86 job's VNNI step — needs a push
 - [ ] **not closed by any of the above**: a measurement. These kernels are
       written to be measured on a rented box, and until one runs them no
       performance claim may be made from this item

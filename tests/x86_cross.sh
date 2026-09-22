@@ -82,6 +82,14 @@ fi
 grep -q 'ISA GUARD: ok' "$MAP" && say ok "the ISA guard accepts this binary here" \
                                || say FAIL "the guard refused a portable binary"
 
+if grep -qE 'sgemm\.kernel .* scalar ' "$MAP"; then
+    say ok "sgemm resolved to the BASELINE variant (E14-4: two builds, one binary)"
+else
+    say FAIL "sgemm did not resolve to the baseline here: $(grep 'sgemm.kernel' "$MAP" | head -1)"
+fi
+grep -q 'sgemm.selftest .* PASS' "$MAP" && say ok "sgemm self-test passes in that resolution" \
+                                        || say FAIL "sgemm self-test did not pass"
+
 # The env override has to be exercised even where it cannot change the answer:
 # a typo in the parsing would otherwise only ever be found on real x86.
 if MYNAH_KERNELS_X86=scalar "$BIN" --self-test >/dev/null 2>&1; then

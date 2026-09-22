@@ -1175,22 +1175,22 @@ after it has been EXECUTED in this process and checked against the scalar
 reference** (`.work/x86-kernel-tiers.md`, "prove-on-first-use gate"). CPUID
 alone does not promote a kernel.
 
-- [ ] E14-1 **the ISA guard is not compiled for the baseline** — a guard built with
+- [x] E14-1 **done** — the ISA guard is compiled for the baseline; 0 AVX registers inside it against 131 elsewhere in the same avx2 object. **the ISA guard was not compiled for the baseline** — a guard built with
       `-march=native` may contain an instruction the host lacks and die before printing
       the message it exists to print. `qwen-tts` carries `target("arch=x86-64")` on its
       guard for exactly this; ours has none. One line
-- [ ] E14-2 **AVX-512 without VNNI has no int8 kernel** — Skylake-SP, Cascade Lake and
+- [x] E14-2 **done** `dot_q8_i32_avx512bw`, `vpmaddwd` on `zmm` x6, gated on a bit-identical run against the scalar reference. **AVX-512 without VNNI had no int8 kernel** — Skylake-SP, Cascade Lake and
       Zen 3 have 512-bit registers and no VPDPBUSD, so they run the 256-bit AVX2 dot and
       half the register file idles. `_mm512_cvtepi8_epi16` + `_mm512_madd_epi16`, exact
       int32, so the gate is **bit-identical to the scalar reference**, not a tolerance.
       This is the brief's X2 question answered in code
-- [ ] E14-3 **VDPBF16PS: x86 has no bf16 multiply and bf16 is what the backbone ships** —
+- [x] E14-3 **done** `matvec_bf16_dpbf16_x4`, `vdpbf16ps` x4 + `vcvtneps2bf16` x8, gated on agreeing with `matvec_bf16_scalar` inside `C*FLT_EPSILON`. **x86 had no bf16 multiply and bf16 is what the backbone ships** —
       on Arm the bf16 path is +33% at B=8; on x86 we widen with a shift and multiply in
       f32. The interleave problem `src/qmat.c` documents is **avoided, not solved**:
       `_mm512_cvtneps_pbh` converts 16 f32 in order, so two concatenated with
       `_mm512_inserti64x4` give 32 consecutive bf16 — sixteen lanes of two k-adjacent
       values, which is what the instruction pairs. No scratch, no allocation in a kernel
-- [ ] E14-4 **`src/sgemm.c` — 43% of the wall, still compile-time on x86** →
+- [x] E14-4 **done** — two translation units of one source, `src/sgemm_rt.c` picks; **0 `ymm` in `sgemm_base.o`, 621 in `sgemm_avx2.o`**, and the variant is asked of the COMPILER not of `uname -m`, because `make x86-cross` builds x86 objects on an arm64 host. **`src/sgemm.c` was 43% of the wall and compile-time on x86** →
       [`.work/sgemm-runtime-dispatch.md`](.work/sgemm-runtime-dispatch.md). Not a
       smaller version of E4-9: `SG_LANES` reaches the packed panel geometry and the
       public `mynah_sgemm_narrow_max`, so multi-versioning makes the LAYOUT a runtime

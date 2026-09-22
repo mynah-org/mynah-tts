@@ -122,6 +122,45 @@ jobs:
           # The numeric gate, which is what a failure here would actually mean.
           make qmat-test
 
+      # THE OTHER HALF OF THE ONLY x86 SILICON THIS PROJECT CAN OBSERVE.
+      #
+      # Since E4-9 the f32 kernels and (E14-4) sgemm are chosen at RUNTIME on
+      # x86, and MYNAH_KERNELS_X86=scalar forces the scalar half. Both
+      # resolutions therefore exist on one host, and this is the only machine
+      # in the fleet where they DIFFER -- on the development Mac, x86 runs
+      # under Rosetta, which has no AVX2, so both settings resolve to scalar
+      # and the comparison is vacuous there.
+      #
+      # What is asserted is that the switch MOVES something. A dispatch that
+      # silently resolves the same way under both settings would pass every
+      # numeric test in this repository while shipping one kernel and testing
+      # the other, which is the exact failure `make self-test`'s third pass
+      # exists to catch and cannot catch alone.
+      - name: f32 runtime dispatch on real x86 silicon
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -e
+          ./build/cpu/mynah-tts --dispatch-map > /tmp/map-auto.txt
+          MYNAH_KERNELS_X86=scalar ./build/cpu/mynah-tts --dispatch-map > /tmp/map-scalar.txt
+          echo "::group::auto";   grep -E 'isa.x86.avx2|sgemm.kernel' /tmp/map-auto.txt;   echo "::endgroup::"
+          echo "::group::scalar"; grep -E 'isa.x86.avx2|sgemm.kernel' /tmp/map-scalar.txt; echo "::endgroup::"
+          auto_f32=$(grep -oE 'run (AVX2\+FMA|SCALAR)' /tmp/map-auto.txt | head -1)
+          scal_f32=$(grep -oE 'run (AVX2\+FMA|SCALAR)' /tmp/map-scalar.txt | head -1)
+          echo "f32: auto='$auto_f32' scalar='$scal_f32'"
+          if [ "$scal_f32" != "run SCALAR" ]; then
+            echo "MYNAH_KERNELS_X86=scalar did not force the scalar f32 kernels"; exit 1
+          fi
+          if [ "$auto_f32" != "run AVX2+FMA" ]; then
+            echo "::warning::this runner resolved the f32 kernels to SCALAR by itself;"
+            echo "::warning::the two resolutions are identical here, so this step proved"
+            echo "::warning::only that the override parses. Not a failure -- a gap."
+          fi
+          # Both resolutions must pass the kernel gates, not just resolve.
+          ./build/cpu/mynah-tts --self-test
+          MYNAH_KERNELS_X86=scalar ./build/cpu/mynah-tts --self-test
+          make qmat-test
+          MYNAH_KERNELS_X86=scalar make kernels-test
+
       - name: Full test target
         run: make test
 

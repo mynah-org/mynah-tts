@@ -169,9 +169,28 @@ STAMP_WRITE := $(shell mkdir -p $(BUILD_DIR) && \
 	fi)
 
 
-CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/sgemm_rt.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
-CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
+# E14-4.  On x86 src/sgemm.c is built TWICE and src/sgemm_rt.c picks between
+# them at runtime; everywhere else it is built once as before.  The reason it
+# cannot be a target attribute on the micro-kernel is at the top of sgemm.c:
+# SG_LANES reaches the packed panel geometry and the public
+# mynah_sgemm_narrow_max(), so the ISA is in the DATA LAYOUT, and an AVX2 kernel
+# would be handed panels packed for the baseline shape.
+#
+# ASKED OF THE COMPILER, NOT OF `uname -m`.  `make x86-cross` builds x86_64
+# objects on an arm64 host, and a decision keyed on the host would silently skip
+# the variant that cross build exists to produce -- then link, and run, and look
+# fine, having tested nothing.
+CC_TARGET_X86 := $(shell echo | $(CC) $(CPPFLAGS) -E -dM - 2>/dev/null | grep -cE '__x86_64__|__i386__')
+ifeq ($(CC_TARGET_X86),0)
+sgemm_objects = $(1)/src/sgemm.o
+else
+sgemm_objects = $(1)/src/sgemm_base.o $(1)/src/sgemm_avx2.o
+endif
+sgemm_object_list = $(filter-out $(1)/src/sgemm.o,$(2)) $(call sgemm_objects,$(1))
+
+CORE_OBJECTS := $(call sgemm_object_list,$(BUILD_DIR),$(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o))
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
 TARGET := $(BUILD_DIR)/mynah-tts
 LIBRARY := $(BUILD_DIR)/libmynah_tts.a
@@ -209,6 +228,20 @@ $(BUILD_STAMP):
 $(BUILD_DIR)/%.o: %.c $(BUILD_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# The two x86 builds of one source.  `base` takes the build's own flags
+# unchanged -- on SIMD=portable that is a genuine baseline binary, which is the
+# whole point -- and `avx2` ADDS -mavx2 -mfma rather than replacing anything, so
+# a build that already carries them is not silently narrowed.  The pattern
+# stem is the build directory, so the sanitizer, Metal and CUDA trees each get
+# their own pair without repeating the recipe.
+%/src/sgemm_base.o: src/sgemm.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DMYNAH_SGEMM_VARIANT=base -MMD -MP -c $< -o $@
+
+%/src/sgemm_avx2.o: src/sgemm.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -mavx2 -mfma -DMYNAH_SGEMM_VARIANT=avx2 -MMD -MP -c $< -o $@
 
 $(INGOT_LIB):
 	$(MAKE) -C $(INGOT_DIR) lib
@@ -655,7 +688,7 @@ METAL_BUILD_DIR := build/metal
 # through LDLIBS, which they do share.
 METAL_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
 METAL_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -ffast-math -fno-finite-math-only -DMYNAH_ENABLE_METAL
-METAL_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o)
+METAL_CORE_OBJECTS := $(call sgemm_object_list,$(METAL_BUILD_DIR),$(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o))
 $(METAL_CORE_OBJECTS): | $(INGOT_LIB)
 METAL_CLI_OBJECT := $(METAL_BUILD_DIR)/cli/main.o
 METAL_HOST_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal.o
@@ -693,7 +726,7 @@ CUDA_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -DMYNAH_ENABLE_CUDA
 ifneq ($(UNAME_S),Darwin)
 CUDA_CPPFLAGS += -D_DEFAULT_SOURCE
 endif
-CUDA_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o)
+CUDA_CORE_OBJECTS := $(call sgemm_object_list,$(CUDA_BUILD_DIR),$(CORE_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o))
 $(CUDA_CORE_OBJECTS): | $(INGOT_LIB)
 CUDA_CLI_OBJECT := $(CUDA_BUILD_DIR)/cli/main.o
 CUDA_HOST_OBJECT := $(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o
