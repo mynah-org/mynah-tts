@@ -239,7 +239,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -632,6 +632,37 @@ ternary-test:
 # macOS-only; skips cleanly (exit 0) anywhere else.
 x86-cross:
 	@sh tests/x86_cross.sh
+
+# Kernel micro-bench: SHAPES without WEIGHTS, so the kernels can be measured on
+# a machine that has no model pack -- which is every rented box in its first
+# five minutes. Runs the same binary under each dispatch forcing, because the
+# choice is memoised per process and the comparison is the point.
+#
+# It is NOT an RTF and NOT a serving number. E12 measured the weight pass at 5%
+# of the AR step at B=8, so a kernel twice as fast here is not a synthesis twice
+# as fast. Idea borrowed from ../qwen-tts's bench_simd.c.
+KERNEL_BENCH_OBJECT := $(BUILD_DIR)/tests/bench_kernels.o
+KERNEL_BENCH_TARGET := $(BUILD_DIR)/tests/bench_kernels
+
+$(KERNEL_BENCH_TARGET): $(CORE_OBJECTS) $(KERNEL_BENCH_OBJECT)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+kernel-bench: $(KERNEL_BENCH_TARGET)
+	@echo "=== as this host resolves it ==="
+	@$(KERNEL_BENCH_TARGET)
+	@echo
+	@echo "=== MYNAH_KERNELS_X86=scalar (f32 and sgemm forced down) ==="
+	@MYNAH_KERNELS_X86=scalar $(KERNEL_BENCH_TARGET)
+	@echo
+	@echo "=== MYNAH_QMAT_VNNI=off (int8 falls to the next tier) ==="
+	@MYNAH_QMAT_VNNI=off $(KERNEL_BENCH_TARGET)
+	@echo
+	@echo "=== MYNAH_QMAT_VNNI=off MYNAH_QMAT_AVX512=off (int8 to AVX2) ==="
+	@MYNAH_QMAT_VNNI=off MYNAH_QMAT_AVX512=off $(KERNEL_BENCH_TARGET)
+	@echo
+	@echo "=== MYNAH_QMAT_BF16DOT=off (bf16 falls to the widening kernel) ==="
+	@MYNAH_QMAT_BF16DOT=off $(KERNEL_BENCH_TARGET)
 
 serving-profile: serving-wave
 

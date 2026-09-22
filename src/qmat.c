@@ -6424,6 +6424,15 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
  * ====================================================================== */
 
 /* Names the int8 kernel this host+binary pair actually resolves to. */
+void mynah_qmat_matvec_bf16(float *out, const float *x, const uint16_t *w,
+                            const float *bias, size_t rows, size_t cols) {
+    /* `pairs` NULL: the tiled ARM path wants a second, pre-interleaved copy of
+     * the weights that only the cache builds, and a caller with a plain
+     * row-major block does not have one. The non-tiled kernel is the same
+     * arithmetic. */
+    matvec_bf16(out, x, w, NULL, bias, rows, cols);
+}
+
 const char *mynah_qmat_int8_kernel(const char **why) {
     const int level = qmat_u8_level();
     switch (level) {

@@ -239,6 +239,17 @@ void mynah_qmat_dots_i8(const int8_t *w, size_t rows, size_t cols,
 
 /* Model-free numeric check: int8 matvec vs an exact f32 dot on deterministic
  * data, asserting a bounded relative error.  0 = ok, -1 = error. */
+/* Model-free bf16 matvec: out[row] = sum_j bf16(w[row][cols]) * bf16(x[j]),
+ * plus bias, through whichever bf16 kernel this host resolved (BFDOT/BFMMLA on
+ * Arm, VDPBF16PS or the AVX2 widening form on x86, scalar otherwise).
+ *
+ * Public because a kernel that cannot be called without a model pack cannot be
+ * BENCHMARKED without one either, and the x86 bf16 tiers landed with no way to
+ * compare them on a host that has both. Weights are raw IEEE-754 bf16 bit
+ * patterns, row-major, exactly as the cache holds them. */
+void mynah_qmat_matvec_bf16(float *out, const float *x, const uint16_t *w,
+                            const float *bias, size_t rows, size_t cols);
+
 /* Is the BFDOT kernel the one that will run?  `why` receives a [predicate]
  * string for the dispatch report.  See src/qmat.c and
  * .work/bf16-native-weights.md. */
