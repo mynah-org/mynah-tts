@@ -2194,6 +2194,10 @@ void mynah_kernels_dispatch_probes(void) {
      * Until then the facts are carried by the two rows below. */
     mynah_dispatch_register_probe("kernel.gelu_vector", probe_gelu_vector);
     mynah_dispatch_register_probe("isa.x86.avx2", probe_x86_f32);
+    /* Same predicate: avx2 and fma are one target attribute and one
+     * decision here, and a row that answered them differently claimed a
+     * binary could run one without the other. */
+    mynah_dispatch_register_probe("isa.x86.fma", probe_x86_f32);
     mynah_dispatch_register_probe("isa.arm.sve", probe_sve);
     mynah_dispatch_register_probe("isa.arm.sve2", probe_sve2);
     mynah_dispatch_register_probe("isa.arm.svei8mm", probe_svei8mm);

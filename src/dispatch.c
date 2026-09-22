@@ -681,15 +681,34 @@ const char *mynah_dispatch_isa_class(void) {
     if (MYNAH_DISPATCH_HAS_DOTPROD) return "arm_neon_dotprod";
     return "arm_neon";
 #elif defined(__x86_64__) || defined(__i386__)
-    /* Asked of the kernel, not of CFLAGS: SIMD=avx512 still says nothing about
-     * which int8 kernel runs, and that gap is what produced the false claim. */
+    /* Asked of the kernels, not of CFLAGS: SIMD=avx512 still says nothing about
+     * which int8 kernel runs, and that gap is what produced the false claim.
+     *
+     * AND NOT OF THE INT8 KERNEL ALONE, which is what it used to ask. That was
+     * a fair proxy while every other x86 kernel was a compile-time #if and the
+     * int8 one was the only runtime choice. It stopped being fair the day the
+     * f32 kernels and sgemm gained their own runtime dispatch: a sanitizer
+     * build, whose CFLAGS replace the SIMD flags entirely, compiles no AVX2
+     * int8 dot and still runs AVX2 f32 and an AVX2 sgemm through their target
+     * attributes. On a CI runner with AVX2 and no VNNI that binary called
+     * itself `x86_scalar` while two of its three kernel families were
+     * vectorised.
+     *
+     * Found by tools/dispatch_gate.py on its first run in CI -- MISMATCH
+     * isa.x86.avx2 expected OFF, got ON -- which is the kind of disagreement
+     * nobody reads out of a 53-row table by eye, and is the reason that gate
+     * exists. `x86_scalar` now means what a reader takes it to mean: nothing
+     * here is vectorised. */
     {
         const char *k = mynah_qmat_int8_kernel(NULL);
         if (strcmp(k, "avx512vnni") == 0) return "x86_avx512_vnni";
         if (strcmp(k, "avxvnni") == 0) return "x86_avx_vnni";
+        if (mynah_kernels_x86_avx2() || strcmp(k, "avx512bw") == 0 ||
+            strcmp(k, "avx2") == 0 || MYNAH_DISPATCH_HAS_AVX2) {
+            return "x86_avx2";
+        }
     }
-    if (!MYNAH_DISPATCH_HAS_AVX2) return "x86_scalar";
-    return "x86_avx2";
+    return "x86_scalar";
 #else
     return "portable_scalar";
 #endif
@@ -788,9 +807,17 @@ static void collect_isa(row_sink *s) {
             "predicate) and src/qmat.c dot_q8_i32_avx2 "
             "(_mm256_cvtepi8_epi16 + _mm256_madd_epi16), the int8 dot for "
             "every x86 CPU without VPDPBUSD");
-    add_gate(s, "isa.x86.fma", MYNAH_DISPATCH_HAS_FMA, cpu_has_fma(),
-             "[gate] _mm256_fmadd_ps in the AVX2 dot/matvec; Makefile passes "
-             "-mfma with -mavx2");
+    /* Answered by the same predicate as isa.x86.avx2, and for the same reason
+     * that row stopped being a gate: the f32 kernels carry target("avx2,fma")
+     * and emit _mm256_fmadd_ps whether or not the BUILD was given -mfma. A
+     * sanitizer build replaces CFLAGS entirely, so it compiles no -mfma and
+     * runs FMA anyway -- and this row said OFF, and the footer counted the
+     * host's FMA unit as idle hardware. Caught by tools/dispatch_gate.py in
+     * CI, one commit after the identical mistake on isa.x86.avx2. */
+    add_unknown(s, "isa.x86.fma", yn(MYNAH_DISPATCH_HAS_FMA), yn3(cpu_has_fma()),
+                "MYNAH_KERNELS_X86",
+                "[UNKNOWN] src/kernels.c did not register the f32 predicate "
+                "over this id");
 
     /* The three rows the false README claim needed.  compiled can be yes here
      * (SIMD=avx512 passes the flags) while resolved is OFF, because no kernel
