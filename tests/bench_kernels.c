@@ -98,7 +98,26 @@ int main(void) {
 
     printf("kernel micro-bench -- shapes only, no model. %s, %s\n",
            mynah_dispatch_isa_class(), mynah_sgemm_isa_name());
-    printf("  f32 rows=%d cols=%d, %d reps, median\n\n", FFN, HID, REPS);
+    printf("  f32 rows=%d cols=%d, %d reps, median\n", FFN, HID, REPS);
+#if defined(__AVX2__)
+    /* THE f32 ROWS BELOW DO NOT COMPARE WHAT THEY APPEAR TO, in this build.
+     *
+     * MYNAH_KERNELS_X86=scalar selects the scalar C functions -- and this
+     * translation unit was compiled with -mavx2 -mfma, so gcc auto-vectorises
+     * those loops too. The dispatch moves, the label moves, and the
+     * instructions barely do; on an EPYC 9254 the "scalar" f32 matvec came out
+     * FASTER than the AVX2 one on two runs out of five, which is noise around
+     * two near-identical binaries and not a result.
+     *
+     * The honest comparison is between BUILDS, not between env settings:
+     * `make kernel-bench SIMD=portable` against this one. The env forcing is
+     * still the right tool for the quantized rows, whose kernels are reached
+     * by target attributes and are genuinely absent from the scalar path. */
+    printf("  NOTE: built with -mavx2, so the f32 'scalar' rows are still\n"
+           "        auto-vectorised. Compare BUILDS (SIMD=portable) for f32;\n"
+           "        the env forcings are exact for int8 and bf16.\n");
+#endif
+    printf("\n");
 
     for (int r = 0; r < REPS; ++r) {
         const double t0 = now_ms();
