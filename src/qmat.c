@@ -6541,7 +6541,12 @@ const char *mynah_qmat_int8_kernel(const char **why) {
         if (why != NULL)
             *why = "[predicate] MYNAH_QMAT_VNNI=scalar: the portable unsigned "
                    "kernel. It is the algebra without the intrinsics, for "
-                   "proving the +128 correction, not for speed";
+                   "proving the +128 correction, not for speed. IT ALSO TURNS "
+                   "codec.conv_int8_host OFF -- src/convq8.c asks which int8 "
+                   "kernel RESOLVED and reads a forced-down one as a host with "
+                   "no dot unit, so the conv stack stays f32. Deliberate, and "
+                   "worth knowing before using this as an A/B control: it "
+                   "changes the audio, and not because the dot changed";
         return "u8-scalar";
     default:
         break;

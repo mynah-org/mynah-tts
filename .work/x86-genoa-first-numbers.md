@@ -125,3 +125,58 @@ row-at-a-time reference` check is what holds it.
 
 No model pack, so no RTF, no bench-matrix, no serving wave. That needs the pack
 on the box and is the next thing worth an hour.
+
+
+---
+
+## 2026-09-22, later: the real pack, and correctness instead of numbers
+
+The box has a CPU-heavy job on it, so this half is deliberately contention-proof:
+`models/pocket-en` (289 MB, scp'd because `kyutai/pocket-tts` is a gated repo),
+and questions whose answers are bits rather than milliseconds.
+
+### The full server suite, on the real pack, on x86 -- PASS
+
+Every check: `stream==batch` byte-identical, `repro x3` byte-identical,
+`batching` 4 concurrent == 4 serial and pairwise distinct, `admission`,
+`mixed` 2 streams + 2 batches, `warmup` not vacuous. Previously this had only
+ever run on Arm and on a fake pack. `--pocket-self-check` passes too.
+
+### Cross-tier audio parity -- the question only this host can be asked
+
+`make x86-tier-parity MODEL_DIR=models/pocket-en`, temperature 0, seed 42.
+
+| check | result |
+|---|---|
+| the same tier twice | **byte-identical** -- without this nothing else means anything |
+| int8 `avx512bw` vs `avx2` | **byte-identical**, as exact int32 requires |
+| `bf16_off`, `f32_scalar`, `vnni_off` vs baseline | same length, 119084 B -- the AR loop made the same decisions |
+
+The second row is E14-2's correctness at the level that matters: the new
+AVX-512BW kernel is not merely close to the AVX2 one, it is the same audio.
+The third is the property an autoregressive model makes fragile -- a one-ULP
+disagreement is amplified by every later step, and here it did not change a
+single frame decision across four different kernel families.
+
+### What the test found that the audio did not
+
+`MYNAH_QMAT_VNNI=off` and `=scalar` **also turn `codec.conv_int8_host` from
+eligible to off**. `src/convq8.c` asks which int8 kernel RESOLVED and reads a
+forced-down one as a host with no dot unit, so the whole conv stack stays f32.
+The behaviour is deliberate and the dispatch map states it in the row's reason.
+
+The defect was mine, in the method: I ran an A/B that varied two things and was
+one step from attributing an audio difference to VPDPBUSD. So the test now
+asserts, for every forcing, that it moves only the dispatch rows it is ALLOWED
+to move -- and `codec.conv_int8_host` is on the int8 forcings' list, which turns
+a surprise into a stated invariant. The reason string for `u8-scalar` says it
+too, so a reader of that one row learns it without diffing two reports.
+
+One more thing that check caught first: it reported the baseline as differing
+from ITSELF, because `pool.spin` is a measured per-host calibration and moves
+between two runs of the same binary. Excluded, with the reason written down.
+
+### Still not done
+
+No RTF and no serving wave, on purpose: the box is busy and a number taken
+there would be a number about the other job. E14-9 stays open.

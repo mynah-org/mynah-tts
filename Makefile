@@ -239,7 +239,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test dispatch-gate ternary-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross x86-tier-parity kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test dispatch-gate ternary-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -673,6 +673,20 @@ kernel-bench: $(KERNEL_BENCH_TARGET)
 	@echo
 	@echo "=== MYNAH_QMAT_BF16DOT=off (bf16 falls to the widening kernel) ==="
 	@MYNAH_QMAT_BF16DOT=off $(KERNEL_BENCH_TARGET)
+
+# Does changing the kernel tier change the AUDIO? Needs a pack and an x86 host
+# with the tiers on it, so it is not in `make test` and never will be: it is
+# the qualification step for a rented box, beside `make x86-cross` which is the
+# one this development machine can run.
+#
+#   make x86-tier-parity MODEL_DIR=models/pocket-en
+#
+# It also asserts that each forcing moves only the dispatch rows it is allowed
+# to -- a control that varies two things is how an audio difference gets blamed
+# on the kernel that did not cause it.
+x86-tier-parity: $(TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make x86-tier-parity MODEL_DIR=pack" >&2; exit 2)
+	@MODEL_DIR="$(MODEL_DIR)" BIN="$(TARGET)" sh tests/x86_tier_parity.sh
 
 serving-profile: serving-wave
 
