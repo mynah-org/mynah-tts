@@ -8,15 +8,25 @@
 # idle machine and presented as "under load" would be a lie the listener cannot
 # detect, which is exactly why it must not be produced that way.
 #
-#   bash tools/capture_bundle.sh [CONCURRENCY] [PORT]
+#   bash tools/capture_bundle.sh [CONCURRENCY] [PORT] [SECONDS]
+#   PREFORK_W=12 PREFORK_T=2 bash tools/capture_bundle.sh 80
 #
 # Run it from the repo root on the serving host. Produces ~/bundle<C>/ with the
 # WAVs, a manifest naming every sentence, and the load conditions they were
 # captured under.
+#
+# THE TOPOLOGY IS AN ARGUMENT, and it had to become one. This script described
+# itself as generic while hardcoding `--prefork 16 --prefork-threads 2`: the
+# qualified cut of a 32-core Axion. Run unchanged on the 24-core EPYC it would
+# have oversubscribed the box by a third and captured audio under a load
+# nobody certified -- which is precisely the lie the header above says this
+# file exists to avoid.
 set -u
 C="${1:-126}"
 PORT="${2:-9200}"
 SECONDS_OF_LOAD="${3:-480}"
+PREFORK_W="${PREFORK_W:-16}"
+PREFORK_T="${PREFORK_T:-2}"
 
 cd "$(dirname "$0")/.." || exit 1
 OUT="$HOME/bundle$C"
@@ -38,8 +48,11 @@ clear_box() {
 }
 
 clear_box
+echo "topology: prefork ${PREFORK_W} x ${PREFORK_T} threads = $((PREFORK_W*PREFORK_T)) cores, \
+$((PREFORK_W*8)) admission slots"
 ./build/cpu/mynah-tts-server -m models/pocket-en -p "$PORT" \
-    --prefork 16 --prefork-threads 2 --max-batch 8 >"$HOME/srv-bundle.log" 2>&1 &
+    --prefork "$PREFORK_W" --prefork-threads "$PREFORK_T" --max-batch 8 \
+    >"$HOME/srv-bundle.log" 2>&1 &
 for _ in $(seq 40); do curl -sf "localhost:$PORT/health" >/dev/null && break; sleep 1; done
 curl -sf "localhost:$PORT/health" >"$OUT/health-before.json" || { echo "server never came up"; exit 1; }
 echo "server up: $(cat "$OUT/health-before.json")"

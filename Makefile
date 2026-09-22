@@ -240,7 +240,7 @@ WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
 .PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross x86-tier-parity kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test dispatch-gate ternary-test server server-test server-multilang-test \
-	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+	server-concurrency-test server-concurrency-test-all server-refusal-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot \
@@ -450,6 +450,12 @@ CONC_LEVELS ?= 2 4 8
 # unlike the `batching` check in tests/test_server.sh it cannot go flaky on a
 # busy machine. SERVER_ARGS passes topology through ("--prefork 4"), or point
 # SERVER at tests/prefork_server.sh for the same thing.
+# The refusals that happen in the ROUTER, which serves no HTTP -- so no worker's
+# /health could ever have carried them. See tests/test_server_refusals.sh.
+server-refusal-test: $(SERVER_TARGET)
+	@test -n "$(MODEL_DIR)" || (echo "usage: make server-refusal-test MODEL_DIR=pack" >&2; exit 2)
+	@MODEL_DIR="$(MODEL_DIR)" SERVER="$(SERVER_TARGET)" sh tests/test_server_refusals.sh
+
 server-concurrency-test: $(SERVER_TARGET)
 	@test -n "$(MODEL_DIR)" || (echo "usage: make server-concurrency-test MODEL_DIR=models/fake-magpie [SERVER_ARGS=--prefork 4]" >&2; exit 2)
 	@MODEL_DIR="$(MODEL_DIR)" SERVER="$(SERVER_TARGET)" SERVER_ARGS="$(SERVER_ARGS)" \

@@ -511,6 +511,19 @@ const char *mynah_prefork_refusal_code(mynah_prefork_refusal reason);
  * `buf`. Returns the length, or 0 if `cap` is too small. Content-Length is
  * computed from the body rather than written as a literal, so an edit to the
  * message cannot silently truncate the response. */
+/* The ROUTER's refusal counts, per reason, indexed by mynah_prefork_refusal.
+ *
+ * These come from the parent, which serves no HTTP, so they are the one set of
+ * numbers a worker cannot know and an operator cannot do without: a request
+ * refused at capacity never reaches a worker and is therefore absent from that
+ * worker's own counters. /health carries them under "router".
+ *
+ * `out` must have room for MYNAH_PREFORK_REFUSE__COUNT entries. Returns how
+ * many were written, or -1 when there is no shared page -- a single-process
+ * server, or a failed mmap. -1 means UNKNOWN and must not be rendered as zero:
+ * "no refusals" and "nobody is counting" are different facts. */
+int mynah_prefork_router_refusals(unsigned long long *out, int n);
+
 size_t mynah_prefork_refusal_response(mynah_prefork_refusal reason,
                                       char *buf, size_t cap);
 

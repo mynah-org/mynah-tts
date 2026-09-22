@@ -48,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -62,6 +63,74 @@
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #endif
+
+/* ------------------------------------------------- the router's refusals
+ *
+ * THE COUNTERS THE FORK DOES NOT SHARE, AND THE ONE AN OPERATOR MUST SEE.
+ *
+ * Everything else in this file is deliberately per-process: `g_stats` in
+ * server/main.c is that worker's, /health says so, and summing it across
+ * workers would be wrong. The refusals are the exception, and they are the
+ * exception in the direction that hurts. A request refused at capacity is
+ * refused BY THE ROUTER, in the parent, before any worker has seen it -- so it
+ * is counted in a parent-local array that goes to stderr and nowhere else.
+ *
+ * Measured on an EPYC 9254 at 2026-09-22: a 2x12 server answered 18 of 72
+ * requests with HTTP 503 server_at_capacity while /health reported
+ * "rejected": 0. Every worker was healthy and every worker was telling the
+ * truth; the refusals had simply happened in a process that serves no HTTP. A
+ * monitoring system polling /health saw a perfect server dropping a quarter of
+ * its traffic.
+ *
+ * One page, MAP_SHARED|MAP_ANONYMOUS, mapped BEFORE the first fork so every
+ * worker inherits the same physical page. The router writes, workers read.
+ * Relaxed ordering: these are counters for a human, not a synchronisation
+ * primitive, and a reader that is one increment behind has still learned the
+ * thing it could not learn before. NULL on a single-process server, and the
+ * accessor says so rather than reporting zeros that would read as "no
+ * refusals". */
+typedef struct {
+    _Atomic unsigned long long refused[MYNAH_PREFORK_REFUSE__COUNT];
+} pf_shared;
+
+static pf_shared *g_shared;
+
+static void pf_shared_open(void) {
+    if (g_shared != NULL) return;
+    void *m = mmap(NULL, sizeof(pf_shared), PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        /* Not fatal: the server routes fine, the stderr counters still work,
+         * and /health will say the block is unavailable rather than print
+         * zeros. Saying so is the whole point of this file's error style. */
+        fprintf(stderr, "prefork: WARNING could not map the shared refusal "
+                        "counters (%s); /health will not carry them\n",
+                strerror(errno));
+        return;
+    }
+    g_shared = (pf_shared *)m;
+    for (int r = 0; r < MYNAH_PREFORK_REFUSE__COUNT; ++r)
+        atomic_store_explicit(&g_shared->refused[r], 0ull, memory_order_relaxed);
+}
+
+/* Every increment of a parent-local refusal count goes through here, so the
+ * shared page cannot drift from the stderr line by someone adding a ++ and
+ * forgetting the other half. */
+static void pf_shared_refused(mynah_prefork_refusal reason) {
+    if (g_shared == NULL) return;
+    if (reason < 0 || reason >= MYNAH_PREFORK_REFUSE__COUNT) return;
+    atomic_fetch_add_explicit(&g_shared->refused[reason], 1ull,
+                              memory_order_relaxed);
+}
+
+int mynah_prefork_router_refusals(unsigned long long *out, int n) {
+    if (g_shared == NULL || out == NULL || n < MYNAH_PREFORK_REFUSE__COUNT)
+        return -1;
+    for (int r = 0; r < MYNAH_PREFORK_REFUSE__COUNT; ++r)
+        out[r] = atomic_load_explicit(&g_shared->refused[r],
+                                      memory_order_relaxed);
+    return MYNAH_PREFORK_REFUSE__COUNT;
+}
 
 #define PREFORK_MAX_WORKERS 256
 /* Upper bound on the cpu ids we will enumerate. Sized for a large server, not
@@ -1433,6 +1502,7 @@ static void router_refuse(pf_router *R, int fd, mynah_prefork_refusal reason,
                           double now) {
     ++R->refused[reason];
     ++R->window_refused[reason];
+    pf_shared_refused(reason);
     pf_linger L;
     linger_begin(&L, fd, reason, now);
     if (linger_step(&L, now)) return;
@@ -1714,6 +1784,10 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     /* Before anything is forked, and before the listening socket is committed
      * to a topology we cannot undo. */
     if (check_fork_preconditions(&local) != 0) return MYNAH_PREFORK_ERROR;
+
+    /* BEFORE the first fork, so every worker inherits the same page. After it
+     * each process would map its own and the workers would read zeros. */
+    pf_shared_open();
 
     worker_state *w = (worker_state *)calloc((size_t)workers, sizeof(*w));
     if (w == NULL) return MYNAH_PREFORK_ERROR;
@@ -2261,6 +2335,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     for (int i = 0; i < q_n; ++i) {
         mynah_prefork_refuse_and_close(q[i].fd, MYNAH_PREFORK_REFUSE_AT_CAPACITY);
         ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+        pf_shared_refused(MYNAH_PREFORK_REFUSE_AT_CAPACITY);
     }
     q_n = 0;
     /* Same for a connection still waiting to be classified: it was accepted,
@@ -2271,6 +2346,7 @@ mynah_prefork_role mynah_prefork_run(const mynah_prefork_config *cfg,
     for (int i = 0; i < pending_n; ++i) {
         mynah_prefork_refuse_and_close(pending[i].fd, MYNAH_PREFORK_REFUSE_AT_CAPACITY);
         ++refused[MYNAH_PREFORK_REFUSE_AT_CAPACITY];
+        pf_shared_refused(MYNAH_PREFORK_REFUSE_AT_CAPACITY);
     }
     pending_n = 0;
     /* Finish the lingering closes properly: the whole point is that the client

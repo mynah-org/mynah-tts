@@ -1366,7 +1366,41 @@ static void handle_health(int fd) {
     const size_t rss_now = mynah_rss_bytes();
     const size_t rss_shared = mynah_rss_shared_bytes();
 
-    char body[2048];
+    /* THE COUNTERS THIS PROCESS CANNOT KNOW.
+     *
+     * `jobs` above is THIS WORKER's, and always was. What it can never contain
+     * is a request the router refused before any worker saw it -- and on
+     * 2026-09-22 a 2x12 server on an EPYC 9254 answered 18 of 72 requests with
+     * 503 server_at_capacity while every worker's /health read "rejected": 0.
+     * Nobody was lying; the refusals happened in the parent, which serves no
+     * HTTP. This block is the parent's numbers, read out of the page it shares
+     * with the fork, and `total` is the one an alert should watch.
+     *
+     * `null` when there is no router: a single-process server has no refusals
+     * of this kind, and printing zeros would claim a measurement nobody made. */
+    char router[512];
+    {
+        unsigned long long ref[MYNAH_PREFORK_REFUSE__COUNT];
+        const int have = mynah_prefork_router_refusals(ref, (int)(sizeof ref / sizeof ref[0]));
+        if (have < 0) {
+            snprintf(router, sizeof(router), "null");
+        } else {
+            unsigned long long total = 0;
+            size_t o = 0;
+            for (int r = 0; r < have; ++r) total += ref[r];
+            o = (size_t)snprintf(router, sizeof(router),
+                                 "{\"refused_total\":%llu,\"refused\":{", total);
+            for (int r = 0; r < have && o < sizeof(router) - 64u; ++r) {
+                o += (size_t)snprintf(router + o, sizeof(router) - o, "%s\"%s\":%llu",
+                                      r == 0 ? "" : ",",
+                                      mynah_prefork_refusal_code((mynah_prefork_refusal)r),
+                                      ref[r]);
+            }
+            snprintf(router + o, sizeof(router) - o, "}}");
+        }
+    }
+
+    char body[3072];
     const int n = snprintf(body, sizeof(body),
                            "{\"status\":\"ok\",\"model\":\"%s\",\"engine\":\"%s\","
                            "\"sample_rate\":%u,\"voices\":%zu,"
@@ -1381,6 +1415,7 @@ static void handle_health(int fd) {
                            "\"failed\":%lu,\"rejected\":%lu,\"timed_out\":%lu,"
                            "\"disconnected\":%lu,\"language_refused\":%lu},"
                            "\"streams\":{\"active\":%lu,\"total\":%lu},"
+                           "\"router\":%s,"
                            /* A policy that is on by default has to be
                             * READABLE, or an operator cannot tell a server
                             * that frees slots on hangup from one that does
@@ -1466,6 +1501,7 @@ static void handle_health(int fd) {
                            atomic_load(&g_stats.language_refused),
                            atomic_load(&g_stats.streams_active),
                            atomic_load(&g_stats.streams_total),
+                           router,
                            g.max_batch, g.max_pending, g.worker_count,
                            prefork_total, prefork_total > 0
                                ? (size_t)prefork_total * g.max_batch
