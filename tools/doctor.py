@@ -427,6 +427,39 @@ def topology_section(rep: Report) -> dict:
 # ------------------------------------------------------ the dispatch table
 
 
+def arch_family(name: str) -> str:
+    """arm | x86 | "" -- the two families the dispatch ids are named after."""
+    n = (name or "").lower()
+    if n.startswith(("aarch64", "arm")):
+        return "arm"
+    if "86" in n:
+        return "x86"
+    return ""
+
+
+def row_arch(rid: str) -> str:
+    """The architecture a dispatch row's ID claims, which is not always the one
+    it answers for: isa.arm.bf16 answers for x86 too, because src/qmat.c grew a
+    VDPBF16PS kernel under a row that was named when only ARM had one."""
+    if ".arm." in rid:
+        return "arm"
+    if ".x86." in rid:
+        return "x86"
+    return ""
+
+
+def lede(reason: str) -> str:
+    """The first sentence of a row's reason, without its [provenance] tag."""
+    r = (reason or "").strip()
+    if r.startswith("["):
+        r = r.partition("]")[2].strip()
+    for stop in (". ", " -- "):
+        if stop in r:
+            r = r.split(stop)[0]
+            break
+    return r[:160]
+
+
 def dispatch_section(rep: Report, binary: str | None) -> dict:
     """The resolved dispatch table, from the binary itself.
 
@@ -503,6 +536,7 @@ def dispatch_section(rep: Report, binary: str | None) -> dict:
         "codec.seanet_blas",
     ]
     by_id = {r["id"]: r for r in doc.get("features", [])}
+    host_arch = arch_family(doc.get("arch", ""))
     for rid in interesting:
         row = by_id.get(rid)
         if row is None:
@@ -532,6 +566,15 @@ def dispatch_section(rep: Report, binary: str | None) -> dict:
             label, note = UNKNOWN, "no predicate exports this decision"
         if row.get("env_value") and row["env_value"] != "unset":
             note = (note + "; " if note else "") + f"{row['env']}={row['env_value']}"
+        # A row whose id names one architecture while this host is another.
+        # `isa.arm.bf16` printed a bare ON on an AMD EPYC because this loop
+        # keeps the resolved value and drops the reason -- and the reason is
+        # the half that said NAMED FOR ARM, ANSWERING FOR x86. An operator
+        # running the doctor first, as intended, saw an ARM row lit on an AMD
+        # box and no sentence anywhere explaining it.
+        cross = row_arch(rid)
+        if cross and host_arch and cross != host_arch:
+            note = (note + "; " if note else "") + lede(reason)
         rep.add(rid, row.get("resolved"), label, note)
 
     # A feature that is present and idle is a finding, not a blank.

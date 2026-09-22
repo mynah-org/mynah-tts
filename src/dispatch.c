@@ -295,6 +295,20 @@ static tri cpu_has_amx_int8(void)    { return 0; }
 static tri cpu_has_avx512bf16(void)  { return 0; }
 #endif
 
+/* `isa.arm.bf16` asks whether a bf16 WEIGHT gets a vector path, and on x86 that
+ * question is not cpu_has_bf16().  The x86 kernel widens bf16 to f32 with a
+ * 16-bit shift and multiplies, so what it needs is AVX2 -- AVX512-BF16 only
+ * decides WHICH x86 tier runs, and that is isa.x86.avx512bf16's row.  Asking
+ * cpu_has_bf16() here produced `supported no, resolved ON` on every AVX2 host
+ * without VDPBF16PS: a row contradicting itself. */
+static tri cpu_has_bf16_path(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    return cpu_has_avx2();
+#else
+    return cpu_has_bf16();
+#endif
+}
+
 /* ======================================================================
  * E4-12: the fatal ISA guard
  *
@@ -789,9 +803,17 @@ static void collect_isa(row_sink *s) {
     add_absent(s, "isa.arm.svebf16", cpu_has_svebf16(),
                "[gate] NOT IMPLEMENTED (no predicate registered by "
                "src/kernels.c)");
-    add_absent(s, "isa.arm.bf16", cpu_has_bf16(),
-               "[gate] NOT IMPLEMENTED (no predicate registered by "
-               "src/kernels.c)");
+    /* NOT add_absent: src/qmat.c compiles a bf16 kernel on BOTH architectures,
+     * so `compiled no` here was false on x86 from the day E14-3 landed, and it
+     * was false in the direction that hides work -- the row said no kernel
+     * while VDPBF16PS was executing two rows below it.  And the env column said
+     * `-` while MYNAH_QMAT_BF16 turned the row OFF, which is the dispatch map's
+     * one promise: the env column names the flag that moves the row. */
+    add_unknown(s, "isa.arm.bf16", yn(MYNAH_DISPATCH_HAS_BF16_KERNEL),
+                yn3(cpu_has_bf16_path()), "MYNAH_QMAT_BF16",
+                "[UNKNOWN] src/qmat.c did not register the bf16 predicate over "
+                "this id. The id names ARM and the kernel exists on x86 too -- "
+                "isa.x86.avx512bf16 carries the x86 tier");
     /* NOT add_gate any more, and the change is the finding it used to hide.
      * This row read `compiled no` on an x86 portable build and stopped
      * there -- true, and it let a reader conclude the whole binary was

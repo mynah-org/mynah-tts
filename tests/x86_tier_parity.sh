@@ -122,7 +122,14 @@ check_rows() {
   fi
 }
 check_rows baseline2   ""
-check_rows vnni_off    "isa.x86.avx512vnni quant.int8_kernel codec.conv_int8_host"
+# vnni_off carries MORE rows than avx512_off, which looks backwards and is
+# correct: turning VNNI off leaves AVX-512 F/BW/VL standing, so the E14-2
+# avx512bw int8 tier WINS and its two rows flip ON. Turning AVX-512 off as well
+# removes that winner, so they stay OFF and never move. The rows mean "this is
+# the kernel that RUNS" since 455e1f2, and this list was written before they
+# did -- the run that caught it was the first with a model pack on a host that
+# has both units.
+check_rows vnni_off    "isa.x86.avx512vnni isa.x86.avx512f isa.x86.avx512bw quant.int8_kernel codec.conv_int8_host"
 check_rows avx512_off  "isa.x86.avx512vnni isa.x86.avx512f isa.x86.avx512bw isa.x86.avx512vl quant.int8_kernel codec.conv_int8_host"
 check_rows bf16_off    "isa.arm.bf16 isa.x86.avx512bf16"
 check_rows f32_scalar  "isa.x86.avx2 isa.x86.fma sgemm.kernel"

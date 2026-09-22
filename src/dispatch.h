@@ -149,6 +149,26 @@ extern "C" {
 #define MYNAH_DISPATCH_HAS_AVX512BF16_KERNEL 0
 #endif
 
+/* The bf16 WEIGHT path, and it is the one row here whose kernel exists on both
+ * architectures under different instructions -- BFDOT/BFMMLA on aarch64,
+ * VDPBF16PS or an AVX2 widening shift on x86.  The row that reports it is still
+ * called `isa.arm.bf16` for historical reasons, and it read `compiled no` on
+ * x86 while src/qmat.c was executing matvec_bf16_dpbf16_x1: a pair the report's
+ * own idle-hardware rule had to special-case, and which turned into
+ * "IDLE HARDWARE: isa.arm.bf16 ... this binary has no kernel for" on an AMD
+ * EPYC the moment MYNAH_QMAT_BF16=off made the special case stop applying.
+ * These two conditions are src/qmat.c's MYNAH_QMAT_BF16_NEON and
+ * MYNAH_QMAT_BF16_X86, and they must stay in step with it. */
+#if !defined(MYNAH_DISABLE_SIMD) && \
+    ((defined(__aarch64__) && \
+      (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 10))) || \
+     ((defined(__x86_64__) || defined(__i386__)) && \
+      (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11))))
+#define MYNAH_DISPATCH_HAS_BF16_KERNEL 1
+#else
+#define MYNAH_DISPATCH_HAS_BF16_KERNEL 0
+#endif
+
 /* src/qmat.c matvec_q8_pair_i8mm, likewise target-attributed. */
 #if !defined(MYNAH_DISABLE_SIMD) && defined(__aarch64__) && \
     (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 10))

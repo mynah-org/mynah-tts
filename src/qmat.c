@@ -133,24 +133,28 @@
 #define MYNAH_QMAT_BF16_NEON 1
 #endif
 
-/* x86 HAS NO VECTOR KERNEL HERE YET, AND THE ENCODING STILL WORKS THERE.
+/* bf16 IS A STORAGE FORMAT AS WELL AS AN INSTRUCTION, and that is why it is
+ * defined on every target: on a host with no bf16 unit the weights are still
+ * half the bytes of f32 and the scalar kernel below multiplies them correctly.
+ * So MYNAH_QMAT_BF16 is defined everywhere and only the kernels are
+ * conditional. `--dispatch-map` reports which one ran, so a scalar fallback can
+ * never be mistaken for a vector win.
  *
- * bf16 is a storage format as well as an instruction: on a host with no bf16
- * unit the weights are still half the bytes of f32 and the scalar kernel below
- * multiplies them correctly. So MYNAH_QMAT_BF16 is defined everywhere and only
- * the ARM kernel is conditional. `--dispatch-map` reports which one ran, so a
- * scalar fallback can never be mistaken for a vector win.
+ * THE x86 TIERS, NOW THREE. E14-3 landed the VDPBF16PS kernel, so the paragraph
+ * that used to stand here -- "x86 has no vector kernel here yet" -- is gone
+ * rather than corrected: a comment that survives the code it describes is how a
+ * reader learns to distrust all of them.
  *
- * WHAT THE x86 KERNEL WILL HAVE TO SOLVE, written down so it is not
- * rediscovered: VDPBF16PS multiplies PAIRWISE WITHIN A LANE, so two k-adjacent
+ * THE TRAP IT RECORDED IS STILL TRUE AND IS THE REASON THE KERNEL LOOKS THE WAY
+ * IT DOES. VDPBF16PS multiplies PAIRWISE WITHIN A LANE, so two k-adjacent
  * values must land in the same 32-bit lane. Weights loaded straight from this
  * cache already do. The activation does not: _mm512_cvtne2ps_pbh(a, b)
  * INTERLEAVES its two sources (dst[2i] = b[i], dst[2i+1] = a[i]), which pairs
- * x[j+i] with x[j+16+i] rather than x[2i] with x[2i+1]. The two ways out are a
- * scratch buffer for the converted activation -- which this file may not
- * allocate in a kernel -- or concatenating two _mm512_cvtneps_pbh results, whose
- * type juggling between __m256bh and __m256i differs across compiler versions.
- * Either is fine; neither should be written without a machine to run it on. */
+ * x[j+i] with x[j+16+i] rather than x[2i] with x[2i+1]. The way out taken is
+ * neither of the two guessed at here: _mm512_cvtneps_pbh is the ONE-source
+ * convert and returns sixteen bf16 IN ORDER, so two of them joined with
+ * _mm512_inserti64x4 give thirty-two consecutive bf16 and no scratch buffer.
+ * See qmat_bf16_narrow32 below. */
 /* x86: AVX2 + FMA, and it is a better fit than it looks.
  *
  * There is no bf16 multiply below AVX512-BF16, but bf16 does not need one to be
