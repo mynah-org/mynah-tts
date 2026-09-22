@@ -2683,6 +2683,63 @@ static void matvec_bf16_dpbf16_x4(float *o0, float *o1, float *o2, float *o3,
     }
 }
 
+/* ONE ACTIVATION, and why it is a separate kernel rather than the x4 with its
+ * arguments repeated.
+ *
+ * The repeat trick is what keeps a row's answer independent of batch width,
+ * and on Arm it is free: that kernel is memory-bound at one activation, so the
+ * three wasted lanes cost nothing. VDPBF16PS is not in that regime. Measured on
+ * an EPYC 9254 at 4096x1024: the x4 kernel fed one activation four times takes
+ * 0.489 ms where f32 matvec over TWICE the bytes takes 0.257 -- bf16 was slower
+ * than f32 for half the traffic, which is the opposite of the reason the
+ * encoding exists. Four dpbf16 per weight load instead of one, and the
+ * instruction is fast enough that the redundant three dominate.
+ *
+ * DETERMINISM IS NOT GIVEN UP TO GET IT. Each output row is its own
+ * accumulator chain over j in the same order, so this produces bit-for-bit what
+ * lane 0 of the x4 kernel produces -- the invariant is that WIDTH must not
+ * change a row's answer, not that one kernel must serve every width. The
+ * existing `qmat bf16 batch=2 differs from the row-at-a-time reference` check
+ * is what holds it, and it is the check that caught the last mistake here. */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
+static void matvec_bf16_dpbf16_x1(float *out, const float *x,
+                                  const uint16_t *weights, const float *bias,
+                                  size_t rows, size_t cols) {
+    for (size_t row = 0; row < rows; ++row) {
+        const uint16_t *w = weights + row * cols;
+        __m512 a0 = _mm512_setzero_ps();
+        size_t j = 0;
+        for (; j + 32u <= cols; j += 32u)
+            a0 = _mm512_dpbf16_ps(a0, qmat_bf16_load32(w + j),
+                                  qmat_bf16_narrow32(x + j));
+        float s0 = _mm512_reduce_add_ps(a0);
+        for (; j < cols; ++j)
+            s0 += qmat_bf16_to_f32(w[j]) *
+                  qmat_bf16_to_f32(qmat_bf16_from_f32(x[j]));
+        out[row] = s0 + (bias == NULL ? 0.0f : bias[row]);
+    }
+}
+
+/* The same saving for the widening kernel, which pays the same four-for-one. */
+__attribute__((target("avx2,fma")))
+static void matvec_bf16_avx2_x1(float *out, const float *x,
+                                const uint16_t *weights, const float *bias,
+                                size_t rows, size_t cols) {
+    for (size_t row = 0; row < rows; ++row) {
+        const uint16_t *w = weights + row * cols;
+        __m256 a0 = _mm256_setzero_ps();
+        size_t j = 0;
+        for (; j + 8u <= cols; j += 8u)
+            a0 = _mm256_fmadd_ps(qmat_bf16_widen(w + j),
+                                 qmat_bf16_round_ps(_mm256_loadu_ps(x + j)), a0);
+        float s0 = qmat_bf16_hsum(a0);
+        for (; j < cols; ++j)
+            s0 += qmat_bf16_to_f32(w[j]) *
+                  qmat_bf16_to_f32(qmat_bf16_from_f32(x[j]));
+        out[row] = s0 + (bias == NULL ? 0.0f : bias[row]);
+    }
+}
+
 /* The prove-on-first-use gate. 200 columns: six full 32-blocks and an 8-wide
  * tail, so both halves of the kernel run. The data is positive-biased on
  * purpose -- a sum that cancels would make a relative bound meaningless, and
@@ -2739,6 +2796,16 @@ static int qmat_bf16_dpbf16_ok(void) {
         cached = (bf16 && qmat_bf16_dpbf16_verify()) ? 1 : 0;
     }
     return cached;
+}
+
+static void matvec_bf16_x86_x1(float *out, const float *x,
+                               const uint16_t *weights, const float *bias,
+                               size_t rows, size_t cols) {
+    if (qmat_bf16_dpbf16_ok()) {
+        matvec_bf16_dpbf16_x1(out, x, weights, bias, rows, cols);
+        return;
+    }
+    matvec_bf16_avx2_x1(out, x, weights, bias, rows, cols);
 }
 
 static void matvec_bf16_x86_x4(float *o0, float *o1, float *o2, float *o3,
@@ -3081,8 +3148,7 @@ static void matvec_bf16(float *out, const float *x, const uint16_t *weights,
     if (qmat_bf16_unit()) {
         /* Same discipline as the ARM side: one activation takes the x4 kernel
          * with itself repeated, so width never changes a row's answer. */
-        matvec_bf16_x86_x4(out, out, out, out, x, x, x, x, weights, bias,
-                           rows, cols);
+        matvec_bf16_x86_x1(out, x, weights, bias, rows, cols);
         return;
     }
 #endif
@@ -6424,6 +6490,27 @@ int mynah_qmat_self_test(char *error, size_t error_capacity) {
  * ====================================================================== */
 
 /* Names the int8 kernel this host+binary pair actually resolves to. */
+/* WHICH bf16 KERNEL, as a TOKEN.
+ *
+ * bf16 was the only encoding here with a boolean and no name, while int8 and
+ * f16 both have one. The cost showed up immediately: tests/bench_kernels.c
+ * sniffed the human-readable reason string for "VDPBF16PS" and labelled the
+ * AVX2 widening kernel as VDPBF16PS, because that reason ends with the words
+ * "half the arithmetic of VDPBF16PS". A benchmark that mislabels which kernel
+ * produced a number is worse than one that prints no label at all. */
+const char *mynah_qmat_bf16_kernel(const char **why) {
+    const int on = mynah_qmat_bf16_enabled(why);
+#if defined(MYNAH_QMAT_BF16_X86)
+    if (!on) return "scalar";
+    return qmat_bf16_dpbf16_ok() ? "vdpbf16ps" : "avx2-widen";
+#elif defined(MYNAH_QMAT_BF16_NEON)
+    return on ? "neon-bfdot" : "scalar";
+#else
+    (void)on;
+    return "scalar";
+#endif
+}
+
 void mynah_qmat_matvec_bf16(float *out, const float *x, const uint16_t *w,
                             const float *bias, size_t rows, size_t cols) {
     /* `pairs` NULL: the tiled ARM path wants a second, pre-interleaved copy of

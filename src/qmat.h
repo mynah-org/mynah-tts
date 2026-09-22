@@ -239,6 +239,13 @@ void mynah_qmat_dots_i8(const int8_t *w, size_t rows, size_t cols,
 
 /* Model-free numeric check: int8 matvec vs an exact f32 dot on deterministic
  * data, asserting a bounded relative error.  0 = ok, -1 = error. */
+/* Which bf16 kernel will run, as a short token -- "vdpbf16ps", "avx2-widen",
+ * "neon-bfdot" or "scalar" -- beside the [predicate] prose in `why`.  The same
+ * shape as mynah_qmat_int8_kernel and mynah_qmat_f16_kernel, which bf16 lacked:
+ * a caller that needs the NAME had to pattern-match the prose, and prose that
+ * mentions a kernel it is not using made that wrong. */
+const char *mynah_qmat_bf16_kernel(const char **why);
+
 /* Model-free bf16 matvec: out[row] = sum_j bf16(w[row][cols]) * bf16(x[j]),
  * plus bias, through whichever bf16 kernel this host resolved (BFDOT/BFMMLA on
  * Arm, VDPBF16PS or the AVX2 widening form on x86, scalar otherwise).

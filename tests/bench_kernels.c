@@ -90,13 +90,11 @@ int main(void) {
 
     const char *k_f32 = mynah_kernels_x86_avx2() ? "avx2+fma" : "scalar-or-neon";
     const char *k_i8 = mynah_qmat_int8_kernel(NULL);
-    const char *why = NULL;
-    (void)mynah_qmat_bf16_enabled(&why);
-    const char *k_bf = strstr(why ? why : "", "VDPBF16PS") ? "vdpbf16ps"
-                     : strstr(why ? why : "", "BFMMLA")    ? "bfmmla"
-                     : strstr(why ? why : "", "BFDOT")     ? "bfdot"
-                     : strstr(why ? why : "", "avx2")      ? "avx2-widen"
-                                                           : "scalar";
+    /* Asked for the NAME, not pattern-matched out of the explanation. The first
+     * version of this line searched the [predicate] prose for "VDPBF16PS" and
+     * labelled the AVX2 widening kernel as VDPBF16PS on an EPYC 9254, because
+     * that kernel's own reason ends "half the arithmetic of VDPBF16PS". */
+    const char *k_bf = mynah_qmat_bf16_kernel(NULL);
 
     printf("kernel micro-bench -- shapes only, no model. %s, %s\n",
            mynah_dispatch_isa_class(), mynah_sgemm_isa_name());
