@@ -5,6 +5,31 @@ Box: AMD EPYC 9254 (Genoa, Zen 4), 24c/48t, 377 GB, Ubuntu 24.04, gcc 13.3.
 2026-09-22. **First machine this project has ever had that can execute the x86
 kernels it ships.**
 
+## Read the ratios, not the milliseconds -- the box was not quiet
+
+Checked after the fact, which is the wrong order and is why it is written here
+rather than left out: `md0` was **resyncing throughout**, 33.8% done at
+206 MB/s with 200 minutes left, and it had been running for 1h43m when the
+numbers below were taken -- i.e. for all of them. A second session of the
+owner's was also on the machine (a Qwen3-4B ternary feasibility run, 22 cores),
+though it started after the bench runs.
+
+What that does and does not touch:
+
+- **The ratios are the claims, and they are comparisons within minutes of each
+  other on one machine**, so contention hits both sides. The large ones --
+  sgemm 4.44x, bf16 3.04x, VDPBF16PS 2.98x -- are far outside the spread
+  observed between repeats.
+- **The absolute milliseconds are soft.** f32 matvec came back between 0.243
+  and 0.413 ms across runs of the same binary, a 70% spread that is contention
+  and not kernel behaviour. Do not quote a ms from this table.
+- The 1.12x on axpy and the 1.26x on avx512bw-vs-avx2 are **inside** that
+  spread and should be treated as "no measured difference", not as small wins.
+
+A quiet box would settle this in ten minutes. Until then these justify the code
+existing and being reached, which was the question, and not a performance
+claim.
+
 ## The measurement that was the point
 
 `make kernel-bench SIMD=portable` -- ONE binary, built with no ISA flag at all,

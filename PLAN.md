@@ -1202,7 +1202,10 @@ alone does not promote a kernel.
       with no build flag. int8 tiers `avx512vnni 0.049 / avx512bw 0.088 / avx2 0.111 ms`;
       bf16 `vdpbf16ps 0.161 / avx2-widen 0.479`. **Kernel micro-bench, not an RTF** —
       E12 put the weight pass at 5% of the AR step at B=8, so none of this is a synthesis
-      speedup and none may be quoted as one
+      speedup and none may be quoted as one. **And the box was not quiet**: a RAID resync
+      ran throughout, f32 matvec repeated between 0.243 and 0.413 ms, so read the large
+      ratios and not the milliseconds — axpy 1.12x and avx512bw-vs-avx2 1.26x are inside
+      that spread and are NOT measured wins
 - [x] E14-6 **the x86 bf16 path was a PESSIMISATION and the bench found it** — one
       activation went through the x4 kernel with itself in all four arguments, so four
       `dpbf16` per weight load with three thrown away. Free on Arm (memory-bound at one
