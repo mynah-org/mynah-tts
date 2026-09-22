@@ -279,6 +279,10 @@ static tri cpu_has_avx512vl(void)    { return x86_feature(7, 0, 1, 31, x86_os_av
 static tri cpu_has_avx512vnni(void)  { return x86_feature(7, 0, 2, 11, x86_os_avx512()); }
 static tri cpu_has_avxvnni(void)     { return x86_feature(7, 1, 0,  4, x86_os_avx()); }
 static tri cpu_has_amx_int8(void)    { return x86_feature(7, 0, 3, 25, x86_os_amx()); }
+/* AVX512-BF16 is leaf 7 SUBLEAF 1, EAX bit 5 -- the same subleaf as AVX-VNNI
+ * and a different one from the F/BW/VL bits, which is where this check is
+ * usually got wrong. */
+static tri cpu_has_avx512bf16(void)  { return x86_feature(7, 1, 0,  5, x86_os_avx512()); }
 #else
 static tri cpu_has_avx2(void)        { return 0; }
 static tri cpu_has_fma(void)         { return 0; }
@@ -288,6 +292,7 @@ static tri cpu_has_avx512vl(void)    { return 0; }
 static tri cpu_has_avx512vnni(void)  { return 0; }
 static tri cpu_has_avxvnni(void)     { return 0; }
 static tri cpu_has_amx_int8(void)    { return 0; }
+static tri cpu_has_avx512bf16(void)  { return 0; }
 #endif
 
 /* ======================================================================
@@ -368,9 +373,38 @@ static const isa_requirement *isa_requirements(void) {
     return table;
 }
 
+/* E14-1.  THE GUARD IS COMPILED FOR THE BASELINE, ON PURPOSE.
+ *
+ * Everything else in this translation unit is built with whatever the profile
+ * asked for -- `-mavx2 -mfma`, or `-march=native` under SIMD=auto. The guard
+ * may not be, and the reason is circular in a way that is easy to miss: it
+ * exists to say "this binary needs an instruction your CPU does not have", and
+ * if the compiler puts one of those instructions INSIDE THE GUARD, the process
+ * dies on it before the message is printed. The operator then gets a SIGILL
+ * with no text, which is precisely the outcome the guard was written to
+ * replace.
+ *
+ * `target("arch=x86-64")` constrains only the instructions generated for these
+ * two functions; the feature macros still describe the build, so what the guard
+ * CHECKS is unchanged. Borrowed from ../qwen-tts, which carries the same
+ * attribute on qwen_check_runtime_isa for the same reason
+ * (.work/qwen-tts-kernel-reuse.md).
+ *
+ * It has never bitten us -- tests/x86_cross.sh proves the guard fires correctly
+ * on a real no-AVX2 host -- and that is an argument for keeping it that way,
+ * not for leaving it to luck: the failure mode is invisible until the one day
+ * it is a silent crash on a customer's machine. */
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#define MYNAH_ISA_GUARD_BASELINE __attribute__((target("arch=x86-64"), noinline))
+#else
+#define MYNAH_ISA_GUARD_BASELINE
+#endif
+
 /* What this CPU does have, for the second half of the message.  A mismatch
  * report that names only what is missing leaves the operator to guess which
  * build to fetch instead. */
+MYNAH_ISA_GUARD_BASELINE
 static void isa_guard_host(char *out, size_t cap) {
     static const isa_requirement known[] = {
 #if defined(__x86_64__) || defined(__i386__)
@@ -399,6 +433,7 @@ static void isa_guard_host(char *out, size_t cap) {
     if (out[0] == '\0') snprintf(out, cap, "(nothing this build knows how to probe)");
 }
 
+MYNAH_ISA_GUARD_BASELINE
 int mynah_dispatch_isa_guard(char *error, size_t error_capacity) {
     const isa_requirement *req = isa_requirements();
     for (size_t i = 0; req[i].name != NULL; ++i) {
@@ -722,18 +757,36 @@ static void collect_isa(row_sink *s) {
     /* The three rows the false README claim needed.  compiled can be yes here
      * (SIMD=avx512 passes the flags) while resolved is OFF, because no kernel
      * dispatches on it.  That gap is the finding, so it is stated twice. */
-    add_row(s, "isa.x86.avx512f", yn(MYNAH_DISPATCH_HAS_AVX512F),
-            yn3(cpu_has_avx512f()), NULL, "OFF", MYNAH_DISPATCH_SRC_GATE,
-            "[gate] COMPILER FLAG ONLY. SIMD=avx512 widens autovectorization; "
-            "no f32 kernel dispatches on it. The one _mm512_* kernel in src/ "
-            "is the VNNI int8 dot, which carries its own target attribute and "
-            "needs no build flag -- see isa.x86.avx512vnni, not this row");
-    add_row(s, "isa.x86.avx512bw", yn(MYNAH_DISPATCH_HAS_AVX512BW),
-            yn3(cpu_has_avx512bw()), NULL, "OFF", MYNAH_DISPATCH_SRC_GATE,
-            "[gate] compiler flag only, as isa.x86.avx512f");
+    /* These three used to say "COMPILER FLAG ONLY ... no f32 kernel dispatches
+     * on it. The one _mm512_* kernel in src/ is the VNNI int8 dot." That was
+     * true until E14-2 and E14-3 and is not any more: there are three now --
+     * the VNNI int8 dot, the AVX-512BW int8 dot for hosts WITHOUT VNNI, and
+     * VDPBF16PS. Two of them need F/BW/VL, so this trio is reached by a kernel
+     * and is answered by src/qmat.c's predicate rather than by CFLAGS.
+     *
+     * `compiled` still reports the build flag, because that is what it means
+     * everywhere else in this table, and it is still not what decides: all
+     * three kernels carry their own target attribute and need no flag. */
+    add_unknown(s, "isa.x86.avx512f", yn(MYNAH_DISPATCH_HAS_AVX512F),
+                yn3(cpu_has_avx512f()), "MYNAH_QMAT_AVX512",
+                "[UNKNOWN] src/qmat.c did not register the AVX-512BW int8 "
+                "predicate over this id");
+    add_unknown(s, "isa.x86.avx512bw", yn(MYNAH_DISPATCH_HAS_AVX512BW),
+                yn3(cpu_has_avx512bw()), "MYNAH_QMAT_AVX512",
+                "[UNKNOWN] src/qmat.c did not register the AVX-512BW int8 "
+                "predicate over this id");
     add_row(s, "isa.x86.avx512vl", yn(MYNAH_DISPATCH_HAS_AVX512VL),
             yn3(cpu_has_avx512vl()), NULL, "OFF", MYNAH_DISPATCH_SRC_GATE,
-            "[gate] compiler flag only, as isa.x86.avx512f");
+            "[gate] required alongside F and BW by the AVX-512BW int8 dot and "
+            "by VDPBF16PS; it selects no kernel on its own, so the resolved "
+            "column for those lives on isa.x86.avx512bw and "
+            "isa.x86.avx512bf16");
+    add_unknown(s, "isa.x86.avx512bf16", yn(MYNAH_DISPATCH_HAS_AVX512F),
+                yn3(cpu_has_avx512bf16()), "MYNAH_QMAT_BF16DOT",
+                "[UNKNOWN] src/qmat.c did not register the VDPBF16PS "
+                "predicate. bf16 is the dtype this backbone ships, so a "
+                "supported=yes with resolved=OFF here is a real gap, not a "
+                "curiosity");
     add_unknown(s, "isa.x86.avx512vnni", yn(MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL),
                 yn3(cpu_has_avx512vnni()), "MYNAH_QMAT_VNNI",
                 "[UNKNOWN] src/qmat.c did not register the VPDPBUSD predicate. "

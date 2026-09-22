@@ -1165,6 +1165,40 @@ measures the runtime side in C, on the box, under load. Needs **no code**:
       per-process**. Poll every worker and sum; do not read one and multiply until they
       are shown to agree
 
+### E14 — The x86 kernel tiers, before the box → [`.work/x86-kernel-tiers.md`](.work/x86-kernel-tiers.md) · [`.work/sgemm-runtime-dispatch.md`](.work/sgemm-runtime-dispatch.md)
+
+**PRIORITY: MAX.** Everything here is code written so that a rented x86 hour
+measures this engine instead of its fallback. E4-9 closed the f32 half; these
+are the tiers still missing, and the doctrine that lets them land without
+putting an unexecuted kernel on the default path: **a new tier resolves only
+after it has been EXECUTED in this process and checked against the scalar
+reference** (`.work/x86-kernel-tiers.md`, "prove-on-first-use gate"). CPUID
+alone does not promote a kernel.
+
+- [ ] E14-1 **the ISA guard is not compiled for the baseline** — a guard built with
+      `-march=native` may contain an instruction the host lacks and die before printing
+      the message it exists to print. `qwen-tts` carries `target("arch=x86-64")` on its
+      guard for exactly this; ours has none. One line
+- [ ] E14-2 **AVX-512 without VNNI has no int8 kernel** — Skylake-SP, Cascade Lake and
+      Zen 3 have 512-bit registers and no VPDPBUSD, so they run the 256-bit AVX2 dot and
+      half the register file idles. `_mm512_cvtepi8_epi16` + `_mm512_madd_epi16`, exact
+      int32, so the gate is **bit-identical to the scalar reference**, not a tolerance.
+      This is the brief's X2 question answered in code
+- [ ] E14-3 **VDPBF16PS: x86 has no bf16 multiply and bf16 is what the backbone ships** —
+      on Arm the bf16 path is +33% at B=8; on x86 we widen with a shift and multiply in
+      f32. The interleave problem `src/qmat.c` documents is **avoided, not solved**:
+      `_mm512_cvtneps_pbh` converts 16 f32 in order, so two concatenated with
+      `_mm512_inserti64x4` give 32 consecutive bf16 — sixteen lanes of two k-adjacent
+      values, which is what the instruction pairs. No scratch, no allocation in a kernel
+- [ ] E14-4 **`src/sgemm.c` — 43% of the wall, still compile-time on x86** →
+      [`.work/sgemm-runtime-dispatch.md`](.work/sgemm-runtime-dispatch.md). Not a
+      smaller version of E4-9: `SG_LANES` reaches the packed panel geometry and the
+      public `mynah_sgemm_narrow_max`, so multi-versioning makes the LAYOUT a runtime
+      choice. Two translation units at different `-m` flags, scalar kept as reference
+- [ ] E14-5 **none of the above may be quoted as a speedup** until a box runs them. The
+      win being claimed here is that one artifact is both safe on an old CPU and fast on
+      a new one; the numbers are E4-9's "Linux measurement box", still open
+
 ### E13 — The ceiling is 128 request slots, not a speed limit → [`.work/int8-backbone.md`](.work/int8-backbone.md)
 
 16 workers x `--max-batch 8` = **128 places**. TTFB p95 is flat at 75-77 ms up to

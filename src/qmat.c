@@ -69,6 +69,13 @@
 #include <cpuid.h>
 #include <immintrin.h>
 #define MYNAH_QMAT_X86_VNNI 1
+/* E14-2/E14-3. The same condition, named separately because it gates a
+ * different pair of instructions: the AVX-512BW int8 dot for hosts that have
+ * 512-bit registers and NO VPDPBUSD (Skylake-SP, Cascade Lake, Zen 3), and
+ * VDPBF16PS for the ones that have AVX512-BF16. Both are reached the same way
+ * as VNNI -- target attribute on the kernel, CPUID at runtime -- so neither
+ * needs a build flag and neither can SIGILL a host that lacks it. */
+#define MYNAH_QMAT_X86_AVX512 1
 #endif
 
 /* ----------------------------------------------------------------- x86 F16
@@ -247,6 +254,31 @@ static void qmat_x86_probe(int *evex, int *vex) {
         ((a >> 4) & 1u)) {
         *vex = 1;
     }
+}
+#endif
+
+#if defined(MYNAH_QMAT_X86_AVX512)
+/* AVX-512 F+BW+VL (the pair the widen-then-madd int8 dot needs) and
+ * AVX512-BF16, probed separately from VNNI because they are separate features
+ * on separate CPUs: Skylake-SP has F/BW/VL and no VNNI and no BF16; Cooper Lake
+ * has BF16; Zen 3 has neither BF16 nor VNNI-512. Reusing qmat_x86_probe() would
+ * have answered a different question. XGETBV is checked for the same reason it
+ * is there: a CPUID bit the OS has not enabled for XSAVE is not a usable unit.
+ *
+ * AVX512-BF16 is leaf 7 SUBLEAF 1, EAX bit 5 -- a different subleaf from the
+ * F/BW/VL bits, which is the same trap the AVX-VNNI check documents one block
+ * up, and the reason this is not folded into the loop above. */
+static void qmat_x86_avx512_probe(int *bw, int *bf16) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    *bw = 0;
+    *bf16 = 0;
+    const unsigned long long xcr0 = qmat_xcr0();
+    const int os_zmm = (xcr0 & 0x6ull) == 0x6ull && (xcr0 & 0xe0ull) == 0xe0ull;
+    if (!os_zmm) return;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return;
+    if (!(((b >> 16) & 1u) && ((b >> 30) & 1u) && ((b >> 31) & 1u))) return;
+    *bw = 1;
+    if (__get_cpuid_count(7, 1, &a, &b, &c, &d) && ((a >> 5) & 1u)) *bf16 = 1;
 }
 #endif
 
@@ -1110,6 +1142,76 @@ static void dot4_u8_i32(const uint8_t *xu, const int8_t *w, size_t cols,
             out[r] += ((int32_t)xu[j] - 128) * (int32_t)wr[j];
     }
 }
+#if defined(MYNAH_QMAT_X86_AVX512)
+/* E14-2.  THE TIER BETWEEN AVX2 AND VNNI, WHICH HAD NO KERNEL.
+ *
+ * Skylake-SP, Cascade Lake and Zen 3 have 512-bit registers and no VPDPBUSD.
+ * Until now they ran the 256-bit AVX2 dot below and half the register file sat
+ * idle -- the brief's "AVX-512 without VNNI" question, unanswered in code.
+ *
+ * It is the same algebra as dot_q8_i32_avx2, twice as wide: widen int8 to
+ * int16, multiply-and-add adjacent pairs into int32, accumulate. EXACT, with
+ * room to spare: |127*127| = 16129, VPMADDWD adds two of them (32258), and a
+ * 4096-long row accumulates 2048 of those to 6.6e7 against int32's 2.1e9. So
+ * the acceptance test is BIT-IDENTICAL to the scalar reference, not a
+ * tolerance -- there is no rounding in it to argue about.
+ *
+ * Unlike the VNNI kernels this needs no u8 re-encoding and no +128 row-sum
+ * correction: VPMADDWD is signed x signed, so it drops straight into the
+ * signed path (QMAT_U8_OFF) that every non-VNNI x86 host already takes. */
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+static int32_t dot_q8_i32_avx512bw(const int8_t *qx, const int8_t *w, size_t k) {
+    __m512i acc = _mm512_setzero_si512();
+    size_t j = 0;
+    for (; j + 32u <= k; j += 32u) {
+        const __m512i x16 =
+            _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)(const void *)(qx + j)));
+        const __m512i w16 =
+            _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)(const void *)(w + j)));
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(x16, w16));
+    }
+    int32_t result = _mm512_reduce_add_epi32(acc);
+    for (; j < k; ++j) result += (int32_t)qx[j] * (int32_t)w[j];
+    return result;
+}
+
+/* THE PROVE-ON-FIRST-USE GATE (.work/x86-kernel-tiers.md).
+ *
+ * This project owns no machine with AVX-512, so this kernel would otherwise
+ * ship on the strength of a CPUID bit and a careful reading -- which is exactly
+ * what src/qmat.c's VDPBF16PS note refuses, and rightly. The answer is not to
+ * leave the kernel unwritten but to stop an UNEXECUTED one from resolving: the
+ * gate runs it, once per process, against the scalar reference, and a host
+ * whose answer disagrees falls back to AVX2 and says so in the dispatch map.
+ *
+ * The shape is chosen to be awkward on purpose: 200 is not a multiple of 32, so
+ * the tail runs; the values sweep the full int8 range including -128, whose
+ * negation is the classic place an int8 kernel goes wrong; and the reference is
+ * the plain int32 loop, which is the definition of the answer. */
+static int qmat_int8_avx512bw_verify(void) {
+    int8_t a[200], b[200];
+    for (size_t i = 0; i < sizeof a; ++i) {
+        a[i] = (int8_t)(((int)i * 37) % 255 - 128);
+        b[i] = (int8_t)(127 - ((int)i * 53) % 255);
+    }
+    int32_t want = 0;
+    for (size_t i = 0; i < sizeof a; ++i) want += (int32_t)a[i] * (int32_t)b[i];
+    return dot_q8_i32_avx512bw(a, b, sizeof a) == want;
+}
+
+static int qmat_int8_avx512bw_ok(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int bw = 0, bf16 = 0;
+        qmat_x86_avx512_probe(&bw, &bf16);
+        const char *env = getenv("MYNAH_QMAT_AVX512");
+        if (env != NULL && (strcmp(env, "off") == 0 || strcmp(env, "0") == 0)) bw = 0;
+        cached = (bw && qmat_int8_avx512bw_verify()) ? 1 : 0;
+    }
+    return cached;
+}
+#endif /* MYNAH_QMAT_X86_AVX512 */
+
 #if defined(MYNAH_QMAT_AVX2)
 static int32_t dot_q8_i32_avx2(const int8_t *qx, const int8_t *w, size_t k) {
     __m256i acc = _mm256_setzero_si256();
@@ -1144,12 +1246,21 @@ static int32_t dot_q8_i32(const void *qa, const int8_t *w, int32_t rowsum,
     int32_t s = vaddvq_s32(acc);
     for (; j < k; ++j) s += (int32_t)w[j] * (int32_t)qx[j];
     return s;
-#elif defined(MYNAH_QMAT_AVX2)
+#else
+#if defined(MYNAH_QMAT_X86_AVX512)
+    /* Only when it has been executed and agreed with the reference in this
+     * process; otherwise this falls through exactly as before. */
+    if (qmat_int8_avx512bw_ok()) return dot_q8_i32_avx512bw(qx, w, k);
+#endif
+#if defined(MYNAH_QMAT_AVX2)
     return dot_q8_i32_avx2(qx, w, k);
 #else
-    int32_t s = 0;
-    for (size_t j = 0; j < k; ++j) s += (int32_t)w[j] * (int32_t)qx[j];
-    return s;
+    {
+        int32_t s = 0;
+        for (size_t j = 0; j < k; ++j) s += (int32_t)w[j] * (int32_t)qx[j];
+        return s;
+    }
+#endif
 #endif
 }
 
@@ -2480,24 +2591,133 @@ static void matvec_bf16_avx2_x4(float *o0, float *o1, float *o2, float *o3,
     }
 }
 
-/* NOT IMPLEMENTED, and the reason is written here rather than discovered later.
+/* E14-3.  VDPBF16PS, and how the refusal that stood here was answered.
  *
- * AVX512-BF16's VDPBF16PS is the x86 counterpart of BFDOT and would roughly
- * double this kernel's arithmetic. It multiplies PAIRWISE WITHIN A LANE, so two
- * k-adjacent values must share a 32-bit lane. Weights loaded straight from this
- * cache already do. The activation does not: _mm512_cvtne2ps_pbh INTERLEAVES
- * its two sources -- dst[2i] = b[i], dst[2i+1] = a[i] -- which pairs x[j+i]
- * with x[j+16+i] instead of x[2i] with x[2i+1]. The ways out are a scratch
- * buffer for the converted activation, which a kernel in this file may not
- * allocate, or concatenating two _mm512_cvtneps_pbh results, whose casts
- * between __m256bh and __m256i differ across compiler versions.
+ * What stood here said: the instruction multiplies PAIRWISE WITHIN A LANE, so
+ * two k-adjacent values must share a 32-bit lane; weights loaded straight from
+ * this cache already do, and the activation does not, because
+ * _mm512_cvtne2ps_pbh INTERLEAVES its two sources -- dst[2i] = b[i],
+ * dst[2i+1] = a[i] -- pairing x[j+i] with x[j+16+i] instead of x[2i] with
+ * x[2i+1]. The two ways out were a scratch buffer a kernel here may not
+ * allocate, or type juggling that differs across compilers. And then: writing
+ * it blind would put an unexecuted vector kernel on the default path, which is
+ * the thing the dispatch report exists to prevent.
  *
- * Neither is hard. Both need a machine with the unit to run on, and this
- * project has none: the x86 CI runner executes --self-test, which is what makes
- * the AVX2 kernel above a tested kernel rather than a hopeful one, but it
- * cannot be relied on to have AVX512-BF16. Writing VDPBF16PS blind would put an
- * unexecuted vector kernel on the default path, which is the thing the
- * dispatch report exists to prevent. */
+ * Both halves are answered, and neither by hand-waving.
+ *
+ * THE INTERLEAVE IS AVOIDED, NOT SOLVED. _mm512_cvtneps_pbh takes sixteen f32
+ * and returns sixteen bf16 IN ORDER -- it is the one-source convert, and the
+ * interleave belongs to the two-source form. Two of them concatenated with
+ * _mm512_inserti64x4 give thirty-two consecutive bf16: sixteen lanes each
+ * holding x[2i] and x[2i+1], which is exactly the pairing the instruction
+ * wants. No scratch buffer and no allocation. The __m256bh/__m256i juggling
+ * goes through a union, which is what ../qwen-tts does and what compiles on
+ * both toolchains (.work/qwen-tts-kernel-reuse.md).
+ *
+ * THE UNEXECUTED KERNEL CANNOT RESOLVE. qmat_bf16_dpbf16_ok() does not promote
+ * this kernel on a CPUID bit: it RUNS it against matvec_bf16_scalar, once per
+ * process, and a host whose answer disagrees keeps the AVX2 path and says so in
+ * the dispatch map. That is a stronger guarantee than a CI gate could give,
+ * because it is checked on the machine that will execute it rather than on the
+ * machine that built it. The doctrine is in .work/x86-kernel-tiers.md.
+ *
+ * STILL NOT MEASURED, and that stays true until a box runs it: this is the
+ * right instruction on paper -- one VDPBF16PS does thirty-two MACs where the
+ * AVX2 form below does eight FMAs on widened lanes -- and paper is not a
+ * number. No speedup may be quoted from this file. */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
+static __m512bh qmat_bf16_load32(const uint16_t *w) {
+    union { __m512i i; __m512bh bh; } u;
+    u.i = _mm512_loadu_si512((const void *)w);
+    return u.bh;
+}
+
+/* Thirty-two f32 narrowed to bf16 and left IN ORDER. Round-to-nearest-even is
+ * what the instruction does and what qmat_bf16_from_f32 does, so the products
+ * are the same numbers as the scalar reference's; only the summation order
+ * differs, which is why the gate below compares with a bound and not for
+ * equality. */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
+static __m512bh qmat_bf16_narrow32(const float *x) {
+    union { __m256bh bh; __m256i i; } lo, hi;
+    union { __m512i i; __m512bh bh; } out;
+    lo.bh = _mm512_cvtneps_pbh(_mm512_loadu_ps(x));
+    hi.bh = _mm512_cvtneps_pbh(_mm512_loadu_ps(x + 16));
+    out.i = _mm512_inserti64x4(_mm512_castsi256_si512(lo.i), hi.i, 1);
+    return out.bh;
+}
+
+/* Four activations per weight row -- the same shape as the AVX2 and NEON
+ * kernels, for the same reason: ONE kernel for every batch width, so a row's
+ * answer never depends on how many requests shared the worker. */
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
+static void matvec_bf16_dpbf16_x4(float *o0, float *o1, float *o2, float *o3,
+                                  const float *x0, const float *x1,
+                                  const float *x2, const float *x3,
+                                  const uint16_t *weights, const float *bias,
+                                  size_t rows, size_t cols) {
+    for (size_t row = 0; row < rows; ++row) {
+        const uint16_t *w = weights + row * cols;
+        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+        __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+        size_t j = 0;
+        for (; j + 32u <= cols; j += 32u) {
+            const __m512bh wv = qmat_bf16_load32(w + j);
+            a0 = _mm512_dpbf16_ps(a0, wv, qmat_bf16_narrow32(x0 + j));
+            a1 = _mm512_dpbf16_ps(a1, wv, qmat_bf16_narrow32(x1 + j));
+            a2 = _mm512_dpbf16_ps(a2, wv, qmat_bf16_narrow32(x2 + j));
+            a3 = _mm512_dpbf16_ps(a3, wv, qmat_bf16_narrow32(x3 + j));
+        }
+        float s0 = _mm512_reduce_add_ps(a0), s1 = _mm512_reduce_add_ps(a1);
+        float s2 = _mm512_reduce_add_ps(a2), s3 = _mm512_reduce_add_ps(a3);
+        for (; j < cols; ++j) {
+            const float wv = qmat_bf16_to_f32(w[j]);
+            s0 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x0[j]));
+            s1 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x1[j]));
+            s2 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x2[j]));
+            s3 += wv * qmat_bf16_to_f32(qmat_bf16_from_f32(x3[j]));
+        }
+        const float bv = (bias == NULL) ? 0.0f : bias[row];
+        o0[row] = s0 + bv; o1[row] = s1 + bv;
+        o2[row] = s2 + bv; o3[row] = s3 + bv;
+    }
+}
+
+/* The prove-on-first-use gate. 200 columns: six full 32-blocks and an 8-wide
+ * tail, so both halves of the kernel run. The data is positive-biased on
+ * purpose -- a sum that cancels would make a relative bound meaningless, and
+ * this bound has to mean something. */
+static int qmat_bf16_dpbf16_verify(void) {
+    enum { R = 5, C = 200 };
+    static float x[C], want[R], got[R];
+    static uint16_t w[R * C];
+    for (size_t j = 0; j < (size_t)C; ++j)
+        x[j] = 0.75f + 0.25f * (float)((j * 7u) % 11u) / 11.0f;
+    for (size_t i = 0; i < (size_t)(R * C); ++i)
+        w[i] = qmat_bf16_from_f32(0.5f + 0.5f * (float)((i * 13u) % 17u) / 17.0f);
+    matvec_bf16_scalar(want, x, w, NULL, R, C);
+    matvec_bf16_dpbf16_x4(got, got, got, got, x, x, x, x, w, NULL, R, C);
+    /* Same products, different summation order, f32 accumulator: the bound is
+     * C*FLT_EPSILON with headroom, derived the way the block-split check is. */
+    const float bound = 8.0f * (float)C * FLT_EPSILON;
+    for (size_t i = 0; i < (size_t)R; ++i) {
+        const float denom = fabsf(want[i]) > 1.0e-3f ? fabsf(want[i]) : 1.0e-3f;
+        if (fabsf(want[i] - got[i]) / denom > bound) return 0;
+    }
+    return 1;
+}
+
+static int qmat_bf16_dpbf16_ok(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int bw = 0, bf16 = 0;
+        qmat_x86_avx512_probe(&bw, &bf16);
+        const char *env = getenv("MYNAH_QMAT_BF16DOT");
+        if (env != NULL && (strcmp(env, "off") == 0 || strcmp(env, "0") == 0)) bf16 = 0;
+        cached = (bf16 && qmat_bf16_dpbf16_verify()) ? 1 : 0;
+    }
+    return cached;
+}
 #endif /* MYNAH_QMAT_BF16_X86 */
 
 #if defined(MYNAH_QMAT_F16_X86)
@@ -2825,6 +3045,11 @@ static void matvec_bf16(float *out, const float *x, const uint16_t *weights,
     if (qmat_bf16_unit()) {
         /* Same discipline as the ARM side: one activation takes the x4 kernel
          * with itself repeated, so width never changes a row's answer. */
+        if (qmat_bf16_dpbf16_ok()) {
+            matvec_bf16_dpbf16_x4(out, out, out, out, x, x, x, x, weights, bias,
+                                  rows, cols);
+            return;
+        }
         matvec_bf16_avx2_x4(out, out, out, out, x, x, x, x, weights, bias,
                             rows, cols);
         return;
@@ -6199,7 +6424,21 @@ const char *mynah_qmat_int8_kernel(const char **why) {
         *why = "[predicate] src/qmat.c matvec_q8: ARM SDOT (vdotq_s32), four "
                "weight rows in flight per activation load";
     return "neon-sdot";
-#elif defined(MYNAH_QMAT_AVX2)
+#else
+#if defined(MYNAH_QMAT_X86_AVX512)
+    if (qmat_int8_avx512bw_ok()) {
+        if (why != NULL)
+            *why = "[predicate] src/qmat.c dot_q8_i32_avx512bw: no usable "
+                   "VPDPBUSD on this CPU, but it has AVX-512 F/BW/VL, so the "
+                   "int8 dot is the 512-bit widen-then-madd pair "
+                   "(_mm512_cvtepi8_epi16 + _mm512_madd_epi16) -- twice the "
+                   "width of the AVX2 form. RESOLVED means it was EXECUTED in "
+                   "this process and agreed bit-for-bit with the scalar "
+                   "reference; a CPUID bit alone does not promote it";
+        return "avx512bw";
+    }
+#endif
+#if defined(MYNAH_QMAT_AVX2)
     if (why != NULL)
         *why = "[predicate] src/qmat.c dot_q8_i32_avx2: no usable VPDPBUSD on "
                "this CPU, so the int8 dot is the AVX2 widen-then-madd pair "
@@ -6210,7 +6449,8 @@ const char *mynah_qmat_int8_kernel(const char **why) {
         *why = "[predicate] src/qmat.c: scalar int32 accumulation, the "
                "correctness reference";
     return "scalar";
-#endif
+#endif  /* MYNAH_QMAT_AVX2 */
+#endif  /* MYNAH_QMAT_DOTPROD */
 }
 
 /* The canonical epilogue, exported.  It is the same inline pair every kernel
@@ -6493,18 +6733,107 @@ int mynah_qmat_bf16_enabled(const char **why) {
                     "off), so a bf16 weight runs the scalar reference";
     }
     return on;
+#elif defined(MYNAH_QMAT_BF16_X86)
+    /* THREE TIERS ON x86 NOW, and the row has to distinguish them or it is
+     * worse than useless: "bf16 is on" would cover a VDPBF16PS host and an
+     * AVX2-widening host, which differ by the whole point of the encoding. */
+    {
+        const int on = qmat_bf16_unit();
+        if (why != NULL) {
+            if (on && qmat_bf16_dpbf16_ok())
+                *why = "[predicate] src/qmat.c matvec_bf16_dpbf16_x4: VDPBF16PS "
+                       "(_mm512_dpbf16_ps), thirty-two MACs per instruction, "
+                       "accumulating in f32. RESOLVED means it was EXECUTED in "
+                       "this process and agreed with matvec_bf16_scalar inside "
+                       "C*FLT_EPSILON -- a CPUID bit alone does not promote it "
+                       "(.work/x86-kernel-tiers.md)";
+            else if (on)
+                *why = "[predicate] src/qmat.c matvec_bf16_avx2_x4: no usable "
+                       "AVX512-BF16 here, so bf16 is WIDENED to f32 and "
+                       "multiplied -- and the widening is free, a bf16 is the "
+                       "top sixteen bits of its f32 (_mm256_slli_epi32), where "
+                       "the f16 path must run vcvtph_ps. Correct and half the "
+                       "arithmetic of VDPBF16PS";
+            else
+                *why = "[predicate] src/qmat.c: this CPU reports no AVX2/FMA "
+                       "(or MYNAH_QMAT_BF16 turned it off), so a bf16 weight "
+                       "runs the scalar reference. The weights are still half "
+                       "the bytes of f32";
+        }
+        return on;
+    }
 #else
     if (why != NULL)
-        *why = "[predicate] src/qmat.c: no BFDOT kernel compiled for this "
+        *why = "[predicate] src/qmat.c: no bf16 kernel compiled for this "
                "target. bf16 WEIGHTS still work here -- they are half the bytes "
                "of f32 and the scalar kernel multiplies them correctly -- but "
-               "the arithmetic is scalar. The x86 VDPBF16PS kernel is unwritten; "
-               ".work/bf16-native-weights.md says what it has to solve";
+               "the arithmetic is scalar";
     return 0;
 #endif
 }
 
 static int probe_bf16(const char **why) { return mynah_qmat_bf16_enabled(why); }
+
+/* E14-2/E14-3. The AVX-512 rows are answered by the kernels that reach them,
+ * not by CFLAGS. Both predicates report the PROVE-ON-FIRST-USE result: ON means
+ * the kernel ran in this process and agreed with the scalar reference, so a
+ * `supported=yes, resolved=OFF` pair is either a missing unit or a kernel that
+ * failed its own check -- and the reason says which. */
+static int probe_avx512bw_int8(const char **why) {
+#if defined(MYNAH_QMAT_X86_AVX512)
+    const int on = qmat_int8_avx512bw_ok();
+    if (why != NULL) {
+        int bw = 0, bf = 0;
+        qmat_x86_avx512_probe(&bw, &bf);
+        *why = on ? "[predicate] src/qmat.c dot_q8_i32_avx512bw: the int8 dot "
+                    "for a host with 512-bit registers and NO VPDPBUSD "
+                    "(Skylake-SP, Cascade Lake, Zen 3). Executed against the "
+                    "scalar reference in this process and bit-identical"
+                  : (bw ? "[predicate] the CPU has AVX-512 F/BW/VL but the "
+                          "kernel DISAGREED with the scalar reference, or "
+                          "MYNAH_QMAT_AVX512 turned it off. The AVX2 int8 dot "
+                          "is running instead -- this is the gate working"
+                        : "[predicate] this CPU has no usable AVX-512 F/BW/VL "
+                          "(or the OS has not enabled ZMM state), so the int8 "
+                          "dot is the AVX2 or scalar form");
+    }
+    return on;
+#else
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c: not an x86 target, or a compiler too "
+               "old for the target attribute (GCC < 11)";
+    return 0;
+#endif
+}
+
+static int probe_avx512bf16(const char **why) {
+#if defined(MYNAH_QMAT_BF16_X86) && defined(MYNAH_QMAT_X86_AVX512)
+    const int on = qmat_bf16_dpbf16_ok();
+    if (why != NULL) {
+        int bw = 0, bf = 0;
+        qmat_x86_avx512_probe(&bw, &bf);
+        *why = on ? "[predicate] src/qmat.c matvec_bf16_dpbf16_x4: VDPBF16PS, "
+                    "thirty-two MACs per instruction. Executed against "
+                    "matvec_bf16_scalar in this process and inside "
+                    "C*FLT_EPSILON. NOT MEASURED: no speed claim has been made "
+                    "from this kernel"
+                  : (bf ? "[predicate] the CPU has AVX512-BF16 but the kernel "
+                          "DISAGREED with matvec_bf16_scalar, or "
+                          "MYNAH_QMAT_BF16DOT turned it off. The AVX2 widening "
+                          "kernel is running instead -- this is the gate "
+                          "working, and it is a bug worth reporting"
+                        : "[predicate] this CPU has no AVX512-BF16 (Cooper "
+                          "Lake, Sapphire Rapids and Zen 4 onward have it), so "
+                          "bf16 is widened to f32 and multiplied -- correct, "
+                          "and half the arithmetic");
+    }
+    return on;
+#else
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c: no VDPBF16PS kernel on this target";
+    return 0;
+#endif
+}
 
 void mynah_qmat_dispatch_probes(void) {
     mynah_dispatch_register_probe("isa.arm.bf16", probe_bf16);
@@ -6512,6 +6841,9 @@ void mynah_qmat_dispatch_probes(void) {
     mynah_dispatch_register_probe("quant.argmax_mt", probe_argmax_mt);
     mynah_dispatch_register_probe("isa.x86.avx512vnni", probe_avx512vnni);
     mynah_dispatch_register_probe("isa.x86.avxvnni", probe_avxvnni);
+    mynah_dispatch_register_probe("isa.x86.avx512f", probe_avx512bw_int8);
+    mynah_dispatch_register_probe("isa.x86.avx512bw", probe_avx512bw_int8);
+    mynah_dispatch_register_probe("isa.x86.avx512bf16", probe_avx512bf16);
     mynah_dispatch_register_probe("isa.arm.i8mm", probe_i8mm);
     mynah_dispatch_register_probe("kernel.fused_greedy", probe_fused_greedy);
     mynah_dispatch_register_value_probe("quant.requested", probe_quant_type);
