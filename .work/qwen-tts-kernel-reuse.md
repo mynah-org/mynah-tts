@@ -109,3 +109,67 @@ look for it: the report already tells us which side of the line we are on.
 
 Neither project has any SVE kernel (`grep -c svfloat32_t` is 0 on both), so the
 idle SVE units on Neoverse-V2 are an open question in both trees.
+
+---
+
+## Second sweep, 2026-09-22: the TOOLS, which is where the rest of it was
+
+The first sweep looked at kernels. The better material was next door in
+`tools/`, and two items there target exactly the defects the Genoa box found.
+
+### Taken: `dispatch_gate.py` (landed the same day)
+
+qwen's version exists because of an AVX-512-BF16 prefill bug that cost it about
+400 ms of TTFA on a c8a.4xlarge, and its expectation file says so in a comment.
+The shape it gates on -- *expected ON, compiled AND supported on this host,
+resolved OFF* -- is the shape Mynah produced twice this week and could not see.
+Ours is `tools/dispatch_gate.py` + `tools/dispatch_expect.json`, wired into
+`make test`, with a six-case negative control that caught a bug in the gate on
+its first run.
+
+Ours differs in one way worth keeping: **idle hardware is reported, not
+failed.** A unit we have no kernel for is a roadmap item; qwen's table has no
+equivalent because its `NOT-IMPLEMENTED` rows are fewer.
+
+### NOT taken yet, and it is the best remaining idea: `flag_parity.py`
+
+It derives, from the preprocessor guards around every env-var READ SITE plus one
+call hop, which backend families can actually reach each flag -- then emits
+`qwen_flag_scope.h`, a table of flag -> scope bitmask, and flags the
+disagreements with the documentation. Its origin is a flag that *parsed and did
+nothing* on ARM: `QWEN_NO_SIMD_QUANT` existed, looked like a feature, and the
+NEON path never consulted it.
+
+Mynah has that problem now and did not last week. This week added
+`MYNAH_KERNELS_X86`, `MYNAH_QMAT_AVX512` and `MYNAH_QMAT_BF16DOT`, all three
+x86-only, next to `MYNAH_QMAT_I8MM` and `MYNAH_QMAT_BF16`, both Arm-only, and
+nothing anywhere states which is which. Setting `MYNAH_QMAT_BF16DOT=off` on
+Graviton is silence -- not an error, not a warning, not a row.
+
+The dispatch map covers the flags that have a ROW (it prints `env` and
+`env_value` per row, which is better than a static table because it is the
+running process). It says nothing about the ones that do not, and there are
+many: a first count finds 30+ `MYNAH_*` names in `src/` and `server/`.
+
+**Recommended shape, adapted rather than copied:** do not generate a header.
+Generate a *test* -- `tests/test_flag_scope.py` -- that walks the read sites,
+derives the scope, and fails when a flag documented for one architecture is
+only reachable on another. A header that nothing reads would be a second thing
+to keep in sync; a test that fails is the thing this repo already trusts.
+
+### Looked at and deliberately not taken
+
+| tool | why not |
+|---|---|
+| `backend_matrix.py` | Mynah's `configs/perf/*.json` + `serving_profile.py --profile` already refuses a run whose world disagrees, which is the same guarantee at the level that matters here |
+| `census_report.py`, `costmap_*` | Mynah has `census`, `costmap.c` and `MYNAH_COST_MAP` already |
+| `check_plan.py`, `check_repo_integrity.py` | governance for a repo with several agents; this one has `PLAN.md` as a board and a human |
+| `cpu_qualify.py`, `doctor_wave.py` | `make doctor` covers the static half and refuses to predict a concurrency it has not soaked, which is the stricter behaviour |
+| `box_info.sh`, `box_sync.sh` | scp and a git clone, which is what we do |
+
+### The kernel conclusion is unchanged after the second sweep
+
+VDPBF16PS and the AVX-512BW int8 dot were the two worth taking and both are in.
+AMX stays out on a measurement (E12: the weight pass is 5% of the step at B=8),
+not on effort. KleidiAI stays out as a dependency decision. Neither project has
+an SVE kernel.

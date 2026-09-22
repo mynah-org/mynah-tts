@@ -1195,9 +1195,30 @@ alone does not promote a kernel.
       smaller version of E4-9: `SG_LANES` reaches the packed panel geometry and the
       public `mynah_sgemm_narrow_max`, so multi-versioning makes the LAYOUT a runtime
       choice. Two translation units at different `-m` flags, scalar kept as reference
-- [ ] E14-5 **none of the above may be quoted as a speedup** until a box runs them. The
-      win being claimed here is that one artifact is both safe on an old CPU and fast on
-      a new one; the numbers are E4-9's "Linux measurement box", still open
+- [x] E14-5 **measured on an EPYC 9254 (Genoa, Zen 4), 2026-09-22** →
+      [`.work/x86-genoa-first-numbers.md`](.work/x86-genoa-first-numbers.md). From ONE
+      `SIMD=portable` binary: f32 matvec **2.26x** and **sgemm 4.44x** over the scalar
+      forms the same binary would have run last week, and it reaches VNNI and VDPBF16PS
+      with no build flag. int8 tiers `avx512vnni 0.049 / avx512bw 0.088 / avx2 0.111 ms`;
+      bf16 `vdpbf16ps 0.161 / avx2-widen 0.479`. **Kernel micro-bench, not an RTF** —
+      E12 put the weight pass at 5% of the AR step at B=8, so none of this is a synthesis
+      speedup and none may be quoted as one
+- [x] E14-6 **the x86 bf16 path was a PESSIMISATION and the bench found it** — one
+      activation went through the x4 kernel with itself in all four arguments, so four
+      `dpbf16` per weight load with three thrown away. Free on Arm (memory-bound at one
+      activation), 3x on Zen 4. An x1 form of both x86 bf16 kernels: **0.489 → 0.161 ms**,
+      bit-identical to lane 0 of the x4 so width still cannot change a row's answer
+- [x] E14-7 **`make kernel-bench` and `make dispatch-gate`** — shapes without weights, so
+      a rented box can be measured in its first five minutes; and the first thing that
+      ever checked the dispatch report, which is the document this project relies on most
+      and verified least → [`.work/qwen-tts-kernel-reuse.md`](.work/qwen-tts-kernel-reuse.md)
+- [ ] E14-8 **which env flags can reach which backend — nothing says** → the one idea from
+      `../qwen-tts` still untaken (`flag_parity.py`). This week added three x86-only flags
+      beside two Arm-only ones; `MYNAH_QMAT_BF16DOT=off` on Graviton is silence. Build it
+      as a TEST that walks the read sites, not as a generated header nothing reads
+- [ ] E14-9 **no model pack on the x86 box, so no RTF and no serving wave.** Everything
+      above is kernels and reports. One hour with the pack on that machine turns it into a
+      product number, and E4-9's "Linux measurement box" is the item it closes
 
 ### E13 — The ceiling is 128 request slots, not a speed limit → [`.work/int8-backbone.md`](.work/int8-backbone.md)
 
