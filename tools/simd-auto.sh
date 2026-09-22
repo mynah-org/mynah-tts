@@ -14,6 +14,13 @@
 # Either alone is a guess — a new kernel on an old gcc, or a new gcc on an old
 # CPU, both produce a binary that does not run.
 #
+# WHAT "runtime" MEANS IN THE detected LIST.  A feature marked `(runtime)` is
+# NOT passed as a build flag and is NOT compiled in: the kernel that uses it
+# carries its own target attribute and a CPUID probe, so the binary stays
+# portable and picks it up on a host that has it.  `--dispatch-map` is where to
+# read whether it actually resolved in a given process; this script only says
+# the unit is there and that something in src/ knows how to reach it.
+#
 # WHAT IT DOES NOT DO.  It does not pass -mavx512f/-mavx512bw/-mavx512vl even
 # when the host has them.  No f32 kernel in src/ dispatches on AVX-512 (see the
 # isa.x86.avx512f row in src/dispatch.c), so the only effect would be to widen
@@ -150,15 +157,21 @@ x86_64|amd64|i386|i686)
         add_rejected "f16c:absent-in-cpuinfo"
     fi
 
-    # Reported, deliberately not turned into build flags.  See the header:
-    # these are either runtime-dispatched already or have no kernel at all, and
-    # a flag that implies neither is how a false ISA claim gets made.
-    has_flag avx512f      && add_rejected "avx512f:no-kernel-dispatches-on-it"
-    has_flag avx512bw     && add_rejected "avx512bw:no-kernel-dispatches-on-it"
-    has_flag avx512vl     && add_rejected "avx512vl:no-kernel-dispatches-on-it"
+    # Reported, deliberately not turned into build flags -- but the reason is
+    # now "already runtime-dispatched", not "nothing reaches it".
+    #
+    # These three read `no-kernel-dispatches-on-it` until E14, and an EPYC 9254
+    # printed that line on 2026-09-22 while the very same binary was executing
+    # dot_q8_i32_avx512bw and matvec_bf16_dpbf16_x4 on it. A resolver that
+    # tells an operator their AVX-512 is unused, on a host where two kernels
+    # are using it, is worse than silent: it is the sentence someone quotes
+    # when choosing an instance type.
+    has_flag avx512f      && add_detected "avx512f(runtime)"
+    has_flag avx512bw     && add_detected "avx512bw(runtime)"
+    has_flag avx512vl     && add_detected "avx512vl(runtime)"
     has_flag avx512_vnni  && add_detected "avx512_vnni(runtime)"
     has_flag avx_vnni     && add_detected "avx_vnni(runtime)"
-    has_flag avx512_bf16  && add_rejected "avx512_bf16:NOT-IMPLEMENTED"
+    has_flag avx512_bf16  && add_detected "avx512_bf16(runtime)"
     has_flag amx_int8     && add_rejected "amx_int8:NOT-IMPLEMENTED"
     has_flag amx_bf16     && add_rejected "amx_bf16:NOT-IMPLEMENTED"
 

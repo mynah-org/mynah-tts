@@ -50,8 +50,12 @@ o=$(resolve x86-zen5-epyc.txt x86_64)
 expect_exact "zen5/flags"     "$o" SIMD_AUTO_FLAGS    "-mavx2 -mfma -mf16c"
 expect_exact "zen5/profile"   "$o" SIMD_AUTO_NAME     "x86-64/avx2+fma+vnni512"
 expect      "zen5/vnni"       "$o" SIMD_AUTO_DETECTED "avx512_vnni(runtime)"
-expect      "zen5/avx512-not-a-flag" "$o" SIMD_AUTO_REJECTED "avx512f:no-kernel-dispatches-on-it"
-expect      "zen5/bf16-absent"       "$o" SIMD_AUTO_REJECTED "avx512_bf16:NOT-IMPLEMENTED"
+# E14: these two used to assert the OPPOSITE, and the assertions were correct
+# until kernels reached those units. A test that pins a stale claim is how the
+# claim survives -- so they now pin that avx512f and avx512_bf16 are REPORTED AS
+# REACHABLE, and still not turned into build flags (the flags check below).
+expect      "zen5/avx512-runtime"    "$o" SIMD_AUTO_DETECTED "avx512f(runtime)"
+expect      "zen5/bf16-runtime"      "$o" SIMD_AUTO_DETECTED "avx512_bf16(runtime)"
 
 # ---- Sapphire Rapids: AMX is detected and deliberately not used.  Their AMX
 # 8-core host qualified C2 while the VNNI 32-core did C12; AMX is E4-7, last.
