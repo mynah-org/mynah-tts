@@ -176,6 +176,26 @@ One more thing that check caught first: it reported the baseline as differing
 from ITSELF, because `pool.spin` is a measured per-host calibration and moves
 between two runs of the same binary. Excluded, with the reason written down.
 
+### The sanitisers over a real synthesis, with the new instructions executing
+
+`make asan` and `make ubsan` both clean, and then each binary run over a real
+40-step Pocket synthesis on real weights: no leak, no UB, the WAV written, and
+the two sanitiser builds **byte-identical to each other**.
+
+Which matters because of what the dispatch map says those builds resolved:
+
+    isa.x86.avx2        ON
+    isa.x86.avx512bf16  ON        <- VDPBF16PS
+    sgemm.kernel        avx2
+    quant.int8_kernel   avx512vnni <- VPDPBUSD
+
+A sanitiser build replaces CFLAGS entirely, so it carries no `-mavx2` and no
+`-mavx512*` -- and reaches all four through their target attributes anyway.
+**VPDPBUSD and VDPBF16PS have now been executed under ASan and UBSan on real
+weights**, which no machine in this project could do before today and which CI
+cannot do at all: its runners are heterogeneous and none is guaranteed to have
+either unit.
+
 ### Still not done
 
 No RTF and no serving wave, on purpose: the box is busy and a number taken
