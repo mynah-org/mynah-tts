@@ -194,6 +194,14 @@ ifeq ($(CC_TARGET_X86),0)
 sgemm_objects = $(1)/src/sgemm.o
 else
 sgemm_objects = $(1)/src/sgemm_base.o $(1)/src/sgemm_avx2.o
+# AND THE C IS TOLD, rather than deducing it a second way.  src/sgemm_rt.c used
+# to key its dispatcher on `#if defined(__x86_64__)` while this Makefile decided
+# with CC_TARGET_X86 -- two conditions for one question, and they disagreed the
+# moment the SIMD=scalar carve-out above was added: no variants were built and
+# the dispatcher still referenced them.  CI caught it on `link-only: x86
+# SIMD=scalar` with four undefined references.  Now the build that creates the
+# variants is the build that switches the dispatcher on.
+CPPFLAGS += -DMYNAH_SGEMM_RUNTIME=1
 endif
 sgemm_object_list = $(filter-out $(1)/src/sgemm.o,$(2)) $(call sgemm_objects,$(1))
 

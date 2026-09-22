@@ -53,7 +53,12 @@ ar rcs "$OUT/libingot.a" "$OUT"/ingot/*.o
 
 # Two profiles, because the whole point is that they now differ at RUNTIME and
 # not at build time. portable must run here; avx2 must refuse to.
-for profile in portable avx2; do
+# THREE profiles, not two.  `scalar` is here because the SIMD=scalar carve-out
+# for the sgemm variants was added without ever being built on x86 -- this Mac
+# builds aarch64 scalar, where the question does not arise -- and CI found four
+# undefined references. A profile this harness does not build is a profile it
+# does not protect.
+for profile in portable avx2 scalar; do
     echo "== mynah-tts, x86_64, SIMD=$profile =="
     make --no-print-directory BUILD_DIR="$OUT/$profile" CC="$XCC" \
          SIMD="$profile" BLAS=none INGOT_LIB="$PWD/$OUT/libingot.a" \
@@ -96,6 +101,13 @@ if MYNAH_KERNELS_X86=scalar "$BIN" --self-test >/dev/null 2>&1; then
     say ok "MYNAH_KERNELS_X86=scalar is accepted and self-tests clean"
 else
     say FAIL "MYNAH_KERNELS_X86=scalar broke the self-test"
+fi
+
+echo "== scalar: it must build, link and run with every intrinsic compiled out =="
+if "$OUT/scalar/mynah-tts" --self-test >"$OUT/scalar.log" 2>&1; then
+    say ok "SIMD=scalar links and self-tests (one sgemm, no variants built)"
+else
+    say FAIL "SIMD=scalar: $(tail -3 "$OUT/scalar.log" | tr '\n' ' ')"
 fi
 
 echo "== avx2: it must REFUSE to start, with the guard's message =="

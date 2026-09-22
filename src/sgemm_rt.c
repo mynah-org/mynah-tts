@@ -31,7 +31,11 @@
 
 #include "sgemm.h"
 
-#if defined(__x86_64__) || defined(__i386__)
+/* MYNAH_SGEMM_RUNTIME is defined by the Makefile, by the same branch that
+ * builds the two variants -- deliberately not re-derived from __x86_64__ here.
+ * Two conditions for one question is how this file once referenced variants
+ * that had not been built (x86 SIMD=scalar, caught by CI on 2026-09-22). */
+#if defined(MYNAH_SGEMM_RUNTIME)
 
 #include "kernels.h"    /* mynah_kernels_x86_avx2 */
 
@@ -127,8 +131,10 @@ void mynah_sgemm_dispatch_probes(void) {
 
 #else
 
-/* Not x86: src/sgemm.c defines the public names itself and there is no variant
- * to choose.  This typedef exists only so the translation unit is not empty. */
+/* No variants were built -- not x86, or SIMD=scalar, where every intrinsic is
+ * compiled out and two identical scalar builds would be pointless.  src/sgemm.c
+ * defines the public names itself.  The typedef exists only so the translation
+ * unit is not empty, which -Wpedantic rejects. */
 typedef int mynah_sgemm_rt_not_needed_on_this_target;
 
 #endif
