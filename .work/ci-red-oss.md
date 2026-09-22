@@ -374,5 +374,18 @@ row prints its full sentence; all three workflow files parse.
 - [x] the cause fixed at the root (offline tool is not a build dependency)
 - [x] the gate is still real in CI, and cannot silently skip there
 - [x] a sanitizer workflow can no longer be red about anything but C
-- [ ] one green push on `main` to prove it — needs a push, which is never done
-      without asking
+- [x] one green push on `main` to prove it — `a62cfff`, **3/3 workflows, 30/30
+      jobs green** (Build & Test 22 + 1 skipped `release`, Memory Safety 4/4,
+      Code Quality 3/3)
+
+### Proven, and proven to be non-vacuous
+
+A green tick is only worth what it executed, so each claim was read out of the
+logs rather than inferred from the colour:
+
+| claim | evidence in run `35713724157` / `35713724210` / `35713724152` |
+|---|---|
+| the ternary gate RAN, it did not skip | `linux-x86_64` and `macos-arm64`, step *Full test target*: `python3 tools/ternary_feasibility.py self-test` → `all checks passed`. No `SKIP` line anywhere |
+| it runs where the skip cannot reach | Code Quality *Python tooling*: `Successfully installed numpy-2.2.6` → `all checks passed` |
+| the sanitizers run C and only C | UBSan (x86_64): `kernels: PASS`, `qmat: PASS` ×6 (the `MYNAH_QMAT_VNNI` levels), `simd-auto: PASS`. No Python gate in the log |
+| the two warnings are gone | grep for `warning:` on `linux-x86_64` returns nothing for `dispatch.c` or `json.c`; the rest of the pre-existing list is unchanged |

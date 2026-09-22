@@ -1284,8 +1284,8 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 
 ### Deferred
 
-- [~] **CI on the OSS repo — red since 2026-09-21, fixed locally, one push from
-  proven** → [`.work/ci-red-oss.md`](.work/ci-red-oss.md). Seven red jobs, one
+- [x] **CI on the OSS repo — green again on `a62cfff`, 3/3 workflows, 30/30
+  jobs** → [`.work/ci-red-oss.md`](.work/ci-red-oss.md). Seven red jobs, one
   cause: `ternary-test` made **numpy a hard dependency of `make test`** and no
   hosted runner has it. The tool skips loudly now instead of failing the build,
   CI installs numpy so the gate is not vacuous there, and `make ubsan`/`make
