@@ -700,10 +700,21 @@ static void collect_isa(row_sink *s) {
     add_absent(s, "isa.arm.bf16", cpu_has_bf16(),
                "[gate] NOT IMPLEMENTED (no predicate registered by "
                "src/kernels.c)");
-    add_gate(s, "isa.x86.avx2", MYNAH_DISPATCH_HAS_AVX2, cpu_has_avx2(),
-             "[gate] src/kernels.c AVX2 kernels and src/qmat.c "
-             "dot_q8_i32_avx2 (_mm256_cvtepi8_epi16 + _mm256_madd_epi16), the "
-             "int8 dot for every x86 CPU without VPDPBUSD");
+    /* NOT add_gate any more, and the change is the finding it used to hide.
+     * This row read `compiled no` on an x86 portable build and stopped
+     * there -- true, and it let a reader conclude the whole binary was
+     * scalar when src/qmat.c was still dispatching to VNNI/F16C at
+     * runtime. Since the f32 kernels grew their own runtime dispatch the
+     * compile flag decides nothing at all here, so the row is answered by
+     * src/kernels.c's predicate and carries the env that overrides it. */
+    add_row(s, "isa.x86.avx2", yn(MYNAH_DISPATCH_HAS_AVX2),
+            yn3(cpu_has_avx2()), "MYNAH_KERNELS_X86", onoff(MYNAH_DISPATCH_HAS_AVX2),
+            MYNAH_DISPATCH_SRC_GATE,
+            "[gate] src/kernels.c f32 kernels (RUNTIME-selected since the x86 "
+            "dispatch landed -- this row is normally answered by that "
+            "predicate) and src/qmat.c dot_q8_i32_avx2 "
+            "(_mm256_cvtepi8_epi16 + _mm256_madd_epi16), the int8 dot for "
+            "every x86 CPU without VPDPBUSD");
     add_gate(s, "isa.x86.fma", MYNAH_DISPATCH_HAS_FMA, cpu_has_fma(),
              "[gate] _mm256_fmadd_ps in the AVX2 dot/matvec; Makefile passes "
              "-mfma with -mavx2");

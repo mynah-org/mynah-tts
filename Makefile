@@ -190,7 +190,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -440,6 +440,13 @@ caps: $(TARGET)
 self-test: $(TARGET)
 	@$(TARGET) --self-test
 	@MYNAH_QMAT_VNNI=scalar $(TARGET) --self-test
+	@# The third run is the f32 half of the same argument. Since the x86 f32
+	@# kernels became runtime-selected, an x86 host runs AVX2 and NEVER the
+	@# scalar forms -- which are the numeric reference the AVX2 ones are
+	@# written against. MYNAH_KERNELS_X86=scalar forces them, so both halves
+	@# are executed on one machine. On aarch64 this is a no-op second run and
+	@# costs a second: NEON is compile-time and has no fallback to select.
+	@MYNAH_KERNELS_X86=scalar $(TARGET) --self-test
 
 # THE C GATES, and the only ones a sanitizer build can say anything about.
 # `make ubsan` and `make asan` run this target, not `test`: the rest of `test`
@@ -549,6 +556,16 @@ ternary-test:
 		echo "     not run: python3 tools/ternary_feasibility.py self-test"; \
 		echo "     enable:  python3 -m pip install numpy"; \
 	fi
+
+# x86 WITHOUT RENTING ONE. Cross-compiles for x86_64 on an Apple Silicon Mac
+# and EXECUTES the result under Rosetta 2 -- which emulates an x86-64 CPU with
+# no AVX2, i.e. exactly the old-x86 tier this project has no hardware for. It
+# proves the portable binary runs correctly there and that an AVX2 binary
+# refuses to start with the ISA guard's message instead of taking a SIGILL.
+# It proves nothing about performance: an emulator is not a measurement.
+# macOS-only; skips cleanly (exit 0) anywhere else.
+x86-cross:
+	@sh tests/x86_cross.sh
 
 serving-profile: serving-wave
 

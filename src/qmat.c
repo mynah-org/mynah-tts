@@ -6,6 +6,7 @@
 #include <pthread.h>
 
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -4508,17 +4509,27 @@ static int self_test_rows_blocked(int qtype, char *error, size_t error_capacity)
                                (size_t)N, (size_t)K, qtype, QMAT_U8_OFF};
     const int blocks = (int)(((size_t)N + QMAT_ROW_BLOCK - 1u) / QMAT_ROW_BLOCK);
     for (int b = 0; b < blocks; ++b) qmat_rows_block((void *)&job, b);
-    /* Compare with a tight tolerance rather than memcmp.  The split performs
+    /* Compare with a bounded tolerance rather than memcmp.  The split performs
      * the same arithmetic per row -- a wrong partition would offset weights or
      * scales and be off by a wide margin, which this still catches -- but the
      * build uses -ffast-math (and -mfma on x86), so the compiler may contract
      * or reassociate the final scale/bias differently for a block of 32 rows
-     * than for one call of 200, giving last-bit differences.  Bit-identical
-     * output was verified end-to-end on macOS/Accelerate; it is not something
-     * these flags guarantee across compilers. */
+     * than for one call of 200, giving last-bit differences.
+     *
+     * THE BOUND IS DERIVED, NOT PICKED.  It used to be a flat 1.0e-6, which is
+     * 30x TIGHTER than reassociating a K-term f32 sum is allowed to be: the
+     * worst case is K*FLT_EPSILON = 256 * 1.19e-7 = 3.05e-5.  It passed only
+     * because every compiler tried so far happened to reassociate both call
+     * shapes the same way.  x86-64 with no AVX2, built by clang -ffast-math and
+     * executed for the first time on 2026-09-22 (tests/x86_cross.sh, under
+     * Rosetta), reassociates them differently and lands at 1.03e-6 -- sixteen
+     * float ULP at this magnitude, and a FALSE FAILURE against the old number.
+     * Nothing is given up by deriving it: a wrong partition is an O(1) relative
+     * error, roughly thirty thousand times this bound. */
+    const float split_tolerance = (float)K * FLT_EPSILON;
     for (size_t i = 0; i < (size_t)N; ++i) {
         const float denom = fabsf(serial[i]) > 1.0e-3f ? fabsf(serial[i]) : 1.0e-3f;
-        if (fabsf(serial[i] - blocked[i]) / denom > 1.0e-6f) {
+        if (fabsf(serial[i] - blocked[i]) / denom > split_tolerance) {
             if (error != NULL && error_capacity > 0) {
                 snprintf(error, error_capacity,
                          "qmat %s blocked matvec differs from serial at row %zu"
@@ -6467,11 +6478,16 @@ int mynah_qmat_bf16_enabled(const char **why) {
 #if defined(MYNAH_QMAT_BF16_NEON)
     const int on = qmat_bf16_unit();
     if (why != NULL) {
-        *why = on ? "[predicate] src/qmat.c matvec_bf16_neon: BFDOT "
-                    "(vbfdotq_f32), two bf16 products per f32 lane -- eight MACs "
-                    "per instruction against the f16 path's four, accumulating "
-                    "in f32. Weights are kept bf16 in the cache in plain "
-                    "row-major, the same layout x86's VDPBF16PS will want"
+        *why = on ? "[predicate] src/qmat.c bf16: TWO kernels, and the batched "
+                    "one is the wide one. Single row -- matvec_bf16_neon, BFDOT "
+                    "(vbfdotq_f32), eight MACs per instruction against the f16 "
+                    "path's four. AT BATCH -- matvec_bf16_neon_tile, BFMMLA "
+                    "(vbfmmlaq_f32), SIXTEEN MACs per instruction over eight "
+                    "accumulators, which is what qmat_rows_job actually calls and "
+                    "is where the measured +33% at B=8 comes from. Reading this "
+                    "row as BFDOT-only understates the batched path by 2x. Both "
+                    "accumulate in f32; weights are kept bf16 in the cache in "
+                    "plain row-major, the same layout x86's VDPBF16PS will want"
                   : "[predicate] src/qmat.c compiled the BFDOT kernel, but this "
                     "CPU reports no FEAT_BF16 (or MYNAH_QMAT_BF16 turned it "
                     "off), so a bf16 weight runs the scalar reference";

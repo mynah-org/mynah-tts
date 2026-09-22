@@ -27,9 +27,22 @@ void mynah_gelu_f32_scalar(float *data, size_t n);
  * or because no vector kernel is compiled for this target. */
 int mynah_gelu_vector_enabled(void);
 
+/* Does this process run the AVX2/FMA f32 kernels?  1 on an x86 host that has
+ * the units and was not told otherwise, 0 on scalar/portable x86 and on every
+ * non-x86 target -- where it is 0 because the question does not arise: NEON is
+ * architecturally guaranteed on aarch64 and is chosen at compile time.
+ *
+ * MYNAH_KERNELS_X86=scalar forces the scalar half on a host that has AVX2, so
+ * the two implementations can be compared on one machine.  Memoised; safe to
+ * call anywhere, including from a hot loop. */
+int mynah_kernels_x86_avx2(void);
+
 /* tanh-approximation GELU, the form the Magpie conv-FFN and the PocketTTS
- * backbone both use.  Both forms now call mynah_tanh_f32 below, so the
- * elementwise and array spellings are the same arithmetic on every target.
+ * backbone both use.  Both forms go through the same vector tanh core as
+ * mynah_tanh_f32 below -- neon_tanh / avx2_tanh -- so the elementwise and
+ * array spellings are the same arithmetic on every target.  They do NOT
+ * call mynah_tanh_f32 itself, which this comment used to claim: the array
+ * form fuses the tanh into its own loop and never materialises it.
  * `scratch` is accepted and ignored: the vector tanh works in registers and
  * needs no staging buffer.  Callers may keep passing NULL. */
 float mynah_gelu_tanh(float x);

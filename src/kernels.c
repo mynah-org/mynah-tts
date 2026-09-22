@@ -27,17 +27,155 @@
 #define MYNAH_KERNELS_AVX2 1
 #endif
 
-float mynah_dot_f32(const float *a, const float *b, size_t n) {
-#if defined(MYNAH_KERNELS_NEON)
-    float32x4_t accumulator = vdupq_n_f32(0.0f);
-    size_t i = 0;
-    for (; i + 4u <= n; i += 4u) {
-        accumulator = vmlaq_f32(accumulator, vld1q_f32(a + i), vld1q_f32(b + i));
+/* =========================================================== x86 f32 KERNELS
+ *
+ * RUNTIME SELECTION, and the portability gap it closes.
+ *
+ * Until this block existed, every f32 kernel below was chosen by one
+ * `#elif defined(__AVX2__)` -- decided when the binary was built, never
+ * afterwards.  On aarch64 that is invisible and harmless: AdvSIMD is
+ * architecturally guaranteed on the architecture, so the compile-time choice
+ * is always the right one and there is nothing to dispatch.  On x86 it meant
+ * there was NO SINGLE BINARY THAT WAS BOTH SAFE ON AN OLD CPU AND FAST ON A
+ * NEW ONE:
+ *
+ *   SIMD=portable    f32 kernels scalar        ships anywhere, and slow
+ *   SIMD=avx2        f32 kernels AVX2          SIGILL on anything pre-Haswell
+ *   SIMD=auto        whatever the BUILD host had -- pins the artifact
+ *
+ * and the asymmetry was sharper than "x86 has no dispatch", because
+ * src/qmat.c DOES dispatch at runtime: on an x86 `portable` build the
+ * quantized kernels stayed vectorized through their target attributes while
+ * these -- layernorm, rmsnorm, matvec, dot, the ones the PocketTTS backbone
+ * actually calls -- silently ran scalar.  A reader of the dispatch map saw
+ * `isa.x86.avx2 compiled=no`, which was true and told them none of that.
+ *
+ * The fix is the pattern src/qmat.c already proves in this same tree, applied
+ * to the f32 half: one AVX2+FMA function per kernel carrying
+ * __attribute__((target("avx2,fma"))), the rest of the file left at the
+ * build's baseline, and __builtin_cpu_supports deciding once at runtime.  No
+ * Makefile flag changes, no new translation unit, and `SIMD=portable` now
+ * produces a binary that is safe on a 2008 CPU and full speed on a 2024 one.
+ *
+ * WHY THESE SEVEN AND NOT ALL 187 INTRINSIC SITES.  These are the f32 kernels
+ * the Pocket path calls (measured, not guessed: matvec_bias from
+ * engine_pocket.c, transformer_ar.c and flow_head.c; layernorm x4 and
+ * residual_add/axpy/dot from transformer_ar.c; rmsnorm from flow_head.c; dot
+ * from seanet.c).  The transcendental block further down -- gelu, tanh, sin,
+ * snake, exp -- is a second surface with its own accuracy contract and its own
+ * self-test, and mixing the two changes into one commit would make a numeric
+ * regression unattributable.  It is tracked, not forgotten.
+ *
+ * AXPY WAS NEVER VECTORIZED ON x86 AT ALL.  It had a NEON path and a scalar
+ * `#else`, so every x86 build ran it scalar however it was compiled.  That is
+ * fixed here rather than noted, because the fix is four lines inside a
+ * function that had to be touched anyway.
+ *
+ * TESTABILITY.  MYNAH_KERNELS_X86=scalar forces the scalar path on a host that
+ * has AVX2, which is what lets one machine compare the two implementations of
+ * the same arithmetic -- the same trick MYNAH_QMAT_VNNI=scalar plays for the
+ * unsigned int8 encoding, and for the same reason: an alternative that cannot
+ * be selected on the machine you have is an alternative that never gets run.
+ */
+#if !defined(MYNAH_DISABLE_SIMD) && (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11))
+#include <immintrin.h>
+#define MYNAH_KERNELS_X86_RT 1
+#endif
+
+#if defined(MYNAH_KERNELS_X86_RT)
+/* Memoised, so no probe ever runs inside a decode loop.  __builtin_cpu_supports
+ * is used here where src/qmat.c refused it for AVX-VNNI: the objection there
+ * was that GCC did not learn the `avxvnni` name until 11, which is not true of
+ * avx2 or fma.  __builtin_cpu_init() first, because this may be the first
+ * consumer in the process. */
+int mynah_kernels_x86_avx2(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *request = getenv("MYNAH_KERNELS_X86");
+        const int forced_scalar = request != NULL &&
+                                  (strcmp(request, "scalar") == 0 ||
+                                   strcmp(request, "off") == 0);
+        __builtin_cpu_init();
+        cached = (!forced_scalar &&
+                  __builtin_cpu_supports("avx2") &&
+                  __builtin_cpu_supports("fma")) ? 1 : 0;
     }
-    float sum = vaddvq_f32(accumulator);
-    for (; i < n; ++i) sum += a[i] * b[i];
+    return cached;
+}
+#else
+int mynah_kernels_x86_avx2(void) { return 0; }
+#endif
+
+/* ------------------------------------------------------------ scalar forms
+ *
+ * Compiled on every target that is not NEON -- which is both x86 (as the
+ * fallback half of the dispatch above) and the scalar/portable builds where
+ * they are the only implementation.  They are not a rollback path: they are
+ * the numeric reference the AVX2 forms are tested against, so they are written
+ * plainly and are never "optimised to match". */
+#if !defined(MYNAH_KERNELS_NEON)
+static float dot_f32_scalar(const float *a, const float *b, size_t n) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) sum += a[i] * b[i];
     return sum;
-#elif defined(MYNAH_KERNELS_AVX2)
+}
+
+static void matvec_f32_scalar(const float *weights, const float *input,
+                              float *output, size_t rows, size_t cols) {
+    for (size_t row = 0; row < rows; ++row) {
+        output[row] = dot_f32_scalar(weights + row * cols, input, cols);
+    }
+}
+
+static void rmsnorm_f32_scalar(const float *input, const float *weight,
+                               float *output, size_t n, float epsilon) {
+    float mean_square = 0.0f;
+    for (size_t i = 0; i < n; ++i) mean_square += input[i] * input[i];
+    mean_square /= (float)n;
+    const float scale = 1.0f / sqrtf(mean_square + epsilon);
+    for (size_t i = 0; i < n; ++i) output[i] = input[i] * scale * weight[i];
+}
+
+static void layernorm_f32_scalar(const float *input, const float *weight,
+                                 const float *bias, float *output, size_t rows,
+                                 size_t width, float epsilon) {
+    for (size_t row = 0; row < rows; ++row) {
+        const float *x = input + row * width;
+        float *y = output + row * width;
+        float mean = 0.0f;
+        for (size_t i = 0; i < width; ++i) mean += x[i];
+        mean /= (float)width;
+        float variance = 0.0f;
+        for (size_t i = 0; i < width; ++i) {
+            const float d = x[i] - mean;
+            variance += d * d;
+        }
+        const float scale = 1.0f / sqrtf(variance / (float)width + epsilon);
+        for (size_t i = 0; i < width; ++i) {
+            y[i] = (x[i] - mean) * scale * weight[i] +
+                   (bias == NULL ? 0.0f : bias[i]);
+        }
+    }
+}
+
+static void residual_add_f32_scalar(float *output, const float *input, size_t n) {
+    for (size_t i = 0; i < n; ++i) output[i] += input[i];
+}
+#endif /* !MYNAH_KERNELS_NEON */
+
+/* -------------------------------------------------------------- AVX2 forms
+ *
+ * Each is a COMPLETE kernel, not a vector prologue: a function carrying
+ * target("avx2,fma") may not be inlined into the baseline caller, so a shared
+ * scalar tail would mean a call per row.  The arithmetic is byte-identical to
+ * what the old `#elif defined(MYNAH_KERNELS_AVX2)` branches emitted -- same
+ * lane order, same sequential horizontal sum -- so an existing SIMD=avx2 build
+ * produces the same numbers as before this change, which is the property the
+ * self-test pins. */
+#if defined(MYNAH_KERNELS_X86_RT)
+__attribute__((target("avx2,fma")))
+static float dot_f32_avx2(const float *a, const float *b, size_t n) {
     __m256 accumulator = _mm256_setzero_ps();
     size_t i = 0;
     for (; i + 8u <= n; i += 8u) {
@@ -49,40 +187,12 @@ float mynah_dot_f32(const float *a, const float *b, size_t n) {
                 partial[4] + partial[5] + partial[6] + partial[7];
     for (; i < n; ++i) sum += a[i] * b[i];
     return sum;
-#else
-    float sum = 0.0f;
-    for (size_t i = 0; i < n; ++i) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-#endif
 }
 
-void mynah_matvec_f32(const float *weights, const float *input, float *output,
-                      size_t rows, size_t cols) {
+__attribute__((target("avx2,fma")))
+static void matvec_f32_avx2(const float *weights, const float *input,
+                            float *output, size_t rows, size_t cols) {
     size_t row = 0;
-#if defined(MYNAH_KERNELS_NEON)
-    for (; row + 1u < rows; row += 2u) {
-        const float *w0 = weights + row * cols;
-        const float *w1 = w0 + cols;
-        float32x4_t a0 = vdupq_n_f32(0.0f);
-        float32x4_t a1 = vdupq_n_f32(0.0f);
-        size_t i = 0;
-        for (; i + 4u <= cols; i += 4u) {
-            float32x4_t x = vld1q_f32(input + i);
-            a0 = vmlaq_f32(a0, vld1q_f32(w0 + i), x);
-            a1 = vmlaq_f32(a1, vld1q_f32(w1 + i), x);
-        }
-        float s0 = vaddvq_f32(a0);
-        float s1 = vaddvq_f32(a1);
-        for (; i < cols; ++i) {
-            s0 += w0[i] * input[i];
-            s1 += w1[i] * input[i];
-        }
-        output[row] = s0;
-        output[row + 1u] = s1;
-    }
-#elif defined(MYNAH_KERNELS_AVX2)
     for (; row + 1u < rows; row += 2u) {
         const float *w0 = weights + row * cols;
         const float *w1 = w0 + cols;
@@ -109,10 +219,139 @@ void mynah_matvec_f32(const float *weights, const float *input, float *output,
         output[row] = s0;
         output[row + 1u] = s1;
     }
+    for (; row < rows; ++row) {
+        output[row] = dot_f32_avx2(weights + row * cols, input, cols);
+    }
+}
+
+__attribute__((target("avx2,fma")))
+static void rmsnorm_f32_avx2(const float *input, const float *weight,
+                             float *output, size_t n, float epsilon) {
+    float mean_square = 0.0f;
+    size_t i = 0;
+    __m256 sum = _mm256_setzero_ps();
+    for (; i + 8u <= n; i += 8u) {
+        const __m256 x = _mm256_loadu_ps(input + i);
+        sum = _mm256_fmadd_ps(x, x, sum);
+    }
+    float lanes[8];
+    _mm256_storeu_ps(lanes, sum);
+    for (size_t lane = 0; lane < 8u; ++lane) mean_square += lanes[lane];
+    for (; i < n; ++i) mean_square += input[i] * input[i];
+    mean_square /= (float)n;
+    const float scale = 1.0f / sqrtf(mean_square + epsilon);
+    i = 0;
+    const __m256 vscale = _mm256_set1_ps(scale);
+    for (; i + 8u <= n; i += 8u) {
+        const __m256 x = _mm256_loadu_ps(input + i);
+        const __m256 w = _mm256_loadu_ps(weight + i);
+        _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_mul_ps(x, vscale), w));
+    }
+    for (; i < n; ++i) output[i] = input[i] * scale * weight[i];
+}
+
+__attribute__((target("avx2,fma")))
+static void layernorm_f32_avx2(const float *input, const float *weight,
+                               const float *bias, float *output, size_t rows,
+                               size_t width, float epsilon) {
+    for (size_t row = 0; row < rows; ++row) {
+        const float *x = input + row * width;
+        float *y = output + row * width;
+        float mean = 0.0f;
+        for (size_t i = 0; i < width; ++i) mean += x[i];
+        mean /= (float)width;
+        float variance = 0.0f;
+        size_t i = 0;
+        __m256 sum = _mm256_setzero_ps();
+        const __m256 vmean = _mm256_set1_ps(mean);
+        for (; i + 8u <= width; i += 8u) {
+            const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), vmean);
+            sum = _mm256_fmadd_ps(d, d, sum);
+        }
+        float lanes[8];
+        _mm256_storeu_ps(lanes, sum);
+        for (size_t lane = 0; lane < 8u; ++lane) variance += lanes[lane];
+        for (; i < width; ++i) {
+            const float d = x[i] - mean;
+            variance += d * d;
+        }
+        const float scale = 1.0f / sqrtf(variance / (float)width + epsilon);
+        i = 0;
+        const __m256 vscale = _mm256_set1_ps(scale);
+        for (; i + 8u <= width; i += 8u) {
+            const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), vmean);
+            __m256 z = _mm256_mul_ps(_mm256_mul_ps(d, vscale), _mm256_loadu_ps(weight + i));
+            if (bias != NULL) z = _mm256_add_ps(z, _mm256_loadu_ps(bias + i));
+            _mm256_storeu_ps(y + i, z);
+        }
+        for (; i < width; ++i) {
+            y[i] = (x[i] - mean) * scale * weight[i] +
+                   (bias == NULL ? 0.0f : bias[i]);
+        }
+    }
+}
+
+__attribute__((target("avx2,fma")))
+static void residual_add_f32_avx2(float *output, const float *input, size_t n) {
+    size_t i = 0;
+    for (; i + 8u <= n; i += 8u)
+        _mm256_storeu_ps(output + i, _mm256_add_ps(_mm256_loadu_ps(output + i),
+                                                   _mm256_loadu_ps(input + i)));
+    for (; i < n; ++i) output[i] += input[i];
+}
+#endif /* MYNAH_KERNELS_X86_RT */
+
+float mynah_dot_f32(const float *a, const float *b, size_t n) {
+#if defined(MYNAH_KERNELS_NEON)
+    float32x4_t accumulator = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 4u <= n; i += 4u) {
+        accumulator = vmlaq_f32(accumulator, vld1q_f32(a + i), vld1q_f32(b + i));
+    }
+    float sum = vaddvq_f32(accumulator);
+    for (; i < n; ++i) sum += a[i] * b[i];
+    return sum;
+#elif defined(MYNAH_KERNELS_X86_RT)
+    return mynah_kernels_x86_avx2() ? dot_f32_avx2(a, b, n)
+                                    : dot_f32_scalar(a, b, n);
+#else
+    return dot_f32_scalar(a, b, n);
 #endif
+}
+
+void mynah_matvec_f32(const float *weights, const float *input, float *output,
+                      size_t rows, size_t cols) {
+#if defined(MYNAH_KERNELS_NEON)
+    size_t row = 0;
+    for (; row + 1u < rows; row += 2u) {
+        const float *w0 = weights + row * cols;
+        const float *w1 = w0 + cols;
+        float32x4_t a0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = vdupq_n_f32(0.0f);
+        size_t i = 0;
+        for (; i + 4u <= cols; i += 4u) {
+            float32x4_t x = vld1q_f32(input + i);
+            a0 = vmlaq_f32(a0, vld1q_f32(w0 + i), x);
+            a1 = vmlaq_f32(a1, vld1q_f32(w1 + i), x);
+        }
+        float s0 = vaddvq_f32(a0);
+        float s1 = vaddvq_f32(a1);
+        for (; i < cols; ++i) {
+            s0 += w0[i] * input[i];
+            s1 += w1[i] * input[i];
+        }
+        output[row] = s0;
+        output[row + 1u] = s1;
+    }
     for (; row < rows; ++row) {
         output[row] = mynah_dot_f32(weights + row * cols, input, cols);
     }
+#elif defined(MYNAH_KERNELS_X86_RT)
+    if (mynah_kernels_x86_avx2()) matvec_f32_avx2(weights, input, output, rows, cols);
+    else                          matvec_f32_scalar(weights, input, output, rows, cols);
+#else
+    matvec_f32_scalar(weights, input, output, rows, cols);
+#endif
 }
 
 void mynah_matvec_bias_f32(const float *weights, const float *input,
@@ -153,52 +392,38 @@ int mynah_matvec_argmax_f32(const float *weights, const float *input,
 
 void mynah_rmsnorm_f32(const float *input, const float *weight, float *output,
                        size_t n, float epsilon) {
+#if defined(MYNAH_KERNELS_NEON)
     float mean_square = 0.0f;
     size_t i = 0;
-#if defined(MYNAH_KERNELS_NEON)
     float32x4_t sum = vdupq_n_f32(0.0f);
     for (; i + 4u <= n; i += 4u) {
         const float32x4_t x = vld1q_f32(input + i);
         sum = vmlaq_f32(sum, x, x);
     }
     mean_square = vaddvq_f32(sum);
-#elif defined(MYNAH_KERNELS_AVX2)
-    __m256 sum = _mm256_setzero_ps();
-    for (; i + 8u <= n; i += 8u) {
-        const __m256 x = _mm256_loadu_ps(input + i);
-        sum = _mm256_fmadd_ps(x, x, sum);
-    }
-    float lanes[8];
-    _mm256_storeu_ps(lanes, sum);
-    for (size_t lane = 0; lane < 8u; ++lane) mean_square += lanes[lane];
-#endif
     for (; i < n; ++i) mean_square += input[i] * input[i];
     mean_square /= (float)n;
     const float scale = 1.0f / sqrtf(mean_square + epsilon);
     i = 0;
-#if defined(MYNAH_KERNELS_NEON)
     const float32x4_t vscale = vdupq_n_f32(scale);
     for (; i + 4u <= n; i += 4u) {
         const float32x4_t x = vld1q_f32(input + i);
         const float32x4_t w = vld1q_f32(weight + i);
         vst1q_f32(output + i, vmulq_f32(vmulq_f32(x, vscale), w));
     }
-#elif defined(MYNAH_KERNELS_AVX2)
-    const __m256 vscale = _mm256_set1_ps(scale);
-    for (; i + 8u <= n; i += 8u) {
-        const __m256 x = _mm256_loadu_ps(input + i);
-        const __m256 w = _mm256_loadu_ps(weight + i);
-        _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_mul_ps(x, vscale), w));
-    }
+    for (; i < n; ++i) output[i] = input[i] * scale * weight[i];
+#elif defined(MYNAH_KERNELS_X86_RT)
+    if (mynah_kernels_x86_avx2()) rmsnorm_f32_avx2(input, weight, output, n, epsilon);
+    else                          rmsnorm_f32_scalar(input, weight, output, n, epsilon);
+#else
+    rmsnorm_f32_scalar(input, weight, output, n, epsilon);
 #endif
-    for (; i < n; ++i) {
-        output[i] = input[i] * scale * weight[i];
-    }
 }
 
 void mynah_layernorm_f32(const float *input, const float *weight,
                          const float *bias, float *output, size_t rows,
                          size_t width, float epsilon) {
+#if defined(MYNAH_KERNELS_NEON)
     for (size_t row = 0; row < rows; ++row) {
         const float *x = input + row * width;
         float *y = output + row * width;
@@ -207,7 +432,6 @@ void mynah_layernorm_f32(const float *input, const float *weight,
         mean /= (float)width;
         float variance = 0.0f;
         size_t i = 0;
-#if defined(MYNAH_KERNELS_NEON)
         float32x4_t sum = vdupq_n_f32(0.0f);
         const float32x4_t vmean = vdupq_n_f32(mean);
         for (; i + 4u <= width; i += 4u) {
@@ -215,24 +439,12 @@ void mynah_layernorm_f32(const float *input, const float *weight,
             sum = vmlaq_f32(sum, d, d);
         }
         variance = vaddvq_f32(sum);
-#elif defined(MYNAH_KERNELS_AVX2)
-        __m256 sum = _mm256_setzero_ps();
-        const __m256 vmean = _mm256_set1_ps(mean);
-        for (; i + 8u <= width; i += 8u) {
-            const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), vmean);
-            sum = _mm256_fmadd_ps(d, d, sum);
-        }
-        float lanes[8];
-        _mm256_storeu_ps(lanes, sum);
-        for (size_t lane = 0; lane < 8u; ++lane) variance += lanes[lane];
-#endif
         for (; i < width; ++i) {
             const float d = x[i] - mean;
             variance += d * d;
         }
         const float scale = 1.0f / sqrtf(variance / (float)width + epsilon);
         i = 0;
-#if defined(MYNAH_KERNELS_NEON)
         const float32x4_t vscale = vdupq_n_f32(scale);
         for (; i + 4u <= width; i += 4u) {
             const float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmean);
@@ -240,33 +452,33 @@ void mynah_layernorm_f32(const float *input, const float *weight,
             if (bias != NULL) z = vaddq_f32(z, vld1q_f32(bias + i));
             vst1q_f32(y + i, z);
         }
-#elif defined(MYNAH_KERNELS_AVX2)
-        const __m256 vscale = _mm256_set1_ps(scale);
-        for (; i + 8u <= width; i += 8u) {
-            const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), vmean);
-            __m256 z = _mm256_mul_ps(_mm256_mul_ps(d, vscale), _mm256_loadu_ps(weight + i));
-            if (bias != NULL) z = _mm256_add_ps(z, _mm256_loadu_ps(bias + i));
-            _mm256_storeu_ps(y + i, z);
-        }
-#endif
         for (; i < width; ++i) {
             y[i] = (x[i] - mean) * scale * weight[i] +
                    (bias == NULL ? 0.0f : bias[i]);
         }
     }
+#elif defined(MYNAH_KERNELS_X86_RT)
+    if (mynah_kernels_x86_avx2())
+        layernorm_f32_avx2(input, weight, bias, output, rows, width, epsilon);
+    else
+        layernorm_f32_scalar(input, weight, bias, output, rows, width, epsilon);
+#else
+    layernorm_f32_scalar(input, weight, bias, output, rows, width, epsilon);
+#endif
 }
 
 void mynah_residual_add_f32(float *output, const float *input, size_t n) {
-    size_t i = 0;
 #if defined(MYNAH_KERNELS_NEON)
+    size_t i = 0;
     for (; i + 4u <= n; i += 4u)
         vst1q_f32(output + i, vaddq_f32(vld1q_f32(output + i), vld1q_f32(input + i)));
-#elif defined(MYNAH_KERNELS_AVX2)
-    for (; i + 8u <= n; i += 8u)
-        _mm256_storeu_ps(output + i, _mm256_add_ps(_mm256_loadu_ps(output + i),
-                                                   _mm256_loadu_ps(input + i)));
-#endif
     for (; i < n; ++i) output[i] += input[i];
+#elif defined(MYNAH_KERNELS_X86_RT)
+    if (mynah_kernels_x86_avx2()) residual_add_f32_avx2(output, input, n);
+    else                          residual_add_f32_scalar(output, input, n);
+#else
+    residual_add_f32_scalar(output, input, n);
+#endif
 }
 
 /* MYNAH_GELU_SCALAR keeps the libm reference GELU for rollback.  Two things
@@ -1073,6 +1285,13 @@ const char *mynah_vecmath_isa(void) {
 #endif
 }
 
+/* NOT DEAD, and not hot either -- the distinction is worth a line because
+ * the audit of 2026-09-21 filed this as "no production caller" and the
+ * obvious next step would have been to delete it. Its only caller is
+ * mynah_vecmath_self_test, and that is the point: it is how the test
+ * reaches neon_tanh/avx2_tanh, which mynah_gelu_tanh_array DOES run on
+ * every activation block but fuses into its own loop where no test can
+ * call it. Deleting this would delete the coverage, not the code. */
 void mynah_tanh_f32(const float *input, float *output, size_t n) {
     size_t i = 0;
 #if defined(MYNAH_VECMATH_NEON)
@@ -1705,6 +1924,23 @@ void mynah_gelu_tanh_array(float *values, size_t length, float *scratch) {
  * A scalar fallback is always compiled for portability. */
 
 /* out[0..n) += weight * src[0..n) */
+#if defined(MYNAH_KERNELS_X86_RT)
+/* New on x86.  This kernel had a NEON path and a scalar `#else`, so on x86 it
+ * ran scalar in EVERY build -- avx2, auto, avx512 alike -- and nothing said so.
+ * transformer_ar.c calls it per attention head. */
+__attribute__((target("avx2,fma")))
+static void axpy_f32_avx2(float *out, const float *src, float weight, size_t n) {
+    const __m256 w = _mm256_set1_ps(weight);
+    size_t i = 0;
+    for (; i + 8u <= n; i += 8u) {
+        _mm256_storeu_ps(out + i,
+                         _mm256_fmadd_ps(w, _mm256_loadu_ps(src + i),
+                                         _mm256_loadu_ps(out + i)));
+    }
+    for (; i < n; ++i) out[i] += weight * src[i];
+}
+#endif
+
 void mynah_axpy_f32(float *out, const float *src, float weight, size_t n) {
 #if defined(MYNAH_KERNELS_NEON)
     const float32x4_t w = vdupq_n_f32(weight);
@@ -1715,6 +1951,9 @@ void mynah_axpy_f32(float *out, const float *src, float weight, size_t n) {
         vst1q_f32(out + i, o);
     }
     for (; i < n; ++i) out[i] += weight * src[i];
+#elif defined(MYNAH_KERNELS_X86_RT)
+    if (mynah_kernels_x86_avx2()) { axpy_f32_avx2(out, src, weight, n); return; }
+    for (size_t i = 0; i < n; ++i) out[i] += weight * src[i];
 #else
     for (size_t i = 0; i < n; ++i) out[i] += weight * src[i];
 #endif
@@ -1895,6 +2134,43 @@ static int probe_isa_bit(unsigned bit, const char **why) {
     return on;
 }
 
+/* isa.x86.avx2 -- the row that used to answer a question nobody was asking.
+ *
+ * As a compile gate it said whether the BUILD had -mavx2, which since the f32
+ * kernels grew runtime dispatch decides nothing: a portable build runs the AVX2
+ * kernels on a host that has the unit, and an avx2 build runs the scalar ones
+ * if MYNAH_KERNELS_X86=scalar says so. What a reader needs is which half is
+ * executing IN THIS PROCESS and what the other half would cost, so that is what
+ * this prints. */
+static int probe_x86_f32(const char **why) {
+    const int on = mynah_kernels_x86_avx2();
+    if (why != NULL) {
+#if defined(MYNAH_KERNELS_X86_RT)
+        static char text[360];
+        snprintf(text, sizeof text,
+                 "[predicate] mynah_kernels_x86_avx2(): the f32 dot, matvec, "
+                 "rmsnorm, layernorm, residual_add and axpy run %s, chosen at "
+                 "RUNTIME by __builtin_cpu_supports and not by the build. %s",
+                 on ? "AVX2+FMA" : "SCALAR",
+                 on ? "src/qmat.c dispatches the quantized half separately -- "
+                      "the two can differ."
+                    : "Either this CPU reports no avx2/fma, or "
+                      "MYNAH_KERNELS_X86 asked for scalar. src/qmat.c "
+                      "dispatches the quantized half separately and may still "
+                      "be vectorized: the two are independent.");
+        *why = text;
+#else
+        *why = on ? "[predicate] unreachable" :
+               "[predicate] not an x86 target, or MYNAH_DISABLE_SIMD, or a "
+               "compiler too old for the target attribute (GCC < 11). On "
+               "aarch64 this is the correct answer and not a gap: AdvSIMD is "
+               "architecturally guaranteed, so src/kernels.c selects NEON at "
+               "compile time and there is nothing to dispatch";
+#endif
+    }
+    return on;
+}
+
 static int probe_sve(const char **why)     { return probe_isa_bit(MYNAH_KERNELS_ISA_SVE, why); }
 static int probe_sve2(const char **why)    { return probe_isa_bit(MYNAH_KERNELS_ISA_SVE2, why); }
 static int probe_svei8mm(const char **why) { return probe_isa_bit(MYNAH_KERNELS_ISA_SVEI8MM, why); }
@@ -1917,6 +2193,7 @@ void mynah_kernels_dispatch_probes(void) {
      *     make visible.
      * Until then the facts are carried by the two rows below. */
     mynah_dispatch_register_probe("kernel.gelu_vector", probe_gelu_vector);
+    mynah_dispatch_register_probe("isa.x86.avx2", probe_x86_f32);
     mynah_dispatch_register_probe("isa.arm.sve", probe_sve);
     mynah_dispatch_register_probe("isa.arm.sve2", probe_sve2);
     mynah_dispatch_register_probe("isa.arm.svei8mm", probe_svei8mm);
