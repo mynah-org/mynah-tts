@@ -182,7 +182,14 @@ CLI_SOURCE := cli/main.c
 # objects on an arm64 host, and a decision keyed on the host would silently skip
 # the variant that cross build exists to produce -- then link, and run, and look
 # fine, having tested nothing.
-CC_TARGET_X86 := $(shell echo | $(CC) $(CPPFLAGS) -E -dM - 2>/dev/null | grep -cE '__x86_64__|__i386__')
+CC_TARGET_X86 := $(shell echo | $(CC) $(CPPFLAGS) $(CFLAGS) -E -dM - 2>/dev/null | grep -cE '__x86_64__|__i386__')
+# SIMD=scalar compiles every intrinsic out, so both variants would be the same
+# scalar code and one of them would carry -mavx2 for nothing -- an object that
+# invites the question "why does the scalar build contain AVX2 flags" and has no
+# good answer. One variant there, and the dispatcher picks it.
+ifneq ($(findstring -DMYNAH_DISABLE_SIMD,$(CFLAGS)),)
+CC_TARGET_X86 := 0
+endif
 ifeq ($(CC_TARGET_X86),0)
 sgemm_objects = $(1)/src/sgemm.o
 else
