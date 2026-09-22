@@ -1,0 +1,64 @@
+{
+  "_doc": [
+    "Expected RESOLVED dispatch per ISA class, keyed by the isa_class that",
+    "`mynah-tts --dispatch-map --json` prints. tools/dispatch_gate.py compares this",
+    "against an observed report and fails when a feature that is expected ON, is",
+    "compiled AND supported on the host, resolves OFF anyway.",
+    "",
+    "That shape -- have the unit, have the kernel, run neither -- is the one this",
+    "project keeps producing and cannot see: on 2026-09-22 an EPYC 9254 ran a bf16",
+    "kernel it reported as unimplemented, and called a unit two kernels require",
+    "'idle hardware'. Neither broke a test, because no test knew what the table",
+    "was supposed to say.",
+    "",
+    "A class absent here is checked by the generic rules only. Values are ON, OFF,",
+    "or a prefix of the resolved string for value rows (e.g. 'avx512' matches",
+    "'avx512vnni')."
+  ],
+
+  "x86_avx512_vnni": {
+    "isa.x86.avx2": "ON",
+    "isa.x86.fma": "ON",
+    "isa.x86.avx512f": "ON",
+    "isa.x86.avx512bw": "ON",
+    "isa.x86.avx512vl": "ON",
+    "isa.x86.avx512vnni": "ON",
+    "quant.int8_kernel": "avx512vnni",
+    "sgemm.provider": "mynah"
+  },
+
+  "x86_avx_vnni": {
+    "isa.x86.avx2": "ON",
+    "isa.x86.fma": "ON",
+    "isa.x86.avxvnni": "ON",
+    "quant.int8_kernel": "avxvnni"
+  },
+
+  "x86_avx2": {
+    "isa.x86.avx2": "ON",
+    "isa.x86.fma": "ON",
+    "isa.x86.avx512vnni": "OFF",
+    "isa.x86.avxvnni": "OFF"
+  },
+
+  "x86_scalar": {
+    "isa.x86.avx2": "OFF",
+    "quant.int8_kernel": "scalar",
+    "sgemm.kernel": "scalar"
+  },
+
+  "arm_neon_dotprod": {
+    "isa.arm.neon": "ON",
+    "isa.arm.dotprod": "ON",
+    "quant.int8_kernel": "neon-sdot"
+  },
+
+  "arm_neon": {
+    "isa.arm.neon": "ON",
+    "isa.arm.dotprod": "OFF"
+  },
+
+  "arm_scalar": {
+    "isa.arm.neon": "OFF"
+  }
+}

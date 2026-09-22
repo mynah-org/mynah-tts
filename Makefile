@@ -239,7 +239,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test dispatch-gate ternary-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -519,7 +519,7 @@ self-test: $(TARGET)
 # is pure Python that the sanitizer never instruments, so a missing Python
 # module used to turn the Memory Safety workflow red while saying nothing about
 # memory safety. That happened -- numpy, 2026-09-21, four red sanitizer jobs.
-test-c: self-test kernels-test qmat-test driver-test window-test json-test simd-auto-test
+test-c: self-test kernels-test qmat-test driver-test window-test json-test simd-auto-test dispatch-gate
 
 test: test-c playback-sim-test perf-profile-test ternary-test
 	@python3 tests/test_python_tools.py
@@ -602,6 +602,16 @@ playback-sim-test:
 # refusals that keep a qualifying run honest actually refuse.
 perf-profile-test:
 	python3 tests/test_perf_profile.py
+
+# The dispatch report is the most carefully written document in this repository
+# and until now nothing checked it: an EPYC 9254 ran a bf16 kernel that
+# `make simd-auto` called NOT-IMPLEMENTED, and the report called a unit two
+# kernels require "idle hardware". Both were read by a person; neither broke a
+# test. The gate runs against THIS binary on THIS host, so it is a different
+# statement from the self-test of the tool itself, which runs everywhere.
+dispatch-gate: $(TARGET)
+	@python3 tools/dispatch_gate.py --selftest >/dev/null
+	@python3 tools/dispatch_gate.py --binary $(TARGET)
 
 # The ternary feasibility analysis (E11) is closed-form solves transcribed from
 # papers. A transcription error would not crash and would not obviously corrupt
