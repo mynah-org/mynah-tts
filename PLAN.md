@@ -451,11 +451,27 @@ Zero-shot cloning is a product requirement. The weights are already in the pack
       conversion measures under 3% against a 20% bar, f16 runs at 1.96x against a
       2.00x byte ratio (so the in-loop convert is free), and every memcpy in the process
       together is 0.4% of samples. The wall is weight bytes. `matvec_f16` alone is 81%
-- [ ] E4-9 **Linux is the target, so measure there**: runtime ISA dispatch on x86 (a
-      binary that picks VNNI/AMX when the CPU has them and does not SIGILL when it
-      does not), OpenBLAS thread-count coordination with our pool, a CI matrix that
-      actually runs, and a Linux measurement box. Until this lands, no production
-      performance number can be quoted.
+- [~] E4-9 **runtime ISA dispatch on x86: the f32 half landed 2026-09-22** →
+      [`.work/mynah-isa-backend-reachability-audit-20260921.md`](.work/mynah-isa-backend-reachability-audit-20260921.md) §6.
+      `src/kernels.c`'s seven hot f32 kernels are now `target("avx2,fma")` + a scalar
+      form chosen by `mynah_kernels_x86_avx2()`, so **one x86 binary is safe on a
+      pre-Haswell CPU and full speed on a new one** — it was not, and `src/qmat.c`
+      dispatching while `kernels.c` did not was the portability gap. `axpy` had no
+      x86 vector path at all and now does. Proven by executing an x86_64 build on
+      this Mac under Rosetta (`make x86-cross`), which is a CPU with no AVX2 — the
+      old-x86 tier we were about to rent. Still open here: **`src/sgemm.c`**, where
+      `SG_LANES` leaks into the packed-panel layout so target attributes on the
+      micro-kernel are not enough; OpenBLAS thread coordination; a Linux measurement
+      box for the numbers.
+- [ ] E4-9b **borrow the kernels next door before writing them** →
+      [`.work/qwen-tts-kernel-reuse.md`](.work/qwen-tts-kernel-reuse.md). `../qwen-tts`
+      has a **VDPBF16PS bf16 matvec** we do not, on the dtype our backbone ships, and
+      its weights are already in the plain row-major bf16 layout our cache holds — an
+      inner-loop port, not a layout change. Then the **AVX-512BW int8 GEMV without
+      VNNI**, which is the Skylake-SP tier nothing in this tree reaches. Not AMX (E12
+      says the arithmetic is 5% at B=8), not KleidiAI (a dependency decision, not a
+      port). Mynah is the one that is ahead on dispatch: qwen has one target attribute
+      in 14,372 lines.
 - [x] E4-8 **done** `ffc28b4` — `SIMD=` profiles and the `.build-flags` stamp · `Makefile`: `SIMD=` profiles + `ARCH_STAMP` rebuild-on-flag-change
 
 ### E8 — The batched vocoder: the structural ceiling
@@ -989,8 +1005,12 @@ the x86 self-test that judges the two kernels written here and never executed
       refuses at `pending >= max_pending` under the mutex and answers **503** with
       `rejected++` before any synthesis, so a rejection costs an accept and a write
       (`server/main.c:376,1208`), `--max-pending` defaults to 256, and `/health` publishes
-      `queued`/`rejected`/`queue_capacity` for an autoscaler. **Gap**: no `Retry-After`
-      header on the 503, so every client invents its own backoff
+      `queued`/`rejected`/`queue_capacity` for an autoscaler. ~~**Gap**: no `Retry-After`
+      header on the 503~~ — **closed 2026-09-22**: `send_status()` emits `Retry-After: 1`
+      for any 503, at the one place every refusal passes through rather than at the four
+      call sites, so a new refusal cannot be added without it. Verified against a live
+      server driven past `--max-pending`. Clients must still jitter: the header
+      synchronises the retry, it does not spread it
 - [x] E10-17 **the configuration of a qualifying run no longer lives in shell history** —
       [`.work/serving-profiles.md`](.work/serving-profiles.md). `configs/perf/*.json` carries
       the deployment shape, the gates AND the operating point measured on that hardware;
@@ -1136,7 +1156,14 @@ measures the runtime side in C, on the box, under load. Needs **no code**:
 - [x] E12-8 **`a` is not all bytes.** It fell 18.6% while the bytes fell 50%, so ≈1.06 ms of the 1.69 ms is fixed cost (per-step setup, activation quantization, epilogue, pool dispatch). A bandwidth model that treats `a` as pure weight traffic over-predicts every future weight-format change by ~2.7×. That is a correction to the instrument `backbone-bandwidth.md` reasons with, and it outlives the int8 result
 - [x] E12-9 **attribution error, caught by the control.** int8's TTFA of 409.2 was first reported as −29.5% against *yesterday's* 580.9. Today's bf16 arm returns 402.8: the gain is the **build**, not the dtype. Only the arm measured beside it, same build same box same hour, is admissible
 - [x] E12-10 **two operational traps, both mine.** `tmux kill-session` does not kill what the session started — a C140 screen ran concurrently with the first soak attempt. And **`pkill -x mynah-tts-server` matches nothing and reports success**: Linux truncates `/proc/<pid>/comm` to 15 chars, so the name is `mynah-tts-serve`; `pgrep -c -x` then says 0 while `ps -C` lists three. Kill by PID from `ps -C`, and prove the box is empty with a different tool than the one that killed
-- [ ] E12-11 the only surviving reason to revisit int8 is **memory**: 151.0 → 75.7 MB of backbone weights, times 16 prefork workers if the quantized cache is per-process. No RSS was captured — the server log does not emit one — so this is a hypothesis
+- [~] E12-11 **the server can report an RSS now, which it could not** — `/health`'s
+      `process` block carries `rss_bytes` and `rss_peak_bytes` (`mynah_rss_bytes()`:
+      `/proc/self/statm` on Linux, the Mach task port on macOS, 0 where the platform
+      cannot answer — never a guess). Reads 805 MB / 808 MB peak for a single-process
+      bf16 `pocket-en` here. The hypothesis is unchanged and now measurable: 151.0 →
+      75.7 MB of backbone weights **times 16 prefork workers if the quantized cache is
+      per-process**. Poll every worker and sum; do not read one and multiply until they
+      are shown to agree
 
 ### E13 — The ceiling is 128 request slots, not a speed limit → [`.work/int8-backbone.md`](.work/int8-backbone.md)
 

@@ -254,3 +254,119 @@ instructions — which is the question the ladder was built to answer.
 - [ ] memory/cache classification per stage (§9) — E12 already established that
       `a` is **not** pure weight traffic, so the naive bandwidth model is known
       to be wrong by ~2.7x and must not be reused here.
+
+---
+
+## 6. 2026-09-22 — P1 landed, and §3's premise was wrong
+
+### The correction first, because it changed what is possible
+
+§3 says: *"Cross-compilation to x86 is not available on this machine (no
+x86_64 toolchain or SDK; `cc -arch x86_64` fails)."* **That is wrong, and the
+way it is wrong is the lesson.** `cc` is shadowed in the developer's
+interactive shell — the probe died with `command not found: gcc-11`, which has
+nothing to do with the toolchain. `/usr/bin/clang -arch x86_64` cross-compiles
+the whole tree, the macOS SDK carries both slices, and **Rosetta 2 runs the
+result**.
+
+That is not a curiosity. **Rosetta emulates an x86-64 CPU with SSE4.2 and no
+AVX**, so `__builtin_cpu_supports("avx2")` answers 0 there. It is an OLD x86
+HOST — the tier this project has no hardware for and was about to rent one to
+reach. `tests/x86_cross.sh` (`make x86-cross`) now builds two profiles and
+executes both:
+
+| check | result |
+|---|---|
+| portable x86 binary, `--self-test` on a CPU with no AVX2 | PASS — the scalar half of the new dispatch, executed |
+| `--dispatch-map` reports `arch=x86_64 isa_class=x86_scalar` | PASS |
+| `isa.x86.avx2` states the runtime consequence | PASS |
+| `MYNAH_KERNELS_X86=scalar` accepted, self-test clean | PASS |
+| **avx2 binary refuses to start, with the guard's message, not a SIGILL** | PASS — exit 1 |
+
+The last row had never been executed anywhere: every CI runner has AVX2, so the
+ISA guard's whole purpose had only ever been reasoned about.
+
+What it does NOT give: any performance number (an emulator is not a
+measurement) and no execution of the AVX2 kernels (Rosetta cannot run them).
+CI's x86 runners cover that half, and now run it both ways.
+
+### P1 — x86 f32 kernels now dispatch at runtime
+
+`src/kernels.c`. Seven kernels — `dot`, `matvec`, `rmsnorm`, `layernorm`,
+`residual_add`, `axpy` and `matvec_bias` through `matvec` — each split into a
+`__attribute__((target("avx2,fma")))` form and a scalar form, selected once by
+`mynah_kernels_x86_avx2()`. The pattern is `src/qmat.c`'s, which already proves
+it in this tree. Verified in the disassembly of a baseline x86 object:
+`dot_f32_avx2` contains six `vfmadd`; `dot_f32_scalar` contains no `ymm` at all.
+
+**`SIMD=portable` on x86 is now safe on a 2008 CPU and full speed on a 2024
+one, from one binary.** That sentence was the whole finding of §2 and it is no
+longer true in the negative.
+
+Two things fell out of doing it:
+
+- **`mynah_axpy_f32` had no x86 vector path at all** — NEON and a scalar
+  `#else`, so every x86 build ran it scalar however it was compiled, in a
+  function `transformer_ar.c` calls per attention head. Fixed with the rest.
+- **`MYNAH_KERNELS_X86=scalar`** forces the scalar half on a host that has
+  AVX2, so one machine can compare both implementations. `make self-test` runs
+  it as a third pass, the way `MYNAH_QMAT_VNNI=scalar` is already run as a
+  second. Without it the scalar forms — which are the numeric reference the
+  AVX2 ones are written against — would never execute on x86 again.
+
+### The first defect the new harness found
+
+`qmat int4 blocked matvec differs from serial at row 124 (0.463348627 vs
+0.46334815)` — relative 1.03e-6 against a tolerance of 1.0e-6.
+
+Confirmed pre-existing (`git stash`, same failure, same row, same digits on
+unmodified HEAD) and confirmed a FALSE FAILURE: the check's flat 1.0e-6 is
+**30x tighter than reassociating a K-term f32 sum is allowed to be**
+(K*FLT_EPSILON = 256 * 1.19e-7 = 3.05e-5). It had only ever passed because
+every compiler tried so far reassociated both call shapes identically; clang on
+x86-64 with no AVX2 does not. The bound is derived from K now. Nothing is given
+up: a wrong partition — the thing the check exists to catch — is an O(1)
+relative error, some thirty thousand times the bound.
+
+That is the argument for the harness in one paragraph: **a tolerance nobody had
+ever tested on a second compiler was one rented box away from being discovered
+as a "mystery x86 failure" at cloud prices.**
+
+### P1b, P2, P3 — the three reporting defects
+
+- **P1b** `isa.x86.avx2` is no longer a compile gate. It is answered by
+  `probe_x86_f32` in `src/kernels.c` and prints which half is executing in this
+  process, that the choice is made at runtime, and that `src/qmat.c` decides
+  the quantized half separately and may differ. The old row said `compiled no`
+  on a portable build and let a reader conclude the binary was entirely scalar.
+- **P2** `isa.arm.bf16` described BFDOT and eight MACs. The batched path calls
+  `matvec_bf16_neon_tile` — BFMMLA, **sixteen** MACs over eight accumulators,
+  which is where the measured +33% at B=8 comes from. The row now names both
+  kernels and says which one `qmat_rows_job` actually calls.
+- **P3** `mynah_tanh_f32` is filed above as having no production caller. True,
+  and deleting it would have been wrong: its only caller is
+  `mynah_vecmath_self_test`, and that is the point — it is how the test reaches
+  `neon_tanh`/`avx2_tanh`, which `mynah_gelu_tanh_array` runs on every
+  activation block but fuses into its own loop where no test can call it. The
+  finding was the header comment claiming the array form calls it, which was
+  never true. Comment fixed, function kept, reason written at the definition.
+
+### Still open in P1, and why it was not done here
+
+**`src/sgemm.c` is not a target-attribute job.** Its seven intrinsic sites are
+behind an `sg_*` macro layer (`sg_load`, `sg_fma`, `SG_LANES`, `SG_ACC_VECS`)
+and **`SG_LANES` leaks into the data layout** — packed panel geometry,
+`SG_NARROW_MAX`, and the public `mynah_sgemm_narrow_max`. Multi-versioning it
+means the packing becomes runtime-dependent, not just the inner loop. That is a
+separate, larger change: either two translation units built with different
+`-m` flags (which the Makefile already knows how to do), or the body in an
+`.inc` included twice. It matters — `seanet.c` calls `mynah_sgemm_f32` six
+times and the codec is 43% of the wall — but it does not belong in the same
+commit as a kernel split, because a numeric regression would be
+unattributable.
+
+### The rest of §5 is unchanged
+
+The 16x2 question, the Mimi per-stage reachability matrix, the one-command
+qualification harness and the per-stage memory classification are all still
+open. `make x86-cross` is a piece of the third, not the whole of it.
