@@ -205,6 +205,21 @@ CPPFLAGS += -DMYNAH_SGEMM_RUNTIME=1
 endif
 sgemm_object_list = $(filter-out $(1)/src/sgemm.o,$(2)) $(call sgemm_objects,$(1))
 
+# THE SPLIT IS THE CPU TREE'S, AND ONLY THE CPU TREE'S.
+#
+# METAL_CPPFLAGS and CUDA_CPPFLAGS are built with `:=` from scratch and inherit
+# nothing from CPPFLAGS, so the define above never reached their sgemm_rt.c --
+# while the variant rule, which uses $(CPPFLAGS) $(CFLAGS), compiled the two
+# variants for them with the CPU tree's flags. Both halves wrong, and CI found
+# it as four undefined references in `compile-only: CUDA`.
+#
+# The fix is not to thread the define through three more flag sets. It is that
+# those trees do not want the split: the portability story is about shipping ONE
+# CPU BINARY that is safe on an old host and fast on a new one, and `make cuda`
+# and `make metal` are already machine-local artifacts pinned to a GPU
+# architecture, validated on the target machine by this repo's own contract.
+# They build one sgemm at their own flags, exactly as before this change.
+
 CORE_OBJECTS := $(call sgemm_object_list,$(BUILD_DIR),$(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o))
 CLI_OBJECT := $(CLI_SOURCE:%.c=$(BUILD_DIR)/%.o)
 TARGET := $(BUILD_DIR)/mynah-tts
@@ -250,11 +265,14 @@ $(BUILD_DIR)/%.o: %.c $(BUILD_STAMP)
 # a build that already carries them is not silently narrowed.  The pattern
 # stem is the build directory, so the sanitizer, Metal and CUDA trees each get
 # their own pair without repeating the recipe.
-%/src/sgemm_base.o: src/sgemm.c
+# $(BUILD_DIR)-anchored, NOT `%/src/...`: a bare stem matched the Metal and CUDA
+# trees too and compiled their variants with the CPU tree's flags. BUILD_DIR is
+# overridden for the sanitizers, so those still get their own pair.
+$(BUILD_DIR)/src/sgemm_base.o: src/sgemm.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DMYNAH_SGEMM_VARIANT=base -MMD -MP -c $< -o $@
 
-%/src/sgemm_avx2.o: src/sgemm.c
+$(BUILD_DIR)/src/sgemm_avx2.o: src/sgemm.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -mavx2 -mfma -DMYNAH_SGEMM_VARIANT=avx2 -MMD -MP -c $< -o $@
 
@@ -703,7 +721,7 @@ METAL_BUILD_DIR := build/metal
 # through LDLIBS, which they do share.
 METAL_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include -DMYNAH_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
 METAL_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -ffast-math -fno-finite-math-only -DMYNAH_ENABLE_METAL
-METAL_CORE_OBJECTS := $(call sgemm_object_list,$(METAL_BUILD_DIR),$(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o))
+METAL_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(METAL_BUILD_DIR)/%.o)
 $(METAL_CORE_OBJECTS): | $(INGOT_LIB)
 METAL_CLI_OBJECT := $(METAL_BUILD_DIR)/cli/main.o
 METAL_HOST_OBJECT := $(METAL_BUILD_DIR)/gpu/metal/backend_metal.o
@@ -741,7 +759,7 @@ CUDA_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -DMYNAH_ENABLE_CUDA
 ifneq ($(UNAME_S),Darwin)
 CUDA_CPPFLAGS += -D_DEFAULT_SOURCE
 endif
-CUDA_CORE_OBJECTS := $(call sgemm_object_list,$(CUDA_BUILD_DIR),$(CORE_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o))
+CUDA_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o)
 $(CUDA_CORE_OBJECTS): | $(INGOT_LIB)
 CUDA_CLI_OBJECT := $(CUDA_BUILD_DIR)/cli/main.o
 CUDA_HOST_OBJECT := $(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o
