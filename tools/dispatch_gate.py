@@ -55,9 +55,30 @@ def rows_by_id(report):
     return {r["id"]: r for r in report.get("features", [])}
 
 
-def generic_findings(report):
+def exclusion_members(expect):
+    """id -> group name, for rows that are alternatives for one job."""
+    out = {}
+    for group, ids in (expect.get("_exclusive") or {}).items():
+        if group.startswith("_"):
+            continue
+        for rid in ids:
+            out[rid] = group
+    return out
+
+
+def generic_findings(report, expect):
     """Wrong shapes, whatever the host is."""
     out = []
+    groups = exclusion_members(expect)
+    rows = rows_by_id(report)
+    # A group with a winner is a group with nothing to report: the losers are
+    # OFF because something better took the job, which is the whole point of
+    # having alternatives.
+    won = set()
+    for rid, group in groups.items():
+        r = rows.get(rid)
+        if r is not None and r.get("resolved") == "ON":
+            won.add(group)
     if report.get("isa_guard_ok") is False:
         out.append(("GUARD", "-", report.get("isa_guard_detail", "")))
     if report.get("gate_drift") is True:
@@ -72,9 +93,14 @@ def generic_findings(report):
         asked = (r.get("env_value") or "unset") not in ("unset", "")
         if (r.get("compiled") == "yes" and r.get("supported") == "yes"
                 and r.get("resolved") == "OFF" and not asked):
+            group = groups.get(rid)
+            if group is not None and group in won:
+                continue      # it lost to a better kernel for the same job
             out.append(("SUSPICIOUS", rid,
                         "compiled and supported here, and it resolved OFF with "
-                        "nothing in the environment asking for that"))
+                        "nothing in the environment asking for that"
+                        + (" (and no alternative in %r took the job either)"
+                           % group if group else "")))
     return out
 
 
@@ -106,6 +132,8 @@ def expected_findings(report, expect):
                   % (rid, got, row.get("env") or "an env",
                      row.get("env_value")))
             continue
+        if rid.startswith("_"):
+            continue
         if (want == "ON" and got == "OFF" and row.get("compiled") == "yes"
                 and row.get("supported") == "yes"):
             out.append(("SUSPICIOUS", rid,
@@ -116,7 +144,7 @@ def expected_findings(report, expect):
 
 
 def report_findings(report, expect, warn_only=False):
-    findings = generic_findings(report)
+    findings = generic_findings(report, expect)
     exp, cls, n_exp = expected_findings(report, expect)
     findings += exp
     print("dispatch gate: isa_class=%s build=%s rows=%d, %d expectations"
@@ -156,19 +184,29 @@ def selftest():
                 "env": "", "reason": ""}
 
     cases = []
+    # A VNNI host: the wider kernel took the int8 job, so the alternatives for
+    # that job read OFF. That is the shape the gate failed a docs-only commit
+    # on before it understood exclusion, so it is the FIRST fixture.
     ok = dict(base, features=[
-        row("isa.x86.avx2"), row("isa.x86.fma"), row("isa.x86.avx512f"),
-        row("isa.x86.avx512bw"), row("isa.x86.avx512vl"),
+        row("isa.x86.avx2"), row("isa.x86.fma"),
+        row("isa.x86.avx512f", resolved="OFF"),
+        row("isa.x86.avx512bw", resolved="OFF"),
+        row("isa.x86.avx512vl"),
         row("isa.x86.avx512vnni"),
+        row("isa.x86.avxvnni", resolved="OFF"),
         row("quant.int8_kernel", resolved="avx512vnni"),
         row("sgemm.provider", resolved="mynah")])
-    cases.append(("a host meeting its class expectation", ok, 0))
+    cases.append(("alternatives that LOST to a better kernel", ok, 0))
 
+    # The same host with nothing taking the job: now every alternative is OFF
+    # and the group has no winner, which is the real gap.
     bad = json.loads(json.dumps(ok))
     for r in bad["features"]:
-        if r["id"] == "isa.x86.avx512bf16" or r["id"] == "isa.x86.avx512vnni":
+        if r["id"] == "isa.x86.avx512vnni":
             r["resolved"] = "OFF"
-    cases.append(("have the unit, have the kernel, run neither", bad, 1))
+        if r["id"] == "quant.int8_kernel":
+            r["resolved"] = "scalar"
+    cases.append(("every alternative OFF: nobody took the job", bad, 1))
 
     orphan = dict(base, features=[row("isa.x86.avx2", source="unknown")])
     cases.append(("a row no module owns", orphan, 1))

@@ -138,11 +138,15 @@ extern "C" {
  * SIMD=avx512 could once imply a kernel that did not exist. */
 #if !defined(MYNAH_DISABLE_SIMD) && (defined(__x86_64__) || defined(__i386__)) && \
     (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11))
-#define MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL 1  /* qmat.c dot4_u8_evex */
-#define MYNAH_DISPATCH_HAS_AVXVNNI_KERNEL    1  /* qmat.c dot4_u8_vex  */
+#define MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL 1  /* qmat.c dot4_u8_evex           */
+#define MYNAH_DISPATCH_HAS_AVXVNNI_KERNEL    1  /* qmat.c dot4_u8_vex            */
+#define MYNAH_DISPATCH_HAS_AVX512BW_KERNEL   1  /* qmat.c dot_q8_i32_avx512bw    */
+#define MYNAH_DISPATCH_HAS_AVX512BF16_KERNEL 1  /* qmat.c matvec_bf16_dpbf16_x1  */
 #else
 #define MYNAH_DISPATCH_HAS_AVX512VNNI_KERNEL 0
 #define MYNAH_DISPATCH_HAS_AVXVNNI_KERNEL    0
+#define MYNAH_DISPATCH_HAS_AVX512BW_KERNEL   0
+#define MYNAH_DISPATCH_HAS_AVX512BF16_KERNEL 0
 #endif
 
 /* src/qmat.c matvec_q8_pair_i8mm, likewise target-attributed. */

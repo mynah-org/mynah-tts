@@ -16,11 +16,29 @@
     "'avx512vnni')."
   ],
 
+  "_exclusive": {
+    "_doc": [
+      "Rows that are ALTERNATIVES for one job. At most one may be ON, and a",
+      "member reading OFF beside a winner is the correct answer, not a gap --",
+      "so the SUSPICIOUS rule fires for a group only when EVERY member is OFF",
+      "while at least one is compiled and supported here.",
+      "",
+      "Written because the gate failed a docs-only commit on 2026-09-22: the",
+      "GitHub x86 runner pool is heterogeneous, that run landed on a machine",
+      "with AVX-VNNI *and* AVX-512 VNNI, and the gate called isa.x86.avxvnni",
+      "suspicious for losing to the wider kernel. A gate that cries wolf gets",
+      "switched off, which would have cost more than the bug it was built for."
+    ],
+    "x86 int8 dot": ["isa.x86.avx512vnni", "isa.x86.avxvnni",
+                     "isa.x86.avx512f", "isa.x86.avx512bw"],
+    "arm int8 dot": ["isa.arm.i8mm", "isa.arm.dotprod"]
+  },
+
   "x86_avx512_vnni": {
     "isa.x86.avx2": "ON",
     "isa.x86.fma": "ON",
-    "isa.x86.avx512f": "ON",
-    "isa.x86.avx512bw": "ON",
+    "isa.x86.avx512f": "OFF",
+    "isa.x86.avx512bw": "OFF",
     "isa.x86.avx512vl": "ON",
     "isa.x86.avx512vnni": "ON",
     "quant.int8_kernel": "avx512vnni",

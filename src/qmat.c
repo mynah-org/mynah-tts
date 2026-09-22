@@ -6917,7 +6917,14 @@ static int probe_bf16(const char **why) { return mynah_qmat_bf16_enabled(why); }
  * failed its own check -- and the reason says which. */
 static int probe_avx512bw_int8(const char **why) {
 #if defined(MYNAH_QMAT_X86_AVX512)
-    const int on = qmat_int8_avx512bw_ok();
+    /* `resolved` means THIS IS THE KERNEL THAT RUNS, the same as every other
+     * row in the table -- not "the kernel verified and is available". The
+     * first cut returned the gate's result alone, so on a host with VNNI this
+     * row read ON while quant.int8_kernel said avx512vnni, and two rows in one
+     * family disagreed about what the word meant. Availability is what
+     * `compiled` and `supported` are for, and the reason says the rest. */
+    const int on = qmat_int8_avx512bw_ok() &&
+                   strcmp(mynah_qmat_int8_kernel(NULL), "avx512bw") == 0;
     if (why != NULL) {
         int bw = 0, bf = 0;
         qmat_x86_avx512_probe(&bw, &bf);
@@ -6925,13 +6932,18 @@ static int probe_avx512bw_int8(const char **why) {
                     "for a host with 512-bit registers and NO VPDPBUSD "
                     "(Skylake-SP, Cascade Lake, Zen 3). Executed against the "
                     "scalar reference in this process and bit-identical"
-                  : (bw ? "[predicate] the CPU has AVX-512 F/BW/VL but the "
-                          "kernel DISAGREED with the scalar reference, or "
-                          "MYNAH_QMAT_AVX512 turned it off. The AVX2 int8 dot "
-                          "is running instead -- this is the gate working"
-                        : "[predicate] this CPU has no usable AVX-512 F/BW/VL "
-                          "(or the OS has not enabled ZMM state), so the int8 "
-                          "dot is the AVX2 or scalar form");
+                  : (bw && qmat_int8_avx512bw_ok()
+                        ? "[predicate] the kernel is here and verified, and a "
+                          "BETTER one won: quant.int8_kernel names it. This "
+                          "row is the AVX-512-without-VNNI tier, so OFF beside "
+                          "a VNNI host is the correct answer and not a gap"
+                    : bw ? "[predicate] the CPU has AVX-512 F/BW/VL but the "
+                           "kernel DISAGREED with the scalar reference, or "
+                           "MYNAH_QMAT_AVX512 turned it off. The AVX2 int8 dot "
+                           "is running instead -- this is the gate working"
+                         : "[predicate] this CPU has no usable AVX-512 F/BW/VL "
+                           "(or the OS has not enabled ZMM state), so the int8 "
+                           "dot is the AVX2 or scalar form");
     }
     return on;
 #else

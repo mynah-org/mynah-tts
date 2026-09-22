@@ -832,19 +832,25 @@ static void collect_isa(row_sink *s) {
      * `compiled` still reports the build flag, because that is what it means
      * everywhere else in this table, and it is still not what decides: all
      * three kernels carry their own target attribute and need no flag. */
-    add_unknown(s, "isa.x86.avx512f", yn(MYNAH_DISPATCH_HAS_AVX512F),
+    /* `compiled` is the KERNEL, not the build flag -- the same correction these
+     * rows' text already carries. The footer counts `compiled=no,
+     * supported=yes` as idle hardware, so reading CFLAGS here told an operator
+     * on a VNNI host that their AVX-512 had no kernel, when it has one that
+     * merely lost the job to a wider one. Second time this exact confusion has
+     * shipped; `compiled` means "it is in this binary" everywhere now. */
+    add_unknown(s, "isa.x86.avx512f", yn(MYNAH_DISPATCH_HAS_AVX512BW_KERNEL),
                 yn3(cpu_has_avx512f()), "MYNAH_QMAT_AVX512",
                 "[UNKNOWN] src/qmat.c did not register the AVX-512BW int8 "
                 "predicate over this id");
-    add_unknown(s, "isa.x86.avx512bw", yn(MYNAH_DISPATCH_HAS_AVX512BW),
+    add_unknown(s, "isa.x86.avx512bw", yn(MYNAH_DISPATCH_HAS_AVX512BW_KERNEL),
                 yn3(cpu_has_avx512bw()), "MYNAH_QMAT_AVX512",
                 "[UNKNOWN] src/qmat.c did not register the AVX-512BW int8 "
                 "predicate over this id");
-    add_unknown(s, "isa.x86.avx512vl", yn(MYNAH_DISPATCH_HAS_AVX512VL),
+    add_unknown(s, "isa.x86.avx512vl", yn(MYNAH_DISPATCH_HAS_AVX512BW_KERNEL),
                 yn3(cpu_has_avx512vl()), NULL,
                 "[UNKNOWN] src/qmat.c did not register the prerequisite "
                 "predicate over this id");
-    add_unknown(s, "isa.x86.avx512bf16", yn(MYNAH_DISPATCH_HAS_AVX512F),
+    add_unknown(s, "isa.x86.avx512bf16", yn(MYNAH_DISPATCH_HAS_AVX512BF16_KERNEL),
                 yn3(cpu_has_avx512bf16()), "MYNAH_QMAT_BF16DOT",
                 "[UNKNOWN] src/qmat.c did not register the VDPBF16PS "
                 "predicate. bf16 is the dtype this backbone ships, so a "
