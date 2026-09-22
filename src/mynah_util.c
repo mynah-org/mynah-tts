@@ -5,6 +5,64 @@
 #include <stdlib.h>
 #include <time.h>
 
+#if defined(__linux__)
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
+
+/* CURRENT resident size.  Linux reads /proc/self/statm, whose second field is
+ * resident pages -- one open/read/close of a synthetic file, no allocation, so
+ * it is safe to call from a request handler.  macOS has no such file and the
+ * answer comes from the Mach task port.  Anywhere else: 0, meaning "this
+ * platform did not say", which the caller must render as absent rather than as
+ * zero bytes. */
+size_t mynah_rss_bytes(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f == NULL) return 0;
+    unsigned long total = 0, resident = 0;
+    const int got = fscanf(f, "%lu %lu", &total, &resident);
+    fclose(f);
+    if (got != 2) return 0;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 0;
+    return (size_t)resident * (size_t)page;
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return (size_t)info.resident_size;
+#else
+    return 0;
+#endif
+}
+
+/* PEAK resident size.  getrusage is the portable answer and its unit is not:
+ * ru_maxrss is KILOBYTES on Linux and BYTES on macOS/BSD.  Getting that wrong
+ * is a factor of 1024 in a capacity plan, so the conversion is explicit per
+ * platform rather than inherited from whichever machine it was first read on. */
+size_t mynah_rss_peak_bytes(void) {
+#if defined(__unix__) || defined(__APPLE__)
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+    if (ru.ru_maxrss <= 0) return 0;
+#if defined(__linux__)
+    return (size_t)ru.ru_maxrss * 1024u;
+#else
+    return (size_t)ru.ru_maxrss;
+#endif
+#else
+    return 0;
+#endif
+}
+
 void mynah_graph_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
 }

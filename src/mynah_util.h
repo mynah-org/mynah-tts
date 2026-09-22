@@ -17,6 +17,23 @@
 #include "backend.h"
 #include "weights.h"
 
+/* Resident set size of THIS process, in bytes, and the high-water mark.
+ *
+ * E12-11.  The int8 backbone was rejected on speed -- it moved `a` by -18.6%
+ * and `b` by +3.6%, which is a wash inside an 80 ms frame -- and the ONE
+ * surviving reason to revisit it is memory: 151.0 MB of bf16 backbone weights
+ * against 75.7 MB of int8, multiplied by however many prefork workers hold
+ * their own copy of the quantized cache.  That multiplier has never been
+ * measured, because nothing in this runtime could report an RSS.  `make bench`
+ * has been contracted to print one since v1 and printed none.
+ *
+ * `current` is what the process holds now; `peak` is the high-water mark since
+ * start, which is the number a machine has to be sized for.  Both return 0
+ * when the platform cannot answer, never a guess -- a fabricated RSS is worse
+ * than an absent one, because it would be quoted. */
+size_t mynah_rss_bytes(void);
+size_t mynah_rss_peak_bytes(void);
+
 /* Write `message` into `error` when both are usable. */
 void mynah_graph_error(char *error, size_t capacity, const char *message);
 

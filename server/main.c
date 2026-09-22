@@ -66,6 +66,7 @@
 
 #include "graph.h"
 #include "json.h"
+#include "mynah_util.h"   /* mynah_rss_bytes / _peak: E12-11 */
 #include "mynah_tts.h"
 #include "tokenizer_sentencepiece.h"
 #include "tokenizer.h"
@@ -908,16 +909,38 @@ static int write_all(int fd, const void *data, size_t len) {
     return 0;
 }
 
+/* E10-20.  EVERY 503 CARRIES Retry-After, and it is emitted here rather than at
+ * the four call sites so a new refusal cannot be added without it.
+ *
+ * The fail-fast itself was already right: job_enqueue refuses under the mutex
+ * when the queue is full and the answer costs an accept and a write, before any
+ * synthesis. What was missing was the other half of the contract -- a shed
+ * request with no Retry-After leaves every client to invent its own backoff,
+ * and in a fleet they invent different ones, which is how a queue that drained
+ * in a second gets hammered for a minute.
+ *
+ * ONE SECOND, and why a constant is the honest answer here. A 503 means the
+ * queue was at max_pending when the request arrived; at the certified operating
+ * point that queue drains continuously (throughput 158 audio-s/s at C128), so
+ * the wait is short and bounded by a request, not by an outage. A derived value
+ * would need the drain rate at the moment of refusal, which this scope does not
+ * have and which would be a guess dressed as a measurement. One second is the
+ * smallest value that is not a busy-retry. CLIENTS MUST STILL JITTER: the
+ * header synchronises the retry, it does not spread it, and that is the
+ * client's half of the contract. */
 static void send_status(int fd, const char *status, const char *ctype,
                         const char *body, size_t len) {
+    const int unavailable = strncmp(status, "503", 3) == 0;
     char head[512];
     const int n = snprintf(head, sizeof(head),
                            "HTTP/1.1 %s\r\n"
                            "Content-Type: %s\r\n"
                            "Content-Length: %zu\r\n"
                            "Access-Control-Allow-Origin: *\r\n"
+                           "%s"
                            "Connection: close\r\n\r\n",
-                           status, ctype, len);
+                           status, ctype, len,
+                           unavailable ? "Retry-After: 1\r\n" : "");
     if (n <= 0) return;
     if (write_all(fd, head, (size_t)n) != 0) return;
     if (len > 0) write_all(fd, body, len);
@@ -1391,9 +1414,20 @@ static void handle_health(int fd) {
                             * budget in force; 65536 and 4096 are different
                             * servers, so the number has to be readable from a
                             * running process and not only from the source. */
+                           /* E12-11. RSS OF THIS PROCESS, not of the
+                            * machine -- under prefork each worker holds
+                            * its own quantized weight cache, and whether
+                            * that cache is per-process or shared is the
+                            * whole question the int8 backbone was left
+                            * open on: 151.0 MB bf16 against 75.7 MB int8,
+                            * times W. Poll every worker and sum, or read
+                            * one and multiply only after checking they
+                            * agree. 0 means the platform did not answer,
+                            * never "no memory". */
                            "\"process\":{\"pid\":%d,\"prefork_worker\":%d,"
                            "\"synthesis_threads\":%d,\"decoder_lane\":%d,"
-                           "\"engine_threads\":%d,\"pool_spin\":%d}}",
+                           "\"engine_threads\":%d,\"pool_spin\":%d,"
+                           "\"rss_bytes\":%zu,\"rss_peak_bytes\":%zu}}",
                            g.model_id, g.info.engine, g.info.sample_rate,
                            g.voice_count,
                            langs,
@@ -1422,7 +1456,8 @@ static void handle_health(int fd) {
                                ? mynah_prefork_worker_threads()
                                : mynah_num_threads(),
                            mynah_lane_width(), mynah_lane_engine_width(),
-                           mynah_pool_spin_budget());
+                           mynah_pool_spin_budget(),
+                           mynah_rss_bytes(), mynah_rss_peak_bytes());
     if (n > 0) send_status(fd, "200 OK", "application/json", body, (size_t)n);
 }
 
