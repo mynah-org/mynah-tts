@@ -66,11 +66,44 @@ echo "server up: $(cat "$OUT/health-before.json")"
 # and the wrong condition for the bundle.
 python3 tools/serving_profile.py --url "http://127.0.0.1:$PORT" \
     --mode soak --bank tests/load_texts_en_v2.txt --levels "$((C-1))" \
-    --soak-seconds "$SECONDS_OF_LOAD" --warmup-seconds 20 --window-seconds 180 \
+    --soak-seconds "$SECONDS_OF_LOAD" --warmup-seconds 20 \
+    --window-seconds "$((SECONDS_OF_LOAD / 4))" \
     >"$HOME/loadgen.log" 2>&1 &
 LOADPID=$!
 sleep 45
-echo "load at C$C, loadavg $(cut -d' ' -f1 /proc/loadavg)"
+
+# THE CHECK THAT WAS MISSING, AND THE ONE FAILURE THIS SCRIPT CANNOT SURVIVE.
+#
+# The generator is a background process. On 2026-09-22 it REFUSED to start --
+# `--soak-seconds 480 cannot contain the 3 windows of 180 s the drift gate
+# needs` -- and this script sailed past it and captured forty-eight files on an
+# idle box, then printed "load at C80, loadavg 1.73". The number that
+# contradicted the sentence was on the same line as the sentence.
+#
+# Everything else here can degrade and still leave a usable artefact. This
+# cannot: audio rendered on a quiet machine and labelled "under load" is
+# indistinguishable to the listener from the real thing, which is the whole
+# reason the header of this file exists. So it is a refusal, not a warning, and
+# it tests the FACT (what the machine is doing) and not only the intent (that a
+# process was launched).
+if ! kill -0 "$LOADPID" 2>/dev/null; then
+  echo "REFUSING: the load generator exited during warm-up. Its log says:"
+  tail -5 "$HOME/loadgen.log"
+  clear_box; exit 1
+fi
+LOADAVG=$(cut -d' ' -f1 /proc/loadavg)
+CORES=$(nproc)
+# Half the cores busy is a floor, not a target: a server certified at C80 on 24
+# cores runs at a load average near 24, and anything under 12 means the streams
+# the bundle claims to be competing with are not there.
+if [ "$(echo "$LOADAVG" | cut -d. -f1)" -lt "$((CORES / 2))" ]; then
+  echo "REFUSING: loadavg $LOADAVG on $CORES cores after 45 s of warm-up."
+  echo "          The generator is alive but the box is idle, so these samples"
+  echo "          would not be 'under load' whatever the manifest says."
+  tail -5 "$HOME/loadgen.log"
+  clear_box; kill "$LOADPID" 2>/dev/null; exit 1
+fi
+echo "load at C$C CONFIRMED: loadavg $LOADAVG on $CORES cores, generator pid $LOADPID alive"
 
 # The bank is TAB-SEPARATED: "class<TAB>text". Splitting on it is not cosmetic --
 # feeding the whole line to the server would make it speak the word "medium"

@@ -1219,9 +1219,26 @@ alone does not promote a kernel.
       `../qwen-tts` still untaken (`flag_parity.py`). This week added three x86-only flags
       beside two Arm-only ones; `MYNAH_QMAT_BF16DOT=off` on Graviton is silence. Build it
       as a TEST that walks the read sites, not as a generated header nothing reads
-- [ ] E14-9 **no model pack on the x86 box, so no RTF and no serving wave.** Everything
-      above is kernels and reports. One hour with the pack on that machine turns it into a
-      product number, and E4-9's "Linux measurement box" is the item it closes
+- [x] E14-9 **the x86 box ran the pack** — EPYC 9254, 24 cores. Seven topologies screened,
+      four soaks, seven defects found and fixed, and the first PocketTTS numbers this
+      project has from x86 → [`.work/x86-genoa-serving-capacity.md`](.work/x86-genoa-serving-capacity.md)
+- [ ] E14-10 **MAX — the C80 figure is NOT a serving capacity and must be re-measured.**
+      It was taken under `--same-text --max-steps 64`: 1.65 s per request, sd 0.56. A real
+      bank is 4.48 s, sd 4.48, and a ragged mix is a different scheduling problem. Redo with
+      `--bank tests/load_texts_en_v2.txt`, no cap, nothing else on the box: screen
+      16/24/32/48/64 then soak 10 min. The only counter-evidence today was CONFOUNDED (it
+      ran alongside the audio capture) and may not be quoted
+      → [`.work/x86-genoa-serving-capacity.md`](.work/x86-genoa-serving-capacity.md)
+- [ ] E14-11 **the load generator shares the server's cores, so no cadence percentile from
+      that box is certifiable.** 19% coalesced reads against a 15% refusal threshold; Axion
+      stayed under it on 32 cores. Needs a SECOND host for the generator — splitting this
+      one made it worse (46.1%). Blocks any client-facing TTFA number on x86
+- [ ] E14-12 **`configs/perf/epyc-9254-24c-pocket-en.json`** — the x86 twin of the Axion
+      profile, so the next x86 soak is one command instead of a five-phase apparatus
+- [ ] E14-13 **gcc 13.3 emits 23 warnings clang does not**, 7 of them
+      `-Waggressive-loop-optimizations` in `kernels.c`/`qmat.c` (`SIZE_MAX/sizeof(float)`).
+      No call site can produce such an `n`, but they cover real warnings on the PRODUCTION
+      compiler. Candidate: a zero-cost `__builtin_unreachable()` precondition
 
 ### E13 — The ceiling is 128 request slots, not a speed limit → [`.work/int8-backbone.md`](.work/int8-backbone.md)
 
