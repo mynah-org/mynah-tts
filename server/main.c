@@ -1360,6 +1360,11 @@ static void handle_health(int fd) {
     /* 0 when this process is not preforked, which is a real configuration and
      * not a missing value: a single process holds max_batch places. */
     const int prefork_total = mynah_prefork_worker_total();
+    /* Read once: two calls to mynah_rss_bytes() inside one report could
+     * straddle an allocation and print a private figure that is not
+     * resident minus shared for any instant. */
+    const size_t rss_now = mynah_rss_bytes();
+    const size_t rss_shared = mynah_rss_shared_bytes();
 
     char body[2048];
     const int n = snprintf(body, sizeof(body),
@@ -1415,19 +1420,36 @@ static void handle_health(int fd) {
                             * servers, so the number has to be readable from a
                             * running process and not only from the source. */
                            /* E12-11. RSS OF THIS PROCESS, not of the
-                            * machine -- under prefork each worker holds
-                            * its own quantized weight cache, and whether
-                            * that cache is per-process or shared is the
-                            * whole question the int8 backbone was left
-                            * open on: 151.0 MB bf16 against 75.7 MB int8,
-                            * times W. Poll every worker and sum, or read
-                            * one and multiply only after checking they
-                            * agree. 0 means the platform did not answer,
-                            * never "no memory". */
+                            * machine, and SPLIT, which the first cut of
+                            * this was not.
+                            *
+                            * DO NOT SUM rss_bytes ACROSS WORKERS. The
+                            * mmap'd pack is file-backed and every prefork
+                            * worker maps the same pages, so summing counts
+                            * the model once per worker -- sixteen workers
+                            * over a 600 MB pack would report ~10 GB of a
+                            * machine using well under 2. The incremental
+                            * cost of one more worker is rss_private_bytes,
+                            * and the quantized weight cache that E12-11
+                            * exists to measure is heap, so it lands there:
+                            * 151.0 MB of bf16 backbone against 75.7 MB of
+                            * int8 should show up as a difference in the
+                            * PRIVATE number, times W.
+                            *
+                            * rss_peak_bytes is clamped to at least the
+                            * current value: Linux refreshes ru_maxrss at
+                            * particular points, and a forked child can grow
+                            * past the watermark it inherited without the
+                            * watermark being revisited -- observed here as
+                            * a "peak" 0.9 MB BELOW current. 0 anywhere
+                            * means the platform did not answer, never "no
+                            * memory"; rss_private_bytes is 0 on macOS,
+                            * which does not separate the two. */
                            "\"process\":{\"pid\":%d,\"prefork_worker\":%d,"
                            "\"synthesis_threads\":%d,\"decoder_lane\":%d,"
                            "\"engine_threads\":%d,\"pool_spin\":%d,"
-                           "\"rss_bytes\":%zu,\"rss_peak_bytes\":%zu}}",
+                           "\"rss_bytes\":%zu,\"rss_shared_bytes\":%zu,"
+                           "\"rss_private_bytes\":%zu,\"rss_peak_bytes\":%zu}}",
                            g.model_id, g.info.engine, g.info.sample_rate,
                            g.voice_count,
                            langs,
@@ -1457,7 +1479,9 @@ static void handle_health(int fd) {
                                : mynah_num_threads(),
                            mynah_lane_width(), mynah_lane_engine_width(),
                            mynah_pool_spin_budget(),
-                           mynah_rss_bytes(), mynah_rss_peak_bytes());
+                           rss_now, rss_shared,
+                           rss_now > rss_shared ? rss_now - rss_shared : 0,
+                           mynah_rss_peak_bytes());
     if (n > 0) send_status(fd, "200 OK", "application/json", body, (size_t)n);
 }
 

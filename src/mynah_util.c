@@ -47,18 +47,63 @@ size_t mynah_rss_bytes(void) {
 /* PEAK resident size.  getrusage is the portable answer and its unit is not:
  * ru_maxrss is KILOBYTES on Linux and BYTES on macOS/BSD.  Getting that wrong
  * is a factor of 1024 in a capacity plan, so the conversion is explicit per
- * platform rather than inherited from whichever machine it was first read on. */
+ * platform rather than inherited from whichever machine it was first read on.
+ *
+ * AND IT CAN READ BELOW THE CURRENT RSS, which is not a contradiction to
+ * explain away in a comment -- it is a number an operator would size a machine
+ * from. A prefork worker on an EPYC 9254 reported current 267.4 MB and "peak"
+ * 266.5 MB on 2026-09-22. Linux's ru_maxrss is the mm's hiwater_rss, which the
+ * kernel refreshes at particular points (unmap, exit, accounting) rather than
+ * on every fault, and a freshly forked child inherits the parent's watermark
+ * and then grows past it through COW faults without the watermark being
+ * revisited. So the answer lags, and under prefork it lags exactly where this
+ * number is read.
+ *
+ * The peak is at least the current value, by definition. Saying so costs one
+ * comparison and removes a reading that would under-size a host. */
 size_t mynah_rss_peak_bytes(void) {
 #if defined(__unix__) || defined(__APPLE__)
     struct rusage ru;
-    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
-    if (ru.ru_maxrss <= 0) return 0;
+    size_t peak = 0;
+    if (getrusage(RUSAGE_SELF, &ru) == 0 && ru.ru_maxrss > 0) {
 #if defined(__linux__)
-    return (size_t)ru.ru_maxrss * 1024u;
+        peak = (size_t)ru.ru_maxrss * 1024u;
 #else
-    return (size_t)ru.ru_maxrss;
+        peak = (size_t)ru.ru_maxrss;
 #endif
+    }
+    const size_t now = mynah_rss_bytes();
+    return peak > now ? peak : now;
 #else
+    return 0;
+#endif
+}
+
+/* The SHARED half of the resident set: file-backed pages, which under prefork
+ * means the mmap'd model weights that every worker maps and none of them owns.
+ *
+ * This is the field E12-11 actually needs and the first cut of it did not have.
+ * "Poll every worker and sum" -- which is what the /health comment said -- is
+ * WRONG under prefork: it counts the shared weight mapping once per worker, so
+ * sixteen workers over a 600 MB pack report ~10 GB of a machine that is using
+ * well under 2. The incremental cost of one more worker is the PRIVATE part,
+ * resident minus shared, and the quantized cache this item exists to measure is
+ * heap, so it lands there. 0 where the platform cannot say. */
+size_t mynah_rss_shared_bytes(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f == NULL) return 0;
+    unsigned long total = 0, resident = 0, shared = 0;
+    const int got = fscanf(f, "%lu %lu %lu", &total, &resident, &shared);
+    fclose(f);
+    if (got != 3) return 0;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 0;
+    return (size_t)shared * (size_t)page;
+#else
+    /* macOS: task_info's resident_size does not separate shared from private,
+     * and the split needs a walk of the VM regions. Not worth it for a
+     * development platform: 0 means "this platform did not say". */
     return 0;
 #endif
 }

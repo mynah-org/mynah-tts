@@ -34,6 +34,13 @@
 size_t mynah_rss_bytes(void);
 size_t mynah_rss_peak_bytes(void);
 
+/* The file-backed (shared) part of the resident set, so a caller can compute
+ * resident - shared = the private part.  Under prefork that difference is the
+ * only honest per-worker cost: the mmap'd weights are shared by every worker,
+ * so summing rss_bytes across them counts the pack once per worker.  0 on a
+ * platform that does not separate the two (macOS). */
+size_t mynah_rss_shared_bytes(void);
+
 /* Write `message` into `error` when both are usable. */
 void mynah_graph_error(char *error, size_t capacity, const char *message);
 
