@@ -190,7 +190,7 @@ DRIVER_TEST_TARGET := $(BUILD_DIR)/tests/test_driver
 WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
-.PHONY: all cpu info caps simd-auto simd-auto-test self-test test stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
+.PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test ternary-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
@@ -441,7 +441,14 @@ self-test: $(TARGET)
 	@$(TARGET) --self-test
 	@MYNAH_QMAT_VNNI=scalar $(TARGET) --self-test
 
-test: self-test kernels-test qmat-test driver-test window-test json-test playback-sim-test perf-profile-test ternary-test simd-auto-test
+# THE C GATES, and the only ones a sanitizer build can say anything about.
+# `make ubsan` and `make asan` run this target, not `test`: the rest of `test`
+# is pure Python that the sanitizer never instruments, so a missing Python
+# module used to turn the Memory Safety workflow red while saying nothing about
+# memory safety. That happened -- numpy, 2026-09-21, four red sanitizer jobs.
+test-c: self-test kernels-test qmat-test driver-test window-test json-test simd-auto-test
+
+test: test-c playback-sim-test perf-profile-test ternary-test
 	@python3 tests/test_python_tools.py
 	@if test -n "$(MODEL_DIR)"; then $(TARGET) --inspect "$(MODEL_DIR)"; fi
 
@@ -528,8 +535,20 @@ perf-profile-test:
 # audio -- it would quietly make one method look worse than another, which is
 # how a wrong number becomes a finding. So the solves are checked against lstsq
 # and the orderings the report claims are asserted. No model needed.
+# numpy is OFFLINE TOOLING. The repo contract keeps the runtime Python-free, so
+# a machine without numpy must not fail `make test` -- but a silent skip would
+# turn a green run into a statement about nothing, so the skip names the exact
+# command it did not run and how to enable it. CI installs numpy on the jobs
+# that run `make test`, which is what keeps this gate from being vacuous there.
 ternary-test:
-	python3 tools/ternary_feasibility.py self-test
+	@if python3 -c 'import numpy' >/dev/null 2>&1; then \
+		echo "python3 tools/ternary_feasibility.py self-test"; \
+		python3 tools/ternary_feasibility.py self-test; \
+	else \
+		echo "SKIP ternary-test: numpy is not installed"; \
+		echo "     not run: python3 tools/ternary_feasibility.py self-test"; \
+		echo "     enable:  python3 -m pip install numpy"; \
+	fi
 
 serving-profile: serving-wave
 
@@ -719,10 +738,10 @@ endif
 SAN_DIR := build/san-$(subst /,-,$(BLAS_NAME))
 
 ubsan:
-	@$(MAKE) BUILD_DIR=$(SAN_DIR)/ubsan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=undefined' LDFLAGS='-fsanitize=undefined' test
+	@$(MAKE) BUILD_DIR=$(SAN_DIR)/ubsan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=undefined' LDFLAGS='-fsanitize=undefined' test-c
 
 asan:
-	@$(MAKE) BUILD_DIR=$(SAN_DIR)/asan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address' LDFLAGS='-fsanitize=address' test
+	@$(MAKE) BUILD_DIR=$(SAN_DIR)/asan CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address' LDFLAGS='-fsanitize=address' test-c
 
 install: $(TARGET) $(LIBRARY)
 	@test -n "$(PREFIX)" || (echo "usage: make install PREFIX=/path" >&2; exit 2)

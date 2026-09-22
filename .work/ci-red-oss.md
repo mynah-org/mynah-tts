@@ -285,3 +285,94 @@ explicitly; a release build should too.
 - **No model pack**, so every gate that needs weights -- the codec int8
   quality gate, the oracle parity, the WAV smoke -- stays local. That is the
   right trade: `models/` is gitignored and should stay so.
+
+## 2026-09-22 — red again, one root cause and two design defects behind it
+
+`main` has been red since the 2026-09-21 push (`7b4abed`). **Seven jobs, one
+cause**, and the cause is a line I added the day before:
+
+```
+python3 tools/ternary_feasibility.py self-test
+ModuleNotFoundError: No module named 'numpy'
+make: *** [Makefile:532: ternary-test] Error 1
+```
+
+`ternary-test` went into `test:` as a hard dependency. No GitHub runner has
+numpy in its system python — not `ubuntu-latest`, not `ubuntu-24.04-arm`, not
+`macos-latest` — so every job that runs `make test` died on an import:
+
+| workflow | jobs red | where |
+|---|---|---|
+| Build & Test | 3 | `linux-x86_64`, `linux-aarch64`, `macos-arm64`, step *Full test target* |
+| Memory Safety | 4 | UBSan and ASan, both arches, inside `make ubsan` / `make asan` |
+| Code Quality | 0 | it never calls `make test` |
+
+The two link-only failures of 2026-09-19 (`undefined reference to
+`self_test_bf16_convert``) and the `Illegal instruction` in UBSan the same
+evening are **both already fixed** — by `Fix the scalar build` and by `Stop
+MYNAH_QMAT_VNNI=256 granting a feature the CPU lacks` respectively. All twelve
+`link-only` profiles are green on `7b4abed`. Nothing else was red.
+
+### Defect 1 — an offline tool became a build dependency
+
+The repo contract is that `tools/` is offline tooling and the runtime has no
+Python dependency. `ternary-test` quietly promoted numpy to a requirement of
+`make test`, which is a requirement no developer box is told about either.
+
+Fixed by making the target **skip when numpy is absent, loudly**: it prints the
+exact command it did not run and how to enable it, per the testing checklist's
+"report the exact skipped command and reason". A skip that CI could reach would
+be worse than the failure, so CI installs numpy on the jobs that run `make
+test`, and the Code Quality *Python tooling* job — which owns the offline tools
+and already has `setup-python` — runs the ternary self-test unconditionally,
+where the skip cannot reach it.
+
+### Defect 2 — the Memory Safety gate could go red over a Python import
+
+`make ubsan` and `make asan` ran the full `test` target, which includes four
+pure-Python gates the sanitizer does not instrument. So a missing Python module
+turned the *memory safety* workflow red while saying nothing whatsoever about
+memory safety, and green there had always cost four unsanitized Python runs.
+
+`test` is split: `test-c` is the C gates (self-test, kernels, qmat, driver,
+window, json, simd-auto) and is what the sanitizers run; `test` is `test-c`
+plus the Python tooling. No coverage is lost — Build & Test still runs all of
+it — and a sanitizer job can now only be red about C.
+
+### Two real warnings the red run surfaced
+
+Every Linux build has been printing these; they were never read because the
+matrix was green.
+
+* `src/dispatch.c` — `pool.inline_fallbacks`'s explanatory text is built in a
+  240-byte buffer and gcc measures the worst case at **321 bytes**. The arm
+  that overflows is the "this report dispatched nothing, so it has measured
+  nothing" sentence: exactly the one whose loss would let a reader quote an
+  empty report as a result. Buffer is 384.
+* `src/json.c` — `'type' may be used uninitialized` in `scan_value`. A false
+  positive (every path that reads it assigns it first, through `scan_scalar`),
+  but an unread initializer costs nothing and a standing false positive is how
+  a real warning goes unnoticed. Initialized.
+
+Left alone deliberately: the `-Waggressive-loop-optimizations` "iteration
+4611686018427387903" notes in `kernels.c` and `qmat.c` (gcc reasoning about a
+`size_t` induction variable at 2^62, unreachable with real memory) and the
+`-Wformat-truncation` notes on error-message paths in `tokenizer.c`,
+`engine_magpie.c` and `seanet.c`, where truncating a path name into a bounded
+error buffer is the intended behaviour.
+
+### Verified locally before committing
+
+`make test` green; `make test-c` green; `make ubsan` green; `make SIMD=scalar`
+links; both arms of the numpy gate exercised (with numpy: runs and passes;
+with a numpy-less `python3` on PATH: skips, exit 0); the `pool.inline_fallbacks`
+row prints its full sentence; all three workflow files parse.
+
+### Acceptance gate
+
+- [x] every red job on `main` traced to one cause
+- [x] the cause fixed at the root (offline tool is not a build dependency)
+- [x] the gate is still real in CI, and cannot silently skip there
+- [x] a sanitizer workflow can no longer be red about anything but C
+- [ ] one green push on `main` to prove it — needs a push, which is never done
+      without asking

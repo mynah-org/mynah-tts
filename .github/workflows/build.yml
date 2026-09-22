@@ -53,6 +53,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libopenblas-dev
 
+      # `make test` includes the offline Python tooling, and the ternary
+      # feasibility self-test needs numpy. The Makefile SKIPS that gate when
+      # numpy is absent rather than failing the build -- which is right for a
+      # developer box and wrong here, because a skipped gate in CI is a green
+      # tick over an unexecuted test. So CI installs it, and the gate is real.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Python tooling dependencies
+        run: python -m pip install --disable-pip-version-check numpy
+
       - name: Build
         run: make ${{ matrix.simd }}
 

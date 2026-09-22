@@ -1053,7 +1053,11 @@ static void collect_selftests(row_sink *s) {
  * cover everything since start. */
 static void collect_pool_stats(row_sink *s) {
     {
-        static char text[240];
+        /* 240 was too small: the "dispatched nothing" arm alone is 321 bytes
+         * worst case, and gcc's -Wformat-truncation said so on every Linux
+         * build. A truncated row cuts the sentence that tells the reader the
+         * report measured nothing -- the one thing it must not lose. */
+        static char text[384];
         char value[24];
         long long dispatches = 0, serial = 0, inline_fallbacks = 0, joins = 0;
         mynah_parallel_stats(&dispatches, &serial, &inline_fallbacks, &joins);

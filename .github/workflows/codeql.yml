@@ -68,3 +68,14 @@ jobs:
 
       - name: Tooling smoke test
         run: python tests/test_python_tools.py
+
+      # The ternary feasibility harness (E11) is closed-form solves transcribed
+      # from papers: a transcription error would not crash and would not
+      # obviously corrupt audio, it would quietly make one method look worse
+      # than another. `make test` skips this when numpy is missing, so run it
+      # HERE unconditionally -- this is the job that owns the Python tooling and
+      # the one place the skip must not be able to reach.
+      - name: Ternary feasibility self-test
+        run: |
+          python -m pip install --disable-pip-version-check numpy
+          python tools/ternary_feasibility.py self-test

@@ -1284,18 +1284,17 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
 
 ### Deferred
 
-- [~] **CI red on the OSS repo — job fixed, awaiting one run to prove it** →
-  [`.work/ci-red-oss.md`](.work/ci-red-oss.md). `main` was always green; both
-  failures were `workflow_dispatch` runs on `lane/int8-*` and both trace to **one
-  job bug, not a code bug**: `link-only: x86 SIMD=avx512` executed the binary it
-  built on a runner reporting `avx2 fma`, so the startup guard correctly refused
-  and exited 1. The guard is untouched; the step now accepts *started* or
-  *refused with the guard's own message* and still fails on SIGILL (132) or any
-  other exit, verified against four fakes. Left open on purpose: the run that
-  proves it (needs a push, twice green — the matrix flapped) and `--self-test`
-  for the whole matrix, which waits until the Axion box is free. AVX-512 gets no
-  execution coverage on any hosted runner; that is now stated in the note rather
-  than implied by a green tick.
+- [~] **CI on the OSS repo — red since 2026-09-21, fixed locally, one push from
+  proven** → [`.work/ci-red-oss.md`](.work/ci-red-oss.md). Seven red jobs, one
+  cause: `ternary-test` made **numpy a hard dependency of `make test`** and no
+  hosted runner has it. The tool skips loudly now instead of failing the build,
+  CI installs numpy so the gate is not vacuous there, and `make ubsan`/`make
+  asan` run a C-only `test-c` — a *memory safety* workflow could go red over a
+  Python import, and did. Two standing warnings the red run surfaced are fixed
+  with it (a 240-byte dispatch row that gcc measures at 321, a false-positive
+  `may be used uninitialized` in `json.c`). Still open: the AVX-512 execution
+  gap on hosted runners (stated in the note, not implied by a green tick) and
+  `--self-test` across the whole link-only matrix.
 - [-] GPU (Metal/CUDA) work — existing backends stay as they are. Metal measured
   *slower* than CPU on Apple Silicon (`docs/performance.md:71-80`).
 - [-] `*_24l` PocketTTS variants — non-distilled previews, 672 MB-1.3 GB each,

@@ -432,7 +432,11 @@ static int scan_value(jscan *s, mynah_json_type *out_type) {
             return fail(s, s->pos, "expected a value, found end of input");
         }
         const char c = s->text[s->pos];
-        mynah_json_type type;
+        /* Every path that reaches a use of `type` assigns it first, but
+         * gcc cannot see that through scan_scalar and warns; an unread
+         * initializer is cheaper than a false positive standing in the
+         * build log where a real one has to be noticed. */
+        mynah_json_type type = MYNAH_JSON_NULL;
         if (c == '{' || c == '[') {
             type = (c == '{') ? MYNAH_JSON_OBJECT : MYNAH_JSON_ARRAY;
             if (!have_root_type) { root_type = type; have_root_type = 1; }
