@@ -835,6 +835,13 @@ static const cq8_case g_cq8_cases[] = {
     { 256,  24, 256, 1, 1, 0.0215, "kernel 1: one tap" }
 };
 
+/* The one printf-family wrapper under src/ that the compiler was not checking:
+ * every sibling (seanet.c, json.c, transformer_ar.c, ...) carries the attribute
+ * and this one did not, so a format/argument mismatch here would compile clean
+ * and be read back out of a `char error[]` at a self-test failure. */
+static int cq8_fail(char *error, size_t capacity, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
 static int cq8_fail(char *error, size_t capacity, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

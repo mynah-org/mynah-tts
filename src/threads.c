@@ -1432,12 +1432,45 @@ int mynah_pool_meter_report(void *out_file) {
     return nsites;
 }
 
+/* Expand the ONE "%d" a meter path may contain, and copy every other byte
+ * literally -- a lone '%', a "%s", a "%n".
+ *
+ * The template arrives from MYNAH_POOL_METER_JSON, so the obvious spelling,
+ * `snprintf(out, cap, tmpl, getpid())`, hands an environment variable to a
+ * function that will read arguments the caller never pushed: CWE-134, and
+ * CodeQL cpp/tainted-format-string alert #5 flagged exactly this line. "%n"
+ * WRITES through a pointer taken off the stack, so this is not only a disclosure
+ * bug. Nothing here trusts the process's own environment more than it has to --
+ * a server inherits it from whoever started it, which under an orchestrator is
+ * not the same party as whoever built the binary.
+ *
+ * Returns 0, or -1 if the result would not fit (the caller then writes no file
+ * rather than a truncated path). */
+static int pf_expand_pid(char *out, size_t cap, const char *tmpl, int pid) {
+    size_t o = 0;
+    int expanded = 0;
+    if (cap == 0) return -1;
+    for (const char *s = tmpl; *s != '\0'; ++s) {
+        if (!expanded && s[0] == '%' && s[1] == 'd') {
+            const int k = snprintf(out + o, cap - o, "%d", pid);
+            if (k < 0 || (size_t)k >= cap - o) return -1;
+            o += (size_t)k;
+            ++s;                       /* consume the 'd' */
+            expanded = 1;
+            continue;
+        }
+        if (o + 1 >= cap) return -1;
+        out[o++] = *s;
+    }
+    out[o] = '\0';
+    return 0;
+}
+
 int mynah_pool_meter_report_json(const char *path) {
     const char *p = path != NULL ? path : getenv("MYNAH_POOL_METER_JSON");
     if (p == NULL || p[0] == '\0') return 0;
     char resolved[1024];
-    if (strstr(p, "%d") != NULL) snprintf(resolved, sizeof resolved, p, (int)getpid());
-    else snprintf(resolved, sizeof resolved, "%s", p);
+    if (pf_expand_pid(resolved, sizeof resolved, p, (int)getpid()) != 0) return -1;
     FILE *f = fopen(resolved, "w");
     if (f == NULL) return -1;
     mynah_pool_meter m;

@@ -39,12 +39,14 @@
 #include "flow_head.h"
 #include "conv1d.h"
 #include "dispatch.h"
+#include "threads.h"
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #if defined(MYNAH_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -1052,6 +1054,48 @@ static void causal_unfold(void) {
            "channel-major out, zero padded before the start\n", C, L, K);
 }
 
+
+/* ---- the pool meter's path template (CodeQL cpp/tainted-format-string #5) --
+ *
+ * mynah_pool_meter_report_json() takes a path that may carry ONE "%d" for the
+ * pid, and the first spelling passed that path to snprintf AS THE FORMAT. The
+ * path's default source is MYNAH_POOL_METER_JSON, so "%s%s%n" in the
+ * environment made the process read -- and with %n write -- through pointers no
+ * caller ever pushed.
+ *
+ * Nothing in this tree calls the function, which is why it sat open: it is a
+ * public symbol of libmynah_tts and reachable only by a consumer. That makes a
+ * test the only thing that can hold the fix, so this is it. The check is that
+ * the conversion specifiers survive AS FILENAME CHARACTERS. */
+static void pool_meter_path_template(void) {
+    printf("\n== pool meter path: a template is expanded, never interpreted ==\n");
+    /* THE %d IS LOAD-BEARING, and a first version of this test left it out and
+     * was therefore worthless: the old code only reached its snprintf when the
+     * template contained "%d" and took a plain "%s" copy otherwise, so a
+     * template of pure %s/%x passed either way. With the %d present the old
+     * spelling hands the pid to a %s that wants a pointer -- verified to
+     * SIGSEGV -- while the fixed one expands ONLY the %d and writes %s and %x
+     * into the filename as characters. */
+    const char *tmpl = "/tmp/mynah-meter-%s-%x-%d.json";
+    char want[256];
+    snprintf(want, sizeof want, "/tmp/mynah-meter-%%s-%%x-%d.json",
+             (int)getpid());
+    CHECK(mynah_pool_meter_report_json(tmpl) == 0, "template refused: %s", tmpl);
+    FILE *f = fopen(want, "r");
+    CHECK(f != NULL, "expected a file at %s -- %%s/%%x must stay characters "
+                     "and %%d must become the pid", want);
+    if (f != NULL) { fclose(f); remove(want); }
+
+    /* A template that cannot fit writes NO file rather than a truncated one. */
+    char huge[2048];
+    memset(huge, 'a', sizeof huge - 1);
+    huge[0] = '/'; huge[sizeof huge - 1] = '\0';
+    CHECK(mynah_pool_meter_report_json(huge) == -1,
+          "an over-long template was accepted");
+    printf("  ok   %%s and %%x stayed characters, %%d became the pid, and a "
+           "template too long to fit wrote no file\n");
+}
+
 int main(void) {
     char error[512];
     printf("kernels: model-free self tests (PLAN.md E3-6, E4-16d)\n");
@@ -1086,6 +1130,7 @@ int main(void) {
     snake_rows();
     tail_sweep();
     causal_unfold();
+    pool_meter_path_template();
 
     printf("\nkernels: %d checks, %d failures\n", checks, failures);
     if (failures != 0) {
