@@ -2707,6 +2707,28 @@ static int qmat_bf16_dpbf16_verify(void) {
     return 1;
 }
 
+/* EVERY x86 bf16 CALL SITE GOES THROUGH HERE, and that is the whole point.
+ *
+ * The first version of the VDPBF16PS kernel was reached only from
+ * matvec_bf16() -- the single-activation path -- while qmat_rows_job kept
+ * calling matvec_bf16_avx2_x4 directly for a batch. Both were numerically fine
+ * on their own and the combination broke the invariant this file protects by
+ * name: `qmat bf16 batch=2 differs from the row-at-a-time reference at row 0
+ * col 2 -- a lane width changed a row's answer`. On an autoregressive model
+ * that 8e-6 is a different take, so the same request renders differently on a
+ * busy server than on an idle one.
+ *
+ * Caught on an EPYC 9254 on 2026-09-22, the first machine with the unit that
+ * ever ran it -- the prove-on-first-use gate had said the kernel was correct,
+ * and it was: what was wrong was which callers reached it. A gate on a kernel
+ * cannot see a caller that does not call it, which is the argument for routing
+ * every site through one selector rather than remembering to update three. */
+static void matvec_bf16_x86_x4(float *o0, float *o1, float *o2, float *o3,
+                               const float *x0, const float *x1,
+                               const float *x2, const float *x3,
+                               const uint16_t *weights, const float *bias,
+                               size_t rows, size_t cols);
+
 static int qmat_bf16_dpbf16_ok(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -2717,6 +2739,20 @@ static int qmat_bf16_dpbf16_ok(void) {
         cached = (bf16 && qmat_bf16_dpbf16_verify()) ? 1 : 0;
     }
     return cached;
+}
+
+static void matvec_bf16_x86_x4(float *o0, float *o1, float *o2, float *o3,
+                               const float *x0, const float *x1,
+                               const float *x2, const float *x3,
+                               const uint16_t *weights, const float *bias,
+                               size_t rows, size_t cols) {
+    if (qmat_bf16_dpbf16_ok()) {
+        matvec_bf16_dpbf16_x4(o0, o1, o2, o3, x0, x1, x2, x3, weights, bias,
+                              rows, cols);
+        return;
+    }
+    matvec_bf16_avx2_x4(o0, o1, o2, o3, x0, x1, x2, x3, weights, bias,
+                        rows, cols);
 }
 #endif /* MYNAH_QMAT_BF16_X86 */
 
@@ -3045,13 +3081,8 @@ static void matvec_bf16(float *out, const float *x, const uint16_t *weights,
     if (qmat_bf16_unit()) {
         /* Same discipline as the ARM side: one activation takes the x4 kernel
          * with itself repeated, so width never changes a row's answer. */
-        if (qmat_bf16_dpbf16_ok()) {
-            matvec_bf16_dpbf16_x4(out, out, out, out, x, x, x, x, weights, bias,
-                                  rows, cols);
-            return;
-        }
-        matvec_bf16_avx2_x4(out, out, out, out, x, x, x, x, weights, bias,
-                            rows, cols);
+        matvec_bf16_x86_x4(out, out, out, out, x, x, x, x, weights, bias,
+                           rows, cols);
         return;
     }
 #endif
@@ -3813,7 +3844,7 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         const uint16_t *wb = (const uint16_t *)weights + row0 * j->cols;
         size_t b = 0;
         for (; b + 4u <= j->batch; b += 4u) {
-            matvec_bf16_avx2_x4(j->out[b] + row0, j->out[b + 1u] + row0,
+            matvec_bf16_x86_x4(j->out[b] + row0, j->out[b + 1u] + row0,
                                 j->out[b + 2u] + row0, j->out[b + 3u] + row0,
                                 j->x[b], j->x[b + 1u], j->x[b + 2u],
                                 j->x[b + 3u], wb, bs, count, j->cols);
@@ -3822,7 +3853,7 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
             const size_t left = j->batch - b;
             const size_t i1 = left > 1u ? b + 1u : b;
             const size_t i2 = left > 2u ? b + 2u : b;
-            matvec_bf16_avx2_x4(j->out[b] + row0, j->out[i1] + row0,
+            matvec_bf16_x86_x4(j->out[b] + row0, j->out[i1] + row0,
                                 j->out[i2] + row0, j->out[b] + row0,
                                 j->x[b], j->x[i1], j->x[i2], j->x[b],
                                 wb, bs, count, j->cols);
@@ -6741,14 +6772,18 @@ int mynah_qmat_bf16_enabled(const char **why) {
         const int on = qmat_bf16_unit();
         if (why != NULL) {
             if (on && qmat_bf16_dpbf16_ok())
-                *why = "[predicate] src/qmat.c matvec_bf16_dpbf16_x4: VDPBF16PS "
+                *why = "[predicate] NAMED FOR ARM, ANSWERING FOR x86 -- the tier "
+                       "detail is on isa.x86.avx512bf16. "
+                       "src/qmat.c matvec_bf16_dpbf16_x4: VDPBF16PS "
                        "(_mm512_dpbf16_ps), thirty-two MACs per instruction, "
                        "accumulating in f32. RESOLVED means it was EXECUTED in "
                        "this process and agreed with matvec_bf16_scalar inside "
                        "C*FLT_EPSILON -- a CPUID bit alone does not promote it "
                        "(.work/x86-kernel-tiers.md)";
             else if (on)
-                *why = "[predicate] src/qmat.c matvec_bf16_avx2_x4: no usable "
+                *why = "[predicate] NAMED FOR ARM, ANSWERING FOR x86 -- see "
+                       "isa.x86.avx512bf16 for the tier. "
+                       "src/qmat.c matvec_bf16_avx2_x4: no usable "
                        "AVX512-BF16 here, so bf16 is WIDENED to f32 and "
                        "multiplied -- and the widening is free, a bf16 is the "
                        "top sixteen bits of its f32 (_mm256_slli_epi32), where "
@@ -6806,6 +6841,38 @@ static int probe_avx512bw_int8(const char **why) {
 #endif
 }
 
+/* isa.x86.avx512vl. It selects no kernel on its own, which is why it used to
+ * report OFF -- and the footer then counted it as IDLE HARDWARE on a machine
+ * where BOTH AVX-512 kernels name it in their target attribute and cannot run
+ * without it. "This CPU has a unit we have no kernel for" was exactly the
+ * wrong thing to tell an operator about it, so the row answers for the pair it
+ * serves. */
+static int probe_avx512vl(const char **why) {
+#if defined(MYNAH_QMAT_X86_AVX512)
+    const int int8 = qmat_int8_avx512bw_ok();
+#if defined(MYNAH_QMAT_BF16_X86)
+    const int bf = qmat_bf16_dpbf16_ok();
+#else
+    const int bf = 0;
+#endif
+    const int on = int8 || bf;
+    if (why != NULL)
+        *why = on ? "[predicate] a PREREQUISITE, not a selector: VL is named in "
+                    "the target attribute of dot_q8_i32_avx512bw and of "
+                    "matvec_bf16_dpbf16_x4, and at least one of them resolved "
+                    "in this process, so this unit is in use. Which one is on "
+                    "isa.x86.avx512bw and isa.x86.avx512bf16"
+                  : "[predicate] a PREREQUISITE, not a selector: no AVX-512 "
+                    "kernel resolved here, so nothing is using VL. See "
+                    "isa.x86.avx512bw and isa.x86.avx512bf16 for why";
+    return on;
+#else
+    if (why != NULL)
+        *why = "[predicate] src/qmat.c: no AVX-512 kernel on this target";
+    return 0;
+#endif
+}
+
 static int probe_avx512bf16(const char **why) {
 #if defined(MYNAH_QMAT_BF16_X86) && defined(MYNAH_QMAT_X86_AVX512)
     const int on = qmat_bf16_dpbf16_ok();
@@ -6844,6 +6911,7 @@ void mynah_qmat_dispatch_probes(void) {
     mynah_dispatch_register_probe("isa.x86.avx512f", probe_avx512bw_int8);
     mynah_dispatch_register_probe("isa.x86.avx512bw", probe_avx512bw_int8);
     mynah_dispatch_register_probe("isa.x86.avx512bf16", probe_avx512bf16);
+    mynah_dispatch_register_probe("isa.x86.avx512vl", probe_avx512vl);
     mynah_dispatch_register_probe("isa.arm.i8mm", probe_i8mm);
     mynah_dispatch_register_probe("kernel.fused_greedy", probe_fused_greedy);
     mynah_dispatch_register_value_probe("quant.requested", probe_quant_type);

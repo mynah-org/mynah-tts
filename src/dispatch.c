@@ -401,6 +401,35 @@ static const isa_requirement *isa_requirements(void) {
 #define MYNAH_ISA_GUARD_BASELINE
 #endif
 
+/* AND THEREFORE NO snprintf IN THESE TWO FUNCTIONS, which is not a style
+ * choice. Found by gcc 13 on an EPYC 9254, first build of this code on real
+ * x86 hardware:
+ *
+ *   bits/stdio2.h: error: inlining failed in call to 'always_inline'
+ *   'snprintf': target specific option mismatch
+ *
+ * With _FORTIFY_SOURCE on, glibc's snprintf is an __always_inline wrapper
+ * compiled for the translation unit's target -- here -mavx2 -mfma -mf16c -- and
+ * gcc refuses, correctly, to inline it into a function that has promised to
+ * emit only baseline instructions. clang accepts it silently, which is why this
+ * survived a full macOS build and a cross-compile and died on the first machine
+ * that would actually have run it.
+ *
+ * The fix is the honest one rather than the quiet one. Turning fortification
+ * off for this file would trade real hardening for a compile; formatting the
+ * message in an unrestricted helper would put AVX2 back on the failure path,
+ * which is the exact path this guard exists to survive. So the message is built
+ * with bounded copies and no libc formatting at all -- it is only string
+ * substitution, there is not one number in it, and a function that must run on
+ * any x86-64 has no business calling into a header inlined for a wider one. */
+MYNAH_ISA_GUARD_BASELINE
+static size_t isa_guard_put(char *out, size_t cap, size_t o, const char *text) {
+    if (out == NULL || cap == 0u || text == NULL) return o;
+    while (text[0] != '\0' && o + 1u < cap) out[o++] = *text++;
+    out[o] = '\0';
+    return o;
+}
+
 /* What this CPU does have, for the second half of the message.  A mismatch
  * report that names only what is missing leaves the operator to guess which
  * build to fetch instead. */
@@ -426,11 +455,11 @@ static void isa_guard_host(char *out, size_t cap) {
     out[0] = '\0';
     for (size_t i = 0; known[i].name != NULL && o + 1 < cap; ++i) {
         if (known[i].probe() != 1) continue;
-        const int k = snprintf(out + o, cap - o, "%s%s", o > 0 ? " " : "",
-                               known[i].name);
-        if (k > 0) o += (size_t)k;
+        if (o > 0) o = isa_guard_put(out, cap, o, " ");
+        o = isa_guard_put(out, cap, o, known[i].name);
     }
-    if (out[0] == '\0') snprintf(out, cap, "(nothing this build knows how to probe)");
+    if (out[0] == '\0')
+        isa_guard_put(out, cap, 0, "(nothing this build knows how to probe)");
 }
 
 MYNAH_ISA_GUARD_BASELINE
@@ -441,15 +470,24 @@ int mynah_dispatch_isa_guard(char *error, size_t error_capacity) {
         if (error != NULL && error_capacity > 0) {
             char host[256];
             isa_guard_host(host, sizeof host);
-            snprintf(error, error_capacity,
-                     "this binary requires %s and this CPU does not have it. "
-                     "Built as SIMD=%s (%s, %s); the CPU reports: %s. "
-                     "Rebuild with a profile this host supports "
-                     "(make SIMD=portable, or SIMD=avx2 for a travelling x86 "
-                     "binary) -- without this check the next instruction would "
-                     "have been SIGILL.",
-                     req[i].name, MYNAH_SIMD_PROFILE, arch_name(),
-                     MYNAH_GIT_REV, host);
+            size_t o = 0;
+            o = isa_guard_put(error, error_capacity, o, "this binary requires ");
+            o = isa_guard_put(error, error_capacity, o, req[i].name);
+            o = isa_guard_put(error, error_capacity, o,
+                              " and this CPU does not have it. Built as SIMD=");
+            o = isa_guard_put(error, error_capacity, o, MYNAH_SIMD_PROFILE);
+            o = isa_guard_put(error, error_capacity, o, " (");
+            o = isa_guard_put(error, error_capacity, o, arch_name());
+            o = isa_guard_put(error, error_capacity, o, ", ");
+            o = isa_guard_put(error, error_capacity, o, MYNAH_GIT_REV);
+            o = isa_guard_put(error, error_capacity, o, "); the CPU reports: ");
+            o = isa_guard_put(error, error_capacity, o, host);
+            o = isa_guard_put(error, error_capacity, o,
+                              ". Rebuild with a profile this host supports "
+                              "(make SIMD=portable, or SIMD=avx2 for a "
+                              "travelling x86 binary) -- without this check the "
+                              "next instruction would have been SIGILL.");
+            (void)o;
         }
         return -1;
     }
@@ -775,12 +813,10 @@ static void collect_isa(row_sink *s) {
                 yn3(cpu_has_avx512bw()), "MYNAH_QMAT_AVX512",
                 "[UNKNOWN] src/qmat.c did not register the AVX-512BW int8 "
                 "predicate over this id");
-    add_row(s, "isa.x86.avx512vl", yn(MYNAH_DISPATCH_HAS_AVX512VL),
-            yn3(cpu_has_avx512vl()), NULL, "OFF", MYNAH_DISPATCH_SRC_GATE,
-            "[gate] required alongside F and BW by the AVX-512BW int8 dot and "
-            "by VDPBF16PS; it selects no kernel on its own, so the resolved "
-            "column for those lives on isa.x86.avx512bw and "
-            "isa.x86.avx512bf16");
+    add_unknown(s, "isa.x86.avx512vl", yn(MYNAH_DISPATCH_HAS_AVX512VL),
+                yn3(cpu_has_avx512vl()), NULL,
+                "[UNKNOWN] src/qmat.c did not register the prerequisite "
+                "predicate over this id");
     add_unknown(s, "isa.x86.avx512bf16", yn(MYNAH_DISPATCH_HAS_AVX512F),
                 yn3(cpu_has_avx512bf16()), "MYNAH_QMAT_BF16DOT",
                 "[UNKNOWN] src/qmat.c did not register the VDPBF16PS "

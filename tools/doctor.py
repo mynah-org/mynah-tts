@@ -490,7 +490,16 @@ def dispatch_section(rep: Report, binary: str | None) -> dict:
         "quant.argmax_mt", "cpu.matvec_policy", "sgemm.provider", "sgemm.kernel",
         "pool.threads", "pool.cpu_topology", "pool.decoder_lane", "pool.spin",
         "backend.cpu", "backend.metal", "backend.cuda",
-        "isa.arm.dotprod", "isa.arm.i8mm", "isa.x86.avx512vnni", "isa.x86.avxvnni",
+        "isa.arm.dotprod", "isa.arm.i8mm", "isa.arm.bf16",
+        # The x86 tiers, all four, because since E4-9/E14 they are RUNTIME
+        # choices and an operator reading this tool is trying to find out what
+        # the binary in front of them will actually execute. isa.x86.avx2 is
+        # the f32 half (and sgemm follows it); avx512bw is the int8 dot for a
+        # host with 512-bit registers and no VNNI; avx512bf16 is VDPBF16PS, and
+        # bf16 is the dtype the PocketTTS backbone ships, so it is the one row
+        # here whose OFF on capable silicon is a missed win rather than a note.
+        "isa.x86.avx2", "isa.x86.avx512bw", "isa.x86.avx512bf16",
+        "isa.x86.avx512vnni", "isa.x86.avxvnni",
         "codec.seanet_blas",
     ]
     by_id = {r["id"]: r for r in doc.get("features", [])}
