@@ -3094,7 +3094,7 @@ int mynah_seanet_gemm_enabled(void) { return sea_gemm_enabled(); }
  * "OpenBLAS" are different facts and ON/OFF would erase the difference. */
 static int probe_seanet_blas(char *out, size_t capacity, const char **why) {
 #if defined(MYNAH_SEANET_BLAS)
-    static char text[240];
+    static char text[384];
 #endif
     snprintf(out, capacity, "%s", MYNAH_SEANET_BLAS_NAME);
 #if defined(MYNAH_SEANET_OWN_SGEMM)
@@ -3123,6 +3123,10 @@ static int probe_seanet_blas(char *out, size_t capacity, const char **why) {
 }
 
 /* codec.seanet_gemm -- the runtime answer, environment included. */
+/* 384, not 240: gcc measures the convtranspose probe's worst case at 352 bytes
+ * (-Wformat-truncation, on the EPYC box) and a truncated dispatch row loses the
+ * end of the sentence, which is where the counts are. The three probes here
+ * carry the same budget so the next one to grow does not have to rediscover it. */
 static int probe_seanet_gemm(const char **why) {
     const int on = mynah_seanet_gemm_enabled();
 #if defined(MYNAH_SEANET_BLAS)
@@ -3143,7 +3147,7 @@ static int probe_seanet_gemm(const char **why) {
 /* One row per call site, saying what RAN rather than what could run:
  * `gemm/total`, plus the reason each refusal fired. */
 static int probe_seanet_conv_path(char *out, size_t capacity, const char **why) {
-    static char text[240];
+    static char text[384];
     mynah_seanet_dispatch_stats st;
     mynah_seanet_dispatch_stats_get(&st);
     if (st.conv_calls == 0) {
@@ -3168,7 +3172,7 @@ static int probe_seanet_conv_path(char *out, size_t capacity, const char **why) 
 
 static int probe_seanet_convtr_path(char *out, size_t capacity,
                                     const char **why) {
-    static char text[240];
+    static char text[384];
     mynah_seanet_dispatch_stats st;
     mynah_seanet_dispatch_stats_get(&st);
     if (st.convtr_calls == 0) {
