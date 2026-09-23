@@ -39,6 +39,11 @@ struct mynah_backend {
     int (*download)(void *, const float *, float *, size_t, char *, size_t);
     int (*sync)(void *, char *, size_t);
     int (*batch_begin)(void *, char *, size_t);
+    int (*graph_begin)(void *, size_t, const void *, int *, char *, size_t);
+    int (*graph_end)(void *, size_t, const void *, char *, size_t);
+    int (*graph_launch)(void *, size_t, const void *, char *, size_t);
+    void (*graph_abort)(void *, size_t, const void *);
+    void (*graph_forget)(void *, const void *);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
     int (*layer_norm_dev)(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
@@ -70,8 +75,10 @@ struct mynah_backend {
     int (*matmul_graph)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*self_attention_dev)(void *, const float *, float *, float *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*self_attention_batch_dev)(void *, const float *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+    int (*gather_kv_batch)(void *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float *, char *, size_t);
     int (*cross_attention_dev)(void *, const float *, const float *, const float *, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*rope_dev)(void *, float *, size_t, size_t, size_t, float, char *, size_t);
+    int (*rope_batch_dev)(void *, float *, const size_t *, size_t, size_t, size_t, float, char *, size_t);
     int (*host_alloc)(void *, size_t, float **, char *, size_t);
     void (*host_free)(void *, float *);
     int metal_cpu_matmul;
@@ -120,6 +127,11 @@ int mynah_backend_cuda_open(void **state, mynah_backend_matmul_fn *matmul,
 extern int mynah_cuda_upload(void *, const float *, size_t, float **, char *, size_t);
 extern int mynah_cuda_download(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_cuda_sync(void *, char *, size_t);
+extern int mynah_cuda_graph_begin(void *, size_t, const void *, int *, char *, size_t);
+extern int mynah_cuda_graph_end(void *, size_t, const void *, char *, size_t);
+extern int mynah_cuda_graph_launch(void *, size_t, const void *, char *, size_t);
+extern void mynah_cuda_graph_abort(void *, size_t, const void *);
+extern void mynah_cuda_graph_forget(void *, const void *);
 extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_layer_norm_dev(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
@@ -153,8 +165,10 @@ extern int mynah_cuda_clip_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_argmax_dev(void *, const float *, size_t, size_t, size_t, int, unsigned *, char *, size_t);
 extern int mynah_cuda_self_attention_dev(void *, const float *, float *, float *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_batch_dev(void *, const float *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+extern int mynah_cuda_gather_kv_batch(void *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float *, char *, size_t);
 extern int mynah_cuda_cross_attention_dev(void *, const float *, const float *, const float *, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_rope_dev(void *, float *, size_t, size_t, size_t, float, char *, size_t);
+extern int mynah_cuda_rope_batch_dev(void *, float *, const size_t *, size_t, size_t, size_t, float, char *, size_t);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -589,6 +603,11 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->download = mynah_cuda_download;
         backend->sync = mynah_cuda_sync;
         backend->batch_begin = mynah_cuda_batch_begin;
+        backend->graph_begin = mynah_cuda_graph_begin;
+        backend->graph_end = mynah_cuda_graph_end;
+        backend->graph_launch = mynah_cuda_graph_launch;
+        backend->graph_abort = mynah_cuda_graph_abort;
+        backend->graph_forget = mynah_cuda_graph_forget;
         backend->snake_dev = mynah_cuda_snake_dev;
         backend->gelu_dev = mynah_cuda_gelu_dev;
         backend->layer_norm_dev = mynah_cuda_layer_norm_dev;
@@ -621,8 +640,10 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->matmul_graph = mynah_cuda_matmul_graph;
         backend->self_attention_dev = mynah_cuda_self_attention_dev;
         backend->self_attention_batch_dev = mynah_cuda_self_attention_batch_dev;
+        backend->gather_kv_batch = mynah_cuda_gather_kv_batch;
         backend->cross_attention_dev = mynah_cuda_cross_attention_dev;
         backend->rope_dev = mynah_cuda_rope_dev;
+        backend->rope_batch_dev = mynah_cuda_rope_batch_dev;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -734,6 +755,48 @@ int mynah_backend_batch_begin(const mynah_backend *backend,
     if (backend->batch_begin != NULL)
         return backend->batch_begin(backend->state, error, error_capacity);
     return 0;
+}
+
+int mynah_backend_graph_begin(const mynah_backend *backend, size_t key,
+                              const void *identity, int *replay,
+                              char *error, size_t error_capacity) {
+    if (replay != NULL) *replay = 0;
+    if (backend == NULL || identity == NULL || key == 0u) return -1;
+    if (backend->graph_begin == NULL) return 1;
+    return backend->graph_begin(backend->state, key, identity, replay, error,
+                                error_capacity);
+}
+
+int mynah_backend_graph_end(const mynah_backend *backend, size_t key,
+                            const void *identity, char *error,
+                            size_t error_capacity) {
+    if (backend == NULL || identity == NULL || key == 0u ||
+        backend->graph_end == NULL) return 1;
+    return backend->graph_end(backend->state, key, identity, error,
+                              error_capacity);
+}
+
+int mynah_backend_graph_launch(const mynah_backend *backend, size_t key,
+                               const void *identity, char *error,
+                               size_t error_capacity) {
+    if (backend == NULL || identity == NULL || key == 0u ||
+        backend->graph_launch == NULL) return -1;
+    return backend->graph_launch(backend->state, key, identity, error,
+                                 error_capacity);
+}
+
+void mynah_backend_graph_abort(const mynah_backend *backend, size_t key,
+                               const void *identity) {
+    if (backend != NULL && backend->graph_abort != NULL && identity != NULL &&
+        key != 0u) {
+        backend->graph_abort(backend->state, key, identity);
+    }
+}
+
+void mynah_backend_graph_forget(const mynah_backend *backend,
+                                const void *identity) {
+    if (backend != NULL && backend->graph_forget != NULL && identity != NULL)
+        backend->graph_forget(backend->state, identity);
 }
 
 int mynah_backend_gelu_dev(const mynah_backend *backend,
@@ -890,12 +953,34 @@ int mynah_backend_self_attention_batch_dev(
         error_capacity);
 }
 
+int mynah_backend_gather_kv_batch(
+    const mynah_backend *backend, float *const *dev_k_cache,
+    float *const *dev_v_cache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float *dev_out, char *error, size_t error_capacity) {
+    if (backend == NULL || backend->gather_kv_batch == NULL) return -1;
+    return backend->gather_kv_batch(
+        backend->state, dev_k_cache, dev_v_cache, positions, cache_strides,
+        batch, heads, head_width, dev_out, error, error_capacity);
+}
+
 int mynah_backend_rope_dev(const mynah_backend *backend, float *dev_qkv,
                            size_t position, size_t heads, size_t head_width,
                            float max_period, char *error, size_t error_capacity) {
     if (backend == NULL || backend->rope_dev == NULL) return -1;
     return backend->rope_dev(backend->state, dev_qkv, position, heads,
                              head_width, max_period, error, error_capacity);
+}
+
+int mynah_backend_rope_batch_dev(const mynah_backend *backend,
+                                 float *dev_qkv, const size_t *positions,
+                                 size_t batch, size_t heads,
+                                 size_t head_width, float max_period,
+                                 char *error, size_t error_capacity) {
+    if (backend == NULL || backend->rope_batch_dev == NULL) return -1;
+    return backend->rope_batch_dev(backend->state, dev_qkv, positions, batch,
+                                   heads, head_width, max_period, error,
+                                   error_capacity);
 }
 
 int mynah_backend_matmul_dev(const mynah_backend *backend,

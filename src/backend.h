@@ -97,6 +97,26 @@ int mynah_backend_sync(const mynah_backend *backend,
 int mynah_backend_batch_begin(const mynah_backend *backend,
                               char *error, size_t error_capacity);
 
+/* CUDA-Graph command capture for a resident engine step.  The backend keeps
+ * graph objects opaque and keyed by (key, identity); `identity` is normally
+ * the engine scratch arena whose device addresses are embedded in the graph.
+ * begin returns 0 when graph support is available and sets `replay` to 1 for
+ * an existing graph or 0 for a new capture.  It returns 1 when graphs are
+ * disabled/unavailable, which is a normal fallback rather than an error. */
+int mynah_backend_graph_begin(const mynah_backend *backend, size_t key,
+                              const void *identity, int *replay,
+                              char *error, size_t error_capacity);
+int mynah_backend_graph_end(const mynah_backend *backend, size_t key,
+                            const void *identity, char *error,
+                            size_t error_capacity);
+int mynah_backend_graph_launch(const mynah_backend *backend, size_t key,
+                               const void *identity, char *error,
+                               size_t error_capacity);
+void mynah_backend_graph_abort(const mynah_backend *backend, size_t key,
+                               const void *identity);
+void mynah_backend_graph_forget(const mynah_backend *backend,
+                                const void *identity);
+
 /* Device-side matmul: out[rows,ow] = in[rows,iw] @ W[ow,iw]^T + bias.
  * Weight/bias are host pointers (cached on device internally). */
 int mynah_backend_matmul_dev(const mynah_backend *backend,
@@ -158,6 +178,15 @@ int mynah_backend_self_attention_batch_dev(
     const size_t *positions, const size_t *cache_strides, size_t batch,
     size_t heads, size_t head_width, float scale, float *dev_out,
     char *error, size_t error_capacity);
+/* Gather the newly-written K/V slot of each independent request into one
+ * fixed device buffer.  The pointer/position metadata is copied by the
+ * backend, so the operation remains graph-capturable while requests rotate
+ * through server slots.  `out` is [batch][2][heads * head_width]. */
+int mynah_backend_gather_kv_batch(
+    const mynah_backend *backend, float *const *dev_k_cache,
+    float *const *dev_v_cache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float *dev_out, char *error, size_t error_capacity);
 int mynah_backend_cross_attention_dev(const mynah_backend *backend,
                                       const float *dev_q,
                                       const float *dev_k_cache,
@@ -173,6 +202,11 @@ int mynah_backend_rope_dev(const mynah_backend *backend,
                            float *dev_qkv, size_t position,
                            size_t heads, size_t head_width, float max_period,
                            char *error, size_t error_capacity);
+int mynah_backend_rope_batch_dev(const mynah_backend *backend,
+                                 float *dev_qkv, const size_t *positions,
+                                 size_t batch, size_t heads,
+                                 size_t head_width, float max_period,
+                                 char *error, size_t error_capacity);
 
 /* Copy n floats from host to a specific device buffer (no scratch). */
 int mynah_backend_h2d(const mynah_backend *backend, const float *host,

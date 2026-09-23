@@ -56,6 +56,13 @@ Passed locally on the ARM development host after the resident/backend changes:
   batching, admission, concurrency, cancellation and warmup cases;
 * `make -n cuda-server CUDA_ARCH=sm_89` and `git diff --check`.
 
+The resident batch step now also has bucketed CUDA-Graph capture/replay: one
+graph per `(scratch, batch-width)` with pinned input/output/KV shadow staging,
+layer-specific persistent KV pointer tables, dynamic position metadata for
+RoPE/attention, and an ordinary-stream fallback when capture or instantiation
+is unavailable. This is source-implemented but not yet compiled or launched
+on this host.
+
 This host has neither `nvcc` nor an NVIDIA device, so CUDA compilation,
 launch/self-test, stage parity and L40S measurements remain explicitly open.
 The repository CI matrix compiles the CLI and Linux CUDA server for `sm_70`,
@@ -139,9 +146,10 @@ The static audit found failure modes that a compile-only gate cannot see:
   `MYNAH_CUDA_FAST_MATH=1` is an explicit FP16/Tensor-Core experiment and is
   not part of the parity claim until intermediate tensors, EOS and audio pass.
 * Weight caches, batch metadata and graph entries are backend-owned. Graphs are
-  destroyed before scratch/staging growth and on backend close; the remaining
-  work is to expose graph hits, transfers and resident fallback in server
-  health rather than infer them from function pointers.
+  destroyed before scratch/staging growth and on backend close. Resident batch
+  capture/replay is now wired through an opaque backend contract; the remaining
+  observability work is to expose graph hits, transfers and resident fallback in
+  server health rather than infer them from function pointers.
 
 ## What transfers from `../qwen-tts`
 
@@ -243,8 +251,9 @@ seam. Keep
 * keep the latent flow head, EOS reductions and final latent control on device
   where practical — this is still pending, so the current slice downloads the
   backbone hidden row and shadows only the appended K/V slot at the engine seam;
-* capture/replay stable projection shapes only in the opt-in fast-math graph
-  path, with an uncaptured FP32 fallback;
+* capture/replay stable full-backbone batch shapes through per-scratch CUDA
+  Graph buckets (enabled by default, `MYNAH_CUDA_GRAPHS=0` escape hatch), with
+  an uncaptured FP32 fallback;
 * leave the CPU `pocket_proj_*`, qmat cache and scalar/SIMD dispatch untouched.
 
 The first implementation uses f32 accumulation with the CPU-approved weight
@@ -263,7 +272,7 @@ state without corrupting another slot's graph or scratch.
 The single-request decoder first proves stream/offline identity on the same
 backend. Cross-request batching comes after that gate.
 
-### P5 — Linux server integration → **build boundary started; runtime counters pending**
+### P5 — Linux server integration → **build boundary and graph batch path started; runtime counters pending**
 
 Use the existing admission/scheduler/sink. For CUDA:
 
@@ -273,7 +282,8 @@ Use the existing admission/scheduler/sink. For CUDA:
 * cancellation, timeout, bounded queue, health and `/v1/audio/speech`/
   `/v1/tts` streaming retain the CPU contract;
 * the scheduler exposes graph-hit, batch-width, H2D/D2H, sync and fallback
-  counters without allocating in the AR loop.
+  counters without allocating in the AR loop (counter publication is still
+  pending; the graph path itself is now present).
 
 Do not add a second HTTP implementation or a CUDA-specific response format.
 

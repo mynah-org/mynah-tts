@@ -255,6 +255,20 @@ struct cuda_graph_entry {
     bool valid;
 };
 
+/* A resident engine graph is different from the small host matmul graph
+ * above: its activations belong to one scratch arena, while request KV
+ * pointers and positions are supplied through persistent metadata buffers at
+ * launch time.  Keeping the identity explicit prevents a graph from outliving
+ * the arena whose addresses it captured. */
+struct cuda_pipeline_graph_entry {
+    size_t key;
+    const void *identity;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    bool valid;
+    bool capturing;
+};
+
 struct cuda_backend_state;
 static void destroy_graphs(cuda_backend_state *st);
 
@@ -281,10 +295,13 @@ struct cuda_backend_state {
     size_t *dev_batch_cache_strides;
     size_t batch_meta_cap;
     bool fast_math;
+    bool graphs_enabled;
     std::vector<cuda_graph_entry> graph_cache;
+    std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
 };
 
 static constexpr size_t CUDA_BATCH_META_CAP = 64u;
+static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 16u;
 
 static void set_error(char *e, size_t c, const char *m) {
     if (e && c > 0) std::snprintf(e, c, "%s", m);
@@ -314,6 +331,11 @@ static int cbe(cublasStatus_t s, char *e, size_t c) {
 static bool cuda_fast_math_enabled(void) {
     const char *value = std::getenv("MYNAH_CUDA_FAST_MATH");
     return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+static bool cuda_graphs_enabled(void) {
+    const char *value = std::getenv("MYNAH_CUDA_GRAPHS");
+    return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
 static cublasComputeType_t cuda_compute_type(const cuda_backend_state *st) {
@@ -869,8 +891,14 @@ extern "C" int mynah_cuda_self_attention_dev(
 extern "C" int mynah_cuda_self_attention_batch_dev(
     void *, const float *, float *const *, float *const *, const size_t *,
     const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+extern "C" int mynah_cuda_gather_kv_batch(
+    void *, float *const *, float *const *, const size_t *, const size_t *,
+    size_t, size_t, size_t, float *, char *, size_t);
 extern "C" int mynah_cuda_rope_dev(void *, float *, size_t, size_t, size_t,
                                     float, char *, size_t);
+extern "C" int mynah_cuda_rope_batch_dev(
+    void *, float *, const size_t *, size_t, size_t, size_t, float, char *,
+    size_t);
 extern "C" int mynah_cuda_conv1d_dev(void *, const float *, float *, int, int,
                                       int, int, int, const float *, const float *,
                                       char *, size_t);
@@ -897,6 +925,7 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
     float softmax_out[8] = {0.0f};
     float qkv[24] = {0.0f};
     float attention_out[8] = {0.0f};
+    float gathered_kv[16] = {0.0f};
     const float conv_input[3] = {1.0f, 2.0f, 3.0f};
     const float conv_weight[2] = {2.0f, -1.0f};
     const float conv_bias[1] = {0.5f};
@@ -910,6 +939,7 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
     float *vcache[2] = {nullptr, nullptr};
     size_t positions[2] = {0u, 0u};
     size_t strides[2] = {4u, 4u};
+    size_t rope_positions[2] = {7u, 9u};
     const float one_qkv[12] = {1.0f, 0.0f, 0.0f, 1.0f,
                                1.0f, 0.0f, 0.0f, 1.0f,
                                1.0f, 2.0f, 3.0f, 4.0f};
@@ -1015,6 +1045,38 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
         }
     }
 
+    for (size_t i = 0; i < 24u; ++i) qkv[i] = (float)(i + 1u) * 0.125f;
+    if (ce(cudaMemcpy(d_in, qkv, 24u * sizeof(float), cudaMemcpyHostToDevice),
+           e, ec) ||
+        mynah_cuda_rope_batch_dev(st, d_in, rope_positions, 2u, 1u, 4u,
+                                  10000.0f, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(qkv, d_in, 24u * sizeof(float), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t request = 0; request < 2u; ++request) {
+        const size_t row = request * 12u;
+        for (size_t base = 0; base < 8u; base += 2u) {
+            const float q0 = (float)(row + base + 1u) * 0.125f;
+            const float q1 = (float)(row + base + 2u) * 0.125f;
+            const float before_q = q0 * q0 + q1 * q1;
+            const float after_q = qkv[row + base] * qkv[row + base] +
+                                  qkv[row + base + 1u] * qkv[row + base + 1u];
+            const float k0 = (float)(row + base + 5u) * 0.125f;
+            const float k1 = (float)(row + base + 6u) * 0.125f;
+            const float before_k = k0 * k0 + k1 * k1;
+            const float after_k = qkv[row + 4u + base] * qkv[row + 4u + base] +
+                                  qkv[row + 4u + base + 1u] *
+                                  qkv[row + 4u + base + 1u];
+            if (fabsf(before_q - after_q) > 2.0e-3f ||
+                fabsf(before_k - after_k) > 2.0e-3f) {
+                std::snprintf(e, ec,
+                              "CUDA batched RoPE self-test mismatch at request %zu",
+                              request);
+                goto fail;
+            }
+        }
+    }
+
     /* Single and independent-request batched attention both reduce to the
      * only valid value at position zero. */
     if (ce(cudaMemcpy(d_in, one_qkv, sizeof(one_qkv), cudaMemcpyHostToDevice), e, ec) ||
@@ -1042,6 +1104,20 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
         if (fabsf(attention_out[d] - batch_qkv[8u + d]) > 2.0e-4f ||
             fabsf(attention_out[4u + d] - batch_qkv[20u + d]) > 2.0e-4f) {
             std::snprintf(e, ec, "CUDA batched attention self-test mismatch at %zu", d);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_gather_kv_batch(st, kcache, vcache, positions, strides,
+                                   2u, 1u, 4u, d_out, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(gathered_kv, d_out, sizeof(gathered_kv),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t d = 0; d < 4u; ++d) {
+        if (fabsf(gathered_kv[d] - batch_qkv[4u + d]) > 2.0e-4f ||
+            fabsf(gathered_kv[4u + d] - batch_qkv[8u + d]) > 2.0e-4f ||
+            fabsf(gathered_kv[8u + d] - batch_qkv[16u + d]) > 2.0e-4f ||
+            fabsf(gathered_kv[12u + d] - batch_qkv[20u + d]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA K/V gather self-test mismatch at %zu", d);
             goto fail;
         }
     }
@@ -1120,6 +1196,7 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->dev_batch_cache_strides = nullptr;
     st->batch_meta_cap = CUDA_BATCH_META_CAP;
     st->fast_math = cuda_fast_math_enabled();
+    st->graphs_enabled = cuda_graphs_enabled();
     if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
     if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
         set_error(e,ec,"cuBLAS init"); cudaStreamDestroy(st->stream); delete st; return -1; }
@@ -1707,6 +1784,41 @@ __global__ static void k_rope_qk(float *qkv, size_t position, int heads,
     qkv[kbase + 1u] = k0 * sine + k1 * cosine;
 }
 
+__global__ static void k_rope_qk_batch(float *qkv, const size_t *positions,
+                                       int batch, int heads, int head_width,
+                                       float max_period) {
+    const int half = head_width / 2;
+    const size_t per_request = (size_t)heads * (size_t)half;
+    const size_t pair = (size_t)blockIdx.x * (size_t)blockDim.x +
+                        (size_t)threadIdx.x;
+    const size_t total = (size_t)batch * per_request;
+    if (pair >= total) return;
+    const size_t request = pair / per_request;
+    const size_t local = pair % per_request;
+    const int head = (int)(local / (size_t)half);
+    const int i = (int)(local % (size_t)half);
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t row = request * width * 3u;
+    const size_t qbase = row + (size_t)head * (size_t)head_width +
+                         (size_t)(2 * i);
+    const size_t kbase = qbase + width;
+    const float slope = (float)(-log((double)max_period) * 2.0 /
+                                (double)head_width);
+    const float frequency = expf((float)i * slope);
+    const float angle = (float)positions[request] * frequency;
+    float sine = 0.0f;
+    float cosine = 0.0f;
+    sincosf(angle, &sine, &cosine);
+    const float q0 = qkv[qbase];
+    const float q1 = qkv[qbase + 1u];
+    qkv[qbase] = q0 * cosine - q1 * sine;
+    qkv[qbase + 1u] = q0 * sine + q1 * cosine;
+    const float k0 = qkv[kbase];
+    const float k1 = qkv[kbase + 1u];
+    qkv[kbase] = k0 * cosine - k1 * sine;
+    qkv[kbase + 1u] = k0 * sine + k1 * cosine;
+}
+
 static int attention_threads(size_t head_width) {
     int threads = 32;
     while ((size_t)threads < head_width && threads < 256) threads <<= 1;
@@ -1884,6 +1996,69 @@ extern "C" int mynah_cuda_self_attention_batch_dev(
     return ce(cudaGetLastError(), e, ec);
 }
 
+__global__ static void k_gather_kv_batch(
+    float *const *kcache, float *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, size_t width, float *out) {
+    const size_t index = (size_t)blockIdx.x * (size_t)blockDim.x +
+                         (size_t)threadIdx.x;
+    const size_t total = (size_t)batch * 2u * width;
+    if (index >= total) return;
+    const size_t request = index / (2u * width);
+    const size_t part = (index / width) & 1u;
+    const size_t column = index % width;
+    const size_t source = positions[request] * cache_strides[request] + column;
+    out[index] = (part == 0u ? kcache[request] : vcache[request])[source];
+}
+
+extern "C" int mynah_cuda_gather_kv_batch(
+    void *opaque, float *const *kcache, float *const *vcache,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u || batch > st->batch_meta_cap || heads == 0u ||
+        head_width == 0u || heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA batched K/V gather dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t total = 0u;
+    size_t blocks = 0u;
+    if (!cuda_size_mul(batch, 2u, &total) || !cuda_size_mul(total, width, &total) ||
+        !cuda_size_add(total, 255u, &blocks) ||
+        (blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA batched K/V gather size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA batched K/V gather cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides),
+                           cudaMemcpyHostToDevice, st->stream), e, ec)) {
+        return -1;
+    }
+    k_gather_kv_batch<<<(int)blocks, 256, 0, st->stream>>>(
+        st->dev_batch_k_cache, st->dev_batch_v_cache, st->dev_batch_positions,
+        st->dev_batch_cache_strides, (int)batch, width, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
 extern "C" int mynah_cuda_rope_dev(void *opaque, float *qkv,
                                     size_t position, size_t heads,
                                     size_t head_width, float max_period,
@@ -1908,6 +2083,37 @@ extern "C" int mynah_cuda_rope_dev(void *opaque, float *qkv,
     }
     k_rope_qk<<<((int)pairs + 255) / 256, 256, 0, st->stream>>>(
         qkv, position, (int)heads, (int)head_width, max_period);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_rope_batch_dev(
+    void *opaque, float *qkv, const size_t *positions, size_t batch,
+    size_t heads, size_t head_width, float max_period, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || qkv == nullptr || positions == nullptr || batch == 0u ||
+        batch > st->batch_meta_cap || heads == 0u || head_width == 0u ||
+        (head_width & 1u) != 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || !(max_period > 0.0f) ||
+        !isfinite(max_period)) {
+        set_error(e, ec, "invalid CUDA batched RoPE dimensions");
+        return -1;
+    }
+    const size_t half = head_width / 2u;
+    size_t pairs = 0u;
+    size_t blocks = 0u;
+    if (!cuda_size_mul(batch, heads, &pairs) ||
+        !cuda_size_mul(pairs, half, &pairs) ||
+        !cuda_size_add(pairs, 255u, &blocks) ||
+        (blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA batched RoPE size overflow");
+        return -1;
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    k_rope_qk_batch<<<(int)blocks, 256, 0, st->stream>>>(
+        qkv, st->dev_batch_positions, (int)batch, (int)heads,
+        (int)head_width, max_period);
     return ce(cudaGetLastError(), e, ec);
 }
 
@@ -1962,6 +2168,136 @@ static void destroy_graphs(cuda_backend_state *st) {
         entry.valid = false;
     }
     st->graph_cache.clear();
+    for (auto &entry : st->pipeline_graphs) {
+        if (entry.exec != nullptr) cudaGraphExecDestroy(entry.exec);
+        if (entry.graph != nullptr) cudaGraphDestroy(entry.graph);
+        entry.exec = nullptr;
+        entry.graph = nullptr;
+        entry.valid = false;
+        entry.capturing = false;
+    }
+    st->pipeline_graphs.clear();
+}
+
+static cuda_pipeline_graph_entry *find_pipeline_graph(
+    cuda_backend_state *st, size_t key, const void *identity) {
+    for (auto &entry : st->pipeline_graphs) {
+        if (entry.key == key && entry.identity == identity) return &entry;
+    }
+    return nullptr;
+}
+
+extern "C" int mynah_cuda_graph_begin(void *opaque, size_t key,
+                                      const void *identity, int *replay,
+                                      char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (replay != nullptr) *replay = 0;
+    if (st == nullptr || identity == nullptr || key == 0u) return 1;
+    if (!st->graphs_enabled) return 1;
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry != nullptr && entry->valid) {
+        if (replay != nullptr) *replay = 1;
+        return 0;
+    }
+    if (entry != nullptr && entry->capturing) {
+        set_error(e, ec, "CUDA graph capture already active");
+        return -1;
+    }
+    if (st->pipeline_graphs.size() >= CUDA_PIPELINE_GRAPH_CAP) return 1;
+    if (st->cublas_workspace == nullptr) {
+        st->cublas_workspace_cap = 8u * 1024u * 1024u;
+        if (ce(cudaMalloc(&st->cublas_workspace, st->cublas_workspace_cap), e,
+               ec)) return 1;
+    }
+    if (cbe(cublasSetWorkspace(st->cublas, st->cublas_workspace,
+                               st->cublas_workspace_cap), e, ec) ||
+        cbe(cublasSetStream(st->cublas, st->stream), e, ec) ||
+        ce(cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeRelaxed), e,
+           ec)) {
+        return 1;
+    }
+    cuda_pipeline_graph_entry created{};
+    created.key = key;
+    created.identity = identity;
+    created.valid = false;
+    created.capturing = true;
+    st->pipeline_graphs.push_back(created);
+    return 0;
+}
+
+extern "C" int mynah_cuda_graph_end(void *opaque, size_t key,
+                                    const void *identity, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr || key == 0u) return 1;
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry == nullptr || !entry->capturing) return 1;
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status = cudaStreamEndCapture(st->stream, &graph);
+    entry->capturing = false;
+    if (capture_status != cudaSuccess || graph == nullptr) {
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (capture_status != cudaSuccess) ce(capture_status, e, ec);
+        st->pipeline_graphs.pop_back();
+        return 1;
+    }
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t instantiate_status =
+        cudaGraphInstantiate(&exec, graph, 0);
+    if (instantiate_status != cudaSuccess || exec == nullptr) {
+        cudaGraphDestroy(graph);
+        if (instantiate_status != cudaSuccess) ce(instantiate_status, e, ec);
+        st->pipeline_graphs.pop_back();
+        return 1;
+    }
+    entry->graph = graph;
+    entry->exec = exec;
+    entry->valid = true;
+    return 0;
+}
+
+extern "C" int mynah_cuda_graph_launch(void *opaque, size_t key,
+                                       const void *identity, char *e,
+                                       size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr || key == 0u) return -1;
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry == nullptr || !entry->valid || entry->exec == nullptr) {
+        set_error(e, ec, "CUDA graph is not instantiated");
+        return -1;
+    }
+    return ce(cudaGraphLaunch(entry->exec, st->stream), e, ec);
+}
+
+extern "C" void mynah_cuda_graph_abort(void *opaque, size_t key,
+                                        const void *identity) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr || key == 0u) return;
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry == nullptr || !entry->capturing) return;
+    cudaGraph_t graph = nullptr;
+    (void)cudaStreamEndCapture(st->stream, &graph);
+    if (graph != nullptr) cudaGraphDestroy(graph);
+    st->pipeline_graphs.pop_back();
+}
+
+extern "C" void mynah_cuda_graph_forget(void *opaque, const void *identity) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr) return;
+    (void)cudaStreamSynchronize(st->stream);
+    for (size_t i = 0; i < st->pipeline_graphs.size();) {
+        cuda_pipeline_graph_entry &entry = st->pipeline_graphs[i];
+        if (entry.identity != identity) {
+            ++i;
+            continue;
+        }
+        if (entry.exec != nullptr) cudaGraphExecDestroy(entry.exec);
+        if (entry.graph != nullptr) cudaGraphDestroy(entry.graph);
+        st->pipeline_graphs.erase(st->pipeline_graphs.begin() + i);
+    }
 }
 
 static cuda_graph_entry *find_graph(cuda_backend_state *st, size_t rows,
