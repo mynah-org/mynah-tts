@@ -215,7 +215,7 @@ __global__ static void k_argmax(const float *logits, unsigned *result,
                                 int vocab, int codebook_size, unsigned eos_id,
                                 int allow_eos) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    float best = -CUDART_INF_F;
+    float best = -1.0e30f;
     unsigned index = 0u;
     for (int i = 0; i < vocab; ++i) {
         const bool allowed = i < codebook_size ||
@@ -903,7 +903,7 @@ extern "C" int mynah_cuda_conv1d_dev(void *, const float *, float *, int, int,
                                       int, int, int, const float *, const float *,
                                       char *, size_t);
 extern "C" int mynah_cuda_conv_transpose_dev(void *, const float *, float *, int,
-                                              int, int, int, int, int,
+                                              int, int, int, int, int, int,
                                               const float *, const float *, char *,
                                               size_t);
 
