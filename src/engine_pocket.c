@@ -939,6 +939,16 @@ struct mynah_engine_ctx {
     int cuda_backbone_enabled;
     int cuda_backbone_valid;
 
+    /* Optional resident CUDA SEANet decoder. The codec transformer and
+     * quantizer boundary remain host-owned for now; this handle owns the
+     * causal convolution rings and transposed-convolution tails on device. */
+    mynah_backend_decoder *cuda_decoder;
+    float *cuda_decoder_input;
+    float *cuda_decoder_output;
+    int cuda_decoder_enabled;
+    int cuda_decoder_graph_enabled;
+    int cuda_decoder_started;
+
     float *noise;      /* [latent_dim] */
     float *flow_out;   /* [latent_dim] */
     float *latents;    /* [max_steps][latent_dim] */
@@ -3431,6 +3441,196 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     ctx->cuda_backbone_valid = 0;
 }
 
+#define POCKET_CUDA_DECODER_GRAPH_KEY ((size_t)0x200000u)
+
+static void pocket_cuda_decoder_release(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    const mynah_backend *backend =
+        ctx->state == NULL ? NULL : ctx->state->backend;
+    if (backend != NULL) {
+        if (ctx->cuda_decoder != NULL)
+            mynah_backend_graph_forget(backend, ctx->cuda_decoder);
+        mynah_backend_dev_free(backend, ctx->cuda_decoder_input);
+        mynah_backend_dev_free(backend, ctx->cuda_decoder_output);
+        mynah_backend_decoder_close(backend, ctx->cuda_decoder);
+    }
+    ctx->cuda_decoder = NULL;
+    ctx->cuda_decoder_input = NULL;
+    ctx->cuda_decoder_output = NULL;
+    ctx->cuda_decoder_enabled = 0;
+    ctx->cuda_decoder_graph_enabled = 0;
+    ctx->cuda_decoder_started = 0;
+}
+
+static int pocket_cuda_decoder_alloc(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->cuda_decoder_enabled || ctx->state == NULL ||
+        ctx->state->backend == NULL ||
+        strcmp(mynah_backend_name(ctx->state->backend), "cuda") != 0) return 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    mynah_backend_decoder_desc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.channels = cfg->audio_channels;
+    desc.dimension = cfg->codec_dim;
+    desc.n_filters = cfg->n_filters;
+    desc.n_residual_layers = cfg->n_residual_layers;
+    desc.ratios = cfg->ratios;
+    desc.n_ratios = cfg->n_ratios;
+    desc.kernel_size = cfg->kernel_size;
+    desc.residual_kernel_size = cfg->residual_kernel_size;
+    desc.last_kernel_size = cfg->last_kernel_size;
+    desc.dilation_base = cfg->dilation_base;
+    desc.compress = cfg->compress;
+    desc.elu_alpha = cfg->elu_alpha;
+    desc.first = state->decoder.first;
+    desc.convtr = state->decoder.convtr;
+    desc.blocks = state->decoder.blocks;
+    desc.last = state->decoder.last;
+
+    char ignored[256];
+    ignored[0] = '\0';
+    if (mynah_backend_decoder_open(state->backend, &desc, cfg->upsample_stride,
+                                   &ctx->cuda_decoder, ignored,
+                                   sizeof(ignored)) != 0) {
+        ctx->cuda_decoder_enabled = 0;
+        return 0; /* optional backend: CPU remains authoritative */
+    }
+    size_t input_floats = 0;
+    size_t output_floats = 0;
+    if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, &input_floats) != 0 ||
+        pocket_mul(cfg->audio_channels, cfg->samples_per_frame, &output_floats) != 0 ||
+        mynah_backend_dev_alloc(state->backend, input_floats,
+                                &ctx->cuda_decoder_input, ignored,
+                                sizeof(ignored)) != 0 ||
+        mynah_backend_dev_alloc(state->backend, output_floats,
+                                &ctx->cuda_decoder_output, ignored,
+                                sizeof(ignored)) != 0) {
+        pocket_cuda_decoder_release(ctx);
+        return 0;
+    }
+    const char *graphs = getenv("MYNAH_CUDA_GRAPHS");
+    ctx->cuda_decoder_graph_enabled = graphs == NULL || strcmp(graphs, "0") != 0;
+    ctx->cuda_decoder_started = 0;
+    return 0;
+}
+
+/* Return 0 when the resident decoder produced ctx->pcm, 1 when the optional
+ * path is unavailable before it touched decoder state, and -1 after a launch
+ * or output error. Once the GPU rings have advanced, silently switching to the
+ * CPU rings would be wrong, so that last case is intentionally request-fatal. */
+static int pocket_cuda_decoder_step(mynah_engine_ctx *ctx, char *error,
+                                    size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL)
+        return 1;
+    const mynah_backend *backend = ctx->state->backend;
+    const pocket_config *cfg = &ctx->state->cfg;
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+    if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, &input_floats) != 0 ||
+        pocket_mul(cfg->audio_channels, cfg->samples_per_frame,
+                   &output_floats) != 0) {
+        pocket_cuda_decoder_release(ctx);
+        return 1;
+    }
+    char local[256];
+    local[0] = '\0';
+    if (mynah_backend_h2d(backend, ctx->codec_back, ctx->cuda_decoder_input,
+                          input_floats, local, sizeof(local)) != 0) {
+        pocket_cuda_decoder_release(ctx);
+        return 1;
+    }
+
+    int capturing = 0;
+    int replay = 0;
+    int graph = 1;
+    if (ctx->cuda_decoder_graph_enabled) {
+        const int status = mynah_backend_graph_begin(
+            backend, POCKET_CUDA_DECODER_GRAPH_KEY, ctx->cuda_decoder, &replay,
+            local, sizeof(local));
+        if (status < 0) {
+            pocket_cuda_decoder_release(ctx);
+            return 1;
+        }
+        if (status == 0) {
+            capturing = replay == 0;
+        } else {
+            graph = 0;
+            ctx->cuda_decoder_graph_enabled = 0;
+        }
+    } else {
+        graph = 0;
+    }
+
+    if (capturing || !graph) {
+        /* The first graph capture does not execute the kernels until replay;
+         * a non-graph call executes them directly. */
+        ctx->cuda_decoder_started = 1;
+        if (mynah_backend_decoder_step(backend, ctx->cuda_decoder,
+                                       ctx->cuda_decoder_input,
+                                       cfg->upsample_stride,
+                                       ctx->cuda_decoder_output, local,
+                                       sizeof(local)) != 0) {
+            if (capturing) mynah_backend_graph_abort(
+                backend, POCKET_CUDA_DECODER_GRAPH_KEY, ctx->cuda_decoder);
+            pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                                  : "CUDA decoder failed");
+            return -1;
+        }
+        if (capturing) {
+            if (mynah_backend_graph_end(backend, POCKET_CUDA_DECODER_GRAPH_KEY,
+                                         ctx->cuda_decoder, local,
+                                         sizeof(local)) == 0) {
+                capturing = 0;
+                if (mynah_backend_graph_launch(backend,
+                                               POCKET_CUDA_DECODER_GRAPH_KEY,
+                                               ctx->cuda_decoder, local,
+                                               sizeof(local)) != 0) {
+                    pocket_error(error, capacity, "%s", local[0] != '\0'
+                                      ? local : "CUDA decoder graph launch failed");
+                    return -1;
+                }
+                (void)mynah_backend_decoder_note_step(backend,
+                                                       ctx->cuda_decoder);
+            } else {
+                /* Capture is an optimization. Its failed capture did not
+                 * execute the recorded commands; run one ordinary step. */
+                ctx->cuda_decoder_graph_enabled = 0;
+                if (mynah_backend_decoder_step(backend, ctx->cuda_decoder,
+                                               ctx->cuda_decoder_input,
+                                               cfg->upsample_stride,
+                                               ctx->cuda_decoder_output, local,
+                                               sizeof(local)) != 0) {
+                    pocket_error(error, capacity, "%s", local[0] != '\0'
+                                  ? local : "CUDA decoder fallback failed");
+                    return -1;
+                }
+            }
+        }
+    } else if (replay) {
+        ctx->cuda_decoder_started = 1;
+        if (mynah_backend_graph_launch(backend, POCKET_CUDA_DECODER_GRAPH_KEY,
+                                       ctx->cuda_decoder, local,
+                                       sizeof(local)) != 0) {
+            pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                                  : "CUDA decoder graph replay failed");
+            return -1;
+        }
+        (void)mynah_backend_decoder_note_step(backend, ctx->cuda_decoder);
+    }
+    if (mynah_backend_d2h(backend, ctx->cuda_decoder_output, ctx->pcm,
+                          output_floats, local, sizeof(local)) != 0 ||
+        mynah_backend_sync(backend, local, sizeof(local)) != 0) {
+        pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                              : "CUDA decoder synchronization failed");
+        return -1;
+    }
+    if (!pocket_all_finite(ctx->pcm, output_floats)) {
+        pocket_error(error, capacity, "CUDA decoder produced non-finite PCM");
+        return -1;
+    }
+    return 0;
+}
+
 static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     if (ctx == NULL || !ctx->cuda_backbone_enabled || ctx->backbone == NULL) {
         return 0;
@@ -4077,6 +4277,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     pocket_dump_flush(ctx);
     pocket_dump_free(ctx->dump);
     pocket_cuda_backbone_release(ctx);
+    pocket_cuda_decoder_release(ctx);
     pocket_call_release(&ctx->backbone_call.call);
     pocket_call_release(&ctx->codec_call.call);
     pocket_call_release(&ctx->flow_call.call);
@@ -4189,6 +4390,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     }
     ctx->state = state;
     ctx->cuda_backbone_enabled = pocket_cuda_resident_requested(state);
+    ctx->cuda_decoder_enabled = pocket_cuda_resident_requested(state);
     ctx->speaker = request->speaker;
     ctx->max_steps = max_steps;
     ctx->text_length = request->text_length;
@@ -4453,6 +4655,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
      * optional resident path cannot reserve them, the context remains a valid
      * CPU context and the backend contract's safe fallback is preserved. */
     (void)pocket_cuda_backbone_alloc(ctx);
+    (void)pocket_cuda_decoder_alloc(ctx);
 
     /* Set last, so the failure paths above (which call `_ctx_free`) cannot
      * submit a span or count a request that never ran. */
@@ -4558,6 +4761,15 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
     mynah_transformer_ar_state_reset(ctx->backbone);
     mynah_transformer_ar_state_reset(ctx->codec_transformer);
     mynah_seanet_state_reset(ctx->codec);
+    if (ctx->cuda_decoder_enabled && ctx->cuda_decoder != NULL) {
+        char decoder_error[256];
+        if (mynah_backend_decoder_reset(state->backend, ctx->cuda_decoder,
+                                        decoder_error, sizeof(decoder_error)) != 0) {
+            /* No GPU decoder frame has been emitted in this generation yet;
+             * dropping the optional device state is therefore safe. */
+            pocket_cuda_decoder_release(ctx);
+        }
+    }
     mynah_flow_head_reset(ctx->flow);
     ctx->frames = 0;
     ctx->decoded_frames = 0;
@@ -5275,7 +5487,13 @@ static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
                ctx->dump->codec_row * sizeof(float));
     }
     mynah_region_begin2(MYNAH_RGN_CODEC_CONV);
-    if (mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
+    const int cuda_decode = pocket_cuda_decoder_step(ctx, error, capacity);
+    if (cuda_decode < 0) {
+        mynah_region_unwind(depth);
+        return -1;
+    }
+    if (cuda_decode > 0 &&
+        mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
                             ctx->pcm) != 0) {
         mynah_region_unwind(depth);
         pocket_error(error, capacity, "pocket: the SEANet decoder failed");

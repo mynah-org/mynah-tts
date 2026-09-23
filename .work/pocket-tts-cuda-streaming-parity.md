@@ -12,9 +12,11 @@ The first useful milestone is not a CUDA matmul. It is a Linux server that can
 be built as `build/cuda/mynah-tts-server`, refuses CPU/GPU topology mistakes,
 and has enough observability to distinguish a resident Pocket path from a
 host-round-trip prototype. This branch now has resident Pocket backbone and
-one-step flow-head batch paths with per-width CUDA-Graph capture/replay; the
-SEANet decoder is still CPU-side. The target is a qualified C100 on a
-representative L40S later; no rented GPU is part of this work item.
+one-step flow-head batch paths with per-width CUDA-Graph capture/replay, plus
+a resident single-context SEANet decoder with causal rings, transpose tails,
+PCM handoff and a per-context CUDA graph. The codec transformer boundary and
+cross-request decoder batching remain open. The target is a qualified C100 on
+a representative L40S later; no rented GPU is part of this work item.
 
 ## Decision
 
@@ -35,17 +37,21 @@ weights/KV/scratch/graphs are owned by the model or request that created them.
 `server/prefork.c` already rejects a GPU backend before `fork()`; keep that
 refusal as a correctness gate. A requested CUDA backend fails explicitly when
 CUDA is not compiled or no device exists. A compatible Pocket context attempts
-its resident backbone allocation; recoverable allocation or runtime failures
-invalidate the device state and retry the same step through the CPU graph, with
-the fallback made observable as a backend-health item before qualification. The
-server does not pretend that a partial CUDA graph is fully resident.
+its resident backbone and decoder allocation; recoverable failures before a
+device state is advanced invalidate the device state and retry the same step
+through the CPU graph, with the fallback made observable in backend health
+before qualification. A decoder
+failure after its CUDA causal rings advance is request-fatal rather than
+silently switching to stale CPU rings. The server does not pretend that a
+partial CUDA graph is fully resident.
 
 The `make cuda-server` target is a build boundary plus the entry point for the
 resident slice. `--device cuda` may run Pocket's transformer backbone and
 one-step flow head resident when their metadata is compatible. The flow path is
 disabled with `MYNAH_CUDA_FLOW=0`, uses raw FP32 weights in this bring-up, and
-falls back to the CPU flow head on a recoverable failure. SEANet decoding
-remains CPU-side until its causal-state and audio parity gates pass.
+falls back to the CPU flow head on a recoverable failure. The SEANet CUDA path
+is opt-in through the CUDA engine context; its codec-transformer input remains
+host-owned and its output is one bounded D2H PCM transfer per frame.
 
 ## Validation snapshot — 2026-09-23
 
@@ -119,13 +125,16 @@ The existing backend is a useful foundation but is not a Pocket CUDA engine.
   cached CUDA projections. This is deliberate for the first parity path; it is
   not evidence that the CPU qmat/f16 representation is already reproduced on
   the GPU.
-* `pocket_decode_audio_batch()` does not use device scratch and invokes the
-  causal codec once per context. Existing CUDA codec primitives are therefore
-  not evidence that Pocket's SEANet decoder is resident.
+* `pocket_decode_audio_batch()` walks ranges frame-major and invokes the
+  resident causal decoder once per context when CUDA is active. Decoder state
+  is device-resident, but cross-request SEANet batching and the
+  quantizer/codec-transformer device boundary remain open; this is not yet a
+  C100 throughput claim.
 * `mynah_backend_has_dev_ops()` remains intentionally too coarse for this job:
   the CUDA backend now has more device operations, but that does not certify a
-  complete Pocket graph. Pocket capability is still model-specific; the health
-  state and per-stage fallback counters are pending.
+  complete Pocket graph. Pocket capability is still model-specific; backend
+  counters are exposed through `mynah_tts_backend_metrics` and `/health`, while
+  CUDA runtime values still need a real-device validation.
 * Before this branch, `make cuda` built only the CLI while `make server` linked
   the CPU object tree. This branch adds `make cuda-server`, using the CUDA core
   objects, CUDA backend and server objects in `build/cuda/`. The CPU target and
@@ -142,9 +151,9 @@ The static audit found failure modes that a compile-only gate cannot see:
 * The CUDA vtable now assigns explicit device contracts for copy/scale/clip,
   argmax, attention, RoPE, resident conv and transposed-conv. A non-null
   matmul pointer still must not be used as a complete resident-graph bit.
-* The host-facing `conv1d` contract is now separate from `conv1d_dev`; Pocket's
-  current SEANet path is deliberately not enabled by that primitive because
-  decoder state and stream parity are not implemented yet.
+* The host-facing `conv1d` contract is separate from `conv1d_dev`; the Pocket
+  decoder uses its own resident stateful path so causal rings and
+  transposed-convolution tails cannot be confused with stateless primitives.
 * Device GELU, LayerNorm, residual, softmax and attention no longer require a
   host round trip in the resident backbone. Device SGEMM honours caller
   leading dimensions. Runtime validation on `nvcc` and a GPU is still pending.
@@ -154,11 +163,12 @@ The static audit found failure modes that a compile-only gate cannot see:
 * CUDA GEMM defaults to FP32 inputs/accumulation for the first parity path.
   `MYNAH_CUDA_FAST_MATH=1` is an explicit FP16/Tensor-Core experiment and is
   not part of the parity claim until intermediate tensors, EOS and audio pass.
-* Weight caches, batch metadata and graph entries are backend-owned. Graphs are
-  destroyed before scratch/staging growth and on backend close. Resident batch
-  capture/replay is now wired through an opaque backend contract; the remaining
-  observability work is to expose graph hits, transfers and resident fallback in
-  server health rather than infer them from function pointers.
+* Weight caches, batch metadata, graph entries and backend counters are
+  backend-owned. `/health` and SIGUSR1 stats expose H2D/D2H bytes, graph
+  captures/replays/fallbacks, decoder steps/failures and resident fallbacks.
+  Graphs are destroyed before scratch/staging growth and on backend close.
+  Resident batch capture/replay is wired through an opaque backend contract;
+  GPU launch and stage parity remain open.
 
 ## What transfers from `../qwen-tts`
 
@@ -272,7 +282,7 @@ representation and explicitly disables TF32/fast-math shortcuts until the
 stage tolerances are measured. CUDA quantization, FP16 compute and TF32 are
 later A/B items, not shortcuts around parity.
 
-### P4 — Resident SEANet streaming decoder → **not started**
+### P4 — Resident SEANet streaming decoder → **single-context slice implemented**
 
 Port the actual Pocket SEANet graph, not the Qwen decoder by name. Carry causal
 conv rings, decoder-transformer KV and frame position in the per-request device
@@ -280,10 +290,15 @@ state. Decode batched contiguous frame ranges and emit a bounded PCM chunk via
 the existing asynchronous stream writer. A disconnect must release the request
 state without corrupting another slot's graph or scratch.
 
-The single-request decoder first proves stream/offline identity on the same
-backend. Cross-request batching comes after that gate.
+The first CUDA slice now carries the SEANet causal conv rings and
+conv-transpose partial tails on device, uses persistent cuBLAS/device scratch,
+captures one stable graph per context, and hands back one bounded PCM frame.
+The model-free CUDA self-test compares two consecutive decoder calls against
+the CPU SEANet state. The codec quantizer/transformer stays host-side and the
+gang remains serial across contexts, so cross-request decoder batching,
+same-backend stream/offline parity and GPU stage parity are still required.
 
-### P5 — Linux server integration → **build boundary and graph batch path started; runtime counters pending**
+### P5 — Linux server integration → **build boundary, graph batch path and metrics implemented**
 
 Use the existing admission/scheduler/sink. For CUDA:
 
@@ -293,8 +308,8 @@ Use the existing admission/scheduler/sink. For CUDA:
 * cancellation, timeout, bounded queue, health and `/v1/audio/speech`/
   `/v1/tts` streaming retain the CPU contract;
 * the scheduler exposes graph-hit, batch-width, H2D/D2H, sync and fallback
-  counters without allocating in the AR loop (counter publication is still
-  pending; the graph path itself is now present).
+  counters without allocating in the AR loop. `/health` carries backend
+  metrics for CPU (zero CUDA counters) and CUDA (live monotonic counters).
 
 Do not add a second HTTP implementation or a CUDA-specific response format.
 

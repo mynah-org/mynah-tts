@@ -74,6 +74,8 @@ done
 
 echo "health      $(curl -s "$BASE/health")"
 curl -s "$BASE/health" | grep -q '"status":"ok"' || fail "/health"
+curl -s "$BASE/health" | grep -q '"backend_metrics":{"h2d_bytes":' ||
+    fail "/health backend_metrics"
 
 curl -s "$BASE/v1/voices" | grep -q '"voices"' || fail "/v1/voices"
 

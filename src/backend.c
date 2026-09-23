@@ -34,6 +34,14 @@ struct mynah_backend {
     mynah_backend_sgemm_fn sgemm;
     mynah_backend_close_fn close;
     mynah_backend_self_test_fn self_test;
+    int (*decoder_open)(void *, const mynah_backend_decoder_desc *, size_t,
+                        mynah_backend_decoder **, char *, size_t);
+    void (*decoder_close)(void *, mynah_backend_decoder *);
+    int (*decoder_reset)(void *, mynah_backend_decoder *, char *, size_t);
+    int (*decoder_step)(void *, mynah_backend_decoder *, const float *, size_t,
+                        float *, char *, size_t);
+    int (*decoder_note_step)(void *, mynah_backend_decoder *);
+    int (*metrics_get)(void *, mynah_tts_backend_metrics *);
     /* Device-side ops (NULL = CPU fallback in backend.c). */
     int (*upload)(void *, const float *, size_t, float **, char *, size_t);
     int (*download)(void *, const float *, float *, size_t, char *, size_t);
@@ -171,6 +179,14 @@ extern int mynah_cuda_gather_kv_batch(void *, float *const *, float *const *, co
 extern int mynah_cuda_cross_attention_dev(void *, const float *, const float *, const float *, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_rope_dev(void *, float *, size_t, size_t, size_t, float, char *, size_t);
 extern int mynah_cuda_rope_batch_dev(void *, float *, const size_t *, size_t, size_t, size_t, float, char *, size_t);
+extern int mynah_cuda_decoder_open(void *, const mynah_backend_decoder_desc *, size_t,
+                                   mynah_backend_decoder **, char *, size_t);
+extern void mynah_cuda_decoder_close(void *, mynah_backend_decoder *);
+extern int mynah_cuda_decoder_reset(void *, mynah_backend_decoder *, char *, size_t);
+extern int mynah_cuda_decoder_step(void *, mynah_backend_decoder *, const float *,
+                                   size_t, float *, char *, size_t);
+extern int mynah_cuda_decoder_note_step(void *, mynah_backend_decoder *);
+extern int mynah_cuda_metrics_get(void *, mynah_tts_backend_metrics *);
 #endif
 
 static void set_error(char *error, size_t capacity, const char *message) {
@@ -647,6 +663,12 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->cross_attention_dev = mynah_cuda_cross_attention_dev;
         backend->rope_dev = mynah_cuda_rope_dev;
         backend->rope_batch_dev = mynah_cuda_rope_batch_dev;
+        backend->decoder_open = mynah_cuda_decoder_open;
+        backend->decoder_close = mynah_cuda_decoder_close;
+        backend->decoder_reset = mynah_cuda_decoder_reset;
+        backend->decoder_step = mynah_cuda_decoder_step;
+        backend->decoder_note_step = mynah_cuda_decoder_note_step;
+        backend->metrics_get = mynah_cuda_metrics_get;
 #else
         free(backend);
         set_error(error, error_capacity, "CUDA backend is not compiled; use make cuda");
@@ -718,6 +740,70 @@ int mynah_backend_self_test(mynah_tts_device device, char *error, size_t error_c
 #endif
     mynah_backend_close(backend);
     return result;
+}
+
+int mynah_backend_decoder_open(const mynah_backend *backend,
+                               const mynah_backend_decoder_desc *desc,
+                               size_t max_encoder_frames,
+                               mynah_backend_decoder **out,
+                               char *error, size_t error_capacity) {
+    if (out != NULL) *out = NULL;
+    if (backend == NULL || desc == NULL || out == NULL ||
+        max_encoder_frames == 0u || backend->decoder_open == NULL) {
+        set_error(error, error_capacity, "resident decoder is unavailable");
+        return -1;
+    }
+    return backend->decoder_open(backend->state, desc, max_encoder_frames, out,
+                                 error, error_capacity);
+}
+
+void mynah_backend_decoder_close(const mynah_backend *backend,
+                                 mynah_backend_decoder *decoder) {
+    if (backend == NULL || decoder == NULL) return;
+    if (backend->decoder_close != NULL)
+        backend->decoder_close(backend->state, decoder);
+}
+
+int mynah_backend_decoder_reset(const mynah_backend *backend,
+                                mynah_backend_decoder *decoder,
+                                char *error, size_t error_capacity) {
+    if (backend == NULL || decoder == NULL || backend->decoder_reset == NULL) {
+        set_error(error, error_capacity, "resident decoder is unavailable");
+        return -1;
+    }
+    return backend->decoder_reset(backend->state, decoder, error, error_capacity);
+}
+
+int mynah_backend_decoder_step(const mynah_backend *backend,
+                               mynah_backend_decoder *decoder,
+                               const float *dev_input,
+                               size_t encoder_frames,
+                               float *dev_output,
+                               char *error, size_t error_capacity) {
+    if (backend == NULL || decoder == NULL || dev_input == NULL ||
+        dev_output == NULL || encoder_frames == 0u ||
+        backend->decoder_step == NULL) {
+        set_error(error, error_capacity, "resident decoder is unavailable");
+        return -1;
+    }
+    return backend->decoder_step(backend->state, decoder, dev_input,
+                                 encoder_frames, dev_output, error,
+                                 error_capacity);
+}
+
+int mynah_backend_decoder_note_step(const mynah_backend *backend,
+                                    mynah_backend_decoder *decoder) {
+    if (backend == NULL || decoder == NULL || backend->decoder_note_step == NULL)
+        return 0;
+    return backend->decoder_note_step(backend->state, decoder);
+}
+
+int mynah_backend_metrics_get(const mynah_backend *backend,
+                              mynah_tts_backend_metrics *metrics) {
+    if (metrics == NULL) return -1;
+    memset(metrics, 0, sizeof(*metrics));
+    if (backend == NULL || backend->metrics_get == NULL) return 0;
+    return backend->metrics_get(backend->state, metrics);
 }
 
 /* ---- Device-side operations ----

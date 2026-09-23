@@ -1366,6 +1366,21 @@ static void handle_health(int fd) {
     const size_t rss_now = mynah_rss_bytes();
     const size_t rss_shared = mynah_rss_shared_bytes();
 
+    mynah_tts_backend_metrics backend_metrics;
+    memset(&backend_metrics, 0, sizeof(backend_metrics));
+    (void)mynah_tts_model_get_backend_metrics(g.model, &backend_metrics);
+    char backend_stats[640];
+    snprintf(backend_stats, sizeof(backend_stats),
+             "{\"h2d_bytes\":%llu,\"d2h_bytes\":%llu,"
+             "\"graph_captures\":%llu,\"graph_replays\":%llu,"
+             "\"graph_fallbacks\":%llu,\"decoder_steps\":%llu,"
+             "\"decoder_failures\":%llu,\"resident_fallbacks\":%llu}",
+             backend_metrics.h2d_bytes, backend_metrics.d2h_bytes,
+             backend_metrics.graph_captures, backend_metrics.graph_replays,
+             backend_metrics.graph_fallbacks, backend_metrics.decoder_steps,
+             backend_metrics.decoder_failures,
+             backend_metrics.resident_fallbacks);
+
     /* THE COUNTERS THIS PROCESS CANNOT KNOW.
      *
      * `jobs` above is THIS WORKER's, and always was. What it can never contain
@@ -1400,7 +1415,7 @@ static void handle_health(int fd) {
         }
     }
 
-    char body[3072];
+    char body[4096];
     const int n = snprintf(body, sizeof(body),
                            "{\"status\":\"ok\",\"model\":\"%s\",\"engine\":\"%s\","
                            "\"sample_rate\":%u,\"voices\":%zu,"
@@ -1415,6 +1430,7 @@ static void handle_health(int fd) {
                            "\"failed\":%lu,\"rejected\":%lu,\"timed_out\":%lu,"
                            "\"disconnected\":%lu,\"language_refused\":%lu},"
                            "\"streams\":{\"active\":%lu,\"total\":%lu},"
+                           "\"backend_metrics\":%s,"
                            "\"router\":%s,"
                            /* A policy that is on by default has to be
                             * READABLE, or an operator cannot tell a server
@@ -1501,6 +1517,7 @@ static void handle_health(int fd) {
                            atomic_load(&g_stats.language_refused),
                            atomic_load(&g_stats.streams_active),
                            atomic_load(&g_stats.streams_total),
+                           backend_stats,
                            router,
                            g.max_batch, g.max_pending, g.worker_count,
                            prefork_total, prefork_total > 0
@@ -1854,6 +1871,9 @@ static void dump_local_stats(void) {
     char who[48];
     if (idx >= 0) snprintf(who, sizeof(who), "worker %d pid %d", idx, (int)getpid());
     else snprintf(who, sizeof(who), "server pid %d", (int)getpid());
+    mynah_tts_backend_metrics backend_metrics;
+    memset(&backend_metrics, 0, sizeof(backend_metrics));
+    (void)mynah_tts_model_get_backend_metrics(g.model, &backend_metrics);
     fprintf(stderr,
             "[%s] queued=%lu active=%lu completed=%lu failed=%lu rejected=%lu "
             "timed_out=%lu disconnected=%lu streams=%lu/%lu · threads=%d max_batch=%zu\n",
@@ -1866,6 +1886,14 @@ static void dump_local_stats(void) {
             mynah_prefork_worker_threads() > 0 ? mynah_prefork_worker_threads()
                                                : mynah_num_threads(),
             g.max_batch);
+    fprintf(stderr,
+            "[%s] backend=%s h2d=%llu d2h=%llu graph=%llu/%llu fallback=%llu "
+            "decoder_steps=%llu decoder_failures=%llu resident_fallbacks=%llu\n",
+            who, g.info.device, backend_metrics.h2d_bytes,
+            backend_metrics.d2h_bytes, backend_metrics.graph_captures,
+            backend_metrics.graph_replays, backend_metrics.graph_fallbacks,
+            backend_metrics.decoder_steps, backend_metrics.decoder_failures,
+            backend_metrics.resident_fallbacks);
     fflush(stderr);
 }
 

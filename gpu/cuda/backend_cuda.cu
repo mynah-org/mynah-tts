@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <new>
 #include <vector>
 
@@ -293,6 +294,95 @@ __global__ static void k_clip(float *data, int n) {
     data[i] = isfinite(value) ? fminf(1.0f, fmaxf(-1.0f, value)) : 0.0f;
 }
 
+__global__ static void k_decoder_elu(const float *input, float *output,
+                                     float alpha, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    const float x = input[i];
+    output[i] = x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+}
+
+/* Build the causal window used by one resident decoder convolution. The CPU
+ * reference carries the last `tail` values of each input channel; the first
+ * call sees zero padding for every Pocket decoder convolution. */
+__global__ static void k_decoder_causal_window(const float *previous,
+                                               const float *input, float *window,
+                                               int channels, int length, int tail) {
+    const int window_len = tail + length;
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * window_len;
+    if (index >= total) return;
+    const int channel = index / window_len;
+    const int pos = index - channel * window_len;
+    if (pos < tail) {
+        window[index] = previous[(size_t)channel * (size_t)tail + (size_t)pos];
+    } else {
+        window[index] = input[(size_t)channel * (size_t)length +
+                              (size_t)(pos - tail)];
+    }
+}
+
+__global__ static void k_decoder_causal_columns(const float *window,
+                                                float *columns, int channels,
+                                                int length, int kernel,
+                                                int dilation, int stride,
+                                                int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * kernel * length;
+    if (index >= total) return;
+    const int out_pos = index % length;
+    const int tap_channel = index / length;
+    const int tap = tap_channel % kernel;
+    const int channel = tap_channel / kernel;
+    const int window_len = tail + length;
+    /* `window` already starts with the carried left context.  The CPU
+     * reference indexes that combined buffer at `out_pos * stride`, so adding
+     * `tail` here would skip the causal padding and shift every convolution
+     * into the future. */
+    const int source = out_pos * stride + tap * dilation;
+    columns[index] = source >= 0 && source < window_len
+        ? window[(size_t)channel * (size_t)window_len + (size_t)source]
+        : 0.0f;
+}
+
+__global__ static void k_decoder_copy_tail(const float *window, float *previous,
+                                           int channels, int length, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * tail;
+    if (index >= total) return;
+    const int channel = index / tail;
+    const int pos = index - channel * tail;
+    const int window_len = tail + length;
+    previous[index] = window[(size_t)channel * (size_t)window_len +
+                             (size_t)(window_len - tail + pos)];
+}
+
+__global__ static void k_decoder_convtr_fold_save(float *full, float *partial,
+                                                  const float *bias,
+                                                  int channels, int full_len,
+                                                  int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * tail;
+    if (index >= total) return;
+    const int channel = index / tail;
+    const int pos = index - channel * tail;
+    float *row = full + (size_t)channel * (size_t)full_len;
+    row[pos] += partial[index];
+    partial[index] = row[full_len - tail + pos] -
+                     (bias == nullptr ? 0.0f : bias[channel]);
+}
+
+__global__ static void k_decoder_copy_prefix(const float *full, float *output,
+                                             int channels, int full_len,
+                                             int output_len) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * output_len;
+    if (index >= total) return;
+    const int channel = index / output_len;
+    const int pos = index - channel * output_len;
+    output[index] = full[(size_t)channel * (size_t)full_len + (size_t)pos];
+}
+
 __global__ static void k_argmax(const float *logits, unsigned *result,
                                 int vocab, int codebook_size, unsigned eos_id,
                                 int allow_eos) {
@@ -380,10 +470,64 @@ struct cuda_backend_state {
     bool graphs_enabled;
     std::vector<cuda_graph_entry> graph_cache;
     std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
+    std::atomic<unsigned long long> h2d_bytes;
+    std::atomic<unsigned long long> d2h_bytes;
+    std::atomic<unsigned long long> graph_captures;
+    std::atomic<unsigned long long> graph_replays;
+    std::atomic<unsigned long long> graph_fallbacks;
+    std::atomic<unsigned long long> decoder_steps;
+    std::atomic<unsigned long long> decoder_failures;
+    std::atomic<unsigned long long> resident_fallbacks;
+};
+
+enum cuda_decoder_op_kind {
+    CUDA_DECODER_CONV = 0,
+    CUDA_DECODER_CONVTR = 1,
+    CUDA_DECODER_RESBLOCK = 2
+};
+
+struct cuda_decoder_op {
+    cuda_decoder_op_kind kind;
+    int pre_elu;
+    int in_channels;
+    int out_channels;
+    int kernel;
+    int stride;
+    int dilation;
+    int groups;
+    size_t max_in_len;
+    size_t tail;
+    size_t max_full_len;
+    float *weight;
+    float *bias;
+    float *previous;
+    float *window;
+    float *partial;
+    float *full;
+};
+
+struct mynah_backend_decoder {
+    cuda_backend_state *backend;
+    size_t channels;
+    size_t dimension;
+    size_t n_filters;
+    size_t max_encoder_frames;
+    float elu_alpha;
+    size_t work_floats;
+    size_t columns_floats;
+    float *work_a;
+    float *work_b;
+    float *work_c;
+    float *columns;
+    std::vector<cuda_decoder_op> ops;
 };
 
 static constexpr size_t CUDA_BATCH_META_CAP = 64u;
-static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 16u;
+/* A server can retain one decoder graph per live context in addition to the
+ * width-bucketed backbone and flow graphs. Sixteen entries made a full
+ * max-batch server disable capture after warm-up. Keep the bound finite, but
+ * large enough for the advertised request width plus the shared graph family. */
+static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 64u;
 
 static void set_error(char *e, size_t c, const char *m) {
     if (e && c > 0) std::snprintf(e, c, "%s", m);
@@ -988,6 +1132,16 @@ extern "C" int mynah_cuda_conv_transpose_dev(void *, const float *, float *, int
                                               int, int, int, int, int, int,
                                               const float *, const float *, char *,
                                               size_t);
+static int cuda_decoder_self_test(void *opaque, char *e, size_t ec);
+extern "C" int mynah_cuda_decoder_open(
+    void *, const mynah_backend_decoder_desc *, size_t,
+    mynah_backend_decoder **, char *, size_t);
+extern "C" void mynah_cuda_decoder_close(void *, mynah_backend_decoder *);
+extern "C" int mynah_cuda_decoder_reset(void *, mynah_backend_decoder *,
+                                          char *, size_t);
+extern "C" int mynah_cuda_decoder_step(void *, mynah_backend_decoder *,
+                                         const float *, size_t, float *, char *,
+                                         size_t);
 
 static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
@@ -1203,6 +1357,7 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
             goto fail;
         }
     }
+    if (cuda_decoder_self_test(st, e, ec) != 0) goto fail;
     cudaFree(d_in); cudaFree(d_out); cudaFree(d_k0); cudaFree(d_v0);
     cudaFree(d_k1); cudaFree(d_v1);
     return 0;
@@ -1276,6 +1431,14 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->dev_batch_v_cache = nullptr;
     st->dev_batch_positions = nullptr;
     st->dev_batch_cache_strides = nullptr;
+    st->h2d_bytes.store(0ull, std::memory_order_relaxed);
+    st->d2h_bytes.store(0ull, std::memory_order_relaxed);
+    st->graph_captures.store(0ull, std::memory_order_relaxed);
+    st->graph_replays.store(0ull, std::memory_order_relaxed);
+    st->graph_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->decoder_steps.store(0ull, std::memory_order_relaxed);
+    st->decoder_failures.store(0ull, std::memory_order_relaxed);
+    st->resident_fallbacks.store(0ull, std::memory_order_relaxed);
     st->batch_meta_cap = CUDA_BATCH_META_CAP;
     st->fast_math = cuda_fast_math_enabled();
     st->graphs_enabled = cuda_graphs_enabled();
@@ -1309,6 +1472,21 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     *close = cuda_close;
     *self_test = cuda_self_test;
     if (e && ec > 0) e[0] = '\0';
+    return 0;
+}
+
+extern "C" int mynah_cuda_metrics_get(void *opaque,
+                                       mynah_tts_backend_metrics *metrics) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || metrics == nullptr) return -1;
+    metrics->h2d_bytes = st->h2d_bytes.load(std::memory_order_relaxed);
+    metrics->d2h_bytes = st->d2h_bytes.load(std::memory_order_relaxed);
+    metrics->graph_captures = st->graph_captures.load(std::memory_order_relaxed);
+    metrics->graph_replays = st->graph_replays.load(std::memory_order_relaxed);
+    metrics->graph_fallbacks = st->graph_fallbacks.load(std::memory_order_relaxed);
+    metrics->decoder_steps = st->decoder_steps.load(std::memory_order_relaxed);
+    metrics->decoder_failures = st->decoder_failures.load(std::memory_order_relaxed);
+    metrics->resident_fallbacks = st->resident_fallbacks.load(std::memory_order_relaxed);
     return 0;
 }
 
@@ -1351,6 +1529,8 @@ extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
         set_error(e, ec, "invalid CUDA host-to-device copy");
         return -1;
     }
+    st->h2d_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(dev_ptr, host, n*sizeof(float),
                               cudaMemcpyHostToDevice, st->stream), e, ec);
 }
@@ -1363,6 +1543,8 @@ extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,
         set_error(e, ec, "invalid CUDA device-to-host copy");
         return -1;
     }
+    st->d2h_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(host, dev_ptr, n*sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
@@ -1869,6 +2051,754 @@ extern "C" int mynah_cuda_conv_transpose_dev(
         input, dw, db, output, in_ch, out_ch, length, output_length,
         kernel, stride, groups);
     return ce(cudaGetLastError(), e, ec);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Resident Pocket SEANet decoder                                    */
+/* ------------------------------------------------------------------ */
+
+static bool decoder_mul(size_t a, size_t b, size_t *out) {
+    if (a != 0u && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool decoder_add(size_t a, size_t b, size_t *out) {
+    if (b > SIZE_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool decoder_int(size_t value, int *out) {
+    if (value > (size_t)INT_MAX) return false;
+    *out = (int)value;
+    return true;
+}
+
+static void decoder_free_op(cuda_decoder_op *op) {
+    if (op == nullptr) return;
+    if (op->previous != nullptr) cudaFree(op->previous);
+    if (op->window != nullptr) cudaFree(op->window);
+    if (op->partial != nullptr) cudaFree(op->partial);
+    if (op->full != nullptr) cudaFree(op->full);
+    op->previous = nullptr;
+    op->window = nullptr;
+    op->partial = nullptr;
+    op->full = nullptr;
+}
+
+static void decoder_destroy(mynah_backend_decoder *decoder) {
+    if (decoder == nullptr) return;
+    for (auto &op : decoder->ops) decoder_free_op(&op);
+    if (decoder->work_a != nullptr) cudaFree(decoder->work_a);
+    if (decoder->work_b != nullptr) cudaFree(decoder->work_b);
+    if (decoder->work_c != nullptr) cudaFree(decoder->work_c);
+    if (decoder->columns != nullptr) cudaFree(decoder->columns);
+    decoder->work_a = nullptr;
+    decoder->work_b = nullptr;
+    decoder->work_c = nullptr;
+    decoder->columns = nullptr;
+    delete decoder;
+}
+
+static bool decoder_add_op(mynah_backend_decoder *decoder,
+                           cuda_decoder_op_kind kind, int pre_elu,
+                           size_t in_channels, size_t out_channels,
+                           size_t kernel, size_t stride, size_t dilation,
+                           size_t groups, size_t max_in_len,
+                           const mynah_backend_decoder_weight *weights,
+                           size_t *max_work, size_t *max_columns,
+                           char *e, size_t ec) {
+    cuda_decoder_op op{};
+    int launch_range = 0;
+    op.kind = kind;
+    op.pre_elu = pre_elu;
+    op.max_in_len = max_in_len;
+    if (!decoder_int(in_channels, &op.in_channels) ||
+        !decoder_int(out_channels, &op.out_channels) ||
+        !decoder_int(kernel, &op.kernel) || !decoder_int(stride, &op.stride) ||
+        !decoder_int(dilation, &op.dilation) || !decoder_int(groups, &op.groups) ||
+        weights == nullptr || weights->weight == nullptr || in_channels == 0u ||
+        out_channels == 0u || kernel == 0u || stride == 0u || groups == 0u ||
+        in_channels % groups != 0u || out_channels % groups != 0u ||
+        max_in_len == 0u || max_in_len > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid resident decoder operation descriptor");
+        return false;
+    }
+    size_t span = 0u;
+    if (!decoder_mul(kernel - 1u, dilation, &span) ||
+        !decoder_add(span, 1u, &span) || span < stride) {
+        set_error(e, ec, "resident decoder causal span is invalid");
+        return false;
+    }
+    op.tail = span - stride;
+    if (!decoder_int(op.tail, &launch_range) ||
+        !decoder_int(max_in_len, &launch_range)) {
+        /* The operation fields are already validated above; this pair is only
+         * a compact launch-range check for the causal state length. */
+        set_error(e, ec, "resident decoder state length exceeds CUDA range");
+        return false;
+    }
+    if (kind == CUDA_DECODER_CONVTR) {
+        if (kernel < stride || !decoder_mul(max_in_len, stride, &op.max_full_len) ||
+            !decoder_add(op.max_full_len, kernel - stride, &op.max_full_len)) {
+            set_error(e, ec, "resident decoder transpose shape overflow");
+            return false;
+        }
+        size_t full_elems = 0u;
+        if (!decoder_mul(out_channels, op.max_full_len, &full_elems) ||
+            full_elems > (size_t)INT_MAX ||
+            !decoder_int(op.max_full_len, &launch_range)) {
+            set_error(e, ec, "resident decoder transpose launch range overflow");
+            return false;
+        }
+    }
+
+    size_t work = 0u;
+    const size_t work_len = kind == CUDA_DECODER_CONVTR
+        ? op.max_full_len - op.tail : max_in_len;
+    if (!decoder_mul(out_channels, work_len, &work)) {
+        set_error(e, ec, "resident decoder work shape overflow");
+        return false;
+    }
+    if (work > (size_t)INT_MAX) {
+        set_error(e, ec, "resident decoder work launch range overflow");
+        return false;
+    }
+    if (work > *max_work) *max_work = work;
+    if (kind != CUDA_DECODER_CONVTR) {
+        if (stride != 1u) {
+            set_error(e, ec, "resident decoder only supports stride-one conv1d");
+            return false;
+        }
+        size_t kernel_width = 0u;
+        size_t inner = 0u;
+        if (!decoder_mul(in_channels, kernel, &kernel_width) ||
+            !decoder_int(kernel_width, &launch_range) ||
+            !decoder_mul(kernel_width, max_in_len, &inner)) {
+            set_error(e, ec, "resident decoder column shape overflow");
+            return false;
+        }
+        if (inner > (size_t)INT_MAX) {
+            set_error(e, ec, "resident decoder column launch range overflow");
+            return false;
+        }
+        if (inner > *max_columns) *max_columns = inner;
+    }
+
+    size_t weight_count = 0u;
+    if (kind == CUDA_DECODER_CONVTR) {
+        size_t out_per_group = out_channels / groups;
+        if (!decoder_mul(in_channels, out_per_group, &weight_count) ||
+            !decoder_mul(weight_count, kernel, &weight_count)) {
+            set_error(e, ec, "resident decoder transpose weight overflow");
+            return false;
+        }
+    } else if (!decoder_mul(out_channels, in_channels, &weight_count) ||
+               !decoder_mul(weight_count, kernel, &weight_count)) {
+        set_error(e, ec, "resident decoder weight overflow");
+        return false;
+    }
+    size_t weight_bytes = 0u;
+    if (!decoder_mul(weight_count, sizeof(float), &weight_bytes) ||
+        cached_weight(decoder->backend, weights->weight, weight_bytes,
+                      &op.weight, e, ec)) return false;
+    size_t bias_bytes = 0u;
+    if (weights->bias != nullptr &&
+        (!decoder_mul(out_channels, sizeof(float), &bias_bytes) ||
+         cached_weight(decoder->backend, weights->bias, bias_bytes, &op.bias,
+                       e, ec))) return false;
+
+    size_t n = 0u;
+    size_t bytes = 0u;
+    if (kind == CUDA_DECODER_CONVTR) {
+        if (op.tail > 0u) {
+            if (!decoder_mul(out_channels, op.tail, &n) ||
+                !decoder_mul(n, sizeof(float), &bytes) ||
+                ce(cudaMalloc(&op.partial, bytes), e, ec) ||
+                ce(cudaMemset(op.partial, 0, bytes), e, ec)) {
+                decoder_free_op(&op);
+                return false;
+            }
+        }
+        if (!decoder_mul(out_channels, op.max_full_len, &n) ||
+            !decoder_mul(n, sizeof(float), &bytes) ||
+            ce(cudaMalloc(&op.full, bytes), e, ec) ||
+            ce(cudaMemset(op.full, 0, bytes), e, ec)) {
+            decoder_free_op(&op);
+            return false;
+        }
+    } else if (op.tail > 0u) {
+        size_t window_len = 0u;
+        if (!decoder_mul(in_channels, op.tail, &n) ||
+            !decoder_mul(n, sizeof(float), &bytes) ||
+            ce(cudaMalloc(&op.previous, bytes), e, ec) ||
+            ce(cudaMemset(op.previous, 0, bytes), e, ec) ||
+            !decoder_add(op.tail, max_in_len, &window_len) ||
+            !decoder_mul(in_channels, window_len, &n) ||
+            !decoder_mul(n, sizeof(float), &bytes) ||
+            ce(cudaMalloc(&op.window, bytes), e, ec) ||
+            ce(cudaMemset(op.window, 0, bytes), e, ec)) {
+            decoder_free_op(&op);
+            return false;
+        }
+    }
+    try {
+        decoder->ops.push_back(op);
+    } catch (const std::bad_alloc &) {
+        decoder_free_op(&op);
+        throw;
+    }
+    return true;
+}
+
+static int decoder_build(mynah_backend_decoder *decoder,
+                         const mynah_backend_decoder_desc *desc,
+                         char *e, size_t ec) {
+    if (desc->channels == 0u || desc->dimension == 0u ||
+        desc->n_filters == 0u || desc->n_ratios == 0u || desc->ratios == nullptr ||
+        desc->kernel_size == 0u || desc->last_kernel_size == 0u ||
+        desc->compress == 0u || desc->first.weight == nullptr ||
+        desc->last.weight == nullptr || desc->convtr == nullptr ||
+        (desc->n_residual_layers > 0u && desc->blocks == nullptr)) {
+        set_error(e, ec, "incomplete resident decoder descriptor");
+        return -1;
+    }
+    size_t stage_ops = 0u;
+    size_t block_ops = 0u;
+    size_t op_capacity = 0u;
+    if (!decoder_mul(desc->n_residual_layers, 3u, &block_ops) ||
+        !decoder_add(block_ops, 1u, &stage_ops) ||
+        !decoder_mul(desc->n_ratios, stage_ops, &op_capacity) ||
+        !decoder_add(op_capacity, 2u, &op_capacity)) {
+        set_error(e, ec, "resident decoder topology size overflow");
+        return -1;
+    }
+    try {
+        decoder->ops.reserve(op_capacity);
+    } catch (const std::bad_alloc &) {
+        set_error(e, ec, "out of memory reserving resident decoder topology");
+        return -1;
+    }
+    size_t mult = 1u;
+    for (size_t i = 0; i < desc->n_ratios; ++i) {
+        if (desc->ratios[i] == 0u || !decoder_mul(mult, 2u, &mult)) {
+            set_error(e, ec, "invalid resident decoder ratio");
+            return -1;
+        }
+    }
+    size_t channels_here = 0u;
+    if (!decoder_mul(mult, desc->n_filters, &channels_here)) {
+        set_error(e, ec, "resident decoder channel overflow");
+        return -1;
+    }
+    size_t length = decoder->max_encoder_frames;
+    size_t max_work = 0u;
+    size_t max_columns = 0u;
+    if (!decoder_add_op(decoder, CUDA_DECODER_CONV, 0, desc->dimension,
+                        channels_here, desc->kernel_size, 1u, 1u, 1u, length,
+                        &desc->first, &max_work, &max_columns, e, ec)) return -1;
+    for (size_t stage = 0; stage < desc->n_ratios; ++stage) {
+        const size_t ratio = desc->ratios[stage];
+        if (channels_here < 2u || channels_here % 2u != 0u) {
+            set_error(e, ec, "resident decoder stage channel count is invalid");
+            return -1;
+        }
+        const size_t out_channels = channels_here / 2u;
+        size_t convtr_kernel = 0u;
+        if (!decoder_mul(ratio, 2u, &convtr_kernel)) {
+            set_error(e, ec, "resident decoder kernel shape overflow");
+            return -1;
+        }
+        if (!decoder_add_op(decoder, CUDA_DECODER_CONVTR, 1,
+                            channels_here, out_channels, convtr_kernel, ratio,
+                            1u, 1u, length, &desc->convtr[stage], &max_work,
+                            &max_columns, e, ec)) return -1;
+        if (!decoder_mul(length, ratio, &length)) {
+            set_error(e, ec, "resident decoder length overflow");
+            return -1;
+        }
+        for (size_t layer = 0; layer < desc->n_residual_layers; ++layer) {
+            if (out_channels % desc->compress != 0u) {
+                set_error(e, ec, "resident decoder compress does not divide channels");
+                return -1;
+            }
+            const size_t hidden = out_channels / desc->compress;
+            size_t dilation = 1u;
+            for (size_t d = 0; d < layer; ++d) {
+                if (!decoder_mul(dilation, desc->dilation_base, &dilation)) {
+                    set_error(e, ec, "resident decoder dilation overflow");
+                    return -1;
+                }
+            }
+            const size_t block = stage * desc->n_residual_layers + layer;
+            if (!decoder_add_op(decoder, CUDA_DECODER_CONV, 0,
+                                out_channels, hidden, desc->residual_kernel_size,
+                                1u, dilation, 1u, length,
+                                &desc->blocks[block].conv1, &max_work,
+                                &max_columns, e, ec) ||
+                !decoder_add_op(decoder, CUDA_DECODER_CONV, 0,
+                                hidden, out_channels, 1u, 1u, 1u, 1u, length,
+                                &desc->blocks[block].conv2, &max_work,
+                                &max_columns, e, ec)) return -1;
+            /* Replace the two conv ops with one explicit residual op marker.
+             * The two stateful conv objects remain the final two entries; the
+             * execution loop consumes this topology through the marker below. */
+            cuda_decoder_op rb1 = decoder->ops[decoder->ops.size() - 2u];
+            cuda_decoder_op rb2 = decoder->ops[decoder->ops.size() - 1u];
+            decoder->ops.resize(decoder->ops.size() - 2u);
+            cuda_decoder_op marker{};
+            marker.kind = CUDA_DECODER_RESBLOCK;
+            marker.pre_elu = 0;
+            marker.in_channels = rb1.in_channels;
+            marker.out_channels = rb1.out_channels;
+            marker.kernel = rb1.kernel;
+            marker.stride = rb1.stride;
+            marker.dilation = rb1.dilation;
+            marker.groups = 1;
+            marker.max_in_len = length;
+            /* The marker owns rb1/rb2 by storing them in adjacent vector
+             * entries immediately after it. This keeps the execution order
+             * explicit without allocating a second topology structure. */
+            decoder->ops.push_back(marker);
+            decoder->ops.push_back(rb1);
+            decoder->ops.push_back(rb2);
+        }
+        channels_here = out_channels;
+    }
+    if (channels_here != desc->n_filters) {
+        set_error(e, ec, "resident decoder final channel count mismatch");
+        return -1;
+    }
+    if (!decoder_add_op(decoder, CUDA_DECODER_CONV, 1, desc->n_filters,
+                        desc->channels, desc->last_kernel_size, 1u, 1u, 1u,
+                        length, &desc->last, &max_work, &max_columns, e, ec))
+        return -1;
+    decoder->work_floats = max_work;
+    decoder->columns_floats = max_columns;
+    return 0;
+}
+
+static int decoder_alloc_workspace(mynah_backend_decoder *decoder,
+                                   char *e, size_t ec) {
+    if (decoder->work_floats == 0u || decoder->columns_floats == 0u) {
+        set_error(e, ec, "resident decoder workspace is empty");
+        return -1;
+    }
+    size_t work_bytes = 0u;
+    size_t columns_bytes = 0u;
+    if (!decoder_mul(decoder->work_floats, sizeof(float), &work_bytes) ||
+        !decoder_mul(decoder->columns_floats, sizeof(float), &columns_bytes)) {
+        set_error(e, ec, "resident decoder workspace size overflow");
+        return -1;
+    }
+    if (ce(cudaMalloc(&decoder->work_a, work_bytes), e, ec) ||
+        ce(cudaMalloc(&decoder->work_b, work_bytes), e, ec) ||
+        ce(cudaMalloc(&decoder->work_c, work_bytes), e, ec) ||
+        ce(cudaMalloc(&decoder->columns, columns_bytes), e, ec)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int decoder_conv1d(cuda_decoder_state *decoder, cuda_decoder_op *op,
+                          const float *input, float *output, size_t length,
+                          char *e, size_t ec) {
+    if (length == 0u || length > op->max_in_len || op->stride != 1 ||
+        length % (size_t)op->stride != 0u)
+        return -1;
+    const size_t out_len = length / (size_t)op->stride;
+    const size_t window_len = op->tail + length;
+    const float *source = input;
+    if (op->tail > 0u) {
+        const size_t total = (size_t)op->in_channels * window_len;
+        k_decoder_causal_window<<<((int)total + 255) / 256, 256,
+                                  0, decoder->backend->stream>>>(
+            op->previous, input, op->window, op->in_channels, (int)length,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        source = op->window;
+    }
+    const size_t inner = (size_t)op->in_channels * (size_t)op->kernel;
+    const size_t columns = inner * out_len;
+    k_decoder_causal_columns<<<((int)columns + 255) / 256, 256,
+                               0, decoder->backend->stream>>>(
+        source, decoder->columns, op->in_channels, (int)out_len, op->kernel,
+        op->dilation, op->stride, (int)op->tail);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (op->bias != nullptr) {
+        k_broadcast_bias<<<((int)((size_t)op->out_channels * out_len) + 255) / 256,
+                           256, 0, decoder->backend->stream>>>(
+            output, op->bias, op->out_channels, (int)out_len);
+    } else if (ce(cudaMemsetAsync(output, 0,
+                                  (size_t)op->out_channels * out_len * sizeof(float),
+                                  decoder->backend->stream), e, ec)) return -1;
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    if (cbe(cublasGemmEx(decoder->backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                         (int)out_len, op->out_channels, (int)inner,
+                         &alpha, decoder->columns, CUDA_R_32F, (int)out_len,
+                         op->weight, CUDA_R_32F, (int)inner, &beta, output,
+                         CUDA_R_32F, (int)out_len,
+                         cuda_compute_type(decoder->backend),
+                         cuda_gemm_algo(decoder->backend)), e, ec)) return -1;
+    if (op->tail > 0u) {
+        const size_t total = (size_t)op->in_channels * op->tail;
+        k_decoder_copy_tail<<<((int)total + 255) / 256, 256,
+                              0, decoder->backend->stream>>>(
+            op->window, op->previous, op->in_channels, (int)length,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    return 0;
+}
+
+static int decoder_convtr(cuda_decoder_state *decoder, cuda_decoder_op *op,
+                          const float *input, float *output, size_t length,
+                          char *e, size_t ec) {
+    if (length == 0u || length > op->max_in_len) return -1;
+    const size_t output_len = length * (size_t)op->stride;
+    const size_t full_len = output_len + op->tail;
+    const size_t total = (size_t)op->out_channels * full_len;
+    k_conv_transpose<<<((int)total + 255) / 256, 256, 0, decoder->backend->stream>>>(
+        input, op->weight, op->bias, op->full, op->in_channels,
+        op->out_channels, (int)length, (int)full_len, op->kernel, op->stride,
+        op->groups);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (op->tail > 0u) {
+        const size_t state = (size_t)op->out_channels * op->tail;
+        k_decoder_convtr_fold_save<<<((int)state + 255) / 256, 256,
+                                     0, decoder->backend->stream>>>(
+            op->full, op->partial, op->bias, op->out_channels, (int)full_len,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    k_decoder_copy_prefix<<<((int)((size_t)op->out_channels * output_len) + 255) / 256,
+                            256, 0, decoder->backend->stream>>>(
+        op->full, output, op->out_channels, (int)full_len, (int)output_len);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int decoder_step_impl(mynah_backend_decoder *decoder,
+                             const float *input, size_t encoder_frames,
+                             float *output, char *e, size_t ec) {
+    if (decoder == nullptr || input == nullptr || output == nullptr ||
+        encoder_frames == 0u || encoder_frames > decoder->max_encoder_frames) {
+        set_error(e, ec, "invalid resident decoder step");
+        return -1;
+    }
+    if (cbe(cublasSetStream(decoder->backend->cublas, decoder->backend->stream),
+            e, ec)) return -1;
+    const float *current = input;
+    size_t length = encoder_frames;
+    size_t channels = decoder->dimension;
+    for (size_t index = 0; index < decoder->ops.size();) {
+        cuda_decoder_op *op = &decoder->ops[index++];
+        if (op->kind == CUDA_DECODER_RESBLOCK) {
+            if (index + 1u >= decoder->ops.size()) {
+                set_error(e, ec, "resident decoder residual topology is truncated");
+                return -1;
+            }
+            cuda_decoder_op *rb1 = &decoder->ops[index++];
+            cuda_decoder_op *rb2 = &decoder->ops[index++];
+            const size_t n = channels * length;
+            float *other = current == decoder->work_a ? decoder->work_b
+                         : current == decoder->work_b ? decoder->work_a
+                         : decoder->work_a;
+            k_decoder_elu<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                current, decoder->work_c, decoder->elu_alpha, (int)n);
+            if (ce(cudaGetLastError(), e, ec) ||
+                decoder_conv1d(decoder, rb1, decoder->work_c, other, length, e, ec) != 0)
+                return -1;
+            k_decoder_elu<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                other, other, decoder->elu_alpha, (int)(rb1->out_channels * length));
+            if (ce(cudaGetLastError(), e, ec) ||
+                decoder_conv1d(decoder, rb2, other, decoder->work_c, length, e, ec) != 0)
+                return -1;
+            k_residual_add<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                const_cast<float *>(current), decoder->work_c, (int)n);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+            continue;
+        }
+        const bool last = index == decoder->ops.size();
+        float *destination = last ? output
+                                  : (current == decoder->work_a
+                                         ? decoder->work_b : decoder->work_a);
+        if (op->pre_elu) {
+            const size_t n = channels * length;
+            k_decoder_elu<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                current, const_cast<float *>(current), decoder->elu_alpha, (int)n);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+        }
+        if (op->kind == CUDA_DECODER_CONV) {
+            if (decoder_conv1d(decoder, op, current, destination, length, e, ec) != 0)
+                return -1;
+            current = destination;
+            channels = (size_t)op->out_channels;
+        } else if (op->kind == CUDA_DECODER_CONVTR) {
+            if (decoder_convtr(decoder, op, current, destination, length, e, ec) != 0)
+                return -1;
+            current = destination;
+            channels = (size_t)op->out_channels;
+            length *= (size_t)op->stride;
+        } else {
+            set_error(e, ec, "resident decoder operation kind is invalid");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+extern "C" int mynah_cuda_decoder_open(
+    void *opaque, const mynah_backend_decoder_desc *desc,
+    size_t max_encoder_frames, mynah_backend_decoder **out,
+    char *e, size_t ec) {
+    if (out != nullptr) *out = nullptr;
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || desc == nullptr || out == nullptr ||
+        max_encoder_frames == 0u) {
+        set_error(e, ec, "invalid resident decoder open");
+        return -1;
+    }
+    auto *decoder = new (std::nothrow) mynah_backend_decoder();
+    if (decoder == nullptr) {
+        set_error(e, ec, "out of memory creating resident decoder");
+        return -1;
+    }
+    decoder->backend = backend;
+    decoder->channels = desc->channels;
+    decoder->dimension = desc->dimension;
+    decoder->n_filters = desc->n_filters;
+    decoder->max_encoder_frames = max_encoder_frames;
+    decoder->elu_alpha = desc->elu_alpha;
+    try {
+        if (decoder_build(decoder, desc, e, ec) != 0 ||
+            decoder_alloc_workspace(decoder, e, ec) != 0) {
+            decoder_destroy(decoder);
+            return -1;
+        }
+    } catch (const std::bad_alloc &) {
+        decoder_destroy(decoder);
+        set_error(e, ec, "out of memory building resident decoder topology");
+        return -1;
+    }
+    *out = decoder;
+    return 0;
+}
+
+extern "C" void mynah_cuda_decoder_close(void *opaque,
+                                           mynah_backend_decoder *decoder) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend != nullptr) (void)cudaStreamSynchronize(backend->stream);
+    decoder_destroy(decoder);
+}
+
+extern "C" int mynah_cuda_decoder_reset(void *opaque,
+                                          mynah_backend_decoder *decoder,
+                                          char *e, size_t ec) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoder == nullptr || decoder->backend != backend) {
+        set_error(e, ec, "invalid resident decoder reset");
+        return -1;
+    }
+    for (auto &op : decoder->ops) {
+        if (op.previous != nullptr &&
+            ce(cudaMemsetAsync(op.previous, 0,
+                               (size_t)op.in_channels * op.tail * sizeof(float),
+                               backend->stream), e, ec)) return -1;
+        if (op.partial != nullptr &&
+            ce(cudaMemsetAsync(op.partial, 0,
+                               (size_t)op.out_channels * op.tail * sizeof(float),
+                               backend->stream), e, ec)) return -1;
+    }
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_decoder_step(void *opaque,
+                                         mynah_backend_decoder *decoder,
+                                         const float *dev_input,
+                                         size_t encoder_frames,
+                                         float *dev_output,
+                                         char *e, size_t ec) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoder == nullptr || decoder->backend != backend) {
+        set_error(e, ec, "invalid resident decoder step");
+        if (backend != nullptr)
+            backend->decoder_failures.fetch_add(1ull, std::memory_order_relaxed);
+        return -1;
+    }
+    /* During graph capture this call only records work; the graph launch is
+     * the logical decoder step. Direct execution counts here, while the
+     * engine calls decoder_note_step after a successful capture/replay. */
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool capturing =
+        cudaStreamIsCapturing(backend->stream, &capture_status) == cudaSuccess &&
+        capture_status != cudaStreamCaptureStatusNone;
+    if (!capturing)
+        backend->decoder_steps.fetch_add(1ull, std::memory_order_relaxed);
+    const int result = decoder_step_impl(decoder, dev_input, encoder_frames,
+                                         dev_output, e, ec);
+    if (result != 0) {
+        backend->decoder_failures.fetch_add(1ull, std::memory_order_relaxed);
+        backend->resident_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    return result;
+}
+
+extern "C" int mynah_cuda_decoder_note_step(
+    void *opaque, mynah_backend_decoder *decoder) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoder == nullptr || decoder->backend != backend)
+        return -1;
+    backend->decoder_steps.fetch_add(1ull, std::memory_order_relaxed);
+    return 0;
+}
+
+/* Model-free end-to-end check for the resident causal decoder.  The generic
+ * conv tests above cannot catch a stale causal ring or a transposed-conv tail
+ * folded into the wrong frame, so this deliberately runs two one-frame calls
+ * against the scalar SEANet state with the same tiny topology and weights. */
+static int cuda_decoder_self_test(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) {
+        set_error(e, ec, "CUDA decoder self-test has no backend");
+        return -1;
+    }
+    const size_t ratios[1] = {2u};
+    float first_weight[24];
+    float first_bias[4];
+    float convtr_weight[32];
+    float convtr_bias[2];
+    float rb1_weight[6];
+    float rb1_bias[1];
+    float rb2_weight[2];
+    float rb2_bias[2];
+    float last_weight[6];
+    float last_bias[1];
+    for (size_t i = 0; i < 24u; ++i)
+        first_weight[i] = ((int)(i % 9u) - 4) * 0.03125f;
+    for (size_t i = 0; i < 4u; ++i) first_bias[i] = ((int)i - 1) * 0.05f;
+    for (size_t i = 0; i < 32u; ++i)
+        convtr_weight[i] = ((int)(i % 11u) - 5) * 0.021f;
+    convtr_bias[0] = 0.07f; convtr_bias[1] = -0.04f;
+    for (size_t i = 0; i < 6u; ++i)
+        rb1_weight[i] = ((int)(i % 5u) - 2) * 0.027f;
+    rb1_bias[0] = 0.03f;
+    rb2_weight[0] = 0.11f; rb2_weight[1] = -0.08f;
+    rb2_bias[0] = 0.02f; rb2_bias[1] = -0.01f;
+    for (size_t i = 0; i < 6u; ++i)
+        last_weight[i] = ((int)(i % 7u) - 3) * 0.019f;
+    last_bias[0] = -0.02f;
+
+    mynah_conv_weights first = {first_weight, first_bias};
+    mynah_conv_weights convtr = {convtr_weight, convtr_bias};
+    mynah_seanet_resblock_weights block;
+    block.conv1.weight = rb1_weight;
+    block.conv1.bias = rb1_bias;
+    block.conv2.weight = rb2_weight;
+    block.conv2.bias = rb2_bias;
+    mynah_conv_weights last = {last_weight, last_bias};
+    mynah_seanet_decoder_weights cpu_weights;
+    cpu_weights.first = first;
+    cpu_weights.convtr = &convtr;
+    cpu_weights.blocks = &block;
+    cpu_weights.last = last;
+
+    mynah_backend_decoder_desc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.channels = 1u;
+    desc.dimension = 2u;
+    desc.n_filters = 2u;
+    desc.n_residual_layers = 1u;
+    desc.ratios = ratios;
+    desc.n_ratios = 1u;
+    desc.kernel_size = 3u;
+    desc.residual_kernel_size = 3u;
+    desc.last_kernel_size = 3u;
+    desc.dilation_base = 2u;
+    desc.compress = 2u;
+    desc.elu_alpha = 1.0f;
+    desc.first = first;
+    desc.convtr = &convtr;
+    desc.blocks = &block;
+    desc.last = last;
+
+    mynah_seanet_config cpu_config;
+    std::memset(&cpu_config, 0, sizeof(cpu_config));
+    cpu_config.channels = 1u;
+    cpu_config.dimension = 2u;
+    cpu_config.n_filters = 2u;
+    cpu_config.n_residual_layers = 1u;
+    cpu_config.ratios = ratios;
+    cpu_config.n_ratios = 1u;
+    cpu_config.kernel_size = 3u;
+    cpu_config.residual_kernel_size = 3u;
+    cpu_config.last_kernel_size = 3u;
+    cpu_config.dilation_base = 2u;
+    cpu_config.compress = 2u;
+    cpu_config.elu_alpha = 1.0f;
+
+    const float inputs[2][2] = {{0.20f, -0.15f}, {-0.31f, 0.27f}};
+    float cpu_output[2];
+    float gpu_output[2];
+    char local[256];
+    local[0] = '\0';
+    mynah_backend_decoder *decoder = nullptr;
+    mynah_seanet_state *cpu_state = nullptr;
+    float *dev_input = nullptr;
+    float *dev_output = nullptr;
+    int result = -1;
+
+    do {
+        cpu_state = mynah_seanet_state_create(&cpu_config, nullptr, 2u, local,
+                                              sizeof(local));
+        if (cpu_state == nullptr) break;
+        if (mynah_cuda_decoder_open(st, &desc, 1u, &decoder, local,
+                                     sizeof(local)) != 0 || decoder == nullptr)
+            break;
+        if (mynah_cuda_decoder_reset(st, decoder, local, sizeof(local)) != 0 ||
+            ce(cudaMalloc(&dev_input, 2u * sizeof(float)), local, sizeof(local)) ||
+            ce(cudaMalloc(&dev_output, 2u * sizeof(float)), local, sizeof(local)))
+            break;
+        for (size_t step = 0; step < 2u; ++step) {
+            if (ce(cudaMemcpyAsync(dev_input, inputs[step], 2u * sizeof(float),
+                                   cudaMemcpyHostToDevice, st->stream),
+                   local, sizeof(local)) != 0 ||
+                mynah_cuda_decoder_step(st, decoder, dev_input, 1u, dev_output,
+                                        local, sizeof(local)) != 0 ||
+                mynah_cuda_sync(st, local, sizeof(local)) != 0 ||
+                ce(cudaMemcpy(gpu_output, dev_output, 2u * sizeof(float),
+                              cudaMemcpyDeviceToHost), local, sizeof(local)) != 0 ||
+                mynah_seanet_decode(cpu_state, &cpu_weights, inputs[step], 1u,
+                                    cpu_output) != 0) {
+                break;
+            }
+            int mismatch = 0;
+            for (size_t i = 0; i < 2u; ++i) {
+                if (fabsf(cpu_output[i] - gpu_output[i]) > 3.0e-3f) {
+                    mismatch = 1;
+                    break;
+                }
+            }
+            if (mismatch) {
+                std::snprintf(local, sizeof(local),
+                              "CUDA resident decoder mismatch at step %zu",
+                              step);
+                break;
+            }
+            if (step == 1u) result = 0;
+        }
+    } while (false);
+
+    if (result != 0 && e != nullptr && ec > 0u)
+        std::snprintf(e, ec, "%s", local[0] != '\0'
+                          ? local : "CUDA resident decoder self-test failed");
+    if (dev_input != nullptr) cudaFree(dev_input);
+    if (dev_output != nullptr) cudaFree(dev_output);
+    if (decoder != nullptr) mynah_cuda_decoder_close(st, decoder);
+    if (cpu_state != nullptr) mynah_seanet_state_destroy(cpu_state);
+    return result;
 }
 
 /* One block owns one attention head.  The score reduction is shared by all
@@ -2434,18 +3364,25 @@ extern "C" int mynah_cuda_graph_begin(void *opaque, size_t key,
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (replay != nullptr) *replay = 0;
     if (st == nullptr || identity == nullptr || key == 0u) return 1;
-    if (!st->graphs_enabled) return 1;
+    if (!st->graphs_enabled) {
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+        return 1;
+    }
     cuda_pipeline_graph_entry *entry =
         find_pipeline_graph(st, key, identity);
     if (entry != nullptr && entry->valid) {
         if (replay != nullptr) *replay = 1;
+        st->graph_replays.fetch_add(1ull, std::memory_order_relaxed);
         return 0;
     }
     if (entry != nullptr && entry->capturing) {
         set_error(e, ec, "CUDA graph capture already active");
         return -1;
     }
-    if (st->pipeline_graphs.size() >= CUDA_PIPELINE_GRAPH_CAP) return 1;
+    if (st->pipeline_graphs.size() >= CUDA_PIPELINE_GRAPH_CAP) {
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+        return 1;
+    }
     if (st->cublas_workspace == nullptr) {
         st->cublas_workspace_cap = 8u * 1024u * 1024u;
         if (ce(cudaMalloc(&st->cublas_workspace, st->cublas_workspace_cap), e,
@@ -2481,6 +3418,7 @@ extern "C" int mynah_cuda_graph_end(void *opaque, size_t key,
         if (graph != nullptr) cudaGraphDestroy(graph);
         if (capture_status != cudaSuccess) ce(capture_status, e, ec);
         st->pipeline_graphs.pop_back();
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
         return 1;
     }
     cudaGraphExec_t exec = nullptr;
@@ -2490,11 +3428,13 @@ extern "C" int mynah_cuda_graph_end(void *opaque, size_t key,
         cudaGraphDestroy(graph);
         if (instantiate_status != cudaSuccess) ce(instantiate_status, e, ec);
         st->pipeline_graphs.pop_back();
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
         return 1;
     }
     entry->graph = graph;
     entry->exec = exec;
     entry->valid = true;
+    st->graph_captures.fetch_add(1ull, std::memory_order_relaxed);
     return 0;
 }
 

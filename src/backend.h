@@ -2,15 +2,42 @@
 #define MYNAH_BACKEND_H
 
 #include "mynah_tts.h"
+#include "seanet.h"
 
 #include <stddef.h>
 
 typedef struct mynah_backend mynah_backend;
+typedef struct mynah_backend_decoder mynah_backend_decoder;
 
 typedef int (*mynah_backend_matmul_fn)(void *, const float *, float *, size_t, size_t,
                                        size_t, const float *, const float *, char *, size_t);
 typedef void (*mynah_backend_close_fn)(void *);
 typedef int (*mynah_backend_self_test_fn)(void *, char *, size_t);
+
+typedef mynah_conv_weights mynah_backend_decoder_weight;
+
+/* Descriptor for the resident Pocket SEANet decoder. The arrays are borrowed
+ * during open only; the backend uploads every weight it needs before the
+ * first decode step. Blocks are flattened stage-major, then residual-layer
+ * major, with one entry for each conv1/conv2 pair. */
+typedef struct {
+    size_t channels;
+    size_t dimension;
+    size_t n_filters;
+    size_t n_residual_layers;
+    const size_t *ratios;
+    size_t n_ratios;
+    size_t kernel_size;
+    size_t residual_kernel_size;
+    size_t last_kernel_size;
+    size_t dilation_base;
+    size_t compress;
+    float elu_alpha;
+    mynah_backend_decoder_weight first;
+    const mynah_backend_decoder_weight *convtr;
+    const mynah_seanet_resblock_weights *blocks;
+    mynah_backend_decoder_weight last;
+} mynah_backend_decoder_desc;
 
 /* Generic sgemm mirroring cblas_sgemm semantics (row-major).
  * C[m,n] = alpha * op(A) * op(B) + beta * C
@@ -46,6 +73,31 @@ int mynah_backend_sgemm(const mynah_backend *backend,
 
 int mynah_backend_self_test(mynah_tts_device device, char *error,
                             size_t error_capacity);
+
+int mynah_backend_decoder_open(const mynah_backend *backend,
+                               const mynah_backend_decoder_desc *desc,
+                               size_t max_encoder_frames,
+                               mynah_backend_decoder **out,
+                               char *error, size_t error_capacity);
+void mynah_backend_decoder_close(const mynah_backend *backend,
+                                 mynah_backend_decoder *decoder);
+int mynah_backend_decoder_reset(const mynah_backend *backend,
+                                mynah_backend_decoder *decoder,
+                                char *error, size_t error_capacity);
+int mynah_backend_decoder_step(const mynah_backend *backend,
+                               mynah_backend_decoder *decoder,
+                               const float *dev_input,
+                               size_t encoder_frames,
+                               float *dev_output,
+                               char *error, size_t error_capacity);
+/* A decoder step recorded inside a CUDA graph is submitted during capture but
+ * does not execute until the graph is launched.  Backends use this hook to
+ * keep the process-local step counter logical rather than counting capture
+ * submissions.  CPU/unsupported backends treat it as a no-op. */
+int mynah_backend_decoder_note_step(const mynah_backend *backend,
+                                    mynah_backend_decoder *decoder);
+int mynah_backend_metrics_get(const mynah_backend *backend,
+                               mynah_tts_backend_metrics *metrics);
 
 /* Query: does this backend support device-side matmul (resident GPU)? */
 int mynah_backend_has_dev_ops(const mynah_backend *backend);

@@ -453,6 +453,12 @@ int mynah_tts_model_get_info(const mynah_tts_model *model,
     return 0;
 }
 
+int mynah_tts_model_get_backend_metrics(const mynah_tts_model *model,
+                                        mynah_tts_backend_metrics *metrics) {
+    if (model == NULL || metrics == NULL) return -1;
+    return mynah_backend_metrics_get(model->backend, metrics);
+}
+
 int mynah_tts_device_self_test(mynah_tts_device device, char *error,
                                size_t error_capacity) {
     return mynah_backend_self_test(device, error, error_capacity);

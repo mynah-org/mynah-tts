@@ -14,6 +14,21 @@ typedef enum {
     MYNAH_TTS_DEVICE_CUDA = 2,
 } mynah_tts_device;
 
+/* Backend counters are process-local diagnostics. They are intentionally
+ * monotonically increasing and may be sampled while synthesis is running;
+ * callers must not treat one snapshot as a transactional view. CPU builds
+ * return zero for CUDA-only fields. */
+typedef struct {
+    unsigned long long h2d_bytes;
+    unsigned long long d2h_bytes;
+    unsigned long long graph_captures;
+    unsigned long long graph_replays;
+    unsigned long long graph_fallbacks;
+    unsigned long long decoder_steps;
+    unsigned long long decoder_failures;
+    unsigned long long resident_fallbacks;
+} mynah_tts_backend_metrics;
+
 typedef struct {
     char engine[32];
     char revision[64];
@@ -102,6 +117,8 @@ int mynah_tts_model_warm(mynah_tts_model *model, char *error,
                          size_t error_capacity);
 int mynah_tts_model_get_info(const mynah_tts_model *model,
                              mynah_tts_model_info *info);
+int mynah_tts_model_get_backend_metrics(const mynah_tts_model *model,
+                                        mynah_tts_backend_metrics *metrics);
 
 const char *mynah_tts_device_name(mynah_tts_device device);
 int mynah_tts_device_self_test(mynah_tts_device device, char *error,
