@@ -65,10 +65,12 @@ is unavailable. The flow head uses the same bucket policy with persistent
 condition/noise/time staging and one bounded latent download per gathered
 batch. These paths are source-implemented but not yet launched on this host.
 
-This host has neither `nvcc` nor an NVIDIA device, so CUDA compilation,
-launch/self-test, stage parity and L40S measurements remain explicitly open.
-The repository CI matrix compiles the CLI and Linux CUDA server for `sm_70`,
-`sm_89` and `sm_90`; that compile-only job does not substitute for a GPU gate.
+This host has neither `nvcc` nor an NVIDIA device, so CUDA launch/self-test,
+stage parity and L40S measurements remain explicitly open. GitHub Actions run
+`35877105405` is green for the CLI and Linux CUDA server compile matrix
+(`sm_70`, `sm_89`, `sm_90`), with Code Quality `35877105452` and Memory Safety
+`35877105478` also green. These compile-only jobs do not substitute for a GPU
+gate.
 
 ## Verified as-is: CPU PocketTTS
 

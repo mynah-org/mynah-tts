@@ -1384,7 +1384,7 @@ artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
 “GPU Pocket”. The target is a measured C100 on an L40S, not an extrapolation.
 
 - [x] E15-0 as-is audit: Pocket CPU driver/state, current CUDA backend, `../qwen-tts` resident CUDA/CI patterns, and vLLM-Omni CUDA-graph/async-chunk designs
-- [~] E15-1 add `make cuda-server`; compile/link CLI + server in CI for explicit `sm_70`, `sm_89` (L40S) and `sm_90`; model-free check distinguishes compiled CUDA from no device — workflow ready, awaiting GitHub run
+- [~] E15-1 add `make cuda-server`; compile/link CLI + server in CI for explicit `sm_70`, `sm_89` (L40S) and `sm_90`; model-free check distinguishes compiled CUDA from no device — GitHub runs `35877105405`/`35877105452`/`35877105478` green
 - [~] E15-2 explicit backend capability/lifecycle: backend-owned weights, graphs, batch metadata and scratch; host/device conv split and safe CPU retry are implemented, while explicit health/capability counters remain
 - [~] E15-3 scalar-reference CUDA kernels: projection matmul, LayerNorm, GELU, residual, softmax, RoPE, attention and resident conv primitives plus model-free self-tests are implemented; `nvcc`/GPU shape sweeps remain
 - [~] E15-4 resident Pocket prefill/AR + flow batch: per-request KV, batched matmul→matmat, device transformer/flow steps, cross-request attention, pinned staging, bounded host K/V/latent handoff and per-scratch `(batch-width)` CUDA-Graph capture/replay buckets are implemented; flow uses the raw FP32 model weights and still needs GPU stage parity
