@@ -117,6 +117,61 @@ void mynah_backend_graph_abort(const mynah_backend *backend, size_t key,
 void mynah_backend_graph_forget(const mynah_backend *backend,
                                 const void *identity);
 
+/* Pocket flow-head descriptor. The engine owns the host weights and device
+ * scratch; CUDA owns cached weight copies and the chained kernels. No CUDA or
+ * cuBLAS type crosses this seam, and the operation is asynchronous. */
+typedef struct {
+    const float *weight;
+    const float *bias;
+} mynah_backend_flow_linear;
+
+typedef struct {
+    const float *in_ln_weight;
+    const float *in_ln_bias;
+    mynah_backend_flow_linear adaln;
+    mynah_backend_flow_linear mlp_in;
+    mynah_backend_flow_linear mlp_out;
+} mynah_backend_flow_block;
+
+typedef struct {
+    size_t batch;
+    size_t latent_dim;
+    size_t cond_dim;
+    size_t hidden_dim;
+    size_t depth;
+    size_t num_time_conds;
+    size_t freq_embed_dim;
+    float layernorm_eps;
+    float rmsnorm_eps;
+    const float *dev_cond;       /* [batch][cond_dim]      */
+    const float *dev_noise;      /* [batch][latent_dim]    */
+    const float *dev_time_embed; /* [time][freq_embed_dim] */
+    float *dev_y;                /* [batch][hidden]         */
+    float *dev_silu;             /* [batch][hidden]         */
+    float *dev_x;                /* [batch][hidden]         */
+    float *dev_norm;             /* [batch][hidden]         */
+    float *dev_hidden;           /* [batch][hidden]         */
+    float *dev_scratch;          /* [batch][hidden]         */
+    float *dev_mod;              /* [batch][3*hidden]       */
+    float *dev_final_mod;        /* [batch][2*hidden]       */
+    float *dev_time_hidden;      /* [time][hidden]          */
+    float *dev_time_output;      /* [time][hidden]          */
+    float *dev_time_sum;         /* [hidden]                */
+    float *dev_out;              /* [batch][latent]         */
+    const mynah_backend_flow_linear *time_mlp_in;
+    const mynah_backend_flow_linear *time_mlp_out;
+    const float *const *time_alpha;
+    const mynah_backend_flow_linear *cond_embed;
+    const mynah_backend_flow_linear *input_proj;
+    const mynah_backend_flow_block *blocks;
+    const mynah_backend_flow_linear *final_adaln;
+    const mynah_backend_flow_linear *final_linear;
+} mynah_backend_flow_batch;
+
+int mynah_backend_flow_batch_dev(const mynah_backend *,
+                                 const mynah_backend_flow_batch *,
+                                 char *, size_t);
+
 /* Device-side matmul: out[rows,ow] = in[rows,iw] @ W[ow,iw]^T + bias.
  * Weight/bias are host pointers (cached on device internally). */
 int mynah_backend_matmul_dev(const mynah_backend *backend,

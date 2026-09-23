@@ -1036,6 +1036,41 @@ struct mynah_engine_scratch {
     const float **flow_cond;      /* [batch] */
     const float **flow_noise;     /* [batch] */
     float **flow_out;             /* [batch] */
+
+    /* Optional resident CUDA flow-head workspace.  It is separate from the
+     * CPU flow batch because the CUDA graph captures these exact device and
+     * pinned-host addresses. */
+    float *cuda_flow_host_cond;
+    float *cuda_flow_host_noise;
+    float *cuda_flow_host_time;
+    float *cuda_flow_host_output;
+    float *cuda_flow_cond;
+    float *cuda_flow_noise;
+    float *cuda_flow_time_embed;
+    float *cuda_flow_output;
+    float *cuda_flow_y;
+    float *cuda_flow_silu;
+    float *cuda_flow_x;
+    float *cuda_flow_norm;
+    float *cuda_flow_hidden;
+    float *cuda_flow_scratch;
+    float *cuda_flow_mod;
+    float *cuda_flow_final_mod;
+    float *cuda_flow_time_hidden;
+    float *cuda_flow_time_output;
+    float *cuda_flow_time_sum;
+    mynah_backend_flow_linear *cuda_flow_time_mlp_in;
+    mynah_backend_flow_linear *cuda_flow_time_mlp_out;
+    const float **cuda_flow_time_alpha;
+    mynah_backend_flow_block *cuda_flow_blocks;
+    mynah_backend_flow_linear cuda_flow_cond_embed;
+    mynah_backend_flow_linear cuda_flow_input_proj;
+    mynah_backend_flow_linear cuda_flow_final_adaln;
+    mynah_backend_flow_linear cuda_flow_final_linear;
+    size_t cuda_flow_batch_capacity;
+    int cuda_flow_enabled;
+    int cuda_flow_graph_enabled;
+    int cuda_flow_graph_ready;
 };
 
 /* --------------------------------------------------------------- the dump
@@ -3339,6 +3374,38 @@ static int pocket_cuda_resident_requested(const mynah_engine_state *state) {
     return setting == NULL || strcmp(setting, "0") != 0;
 }
 
+static int pocket_cuda_flow_requested(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state)) return 0;
+    const char *setting = getenv("MYNAH_CUDA_FLOW");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+/* The released Pocket configuration pins the LSD time pair at {0, 1}.  Build
+ * the same BF16-rounded sinusoidal features once into persistent staging so a
+ * flow graph replay never depends on a stack buffer or a host allocation. */
+static int pocket_cuda_flow_time_features(const pocket_config *cfg, float *out) {
+    if (cfg == NULL || out == NULL || cfg->flow_time_conds != 2u ||
+        cfg->flow_freqs == 0u) return -1;
+    const double log_period = log(10000.0);
+    const size_t half = cfg->flow_freqs;
+    for (size_t t = 0; t < 2u; ++t) {
+        const float time = t == 0u ? 0.0f : 1.0f;
+        float *row = out + t * 2u * half;
+        for (size_t i = 0; i < half; ++i) {
+            float freq = (float)exp(-log_period * (double)i / (double)half);
+            uint32_t bits = 0u;
+            memcpy(&bits, &freq, sizeof(bits));
+            bits = (bits + UINT32_C(0x7fff) + ((bits >> 16) & 1u)) &
+                   UINT32_C(0xffff0000);
+            memcpy(&freq, &bits, sizeof(freq));
+            const float arg = time * freq;
+            row[i] = cosf(arg);
+            row[half + i] = sinf(arg);
+        }
+    }
+    return 0;
+}
+
 static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     if (ctx == NULL) return;
     const mynah_backend *backend =
@@ -3820,6 +3887,184 @@ fail:
     pocket_error(error, capacity, "%s",
                  local[0] != '\0' ? local : "CUDA resident backbone batch failed");
     return -1;
+}
+
+#define POCKET_CUDA_FLOW_GRAPH_BASE ((size_t)0x100000u)
+
+/* Resident Pocket flow head for the subset of rows that actually emitted a
+ * latent. The first call warms all weight caches on the ordinary stream; the
+ * next call captures/replays one graph per gathered width. A failure only
+ * disables this optional stage and leaves the CPU flow implementation to
+ * produce the row, so no request state is consumed by a failed launch. */
+static int pocket_cuda_flow_step_batch(const mynah_engine_state *state,
+                                       size_t count,
+                                       mynah_engine_scratch *scratch,
+                                       char *error, size_t capacity) {
+    if (state == NULL || scratch == NULL || count == 0u ||
+        !scratch->cuda_flow_enabled || scratch->backend == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0 ||
+        count > scratch->cuda_flow_batch_capacity ||
+        scratch->flow_cond == NULL || scratch->flow_noise == NULL ||
+        scratch->flow_out == NULL || scratch->cuda_flow_host_cond == NULL ||
+        scratch->cuda_flow_host_noise == NULL ||
+        scratch->cuda_flow_host_time == NULL ||
+        scratch->cuda_flow_host_output == NULL ||
+        scratch->cuda_flow_cond == NULL || scratch->cuda_flow_noise == NULL ||
+        scratch->cuda_flow_time_embed == NULL ||
+        scratch->cuda_flow_output == NULL || scratch->cuda_flow_y == NULL ||
+        scratch->cuda_flow_silu == NULL || scratch->cuda_flow_x == NULL ||
+        scratch->cuda_flow_norm == NULL || scratch->cuda_flow_hidden == NULL ||
+        scratch->cuda_flow_scratch == NULL || scratch->cuda_flow_mod == NULL ||
+        scratch->cuda_flow_final_mod == NULL ||
+        scratch->cuda_flow_time_hidden == NULL ||
+        scratch->cuda_flow_time_output == NULL ||
+        scratch->cuda_flow_time_sum == NULL ||
+        scratch->cuda_flow_time_mlp_in == NULL ||
+        scratch->cuda_flow_time_mlp_out == NULL ||
+        scratch->cuda_flow_time_alpha == NULL || scratch->cuda_flow_blocks == NULL) {
+        return 1;
+    }
+    const pocket_config *cfg = &state->cfg;
+    size_t flow_freq_width = 0u;
+    size_t rows_hidden = 0u;
+    size_t rows_latent = 0u;
+    size_t time_rows = 0u;
+    if (pocket_mul(cfg->flow_freqs, 2u, &flow_freq_width) != 0 ||
+        pocket_mul(count, cfg->hidden_dim, &rows_hidden) != 0 ||
+        pocket_mul(count, cfg->latent_dim, &rows_latent) != 0 ||
+        pocket_mul(cfg->flow_time_conds, flow_freq_width, &time_rows) != 0 ||
+        flow_freq_width == 0u || cfg->flow_time_conds == 0u) return 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (scratch->flow_cond[i] == NULL || scratch->flow_noise[i] == NULL ||
+            scratch->flow_out[i] == NULL) return 1;
+        memcpy(scratch->cuda_flow_host_cond + i * cfg->hidden_dim,
+               scratch->flow_cond[i], cfg->hidden_dim * sizeof(float));
+        memcpy(scratch->cuda_flow_host_noise + i * cfg->latent_dim,
+               scratch->flow_noise[i], cfg->latent_dim * sizeof(float));
+    }
+
+    char local[256];
+    char drain_error[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0)
+        return 1;
+
+    int replay = 0;
+    int capturing = 0;
+    const size_t graph_key = POCKET_CUDA_FLOW_GRAPH_BASE + count;
+    if (scratch->cuda_flow_graph_enabled && scratch->cuda_flow_graph_ready) {
+        const int graph_rc = mynah_backend_graph_begin(
+            scratch->backend, graph_key, scratch, &replay, local, sizeof(local));
+        if (graph_rc == 0) capturing = !replay;
+    }
+
+    if (!replay) {
+        if (mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_cond,
+                              scratch->cuda_flow_cond, rows_hidden, local,
+                              sizeof(local)) != 0 ||
+            mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_noise,
+                              scratch->cuda_flow_noise, rows_latent, local,
+                              sizeof(local)) != 0 ||
+            mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_time,
+                              scratch->cuda_flow_time_embed, time_rows,
+                              local, sizeof(local)) != 0) {
+            if (capturing) mynah_backend_graph_abort(
+                scratch->backend, graph_key, scratch);
+            return 1;
+        }
+        mynah_backend_flow_batch flow;
+        memset(&flow, 0, sizeof(flow));
+        flow.batch = count;
+        flow.latent_dim = cfg->latent_dim;
+        flow.cond_dim = cfg->hidden_dim;
+        flow.hidden_dim = cfg->flow_dim;
+        flow.depth = cfg->flow_depth;
+        flow.num_time_conds = cfg->flow_time_conds;
+        flow.freq_embed_dim = flow_freq_width;
+        flow.layernorm_eps = cfg->flow_layernorm_eps;
+        flow.rmsnorm_eps = 1.0e-5f;
+        flow.dev_cond = scratch->cuda_flow_cond;
+        flow.dev_noise = scratch->cuda_flow_noise;
+        flow.dev_time_embed = scratch->cuda_flow_time_embed;
+        flow.dev_y = scratch->cuda_flow_y;
+        flow.dev_silu = scratch->cuda_flow_silu;
+        flow.dev_x = scratch->cuda_flow_x;
+        flow.dev_norm = scratch->cuda_flow_norm;
+        flow.dev_hidden = scratch->cuda_flow_hidden;
+        flow.dev_scratch = scratch->cuda_flow_scratch;
+        flow.dev_mod = scratch->cuda_flow_mod;
+        flow.dev_final_mod = scratch->cuda_flow_final_mod;
+        flow.dev_time_hidden = scratch->cuda_flow_time_hidden;
+        flow.dev_time_output = scratch->cuda_flow_time_output;
+        flow.dev_time_sum = scratch->cuda_flow_time_sum;
+        flow.dev_out = scratch->cuda_flow_output;
+        flow.time_mlp_in = scratch->cuda_flow_time_mlp_in;
+        flow.time_mlp_out = scratch->cuda_flow_time_mlp_out;
+        flow.time_alpha = scratch->cuda_flow_time_alpha;
+        flow.cond_embed = &scratch->cuda_flow_cond_embed;
+        flow.input_proj = &scratch->cuda_flow_input_proj;
+        flow.blocks = scratch->cuda_flow_blocks;
+        flow.final_adaln = &scratch->cuda_flow_final_adaln;
+        flow.final_linear = &scratch->cuda_flow_final_linear;
+        if (mynah_backend_flow_batch_dev(scratch->backend, &flow, local,
+                                          sizeof(local)) != 0) {
+            if (capturing) mynah_backend_graph_abort(
+                scratch->backend, graph_key, scratch);
+            return 1;
+        }
+        if (capturing) {
+            if (mynah_backend_graph_end(scratch->backend, graph_key, scratch,
+                                         local, sizeof(local)) != 0) {
+                scratch->cuda_flow_graph_ready = 0;
+                return 1;
+            }
+            capturing = 0;
+            if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
+                                            local, sizeof(local)) != 0) {
+                mynah_backend_graph_forget(scratch->backend, scratch);
+                scratch->cuda_flow_enabled = 0;
+                return 1;
+            }
+        } else if (scratch->cuda_flow_graph_enabled) {
+            /* This is the warm-up submission. */
+            scratch->cuda_flow_graph_ready = 1;
+        }
+    } else if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
+                                           local, sizeof(local)) != 0) {
+        mynah_backend_graph_forget(scratch->backend, scratch);
+        scratch->cuda_flow_enabled = 0;
+        scratch->cuda_flow_graph_ready = 0;
+        return 1;
+    }
+
+    if (mynah_backend_d2h(scratch->backend, scratch->cuda_flow_output,
+                          scratch->cuda_flow_host_output, rows_latent, local,
+                          sizeof(local)) != 0 ||
+        mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) {
+        if (capturing) mynah_backend_graph_abort(
+            scratch->backend, graph_key, scratch);
+        snprintf(drain_error, sizeof(drain_error), "%s", local);
+        (void)mynah_backend_sync(scratch->backend, drain_error,
+                                 sizeof(drain_error));
+        mynah_backend_graph_forget(scratch->backend, scratch);
+        scratch->cuda_flow_enabled = 0;
+        scratch->cuda_flow_graph_ready = 0;
+        return 1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        float *out = scratch->flow_out[i];
+        const float *src = scratch->cuda_flow_host_output + i * cfg->latent_dim;
+        if (!pocket_all_finite(src, cfg->latent_dim)) {
+            mynah_backend_graph_forget(scratch->backend, scratch);
+            scratch->cuda_flow_enabled = 0;
+            scratch->cuda_flow_graph_ready = 0;
+            return 1;
+        }
+        memcpy(out, src, cfg->latent_dim * sizeof(float));
+    }
+    if (error != NULL && capacity > 0u) error[0] = '\0';
+    return 0;
 }
 
 static void pocket_ctx_free(mynah_engine_ctx *ctx) {
@@ -4867,14 +5112,22 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
      * the pocket profile read as if it had Magpie's depth head. */
     mynah_region_begin(MYNAH_RGN_FLOW);
     int flow_failed = 0;
+    int cuda_flow_used = 0;
     if (gathered > 0) {
-        if (gathered <= flow_capacity && scratch != NULL &&
+        if (scratch != NULL && scratch->cuda_flow_enabled) {
+            char cuda_error[256];
+            cuda_error[0] = '\0';
+            if (pocket_cuda_flow_step_batch(ctxs[0]->state, gathered, scratch,
+                                            cuda_error, sizeof(cuda_error)) == 0)
+                cuda_flow_used = 1;
+        }
+        if (!cuda_flow_used && gathered <= flow_capacity && scratch != NULL &&
             scratch->flow_heads != NULL) {
             flow_failed = mynah_flow_head_forward_batch(
                               scratch->flow_heads, gathered, &scratch->flow_w,
                               scratch->flow_cond, times, scratch->flow_noise,
                               scratch->flow_out, scratch->flow_batch) != 0;
-        } else {
+        } else if (!cuda_flow_used) {
             for (size_t i = 0; i < count && !flow_failed; ++i) {
                 mynah_engine_ctx *ctx = ctxs[i];
                 if (results[i].frames_appended == 0u) continue;
@@ -5308,10 +5561,80 @@ static void pocket_host_free_bytes(const mynah_backend *backend, void *ptr) {
         mynah_backend_host_free(backend, (float *)ptr);
 }
 
+static void pocket_cuda_flow_release(mynah_engine_scratch *scratch) {
+    if (scratch == NULL) return;
+    const mynah_backend *backend = scratch->backend;
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, scratch->cuda_flow_cond);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_noise);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_embed);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_output);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_y);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_silu);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_x);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_norm);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_hidden);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_scratch);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_mod);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_final_mod);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_hidden);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_output);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_sum);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_cond);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_noise);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_time);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_output);
+    } else {
+        free(scratch->cuda_flow_host_cond);
+        free(scratch->cuda_flow_host_noise);
+        free(scratch->cuda_flow_host_time);
+        free(scratch->cuda_flow_host_output);
+    }
+    scratch->cuda_flow_host_cond = NULL;
+    scratch->cuda_flow_host_noise = NULL;
+    scratch->cuda_flow_host_time = NULL;
+    scratch->cuda_flow_host_output = NULL;
+    scratch->cuda_flow_cond = NULL;
+    scratch->cuda_flow_noise = NULL;
+    scratch->cuda_flow_time_embed = NULL;
+    scratch->cuda_flow_output = NULL;
+    scratch->cuda_flow_y = NULL;
+    scratch->cuda_flow_silu = NULL;
+    scratch->cuda_flow_x = NULL;
+    scratch->cuda_flow_norm = NULL;
+    scratch->cuda_flow_hidden = NULL;
+    scratch->cuda_flow_scratch = NULL;
+    scratch->cuda_flow_mod = NULL;
+    scratch->cuda_flow_final_mod = NULL;
+    scratch->cuda_flow_time_hidden = NULL;
+    scratch->cuda_flow_time_output = NULL;
+    scratch->cuda_flow_time_sum = NULL;
+    free(scratch->cuda_flow_time_mlp_in);
+    free(scratch->cuda_flow_time_mlp_out);
+    free((void *)scratch->cuda_flow_time_alpha);
+    free(scratch->cuda_flow_blocks);
+    scratch->cuda_flow_time_mlp_in = NULL;
+    scratch->cuda_flow_time_mlp_out = NULL;
+    scratch->cuda_flow_time_alpha = NULL;
+    scratch->cuda_flow_blocks = NULL;
+    memset(&scratch->cuda_flow_cond_embed, 0,
+           sizeof(scratch->cuda_flow_cond_embed));
+    memset(&scratch->cuda_flow_input_proj, 0,
+           sizeof(scratch->cuda_flow_input_proj));
+    memset(&scratch->cuda_flow_final_adaln, 0,
+           sizeof(scratch->cuda_flow_final_adaln));
+    memset(&scratch->cuda_flow_final_linear, 0,
+           sizeof(scratch->cuda_flow_final_linear));
+    scratch->cuda_flow_batch_capacity = 0u;
+    scratch->cuda_flow_enabled = 0;
+    scratch->cuda_flow_graph_ready = 0;
+}
+
 static void pocket_scratch_free(mynah_engine_scratch *scratch) {
     if (scratch == NULL) return;
     if (scratch->backend != NULL) {
         mynah_backend_graph_forget(scratch->backend, scratch);
+        pocket_cuda_flow_release(scratch);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_x);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_norm);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_qkv);
@@ -5323,6 +5646,7 @@ static void pocket_scratch_free(mynah_engine_scratch *scratch) {
         mynah_backend_host_free(scratch->backend, scratch->cuda_host_output);
         mynah_backend_host_free(scratch->backend, scratch->cuda_host_kv);
     } else {
+        pocket_cuda_flow_release(scratch);
         free(scratch->cuda_host_input);
         free(scratch->cuda_host_output);
         free(scratch->cuda_host_kv);
@@ -5472,6 +5796,179 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                         batch * sizeof(*scratch->cuda_cache_strides),
                         (void **)&scratch->cuda_cache_strides, ignored,
                         sizeof(ignored)) != 0;
+            }
+            int flow_failed = 0;
+            size_t flow_freq_width = 0u;
+            size_t flow_rows = 0u;
+            size_t flow_rows_latent = 0u;
+            size_t flow_three_hidden = 0u;
+            size_t flow_two_hidden = 0u;
+            size_t flow_mod_rows = 0u;
+            size_t flow_final_mod_rows = 0u;
+            size_t flow_time_rows = 0u;
+            size_t flow_time_hidden = 0u;
+            if (!device_failed && pocket_cuda_flow_requested(state)) {
+                if (pocket_mul(cfg->flow_freqs, 2u, &flow_freq_width) != 0 ||
+                    pocket_mul(batch, cfg->flow_dim, &flow_rows) != 0 ||
+                    pocket_mul(batch, cfg->latent_dim, &flow_rows_latent) != 0 ||
+                    pocket_mul(cfg->flow_dim, 3u, &flow_three_hidden) != 0 ||
+                    pocket_mul(cfg->flow_dim, 2u, &flow_two_hidden) != 0 ||
+                    pocket_mul(batch, flow_three_hidden, &flow_mod_rows) != 0 ||
+                    pocket_mul(batch, flow_two_hidden, &flow_final_mod_rows) != 0 ||
+                    pocket_mul(cfg->flow_time_conds, flow_freq_width,
+                               &flow_time_rows) != 0 ||
+                    pocket_mul(cfg->flow_time_conds, cfg->flow_dim,
+                               &flow_time_hidden) != 0 ||
+                    cfg->flow_time_conds == 0u || cfg->flow_dim < 2u ||
+                    pocket_mul(flow_rows, sizeof(float), &flow_rows) != 0 ||
+                    pocket_mul(flow_rows_latent, sizeof(float), &flow_rows_latent) != 0 ||
+                    pocket_mul(flow_mod_rows, sizeof(float), &flow_mod_rows) != 0 ||
+                    pocket_mul(flow_final_mod_rows, sizeof(float),
+                               &flow_final_mod_rows) != 0 ||
+                    pocket_mul(flow_time_rows, sizeof(float), &flow_time_rows) != 0 ||
+                    pocket_mul(flow_time_hidden, sizeof(float),
+                               &flow_time_hidden) != 0) {
+                    flow_failed = 1;
+                }
+                /* `flow_rows` etc. are byte counts after the checked
+                 * multiplications above; keep the element counts separate for
+                 * the device allocator. */
+                size_t flow_rows_floats = 0u;
+                size_t flow_rows_latent_floats = 0u;
+                size_t flow_mod_rows_floats = 0u;
+                size_t flow_final_mod_rows_floats = 0u;
+                size_t flow_time_rows_floats = 0u;
+                size_t flow_time_hidden_floats = 0u;
+                if (!flow_failed) {
+                    flow_rows_floats = flow_rows / sizeof(float);
+                    flow_rows_latent_floats = flow_rows_latent / sizeof(float);
+                    flow_mod_rows_floats = flow_mod_rows / sizeof(float);
+                    flow_final_mod_rows_floats = flow_final_mod_rows / sizeof(float);
+                    flow_time_rows_floats = flow_time_rows / sizeof(float);
+                    flow_time_hidden_floats = flow_time_hidden / sizeof(float);
+                    if (mynah_backend_host_alloc(state->backend, rows_hidden,
+                                                 &scratch->cuda_flow_host_cond,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        mynah_backend_host_alloc(state->backend,
+                                                 flow_rows_latent_floats,
+                                                 &scratch->cuda_flow_host_noise,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        mynah_backend_host_alloc(state->backend, flow_time_rows_floats,
+                                                 &scratch->cuda_flow_host_time,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        mynah_backend_host_alloc(state->backend,
+                                                 flow_rows_latent_floats,
+                                                 &scratch->cuda_flow_host_output,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        pocket_cuda_flow_time_features(
+                            cfg, scratch->cuda_flow_host_time) != 0) {
+                        flow_failed = 1;
+                    }
+                }
+#define POCKET_CUDA_FLOW_ALLOC(field, count)                                  \
+                do {                                                           \
+                    if (!flow_failed &&                                       \
+                        mynah_backend_dev_alloc(state->backend, (count),      \
+                                                &(field), ignored,              \
+                                                sizeof(ignored)) != 0)          \
+                        flow_failed = 1;                                       \
+                } while (0)
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_cond, rows_hidden);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_noise,
+                                       flow_rows_latent_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_embed,
+                                       flow_time_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_output,
+                                       flow_rows_latent_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_y, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_silu, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_x, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_norm, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_hidden, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_scratch, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_mod, flow_mod_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_final_mod,
+                                       flow_final_mod_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_hidden,
+                                       flow_time_hidden_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_output,
+                                       flow_time_hidden_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_sum,
+                                       cfg->flow_dim);
+#undef POCKET_CUDA_FLOW_ALLOC
+                if (flow_failed) pocket_cuda_flow_release(scratch);
+                else {
+                    scratch->cuda_flow_batch_capacity = batch;
+                    scratch->cuda_flow_enabled = 1;
+                    scratch->cuda_flow_graph_enabled =
+                        getenv("MYNAH_CUDA_GRAPHS") == NULL ||
+                        strcmp(getenv("MYNAH_CUDA_GRAPHS"), "0") != 0;
+                    scratch->cuda_flow_graph_ready = 0;
+                    scratch->cuda_flow_time_mlp_in =
+                        (mynah_backend_flow_linear *)calloc(
+                            cfg->flow_time_conds,
+                            sizeof(*scratch->cuda_flow_time_mlp_in));
+                    scratch->cuda_flow_time_mlp_out =
+                        (mynah_backend_flow_linear *)calloc(
+                            cfg->flow_time_conds,
+                            sizeof(*scratch->cuda_flow_time_mlp_out));
+                    scratch->cuda_flow_time_alpha =
+                        (const float **)calloc(cfg->flow_time_conds,
+                                               sizeof(*scratch->cuda_flow_time_alpha));
+                    scratch->cuda_flow_blocks =
+                        (mynah_backend_flow_block *)calloc(
+                            cfg->flow_depth, sizeof(*scratch->cuda_flow_blocks));
+                    if (scratch->cuda_flow_time_mlp_in == NULL ||
+                        scratch->cuda_flow_time_mlp_out == NULL ||
+                        scratch->cuda_flow_time_alpha == NULL ||
+                        scratch->cuda_flow_blocks == NULL) {
+                        pocket_cuda_flow_release(scratch);
+                    } else {
+                        for (size_t t = 0; t < cfg->flow_time_conds; ++t) {
+                            const mynah_flow_time_embed_weights *src =
+                                &state->time_embed[t];
+                            scratch->cuda_flow_time_mlp_in[t].weight =
+                                src->mlp_in.weight;
+                            scratch->cuda_flow_time_mlp_in[t].bias =
+                                src->mlp_in.bias;
+                            scratch->cuda_flow_time_mlp_out[t].weight =
+                                src->mlp_out.weight;
+                            scratch->cuda_flow_time_mlp_out[t].bias =
+                                src->mlp_out.bias;
+                            scratch->cuda_flow_time_alpha[t] = src->alpha;
+                        }
+                        for (size_t b = 0; b < cfg->flow_depth; ++b) {
+                            const mynah_flow_res_block_weights *src =
+                                &state->res_blocks[b];
+                            mynah_backend_flow_block *dst =
+                                &scratch->cuda_flow_blocks[b];
+                            dst->in_ln_weight = src->in_ln_weight;
+                            dst->in_ln_bias = src->in_ln_bias;
+                            dst->adaln.weight = src->adaln.weight;
+                            dst->adaln.bias = src->adaln.bias;
+                            dst->mlp_in.weight = src->mlp_in.weight;
+                            dst->mlp_in.bias = src->mlp_in.bias;
+                            dst->mlp_out.weight = src->mlp_out.weight;
+                            dst->mlp_out.bias = src->mlp_out.bias;
+                        }
+                        scratch->cuda_flow_cond_embed.weight =
+                            state->flow.cond_embed.weight;
+                        scratch->cuda_flow_cond_embed.bias =
+                            state->flow.cond_embed.bias;
+                        scratch->cuda_flow_input_proj.weight =
+                            state->flow.input_proj.weight;
+                        scratch->cuda_flow_input_proj.bias =
+                            state->flow.input_proj.bias;
+                        scratch->cuda_flow_final_adaln.weight =
+                            state->flow.final_adaln.weight;
+                        scratch->cuda_flow_final_adaln.bias =
+                            state->flow.final_adaln.bias;
+                        scratch->cuda_flow_final_linear.weight =
+                            state->flow.final_linear.weight;
+                        scratch->cuda_flow_final_linear.bias =
+                            state->flow.final_linear.bias;
+                    }
+                }
             }
             if (device_failed) {
                 mynah_backend_dev_free(state->backend, scratch->cuda_x);

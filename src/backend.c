@@ -44,6 +44,7 @@ struct mynah_backend {
     int (*graph_launch)(void *, size_t, const void *, char *, size_t);
     void (*graph_abort)(void *, size_t, const void *);
     void (*graph_forget)(void *, const void *);
+    int (*flow_batch_dev)(void *, const mynah_backend_flow_batch *, char *, size_t);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
     int (*layer_norm_dev)(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
@@ -132,6 +133,7 @@ extern int mynah_cuda_graph_end(void *, size_t, const void *, char *, size_t);
 extern int mynah_cuda_graph_launch(void *, size_t, const void *, char *, size_t);
 extern void mynah_cuda_graph_abort(void *, size_t, const void *);
 extern void mynah_cuda_graph_forget(void *, const void *);
+extern int mynah_cuda_flow_batch_dev(void *, const mynah_backend_flow_batch *, char *, size_t);
 extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_layer_norm_dev(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
@@ -608,6 +610,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->graph_launch = mynah_cuda_graph_launch;
         backend->graph_abort = mynah_cuda_graph_abort;
         backend->graph_forget = mynah_cuda_graph_forget;
+        backend->flow_batch_dev = mynah_cuda_flow_batch_dev;
         backend->snake_dev = mynah_cuda_snake_dev;
         backend->gelu_dev = mynah_cuda_gelu_dev;
         backend->layer_norm_dev = mynah_cuda_layer_norm_dev;
@@ -797,6 +800,14 @@ void mynah_backend_graph_forget(const mynah_backend *backend,
                                 const void *identity) {
     if (backend != NULL && backend->graph_forget != NULL && identity != NULL)
         backend->graph_forget(backend->state, identity);
+}
+
+int mynah_backend_flow_batch_dev(const mynah_backend *backend,
+                                 const mynah_backend_flow_batch *flow,
+                                 char *error, size_t error_capacity) {
+    if (backend == NULL || flow == NULL || backend->flow_batch_dev == NULL)
+        return -1;
+    return backend->flow_batch_dev(backend->state, flow, error, error_capacity);
 }
 
 int mynah_backend_gelu_dev(const mynah_backend *backend,

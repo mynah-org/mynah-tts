@@ -81,7 +81,8 @@ __global__ static void k_layer_norm(float *out, const float *in,
     __syncthreads();
     for (int d = tid; d < width; d += (int)blockDim.x) {
         const float b = bias == nullptr ? 0.0f : bias[d];
-        y[d] = (x[d] - mean) * inv_shared * gain[d] + b;
+        const float g = gain == nullptr ? 1.0f : gain[d];
+        y[d] = (x[d] - mean) * inv_shared * g + b;
     }
 }
 
@@ -144,6 +145,87 @@ __global__ static void k_gelu(float *data, int n) {
         float c = 0.7978845608f * (x + 0.044715f * x * x * x);
         data[i] = 0.5f * x * (1.0f + tanhf(c));
     }
+}
+
+__global__ static void k_silu(float *data, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float x = data[i];
+        data[i] = x / (1.0f + expf(-x));
+    }
+}
+
+/* Flow-head variance RMSNorm: the variance is mean-subtracted and unbiased,
+ * matching torch.var() in Pocket's timestep embedder. */
+__global__ static void k_flow_var_rms_norm(const float *in, const float *alpha,
+                                           float *out, int rows, int width,
+                                           float epsilon) {
+    const int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float partial_sum[8];
+    __shared__ float partial_sq[8];
+    __shared__ float mean_shared;
+    __shared__ float inv_shared;
+    const float *x = in + (size_t)row * (size_t)width;
+    float *y = out + (size_t)row * (size_t)width;
+    float sum = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) sum += x[d];
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) partial_sum[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        const int warps = ((int)blockDim.x + 31) / 32;
+        float total = 0.0f;
+        for (int w = 0; w < warps; ++w) total += partial_sum[w];
+        mean_shared = total / (float)width;
+    }
+    __syncthreads();
+    float sq = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float delta = x[d] - mean_shared;
+        sq += delta * delta;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffffu, sq, off);
+    if (lane == 0) partial_sq[warp] = sq;
+    __syncthreads();
+    if (tid == 0) {
+        const int warps = ((int)blockDim.x + 31) / 32;
+        float total = 0.0f;
+        for (int w = 0; w < warps; ++w) total += partial_sq[w];
+        inv_shared = rsqrtf(total / (float)(width - 1) + epsilon);
+    }
+    __syncthreads();
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float gain = alpha == nullptr ? 1.0f : alpha[d];
+        y[d] = x[d] * gain * inv_shared;
+    }
+}
+
+__global__ static void k_flow_modulate(float *data, const float *mod,
+                                       int rows, int width, int mod_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * width;
+    if (i >= total) return;
+    const int row = i / width;
+    const int col = i - row * width;
+    const float *m = mod + (size_t)row * (size_t)mod_stride;
+    data[i] = data[i] * (1.0f + m[col + width]) + m[col];
+}
+
+__global__ static void k_flow_gate_add(float *out, const float *gate,
+                                       const float *update, int rows, int width,
+                                       int gate_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * width;
+    if (i >= total) return;
+    const int row = i / width;
+    const int col = i - row * width;
+    out[i] += gate[(size_t)row * (size_t)gate_stride + col] * update[i];
 }
 
 __global__ static void k_snake(float *data, const float *alpha,
@@ -1392,6 +1474,165 @@ extern "C" int mynah_cuda_matmul_d2d(void *opaque, const float *d_in, float *d_o
         if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     return 0; /* no sync */
+}
+
+static int cuda_flow_layer_norm(cuda_backend_state *st, const float *in,
+                                float *out, const float *gain,
+                                const float *bias, size_t rows, size_t width,
+                                float epsilon, char *e, size_t ec) {
+    float *d_gain = nullptr;
+    float *d_bias = nullptr;
+    if (gain != nullptr && cached_weight(st, gain, width * sizeof(float),
+                                          &d_gain, e, ec)) return -1;
+    if (bias != nullptr && cached_weight(st, bias, width * sizeof(float),
+                                          &d_bias, e, ec)) return -1;
+    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
+        out, in, d_gain, d_bias, (int)width, epsilon, (int)rows);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int cuda_flow_linear(cuda_backend_state *st, const float *in, float *out,
+                            size_t rows, size_t input_width,
+                            size_t output_width,
+                            const mynah_backend_flow_linear *linear,
+                            char *e, size_t ec) {
+    if (linear == nullptr || linear->weight == nullptr) {
+        set_error(e, ec, "missing CUDA flow projection");
+        return -1;
+    }
+    return mynah_cuda_matmul_d2d(st, in, out, rows, input_width, output_width,
+                                 linear->weight, linear->bias, e, ec);
+}
+
+extern "C" int mynah_cuda_flow_batch_dev(
+    void *opaque, const mynah_backend_flow_batch *flow, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || flow == nullptr || flow->batch == 0u ||
+        flow->latent_dim == 0u || flow->cond_dim == 0u ||
+        flow->hidden_dim < 2u || flow->depth == 0u ||
+        flow->num_time_conds == 0u || flow->freq_embed_dim < 2u ||
+        flow->dev_cond == nullptr || flow->dev_noise == nullptr ||
+        flow->dev_time_embed == nullptr || flow->dev_y == nullptr ||
+        flow->dev_silu == nullptr || flow->dev_x == nullptr ||
+        flow->dev_norm == nullptr || flow->dev_hidden == nullptr ||
+        flow->dev_scratch == nullptr || flow->dev_mod == nullptr ||
+        flow->dev_final_mod == nullptr || flow->dev_time_hidden == nullptr ||
+        flow->dev_time_output == nullptr || flow->dev_time_sum == nullptr ||
+        flow->dev_out == nullptr || flow->time_mlp_in == nullptr ||
+        flow->time_mlp_out == nullptr || flow->time_alpha == nullptr ||
+        flow->cond_embed == nullptr || flow->input_proj == nullptr ||
+        flow->blocks == nullptr || flow->final_adaln == nullptr ||
+        flow->final_linear == nullptr) {
+        set_error(e, ec, "invalid CUDA flow batch descriptor");
+        return -1;
+    }
+    const size_t h = flow->hidden_dim;
+    size_t three_h = 0u;
+    size_t two_h = 0u;
+    size_t batch_hidden = 0u;
+    size_t time_hidden = 0u;
+    if (!cuda_size_mul(h, 3u, &three_h) || !cuda_size_mul(h, 2u, &two_h) ||
+        !cuda_size_mul(flow->batch, h, &batch_hidden) ||
+        !cuda_size_mul(flow->num_time_conds, h, &time_hidden) ||
+        flow->batch > (size_t)INT_MAX || h > (size_t)INT_MAX ||
+        three_h > (size_t)INT_MAX || two_h > (size_t)INT_MAX ||
+        flow->latent_dim > (size_t)INT_MAX || flow->cond_dim > (size_t)INT_MAX ||
+        flow->freq_embed_dim > (size_t)INT_MAX ||
+        flow->num_time_conds > (size_t)INT_MAX ||
+        batch_hidden > (size_t)INT_MAX || time_hidden > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA flow batch dimensions overflow");
+        return -1;
+    }
+
+    /* y = cond_embed(cond) + mean(time_embed(t)).  Time features are supplied
+     * by the engine in persistent pinned staging, while all learned time MLPs
+     * stay on the device after their first cache lookup. */
+    if (cuda_flow_linear(st, flow->dev_cond, flow->dev_y, flow->batch,
+                         flow->cond_dim, h, flow->cond_embed, e, ec) != 0)
+        return -1;
+    for (size_t t = 0; t < flow->num_time_conds; ++t) {
+        if (cuda_flow_linear(st, flow->dev_time_embed +
+                                 t * flow->freq_embed_dim,
+                             flow->dev_time_hidden + t * h, 1u,
+                             flow->freq_embed_dim, h, &flow->time_mlp_in[t], e,
+                             ec) != 0) return -1;
+        k_silu<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_time_hidden + t * h, (int)h);
+        if (ce(cudaGetLastError(), e, ec) ||
+            cuda_flow_linear(st, flow->dev_time_hidden + t * h,
+                             flow->dev_time_output + t * h, 1u, h, h,
+                             &flow->time_mlp_out[t], e, ec) != 0) return -1;
+        const float *alpha = flow->time_alpha[t];
+        float *d_alpha = nullptr;
+        if (alpha == nullptr || cached_weight(st, alpha, h * sizeof(float),
+                                              &d_alpha, e, ec)) return -1;
+        k_flow_var_rms_norm<<<1, 256, 0, st->stream>>>(
+            flow->dev_time_output + t * h, d_alpha,
+            flow->dev_time_output + t * h, 1, (int)h, flow->rmsnorm_eps);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        if (t == 0u) {
+            k_copy<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+                flow->dev_time_sum, flow->dev_time_output, (int)h);
+        } else {
+            k_residual_add<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+                flow->dev_time_sum, flow->dev_time_output + t * h, (int)h);
+        }
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    k_scale<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_time_sum, 1.0f / (float)flow->num_time_conds, (int)h);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    k_bias_add<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_y, flow->dev_time_sum, (int)flow->batch, (int)h);
+    if (ce(cudaGetLastError(), e, ec) ||
+        cuda_flow_linear(st, flow->dev_noise, flow->dev_x, flow->batch,
+                         flow->latent_dim, h, flow->input_proj, e, ec) != 0)
+        return -1;
+    k_copy<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_silu, flow->dev_y, (int)batch_hidden);
+    k_silu<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_silu, (int)batch_hidden);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+
+    for (size_t b = 0; b < flow->depth; ++b) {
+        const mynah_backend_flow_block *block = &flow->blocks[b];
+        if (cuda_flow_linear(st, flow->dev_silu, flow->dev_mod, flow->batch,
+                             h, three_h, &block->adaln, e, ec) != 0 ||
+            cuda_flow_layer_norm(st, flow->dev_x, flow->dev_norm,
+                                 block->in_ln_weight, block->in_ln_bias,
+                                 flow->batch, h, flow->layernorm_eps, e, ec) != 0)
+            return -1;
+        k_flow_modulate<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_norm, flow->dev_mod, (int)flow->batch, (int)h,
+            (int)three_h);
+        if (ce(cudaGetLastError(), e, ec) ||
+            cuda_flow_linear(st, flow->dev_norm, flow->dev_hidden, flow->batch,
+                             h, h, &block->mlp_in, e, ec) != 0) return -1;
+        k_silu<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_hidden, (int)batch_hidden);
+        if (ce(cudaGetLastError(), e, ec) ||
+            cuda_flow_linear(st, flow->dev_hidden, flow->dev_scratch,
+                             flow->batch, h, h, &block->mlp_out, e, ec) != 0)
+            return -1;
+        k_flow_gate_add<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_x, flow->dev_mod + 2u * h, flow->dev_scratch,
+            (int)flow->batch, (int)h, (int)three_h);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+
+    if (cuda_flow_linear(st, flow->dev_silu, flow->dev_final_mod,
+                         flow->batch, h, two_h, flow->final_adaln, e, ec) != 0 ||
+        cuda_flow_layer_norm(st, flow->dev_x, flow->dev_norm, nullptr, nullptr,
+                             flow->batch, h, flow->layernorm_eps, e, ec) != 0)
+        return -1;
+    k_flow_modulate<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_norm, flow->dev_final_mod, (int)flow->batch, (int)h,
+        (int)two_h);
+    if (ce(cudaGetLastError(), e, ec) ||
+        cuda_flow_linear(st, flow->dev_norm, flow->dev_out, flow->batch, h,
+                         flow->latent_dim, flow->final_linear, e, ec) != 0)
+        return -1;
+    return 0;
 }
 
 /* im2col kernel for causal conv1d: builds the columns matrix on GPU.

@@ -11,10 +11,10 @@ did not ask for it.
 The first useful milestone is not a CUDA matmul. It is a Linux server that can
 be built as `build/cuda/mynah-tts-server`, refuses CPU/GPU topology mistakes,
 and has enough observability to distinguish a resident Pocket path from a
-host-round-trip prototype. This branch now has the first resident Pocket
-backbone slice and cross-request batch path; it is not yet a fully resident
-flow/SEANet graph. The target is a qualified C100 on a representative L40S
-later; no rented GPU is part of this work item.
+host-round-trip prototype. This branch now has resident Pocket backbone and
+one-step flow-head batch paths with per-width CUDA-Graph capture/replay; the
+SEANet decoder is still CPU-side. The target is a qualified C100 on a
+representative L40S later; no rented GPU is part of this work item.
 
 ## Decision
 
@@ -40,11 +40,12 @@ invalidate the device state and retry the same step through the CPU graph, with
 the fallback made observable as a backend-health item before qualification. The
 server does not pretend that a partial CUDA graph is fully resident.
 
-The newly added `make cuda-server` target is a build boundary plus the entry
-point for the partial resident slice. `--device cuda` currently means that
-Pocket's transformer backbone may run resident when its metadata is compatible;
-flow head, latent control and SEANet decoding remain CPU-side until their own
-parity gates pass.
+The `make cuda-server` target is a build boundary plus the entry point for the
+resident slice. `--device cuda` may run Pocket's transformer backbone and
+one-step flow head resident when their metadata is compatible. The flow path is
+disabled with `MYNAH_CUDA_FLOW=0`, uses raw FP32 weights in this bring-up, and
+falls back to the CPU flow head on a recoverable failure. SEANet decoding
+remains CPU-side until its causal-state and audio parity gates pass.
 
 ## Validation snapshot — 2026-09-23
 
@@ -60,8 +61,9 @@ The resident batch step now also has bucketed CUDA-Graph capture/replay: one
 graph per `(scratch, batch-width)` with pinned input/output/KV shadow staging,
 layer-specific persistent KV pointer tables, dynamic position metadata for
 RoPE/attention, and an ordinary-stream fallback when capture or instantiation
-is unavailable. This is source-implemented but not yet compiled or launched
-on this host.
+is unavailable. The flow head uses the same bucket policy with persistent
+condition/noise/time staging and one bounded latent download per gathered
+batch. These paths are source-implemented but not yet launched on this host.
 
 This host has neither `nvcc` nor an NVIDIA device, so CUDA compilation,
 launch/self-test, stage parity and L40S measurements remain explicitly open.
@@ -101,7 +103,8 @@ The existing backend is a useful foundation but is not a Pocket CUDA engine.
   and a small matmul graph prototype. This branch adds device LayerNorm,
   GELU, residual, softmax, RoPE, causal attention, independent-request batch
   attention, resident causal conv/transpose-conv primitives, and model-free
-  self-tests for the new kernels.
+  self-tests for the new kernels, plus resident flow-head kernels and
+  asynchronous batch execution.
 * The host-facing matmul path copies activations to a mapped buffer, launches a
   GEMM, synchronizes, and copies the result back. That is a correctness and
   bring-up path, not an autoregressive serving path.
@@ -110,6 +113,10 @@ The existing backend is a useful foundation but is not a Pocket CUDA engine.
   but that still has host-round-trip semantics. Quantized/f16 qmat paths are
   CPU code today (`src/qmat.c:mynah_qmat_linear_resolved_qt()` and its batched
   twin).
+* The resident Pocket flow head currently uses raw FP32 model pointers for its
+  cached CUDA projections. This is deliberate for the first parity path; it is
+  not evidence that the CPU qmat/f16 representation is already reproduced on
+  the GPU.
 * `pocket_decode_audio_batch()` does not use device scratch and invokes the
   causal codec once per context. Existing CUDA codec primitives are therefore
   not evidence that Pocket's SEANet decoder is resident.
@@ -178,7 +185,8 @@ The first CUDA kernel set is intentionally small and testable:
    Pocket backbone and flow head;
 3. causal self-attention with Pocket's actual head/cache layout, including
    append-to-KV and valid-length masking;
-4. flow-head adaLN modulation and the one-step latent output;
+4. flow-head time embedding, variance-RMSNorm, adaLN modulation and the
+   one-step latent output, with resident batch/graph execution;
 5. causal SEANet conv, residual blocks, and transposed-conv output with the
    exact model-configured strides, padding and streaming state;
 6. device-side final latent/audio chunk staging, with one bounded transfer at
@@ -248,9 +256,10 @@ seam. Keep
   across a step;
 * batch independent request rows so a shared weight read becomes matmat, with
   per-request KV pointers and positions;
-* keep the latent flow head, EOS reductions and final latent control on device
-  where practical — this is still pending, so the current slice downloads the
-  backbone hidden row and shadows only the appended K/V slot at the engine seam;
+* keep the one-step latent flow head on device where practical — the current
+  slice downloads one latent row per gathered batch while retaining all flow
+  intermediates resident; EOS reductions and the SEANet decoder remain at the
+  engine seam, and the backbone still shadows only the appended K/V slot;
 * capture/replay stable full-backbone batch shapes through per-scratch CUDA
   Graph buckets (enabled by default, `MYNAH_CUDA_GRAPHS=0` escape hatch), with
   an uncaptured FP32 fallback;

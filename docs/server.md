@@ -22,15 +22,16 @@ make cuda-server CUDA_ARCH=sm_89
 resident CUDA execution and its parity/serving qualification are tracked in
 [the CUDA work item](../.work/pocket-tts-cuda-streaming-parity.md). Failure to
 open an explicitly requested CUDA backend is reported; inside a compatible
-Pocket request, a recoverable resident-backbone allocation, launch or
-graph-capture failure can retry that same step on the CPU path while the full
-flow/SEANet CUDA graph is still being brought up.
+Pocket request, recoverable resident-backbone or flow-head allocation, launch
+or graph-capture failures retry the same stage on the CPU path. The Pocket
+SEANet decoder remains CPU-side until its causal-state parity gate is complete.
 
 The current opt-in controls are:
 
 | environment | effect |
 |---|---|
 | `MYNAH_CUDA_RESIDENT=0` | disable Pocket's resident transformer slice and use the CPU engine path |
+| `MYNAH_CUDA_FLOW=0` | disable the optional resident Pocket flow-head batch path; CPU flow remains the fallback |
 | `MYNAH_CUDA_FAST_MATH=1` | opt into FP16/Tensor-Core GEMM; default is FP32 parity mode |
 | `MYNAH_CUDA_GRAPHS=0` | disable resident Pocket batch CUDA-Graph capture/replay; graphs are enabled by default and fall back to ordinary stream submission when capture is unavailable |
 | `MYNAH_CUDA_CODEC=1` | opt into the existing generic NanoCodec resident path; it is not Pocket's SEANet decoder and is not a qualification claim |
