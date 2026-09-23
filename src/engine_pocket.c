@@ -921,6 +921,24 @@ struct mynah_engine_ctx {
     float *text_embed; /* [text_capacity][hidden_dim] */
     float *step_input; /* [hidden_dim] */
     float *hidden;     /* [hidden_dim] */
+
+    /* Optional resident CUDA backbone.  These are deliberately opaque
+     * backend-owned buffers represented as float pointers; the CPU state above
+     * remains the source of truth for admission, rollback and fallback.  KV is
+     * [layers][2][capacity][heads*head_dim], K then V, matching the host state
+     * byte layout. */
+    float *cuda_backbone_kv;
+    float *cuda_x;
+    float *cuda_norm;
+    float *cuda_qkv;
+    float *cuda_attn;
+    float *cuda_proj;
+    float *cuda_ffn;
+    size_t cuda_backbone_capacity;
+    size_t cuda_backbone_kv_floats;
+    int cuda_backbone_enabled;
+    int cuda_backbone_valid;
+
     float *noise;      /* [latent_dim] */
     float *flow_out;   /* [latent_dim] */
     float *latents;    /* [max_steps][latent_dim] */
@@ -975,6 +993,21 @@ struct mynah_engine_ctx {
 
 struct mynah_engine_scratch {
     size_t batch;
+    const mynah_backend *backend; /* borrowed model backend */
+    /* Shared resident-CUDA transformer workspace for cross-request batching.
+     * The host staging arrays are allocated once with this scratch; each row
+     * still keeps its own persistent KV cache in mynah_engine_ctx. */
+    float *cuda_host_input;
+    float *cuda_host_output;
+    float *cuda_x;
+    float *cuda_norm;
+    float *cuda_qkv;
+    float *cuda_attn;
+    float *cuda_proj;
+    float *cuda_ffn;
+    size_t cuda_batch_capacity;
+    int cuda_batch_enabled;
+
     /* The cross-request step: one stacked activation set and one projection
      * scratch for the whole batch, owned by the driver rather than by any
      * request in it. */
@@ -3286,6 +3319,433 @@ static int pocket_caps(const mynah_tts_model *model,
 
 /* ----------------------------------------------------------------- context */
 
+static int pocket_all_finite(const float *v, size_t n);
+
+static int pocket_cuda_resident_requested(const mynah_engine_state *state) {
+    if (state == NULL || state->backend == NULL ||
+        strcmp(mynah_backend_name(state->backend), "cuda") != 0) {
+        return 0;
+    }
+    const char *setting = getenv("MYNAH_CUDA_RESIDENT");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    const mynah_backend *backend =
+        (ctx->state == NULL) ? NULL : ctx->state->backend;
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, ctx->cuda_backbone_kv);
+        mynah_backend_dev_free(backend, ctx->cuda_x);
+        mynah_backend_dev_free(backend, ctx->cuda_norm);
+        mynah_backend_dev_free(backend, ctx->cuda_qkv);
+        mynah_backend_dev_free(backend, ctx->cuda_attn);
+        mynah_backend_dev_free(backend, ctx->cuda_proj);
+        mynah_backend_dev_free(backend, ctx->cuda_ffn);
+    }
+    ctx->cuda_backbone_kv = NULL;
+    ctx->cuda_x = NULL;
+    ctx->cuda_norm = NULL;
+    ctx->cuda_qkv = NULL;
+    ctx->cuda_attn = NULL;
+    ctx->cuda_proj = NULL;
+    ctx->cuda_ffn = NULL;
+    ctx->cuda_backbone_capacity = 0u;
+    ctx->cuda_backbone_kv_floats = 0u;
+    ctx->cuda_backbone_valid = 0;
+}
+
+static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->cuda_backbone_enabled || ctx->backbone == NULL) {
+        return 0;
+    }
+    const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    if (bc == NULL || cfg->heads == 0u || cfg->head_dim == 0u ||
+        cfg->layers == 0u || cfg->hidden_dim == 0u || cfg->ffn_dim == 0u ||
+        fabsf(cfg->layernorm_eps - 1.0e-5f) > 1.0e-7f) {
+        /* The CUDA layer-norm kernel currently implements the transformer
+         * family's fixed 1e-5 epsilon.  Unsupported metadata stays on CPU. */
+        ctx->cuda_backbone_enabled = 0;
+        return 0;
+    }
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        if (ctx->state->backbone_layers[l].layer_scale_1 != NULL ||
+            ctx->state->backbone_layers[l].layer_scale_2 != NULL) {
+            ctx->cuda_backbone_enabled = 0;
+            return 0;
+        }
+    }
+
+    size_t attn_dim = 0;
+    size_t layer_half = 0;
+    size_t layer_span = 0;
+    size_t kv_floats = 0;
+    size_t qkv = 0;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(bc->max_seq_len, attn_dim, &layer_half) != 0 ||
+        pocket_mul(layer_half, 2u, &layer_span) != 0 ||
+        pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
+        pocket_mul(attn_dim, 3u, &qkv) != 0) {
+        ctx->cuda_backbone_enabled = 0;
+        return 0;
+    }
+
+    char ignored[256];
+#define POCKET_CUDA_ALLOC(field, count)                                      \
+    do {                                                                      \
+        ignored[0] = '\0';                                                    \
+        if (mynah_backend_dev_alloc(ctx->state->backend, (count), &(field),  \
+                                    ignored, sizeof(ignored)) != 0) {          \
+            pocket_cuda_backbone_release(ctx);                                \
+            ctx->cuda_backbone_enabled = 0;                                   \
+            return 0;                                                         \
+        }                                                                       \
+    } while (0)
+    POCKET_CUDA_ALLOC(ctx->cuda_backbone_kv, kv_floats);
+    POCKET_CUDA_ALLOC(ctx->cuda_x, cfg->hidden_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_norm, cfg->hidden_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_qkv, qkv);
+    POCKET_CUDA_ALLOC(ctx->cuda_attn, attn_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_proj, cfg->hidden_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_ffn, cfg->ffn_dim);
+#undef POCKET_CUDA_ALLOC
+    ctx->cuda_backbone_capacity = bc->max_seq_len;
+    ctx->cuda_backbone_kv_floats = kv_floats;
+    ctx->cuda_backbone_valid = 0;
+    return 0;
+}
+
+static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
+                                       size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_backbone_enabled ||
+        ctx->cuda_backbone_kv == NULL) {
+        return 1;
+    }
+    const pocket_config *cfg = &ctx->state->cfg;
+    const size_t half = mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+    size_t layer_span = 0;
+    if (pocket_mul(half, 2u, &layer_span) != 0 ||
+        pocket_mul(cfg->layers, layer_span, &layer_span) != 0 ||
+        layer_span > ctx->cuda_backbone_kv_floats) {
+        pocket_error(error, capacity, "pocket: CUDA KV upload size overflow");
+        return -1;
+    }
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        float *destination = ctx->cuda_backbone_kv + l * (half * 2u);
+        const float *source = mynah_transformer_ar_state_kv(ctx->backbone, l);
+        if (source == NULL ||
+            mynah_backend_h2d(ctx->state->backend, source, destination,
+                              half * 2u, error, capacity) != 0) {
+            ctx->cuda_backbone_valid = 0;
+            return -1;
+        }
+    }
+    ctx->cuda_backbone_valid = 1;
+    return 0;
+}
+
+/* One resident Pocket autoregressive step.  The host state is deliberately
+ * committed only after the device output has been downloaded and validated;
+ * this lets the caller retry the same position on CPU after a recoverable CUDA
+ * failure without consuming a different KV position. */
+static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
+                                     size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_backbone_enabled ||
+        ctx->cuda_backbone_kv == NULL) {
+        return 1; /* unavailable: use the normal CPU path */
+    }
+    const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_backend *backend = ctx->state->backend;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    if (bc == NULL || ctx->cuda_backbone_capacity != bc->max_seq_len ||
+        ctx->cuda_x == NULL || ctx->cuda_norm == NULL || ctx->cuda_qkv == NULL ||
+        ctx->cuda_attn == NULL || ctx->cuda_proj == NULL || ctx->cuda_ffn == NULL) {
+        return 1;
+    }
+    const size_t position = mynah_transformer_ar_state_offset(ctx->backbone);
+    if (position >= bc->max_seq_len) {
+        pocket_error(error, capacity, "pocket: CUDA backbone KV capacity exhausted");
+        return -1;
+    }
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    const size_t layer_half = bc->max_seq_len * attn_dim;
+    char local[256];
+    char drain_error[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(backend, local, sizeof(local)) != 0) goto fail;
+    if (!ctx->cuda_backbone_valid &&
+        pocket_cuda_backbone_upload(ctx, local, sizeof(local)) != 0) goto fail;
+    if (mynah_backend_h2d(backend, ctx->step_input, ctx->cuda_x,
+                          cfg->hidden_dim, local, sizeof(local)) != 0) goto fail;
+
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        const mynah_transformer_ar_layer *layer = &ctx->state->backbone_layers[l];
+        if (mynah_backend_layer_norm_dev(backend, ctx->cuda_x, ctx->cuda_norm,
+                                         layer->norm1_weight, layer->norm1_bias,
+                                         1u, cfg->hidden_dim, local,
+                                         sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(backend, ctx->cuda_norm, ctx->cuda_qkv,
+                                     1u, cfg->hidden_dim, 3u * attn_dim,
+                                     layer->in_proj_weight, layer->in_proj_bias,
+                                     local, sizeof(local)) != 0 ||
+            mynah_backend_rope_dev(backend, ctx->cuda_qkv, position, cfg->heads,
+                                   cfg->head_dim, bc->max_period, local,
+                                   sizeof(local)) != 0) goto fail;
+        float *layer_kv = ctx->cuda_backbone_kv + l * (2u * layer_half);
+        if (mynah_backend_self_attention_dev(
+                backend, ctx->cuda_qkv, layer_kv, layer_kv + layer_half,
+                position, attn_dim, position + 1u, cfg->heads, cfg->head_dim,
+                1.0f / sqrtf((float)cfg->head_dim), ctx->cuda_attn, local,
+                sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(backend, ctx->cuda_attn, ctx->cuda_proj,
+                                     1u, attn_dim, cfg->hidden_dim,
+                                     layer->out_proj_weight, layer->out_proj_bias,
+                                     local, sizeof(local)) != 0 ||
+            mynah_backend_residual_add_dev(backend, ctx->cuda_x, ctx->cuda_proj,
+                                           cfg->hidden_dim, local,
+                                           sizeof(local)) != 0 ||
+            mynah_backend_layer_norm_dev(backend, ctx->cuda_x, ctx->cuda_norm,
+                                         layer->norm2_weight, layer->norm2_bias,
+                                         1u, cfg->hidden_dim, local,
+                                         sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(backend, ctx->cuda_norm, ctx->cuda_ffn,
+                                     1u, cfg->hidden_dim, cfg->ffn_dim,
+                                     layer->linear1_weight, layer->linear1_bias,
+                                     local, sizeof(local)) != 0 ||
+            mynah_backend_gelu_dev(backend, ctx->cuda_ffn, cfg->ffn_dim, local,
+                                   sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(backend, ctx->cuda_ffn, ctx->cuda_proj,
+                                     1u, cfg->ffn_dim, cfg->hidden_dim,
+                                     layer->linear2_weight, layer->linear2_bias,
+                                     local, sizeof(local)) != 0 ||
+            mynah_backend_residual_add_dev(backend, ctx->cuda_x, ctx->cuda_proj,
+                                           cfg->hidden_dim, local,
+                                           sizeof(local)) != 0) goto fail;
+    }
+    if (mynah_backend_layer_norm_dev(
+            backend, ctx->cuda_x, ctx->cuda_norm, ctx->state->backbone.out_norm_weight,
+            ctx->state->backbone.out_norm_bias, 1u, cfg->hidden_dim, local,
+            sizeof(local)) != 0 ||
+        mynah_backend_d2h(backend, ctx->cuda_norm, ctx->hidden,
+                          cfg->hidden_dim, local, sizeof(local)) != 0) goto fail;
+    /* Keep only the newly appended K/V slot shadowed in the host cache.  The
+     * whole prefix stays resident, but this bounded copy is what makes a
+     * later recoverable CUDA failure safe to retry on CPU without replaying
+     * the request from the beginning. */
+    const size_t host_half =
+        mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+    const size_t host_slot = position * attn_dim;
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
+        const float *device_k =
+            ctx->cuda_backbone_kv + l * (2u * layer_half) + host_slot;
+        const float *device_v = device_k + layer_half;
+        if (host_kv == NULL ||
+            mynah_backend_d2h(backend, device_k, host_kv + host_slot,
+                              attn_dim, local, sizeof(local)) != 0 ||
+            mynah_backend_d2h(backend, device_v, host_kv + host_half + host_slot,
+                              attn_dim, local, sizeof(local)) != 0) goto fail;
+    }
+    if (mynah_backend_sync(backend, local, sizeof(local)) != 0 ||
+        !pocket_all_finite(ctx->hidden, cfg->hidden_dim)) goto fail;
+    if (mynah_transformer_ar_state_set_offset(ctx->backbone, position + 1u,
+                                              local, sizeof(local)) != 0) goto fail;
+    if (error != NULL && capacity > 0u) error[0] = '\0';
+    return 0;
+
+fail:
+    /* A failed CUDA launch can leave the stream in an error state.  Do not
+     * pay the same failure on every following frame: the host cache is still
+     * authoritative, so this request can continue on CPU until its context is
+     * destroyed. */
+    (void)mynah_backend_sync(backend, drain_error, sizeof(drain_error));
+    ctx->cuda_backbone_enabled = 0;
+    ctx->cuda_backbone_valid = 0;
+    pocket_error(error, capacity, "%s",
+                 local[0] != '\0' ? local : "CUDA resident backbone failed");
+    return -1;
+}
+
+/* Cross-request CUDA batch: projections and residual/FFN work are stacked,
+ * while every row keeps its own KV pointer and absolute position.  A return of
+ * 1 means "not eligible" and leaves all host state untouched; -1 means a CUDA
+ * failure after submission and invalidates the resident caches so the caller
+ * can retry the same rows through the CPU implementation. */
+static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
+                                           size_t count,
+                                           mynah_engine_scratch *scratch,
+                                           char *error, size_t capacity) {
+    if (ctxs == NULL || scratch == NULL || count < 2u ||
+        !scratch->cuda_batch_enabled || scratch->backend == NULL ||
+        count > scratch->cuda_batch_capacity || count > POCKET_MAX_BATCH) {
+        return 1;
+    }
+    mynah_engine_ctx *first = ctxs[0];
+    if (first == NULL || first->state == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0) return 1;
+    const mynah_engine_state *state = first->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *first_config =
+        mynah_transformer_ar_state_config(first->backbone);
+    if (first_config == NULL) return 1;
+
+    float *kcache[POCKET_MAX_BATCH];
+    float *vcache[POCKET_MAX_BATCH];
+    size_t positions[POCKET_MAX_BATCH];
+    size_t cache_strides[POCKET_MAX_BATCH];
+    size_t half[POCKET_MAX_BATCH];
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || !ctx->cuda_backbone_enabled ||
+            ctx->cuda_backbone_kv == NULL || ctx->cuda_x == NULL ||
+            ctx->cuda_backbone_capacity == 0u) return 1;
+        const mynah_transformer_ar_config *config =
+            mynah_transformer_ar_state_config(ctx->backbone);
+        if (config == NULL || config->d_model != first_config->d_model ||
+            config->num_heads != first_config->num_heads ||
+            config->head_dim != first_config->head_dim ||
+            config->num_layers != first_config->num_layers ||
+            config->ffn_dim != first_config->ffn_dim ||
+            config->max_period != first_config->max_period ||
+            config->layernorm_eps != first_config->layernorm_eps) return 1;
+        positions[i] = mynah_transformer_ar_state_offset(ctx->backbone);
+        if (positions[i] >= config->max_seq_len) return -1;
+        half[i] = config->max_seq_len * (cfg->heads * cfg->head_dim);
+        cache_strides[i] = half[i];
+        memcpy(scratch->cuda_host_input + i * cfg->hidden_dim,
+               ctx->step_input, cfg->hidden_dim * sizeof(float));
+    }
+
+    char local[256];
+    char drain_error[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0)
+        goto fail;
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (!ctx->cuda_backbone_valid &&
+            pocket_cuda_backbone_upload(ctx, local, sizeof(local)) != 0) goto fail;
+    }
+    if (mynah_backend_h2d(scratch->backend, scratch->cuda_host_input,
+                          scratch->cuda_x, count * cfg->hidden_dim, local,
+                          sizeof(local)) != 0) goto fail;
+
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        const mynah_transformer_ar_layer *layer = &state->backbone_layers[l];
+        if (mynah_backend_layer_norm_dev(
+                scratch->backend, scratch->cuda_x, scratch->cuda_norm,
+                layer->norm1_weight, layer->norm1_bias, count, cfg->hidden_dim,
+                local, sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(
+                scratch->backend, scratch->cuda_norm, scratch->cuda_qkv, count,
+                cfg->hidden_dim, 3u * attn_dim, layer->in_proj_weight,
+                layer->in_proj_bias, local, sizeof(local)) != 0) goto fail;
+        for (size_t i = 0; i < count; ++i) {
+            if (mynah_backend_rope_dev(
+                    scratch->backend,
+                    scratch->cuda_qkv + i * (3u * attn_dim), positions[i],
+                    cfg->heads, cfg->head_dim, first_config->max_period, local,
+                    sizeof(local)) != 0) goto fail;
+            const size_t layer_offset = l * 2u * half[i];
+            kcache[i] = ctxs[i]->cuda_backbone_kv + layer_offset;
+            vcache[i] = kcache[i] + half[i];
+        }
+        if (mynah_backend_self_attention_batch_dev(
+                scratch->backend, scratch->cuda_qkv, kcache, vcache, positions,
+                cache_strides, count, cfg->heads, cfg->head_dim,
+                1.0f / sqrtf((float)cfg->head_dim), scratch->cuda_attn, local,
+                sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(
+                scratch->backend, scratch->cuda_attn, scratch->cuda_proj, count,
+                attn_dim, cfg->hidden_dim, layer->out_proj_weight,
+                layer->out_proj_bias, local, sizeof(local)) != 0 ||
+            mynah_backend_residual_add_dev(
+                scratch->backend, scratch->cuda_x, scratch->cuda_proj,
+                count * cfg->hidden_dim, local, sizeof(local)) != 0 ||
+            mynah_backend_layer_norm_dev(
+                scratch->backend, scratch->cuda_x, scratch->cuda_norm,
+                layer->norm2_weight, layer->norm2_bias, count, cfg->hidden_dim,
+                local, sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(
+                scratch->backend, scratch->cuda_norm, scratch->cuda_ffn, count,
+                cfg->hidden_dim, cfg->ffn_dim, layer->linear1_weight,
+                layer->linear1_bias, local, sizeof(local)) != 0 ||
+            mynah_backend_gelu_dev(scratch->backend, scratch->cuda_ffn,
+                                   count * cfg->ffn_dim, local, sizeof(local)) != 0 ||
+            mynah_backend_matmul_d2d(
+                scratch->backend, scratch->cuda_ffn, scratch->cuda_proj, count,
+                cfg->ffn_dim, cfg->hidden_dim, layer->linear2_weight,
+                layer->linear2_bias, local, sizeof(local)) != 0 ||
+            mynah_backend_residual_add_dev(
+                scratch->backend, scratch->cuda_x, scratch->cuda_proj,
+                count * cfg->hidden_dim, local, sizeof(local)) != 0) goto fail;
+    }
+    if (mynah_backend_layer_norm_dev(
+            scratch->backend, scratch->cuda_x, scratch->cuda_norm,
+            state->backbone.out_norm_weight, state->backbone.out_norm_bias, count,
+            cfg->hidden_dim, local, sizeof(local)) != 0 ||
+        mynah_backend_d2h(scratch->backend, scratch->cuda_norm,
+                          scratch->cuda_host_output,
+                          count * cfg->hidden_dim, local, sizeof(local)) != 0) goto fail;
+    /* Shadow only the newly appended K/V slot in each host state.  The large
+     * prefix remains resident, while this bounded commit preserves the CPU
+     * retry guarantee if a later CUDA step fails. */
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        for (size_t i = 0; i < count; ++i) {
+            mynah_engine_ctx *ctx = ctxs[i];
+            const size_t host_half =
+                mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+            const size_t host_slot = positions[i] * attn_dim;
+            float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
+            const float *device_k =
+                ctx->cuda_backbone_kv + l * (2u * half[i]) + host_slot;
+            const float *device_v = device_k + half[i];
+            if (host_kv == NULL ||
+                mynah_backend_d2h(scratch->backend, device_k,
+                                  host_kv + host_slot, attn_dim, local,
+                                  sizeof(local)) != 0 ||
+                mynah_backend_d2h(scratch->backend, device_v,
+                                  host_kv + host_half + host_slot, attn_dim,
+                                  local, sizeof(local)) != 0) goto fail;
+        }
+    }
+    if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) goto fail;
+    for (size_t i = 0; i < count; ++i) {
+        if (!pocket_all_finite(scratch->cuda_host_output + i * cfg->hidden_dim,
+                               cfg->hidden_dim)) goto fail;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        memcpy(ctxs[i]->hidden, scratch->cuda_host_output + i * cfg->hidden_dim,
+               cfg->hidden_dim * sizeof(float));
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (mynah_transformer_ar_state_set_offset(
+                ctxs[i]->backbone, positions[i] + 1u, local, sizeof(local)) != 0) {
+            for (size_t j = 0; j < i; ++j) {
+                (void)mynah_transformer_ar_state_set_offset(
+                    ctxs[j]->backbone, positions[j], NULL, 0u);
+            }
+            goto fail;
+        }
+    }
+    if (error != NULL && capacity > 0u) error[0] = '\0';
+    return 0;
+
+fail:
+    (void)mynah_backend_sync(scratch->backend, drain_error, sizeof(drain_error));
+    for (size_t i = 0; i < count; ++i) {
+        ctxs[i]->cuda_backbone_enabled = 0;
+        ctxs[i]->cuda_backbone_valid = 0;
+    }
+    pocket_error(error, capacity, "%s",
+                 local[0] != '\0' ? local : "CUDA resident backbone batch failed");
+    return -1;
+}
+
 static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     if (ctx == NULL) return;
     if (ctx->t_created_ns != 0u) {
@@ -3295,6 +3755,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     }
     pocket_dump_flush(ctx);
     pocket_dump_free(ctx->dump);
+    pocket_cuda_backbone_release(ctx);
     pocket_call_release(&ctx->backbone_call.call);
     pocket_call_release(&ctx->codec_call.call);
     pocket_call_release(&ctx->flow_call.call);
@@ -3406,6 +3867,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
     ctx->state = state;
+    ctx->cuda_backbone_enabled = pocket_cuda_resident_requested(state);
     ctx->speaker = request->speaker;
     ctx->max_steps = max_steps;
     ctx->text_length = request->text_length;
@@ -3666,6 +4128,11 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
 
+    /* CUDA allocations happen before the request can be prepared.  If the
+     * optional resident path cannot reserve them, the context remains a valid
+     * CPU context and the backend contract's safe fallback is preserved. */
+    (void)pocket_cuda_backbone_alloc(ctx);
+
     /* Set last, so the failure paths above (which call `_ctx_free`) cannot
      * submit a span or count a request that never ran. */
     ctx->t_created_ns = mynah_costmap_level() ? mynah_costmap_now_ns() : 0u;
@@ -3779,6 +4246,10 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
     ctx->broken = 0;
     ctx->budget_exhausted = 0;
     ctx->eos_logit = 0.0f;
+    /* The host reset below is authoritative.  The resident cache is
+     * re-uploaded lazily before the next CUDA step, after voice/text prefill
+     * has rebuilt every valid host position. */
+    ctx->cuda_backbone_valid = 0;
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
     ctx->spare = 0.0f;
@@ -4117,13 +4588,39 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
     int failed = 0;
     size_t failed_at = 0;
-    if (live > 1u && can_gather) {
+    int cuda_used = 0;
+    if (live > 1u && live == count) {
+        char cuda_error[256];
+        cuda_error[0] = '\0';
+        const int cuda_rc = pocket_cuda_backbone_step_batch(
+            ctxs, count, scratch, cuda_error, sizeof(cuda_error));
+        if (cuda_rc == 0) cuda_used = 1;
+    }
+    if (live == 1u) {
+        /* A single request is the latency-critical server path.  CUDA keeps
+         * the whole transformer step resident; if a launch/sync fails, the
+         * host KV offset is still unchanged and the ordinary CPU step below
+         * can safely retry it. */
+        mynah_engine_ctx *single = NULL;
+        for (size_t i = 0; i < count; ++i) {
+            if (will_step[i]) {
+                single = ctxs[i];
+                break;
+            }
+        }
+        char cuda_error[256];
+        cuda_error[0] = '\0';
+        const int cuda_rc = pocket_cuda_backbone_step(
+            single, cuda_error, sizeof(cuda_error));
+        if (cuda_rc == 0) cuda_used = 1;
+    }
+    if (!cuda_used && live > 1u && can_gather) {
         failed = mynah_transformer_ar_step_batch(scratch->states, live,
                                                  &scratch->backbone_w,
                                                  scratch->backbone_batch,
                                                  scratch->inputs,
                                                  scratch->outputs) != 0;
-    } else {
+    } else if (!cuda_used) {
         /* No batch scratch (or a single live request): the same graph, one row
          * at a time.  Not a second implementation -- `_step_batch` of one row
          * is `_step` -- just the path with nothing to share.  It is also the
@@ -4714,6 +5211,19 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
 
 static void pocket_scratch_free(mynah_engine_scratch *scratch) {
     if (scratch == NULL) return;
+    if (scratch->backend != NULL) {
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_x);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_norm);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_qkv);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_attn);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_proj);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_ffn);
+        mynah_backend_host_free(scratch->backend, scratch->cuda_host_input);
+        mynah_backend_host_free(scratch->backend, scratch->cuda_host_output);
+    } else {
+        free(scratch->cuda_host_input);
+        free(scratch->cuda_host_output);
+    }
     mynah_transformer_ar_batch_free(scratch->backbone_batch);
     mynah_flow_head_batch_free(scratch->flow_batch);
     pocket_call_release(&scratch->backbone_call.call);
@@ -4753,6 +5263,7 @@ static int pocket_scratch_new(const mynah_tts_model *model,
         return -1;
     }
     scratch->batch = batch;
+    scratch->backend = state->backend;
     if (batch == 1u) {
         /* Nothing to share: a one-slot driver keeps the single-step path. */
         *out = scratch;
@@ -4761,6 +5272,68 @@ static int pocket_scratch_new(const mynah_tts_model *model,
 
     const pocket_config *cfg = &state->cfg;
     const size_t attn_dim = cfg->heads * cfg->head_dim;
+
+    /* Reserve the cross-request resident workspace up front.  If the optional
+     * CUDA buffers cannot be created, the already-correct CPU batch remains
+     * available; no decode call allocates a smaller emergency workspace. */
+    if (pocket_cuda_resident_requested(state)) {
+        size_t rows_hidden = 0, rows_qkv = 0, rows_attn = 0, rows_ffn = 0;
+        if (pocket_mul(batch, cfg->hidden_dim, &rows_hidden) == 0 &&
+            pocket_mul(batch, 3u * attn_dim, &rows_qkv) == 0 &&
+            pocket_mul(batch, attn_dim, &rows_attn) == 0 &&
+            pocket_mul(batch, cfg->ffn_dim, &rows_ffn) == 0) {
+            scratch->cuda_host_input =
+                NULL;
+            scratch->cuda_host_output = NULL;
+            char ignored[256];
+            int device_failed =
+                mynah_backend_host_alloc(state->backend, rows_hidden,
+                                         &scratch->cuda_host_input, ignored,
+                                         sizeof(ignored)) != 0;
+            if (!device_failed) {
+                device_failed =
+                    mynah_backend_host_alloc(state->backend, rows_hidden,
+                                             &scratch->cuda_host_output, ignored,
+                                             sizeof(ignored)) != 0;
+            }
+#define POCKET_CUDA_SCRATCH_ALLOC(field, count)                                \
+            do {                                                                \
+                if (!device_failed &&                                          \
+                    mynah_backend_dev_alloc(state->backend, (count),           \
+                                            &(field), ignored, sizeof(ignored)) != 0) \
+                    device_failed = 1;                                          \
+            } while (0)
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_x, rows_hidden);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_norm, rows_hidden);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_qkv, rows_qkv);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_attn, rows_attn);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_proj, rows_hidden);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_ffn, rows_ffn);
+#undef POCKET_CUDA_SCRATCH_ALLOC
+            if (device_failed) {
+                mynah_backend_dev_free(state->backend, scratch->cuda_x);
+                mynah_backend_dev_free(state->backend, scratch->cuda_norm);
+                mynah_backend_dev_free(state->backend, scratch->cuda_qkv);
+                mynah_backend_dev_free(state->backend, scratch->cuda_attn);
+                mynah_backend_dev_free(state->backend, scratch->cuda_proj);
+                mynah_backend_dev_free(state->backend, scratch->cuda_ffn);
+                scratch->cuda_x = NULL;
+                scratch->cuda_norm = NULL;
+                scratch->cuda_qkv = NULL;
+                scratch->cuda_attn = NULL;
+                scratch->cuda_proj = NULL;
+                scratch->cuda_ffn = NULL;
+                mynah_backend_host_free(state->backend, scratch->cuda_host_input);
+                mynah_backend_host_free(state->backend, scratch->cuda_host_output);
+                scratch->cuda_host_input = NULL;
+                scratch->cuda_host_output = NULL;
+            } else {
+                scratch->cuda_batch_capacity = batch;
+                scratch->cuda_batch_enabled = 1;
+            }
+        }
+    }
+
     size_t backbone_k = cfg->hidden_dim;
     if (attn_dim > backbone_k) backbone_k = attn_dim;
     if (cfg->ffn_dim > backbone_k) backbone_k = cfg->ffn_dim;
@@ -5008,9 +5581,11 @@ int mynah_engine_pocket_reserve_text(mynah_engine_ctx *ctx, size_t total_tokens,
     ctx->text_ids = ids;
     free(ctx->text_embed);
     ctx->text_embed = embed;
+    pocket_cuda_backbone_release(ctx);
     mynah_transformer_ar_state_free(ctx->backbone);
     ctx->backbone = grown;
     ctx->text_capacity = total_tokens;
+    (void)pocket_cuda_backbone_alloc(ctx);
     return 0;
 }
 

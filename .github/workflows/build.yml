@@ -390,27 +390,47 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Two architectures, because an intrinsic or a __shfl variant can exist
-        # on one and not the other, and that is a compile error we can have for
-        # free. Neither needs the silicon to be present.
-        arch: [sm_70, sm_90]
+        # Three architectures, including sm_89 for the L40S target. An
+        # intrinsic or a __shfl variant can exist on one and not the other,
+        # and that is a compile error we can have for free. None needs the
+        # silicon to be present.
+        arch: [sm_70, sm_89, sm_90]
     steps:
       - name: Install build tools
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential git ca-certificates
+          nvcc --version
 
       - uses: actions/checkout@v7
 
       # CUDA_ARCH must be named. The Makefile defaults to `-arch=native`, and
       # native means "ask the installed GPU", so `make cuda` cannot work on any
       # machine without one -- which is every build farm.
-      - name: Compile and link the CUDA build
-        run: make cuda CUDA_ARCH=${{ matrix.arch }}
+      - name: Compile and link the CUDA CLI and server builds
+        run: make cuda cuda-server CUDA_ARCH=${{ matrix.arch }}
+
+      - name: Prove the CUDA backend is linked (still no GPU)
+        run: |
+          set -eu
+          ./build/cuda/mynah-tts --dispatch-map > dispatch.txt
+          cat dispatch.txt
+          grep -q 'backend.cuda' dispatch.txt
+          if grep -q 'CUDA backend is not compiled' dispatch.txt; then
+            echo 'CUDA dispatch row says the binary is CPU-only' >&2
+            exit 1
+          fi
+          ./build/cuda/mynah-tts --gpu-self-test cuda > selftest.txt 2>&1 || true
+          cat selftest.txt
+          if grep -q 'CUDA backend is not compiled' selftest.txt; then
+            echo 'GPU self-test reached a CPU-only binary' >&2
+            exit 1
+          fi
+          test -x build/cuda/mynah-tts-server
 
       - name: Say what this did and did not prove
         run: |
-          echo "::notice title=CUDA::Compiled and linked for ${{ matrix.arch }} with no GPU present. Nothing was executed: no kernel correctness, no performance, not even a launch."
+          echo "::notice title=CUDA::CLI and server compiled and linked for ${{ matrix.arch }} with no GPU present. Backend presence was checked; no kernel correctness, performance, or launch was tested."
 
   metal-compile:
     name: "compile-only: Metal (shaders + backend)"

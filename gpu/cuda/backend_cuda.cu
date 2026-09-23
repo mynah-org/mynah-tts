@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,43 +31,110 @@
 /*  CUDA kernels                                                       */
 /* ------------------------------------------------------------------ */
 
+/* The first CUDA slice used one thread per norm row and accidentally ignored
+ * the optional bias.  One block per row keeps the operation resident while
+ * reducing the work in parallel.  The reduction order is fixed (warp tree),
+ * so CPU/GPU parity only needs the documented floating-point tolerance. */
 __global__ static void k_layer_norm(float *out, const float *in,
-                                    const float *gain,
+                                    const float *gain, const float *bias,
                                     int width, float eps, int nrows) {
-    /* One thread per row: sequential accumulation matches CPU bit-order. */
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = (int)blockIdx.x;
     if (row >= nrows) return;
-    const float *x = in + (size_t)row * width;
-    float *y = out + (size_t)row * width;
-    float mean = 0.0f;
-    for (int d = 0; d < width; ++d) mean += x[d];
-    mean /= (float)width;
-    float var = 0.0f;
-    for (int d = 0; d < width; ++d) { float dd = x[d] - mean; var += dd * dd; }
-    float inv = 1.0f / sqrtf(var / (float)width + eps);
-    for (int d = 0; d < width; ++d)
-        y[d] = (x[d] - mean) * inv * gain[d];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float warp_sum[8];
+    __shared__ float warp_sq[8];
+    __shared__ float mean_shared;
+    __shared__ float inv_shared;
+    const float *x = in + (size_t)row * (size_t)width;
+    float *y = out + (size_t)row * (size_t)width;
+    float sum = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) sum += x[d];
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) warp_sum[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) total += warp_sum[w];
+        mean_shared = total / (float)width;
+    }
+    __syncthreads();
+    const float mean = mean_shared;
+    float sq = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float delta = x[d] - mean;
+        sq += delta * delta;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffffu, sq, off);
+    if (lane == 0) warp_sq[warp] = sq;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) total += warp_sq[w];
+        inv_shared = rsqrtf(total / (float)width + eps);
+    }
+    __syncthreads();
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float b = bias == nullptr ? 0.0f : bias[d];
+        y[d] = (x[d] - mean) * inv_shared * gain[d] + b;
+    }
+}
+
+__device__ static float warp_max(float value) {
+    for (int off = 16; off > 0; off >>= 1)
+        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, off));
+    return value;
+}
+
+__device__ static float warp_sum(float value) {
+    for (int off = 16; off > 0; off >>= 1)
+        value += __shfl_down_sync(0xffffffffu, value, off);
+    return value;
 }
 
 __global__ static void k_softmax_causal(float *data, int cols, int valid) {
-    int row = blockIdx.x;
-    float *r = data + (size_t)row * cols;
-    int v = valid < cols ? valid : cols;
-    float mx = -1e30f;
-    for (int i = threadIdx.x; i < v; i += blockDim.x) mx = fmaxf(mx, r[i]);
-    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, off));
-    __shared__ float s_mx, s_sum;
-    if (threadIdx.x == 0) s_mx = mx;
+    const int row = (int)blockIdx.x;
+    float *r = data + (size_t)row * (size_t)cols;
+    const int v = valid < cols ? valid : cols;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float partial[8];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    float local_max = -1.0e30f;
+    for (int i = tid; i < v; i += (int)blockDim.x) local_max = fmaxf(local_max, r[i]);
+    local_max = warp_max(local_max);
+    if (lane == 0) partial[warp] = local_max;
     __syncthreads();
-    mx = s_mx;
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < v; i += blockDim.x) { r[i] = expf(r[i] - mx); sum += r[i]; }
-    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
-    if (threadIdx.x == 0) s_sum = sum;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) maximum = fmaxf(maximum, partial[w]);
+    }
     __syncthreads();
-    float inv = 1.0f / s_sum;
-    for (int i = threadIdx.x; i < v; i += blockDim.x) r[i] *= inv;
-    for (int i = threadIdx.x + v; i < cols; i += blockDim.x) r[i] = 0.0f;
+    float local_sum = 0.0f;
+    for (int i = tid; i < v; i += (int)blockDim.x) {
+        r[i] = expf(r[i] - maximum);
+        local_sum += r[i];
+    }
+    local_sum = warp_sum(local_sum);
+    if (lane == 0) partial[warp] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        denominator = 0.0f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) denominator += partial[w];
+    }
+    __syncthreads();
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int i = tid; i < v; i += (int)blockDim.x) r[i] *= inv;
+    for (int i = tid + v; i < cols; i += (int)blockDim.x) r[i] = 0.0f;
 }
 
 __global__ static void k_gelu(float *data, int n) {
@@ -126,6 +194,40 @@ __global__ static void k_copy_strided(float *dst, const float *src,
         dst[(size_t)r * dst_stride + c] = src[(size_t)r * src_stride + c];
 }
 
+__global__ static void k_copy(float *dst, const float *src, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+__global__ static void k_scale(float *data, float scale, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) data[i] *= scale;
+}
+
+__global__ static void k_clip(float *data, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    const float value = data[i];
+    data[i] = isfinite(value) ? fminf(1.0f, fmaxf(-1.0f, value)) : 0.0f;
+}
+
+__global__ static void k_argmax(const float *logits, unsigned *result,
+                                int vocab, int codebook_size, unsigned eos_id,
+                                int allow_eos) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    float best = -CUDART_INF_F;
+    unsigned index = 0u;
+    for (int i = 0; i < vocab; ++i) {
+        const bool allowed = i < codebook_size ||
+                             (allow_eos != 0 && (unsigned)i == eos_id);
+        if (allowed && logits[i] > best) {
+            best = logits[i];
+            index = (unsigned)i;
+        }
+    }
+    result[0] = index;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Backend state                                                      */
 /* ------------------------------------------------------------------ */
@@ -142,6 +244,20 @@ struct cuda_cached_fp16 {
     half *device_ptr;
 };
 
+struct cuda_graph_entry {
+    size_t rows;
+    size_t iw;
+    size_t ow;
+    const void *weight_pointer;
+    const void *bias_pointer;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    bool valid;
+};
+
+struct cuda_backend_state;
+static void destroy_graphs(cuda_backend_state *st);
+
 struct cuda_backend_state {
     cublasHandle_t cublas;
     cudaStream_t stream;
@@ -154,11 +270,38 @@ struct cuda_backend_state {
     float *host_buf;
     float *dev_buf;           /* mapped device pointer for host_buf */
     size_t host_buf_cap;
+    unsigned *dev_argmax;
+    void *cublas_workspace;
+    size_t cublas_workspace_cap;
+    /* Metadata for independent-request attention batches.  The arrays are
+     * allocated with the backend, never from the autoregressive hot loop. */
+    float **dev_batch_k_cache;
+    float **dev_batch_v_cache;
+    size_t *dev_batch_positions;
+    size_t *dev_batch_cache_strides;
+    size_t batch_meta_cap;
+    bool fast_math;
+    std::vector<cuda_graph_entry> graph_cache;
 };
+
+static constexpr size_t CUDA_BATCH_META_CAP = 64u;
 
 static void set_error(char *e, size_t c, const char *m) {
     if (e && c > 0) std::snprintf(e, c, "%s", m);
 }
+
+static bool cuda_size_mul(size_t a, size_t b, size_t *out) {
+    if (a != 0u && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool cuda_size_add(size_t a, size_t b, size_t *out) {
+    if (b > SIZE_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
 static int ce(cudaError_t r, char *e, size_t c) {
     if (r == cudaSuccess) return 0;
     std::snprintf(e, c, "CUDA: %s", cudaGetErrorString(r)); return -1;
@@ -168,10 +311,34 @@ static int cbe(cublasStatus_t s, char *e, size_t c) {
     std::snprintf(e, c, "cuBLAS: %d", (int)s); return -1;
 }
 
+static bool cuda_fast_math_enabled(void) {
+    const char *value = std::getenv("MYNAH_CUDA_FAST_MATH");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+static cublasComputeType_t cuda_compute_type(const cuda_backend_state *st) {
+    return st->fast_math ? CUBLAS_COMPUTE_32F_FAST_16F
+                                    : CUBLAS_COMPUTE_32F;
+}
+
+static cublasGemmAlgo_t cuda_gemm_algo(const cuda_backend_state *st) {
+    return st->fast_math ? CUBLAS_GEMM_DEFAULT_TENSOR_OP
+                                    : CUBLAS_GEMM_DEFAULT;
+}
+
 static int ensure_scratch(cuda_backend_state *st, size_t bytes, char *e, size_t ec) {
     if (st->dev_scratch_cap >= bytes) return 0;
+    size_t rounded = 0;
+    if (!cuda_size_add(bytes, (32u << 20) - 1u, &rounded)) {
+        set_error(e, ec, "CUDA scratch size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    destroy_graphs(st);
     if (st->dev_scratch) cudaFree(st->dev_scratch);
-    size_t cap = (bytes + (32u<<20) - 1u) & ~((32u<<20) - 1u);
+    st->dev_scratch = nullptr;
+    st->dev_scratch_cap = 0;
+    size_t cap = rounded & ~((32u << 20) - 1u);
     if (ce(cudaMalloc(&st->dev_scratch, cap), e, ec)) { st->dev_scratch = nullptr; st->dev_scratch_cap = 0; return -1; }
     st->dev_scratch_cap = cap;
     return 0;
@@ -179,9 +346,16 @@ static int ensure_scratch(cuda_backend_state *st, size_t bytes, char *e, size_t 
 
 static int ensure_host(cuda_backend_state *st, size_t bytes, char *e, size_t ec) {
     if (st->host_buf_cap >= bytes) return 0;
+    size_t rounded = 0;
+    if (!cuda_size_add(bytes, (16u << 20) - 1u, &rounded)) {
+        set_error(e, ec, "CUDA host staging size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    destroy_graphs(st);
     if (st->host_buf) cudaFreeHost(st->host_buf);
     st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
-    size_t cap = (bytes + (16u<<20) - 1u) & ~((16u<<20) - 1u);
+    size_t cap = rounded & ~((16u << 20) - 1u);
     if (ce(cudaHostAlloc(&st->host_buf, cap, cudaHostAllocMapped), e, ec)) return -1;
     if (ce(cudaHostGetDevicePointer(&st->dev_buf, st->host_buf, 0), e, ec)) {
         cudaFreeHost(st->host_buf); st->host_buf = nullptr; return -1;
@@ -192,6 +366,10 @@ static int ensure_host(cuda_backend_state *st, size_t bytes, char *e, size_t ec)
 
 static int cached_weight(cuda_backend_state *st, const float *hp, size_t bytes,
                          float **dp, char *e, size_t ec) {
+    if (st == nullptr || hp == nullptr || dp == nullptr || bytes == 0u) {
+        set_error(e, ec, "invalid CUDA weight cache request");
+        return -1;
+    }
     for (auto &c : st->weights)
         if (c.host_pointer == hp && c.bytes == bytes) { *dp = c.device_pointer; return 0; }
     float *d = nullptr;
@@ -204,17 +382,67 @@ static int cached_weight(cuda_backend_state *st, const float *hp, size_t bytes,
 
 static int cached_weight_fp16(cuda_backend_state *st, const float *hp, size_t n,
                               half **dp, char *e, size_t ec) {
+    size_t bytes = 0;
+    if (st == nullptr || hp == nullptr || dp == nullptr || n == 0u ||
+        n > (size_t)INT_MAX || !cuda_size_mul(n, sizeof(float), &bytes)) {
+        set_error(e, ec, "invalid CUDA FP16 weight cache request");
+        return -1;
+    }
     for (auto &c : st->weights_fp16)
         if (c.host_pointer == hp && c.n == n) { *dp = c.device_ptr; return 0; }
     float *tmp = nullptr;
     half *d16 = nullptr;
-    if (ce(cudaMalloc(&tmp, n * sizeof(float)), e, ec)) return -1;
-    if (ce(cudaMalloc(&d16, n * sizeof(half)), e, ec)) { cudaFree(tmp); return -1; }
-    cudaMemcpy(tmp, hp, n * sizeof(float), cudaMemcpyHostToDevice);
-    k_f32_to_f16<<<((int)n+255)/256, 256>>>(tmp, d16, (int)n);
-    cudaFree(tmp);
+    size_t half_bytes = 0;
+    if (!cuda_size_mul(n, sizeof(half), &half_bytes)) {
+        set_error(e, ec, "CUDA FP16 weight size overflow");
+        return -1;
+    }
+    if (ce(cudaMalloc(&tmp, bytes), e, ec)) return -1;
+    if (ce(cudaMalloc(&d16, half_bytes), e, ec)) { cudaFree(tmp); return -1; }
+    if (ce(cudaMemcpyAsync(tmp, hp, bytes, cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    k_f32_to_f16<<<((int)n+255)/256, 256, 0, st->stream>>>(tmp, d16, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    /* The temporary is not part of the captured graph and can be reclaimed
+     * after the stream reaches the conversion.  cudaFree provides the needed
+     * ordering on supported CUDA runtimes. */
+    if (ce(cudaFree(tmp), e, ec)) {
+        cudaFree(d16);
+        return -1;
+    }
     st->weights_fp16.push_back({hp, n, d16});
     *dp = d16;
+    return 0;
+}
+
+static int validate_cuda_matmul(const void *input, const void *output,
+                                const float *weight, size_t rows, size_t iw,
+                                size_t ow, size_t *in_n, size_t *out_n,
+                                size_t *weight_n, size_t *total_n,
+                                char *e, size_t ec) {
+    size_t input_bytes = 0, output_bytes = 0, weight_bytes = 0, total_bytes = 0;
+    if (input == nullptr || output == nullptr || weight == nullptr || rows == 0u ||
+        iw == 0u || ow == 0u || rows > (size_t)INT_MAX ||
+        iw > (size_t)INT_MAX || ow > (size_t)INT_MAX ||
+        !cuda_size_mul(rows, iw, in_n) ||
+        !cuda_size_mul(rows, ow, out_n) ||
+        !cuda_size_mul(iw, ow, weight_n) ||
+        !cuda_size_add(*in_n, *out_n, total_n) ||
+        !cuda_size_mul(*in_n, sizeof(float), &input_bytes) ||
+        !cuda_size_mul(*out_n, sizeof(float), &output_bytes) ||
+        !cuda_size_mul(*weight_n, sizeof(float), &weight_bytes) ||
+        !cuda_size_mul(*total_n, sizeof(float), &total_bytes)) {
+        set_error(e, ec, "invalid CUDA matmul dimensions");
+        return -1;
+    }
     return 0;
 }
 
@@ -226,9 +454,34 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                        size_t iw, size_t ow, const float *weight, const float *bias,
                        char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    const size_t in_n = rows * iw;
-    const size_t out_n = rows * ow;
-    const size_t w_n = iw * ow;
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(input, output, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    if (!st->fast_math) {
+        float *dw = nullptr;
+        if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
+        float *db = nullptr;
+        if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+        if (ensure_host(st, total_n * sizeof(float), e, ec)) return -1;
+        std::memcpy(st->host_buf, input, in_n * sizeof(float));
+        cublasSetStream(st->cublas, st->stream);
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             (int)ow, (int)rows, (int)iw,
+                             &alpha, dw, CUDA_R_32F, (int)iw,
+                             st->dev_buf, CUDA_R_32F, (int)iw,
+                             &beta, st->dev_buf + in_n, CUDA_R_32F, (int)ow,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), e, ec)) return -1;
+        if (db) {
+            k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+                st->dev_buf + in_n, db, (int)rows, (int)ow);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+        }
+        if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+        std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
+        return 0;
+    }
     half *dw16 = nullptr;
     if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
@@ -248,8 +501,7 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                          &a1, dw16, CUDA_R_16F, (int)iw,
                          di16, CUDA_R_16F, (int)iw,
                          &b0, d_out_mapped, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
         k_bias_add<<<((int)(rows*ow)+255)/256, 256, 0, st->stream>>>(
             d_out_mapped, db, (int)rows, (int)ow);
@@ -266,9 +518,34 @@ static int cuda_matmul_to_dev(void *opaque, const float *input, float *d_out,
                               const float *weight, const float *bias,
                               char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    const size_t in_n = rows * iw;
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(input, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    if (!st->fast_math) {
+        float *dw = nullptr;
+        if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
+        float *db = nullptr;
+        if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+        if (ensure_host(st, in_n * sizeof(float), e, ec)) return -1;
+        std::memcpy(st->host_buf, input, in_n * sizeof(float));
+        cublasSetStream(st->cublas, st->stream);
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             (int)ow, (int)rows, (int)iw,
+                             &alpha, dw, CUDA_R_32F, (int)iw,
+                             st->dev_buf, CUDA_R_32F, (int)iw,
+                             &beta, d_out, CUDA_R_32F, (int)ow,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), e, ec)) return -1;
+        if (db) {
+            k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+                d_out, db, (int)rows, (int)ow);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+        }
+        return 0;
+    }
     half *dw16 = nullptr;
-    if (cached_weight_fp16(st, weight, iw * ow, &dw16, e, ec)) return -1;
+    if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
     if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
@@ -283,15 +560,11 @@ static int cuda_matmul_to_dev(void *opaque, const float *input, float *d_out,
                          &a1, dw16, CUDA_R_16F, (int)iw,
                          di16, CUDA_R_16F, (int)iw,
                          &b0, d_out, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
-        const float one = 1.0f;
-        static float *d_ones2 = nullptr; static size_t oc2 = 0;
-        if (oc2 < rows) { if (d_ones2) cudaFree(d_ones2); size_t c2 = (rows+255)&~255;
-            ce(cudaMalloc(&d_ones2, c2*4), e, ec); std::vector<float> h(c2,1.0f);
-            cudaMemcpy(d_ones2,h.data(),c2*4,cudaMemcpyHostToDevice); oc2=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones2,1,d_out,(int)ow);
+        k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     return 0; /* no sync */
 }
@@ -328,8 +601,7 @@ static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k
     if (cbe(cublasGemmEx(st->cublas,oa,ob,(int)n,(int)m,(int)k,&alpha,
                         db2,CUDA_R_32F,(int)bc,da,CUDA_R_32F,(int)ac,
                         &beta,dc,CUDA_R_32F,(int)n,
-                        CUBLAS_COMPUTE_32F_FAST_16F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),e,ec)) return -1;
+                        cuda_compute_type(st), cuda_gemm_algo(st)),e,ec)) return -1;
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
     if (ldc == n) std::memcpy(c, hc, cp*4);
     else for (size_t r=0;r<m;r++) std::memcpy(c+r*ldc, hc+r*n, n*4);
@@ -347,8 +619,12 @@ static int cuda_matmul_dev(void *opaque, const float *d_in, float *d_out,
                            const float *weight, const float *bias,
                            char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
     float *dw = nullptr;
-    if (cached_weight(st, weight, iw * ow * sizeof(float), &dw, e, ec)) return -1;
+    if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
     cublasSetStream(st->cublas, st->stream);
@@ -358,15 +634,11 @@ static int cuda_matmul_dev(void *opaque, const float *d_in, float *d_out,
                          &a1, dw, CUDA_R_32F, (int)iw,
                          d_in, CUDA_R_32F, (int)iw,
                          &b0, d_out, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F_FAST_16F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
-        const float one = 1.0f;
-        static float *d_ones = nullptr; static size_t oc = 0;
-        if (oc < rows) { if (d_ones) cudaFree(d_ones); size_t c2 = (rows+255)&~255;
-            ce(cudaMalloc(&d_ones, c2*4), e, ec); std::vector<float> h(c2,1.0f);
-            cudaMemcpy(d_ones,h.data(),c2*4,cudaMemcpyHostToDevice); oc=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,d_out,(int)ow);
+        k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     return 0; /* no sync */
 }
@@ -381,19 +653,33 @@ static int cuda_sgemm_dev(void *opaque, int ta, int tb,
                           float *d_c, size_t ldc,
                           char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || d_a == nullptr || d_b == nullptr || d_c == nullptr ||
+        (ta != 0 && ta != 1) || (tb != 0 && tb != 1) ||
+        m == 0u || n == 0u || k == 0u) {
+        set_error(e, ec, "invalid CUDA device sgemm dimensions");
+        return -1;
+    }
     cublasSetStream(st->cublas, st->stream);
     cublasOperation_t oa = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t ob = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
-    /* Packed leading dimensions: caller provides actual data cols. */
-    size_t ac = ta ? m : k;
-    size_t bc = tb ? k : n;
+    /* The row-major API is represented as C^T = B^T A^T in cuBLAS.  The
+     * leading dimensions are therefore the caller's actual row strides, not
+     * the packed shape columns.  Ignoring them silently corrupts padded and
+     * strided batched projections. */
+    const size_t a_cols = ta ? m : k;
+    const size_t b_cols = tb ? k : n;
+    if (lda < a_cols || ldb < b_cols || ldc < n ||
+        m > (size_t)INT_MAX || n > (size_t)INT_MAX || k > (size_t)INT_MAX ||
+        lda > (size_t)INT_MAX || ldb > (size_t)INT_MAX || ldc > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA strided sgemm dimensions");
+        return -1;
+    }
     return cbe(cublasGemmEx(st->cublas, oa, ob,
                            (int)n, (int)m, (int)k, &alpha,
-                           d_b, CUDA_R_32F, (int)bc,
-                           d_a, CUDA_R_32F, (int)ac,
-                           &beta, d_c, CUDA_R_32F, (int)n,
-                           CUBLAS_COMPUTE_32F_FAST_16F,
-                           CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec) ? -1 : 0;
+                           d_b, CUDA_R_32F, (int)ldb,
+                           d_a, CUDA_R_32F, (int)lda,
+                           &beta, d_c, CUDA_R_32F, (int)ldc,
+                           cuda_compute_type(st), cuda_gemm_algo(st)), e, ec) ? -1 : 0;
 }
 
 extern "C" int mynah_cuda_matmul_dev(void *s, const float *di, float *dout,
@@ -437,74 +723,336 @@ extern "C" int mynah_cuda_sync(void *opaque, char *e, size_t ec) {
     return ce(cudaStreamSynchronize(st->stream), e, ec);
 }
 
+extern "C" int mynah_cuda_batch_begin(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return cbe(cublasSetStream(st->cublas, st->stream), e, ec);
+}
+
 extern "C" int mynah_cuda_snake_dev(void *opaque, float *dev_data, const float *alpha,
                           size_t channels, size_t length, size_t snake_ch,
                           char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    /* Upload alpha to device (small, use host_buf). */
-    if (ensure_host(st, channels * sizeof(float), e, ec)) return -1;
-    std::memcpy(st->host_buf, alpha, channels * sizeof(float));
-    int threads = 256;
-    k_snake<<<(int)channels, threads, 0, st->stream>>>(
-        dev_data, st->dev_buf, (int)channels, (int)length, (int)snake_ch);
+    if (channels == 0 || length == 0 || snake_ch > channels ||
+        channels > (size_t)INT_MAX || length > (size_t)INT_MAX ||
+        snake_ch > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA Snake dimensions");
+        return -1;
+    }
+    float *d_alpha = nullptr;
+    if (snake_ch > 0u &&
+        cached_weight(st, alpha, snake_ch * sizeof(float), &d_alpha, e, ec)) return -1;
+    k_snake<<<(int)channels, 256, 0, st->stream>>>(
+        dev_data, d_alpha, (int)channels, (int)length, (int)snake_ch);
     return ce(cudaGetLastError(), e, ec);
 }
 
 extern "C" int mynah_cuda_gelu_dev(void *opaque, float *data, size_t n,
                          char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    size_t bytes = n * sizeof(float);
-    if (ensure_scratch(st, bytes, e, ec)) return -1;
-    float *d = st->dev_scratch;
-    if (ce(cudaMemcpyAsync(d, data, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    int threads = 256;
-    int blocks = ((int)n + threads - 1) / threads;
-    k_gelu<<<blocks, threads, 0, st->stream>>>(d, (int)n);
+    if (data == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA GELU dimensions");
+        return -1;
+    }
+    k_gelu<<<((int)n + 255) / 256, 256, 0, st->stream>>>(data, (int)n);
     if (ce(cudaGetLastError(), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(data, d, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
-    return ce(cudaStreamSynchronize(st->stream), e, ec);
+    return 0;
 }
 
 extern "C" int mynah_cuda_layer_norm_dev(void *opaque, const float *in, float *out,
                                const float *gain, const float *bias,
                                size_t rows, size_t width,
                                char *e, size_t ec) {
-    (void)bias; /* Magpie layer_norm has no bias */
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    size_t data_bytes = rows * width * sizeof(float);
-    size_t gb = width * sizeof(float);
-    if (ensure_scratch(st, data_bytes * 2, e, ec)) return -1;
-    if (ensure_host(st, gb, e, ec)) return -1;
-    float *d_in = st->dev_scratch;
-    float *d_out = st->dev_scratch + rows * width;
-    std::memcpy(st->host_buf, gain, gb);
-    float *d_gain = st->dev_buf;
-    if (ce(cudaMemcpyAsync(d_in, in, data_bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    /* 1 thread per row, sequential accumulation for CPU bit-parity. */
-    int threads = rows <= 256 ? (int)rows : 256;
-    int blocks = ((int)rows + threads - 1) / threads;
-    k_layer_norm<<<blocks, threads, 0, st->stream>>>(
-        d_out, d_in, d_gain, (int)width, 1e-5f, (int)rows);
+    if (in == nullptr || out == nullptr || gain == nullptr || rows == 0 || width == 0 ||
+        rows > (size_t)INT_MAX || width > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA layer-norm dimensions");
+        return -1;
+    }
+    float *d_gain = nullptr;
+    float *d_bias = nullptr;
+    if (cached_weight(st, gain, width * sizeof(float), &d_gain, e, ec)) return -1;
+    if (bias != nullptr && cached_weight(st, bias, width * sizeof(float), &d_bias, e, ec)) return -1;
+    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
+        out, in, d_gain, d_bias, (int)width, 1e-5f, (int)rows);
     if (ce(cudaGetLastError(), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(out, d_out, data_bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
-    return ce(cudaStreamSynchronize(st->stream), e, ec);
+    return 0;
 }
 
 extern "C" int mynah_cuda_residual_add_dev(void *opaque, float *out, const float *in,
                                  size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    size_t bytes = n * sizeof(float);
-    if (ensure_scratch(st, bytes * 2, e, ec)) return -1;
-    float *d_out = st->dev_scratch;
-    float *d_in = st->dev_scratch + n;
-    if (ce(cudaMemcpyAsync(d_out, out, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(d_in, in, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    int threads = 256;
-    int blocks = ((int)n + threads - 1) / threads;
-    k_residual_add<<<blocks, threads, 0, st->stream>>>(d_out, d_in, (int)n);
+    if (out == nullptr || in == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA residual dimensions");
+        return -1;
+    }
+    k_residual_add<<<((int)n + 255) / 256, 256, 0, st->stream>>>(out, in, (int)n);
     if (ce(cudaGetLastError(), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(out, d_out, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
-    return ce(cudaStreamSynchronize(st->stream), e, ec);
+    return 0;
+}
+
+extern "C" int mynah_cuda_copy_dev(void *opaque, float *dst, const float *src,
+                                    size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (dst == nullptr || src == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA copy dimensions");
+        return -1;
+    }
+    k_copy<<<((int)n + 255) / 256, 256, 0, st->stream>>>(dst, src, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_scale_dev(void *opaque, float *data, size_t n,
+                                     float scale, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (data == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA scale dimensions");
+        return -1;
+    }
+    k_scale<<<((int)n + 255) / 256, 256, 0, st->stream>>>(data, scale, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_clip_dev(void *opaque, float *data, size_t n,
+                                    char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (data == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA clip dimensions");
+        return -1;
+    }
+    k_clip<<<((int)n + 255) / 256, 256, 0, st->stream>>>(data, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_argmax_dev(void *opaque, const float *logits,
+                                      size_t vocab, size_t codebook_size,
+                                      size_t eos_id, int allow_eos,
+                                      unsigned *argmax, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (logits == nullptr || argmax == nullptr || vocab == 0 ||
+        codebook_size > vocab || vocab > (size_t)INT_MAX ||
+        codebook_size > (size_t)INT_MAX || eos_id > (size_t)UINT_MAX) {
+        set_error(e, ec, "invalid CUDA argmax dimensions");
+        return -1;
+    }
+    if (st->dev_argmax == nullptr &&
+        ce(cudaMalloc(&st->dev_argmax, sizeof(unsigned)), e, ec)) return -1;
+    k_argmax<<<1, 1, 0, st->stream>>>(logits, st->dev_argmax,
+                                       (int)vocab, (int)codebook_size,
+                                       (unsigned)eos_id, allow_eos != 0);
+    if (ce(cudaGetLastError(), e, ec) ||
+        ce(cudaMemcpyAsync(argmax, st->dev_argmax, sizeof(unsigned),
+                           cudaMemcpyDeviceToHost, st->stream), e, ec) ||
+        ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    return 0;
+}
+
+extern "C" int mynah_cuda_softmax_dev(void *opaque, float *data,
+                                       size_t rows, size_t cols, size_t valid,
+                                       char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (data == nullptr || rows == 0 || cols == 0 || rows > (size_t)INT_MAX ||
+        cols > (size_t)INT_MAX || valid > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA softmax dimensions");
+        return -1;
+    }
+    const int v = valid > (size_t)INT_MAX ? INT_MAX : (int)valid;
+    k_softmax_causal<<<(int)rows, 256, 0, st->stream>>>(
+        data, (int)cols, v);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+/* Forward declarations for the attention/RoPE entry points below the
+ * model-free self-test. */
+extern "C" int mynah_cuda_self_attention_dev(
+    void *, const float *, float *, float *, size_t, size_t, size_t, size_t,
+    size_t, float, float *, char *, size_t);
+extern "C" int mynah_cuda_self_attention_batch_dev(
+    void *, const float *, float *const *, float *const *, const size_t *,
+    const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+extern "C" int mynah_cuda_rope_dev(void *, float *, size_t, size_t, size_t,
+                                    float, char *, size_t);
+extern "C" int mynah_cuda_conv1d_dev(void *, const float *, float *, int, int,
+                                      int, int, int, const float *, const float *,
+                                      char *, size_t);
+extern "C" int mynah_cuda_conv_transpose_dev(void *, const float *, float *, int,
+                                              int, int, int, int, int,
+                                              const float *, const float *, char *,
+                                              size_t);
+
+static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    float *d_in = nullptr;
+    float *d_out = nullptr;
+    float *d_k0 = nullptr;
+    float *d_v0 = nullptr;
+    float *d_k1 = nullptr;
+    float *d_v1 = nullptr;
+    const float norm_in[8] = {1.0f, 2.0f, 3.0f, 4.0f,
+                              -1.0f, 0.0f, 1.0f, 2.0f};
+    const float gain[4] = {1.0f, 2.0f, 1.0f, 0.5f};
+    const float bias[4] = {0.1f, -0.2f, 0.3f, -0.4f};
+    float norm_out[8] = {0.0f};
+    const float softmax_in[8] = {1.0f, 2.0f, 3.0f, 4.0f,
+                                 0.0f, -1.0f, 2.0f, 9.0f};
+    float softmax_out[8] = {0.0f};
+    float qkv[24] = {0.0f};
+    float attention_out[8] = {0.0f};
+    const float conv_input[3] = {1.0f, 2.0f, 3.0f};
+    const float conv_weight[2] = {2.0f, -1.0f};
+    const float conv_bias[1] = {0.5f};
+    const float conv_expected[3] = {-0.5f, 0.5f, 1.5f};
+    float conv_output[4] = {0.0f};
+    const float convt_input[2] = {1.0f, 2.0f};
+    const float convt_weight[2] = {2.0f, 3.0f};
+    const float convt_expected[4] = {2.5f, 3.5f, 4.5f, 6.5f};
+    float convt_output[4] = {0.0f};
+    float *kcache[2] = {nullptr, nullptr};
+    float *vcache[2] = {nullptr, nullptr};
+    size_t positions[2] = {0u, 0u};
+    size_t strides[2] = {4u, 4u};
+    const float one_qkv[12] = {1.0f, 0.0f, 0.0f, 1.0f,
+                               1.0f, 0.0f, 0.0f, 1.0f,
+                               1.0f, 2.0f, 3.0f, 4.0f};
+    const float batch_qkv[24] = {
+        1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f,
+        1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    const float rope_slope = (float)(-std::log(10000.0) * 2.0 / 4.0);
+
+    if (ce(cudaMalloc(&d_in, 24u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_out, 24u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_k0, 4u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_v0, 4u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_k1, 4u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_v1, 4u * sizeof(float)), e, ec)) goto fail;
+
+    if (ce(cudaMemcpy(d_in, norm_in, sizeof(norm_in), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_layer_norm_dev(st, d_in, d_out, gain, bias, 2u, 4u, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(norm_out, d_out, sizeof(norm_out), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t r = 0; r < 2u; ++r) {
+        float mean = 0.0f;
+        for (size_t d = 0; d < 4u; ++d) mean += norm_in[r * 4u + d];
+        mean /= 4.0f;
+        float variance = 0.0f;
+        for (size_t d = 0; d < 4u; ++d) {
+            const float delta = norm_in[r * 4u + d] - mean;
+            variance += delta * delta;
+        }
+        const float inv = 1.0f / sqrtf(variance / 4.0f + 1.0e-5f);
+        for (size_t d = 0; d < 4u; ++d) {
+            const float expected = (norm_in[r * 4u + d] - mean) * inv * gain[d] + bias[d];
+            if (fabsf(norm_out[r * 4u + d] - expected) > 2.0e-3f) {
+                std::snprintf(e, ec, "CUDA layer-norm self-test mismatch at %zu", r * 4u + d);
+                goto fail;
+            }
+        }
+    }
+
+    if (ce(cudaMemcpy(d_in, softmax_in, sizeof(softmax_in), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_softmax_dev(st, d_in, 2u, 4u, 3u, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(softmax_out, d_in, sizeof(softmax_out), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t r = 0; r < 2u; ++r) {
+        float sum = 0.0f;
+        for (size_t d = 0; d < 3u; ++d) sum += softmax_out[r * 4u + d];
+        if (fabsf(sum - 1.0f) > 2.0e-4f || softmax_out[r * 4u + 3u] != 0.0f) {
+            std::snprintf(e, ec, "CUDA softmax self-test mismatch at row %zu", r);
+            goto fail;
+        }
+    }
+
+    if (ce(cudaMemcpy(d_in, conv_input, sizeof(conv_input), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv1d_dev(st, d_in, d_out, 1, 1, 3, 2, 1, conv_weight,
+                              conv_bias, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(conv_output, d_out, sizeof(conv_output), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 3u; ++i) {
+        if (fabsf(conv_output[i] - conv_expected[i]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA causal-conv self-test mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (ce(cudaMemcpy(d_in, convt_input, sizeof(convt_input), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_dev(st, d_in, d_out, 1, 1, 2, 4, 2, 2, 1,
+                                      convt_weight, conv_bias, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(convt_output, d_out, sizeof(convt_output), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 4u; ++i) {
+        if (fabsf(convt_output[i] - convt_expected[i]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA transpose-conv self-test mismatch at %zu", i);
+            goto fail;
+        }
+    }
+
+    /* RoPE at a non-zero position preserves each complex pair's norm. */
+    for (size_t i = 0; i < 24u; ++i) qkv[i] = (float)(i + 1u) * 0.125f;
+    if (ce(cudaMemcpy(d_in, qkv, 12u * sizeof(float), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_rope_dev(st, d_in, 7u, 1u, 4u, 10000.0f, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(qkv, d_in, 12u * sizeof(float), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t base = 0; base < 8u; base += 2u) {
+        const size_t pair = base / 2u;
+        const float q0 = (float)(base + 1u) * 0.125f;
+        const float q1 = (float)(base + 2u) * 0.125f;
+        const float frequency = expf((float)pair * rope_slope);
+        const float angle = 7.0f * frequency;
+        const float sine = sinf(angle);
+        const float cosine = cosf(angle);
+        const float expected0 = q0 * cosine - q1 * sine;
+        const float expected1 = q0 * sine + q1 * cosine;
+        const float before = q0 * q0 + q1 * q1;
+        const float after = qkv[base] * qkv[base] + qkv[base + 1u] * qkv[base + 1u];
+        if (fabsf(qkv[base] - expected0) > 3.0e-3f ||
+            fabsf(qkv[base + 1u] - expected1) > 3.0e-3f ||
+            fabsf(before - after) > 2.0e-3f) {
+            std::snprintf(e, ec, "CUDA RoPE self-test mismatch at pair %zu", base / 2u);
+            goto fail;
+        }
+    }
+
+    /* Single and independent-request batched attention both reduce to the
+     * only valid value at position zero. */
+    if (ce(cudaMemcpy(d_in, one_qkv, sizeof(one_qkv), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_self_attention_dev(st, d_in, d_k0, d_v0, 0u, 4u, 1u, 1u, 4u,
+                                       0.5f, d_out, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(attention_out, d_out, 4u * sizeof(float), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t d = 0; d < 4u; ++d) {
+        if (fabsf(attention_out[d] - one_qkv[8u + d]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA attention self-test mismatch at %zu", d);
+            goto fail;
+        }
+    }
+    kcache[0] = d_k0; kcache[1] = d_k1;
+    vcache[0] = d_v0; vcache[1] = d_v1;
+    if (ce(cudaMemcpy(d_in, batch_qkv, sizeof(batch_qkv), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_self_attention_batch_dev(st, d_in, kcache, vcache, positions,
+                                             strides, 2u, 1u, 4u, 0.5f, d_out,
+                                             e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(attention_out, d_out, 8u * sizeof(float), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t d = 0; d < 4u; ++d) {
+        if (fabsf(attention_out[d] - batch_qkv[8u + d]) > 2.0e-4f ||
+            fabsf(attention_out[4u + d] - batch_qkv[20u + d]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA batched attention self-test mismatch at %zu", d);
+            goto fail;
+        }
+    }
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_k0); cudaFree(d_v0);
+    cudaFree(d_k1); cudaFree(d_v1);
+    return 0;
+
+fail:
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_k0); cudaFree(d_v0);
+    cudaFree(d_k1); cudaFree(d_v1);
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -525,16 +1073,23 @@ static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float en[8]={1,2,3,6,-1,0.5f,2,1.5f};
     for (int i=0;i<8;i++) if (std::fabs(so[i]-en[i])>1e-4f) {
         std::snprintf(e,ec,"sgemm mismatch %d: %f!=%f",i,so[i],en[i]); return -1; }
-    return 0;
+    return cuda_resident_kernel_self_test(opaque, e, ec);
 }
 
 static void cuda_close(void *opaque) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (!st) return;
+    destroy_graphs(st);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
     if (st->dev_scratch) cudaFree(st->dev_scratch);
     if (st->host_buf) cudaFreeHost(st->host_buf);
+    if (st->dev_argmax) cudaFree(st->dev_argmax);
+    if (st->cublas_workspace) cudaFree(st->cublas_workspace);
+    if (st->dev_batch_k_cache) cudaFree(st->dev_batch_k_cache);
+    if (st->dev_batch_v_cache) cudaFree(st->dev_batch_v_cache);
+    if (st->dev_batch_positions) cudaFree(st->dev_batch_positions);
+    if (st->dev_batch_cache_strides) cudaFree(st->dev_batch_cache_strides);
     cublasDestroy(st->cublas);
     cudaStreamDestroy(st->stream);
     delete st;
@@ -545,19 +1100,50 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
                                        mynah_backend_close_fn *close,
                                        mynah_backend_self_test_fn *self_test,
                                        char *e, size_t ec) {
+    /* Mapped host staging is part of the FP32 bring-up path.  Device flags
+     * must be set before any runtime call that can initialise the primary
+     * context; otherwise cudaHostGetDevicePointer may be unavailable. */
+    if (ce(cudaSetDeviceFlags(cudaDeviceMapHost), e, ec)) return -1;
     int dc = 0;
     if (ce(cudaGetDeviceCount(&dc), e, ec) || dc == 0) {
         if (dc == 0) set_error(e, ec, "no CUDA device"); return -1; }
-    ce(cudaSetDevice(0), e, ec);
-    cudaSetDeviceFlags(cudaDeviceMapHost);
+    if (ce(cudaSetDevice(0), e, ec)) return -1;
     auto *st = new (std::nothrow) cuda_backend_state();
     if (!st) { set_error(e,ec,"oom"); return -1; }
     st->dev_scratch = nullptr; st->dev_scratch_cap = 0;
     st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
+    st->dev_argmax = nullptr;
+    st->cublas_workspace = nullptr; st->cublas_workspace_cap = 0;
+    st->dev_batch_k_cache = nullptr;
+    st->dev_batch_v_cache = nullptr;
+    st->dev_batch_positions = nullptr;
+    st->dev_batch_cache_strides = nullptr;
+    st->batch_meta_cap = CUDA_BATCH_META_CAP;
+    st->fast_math = cuda_fast_math_enabled();
     if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
     if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
         set_error(e,ec,"cuBLAS init"); cudaStreamDestroy(st->stream); delete st; return -1; }
-    cublasSetMathMode(st->cublas, CUBLAS_DEFAULT_MATH);
+    if (ce(cudaMalloc(&st->dev_batch_k_cache,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_k_cache)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_v_cache,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_v_cache)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_positions,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_positions)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_cache_strides,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_cache_strides)), e, ec)) {
+        cuda_close(st);
+        return -1;
+    }
+    /* The parity path must not silently use TF32 on Ampere/Ada.  Fast math is
+     * an explicit opt-in experiment; its Tensor-Core error budget is a later
+     * stage gate, not the default CUDA result. */
+    const cublasMath_t math_mode = st->fast_math
+        ? CUBLAS_DEFAULT_MATH : CUBLAS_PEDANTIC_MATH;
+    if (cublasSetMathMode(st->cublas, math_mode) != CUBLAS_STATUS_SUCCESS) {
+        set_error(e, ec, "cuBLAS math mode setup failed");
+        cuda_close(st);
+        return -1;
+    }
     *state_out = st;
     *matmul = cuda_matmul;
     *sgemm = cuda_sgemm;
@@ -570,6 +1156,10 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
 extern "C" int mynah_cuda_dev_alloc(void *opaque, size_t n, float **dev_ptr,
                           char *e, size_t ec) {
     (void)opaque;
+    if (dev_ptr == nullptr || n == 0u || n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA device allocation size");
+        return -1;
+    }
     return ce(cudaMalloc(dev_ptr, n * sizeof(float)), e, ec);
 }
 
@@ -578,9 +1168,30 @@ extern "C" void mynah_cuda_dev_free(void *opaque, float *dev_ptr) {
     if (dev_ptr) cudaFree(dev_ptr);
 }
 
+extern "C" int mynah_cuda_host_alloc(void *opaque, size_t n, float **host_ptr,
+                                      char *e, size_t ec) {
+    (void)opaque;
+    if (host_ptr == nullptr || n == 0u || n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA host allocation size");
+        return -1;
+    }
+    return ce(cudaHostAlloc((void **)host_ptr, n * sizeof(float),
+                            cudaHostAllocPortable), e, ec);
+}
+
+extern "C" void mynah_cuda_host_free(void *opaque, float *host_ptr) {
+    (void)opaque;
+    if (host_ptr != nullptr) cudaFreeHost(host_ptr);
+}
+
 extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
                     size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || host == nullptr || dev_ptr == nullptr || n == 0u ||
+        n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA host-to-device copy");
+        return -1;
+    }
     return ce(cudaMemcpyAsync(dev_ptr, host, n*sizeof(float),
                               cudaMemcpyHostToDevice, st->stream), e, ec);
 }
@@ -588,6 +1199,11 @@ extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
 extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,
                     size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dev_ptr == nullptr || host == nullptr || n == 0u ||
+        n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA device-to-host copy");
+        return -1;
+    }
     return ce(cudaMemcpyAsync(host, dev_ptr, n*sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
@@ -613,29 +1229,23 @@ extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_o
                            const float *weight, const float *bias,
                            char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    half *dw16 = nullptr;
-    if (cached_weight_fp16(st, weight, K * N, &dw16, e, ec)) return -1;
-    float *db = nullptr;
-    if (bias && cached_weight(st, bias, N * sizeof(float), &db, e, ec)) return -1;
-    /* Convert FP32 input to FP16 in scratch. */
-    if (ensure_scratch(st, K * sizeof(half), e, ec)) return -1;
-    half *di16 = (half *)st->dev_scratch;
-    k_f32_to_f16<<<((int)K+255)/256, 256, 0, st->stream>>>(d_in, di16, (int)K);
-    cublasSetStream(st->cublas, st->stream);
-    const float a1 = 1.0f, b0 = 0.0f;
-    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                         (int)N, 1, (int)K,
-                         &a1, dw16, CUDA_R_16F, (int)K,
-                         di16, CUDA_R_16F, (int)K,
-                         &b0, d_out, CUDA_R_32F, (int)N,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
-    if (db) {
-        const float one = 1.0f;
-        static float *d_one = nullptr;
-        if (!d_one) { ce(cudaMalloc(&d_one, 4), e, ec); cudaMemcpy(d_one, &one, 4, cudaMemcpyHostToDevice); }
-        cublasSaxpy(st->cublas, (int)N, &one, db, 1, d_out, 1);
+    size_t weight_n = 0;
+    if (st == nullptr || d_in == nullptr || d_out == nullptr || weight == nullptr ||
+        K == 0 || N == 0 || K > (size_t)INT_MAX || N > (size_t)INT_MAX ||
+        !cuda_size_mul(K, N, &weight_n) ||
+        !cuda_size_mul(weight_n, sizeof(float), &weight_n)) {
+        set_error(e, ec, "invalid CUDA matvec dimensions");
+        return -1;
     }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_n, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    size_t bias_bytes = 0;
+    if (bias && (!cuda_size_mul(N, sizeof(float), &bias_bytes) ||
+                 cached_weight(st, bias, bias_bytes, &db, e, ec))) return -1;
+    k_matvec<<<((int)N + 255) / 256, 256, 0, st->stream>>>(
+        d_in, dw, db, d_out, (int)K, (int)N);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
     return 0; /* no sync */
 }
 
@@ -661,46 +1271,48 @@ extern "C" int mynah_cuda_layer_norm_inplace(void *opaque, const float *dev_in,
                                    size_t rows, size_t width,
                                    char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (dev_in == nullptr || dev_out == nullptr || gain == nullptr ||
+        rows == 0 || width == 0 || rows > (size_t)INT_MAX ||
+        width > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA inplace layer-norm dimensions");
+        return -1;
+    }
     /* Cache gain on device (same pointer = same layer, reused across steps). */
     float *d_gain = nullptr;
     if (cached_weight(st, gain, width * sizeof(float), &d_gain, e, ec)) return -1;
-    k_layer_norm<<<(int)rows, 1, 0, st->stream>>>(
-        dev_out, dev_in, d_gain, (int)width, 1e-5f, (int)rows);
+    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
+        dev_out, dev_in, d_gain, nullptr, (int)width, 1e-5f, (int)rows);
     return ce(cudaGetLastError(), e, ec);
 }
 
-/* matmul device-to-device: input already on GPU, no host round-trip.
- * Converts FP32 device input → FP16, runs cuBLAS, output stays on device.
- * Does NOT sync. Caller syncs when needed. */
+/* Matmul device-to-device: input already on GPU, no host round-trip.  The
+ * default is FP32 accumulation/input for parity; MYNAH_CUDA_FAST_MATH=1 opts
+ * into the tensor-core compute mode after the parity gate has been measured. */
 extern "C" int mynah_cuda_matmul_d2d(void *opaque, const float *d_in, float *d_out,
                            size_t rows, size_t iw, size_t ow,
                            const float *weight, const float *bias,
                            char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    const size_t in_n = rows * iw;
-    half *dw16 = nullptr;
-    if (cached_weight_fp16(st, weight, iw * ow, &dw16, e, ec)) return -1;
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    float *dw = nullptr;
+    if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
-    if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
-    half *di16 = (half *)st->dev_scratch;
-    k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(d_in, di16, (int)in_n);
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
     if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                          (int)ow, (int)rows, (int)iw,
-                         &a1, dw16, CUDA_R_16F, (int)iw,
-                         di16, CUDA_R_16F, (int)iw,
+                         &a1, dw, CUDA_R_32F, (int)iw,
+                         d_in, CUDA_R_32F, (int)iw,
                          &b0, d_out, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
-        const float one = 1.0f;
-        static float *d_ones3 = nullptr; static size_t oc3 = 0;
-        if (oc3 < rows) { if (d_ones3) cudaFree(d_ones3); size_t c2 = (rows+255)&~255;
-            ce(cudaMalloc(&d_ones3, c2*4), e, ec); std::vector<float> h(c2,1.0f);
-            cudaMemcpy(d_ones3,h.data(),c2*4,cudaMemcpyHostToDevice); oc3=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones3,1,d_out,(int)ow);
+        k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     return 0; /* no sync */
 }
@@ -726,6 +1338,13 @@ extern "C" int mynah_cuda_im2col(void *opaque, const float *input, float *column
                        int in_ch, int length, int kernel, int dilation,
                        char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (input == nullptr || columns == nullptr || in_ch <= 0 || length <= 0 ||
+        kernel <= 0 || dilation <= 0 ||
+        (size_t)in_ch > (size_t)INT_MAX / (size_t)kernel ||
+        (size_t)in_ch * (size_t)kernel > (size_t)INT_MAX / (size_t)length) {
+        set_error(e, ec, "invalid CUDA im2col dimensions");
+        return -1;
+    }
     int total = in_ch * kernel * length;
     k_im2col_causal<<<(total+255)/256, 256, 0, st->stream>>>(
         input, columns, in_ch, length, kernel, dilation);
@@ -796,8 +1415,7 @@ extern "C" int mynah_cuda_conv1d(void *opaque,
                          dw, CUDA_R_32F, (int)inner,
                          &b1,
                          d_out, CUDA_R_32F, length,
-                         CUBLAS_COMPUTE_32F_FAST_16F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
 
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
 
@@ -807,6 +1425,490 @@ extern "C" int mynah_cuda_conv1d(void *opaque,
     cudaMemcpy(st->host_buf, d_out, out_count * sizeof(float), cudaMemcpyDeviceToHost);
     std::memcpy(output, st->host_buf, out_count * sizeof(float));
     return 0;
+}
+
+/* Resident causal conv1d.  Unlike mynah_cuda_conv1d(), this function never
+ * interprets its activation pointers as host memory, never uses mapped host
+ * staging, and never synchronizes.  It is the unit used by the resident
+ * NanoCodec graph. */
+extern "C" int mynah_cuda_conv1d_dev(void *opaque,
+                                     const float *input, float *output,
+                                     int in_ch, int out_ch, int length,
+                                     int kernel, int dilation,
+                                     const float *weight, const float *bias,
+                                     char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (input == nullptr || output == nullptr || weight == nullptr ||
+        in_ch <= 0 || out_ch <= 0 || length <= 0 || kernel <= 0 || dilation <= 0 ||
+        (size_t)in_ch > (size_t)INT_MAX / (size_t)kernel ||
+        (size_t)in_ch * (size_t)kernel > (size_t)INT_MAX / (size_t)length ||
+        (size_t)out_ch > (size_t)INT_MAX / (size_t)length) {
+        set_error(e, ec, "invalid CUDA resident conv1d dimensions");
+        return -1;
+    }
+    const size_t inner = (size_t)in_ch * (size_t)kernel;
+    const size_t columns_count = inner * (size_t)length;
+    const size_t output_count = (size_t)out_ch * (size_t)length;
+    size_t weight_count = 0;
+    size_t weight_bytes = 0;
+    if (columns_count > SIZE_MAX - output_count ||
+        columns_count + output_count > SIZE_MAX / sizeof(float) ||
+        !cuda_size_mul(inner, (size_t)out_ch, &weight_count) ||
+        !cuda_size_mul(weight_count, sizeof(float), &weight_bytes)) {
+        set_error(e, ec, "CUDA resident conv1d workspace overflow");
+        return -1;
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_bytes, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias != nullptr && cached_weight(st, bias, (size_t)out_ch * sizeof(float),
+                                         &db, e, ec)) return -1;
+    if (ensure_scratch(st, columns_count * sizeof(float), e, ec)) return -1;
+    float *columns = st->dev_scratch;
+    const int total = in_ch * kernel * length;
+    k_im2col_causal<<<(total + 255) / 256, 256, 0, st->stream>>>(
+        input, columns, in_ch, length, kernel, dilation);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (db != nullptr) {
+        k_broadcast_bias<<<((int)output_count + 255) / 256, 256, 0, st->stream>>>(
+            output, db, out_ch, length);
+    } else {
+        if (ce(cudaMemsetAsync(output, 0, output_count * sizeof(float), st->stream), e, ec)) return -1;
+    }
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (cbe(cublasSetStream(st->cublas, st->stream), e, ec)) return -1;
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        length, out_ch, (int)inner,
+                        &alpha, columns, CUDA_R_32F, length,
+                        dw, CUDA_R_32F, (int)inner,
+                        &beta, output, CUDA_R_32F, length,
+                        cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
+    return 0;
+}
+
+__global__ static void k_conv_transpose(const float *input, const float *weight,
+                                        const float *bias, float *output,
+                                        int in_ch, int out_ch, int length,
+                                        int output_length, int kernel, int stride,
+                                        int groups) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = out_ch * output_length;
+    if (index >= total) return;
+    const int t = index % output_length;
+    const int o = index / output_length;
+    const int in_per_group = in_ch / groups;
+    const int out_per_group = out_ch / groups;
+    const int group = o / out_per_group;
+    const int out_local = o % out_per_group;
+    float value = bias == nullptr ? 0.0f : bias[o];
+    for (int k = 0; k < kernel; ++k) {
+        if (t < k || ((t - k) % stride) != 0) continue;
+        const int input_t = (t - k) / stride;
+        if (input_t >= length) continue;
+        for (int input_local = 0; input_local < in_per_group; ++input_local) {
+            const int input_channel = group * in_per_group + input_local;
+            const size_t weight_index =
+                ((size_t)input_channel * (size_t)out_per_group + (size_t)out_local) *
+                (size_t)kernel + (size_t)k;
+            value += input[(size_t)input_channel * (size_t)length + (size_t)input_t] *
+                     weight[weight_index];
+        }
+    }
+    output[index] = value;
+}
+
+extern "C" int mynah_cuda_conv_transpose_dev(
+    void *opaque, const float *input, float *output,
+    int in_ch, int out_ch, int length, int output_length,
+    int kernel, int stride, int groups,
+    const float *weight, const float *bias, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (input == nullptr || output == nullptr || weight == nullptr ||
+        in_ch <= 0 || out_ch <= 0 || length <= 0 || output_length <= 0 ||
+        kernel <= 0 || stride <= 0 || groups <= 0 || in_ch % groups != 0 ||
+        out_ch % groups != 0 || (size_t)out_ch > (size_t)INT_MAX / (size_t)output_length) {
+        set_error(e, ec, "invalid CUDA conv-transpose dimensions");
+        return -1;
+    }
+    const size_t out_per_group = (size_t)out_ch / (size_t)groups;
+    size_t weight_count = 0;
+    size_t weight_bytes = 0;
+    if (!cuda_size_mul((size_t)in_ch, out_per_group, &weight_count) ||
+        !cuda_size_mul(weight_count, (size_t)kernel, &weight_count) ||
+        !cuda_size_mul(weight_count, sizeof(float), &weight_bytes)) {
+        set_error(e, ec, "CUDA conv-transpose weight size overflow");
+        return -1;
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_bytes, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias != nullptr && cached_weight(st, bias, (size_t)out_ch * sizeof(float),
+                                         &db, e, ec)) return -1;
+    const int total = out_ch * output_length;
+    k_conv_transpose<<<(total + 255) / 256, 256, 0, st->stream>>>(
+        input, dw, db, output, in_ch, out_ch, length, output_length,
+        kernel, stride, groups);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+/* One block owns one attention head.  The score reduction is shared by all
+ * value lanes; the output accumulator stays in the destination buffer, so a
+ * head_width larger than the block size is still supported without a dynamic
+ * per-thread array.  This is the same online-softmax recurrence used by the
+ * Metal backend and avoids materialising a [heads, valid] score matrix. */
+__global__ static void k_self_attention(const float *qkv, float *kcache,
+                                        float *vcache, size_t position,
+                                        size_t cache_stride, size_t valid,
+                                        int heads, int head_width, float scale,
+                                        float *out) {
+    const int head = (int)blockIdx.x;
+    if (head >= heads) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t cache_base = position * cache_stride + hbase;
+    const float *q = qkv + hbase;
+    const float *k = qkv + width + hbase;
+    const float *v = qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        kcache[cache_base + (size_t)d] = k[d];
+        vcache[cache_base + (size_t)d] = v[d];
+        out[hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s < valid; ++s) {
+        const float *ks = kcache + s * cache_stride + hbase;
+        const float *vs = vcache + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * ks[d];
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = hbase + (size_t)d;
+            out[index] = out[index] * correction + probability * vs[d];
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] *= inv;
+}
+
+__global__ static void k_cross_attention(const float *q, const float *kcache,
+                                         const float *vcache, size_t valid,
+                                         size_t cache_stride, int heads,
+                                         int head_width, float scale,
+                                         float *out) {
+    const int head = (int)blockIdx.x;
+    if (head >= heads) return;
+    const int tid = (int)threadIdx.x;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] = 0.0f;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s < valid; ++s) {
+        const float *ks = kcache + s * cache_stride + hbase;
+        const float *vs = vcache + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[hbase + (size_t)d] * ks[d];
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = hbase + (size_t)d;
+            out[index] = out[index] * correction + probability * vs[d];
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] *= inv;
+}
+
+/* Interleaved RoPE for the fused QKV row.  PocketTTS uses the same absolute
+ * position and frequency construction as transformer_ar.c; keeping the
+ * rotation on the device avoids a host round-trip between QKV projection and
+ * resident attention. */
+__global__ static void k_rope_qk(float *qkv, size_t position, int heads,
+                                 int head_width, float max_period) {
+    const int pair = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int half = head_width / 2;
+    const int total = heads * half;
+    if (pair >= total) return;
+    const int head = pair / half;
+    const int i = pair % half;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t qbase = (size_t)head * (size_t)head_width + (size_t)(2 * i);
+    const size_t kbase = width + qbase;
+    /* Match transformer_ar.c: the slope is formed from a double-precision
+     * logarithm and rounded once before the float32 exp/angle operations. */
+    const float slope = (float)(-log((double)max_period) * 2.0 /
+                                (double)head_width);
+    const float frequency = expf((float)i * slope);
+    const float angle = (float)position * frequency;
+    float sine = 0.0f;
+    float cosine = 0.0f;
+    sincosf(angle, &sine, &cosine);
+    const float q0 = qkv[qbase];
+    const float q1 = qkv[qbase + 1u];
+    qkv[qbase] = q0 * cosine - q1 * sine;
+    qkv[qbase + 1u] = q0 * sine + q1 * cosine;
+    const float k0 = qkv[kbase];
+    const float k1 = qkv[kbase + 1u];
+    qkv[kbase] = k0 * cosine - k1 * sine;
+    qkv[kbase + 1u] = k0 * sine + k1 * cosine;
+}
+
+static int attention_threads(size_t head_width) {
+    int threads = 32;
+    while ((size_t)threads < head_width && threads < 256) threads <<= 1;
+    return threads;
+}
+
+extern "C" int mynah_cuda_self_attention_dev(
+    void *opaque, const float *qkv, float *kcache, float *vcache,
+    size_t position, size_t cache_stride, size_t valid, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
+        heads == 0 || head_width == 0 || valid == 0 || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || cache_stride == 0 || position >= valid ||
+        heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    if (cache_stride < width ||
+        (valid - 1u) > (SIZE_MAX - (width - 1u)) / cache_stride) {
+        set_error(e, ec, "CUDA self-attention cache stride overflow");
+        return -1;
+    }
+    k_self_attention<<<(int)heads, attention_threads(head_width), 0, st->stream>>>(
+        qkv, kcache, vcache, position, cache_stride, valid,
+        (int)heads, (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_cross_attention_dev(
+    void *opaque, const float *q, const float *kcache, const float *vcache,
+    size_t valid, size_t cache_stride, size_t heads, size_t head_width,
+    float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (q == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
+        heads == 0 || head_width == 0 || valid == 0 || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || cache_stride == 0) {
+        set_error(e, ec, "invalid CUDA cross-attention dimensions");
+        return -1;
+    }
+    if (heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "CUDA cross-attention width overflow");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    if (cache_stride < width ||
+        (valid - 1u) > (SIZE_MAX - (width - 1u)) / cache_stride) {
+        set_error(e, ec, "CUDA cross-attention cache stride overflow");
+        return -1;
+    }
+    k_cross_attention<<<(int)heads, attention_threads(head_width), 0, st->stream>>>(
+        q, kcache, vcache, valid, cache_stride, (int)heads,
+        (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+__global__ static void k_self_attention_batch(
+    const float *qkv, float *const *kcache, float *const *vcache,
+    const size_t *positions, const size_t *cache_strides, int batch, int heads,
+    int head_width, float scale, float *out) {
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t position = positions[request];
+    const size_t cache_stride = cache_strides[request];
+    const size_t cache_base = position * cache_stride + hbase;
+    float *request_k = kcache[request];
+    float *request_v = vcache[request];
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    const float *q = request_qkv + hbase;
+    const float *k = request_qkv + width + hbase;
+    const float *v = request_qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        request_k[cache_base + (size_t)d] = k[d];
+        request_v[cache_base + (size_t)d] = v[d];
+        out[(size_t)request * width + hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s <= position; ++s) {
+        const float *ks = request_k + s * cache_stride + hbase;
+        const float *vs = request_v + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * ks[d];
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = (size_t)request * width + hbase + (size_t)d;
+            out[index] = out[index] * correction + probability * vs[d];
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[(size_t)request * width + hbase + (size_t)d] *= inv;
+}
+
+extern "C" int mynah_cuda_self_attention_batch_dev(
+    void *opaque, const float *qkv, float *const *kcache,
+    float *const *vcache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale,
+    float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u ||
+        batch > st->batch_meta_cap || heads == 0u || head_width == 0u ||
+        heads > (size_t)INT_MAX || head_width > (size_t)INT_MAX ||
+        heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA batched self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t qkv_count = 0;
+    if (!cuda_size_mul(width, 3u, &qkv_count) ||
+        !cuda_size_mul(batch, qkv_count, &qkv_count)) {
+        set_error(e, ec, "CUDA batched self-attention size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            positions[i] == SIZE_MAX ||
+            cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA batched self-attention cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    dim3 grid((unsigned)heads, (unsigned)batch, 1u);
+    k_self_attention_batch<<<grid, attention_threads(head_width), 0, st->stream>>>(
+        qkv, st->dev_batch_k_cache, st->dev_batch_v_cache,
+        st->dev_batch_positions, st->dev_batch_cache_strides,
+        (int)batch, (int)heads,
+        (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_rope_dev(void *opaque, float *qkv,
+                                    size_t position, size_t heads,
+                                    size_t head_width, float max_period,
+                                    char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || heads == 0u || head_width == 0u ||
+        (head_width & 1u) != 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || !(max_period > 0.0f) ||
+        !isfinite(max_period)) {
+        set_error(e, ec, "invalid CUDA RoPE dimensions");
+        return -1;
+    }
+    const size_t half = head_width / 2u;
+    if (half == 0u || heads > SIZE_MAX / half) {
+        set_error(e, ec, "CUDA RoPE dimensions overflow");
+        return -1;
+    }
+    const size_t pairs = heads * half;
+    if (pairs > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA RoPE dimensions overflow launch range");
+        return -1;
+    }
+    k_rope_qk<<<((int)pairs + 255) / 256, 256, 0, st->stream>>>(
+        qkv, position, (int)heads, (int)head_width, max_period);
+    return ce(cudaGetLastError(), e, ec);
 }
 
 /* GELU on host data: upload → kernel → download → sync. */
@@ -850,22 +1952,26 @@ extern "C" int mynah_cuda_gelu_host_f64(void *opaque, float *data, size_t n,
 }
 
 /* ---- CUDA Graph cache for matmul segments ---- */
-struct cuda_graph_entry {
-    size_t rows, iw, ow;
-    cudaGraph_t graph;
-    cudaGraphExec_t exec;
-    bool valid;
-};
+static void destroy_graphs(cuda_backend_state *st) {
+    if (st == nullptr) return;
+    for (auto &entry : st->graph_cache) {
+        if (entry.exec != nullptr) cudaGraphExecDestroy(entry.exec);
+        if (entry.graph != nullptr) cudaGraphDestroy(entry.graph);
+        entry.exec = nullptr;
+        entry.graph = nullptr;
+        entry.valid = false;
+    }
+    st->graph_cache.clear();
+}
 
-#define GRAPH_CACHE_SIZE 16
-static cuda_graph_entry g_graph_cache[GRAPH_CACHE_SIZE];
-static int g_graph_count = 0;
-
-static cuda_graph_entry *find_graph(size_t rows, size_t iw, size_t ow) {
-    for (int i = 0; i < g_graph_count; ++i)
-        if (g_graph_cache[i].rows == rows && g_graph_cache[i].iw == iw &&
-            g_graph_cache[i].ow == ow)
-            return &g_graph_cache[i];
+static cuda_graph_entry *find_graph(cuda_backend_state *st, size_t rows,
+                                    size_t iw, size_t ow,
+                                    const void *weight, const void *bias) {
+    for (auto &entry : st->graph_cache) {
+        if (entry.valid && entry.rows == rows && entry.iw == iw && entry.ow == ow &&
+            entry.weight_pointer == weight && entry.bias_pointer == bias)
+            return &entry;
+    }
     return nullptr;
 }
 
@@ -876,60 +1982,67 @@ extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *
                              const float *weight, const float *bias,
                              char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(input, output, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    /* The captured graph below intentionally uses the FP16/Tensor-Core
+     * pipeline.  Keep the default parity mode on the uncaptured FP32 path;
+     * operators opt into this graph together with MYNAH_CUDA_FAST_MATH=1. */
+    if (!st->fast_math) return cuda_matmul(opaque, input, output, rows, iw, ow,
+                                           weight, bias, e, ec);
+    const size_t mapped_need = total_n * sizeof(float);
+    if (ensure_host(st, mapped_need, e, ec)) return -1;
 
     /* Try to find a cached graph. */
-    cuda_graph_entry *entry = find_graph(rows, iw, ow);
+    cuda_graph_entry *entry = find_graph(st, rows, iw, ow, weight, bias);
     if (entry && entry->valid) {
         /* Update input in mapped buffer, replay graph. */
-        const size_t in_n = rows * iw;
-        const size_t out_n = rows * ow;
-        size_t mapped_need = (in_n + out_n) * sizeof(float);
-        if (ensure_host(st, mapped_need, e, ec)) return -1;
         std::memcpy(st->host_buf, input, in_n * sizeof(float));
-        cudaGraphLaunch(entry->exec, st->stream);
+        if (ce(cudaGraphLaunch(entry->exec, st->stream), e, ec)) return -1;
         if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
         std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
         return 0;
     }
 
     /* First call: capture the graph. */
-    const size_t in_n = rows * iw;
-    const size_t out_n = rows * ow;
-    const size_t w_n = iw * ow;
     half *dw16 = nullptr;
     if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
     if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
     half *di16 = (half *)st->dev_scratch;
-    size_t mapped_need = (in_n + out_n) * sizeof(float);
-    if (ensure_host(st, mapped_need, e, ec)) return -1;
     float *d_out_mapped = st->dev_buf + in_n;
     std::memcpy(st->host_buf, input, in_n * sizeof(float));
 
     /* Capture. Alpha/beta must be static (not stack) for graph capture.
      * Pre-allocate cuBLAS workspace to avoid allocation during capture. */
     static const float g_alpha = 1.0f, g_beta = 0.0f;
-    static void *cublas_ws = nullptr;
-    static size_t cublas_ws_size = 4 * 1024 * 1024; /* 4MB workspace */
-    if (!cublas_ws) cudaMalloc(&cublas_ws, cublas_ws_size);
-    cublasSetWorkspace(st->cublas, cublas_ws, cublas_ws_size);
-    cublasSetStream(st->cublas, st->stream);
-    cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeRelaxed);
+    if (st->cublas_workspace == nullptr) {
+        st->cublas_workspace_cap = 4u * 1024u * 1024u;
+        if (ce(cudaMalloc(&st->cublas_workspace, st->cublas_workspace_cap), e, ec)) return -1;
+    }
+    if (cbe(cublasSetWorkspace(st->cublas, st->cublas_workspace,
+                               st->cublas_workspace_cap), e, ec) ||
+        cbe(cublasSetStream(st->cublas, st->stream), e, ec) ||
+        ce(cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeRelaxed), e, ec)) {
+        return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
+    }
     k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(st->dev_buf, di16, (int)in_n);
-    cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                 (int)ow, (int)rows, (int)iw,
-                 &g_alpha, dw16, CUDA_R_16F, (int)iw,
-                 di16, CUDA_R_16F, (int)iw,
-                 &g_beta, d_out_mapped, CUDA_R_32F, (int)ow,
-                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    const cublasStatus_t gemm_status = cublasGemmEx(
+        st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)ow, (int)rows, (int)iw,
+        &g_alpha, dw16, CUDA_R_16F, (int)iw,
+        di16, CUDA_R_16F, (int)iw,
+        &g_beta, d_out_mapped, CUDA_R_32F, (int)ow,
+        cuda_compute_type(st), cuda_gemm_algo(st));
     if (db) {
         k_bias_add<<<((int)(rows*ow)+255)/256, 256, 0, st->stream>>>(
             d_out_mapped, db, (int)rows, (int)ow);
     }
     cudaGraph_t graph;
     cudaError_t cap_err = cudaStreamEndCapture(st->stream, &graph);
-    if (cap_err != cudaSuccess || graph == nullptr) {
+    if (gemm_status != CUBLAS_STATUS_SUCCESS || cap_err != cudaSuccess || graph == nullptr) {
         /* Capture failed — fall back to regular matmul. */
         return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
     }
@@ -941,13 +2054,16 @@ extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *
     }
 
     /* Cache the graph. */
-    if (g_graph_count < GRAPH_CACHE_SIZE) {
-        g_graph_cache[g_graph_count] = {rows, iw, ow, graph, exec, true};
-        g_graph_count++;
+    if (st->graph_cache.size() < 16u) {
+        st->graph_cache.push_back({rows, iw, ow, weight, bias, graph, exec, true});
+    } else {
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
     }
 
     /* Replay for this call. */
-    cudaGraphLaunch(exec, st->stream);
+    if (ce(cudaGraphLaunch(exec, st->stream), e, ec)) return -1;
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
     std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
     return 0;

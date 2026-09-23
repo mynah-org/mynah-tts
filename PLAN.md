@@ -11,7 +11,9 @@ batching, and optional Metal/CUDA matmul backends. Oracle parity is closed.
 Current work is the **second engine**: PocketTTS, a continuous-latent AR model,
 which requires the engine seam that has been outstanding since July.
 
-**Current focus is CPU — ARM and x86 together. GPU work is deferred.**
+**Current focus remains CPU — ARM and x86 together.** GPU is still opt-in and
+deferred for Magpie; the newly opened E15 is the PocketTTS CUDA/server track
+and does not change the CPU default or its qualification gates.
 
 **Priority order, from the author of the reference implementation** (who reached
 **C20/C22 real-time streams on 32 ARM cores with a 0.6B model**) — see
@@ -1375,6 +1377,22 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       cache-resident than DRAM*). Both are ten-minute measurements
 - [x] E5-8 **done** `89070f8` — proven through HTTP at C=2/4/8, both routes, either arrival order, ragged, single-process and across 4 prefork processes, with two injected contamination mutants caught · gate: **N concurrent streams byte-identical to the same request run alone**
 
+### E15 — PocketTTS CUDA and Linux GPU streaming → [`.work/pocket-tts-cuda-streaming-parity.md`](.work/pocket-tts-cuda-streaming-parity.md)
+
+New, opt-in track. CPU remains the oracle/default; CUDA gets a separate server
+artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
+“GPU Pocket”. The target is a measured C100 on an L40S, not an extrapolation.
+
+- [x] E15-0 as-is audit: Pocket CPU driver/state, current CUDA backend, `../qwen-tts` resident CUDA/CI patterns, and vLLM-Omni CUDA-graph/async-chunk designs
+- [~] E15-1 add `make cuda-server`; compile/link CLI + server in CI for explicit `sm_70`, `sm_89` (L40S) and `sm_90`; model-free check distinguishes compiled CUDA from no device — workflow ready, awaiting GitHub run
+- [~] E15-2 explicit backend capability/lifecycle: backend-owned weights, graphs, batch metadata and scratch; host/device conv split and safe CPU retry are implemented, while explicit health/capability counters remain
+- [~] E15-3 scalar-reference CUDA kernels: projection matmul, LayerNorm, GELU, residual, softmax, RoPE, attention and resident conv primitives plus model-free self-tests are implemented; `nvcc`/GPU shape sweeps remain
+- [~] E15-4 resident Pocket prefill/AR batch: per-request KV, batched matmul→matmat, device transformer step, cross-request attention, pinned batch staging and bounded host K/V shadow commit are implemented; flow/latent control and graph buckets remain
+- [~] E15-5 resident Pocket SEANet/decoder streaming: generic causal/transposed-conv device primitives exist, but Pocket's causal state, batched ranges and PCM handoff remain
+- [~] E15-6 CUDA server integration: one process/GPU build boundary, prefork refusal and existing queue/cancel/stream contract are present; health and graph/H2D/D2H/fallback counters remain
+- [ ] E15-7 CPU↔CUDA stage/EOS/audio parity and solo↔batch/stream parity on a real CUDA device; CPU gates must remain green
+- [ ] E15-8 L40S qualification campaign: warmups, serial A/B, batch sweep, C ladder, VRAM/RSS/transfer metrics and 30-minute C100 cadence soak
+
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)
 
 - [ ] E6-1 `speakers.json`: `source_dataset`, `license`, `commercial_use` per voice
@@ -1397,8 +1415,9 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
   `may be used uninitialized` in `json.c`). Still open: the AVX-512 execution
   gap on hosted runners (stated in the note, not implied by a green tick) and
   `--self-test` across the whole link-only matrix.
-- [-] GPU (Metal/CUDA) work — existing backends stay as they are. Metal measured
-  *slower* than CPU on Apple Silicon (`docs/performance.md:71-80`).
+- [-] Generic Magpie GPU expansion — existing partial backends stay as they are;
+  Metal measured *slower* than CPU on Apple Silicon (`docs/performance.md:71-80`).
+  Pocket-specific CUDA work is now tracked in E15 and does not reopen this item.
 - [-] `*_24l` PocketTTS variants — non-distilled previews, 672 MB-1.3 GB each,
   same schema with `num_layers: 24`. French exists **only** in this form.
 - [-] dots.tts (§9) and Chatterbox (§10) — unchanged as later engines.

@@ -243,7 +243,7 @@ WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 	server-concurrency-test server-concurrency-test-all server-refusal-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
-        metal cuda gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot \
+        metal cuda cuda-server gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot \
         doctor census-test census-parity census-overhead alloc-shim alloc-constant-test observability-test
 
 all: $(TARGET)
@@ -823,8 +823,10 @@ endif
 CUDA_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o)
 $(CUDA_CORE_OBJECTS): | $(INGOT_LIB)
 CUDA_CLI_OBJECT := $(CUDA_BUILD_DIR)/cli/main.o
+CUDA_SERVER_OBJECTS := $(SERVER_SOURCES:%.c=$(CUDA_BUILD_DIR)/%.o)
 CUDA_HOST_OBJECT := $(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o
 CUDA_TARGET := $(CUDA_BUILD_DIR)/mynah-tts
+CUDA_SERVER_TARGET := $(CUDA_BUILD_DIR)/mynah-tts-server
 
 $(CUDA_BUILD_DIR)/%.o: %.c
 	@mkdir -p $(@D)
@@ -857,6 +859,19 @@ $(CUDA_TARGET): $(CUDA_CORE_OBJECTS) $(CUDA_CLI_OBJECT) $(CUDA_HOST_OBJECT) | $(
 
 cuda: $(CUDA_TARGET)
 	@echo "CUDA build ready: $(CUDA_TARGET)"
+
+# The CPU server target deliberately links the CPU object tree.  A CUDA server
+# must be a separate artifact so `--device cuda` cannot accidentally be handed
+# a binary whose backend was compiled without MYNAH_ENABLE_CUDA.  The server
+# objects use the same CUDA core tree and backend as the CLI; only the HTTP
+# front end is different.  No fork is allowed once this binary opens a GPU --
+# server/main.c/prefork.c enforce that at runtime.
+$(CUDA_SERVER_TARGET): $(CUDA_CORE_OBJECTS) $(CUDA_SERVER_OBJECTS) $(CUDA_HOST_OBJECT) | $(INGOT_LIB)
+	@mkdir -p $(@D)
+	nvcc $(CUDA_ARCH_FLAGS) $(filter %.o,$^) $(LDLIBS) -lcublas -o $@
+
+cuda-server: $(CUDA_SERVER_TARGET)
+	@echo "CUDA server build ready: $(CUDA_SERVER_TARGET)"
 
 gpu-selftest:
 	@if test "$(DEVICE)" = "cuda"; then $(MAKE) cuda && build/cuda/mynah-tts --gpu-self-test cuda; \
@@ -918,7 +933,8 @@ update-ingot:
 # which reached the admission ladder as nonsense defaults. Same class as the
 # mixed-binary trap in .work/linux-production.md: objects reused across a change
 # that altered their meaning.
--include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d) $(WINDOW_TEST_OBJECT:.o=.d) $(QMAT_TEST_OBJECT:.o=.d)
+-include $(CORE_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(STREAM_TEST_OBJECT:.o=.d) $(DRIVER_TEST_OBJECT:.o=.d) $(WINDOW_TEST_OBJECT:.o=.d) $(QMAT_TEST_OBJECT:.o=.d) \
+	$(CUDA_CORE_OBJECTS:.o=.d) $(CUDA_SERVER_OBJECTS:.o=.d) $(CUDA_CLI_OBJECT:.o=.d)
 
 
 # ======================================================================

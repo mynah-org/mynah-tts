@@ -8,6 +8,32 @@ make server
 ./build/cpu/mynah-tts-server -m models/magpie-v2607-pack -p 8080
 ```
 
+The CPU and CUDA servers are separate artifacts. The CPU binary is never
+silently promoted to CUDA; build the opt-in server explicitly when the CUDA
+toolkit is available (a device is required only when running it):
+
+```bash
+make cuda-server CUDA_ARCH=sm_89
+./build/cuda/mynah-tts-server -m models/magpie-v2607-pack \
+  --device cuda -p 8080
+```
+
+`cuda-server` proves the CUDA-linked server builds without a GPU. PocketTTS
+resident CUDA execution and its parity/serving qualification are tracked in
+[the CUDA work item](../.work/pocket-tts-cuda-streaming-parity.md). Failure to
+open an explicitly requested CUDA backend is reported; inside a compatible
+Pocket request, a recoverable resident-backbone allocation/launch failure can
+retry that same step on the CPU path while the full flow/SEANet CUDA graph is
+still being brought up.
+
+The current opt-in controls are:
+
+| environment | effect |
+|---|---|
+| `MYNAH_CUDA_RESIDENT=0` | disable Pocket's resident transformer slice and use the CPU engine path |
+| `MYNAH_CUDA_FAST_MATH=1` | opt into FP16/Tensor-Core GEMM and CUDA graph experiments; default is FP32 parity mode |
+| `MYNAH_CUDA_CODEC=1` | opt into the existing generic NanoCodec resident path; it is not Pocket's SEANet decoder and is not a qualification claim |
+
 | flag | meaning |
 |---|---|
 | `-m, --model DIR` | model pack directory (required) |

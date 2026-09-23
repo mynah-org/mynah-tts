@@ -58,6 +58,11 @@ int mynah_backend_matmul_to_dev(const mynah_backend *, const float *, float *, s
 int mynah_backend_matmul_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 int mynah_backend_im2col(const mynah_backend *, const float *, float *, int, int, int, int, char *, size_t);
 int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
+/* Device-resident causal conv1d.  `input` and `output` are backend-owned
+ * device buffers; weights and bias remain host model-pack views and are
+ * cached by the backend.  This is deliberately separate from conv1d(), whose
+ * contract is host input/output and may synchronize. */
+int mynah_backend_conv1d_dev(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 int mynah_backend_conv_transpose_dev(const mynah_backend *, const float *, float *, int, int, int, int, int, int, int, const float *, const float *, char *, size_t);
 int mynah_backend_gelu_host(const mynah_backend *, float *, size_t, char *, size_t);
 int mynah_backend_gelu_host_f64(const mynah_backend *, float *, size_t, char *, size_t);
@@ -144,6 +149,15 @@ int mynah_backend_self_attention_dev(const mynah_backend *backend,
                                      size_t head_width, float scale,
                                      float *dev_out,
                                      char *error, size_t error_capacity);
+/* Batched self-attention for independent requests.  QKV is contiguous as
+ * [batch][3][heads][head_width], while each request supplies its own resident
+ * K/V cache and absolute position. */
+int mynah_backend_self_attention_batch_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    float *const *dev_k_cache, float *const *dev_v_cache,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float scale, float *dev_out,
+    char *error, size_t error_capacity);
 int mynah_backend_cross_attention_dev(const mynah_backend *backend,
                                       const float *dev_q,
                                       const float *dev_k_cache,
@@ -152,6 +166,13 @@ int mynah_backend_cross_attention_dev(const mynah_backend *backend,
                                       size_t heads, size_t head_width,
                                       float scale, float *dev_out,
                                       char *error, size_t error_capacity);
+/* Apply the model's interleaved RoPE to the Q and K thirds of one resident
+ * fused-QKV row.  The operation is separate from attention because the
+ * position is request state, not a property of the weight graph. */
+int mynah_backend_rope_dev(const mynah_backend *backend,
+                           float *dev_qkv, size_t position,
+                           size_t heads, size_t head_width, float max_period,
+                           char *error, size_t error_capacity);
 
 /* Copy n floats from host to a specific device buffer (no scratch). */
 int mynah_backend_h2d(const mynah_backend *backend, const float *host,
@@ -184,6 +205,14 @@ int mynah_backend_argmax_dev(const mynah_backend *backend, const float *dev_logi
 int mynah_backend_dev_alloc(const mynah_backend *backend, size_t n,
                             float **dev_ptr, char *error, size_t error_capacity);
 void mynah_backend_dev_free(const mynah_backend *backend, float *dev_ptr);
+
+/* Allocate pinned host staging when the backend can provide it.  CPU and
+ * backends without a pinned allocator use malloc/free; CUDA uses cudaHostAlloc
+ * so H2D/D2H transfers in the batch driver are genuinely asynchronous. */
+int mynah_backend_host_alloc(const mynah_backend *backend, size_t n,
+                             float **host_ptr, char *error,
+                             size_t error_capacity);
+void mynah_backend_host_free(const mynah_backend *backend, float *host_ptr);
 
 /* Which CPU matmul path a shape takes: "parallel" (output rows split over the
  * pool), "simd" (serial in-tree matvec) or "sgemm" (one sgemm call -- whose
