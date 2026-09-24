@@ -430,7 +430,12 @@ jobs:
             exit 1
           fi
           if [ "$selftest_rc" -ne 0 ]; then
-            if grep -Eiq 'no CUDA device|no cuda device|no device' selftest.txt; then
+            # The CUDA container deliberately has nvcc but no usable driver.
+            # Depending on the host/container combination, the runtime reports
+            # either no device or an incompatible driver instead of the same
+            # canonical "no CUDA device" string. Both are an expected
+            # compile-only outcome; any other self-test error remains fatal.
+            if grep -Eiq 'no CUDA device|no cuda device|no device|driver version is insufficient|no NVIDIA driver' selftest.txt; then
               echo 'CUDA self-test skipped: this compile-only runner has no device'
             else
               echo 'CUDA self-test failed for a reason other than missing device' >&2
