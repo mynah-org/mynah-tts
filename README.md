@@ -144,9 +144,12 @@ make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
 Pocket-TTS support is currently an experimental engine path: official 6-layer
 and 24-layer packs run on CPU, and the Linux CUDA server path has been exercised
 on an RTX PRO 6000 Blackwell (`sm_120`) with resident backbone, flow and causal
-SEANet decoder work. CUDA remains opt-in and model-specific; L4/L40S
-qualification, full CPU↔CUDA stage parity and sustained high-concurrency
-streaming are still tracked in [PLAN.md](PLAN.md).
+SEANet decoder work. The current CUDA branch also contains a resident Mimi
+decoder-transformer path with compact per-request KV windows and true
+cross-request frame-tile batching; it is guarded by `MYNAH_CUDA_POCKET_CODEC=0` for
+bring-up and still needs real-device stage parity. CUDA remains opt-in and
+model-specific; L4/L40S qualification and sustained high-concurrency streaming
+are tracked in [PLAN.md](PLAN.md) and the [CUDA work item](.work/pocket-tts-cuda-streaming-parity.md).
 
 A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
@@ -190,6 +193,20 @@ batch response.
 For CUDA server experiments, `--max-batch` is the bounded engine microbatch and
 `--max-inflight` is the independent resident-slot ceiling (for example 16 and
 128). This prepares C100 concurrency without claiming a B100 kernel.
+
+On Linux/NVIDIA, the reproducible build entry point is:
+
+```bash
+make cuda-server CUDA_ARCH=sm_89
+MYNAH_CUDA_RESIDENT=1 MYNAH_CUDA_FLOW=1 MYNAH_CUDA_POCKET_CODEC=1 \
+  ./build/cuda/mynah-tts-server --device cuda --max-batch 16 \
+  --max-inflight 128 -m models/pocket-6l
+```
+
+`MYNAH_CUDA_POCKET_CODEC=0` keeps the resident backbone/flow/SEANet path while
+forcing Pocket's Mimi decoder transformer through its CPU oracle for A/B parity.
+The older `MYNAH_CUDA_CODEC=0` remains a compatibility kill switch for both
+the generic NanoCodec experiment and Pocket.
 
 **Concurrent requests are batched, vLLM-style.** Offline requests are not
 serialized behind a lock: a scheduler admits everything queued into one

@@ -249,6 +249,21 @@ float *mynah_transformer_ar_state_kv(mynah_transformer_ar_state *state,
 size_t mynah_transformer_ar_state_kv_half_floats(
     const mynah_transformer_ar_state *state);
 
+/* Windowed-cache accessors for a resident backend. Unlike `state_kv()`, these
+ * are valid for both the unwindowed backbone cache and Mimi's compact sliding
+ * window. `value == 0` selects K and `value == 1` selects V; the returned row
+ * starts at the current absolute `kv_base`. */
+float *mynah_transformer_ar_state_kv_window(mynah_transformer_ar_state *state,
+                                            size_t layer, int value);
+size_t mynah_transformer_ar_state_kv_positions(
+    const mynah_transformer_ar_state *state);
+size_t mynah_transformer_ar_state_kv_base(
+    const mynah_transformer_ar_state *state);
+
+/* Make room for an exclusive end position without advancing the state. */
+int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
+                                               size_t end_position);
+
 /*
  * Copies a voice prefix into layer `layer`.  `kv` is
  * `[2][positions][num_heads][head_dim]` — the voice safetensors layout with

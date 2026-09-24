@@ -626,6 +626,26 @@ size_t mynah_transformer_ar_state_kv_half_floats(
     return (state == NULL) ? 0 : state->kv_half;
 }
 
+float *mynah_transformer_ar_state_kv_window(mynah_transformer_ar_state *state,
+                                            size_t layer, int value) {
+    if (state == NULL || layer >= state->config.num_layers ||
+        (value != 0 && value != 1)) {
+        return NULL;
+    }
+    return state->kv + layer * state->kv_layer +
+           (value ? state->kv_half : 0u);
+}
+
+size_t mynah_transformer_ar_state_kv_positions(
+    const mynah_transformer_ar_state *state) {
+    return state == NULL ? 0u : state->kv_positions;
+}
+
+size_t mynah_transformer_ar_state_kv_base(
+    const mynah_transformer_ar_state *state) {
+    return state == NULL ? 0u : state->kv_base;
+}
+
 int mynah_transformer_ar_state_load_kv(mynah_transformer_ar_state *state,
                                        size_t layer, const float *kv,
                                        size_t positions, char *error,
@@ -781,6 +801,19 @@ static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
     }
     state->kv_base = keep_from;
     return (hi - state->kv_base < state->kv_positions) ? 0 : -1;
+}
+
+int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
+                                               size_t end_position) {
+    if (state == NULL || end_position > state->config.max_seq_len ||
+        end_position < state->offset) {
+        return -1;
+    }
+    if (end_position == state->offset || end_position == 0u) return 0;
+    const size_t hi = end_position - 1u;
+    return tar_kv_reserve(state,
+                          tar_window_start(state->offset, state->config.context),
+                          hi);
 }
 
 /* Every state in `refs` gets room for the whole tile before ANY row writes.

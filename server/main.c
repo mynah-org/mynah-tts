@@ -1442,13 +1442,16 @@ static void handle_health(int fd) {
     mynah_tts_backend_metrics backend_metrics;
     memset(&backend_metrics, 0, sizeof(backend_metrics));
     (void)mynah_tts_model_get_backend_metrics(g.model, &backend_metrics);
-    char backend_stats[1600];
+    char backend_stats[1900];
     snprintf(backend_stats, sizeof(backend_stats),
              "{\"h2d_bytes\":%llu,\"d2h_bytes\":%llu,"
              "\"h2d_calls\":%llu,\"d2h_calls\":%llu,\"sync_calls\":%llu,"
              "\"graph_captures\":%llu,\"graph_replays\":%llu,"
              "\"graph_fallbacks\":%llu,\"backbone_batch_calls\":%llu,"
              "\"backbone_batch_items\":%llu,\"backbone_batch_max_width\":%llu,"
+             "\"codec_transformer_batch_calls\":%llu,"
+             "\"codec_transformer_batch_items\":%llu,"
+             "\"codec_transformer_batch_max_width\":%llu,"
              "\"decoder_steps\":%llu,"
              "\"decoder_batch_calls\":%llu,\"decoder_batch_items\":%llu,"
              "\"decoder_batch_frames\":%llu,\"decoder_failures\":%llu,"
@@ -1464,6 +1467,9 @@ static void handle_health(int fd) {
              backend_metrics.backbone_batch_calls,
              backend_metrics.backbone_batch_items,
              backend_metrics.backbone_batch_max_width,
+             backend_metrics.codec_transformer_batch_calls,
+             backend_metrics.codec_transformer_batch_items,
+             backend_metrics.codec_transformer_batch_max_width,
              backend_metrics.decoder_steps,
              backend_metrics.decoder_batch_calls,
              backend_metrics.decoder_batch_items,
@@ -1769,6 +1775,18 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_backbone_batch_max_width gauge\n"
            "mynah_backend_backbone_batch_max_width %llu\n",
            m.backbone_batch_max_width);
+    METRIC("# HELP mynah_backend_codec_transformer_batch_calls_total Resident Mimi decoder-transformer tiles.\n"
+           "# TYPE mynah_backend_codec_transformer_batch_calls_total counter\n"
+           "mynah_backend_codec_transformer_batch_calls_total %llu\n",
+           m.codec_transformer_batch_calls);
+    METRIC("# HELP mynah_backend_codec_transformer_batch_items_total Requests in resident Mimi decoder-transformer tiles.\n"
+           "# TYPE mynah_backend_codec_transformer_batch_items_total counter\n"
+           "mynah_backend_codec_transformer_batch_items_total %llu\n",
+           m.codec_transformer_batch_items);
+    METRIC("# HELP mynah_backend_codec_transformer_batch_max_width Maximum resident Mimi decoder-transformer batch width.\n"
+           "# TYPE mynah_backend_codec_transformer_batch_max_width gauge\n"
+           "mynah_backend_codec_transformer_batch_max_width %llu\n",
+           m.codec_transformer_batch_max_width);
     METRIC("# HELP mynah_backend_decoder_steps_total Decoder steps submitted.\n"
            "# TYPE mynah_backend_decoder_steps_total counter\n"
            "mynah_backend_decoder_steps_total %llu\n",
@@ -2177,6 +2195,7 @@ static void dump_local_stats(void) {
     fprintf(stderr,
             "[%s] backend=%s h2d=%llu d2h=%llu graph=%llu/%llu fallback=%llu "
             "sync=%llu backbone_batch=%llu/%llu max=%llu "
+            "codec_transformer_batch=%llu/%llu max=%llu "
             "decoder_steps=%llu decoder_batch=%llu/%llu/%llu "
             "decoder_failures=%llu resident_fallbacks=%llu matmul=%llu matvec=%llu "
             "vram=%llu/%llu flags=%u/%u/%u\n",
@@ -2187,6 +2206,9 @@ static void dump_local_stats(void) {
             backend_metrics.backbone_batch_calls,
             backend_metrics.backbone_batch_items,
             backend_metrics.backbone_batch_max_width,
+            backend_metrics.codec_transformer_batch_calls,
+            backend_metrics.codec_transformer_batch_items,
+            backend_metrics.codec_transformer_batch_max_width,
             backend_metrics.decoder_steps,
             backend_metrics.decoder_batch_calls,
             backend_metrics.decoder_batch_items,

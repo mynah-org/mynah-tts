@@ -253,6 +253,22 @@ __global__ static void k_residual_add(float *out, const float *in, int n) {
     if (i < n) out[i] += in[i];
 }
 
+__global__ static void k_scaled_residual_add(float *out, const float *in,
+                                             const float *scale, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += scale[i] * in[i];
+}
+
+__global__ static void k_scaled_residual_rows_add(float *out, const float *in,
+                                                  const float *scale, int rows,
+                                                  int width) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * width;
+    if (index < total) {
+        out[index] += scale[index % width] * in[index];
+    }
+}
+
 __global__ static void k_bias_add(float *out, const float *bias, int rows, int cols) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < rows * cols) out[i] += bias[i % cols];
@@ -481,6 +497,9 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> backbone_batch_calls;
     std::atomic<unsigned long long> backbone_batch_items;
     std::atomic<unsigned long long> backbone_batch_max_width;
+    std::atomic<unsigned long long> codec_transformer_batch_calls;
+    std::atomic<unsigned long long> codec_transformer_batch_items;
+    std::atomic<unsigned long long> codec_transformer_batch_max_width;
     std::atomic<unsigned long long> decoder_steps;
     std::atomic<unsigned long long> decoder_batch_calls;
     std::atomic<unsigned long long> decoder_batch_items;
@@ -1066,6 +1085,43 @@ extern "C" int mynah_cuda_residual_add_dev(void *opaque, float *out, const float
     return 0;
 }
 
+extern "C" int mynah_cuda_scaled_residual_add_dev(
+    void *opaque, float *out, const float *in, const float *scale,
+    size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || out == nullptr || in == nullptr || scale == nullptr ||
+        n == 0u || n > (size_t)INT_MAX || n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA scaled residual dimensions");
+        return -1;
+    }
+    float *d_scale = nullptr;
+    if (cached_weight(st, scale, n * sizeof(float), &d_scale, e, ec)) return -1;
+    k_scaled_residual_add<<<((int)n + 255) / 256, 256, 0, st->stream>>>(
+        out, in, d_scale, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    return 0;
+}
+
+extern "C" int mynah_cuda_scaled_residual_rows_dev(
+    void *opaque, float *out, const float *in, const float *scale,
+    size_t rows, size_t width, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    if (st == nullptr || out == nullptr || in == nullptr || scale == nullptr ||
+        rows == 0u || width == 0u || rows > (size_t)INT_MAX ||
+        width > (size_t)INT_MAX || !cuda_size_mul(rows, width, &total) ||
+        total > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA row-wise scaled residual dimensions");
+        return -1;
+    }
+    float *d_scale = nullptr;
+    if (cached_weight(st, scale, width * sizeof(float), &d_scale, e, ec)) return -1;
+    k_scaled_residual_rows_add<<<((int)total + 255) / 256, 256, 0, st->stream>>>(
+        out, in, d_scale, (int)rows, (int)width);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    return 0;
+}
+
 extern "C" int mynah_cuda_copy_dev(void *opaque, float *dst, const float *src,
                                     size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
@@ -1184,6 +1240,10 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
     const float gain[4] = {1.0f, 2.0f, 1.0f, 0.5f};
     const float bias[4] = {0.1f, -0.2f, 0.3f, -0.4f};
     float norm_out[8] = {0.0f};
+    const float scaled_rows_in[8] = {1.0f, -2.0f, 3.0f, -4.0f,
+                                     5.0f, -6.0f, 7.0f, -8.0f};
+    const float scaled_rows_scale[4] = {0.5f, -1.0f, 2.0f, 0.25f};
+    float scaled_rows_out[8] = {0.0f};
     const float softmax_in[8] = {1.0f, 2.0f, 3.0f, 4.0f,
                                  0.0f, -1.0f, 2.0f, 9.0f};
     float softmax_out[8] = {0.0f};
@@ -1240,6 +1300,26 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
                 std::snprintf(e, ec, "CUDA layer-norm self-test mismatch at %zu", r * 4u + d);
                 goto fail;
             }
+        }
+    }
+
+    if (ce(cudaMemcpy(d_in, scaled_rows_in, sizeof(scaled_rows_in),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemcpy(d_out, scaled_rows_in, sizeof(scaled_rows_in),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_scaled_residual_rows_dev(st, d_out, d_in,
+                                             scaled_rows_scale, 2u, 4u,
+                                             e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(scaled_rows_out, d_out, sizeof(scaled_rows_out),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 8u; ++i) {
+        const float expected = scaled_rows_in[i] +
+                               scaled_rows_scale[i % 4u] * scaled_rows_in[i];
+        if (fabsf(scaled_rows_out[i] - expected) > 2.0e-4f) {
+            std::snprintf(e, ec,
+                          "CUDA row-wise LayerScale self-test mismatch at %zu", i);
+            goto fail;
         }
     }
 
@@ -1480,6 +1560,9 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->backbone_batch_calls.store(0ull, std::memory_order_relaxed);
     st->backbone_batch_items.store(0ull, std::memory_order_relaxed);
     st->backbone_batch_max_width.store(0ull, std::memory_order_relaxed);
+    st->codec_transformer_batch_calls.store(0ull, std::memory_order_relaxed);
+    st->codec_transformer_batch_items.store(0ull, std::memory_order_relaxed);
+    st->codec_transformer_batch_max_width.store(0ull, std::memory_order_relaxed);
     st->decoder_steps.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_calls.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_items.store(0ull, std::memory_order_relaxed);
@@ -1543,6 +1626,12 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         st->backbone_batch_items.load(std::memory_order_relaxed);
     metrics->backbone_batch_max_width =
         st->backbone_batch_max_width.load(std::memory_order_relaxed);
+    metrics->codec_transformer_batch_calls =
+        st->codec_transformer_batch_calls.load(std::memory_order_relaxed);
+    metrics->codec_transformer_batch_items =
+        st->codec_transformer_batch_items.load(std::memory_order_relaxed);
+    metrics->codec_transformer_batch_max_width =
+        st->codec_transformer_batch_max_width.load(std::memory_order_relaxed);
     metrics->decoder_steps = st->decoder_steps.load(std::memory_order_relaxed);
     metrics->decoder_batch_calls =
         st->decoder_batch_calls.load(std::memory_order_relaxed);
@@ -2760,6 +2849,27 @@ extern "C" int mynah_cuda_note_backbone_batch(void *opaque, size_t items) {
     while (observed < width &&
            !backend->backbone_batch_max_width.compare_exchange_weak(
                observed, width, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    return 0;
+}
+
+extern "C" int mynah_cuda_note_codec_transformer_batch(void *opaque,
+                                                         size_t items,
+                                                         size_t width) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || items == 0u || width == 0u) return -1;
+    backend->codec_transformer_batch_calls.fetch_add(
+        1ull, std::memory_order_relaxed);
+    backend->codec_transformer_batch_items.fetch_add(
+        (unsigned long long)items, std::memory_order_relaxed);
+    unsigned long long observed =
+        backend->codec_transformer_batch_max_width.load(
+            std::memory_order_relaxed);
+    const unsigned long long batch_width = (unsigned long long)items;
+    while (observed < batch_width &&
+           !backend->codec_transformer_batch_max_width.compare_exchange_weak(
+               observed, batch_width, std::memory_order_relaxed,
                std::memory_order_relaxed)) {
     }
     return 0;

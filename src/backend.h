@@ -104,6 +104,9 @@ int mynah_backend_decoder_note_batch(const mynah_backend *backend,
  * intentionally no-ops; CUDA exposes the counters for server observability. */
 int mynah_backend_note_backbone_batch(const mynah_backend *backend,
                                       size_t items);
+/* Record one resident Mimi decoder-transformer tile. */
+int mynah_backend_note_codec_transformer_batch(const mynah_backend *backend,
+                                               size_t items, size_t width);
 int mynah_backend_metrics_get(const mynah_backend *backend,
                                mynah_tts_backend_metrics *metrics);
 
@@ -266,6 +269,17 @@ int mynah_backend_residual_add_dev(const mynah_backend *backend,
                                    float *dev_out, const float *dev_in,
                                    size_t n,
                                    char *error, size_t error_capacity);
+/* out[i] += scale[i] * in[i], used by Mimi's LayerScale decoder transformer. */
+int mynah_backend_scaled_residual_add_dev(const mynah_backend *backend,
+                                          float *dev_out, const float *dev_in,
+                                          const float *scale, size_t n,
+                                          char *error, size_t error_capacity);
+/* Row-wise LayerScale: out[row][i] += scale[i] * in[row][i]. */
+int mynah_backend_scaled_residual_rows_dev(const mynah_backend *backend,
+                                           float *dev_out, const float *dev_in,
+                                           const float *scale, size_t rows,
+                                           size_t width, char *error,
+                                           size_t error_capacity);
 int mynah_backend_snake_dev(const mynah_backend *backend,
                             float *dev_data, const float *alpha,
                             size_t channels, size_t length,

@@ -941,9 +941,26 @@ struct mynah_engine_ctx {
     int cuda_backbone_enabled;
     int cuda_backbone_valid;
 
-    /* Optional resident CUDA SEANet decoder. The codec transformer and
-     * quantizer boundary remain host-owned for now; this handle owns the
-     * causal convolution rings and transposed-convolution tails on device. */
+    /* Optional resident CUDA Mimi decoder transformer. The host transformer
+     * remains the correctness/fallback state; the device owns a compact KV
+     * window, while the host mirror is refreshed only at a rebase or retry. */
+    float **cuda_codec_kv; /* [codec_tf_layers], each [K][V] device block */
+    float *cuda_codec_x;
+    float *cuda_codec_norm;
+    float *cuda_codec_qkv;
+    float *cuda_codec_attn;
+    float *cuda_codec_proj;
+    float *cuda_codec_ffn;
+    size_t cuda_codec_kv_positions;
+    size_t cuda_codec_kv_half;
+    size_t cuda_codec_kv_base;
+    int cuda_codec_enabled;
+    int cuda_codec_valid;
+    int cuda_codec_needs_host_sync;
+    int cuda_codec_pending;
+
+    /* Optional resident CUDA SEANet decoder. This handle owns the causal
+     * convolution rings and transposed-convolution tails on device. */
     mynah_backend_decoder *cuda_decoder;
     float *cuda_decoder_input;
     float *cuda_decoder_output;
@@ -1028,6 +1045,21 @@ struct mynah_engine_scratch {
     int cuda_graph_enabled;
     int cuda_graph_ready;
     size_t cuda_kv_shadow_floats;
+
+    /* Shared CUDA Mimi decoder-transformer workspace.  Per-request KV remains
+     * in the context; these activation slabs are reused across frame-major
+     * gangs and are never multiplied by the number of layers. */
+    float *cuda_codec_host_input;
+    float *cuda_codec_host_output;
+    float *cuda_codec_x;
+    float *cuda_codec_norm;
+    float *cuda_codec_qkv;
+    float *cuda_codec_attn;
+    float *cuda_codec_proj;
+    float *cuda_codec_ffn;
+    size_t *cuda_codec_abs_positions;
+    size_t cuda_codec_batch_capacity;
+    int cuda_codec_enabled;
 
     /* The cross-request step: one stacked activation set and one projection
      * scratch for the whole batch, owned by the driver rather than by any
@@ -3394,6 +3426,17 @@ static int pocket_cuda_flow_requested(const mynah_engine_state *state) {
     return setting == NULL || strcmp(setting, "0") != 0;
 }
 
+static int pocket_cuda_codec_requested(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state)) return 0;
+    /* MYNAH_CUDA_CODEC predates Pocket and controls the generic NanoCodec
+     * resident experiment. Honor it as a compatibility kill switch, but give
+     * Pocket its own name so enabling/disabling one model family cannot be
+     * confused with the other. */
+    const char *setting = getenv("MYNAH_CUDA_POCKET_CODEC");
+    if (setting == NULL) setting = getenv("MYNAH_CUDA_CODEC");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
 /* The released Pocket configuration pins the LSD time pair at {0, 1}.  Build
  * the same BF16-rounded sinusoidal features once into persistent staging so a
  * flow graph replay never depends on a stack buffer or a host allocation. */
@@ -3443,6 +3486,322 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     ctx->cuda_backbone_capacity = 0u;
     ctx->cuda_backbone_kv_floats = 0u;
     ctx->cuda_backbone_valid = 0;
+}
+
+static void pocket_cuda_codec_release(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    const mynah_backend *backend =
+        ctx->state == NULL ? NULL : ctx->state->backend;
+    if (backend != NULL && ctx->cuda_codec_kv != NULL) {
+        for (size_t l = 0; l < ctx->state->cfg.codec_tf_layers; ++l)
+            mynah_backend_dev_free(backend, ctx->cuda_codec_kv[l]);
+    }
+    free(ctx->cuda_codec_kv);
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, ctx->cuda_codec_x);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_norm);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_qkv);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_attn);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_proj);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_ffn);
+    }
+    ctx->cuda_codec_kv = NULL;
+    ctx->cuda_codec_x = NULL;
+    ctx->cuda_codec_norm = NULL;
+    ctx->cuda_codec_qkv = NULL;
+    ctx->cuda_codec_attn = NULL;
+    ctx->cuda_codec_proj = NULL;
+    ctx->cuda_codec_ffn = NULL;
+    ctx->cuda_codec_kv_positions = 0u;
+    ctx->cuda_codec_kv_half = 0u;
+    ctx->cuda_codec_kv_base = 0u;
+    ctx->cuda_codec_enabled = 0;
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 0;
+    ctx->cuda_codec_pending = 0;
+}
+
+/* Allocate one compact device KV window plus reusable single-context
+ * activations. The shared gang scratch below is preferred whenever the server
+ * has more than one pending decoder, but the context-owned buffers keep the
+ * optional CUDA codec path correct for the lane/offline entry point too. */
+static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || ctx->state == NULL ||
+        !pocket_cuda_codec_requested(ctx->state) ||
+        ctx->codec_transformer == NULL) return 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_backend *backend = state->backend;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    if (backend == NULL || tc == NULL || cfg->codec_tf_layers == 0u ||
+        cfg->codec_tf_dim == 0u || cfg->codec_tf_heads == 0u ||
+        cfg->codec_tf_ffn == 0u || tc->context == 0u ||
+        tc->d_model != cfg->codec_tf_dim ||
+        tc->num_heads != cfg->codec_tf_heads ||
+        tc->head_dim != cfg->codec_tf_dim / cfg->codec_tf_heads ||
+        tc->num_layers != cfg->codec_tf_layers ||
+        tc->ffn_dim != cfg->codec_tf_ffn ||
+        tc->context != cfg->codec_tf_context ||
+        fabsf(tc->layernorm_eps - 1.0e-5f) > 1.0e-7f) return 0;
+    const size_t positions =
+        mynah_transformer_ar_state_kv_positions(ctx->codec_transformer);
+    const size_t half =
+        mynah_transformer_ar_state_kv_half_floats(ctx->codec_transformer);
+    size_t kv_floats = 0u;
+    size_t qkv_floats = 0u;
+    if (positions == 0u || half == 0u ||
+        pocket_mul(half, 2u, &kv_floats) != 0 ||
+        pocket_mul(cfg->codec_tf_dim, 3u, &qkv_floats) != 0) return 0;
+
+    char ignored[256];
+    ctx->cuda_codec_kv = (float **)calloc(cfg->codec_tf_layers,
+                                          sizeof(*ctx->cuda_codec_kv));
+    if (ctx->cuda_codec_kv == NULL) return 0;
+#define POCKET_CODEC_ALLOC(field, count)                                      \
+    do {                                                                       \
+        if (mynah_backend_dev_alloc(backend, (count), &(field), ignored,     \
+                                     sizeof(ignored)) != 0)                    \
+            goto fail;                                                         \
+    } while (0)
+    for (size_t l = 0; l < cfg->codec_tf_layers; ++l)
+        POCKET_CODEC_ALLOC(ctx->cuda_codec_kv[l], kv_floats);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_x, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_norm, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_qkv, qkv_floats);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_attn, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_proj, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_ffn, cfg->codec_tf_ffn);
+#undef POCKET_CODEC_ALLOC
+    ctx->cuda_codec_kv_positions = positions;
+    ctx->cuda_codec_kv_half = half;
+    ctx->cuda_codec_kv_base = 0u;
+    ctx->cuda_codec_enabled = 1;
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 0;
+    ctx->cuda_codec_pending = 0;
+    return 0;
+fail:
+    pocket_cuda_codec_release(ctx);
+    return 0;
+}
+
+static int pocket_cuda_codec_sync_host_window(mynah_engine_ctx *ctx,
+                                              char *error, size_t capacity);
+
+/* Compact the host Mimi cache before a device frame and upload it only when
+ * the sliding-window base changed. The host state remains authoritative for
+ * fallback; the device cache is a resident mirror of the same [K][V] window. */
+static int pocket_cuda_codec_prepare_window(mynah_engine_ctx *ctx,
+                                            size_t end_position, char *error,
+                                            size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_codec_enabled || ctx->codec_transformer == NULL)
+        return 1;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    if (tc == NULL) return -1;
+    const size_t offset =
+        mynah_transformer_ar_state_offset(ctx->codec_transformer);
+    const size_t expected_base =
+        offset >= tc->context ? offset - tc->context + 1u : 0u;
+    if (ctx->cuda_codec_valid && expected_base != ctx->cuda_codec_kv_base) {
+        /* The host cache is intentionally stale between frames.  Refresh it
+         * before transformer_ar compacts/rebases the host window, otherwise a
+         * later full H2D upload would put old device rows into new slots. */
+        char sync_error[256];
+        if (pocket_cuda_codec_sync_host_window(ctx, sync_error,
+                                               sizeof(sync_error)) != 0) {
+            pocket_error(error, capacity, "%s", sync_error);
+            return -1;
+        }
+    }
+    if (mynah_transformer_ar_state_prepare_window(ctx->codec_transformer,
+                                                   end_position) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA codec window cannot fit frame");
+        return -1;
+    }
+    const size_t base =
+        mynah_transformer_ar_state_kv_base(ctx->codec_transformer);
+    if (ctx->cuda_codec_valid && ctx->cuda_codec_kv_base == base) return 0;
+    const size_t half = ctx->cuda_codec_kv_half;
+    char local[256];
+    for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+        const float *host_k = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 0);
+        const float *host_v = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 1);
+        float *device = ctx->cuda_codec_kv[l];
+        if (host_k == NULL || host_v == NULL || device == NULL ||
+            mynah_backend_h2d(state->backend, host_k, device, half, local,
+                              sizeof(local)) != 0 ||
+            mynah_backend_h2d(state->backend, host_v, device + half, half, local,
+                              sizeof(local)) != 0) {
+            ctx->cuda_codec_valid = 0;
+            ctx->cuda_codec_needs_host_sync = 0;
+            return -1;
+        }
+    }
+    ctx->cuda_codec_kv_base = base;
+    ctx->cuda_codec_valid = 1;
+    ctx->cuda_codec_needs_host_sync = 0;
+    return 0;
+}
+
+/* Refresh the complete bounded KV window only at a rebase or a recoverable
+ * CUDA failure.  Keeping this off the normal frame path removes two D2H calls
+ * per layer per request while preserving the host transformer as a safe retry
+ * oracle. */
+static int pocket_cuda_codec_sync_host_window(mynah_engine_ctx *ctx, char *error,
+                                              size_t capacity) {
+    if (ctx == NULL || ctx->state == NULL || ctx->codec_transformer == NULL)
+        return -1;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    if (mynah_transformer_ar_state_kv_base(ctx->codec_transformer) !=
+        ctx->cuda_codec_kv_base) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA codec and host KV bases disagree");
+        return -1;
+    }
+    char local[256];
+    for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+        float *host_k = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 0);
+        float *host_v = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 1);
+        float *device = ctx->cuda_codec_kv[l];
+        if (host_k == NULL || host_v == NULL || device == NULL ||
+            mynah_backend_d2h(state->backend, device, host_k,
+                              ctx->cuda_codec_kv_half, local, sizeof(local)) != 0 ||
+            mynah_backend_d2h(state->backend, device + ctx->cuda_codec_kv_half,
+                              host_v, ctx->cuda_codec_kv_half, local,
+                              sizeof(local)) != 0)
+            return -1;
+    }
+    const int result = mynah_backend_sync(state->backend, local, sizeof(local));
+    if (result == 0) ctx->cuda_codec_needs_host_sync = 0;
+    return result;
+}
+
+/* One complete Mimi decoder-transformer frame on the resident CUDA stream.
+ * It is intentionally the same layer order as transformer_ar.c: the only
+ * host boundary is the 16-row input/output and the bounded K/V shadow needed
+ * for a safe CPU retry. */
+static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx, char *error,
+                                           size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_codec_enabled || ctx->state == NULL) return 1;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    const size_t stride = cfg->upsample_stride;
+    const size_t dim = cfg->codec_tf_dim;
+    size_t output_floats = 0u;
+    if (tc == NULL || stride == 0u || dim == 0u ||
+        ctx->cuda_codec_x == NULL || ctx->cuda_codec_norm == NULL ||
+        ctx->cuda_codec_qkv == NULL || ctx->cuda_codec_attn == NULL ||
+        ctx->cuda_codec_proj == NULL || ctx->cuda_codec_ffn == NULL ||
+        pocket_mul(stride, dim, &output_floats) != 0) return 1;
+    const size_t start = mynah_transformer_ar_state_offset(ctx->codec_transformer);
+    size_t end = 0u;
+    if (pocket_add(start, stride, &end) != 0 ||
+        pocket_cuda_codec_prepare_window(ctx, end, error, capacity) != 0) return 1;
+    char local[256];
+    char drain[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    for (size_t t = 0; t < stride; ++t) {
+        const size_t absolute = start + t;
+        const size_t relative = absolute - ctx->cuda_codec_kv_base;
+        const size_t window_absolute =
+            absolute >= tc->context ? absolute - tc->context + 1u : 0u;
+        if (window_absolute < ctx->cuda_codec_kv_base ||
+            window_absolute > absolute || relative >= ctx->cuda_codec_kv_positions)
+            goto fail_region;
+        const size_t window_slot = window_absolute - ctx->cuda_codec_kv_base;
+        const size_t attention_position = relative - window_slot;
+        if (mynah_backend_h2d(state->backend, ctx->codec_seq + t * dim,
+                              ctx->cuda_codec_x, dim, local, sizeof(local)) != 0)
+            goto fail_region;
+        for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+            const mynah_transformer_ar_layer *layer = &state->codec_layers[l];
+            float *device = ctx->cuda_codec_kv[l];
+            if (mynah_backend_layer_norm_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_norm,
+                    layer->norm1_weight, layer->norm1_bias, 1u, dim, local,
+                    sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, ctx->cuda_codec_norm, ctx->cuda_codec_qkv,
+                    1u, dim, 3u * dim, layer->in_proj_weight,
+                    layer->in_proj_bias, local, sizeof(local)) != 0 ||
+                mynah_backend_rope_dev(state->backend, ctx->cuda_codec_qkv,
+                                       absolute, cfg->codec_tf_heads,
+                                       dim / cfg->codec_tf_heads, tc->max_period,
+                                       local, sizeof(local)) != 0 ||
+                mynah_backend_self_attention_dev(
+                    state->backend, ctx->cuda_codec_qkv,
+                    device + window_slot * dim,
+                    device + ctx->cuda_codec_kv_half + window_slot * dim,
+                    attention_position, dim, attention_position + 1u,
+                    cfg->codec_tf_heads,
+                    dim / cfg->codec_tf_heads,
+                    1.0f / sqrtf((float)(dim / cfg->codec_tf_heads)),
+                    ctx->cuda_codec_attn, local, sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, ctx->cuda_codec_attn, ctx->cuda_codec_proj,
+                    1u, dim, dim, layer->out_proj_weight, layer->out_proj_bias,
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_add_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_proj,
+                    layer->layer_scale_1, dim, local, sizeof(local)) != 0 ||
+                mynah_backend_layer_norm_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_norm,
+                    layer->norm2_weight, layer->norm2_bias, 1u, dim, local,
+                    sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, ctx->cuda_codec_norm, ctx->cuda_codec_ffn,
+                    1u, dim, cfg->codec_tf_ffn, layer->linear1_weight,
+                    layer->linear1_bias, local, sizeof(local)) != 0 ||
+                mynah_backend_gelu_dev(state->backend, ctx->cuda_codec_ffn,
+                                       cfg->codec_tf_ffn, local, sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, ctx->cuda_codec_ffn, ctx->cuda_codec_proj,
+                    1u, cfg->codec_tf_ffn, dim, layer->linear2_weight,
+                    layer->linear2_bias, local, sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_add_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_proj,
+                    layer->layer_scale_2, dim, local, sizeof(local)) != 0)
+                goto fail_region;
+        }
+        if (mynah_backend_d2h(state->backend, ctx->cuda_codec_x,
+                              ctx->codec_out + t * dim, dim, local,
+                              sizeof(local)) != 0)
+            goto fail_region;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (mynah_backend_sync(state->backend, local, sizeof(local)) != 0 ||
+        !pocket_all_finite(ctx->codec_out, output_floats)) goto fail;
+    if (mynah_transformer_ar_state_set_offset(ctx->codec_transformer, end, local,
+                                              sizeof(local)) != 0)
+        goto fail;
+    ctx->cuda_codec_pending = 0;
+    return 0;
+
+fail_region:
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+fail:
+    (void)mynah_backend_sync(state->backend, drain, sizeof(drain));
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 1;
+    /* Leave the marker set so a frame-major caller can run the untouched CPU
+     * tile. The direct compatibility wrapper clears it before that fallback. */
+    ctx->cuda_codec_pending = 1;
+    /* Returning 1 asks the caller to run the untouched host transformer. */
+    return 1;
 }
 
 #define POCKET_CUDA_DECODER_GRAPH_KEY ((size_t)0x200000u)
@@ -4419,6 +4778,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     pocket_dump_flush(ctx);
     pocket_dump_free(ctx->dump);
     pocket_cuda_backbone_release(ctx);
+    pocket_cuda_codec_release(ctx);
     pocket_cuda_decoder_release(ctx);
     pocket_call_release(&ctx->backbone_call.call);
     pocket_call_release(&ctx->codec_call.call);
@@ -4797,6 +5157,7 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
      * optional resident path cannot reserve them, the context remains a valid
      * CPU context and the backend contract's safe fallback is preserved. */
     (void)pocket_cuda_backbone_alloc(ctx);
+    (void)pocket_cuda_codec_alloc(ctx);
     (void)pocket_cuda_decoder_alloc(ctx);
 
     /* Set last, so the failure paths above (which call `_ctx_free`) cannot
@@ -4925,6 +5286,9 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
      * re-uploaded lazily before the next CUDA step, after voice/text prefill
      * has rebuilt every valid host position. */
     ctx->cuda_backbone_valid = 0;
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 0;
+    ctx->cuda_codec_pending = 0;
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
     ctx->spare = 0.0f;
@@ -5562,11 +5926,58 @@ static void pocket_truncate(mynah_engine_ctx *ctx, size_t frame_count) {
  * ring buffers, the decoder transformer's KV, the position counter -- so the
  * order in which contexts are visited cannot reach any of the numbers.
  */
-/* Prepare the host-owned portion of one codec frame.  Decoder submission is
+static int pocket_decode_frame_transform_cpu(mynah_engine_ctx *ctx, char *error,
+                                             size_t capacity) {
+    const int depth = mynah_region_depth();
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (mynah_transformer_ar_prefill(ctx->codec_transformer, &ctx->codec_w,
+                                     ctx->codec_seq,
+                                     ctx->state->cfg.upsample_stride,
+                                     ctx->codec_out) != 0) {
+        mynah_region_unwind(depth);
+        pocket_error(error, capacity, "pocket: the decoder transformer failed");
+        return -1;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    return 0;
+}
+
+static int pocket_decode_frame_transform_finish(mynah_engine_ctx *ctx,
+                                                char *error, size_t capacity) {
+    const pocket_config *cfg = &ctx->state->cfg;
+    const size_t stride = cfg->upsample_stride;
+    const size_t dim = cfg->codec_dim;
+    size_t output_floats = 0u;
+    if (pocket_mul(stride, dim, &output_floats) != 0) {
+        pocket_error(error, capacity, "pocket: decoder transformer output size overflow");
+        return -1;
+    }
+    for (size_t t = 0; t < stride; ++t) {
+        for (size_t c = 0; c < dim; ++c)
+            ctx->codec_back[c * stride + t] = ctx->codec_out[t * dim + c];
+    }
+    if (!pocket_all_finite(ctx->codec_out, output_floats)) {
+        pocket_error(error, capacity, "pocket: decoder transformer produced non-finite values");
+        return -1;
+    }
+    if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
+        const size_t slot = ctx->dump->decoded;
+        memcpy(ctx->dump->denorm + slot * cfg->latent_dim, ctx->denorm,
+               cfg->latent_dim * sizeof(float));
+        memcpy(ctx->dump->codec_tf + slot * ctx->dump->codec_row, ctx->codec_out,
+               ctx->dump->codec_row * sizeof(float));
+    }
+    return 0;
+}
+
+/* Prepare the host-owned portion of one codec frame. Decoder submission is
  * deliberately outside this helper so a gang can prepare every context before
- * it queues any D2H or synchronization work. */
+ * it queues any D2H or synchronization work. `defer_cuda` is set only by the
+ * frame-major gang; the single/offline path runs the same resident transformer
+ * immediately. */
 static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
-                                       char *error, size_t capacity) {
+                                       int defer_cuda, char *error,
+                                       size_t capacity) {
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
     const size_t stride = cfg->upsample_stride;
@@ -5597,7 +6008,6 @@ static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
     /* The decoder transformer runs at the encoder frame rate and its inner
      * layers see [positions, channels]; the transpose belongs here, at the
      * same place the reference puts it. */
-    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
     for (size_t c = 0; c < dim; ++c) {
         for (size_t t = 0; t < stride; ++t) {
             ctx->codec_seq[t * dim + c] = ctx->codec_up[c * stride + t];
@@ -5615,26 +6025,22 @@ static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
                      mynah_transformer_ar_state_offset(ctx->codec_transformer));
         return -1;
     }
-    if (mynah_transformer_ar_prefill(ctx->codec_transformer, &ctx->codec_w,
-                                     ctx->codec_seq, stride, ctx->codec_out) != 0) {
-        mynah_region_unwind(depth);
-        pocket_error(error, capacity, "pocket: the decoder transformer failed");
-        return -1;
+    if (ctx->cuda_codec_enabled) {
+        ctx->cuda_codec_pending = 1;
+        if (defer_cuda) return 0;
+        if (pocket_cuda_codec_transform_one(ctx, error, capacity) == 0)
+            return pocket_decode_frame_transform_finish(ctx, error, capacity);
+        /* The resident attempt did not advance the host offset. Disable this
+         * context's device mirror after restoring its bounded KV mirror, then
+         * run the exact CPU oracle below. */
+        if (ctx->cuda_codec_needs_host_sync &&
+            pocket_cuda_codec_sync_host_window(ctx, error, capacity) != 0)
+            return -1;
+        ctx->cuda_codec_enabled = 0;
     }
-    for (size_t t = 0; t < stride; ++t) {
-        for (size_t c = 0; c < dim; ++c) {
-            ctx->codec_back[c * stride + t] = ctx->codec_out[t * dim + c];
-        }
-    }
-    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
-    if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
-        const size_t slot = ctx->dump->decoded;
-        memcpy(ctx->dump->denorm + slot * cfg->latent_dim, ctx->denorm,
-               cfg->latent_dim * sizeof(float));
-        memcpy(ctx->dump->codec_tf + slot * ctx->dump->codec_row, ctx->codec_out,
-               ctx->dump->codec_row * sizeof(float));
-    }
-    return 0;
+    ctx->cuda_codec_pending = 0;
+    if (pocket_decode_frame_transform_cpu(ctx, error, capacity) != 0) return -1;
+    return pocket_decode_frame_transform_finish(ctx, error, capacity);
 }
 
 /* Finish the common host-side state transition after either a CPU decoder or
@@ -5673,7 +6079,7 @@ static int pocket_decode_frame_finish(mynah_engine_ctx *ctx, int cuda_decode,
 static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
                                size_t capacity) {
     const int depth = mynah_region_depth();
-    if (pocket_decode_frame_prepare(ctx, frame, error, capacity) != 0) {
+    if (pocket_decode_frame_prepare(ctx, frame, 0, error, capacity) != 0) {
         mynah_region_unwind(depth);
         return -1;
     }
@@ -5798,20 +6204,12 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
  * ## Frame-major, and what that is and is not worth
  *
  * The gang is walked frame index by frame index, all contexts at each index,
- * rather than context by context. That is NOT a performance claim: the codec
- * transformer and the SEANet stack are still one pass over their own weights
- * per context per frame, exactly as before, and nothing here was benchmarked
- * (this machine compiles for correctness only). Frame-major is chosen because
- * it is the schedule a shared pass would need, and adopting it now means the
- * step that actually shares work is local to this function instead of a
- * restructuring of it.
- *
- * What blocks true cross-request arithmetic is named rather than implied: the
- * 41.8% item is the decoder transformer, and sharing it across contexts needs
- * a cross-request PREFILL in `transformer_ar` -- `_step_batch` takes one
- * position per state, while a codec frame is `upsample_stride` consecutive
- * positions of one state. The resident SEANet gang below is therefore a
- * launch/overlap slice, not a claim that the decoder is already a Bx kernel.
+ * rather than context by context. The Mimi decoder-transformer tile now uses
+ * a true cross-request CUDA batch: each request contributes
+ * `upsample_stride` consecutive positions, with independent absolute RoPE and
+ * compact KV windows. SEANet still has per-request causal state and the
+ * quantizer/upsample boundary remains host-side, so this is not yet a claim
+ * that the complete decoder is a single fused Bx kernel.
  *
  * ## Blast radius
  *
@@ -5845,16 +6243,217 @@ static void pocket_decode_batch_drop(mynah_engine_ctx *ctx, size_t index,
     }
 }
 
+/* Run one frame's consecutive codec positions as a true cross-request batch.
+ * The decoder transformer is a prefill tile, not a one-token AR step: each
+ * request contributes `upsample_stride` positions, while its KV window and
+ * absolute RoPE positions remain independent. */
+static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
+                                              size_t count,
+                                              mynah_engine_scratch *scratch,
+                                              char *error, size_t capacity) {
+    if (ctxs == NULL || count == 0u) return 0;
+    if (count == 1u)
+        return pocket_cuda_codec_transform_one(ctxs[0], error, capacity);
+    if (scratch == NULL || !scratch->cuda_codec_enabled ||
+        scratch->cuda_codec_x == NULL || scratch->cuda_codec_norm == NULL ||
+        scratch->cuda_codec_qkv == NULL || scratch->cuda_codec_attn == NULL ||
+        scratch->cuda_codec_proj == NULL || scratch->cuda_codec_ffn == NULL ||
+        scratch->cuda_codec_host_input == NULL ||
+        scratch->cuda_codec_host_output == NULL ||
+        scratch->cuda_codec_abs_positions == NULL ||
+        scratch->cuda_positions == NULL || scratch->cuda_kcache == NULL ||
+        scratch->cuda_vcache == NULL || count > scratch->cuda_batch_capacity) {
+        int failed = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i] == NULL || !ctxs[i]->cuda_codec_pending) continue;
+            if (pocket_cuda_codec_transform_one(ctxs[i], error, capacity) != 0)
+                failed = 1;
+        }
+        return failed;
+    }
+    const mynah_engine_state *state = ctxs[0]->state;
+    if (state == NULL || state->backend == NULL ||
+        strcmp(mynah_backend_name(state->backend), "cuda") != 0) return 1;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctxs[0]->codec_transformer);
+    const size_t stride = cfg->upsample_stride;
+    const size_t dim = cfg->codec_tf_dim;
+    if (tc == NULL || stride == 0u || dim == 0u || count > POCKET_MAX_BATCH)
+        return 1;
+
+    size_t rows = 0u;
+    if (pocket_mul(count, dim, &rows) != 0) return 1;
+    size_t ffn_rows = 0u;
+    if (pocket_mul(count, cfg->codec_tf_ffn, &ffn_rows) != 0) return 1;
+    size_t output_floats = 0u;
+    if (pocket_mul(stride, dim, &output_floats) != 0) return 1;
+    size_t starts[POCKET_MAX_BATCH];
+    size_t bases[POCKET_MAX_BATCH];
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || !ctx->cuda_codec_pending ||
+            !ctx->cuda_codec_enabled || ctx->cuda_codec_kv == NULL ||
+            ctx->cuda_codec_kv_positions == 0u ||
+            ctx->cuda_codec_kv_half == 0u) return 1;
+        const mynah_transformer_ar_config *other =
+            mynah_transformer_ar_state_config(ctx->codec_transformer);
+        if (other == NULL || other->d_model != tc->d_model ||
+            other->num_heads != tc->num_heads ||
+            other->head_dim != tc->head_dim ||
+            other->num_layers != tc->num_layers ||
+            other->ffn_dim != tc->ffn_dim || other->context != tc->context ||
+            other->max_period != tc->max_period ||
+            other->layernorm_eps != tc->layernorm_eps) return 1;
+        starts[i] = mynah_transformer_ar_state_offset(ctx->codec_transformer);
+        size_t end = 0u;
+        if (pocket_add(starts[i], stride, &end) != 0 ||
+            pocket_cuda_codec_prepare_window(ctx, end, error, capacity) != 0)
+            return 1;
+        bases[i] = ctx->cuda_codec_kv_base;
+    }
+
+    char local[256];
+    char drain[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    for (size_t t = 0; t < stride; ++t) {
+        for (size_t i = 0; i < count; ++i) {
+            const size_t absolute = starts[i] + t;
+            const size_t window_absolute =
+                absolute >= tc->context ? absolute - tc->context + 1u : 0u;
+            if (absolute < bases[i] || window_absolute < bases[i] ||
+                window_absolute > absolute ||
+                absolute - bases[i] >= ctxs[i]->cuda_codec_kv_positions)
+                goto fail_region;
+            const size_t window_slot = window_absolute - bases[i];
+            memcpy(scratch->cuda_codec_host_input + i * dim,
+                   ctxs[i]->codec_seq + t * dim, dim * sizeof(float));
+            scratch->cuda_codec_abs_positions[i] = absolute;
+            scratch->cuda_positions[i] = absolute - bases[i] - window_slot;
+            scratch->cuda_cache_strides[i] = dim;
+        }
+        if (mynah_backend_h2d(state->backend, scratch->cuda_codec_host_input,
+                              scratch->cuda_codec_x, rows, local,
+                              sizeof(local)) != 0)
+            goto fail_region;
+        for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+            const mynah_transformer_ar_layer *layer = &state->codec_layers[l];
+            for (size_t i = 0; i < count; ++i) {
+                float *device = ctxs[i]->cuda_codec_kv[l];
+                const size_t metadata = l * scratch->cuda_batch_capacity + i;
+                const size_t absolute = starts[i] + t;
+                const size_t window_absolute =
+                    absolute >= tc->context ? absolute - tc->context + 1u : 0u;
+                const size_t window_slot = window_absolute - bases[i];
+                scratch->cuda_kcache[metadata] = device + window_slot * dim;
+                scratch->cuda_vcache[metadata] =
+                    device + ctxs[i]->cuda_codec_kv_half + window_slot * dim;
+            }
+            if (mynah_backend_layer_norm_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_norm, layer->norm1_weight,
+                    layer->norm1_bias, count, dim, local, sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, scratch->cuda_codec_norm,
+                    scratch->cuda_codec_qkv, count, dim, 3u * dim,
+                    layer->in_proj_weight, layer->in_proj_bias, local,
+                    sizeof(local)) != 0 ||
+                mynah_backend_rope_batch_dev(
+                    state->backend, scratch->cuda_codec_qkv,
+                    scratch->cuda_codec_abs_positions, count,
+                    cfg->codec_tf_heads, dim / cfg->codec_tf_heads,
+                    tc->max_period, local, sizeof(local)) != 0 ||
+                mynah_backend_self_attention_batch_dev(
+                    state->backend, scratch->cuda_codec_qkv,
+                    scratch->cuda_kcache + l * scratch->cuda_batch_capacity,
+                    scratch->cuda_vcache + l * scratch->cuda_batch_capacity,
+                    scratch->cuda_positions, scratch->cuda_cache_strides,
+                    count, cfg->codec_tf_heads, dim / cfg->codec_tf_heads,
+                    1.0f / sqrtf((float)(dim / cfg->codec_tf_heads)),
+                    scratch->cuda_codec_attn, local, sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, scratch->cuda_codec_attn,
+                    scratch->cuda_codec_proj, count, dim, dim,
+                    layer->out_proj_weight, layer->out_proj_bias, local,
+                    sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_rows_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_proj, layer->layer_scale_1, rows,
+                    dim, local, sizeof(local)) != 0 ||
+                mynah_backend_layer_norm_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_norm, layer->norm2_weight,
+                    layer->norm2_bias, count, dim, local, sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, scratch->cuda_codec_norm,
+                    scratch->cuda_codec_ffn, count, dim, cfg->codec_tf_ffn,
+                    layer->linear1_weight, layer->linear1_bias, local,
+                    sizeof(local)) != 0 ||
+                mynah_backend_gelu_dev(state->backend, scratch->cuda_codec_ffn,
+                                       ffn_rows, local, sizeof(local)) != 0 ||
+                mynah_backend_matmul_d2d(
+                    state->backend, scratch->cuda_codec_ffn,
+                    scratch->cuda_codec_proj, count, cfg->codec_tf_ffn, dim,
+                    layer->linear2_weight, layer->linear2_bias, local,
+                    sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_rows_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_proj, layer->layer_scale_2, rows,
+                    dim, local, sizeof(local)) != 0)
+                goto fail_region;
+        }
+        if (mynah_backend_d2h(state->backend, scratch->cuda_codec_x,
+                              scratch->cuda_codec_host_output + t * rows, rows,
+                              local,
+                              sizeof(local)) != 0)
+            goto fail_region;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (mynah_backend_sync(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    for (size_t i = 0; i < count; ++i) {
+        /* The staged D2H for the last tile is complete only after the stream
+         * drain above; copying it earlier would race pageable host state. */
+        for (size_t t = 0; t < stride; ++t)
+            memcpy(ctxs[i]->codec_out + t * dim,
+                   scratch->cuda_codec_host_output + t * rows + i * dim,
+                   dim * sizeof(float));
+        if (!pocket_all_finite(ctxs[i]->codec_out, output_floats)) goto fail;
+        size_t end = 0u;
+        if (pocket_add(starts[i], stride, &end) != 0 ||
+            mynah_transformer_ar_state_set_offset(
+                ctxs[i]->codec_transformer, end, local, sizeof(local)) != 0)
+            goto fail;
+        ctxs[i]->cuda_codec_pending = 0;
+    }
+    (void)mynah_backend_note_codec_transformer_batch(
+        state->backend, count, stride);
+    return 0;
+
+fail_region:
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+fail:
+    (void)mynah_backend_sync(state->backend, drain, sizeof(drain));
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i] != NULL) {
+            ctxs[i]->cuda_codec_valid = 0;
+            ctxs[i]->cuda_codec_needs_host_sync = 1;
+        }
+    }
+    return 1;
+}
+
 static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
                                      const size_t *first_frame,
                                      const size_t *frame_count, float **out_samples,
                                      size_t *out_count, int *failed,
                                      mynah_engine_scratch *scratch, char *error,
                                      size_t capacity) {
-    /* The driver owns the arrays and pre-clears them; nothing in `scratch` is
-     * needed while the codec is per context, and nothing here keeps a pointer
-     * into any of them. */
-    (void)scratch;
+    /* The driver owns the arrays and pre-clears them; scratch is shared only
+     * for the resident CUDA codec gang and never retains request ownership. */
     if (ctxs == NULL || first_frame == NULL || frame_count == NULL ||
         out_samples == NULL || out_count == NULL || failed == NULL) {
         pocket_error(error, capacity, "pocket: null argument decoding a gang");
@@ -5968,7 +6567,7 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
             for (size_t i = 0; i < count; ++i) {
                 if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
                 one_error[0] = '\0';
-                if (pocket_decode_frame_prepare(ctxs[i], first_frame[i] + f,
+                if (pocket_decode_frame_prepare(ctxs[i], first_frame[i] + f, 1,
                                                 one_error, sizeof(one_error)) != 0) {
                     pocket_decode_batch_drop(ctxs[i], i, out_samples, out_count,
                                              failed, &reported, one_error,
@@ -5976,6 +6575,62 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                     continue;
                 }
                 prepared[i] = 1;
+            }
+
+            /* All host-side frame preparation is complete. Run the pending
+             * codec-transformer tiles together; contexts that cannot use the
+             * optional resident path fall back to the same CPU tile before
+             * any decoder submission observes codec_back. */
+            mynah_engine_ctx *codec_pending[POCKET_MAX_BATCH];
+            size_t codec_count = 0u;
+            for (size_t i = 0; i < count; ++i) {
+                if (prepared[i] && !failed[i] &&
+                    ctxs[i]->cuda_codec_pending)
+                    codec_pending[codec_count++] = ctxs[i];
+            }
+            if (codec_count > 0u) {
+                char codec_error[256];
+                codec_error[0] = '\0';
+                (void)pocket_cuda_codec_transform_batch(
+                    codec_pending, codec_count, scratch, codec_error,
+                    sizeof(codec_error));
+                for (size_t p = 0; p < codec_count; ++p) {
+                    mynah_engine_ctx *ctx = codec_pending[p];
+                    if (ctx->cuda_codec_pending) {
+                        int host_sync = 0;
+                        if (ctx->cuda_codec_needs_host_sync) {
+                            host_sync = pocket_cuda_codec_sync_host_window(
+                                ctx, codec_error, sizeof(codec_error));
+                        }
+                        ctx->cuda_codec_pending = 0;
+                        ctx->cuda_codec_enabled = 0;
+                        if (host_sync != 0 ||
+                            pocket_decode_frame_transform_cpu(
+                                ctx, codec_error, sizeof(codec_error)) != 0 ||
+                            pocket_decode_frame_transform_finish(
+                                ctx, codec_error, sizeof(codec_error)) != 0) {
+                            size_t failed_index = 0u;
+                            for (size_t i = 0; i < count; ++i) {
+                                if (ctxs[i] == ctx) {
+                                    failed_index = i;
+                                    break;
+                                }
+                            }
+                            pocket_decode_batch_drop(
+                                ctx, failed_index, out_samples, out_count, failed,
+                                &reported, codec_error, error, capacity);
+                        }
+                    } else if (pocket_decode_frame_transform_finish(
+                                   ctx, codec_error, sizeof(codec_error)) != 0) {
+                        for (size_t i = 0; i < count; ++i) {
+                            if (ctxs[i] != ctx) continue;
+                            pocket_decode_batch_drop(
+                                ctx, i, out_samples, out_count, failed,
+                                &reported, codec_error, error, capacity);
+                            break;
+                        }
+                    }
+                }
             }
 
             for (size_t i = 0; i < count; ++i) {
@@ -6101,6 +6756,37 @@ static void pocket_host_free_bytes(const mynah_backend *backend, void *ptr) {
         mynah_backend_host_free(backend, (float *)ptr);
 }
 
+static void pocket_cuda_codec_scratch_release(mynah_engine_scratch *scratch) {
+    if (scratch == NULL) return;
+    const mynah_backend *backend = scratch->backend;
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, scratch->cuda_codec_x);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_norm);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_qkv);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_attn);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_proj);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_ffn);
+        mynah_backend_host_free(backend, scratch->cuda_codec_host_input);
+        mynah_backend_host_free(backend, scratch->cuda_codec_host_output);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_abs_positions);
+    } else {
+        free(scratch->cuda_codec_host_input);
+        free(scratch->cuda_codec_host_output);
+        free(scratch->cuda_codec_abs_positions);
+    }
+    scratch->cuda_codec_host_input = NULL;
+    scratch->cuda_codec_host_output = NULL;
+    scratch->cuda_codec_x = NULL;
+    scratch->cuda_codec_norm = NULL;
+    scratch->cuda_codec_qkv = NULL;
+    scratch->cuda_codec_attn = NULL;
+    scratch->cuda_codec_proj = NULL;
+    scratch->cuda_codec_ffn = NULL;
+    scratch->cuda_codec_abs_positions = NULL;
+    scratch->cuda_codec_batch_capacity = 0u;
+    scratch->cuda_codec_enabled = 0;
+}
+
 static void pocket_cuda_flow_release(mynah_engine_scratch *scratch) {
     if (scratch == NULL) return;
     const mynah_backend *backend = scratch->backend;
@@ -6172,6 +6858,7 @@ static void pocket_cuda_flow_release(mynah_engine_scratch *scratch) {
 
 static void pocket_scratch_free(mynah_engine_scratch *scratch) {
     if (scratch == NULL) return;
+    pocket_cuda_codec_scratch_release(scratch);
     if (scratch->backend != NULL) {
         mynah_backend_graph_forget(scratch->backend, scratch);
         pocket_cuda_flow_release(scratch);
@@ -6243,7 +6930,7 @@ static int pocket_scratch_new(const mynah_tts_model *model,
     }
     scratch->batch = batch;
     scratch->backend = state->backend;
-    if (batch == 1u) {
+    if (batch == 1u && !pocket_cuda_resident_requested(state)) {
         /* Nothing to share: a one-slot driver keeps the single-step path. */
         *out = scratch;
         return 0;
@@ -6254,9 +6941,11 @@ static int pocket_scratch_new(const mynah_tts_model *model,
     size_t qkv_width = 0u;
     size_t kv_metadata = 0u;
     size_t kv_shadow_floats = 0u;
+    size_t metadata_layers = cfg->layers;
+    if (cfg->codec_tf_layers > metadata_layers) metadata_layers = cfg->codec_tf_layers;
     if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
         pocket_mul(attn_dim, 3u, &qkv_width) != 0 ||
-        pocket_mul(batch, cfg->layers, &kv_metadata) != 0 ||
+        pocket_mul(batch, metadata_layers, &kv_metadata) != 0 ||
         pocket_mul(batch, cfg->layers, &kv_shadow_floats) != 0 ||
         pocket_mul(kv_shadow_floats, 2u, &kv_shadow_floats) != 0 ||
         pocket_mul(kv_shadow_floats, attn_dim, &kv_shadow_floats) != 0) {
@@ -6336,6 +7025,60 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                         batch * sizeof(*scratch->cuda_cache_strides),
                         (void **)&scratch->cuda_cache_strides, ignored,
                         sizeof(ignored)) != 0;
+            }
+            if (!device_failed && pocket_cuda_codec_requested(state)) {
+                int codec_failed = 0;
+                size_t codec_rows = 0u;
+                size_t codec_output = 0u;
+                size_t codec_qkv = 0u;
+                size_t codec_ffn = 0u;
+                if (pocket_mul(batch, cfg->codec_tf_dim, &codec_rows) != 0 ||
+                    pocket_mul(codec_rows, cfg->upsample_stride, &codec_output) != 0 ||
+                    pocket_mul(codec_rows, 3u, &codec_qkv) != 0 ||
+                    pocket_mul(batch, cfg->codec_tf_ffn, &codec_ffn) != 0) {
+                    codec_failed = 1;
+                }
+                if (!codec_failed &&
+                    mynah_backend_host_alloc(state->backend, codec_rows,
+                                             &scratch->cuda_codec_host_input,
+                                             ignored, sizeof(ignored)) != 0)
+                    codec_failed = 1;
+                if (!codec_failed &&
+                    mynah_backend_host_alloc(state->backend, codec_output,
+                                             &scratch->cuda_codec_host_output,
+                                             ignored, sizeof(ignored)) != 0)
+                    codec_failed = 1;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, batch * sizeof(size_t),
+                            (void **)&scratch->cuda_codec_abs_positions,
+                            ignored, sizeof(ignored)) != 0;
+#define POCKET_CUDA_CODEC_ALLOC(field, count)                                 \
+                do {                                                           \
+                    if (!codec_failed &&                                     \
+                        mynah_backend_dev_alloc(state->backend, (count),      \
+                                                &(field), ignored,              \
+                                                sizeof(ignored)) != 0)          \
+                        codec_failed = 1;                                     \
+                } while (0)
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_x,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_norm,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_qkv, codec_qkv);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_attn,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_proj,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_ffn, codec_ffn);
+#undef POCKET_CUDA_CODEC_ALLOC
+                if (codec_failed) {
+                    pocket_cuda_codec_scratch_release(scratch);
+                } else {
+                    scratch->cuda_codec_batch_capacity = batch;
+                    scratch->cuda_codec_enabled = 1;
+                }
             }
             int flow_failed = 0;
             size_t flow_freq_width = 0u;

@@ -43,6 +43,7 @@ struct mynah_backend {
     int (*decoder_note_step)(void *, mynah_backend_decoder *);
     int (*decoder_note_batch)(void *, size_t, size_t);
     int (*backbone_note_batch)(void *, size_t);
+    int (*codec_transformer_note_batch)(void *, size_t, size_t);
     int (*metrics_get)(void *, mynah_tts_backend_metrics *);
     /* Device-side ops (NULL = CPU fallback in backend.c). */
     int (*upload)(void *, const float *, size_t, float **, char *, size_t);
@@ -60,6 +61,8 @@ struct mynah_backend {
     int (*layer_norm_dev)(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
     int (*softmax_dev)(void *, float *, size_t, size_t, size_t, char *, size_t);
     int (*residual_add_dev)(void *, float *, const float *, size_t, char *, size_t);
+    int (*scaled_residual_add_dev)(void *, float *, const float *, const float *, size_t, char *, size_t);
+    int (*scaled_residual_rows_dev)(void *, float *, const float *, const float *, size_t, size_t, char *, size_t);
     int (*matmul_dev)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*sgemm_dev)(void *, int, int, size_t, size_t, size_t, float, const float *, size_t, const float *, size_t, float, float *, size_t, char *, size_t);
     int (*dev_alloc)(void *, size_t, float **, char *, size_t);
@@ -149,6 +152,8 @@ extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_layer_norm_dev(void *, const float *, float *, const float *, const float *, size_t, size_t, char *, size_t);
 extern int mynah_cuda_softmax_dev(void *, float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_residual_add_dev(void *, float *, const float *, size_t, char *, size_t);
+extern int mynah_cuda_scaled_residual_add_dev(void *, float *, const float *, const float *, size_t, char *, size_t);
+extern int mynah_cuda_scaled_residual_rows_dev(void *, float *, const float *, const float *, size_t, size_t, char *, size_t);
 extern int mynah_cuda_matmul_dev(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 extern int mynah_cuda_sgemm_dev(void *, int, int, size_t, size_t, size_t, float, const float *, size_t, const float *, size_t, float, float *, size_t, char *, size_t);
 extern int mynah_cuda_dev_alloc(void *, size_t, float **, char *, size_t);
@@ -190,6 +195,7 @@ extern int mynah_cuda_decoder_step(void *, mynah_backend_decoder *, const float 
 extern int mynah_cuda_decoder_note_step(void *, mynah_backend_decoder *);
 extern int mynah_cuda_decoder_note_batch(void *, size_t, size_t);
 extern int mynah_cuda_note_backbone_batch(void *, size_t);
+extern int mynah_cuda_note_codec_transformer_batch(void *, size_t, size_t);
 extern int mynah_cuda_metrics_get(void *, mynah_tts_backend_metrics *);
 #endif
 
@@ -636,6 +642,8 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->layer_norm_dev = mynah_cuda_layer_norm_dev;
         backend->softmax_dev = mynah_cuda_softmax_dev;
         backend->residual_add_dev = mynah_cuda_residual_add_dev;
+        backend->scaled_residual_add_dev = mynah_cuda_scaled_residual_add_dev;
+        backend->scaled_residual_rows_dev = mynah_cuda_scaled_residual_rows_dev;
         backend->matmul_dev = mynah_cuda_matmul_dev;
         backend->sgemm_dev = mynah_cuda_sgemm_dev;
         backend->dev_alloc = mynah_cuda_dev_alloc;
@@ -674,6 +682,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->decoder_note_step = mynah_cuda_decoder_note_step;
         backend->decoder_note_batch = mynah_cuda_decoder_note_batch;
         backend->backbone_note_batch = mynah_cuda_note_backbone_batch;
+        backend->codec_transformer_note_batch = mynah_cuda_note_codec_transformer_batch;
         backend->metrics_get = mynah_cuda_metrics_get;
 #else
         free(backend);
@@ -816,6 +825,14 @@ int mynah_backend_note_backbone_batch(const mynah_backend *backend,
     if (backend == NULL || items == 0u || backend->backbone_note_batch == NULL)
         return 0;
     return backend->backbone_note_batch(backend->state, items);
+}
+
+int mynah_backend_note_codec_transformer_batch(const mynah_backend *backend,
+                                               size_t items, size_t width) {
+    if (backend == NULL || items == 0u || width == 0u ||
+        backend->codec_transformer_note_batch == NULL)
+        return 0;
+    return backend->codec_transformer_note_batch(backend->state, items, width);
 }
 
 int mynah_backend_metrics_get(const mynah_backend *backend,
@@ -971,6 +988,53 @@ int mynah_backend_residual_add_dev(const mynah_backend *backend,
         return backend->residual_add_dev(backend->state, dev_out, dev_in, n,
                                          error, error_capacity);
     mynah_residual_add_f32(dev_out, dev_in, n);
+    return 0;
+}
+
+int mynah_backend_scaled_residual_add_dev(const mynah_backend *backend,
+                                          float *dev_out, const float *dev_in,
+                                          const float *scale, size_t n,
+                                          char *error, size_t error_capacity) {
+    if (backend == NULL || dev_out == NULL || dev_in == NULL || scale == NULL ||
+        n == 0u) {
+        set_error(error, error_capacity, "invalid scaled residual request");
+        return -1;
+    }
+    if (backend->scaled_residual_add_dev != NULL)
+        return backend->scaled_residual_add_dev(backend->state, dev_out, dev_in,
+                                                scale, n, error, error_capacity);
+    if (backend->device != MYNAH_TTS_DEVICE_CPU) {
+        set_error(error, error_capacity,
+                  "scaled residual is unavailable on this device backend");
+        return -1;
+    }
+    for (size_t i = 0; i < n; ++i) dev_out[i] += scale[i] * dev_in[i];
+    return 0;
+}
+
+int mynah_backend_scaled_residual_rows_dev(const mynah_backend *backend,
+                                           float *dev_out, const float *dev_in,
+                                           const float *scale, size_t rows,
+                                           size_t width, char *error,
+                                           size_t error_capacity) {
+    if (backend == NULL || dev_out == NULL || dev_in == NULL || scale == NULL ||
+        rows == 0u || width == 0u) {
+        set_error(error, error_capacity, "invalid row-wise scaled residual request");
+        return -1;
+    }
+    if (backend->scaled_residual_rows_dev != NULL)
+        return backend->scaled_residual_rows_dev(
+            backend->state, dev_out, dev_in, scale, rows, width, error,
+            error_capacity);
+    if (backend->device != MYNAH_TTS_DEVICE_CPU) {
+        set_error(error, error_capacity,
+                  "row-wise scaled residual is unavailable on this device backend");
+        return -1;
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t i = 0; i < width; ++i)
+            dev_out[r * width + i] += scale[i] * dev_in[r * width + i];
+    }
     return 0;
 }
 

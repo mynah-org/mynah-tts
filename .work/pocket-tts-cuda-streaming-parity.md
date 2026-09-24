@@ -14,8 +14,10 @@ and has enough observability to distinguish a resident Pocket path from a
 host-round-trip prototype. This branch now has resident Pocket backbone and
 one-step flow-head batch paths with per-width CUDA-Graph capture/replay, plus
 a resident single-context SEANet decoder with causal rings, transpose tails,
-PCM handoff and a per-context CUDA graph. The codec transformer boundary and
-cross-request decoder batching remain open. The target is a qualified C100 on
+PCM handoff and a per-context CUDA graph. The Mimi decoder-transformer now has
+an opt-in resident CUDA path with compact per-request KV windows and true
+cross-request frame-tile batching; real-device stage parity and full decoder
+fusion remain open. The target is a qualified C100 on
 a representative L40S later; the RTX PRO 6000 is now the bring-up box, not a
 substitute for that production qualification.
 
@@ -47,12 +49,15 @@ silently switching to stale CPU rings. The server does not pretend that a
 partial CUDA graph is fully resident.
 
 The `make cuda-server` target is a build boundary plus the entry point for the
-resident slice. `--device cuda` may run Pocket's transformer backbone and
-one-step flow head resident when their metadata is compatible. The flow path is
-disabled with `MYNAH_CUDA_FLOW=0`, uses raw FP32 weights in this bring-up, and
-falls back to the CPU flow head on a recoverable failure. The SEANet CUDA path
-is opt-in through the CUDA engine context; its codec-transformer input remains
-host-owned and its output is one bounded D2H PCM transfer per frame.
+resident slice. `--device cuda` may run Pocket's transformer backbone,
+one-step flow head and Mimi decoder transformer resident when their metadata is
+compatible. The flow path is disabled with `MYNAH_CUDA_FLOW=0`, uses raw FP32
+weights in this bring-up, and falls back to the CPU flow head on a recoverable
+failure. `MYNAH_CUDA_POCKET_CODEC=0` is the explicit A/B escape hatch for the CPU
+decoder-transformer oracle. Quantizer/upsample inputs remain host-owned for
+now; the resident transformer keeps activations and KV on device, stages one
+bounded output tile per frame gang, and refreshes the host KV oracle only on a
+window rebase or retry.
 
 ## Validation snapshot — 2026-09-23
 
@@ -295,9 +300,12 @@ The first CUDA slice now carries the SEANet causal conv rings and
 conv-transpose partial tails on device, uses persistent cuBLAS/device scratch,
 captures one stable graph per context, and hands back one bounded PCM frame.
 The model-free CUDA self-test compares two consecutive decoder calls against
-the CPU SEANet state. The codec quantizer/transformer stays host-side and the
-gang remains serial across contexts, so cross-request decoder batching,
-same-backend stream/offline parity and GPU stage parity are still required.
+the CPU SEANet state. The new codec-transformer slice keeps the 250-position
+Mimi KV window resident, handles absolute RoPE after window rebases, and
+executes frame-major cross-request tiles with row-wise LayerScale. The
+quantizer/upsample boundary remains host-side; real-device codec stage parity,
+same-backend stream/offline parity and fully batched SEANet kernels are still
+required.
 
 ### P5 — Linux server integration → **build boundary, graph batch path and metrics implemented**
 
@@ -357,15 +365,15 @@ between **active request capacity** and **GPU microbatch width**: Pocket current
 publishes `max_batch = 16`, so a CUDA server cannot express C100 concurrent slots
 without a scheduler/capacity seam even if the GPU executes only B8/B16 at a time.
 
-The current CUDA decoder is still context-serial arithmetically. The
-`decode_audio_batch()` path now prepares every context, submits resident decoder
-work and queues every D2H before one common stream drain behind
-`MYNAH_CUDA_DECODER_BATCH`; this is a launch/synchronization optimization and
-must not be described as true cross-request arithmetic batching. The scheduler
-also separates `--max-batch` (engine microbatch) from `--max-inflight` (resident
-slots, up to 128), so a C100 experiment can keep 100 live requests while
-executing bounded B1/B2/B4/B8/B16 work. The next slice owns B1/B2/B4/B8/B16
-decoder state arrays and padded `(batch, frames)` graph buckets.
+The SEANet decoder remains context-serial arithmetically. The
+`decode_audio_batch()` path now also runs the Mimi decoder-transformer as a
+true cross-request frame-tile batch, with per-request KV pointers and
+window-relative attention positions; its activation output is staged once per
+tile. Quantizer/upsample and SEANet state are still per-context, so the next
+slice owns B1/B2/B4/B8/B16 state arrays and padded `(batch, frames)` decoder
+graph buckets. The scheduler separates `--max-batch` (engine microbatch) from
+`--max-inflight` (resident slots, up to 128), so a C100 experiment can keep 100
+live requests while executing bounded microbatches.
 
 The following flags are explicit experiments, not hidden policy:
 
@@ -373,6 +381,8 @@ The following flags are explicit experiments, not hidden policy:
 MYNAH_CUDA_GRAPHS=0|1              graph capture/replay escape hatch
 MYNAH_CUDA_FAST_MATH=0|1           TF32/fast compute experiment; no parity claim
 MYNAH_CUDA_DECODER_BATCH=0|1       async decoder gang submission, default on for CUDA
+MYNAH_CUDA_POCKET_CODEC=0|1        resident Pocket Mimi decoder transformer, default on for CUDA
+MYNAH_CUDA_CODEC=0                  legacy global codec kill switch (also disables Pocket)
 ```
 
 `MYNAH_CUDA_DECODER_GEMM` and `MYNAH_CUDA_METRICS` are intentionally not
@@ -385,7 +395,8 @@ future histograms. The current `/metrics` surface includes queue wait, TTFA,
 E2E, RTF and audio seconds; TTFB, stage/batch width, decoder bucket hit/miss,
 and per-stage H2D/D2H timing remain follow-up work. The backend already exposes
 H2D/D2H bytes and calls, graph capture/replay/fallback reasons, sync count,
-device VRAM totals and resident fallback counts. Labels stay low-cardinality (`backend`, `arch`,
+device VRAM totals, resident fallback counts, and resident Mimi transformer
+tile counts/width. Labels stay low-cardinality (`backend`, `arch`,
 `precision`, `stage`, `bucket`) so a request ID never enters Prometheus.
 
 The hosted GitHub job remains compile-only for `sm_70`, `sm_89` and `sm_90`.
@@ -407,7 +418,7 @@ CUDA-01  async decoder gang submission + backend batch counters (implemented; GP
 CUDA-02  Prometheus /metrics + GPU/graph/transfer/batch observability (implemented; TTFB/per-stage timing histograms open)
 CUDA-03  C100 capacity seam: inflight slots separate from microbatch width (implemented; runtime soak open)
 CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels and graph buckets
-CUDA-05  codec-transformer residency + H2D/D2H overlap
+CUDA-05  codec-transformer residency + H2D/D2H overlap (resident frame-tile path implemented; GPU parity/overlap open)
 CUDA-06  BF16/FP16/cuBLASLt/fused kernel ladder with stage parity gates
 CUDA-07  optional GPU CI, sanitizer and L40S qualification campaign
 CUDA-08  Blackwell/Ada architecture stamp, real-device self-test and no-hidden-fallback audit (sm120/sm89 build + model bring-up done; qualification open)
@@ -631,6 +642,53 @@ show that the current server is functionally stable and genuinely uses CUDA,
 but the CPU codec transformer and launch/synchronization overhead still limit
 continuous high-concurrency streaming. They do not support a C100 or 99%-GPU
 claim.
+
+## 2026-09-24 resident Mimi decoder-transformer implementation
+
+The next source slice is now implemented locally, but has deliberately not been
+promoted to a CUDA result because the Blackwell box is off and this Mac has no
+`nvcc` or NVIDIA device.
+
+* `src/transformer_ar.c` exposes the bounded window base/capacity and a
+  non-advancing `prepare_window()` operation. This keeps the existing CPU
+  sliding-window state authoritative and makes rebasing explicit to the device
+  mirror; no CPU inference loop was split into a second model.
+* Pocket allocates one device KV window and reusable activations per context,
+  plus one pinned frame-major gang workspace. Allocation is driven by
+  `model.json` codec metadata and `codec_tf_layers`, not by backbone depth.
+* The CUDA tile executes LayerNorm → fused QKV matmul → absolute RoPE →
+  window-relative causal attention → output projection → LayerScale residual →
+  FFN/GELU → LayerScale residual for every Mimi decoder-transformer layer.
+  The batch path uses row-wise LayerScale; a flat elementwise scale would be
+  wrong for every request after row zero.
+* Host KV is not copied back on every frame. It is refreshed only before a
+  window rebase or when a failed resident tile needs the CPU retry oracle.
+  `MYNAH_CUDA_POCKET_CODEC=0` disables this optional slice for a clean A/B
+  against the prior CPU decoder-transformer path. The legacy
+  `MYNAH_CUDA_CODEC=0` switch remains honored too.
+* Failure recovery distinguishes a partial KV H2D upload from a device mirror
+  that already ran kernels: the former keeps the host cache authoritative and
+  retries CPU directly; the latter performs one bounded D2H mirror before the
+  CPU retry. This avoids importing an incomplete device window into fallback.
+* Health/Prometheus diagnostics now include resident codec-transformer tile
+  calls/items/max width, in addition to the existing H2D/D2H/sync/matmul and
+  decoder counters. A CUDA model-free self-test also covers the new row-wise
+  LayerScale kernel.
+
+The next-box gate is intentionally narrow:
+
+```text
+1. make cuda-server CUDA_ARCH=sm_89                 compile-only first
+2. --gpu-self-test cuda                             model-free kernels + LayerScale
+3. 6L and 24L CLI with MYNAH_CUDA_POCKET_CODEC=0/1  finite audio, same sample count
+4. dump/compare decoder-transformer outputs          CPU vs CUDA max error/correlation
+5. long-form >250 codec positions                   window rebase correctness
+6. C2/C4/C8/C16 wave ladder                         codec tile counters + stalls
+```
+
+Until those six checks pass on real hardware, the 2x2 matrix above remains the
+previous Blackwell smoke result and this new codec-transformer path is marked
+**source-implemented / runtime validation pending**.
 
 ## Acceptance gates before calling this done
 
