@@ -407,6 +407,7 @@ CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels and graph buckets
 CUDA-05  codec-transformer residency + H2D/D2H overlap
 CUDA-06  BF16/FP16/cuBLASLt/fused kernel ladder with stage parity gates
 CUDA-07  optional GPU CI, sanitizer and L40S qualification campaign
+CUDA-08  Blackwell/Ada architecture stamp, real-device self-test and no-hidden-fallback audit (bring-up partial; model gate open)
 ```
 
 ## 2026-09-24 24L compatibility audit and work items
@@ -503,7 +504,40 @@ The CUDA path was audited for metadata-driven layer allocation/loops in the
 resident backbone, KV cache, graph pointer tables and decoder descriptors;
 the existing driverless CI compile is the available CUDA evidence here. A
 green `nvcc` build is not reported as CUDA inference parity. Real 6L and 24L
-CUDA gates remain blocked only by access to an NVIDIA runner/GPU.
+CUDA gates remain blocked only by model access on the NVIDIA runner/GPU.
+
+## 2026-09-24 RTX PRO 6000 Blackwell bring-up
+
+The requested remote box is an NVIDIA RTX PRO 6000 Blackwell Server Edition
+with 97,887 MiB VRAM, driver 580.178.04 and CUDA 13.0 runtime. The installed
+CUDA 13.2 toolkit compiles the CUDA CLI and server. A clean explicit
+`CUDA_ARCH=sm_120` build passed the full model-free CUDA backend self-test on
+the real device. A separate clean `CUDA_ARCH=sm_89` build also compiled and
+linked, covering the L4/L40S production profile; CI continues to cover sm_70,
+sm_89 and sm_90. `CUDA_ARCH=native` is reserved for local bring-up, never for a
+portable production artifact.
+
+The bring-up also found and fixed a self-test defect: the single-row RoPE test
+checked K values as though they were additional Q pairs. The kernel was
+correct; the corrected test now checks Q and K with their shared pair
+frequencies. The Makefile now records the requested CUDA architecture in a
+stamp so changing from sm_120 to sm_89 (or back) cannot silently relink a cubin
+compiled for the previous GPU.
+
+The resident coverage audit is deliberately not a 99%-GPU claim yet. The
+backbone attention/FFN, flow head and causal SEANet decoder execute on CUDA
+when their opt-in allocations succeed. CPU work still includes tokenization,
+sampling/RNG/EOS bookkeeping, host projection boundaries, the codec
+transformer, bounded K/V shadow copies for retry safety, and D2H/H2D handoffs
+per autoregressive step/frame. The first real model run must report these
+transfer counters and CPU utilization; CUDA-05 owns eliminating the remaining
+hot-path host boundaries before an AWS L4/L40S capacity claim.
+
+The remote host currently has no Hugging Face credential, and the official
+checkpoint URL returns HTTP 401. Local official 6L/24L packs have not been
+copied to the root-owned remote host without explicit authorization. Until a
+pack is present, the validation matrix remains runtime-pending even though the
+Blackwell kernel gate is green.
 
 ## Acceptance gates before calling this done
 

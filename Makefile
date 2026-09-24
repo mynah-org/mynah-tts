@@ -828,6 +828,13 @@ CUDA_HOST_OBJECT := $(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o
 CUDA_TARGET := $(CUDA_BUILD_DIR)/mynah-tts
 CUDA_SERVER_TARGET := $(CUDA_BUILD_DIR)/mynah-tts-server
 
+# CUDA_ARCH is part of the object ABI.  Without a stamp, `make cuda
+# CUDA_ARCH=sm_89` after a native build silently relinks the old cubin instead
+# of recompiling backend_cuda.cu.  The stamp records the current choice and
+# is checked on every invocation, so switching between Blackwell (sm_120),
+# Ada (sm_89) and the CI profiles always rebuilds the CUDA host object.
+CUDA_ARCH_STAMP := $(CUDA_BUILD_DIR)/.cuda-arch
+
 $(CUDA_BUILD_DIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CUDA_CPPFLAGS) $(CUDA_CFLAGS) -MMD -MP -c $< -o $@
@@ -838,10 +845,20 @@ else
 CUDA_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 
-$(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o: gpu/cuda/backend_cuda.cu
+$(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o: gpu/cuda/backend_cuda.cu $(CUDA_ARCH_STAMP)
 	@mkdir -p $(@D)
 	@command -v nvcc >/dev/null 2>&1 || (echo "nvcc is required for CUDA; install the NVIDIA CUDA toolkit" >&2; exit 2)
 	nvcc -Isrc -O2 $(CUDA_ARCH_FLAGS) -Xcompiler "-Wall,-Wextra" -c $< -o $@
+
+
+.PHONY: cuda-arch-stamp-force
+cuda-arch-stamp-force:
+
+$(CUDA_ARCH_STAMP): cuda-arch-stamp-force
+	@mkdir -p $(@D)
+	@if test ! -f "$@" || ! grep -Fqx '$(CUDA_ARCH)' "$@"; then \
+		printf '%s\n' '$(CUDA_ARCH)' > "$@"; \
+	fi
 
 # $(LDLIBS), not a hand-written `-lm`: the CPU and Metal targets both link
 # through LDLIBS, and this one spelled its libraries out instead -- so when
