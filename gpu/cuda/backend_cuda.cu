@@ -1286,21 +1286,31 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
         mynah_cuda_sync(st, e, ec) != 0 ||
         ce(cudaMemcpy(qkv, d_in, 12u * sizeof(float), cudaMemcpyDeviceToHost), e, ec))
         goto fail;
-    for (size_t base = 0; base < 8u; base += 2u) {
+    for (size_t base = 0; base < 4u; base += 2u) {
         const size_t pair = base / 2u;
         const float q0 = (float)(base + 1u) * 0.125f;
         const float q1 = (float)(base + 2u) * 0.125f;
+        const float k0 = (float)(4u + base + 1u) * 0.125f;
+        const float k1 = (float)(4u + base + 2u) * 0.125f;
         const float frequency = expf((float)pair * rope_slope);
         const float angle = 7.0f * frequency;
         const float sine = sinf(angle);
         const float cosine = cosf(angle);
         const float expected0 = q0 * cosine - q1 * sine;
         const float expected1 = q0 * sine + q1 * cosine;
+        const float expected_k0 = k0 * cosine - k1 * sine;
+        const float expected_k1 = k0 * sine + k1 * cosine;
         const float before = q0 * q0 + q1 * q1;
+        const float before_k = k0 * k0 + k1 * k1;
         const float after = qkv[base] * qkv[base] + qkv[base + 1u] * qkv[base + 1u];
+        const float after_k = qkv[4u + base] * qkv[4u + base] +
+                              qkv[4u + base + 1u] * qkv[4u + base + 1u];
         if (fabsf(qkv[base] - expected0) > 3.0e-3f ||
             fabsf(qkv[base + 1u] - expected1) > 3.0e-3f ||
-            fabsf(before - after) > 2.0e-3f) {
+            fabsf(qkv[4u + base] - expected_k0) > 3.0e-3f ||
+            fabsf(qkv[4u + base + 1u] - expected_k1) > 3.0e-3f ||
+            fabsf(before - after) > 2.0e-3f ||
+            fabsf(before_k - after_k) > 2.0e-3f) {
             std::snprintf(e, ec, "CUDA RoPE self-test mismatch at pair %zu", base / 2u);
             goto fail;
         }
