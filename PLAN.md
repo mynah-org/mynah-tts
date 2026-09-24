@@ -1399,7 +1399,7 @@ artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
 - [ ] E15-7 CPU↔CUDA stage/EOS/audio parity and solo↔batch/stream parity on a real CUDA device; CPU gates must remain green
 - [ ] E15-8 L40S qualification campaign: warmups, serial A/B, batch sweep, C ladder, VRAM/RSS/transfer metrics and 30-minute C100 cadence soak
 - [x] E15-15 official Pocket 6L/24L schema audit: 24L is the same graph with 18 additional backbone blocks; flow/Mimi/lookup/projection shapes and tokenizer are compatible; mixed source dtypes and 24L voice-cache metadata are recorded in [`.work/pocket-tts-24l-compatibility.md`](.work/pocket-tts-24l-compatibility.md)
-- [~] E15-16 depth-driven Pocket converter/runtime: converter accepts 6L/24L block counts and mixed BF16/F32 source tensors with `--dtype source`; actual 24L pack conversion is green, CPU load/inference and CUDA parity remain
+- [~] E15-16 depth-driven Pocket converter/runtime: converter accepts 6L/24L block counts and mixed BF16/F32 source tensors with `--dtype source`; actual 24L pack conversion and CPU load/inference are green, CUDA parity remains
 - [ ] E15-17 2x2 Pocket validation matrix (6L/24L × CPU/CUDA), including stage/EOS/audio parity, RAM/VRAM, TTFA and RTF; do not claim 24L support before an official 24L inference completes on each backend
 - [ ] E15-18 README support matrix and reproduction commands for CPU, CUDA, Linux streaming server and optional CUDA graph/metrics flags
 
