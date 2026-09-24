@@ -141,6 +141,13 @@ make metal && build/metal/mynah-tts --gpu-self-test metal   # macOS
 make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
 ```
 
+Pocket-TTS support is currently an experimental engine path: official 6-layer
+and 24-layer packs run on CPU, and the Linux CUDA server path has been exercised
+on an RTX PRO 6000 Blackwell (`sm_120`) with resident backbone, flow and causal
+SEANet decoder work. CUDA remains opt-in and model-specific; L4/L40S
+qualification, full CPU↔CUDA stage parity and sustained high-concurrency
+streaming are still tracked in [PLAN.md](PLAN.md).
+
 A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
 local `.venv` are all gitignored.

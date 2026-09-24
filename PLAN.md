@@ -1402,7 +1402,7 @@ artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
 - [x] E15-15 official Pocket 6L/24L schema audit: 24L is the same graph with 18 additional backbone blocks; flow/Mimi/lookup/projection shapes and tokenizer are compatible; mixed source dtypes and 24L voice-cache metadata are recorded in [`.work/pocket-tts-24l-compatibility.md`](.work/pocket-tts-24l-compatibility.md)
 - [~] E15-16 depth-driven Pocket converter/runtime: converter accepts 6L/24L block counts and mixed BF16/F32 source tensors with `--dtype source`; official 24L conversion, CPU load/inference and CUDA load/inference are green, while CUDA stage parity remains
 - [~] E15-17 2x2 Pocket validation matrix (6L/24L × CPU/CUDA): official packs now convert, load and complete inference on both backends, with RAM/VRAM, TTFA and RTF smoke numbers recorded; stage/EOS/audio and solo↔batch parity remain before final qualification
-- [ ] E15-18 README support matrix and reproduction commands for CPU, CUDA, Linux streaming server and optional CUDA graph/metrics flags
+- [~] E15-18 README now names the experimental Pocket CPU/CUDA paths and links the CUDA work item; full CPU/CUDA support matrix and L4/L40S reproduction/qualification commands remain
 
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)
 

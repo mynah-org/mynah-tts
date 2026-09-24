@@ -602,6 +602,36 @@ device matmul calls were recorded. The GPU path is real and useful, but this
 transfer/synchronization profile plus the CPU codec-transformer boundary is
 why no 99%-GPU or C100 claim is made yet.
 
+## 2026-09-24 final Blackwell screen before shutdown
+
+The box was shut down after all reports were copied to the local, untracked
+directory `.work/blackwell-20260924/`. The latest branch commit was `1b1efce`
+(`perf: coalesce CUDA backbone KV readback`); the local worktree was clean
+before collecting the reports. No CUDA server, soak process or residual GPU
+allocation remained at shutdown.
+
+The final 24L C64 wave used the current `max_batch=64` path, prefix-only KV
+upload and coalesced backbone KV readback. It completed 64/64 requests with
+zero failures and zero resident fallbacks, but was **NOT STREAMABLE**:
+`STREAM_RTF p95=2.398`, `TTFA p95=10.09 s`, `stall@500 ms=91%`, aggregate
+throughput 9.77 audio-s/wall-s and aggregate RTF 0.102. Health recorded
+`backbone_batch_calls=82`, `items=1485`, `max_width=27`, `decoder_batch_calls=107`,
+`decoder_batch_items=1447`, 1.762 GB H2D, 303 MB D2H, 3,031 D2H calls, 323
+synchronizations, zero graph fallbacks and peak RSS about 3.96 GB. Sampled
+VRAM stayed below 4.4 GB; sampled GPU utilisation was bursty rather than near
+100%.
+
+The earlier ten-minute C64 soaks are useful threshold evidence, not promotion
+evidence: 6L completed 2,829/2,829 with no rejects but `STREAM_RTF p95=5.591`
+and 100% stall rate; 24L completed 1,235/1,235 with no rejects but
+`STREAM_RTF p95=13.789` and 100% stall rate. The short wave ladder was much
+better at low concurrency: 6L was GOOD through C8 and MARGINAL at C16; 24L
+was GOOD through C4, MARGINAL at C8 and NOT STREAMABLE at C16. These results
+show that the current server is functionally stable and genuinely uses CUDA,
+but the CPU codec transformer and launch/synchronization overhead still limit
+continuous high-concurrency streaming. They do not support a C100 or 99%-GPU
+claim.
+
 ## Acceptance gates before calling this done
 
 1. `make` and the existing CPU self-test/parity/server gates pass unchanged.
