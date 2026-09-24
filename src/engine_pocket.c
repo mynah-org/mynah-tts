@@ -5222,7 +5222,10 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         cuda_error[0] = '\0';
         const int cuda_rc = pocket_cuda_backbone_step_batch(
             ctxs, count, scratch, cuda_error, sizeof(cuda_error));
-        if (cuda_rc == 0) cuda_used = 1;
+        if (cuda_rc == 0) {
+            cuda_used = 1;
+            (void)mynah_backend_note_backbone_batch(scratch->backend, count);
+        }
     }
     if (live == 1u) {
         /* A single request is the latency-critical server path.  CUDA keeps

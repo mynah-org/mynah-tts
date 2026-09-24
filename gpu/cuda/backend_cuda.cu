@@ -478,6 +478,9 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> graph_captures;
     std::atomic<unsigned long long> graph_replays;
     std::atomic<unsigned long long> graph_fallbacks;
+    std::atomic<unsigned long long> backbone_batch_calls;
+    std::atomic<unsigned long long> backbone_batch_items;
+    std::atomic<unsigned long long> backbone_batch_max_width;
     std::atomic<unsigned long long> decoder_steps;
     std::atomic<unsigned long long> decoder_batch_calls;
     std::atomic<unsigned long long> decoder_batch_items;
@@ -1474,6 +1477,9 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->graph_captures.store(0ull, std::memory_order_relaxed);
     st->graph_replays.store(0ull, std::memory_order_relaxed);
     st->graph_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->backbone_batch_calls.store(0ull, std::memory_order_relaxed);
+    st->backbone_batch_items.store(0ull, std::memory_order_relaxed);
+    st->backbone_batch_max_width.store(0ull, std::memory_order_relaxed);
     st->decoder_steps.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_calls.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_items.store(0ull, std::memory_order_relaxed);
@@ -1531,6 +1537,12 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
     metrics->graph_captures = st->graph_captures.load(std::memory_order_relaxed);
     metrics->graph_replays = st->graph_replays.load(std::memory_order_relaxed);
     metrics->graph_fallbacks = st->graph_fallbacks.load(std::memory_order_relaxed);
+    metrics->backbone_batch_calls =
+        st->backbone_batch_calls.load(std::memory_order_relaxed);
+    metrics->backbone_batch_items =
+        st->backbone_batch_items.load(std::memory_order_relaxed);
+    metrics->backbone_batch_max_width =
+        st->backbone_batch_max_width.load(std::memory_order_relaxed);
     metrics->decoder_steps = st->decoder_steps.load(std::memory_order_relaxed);
     metrics->decoder_batch_calls =
         st->decoder_batch_calls.load(std::memory_order_relaxed);
@@ -2733,6 +2745,23 @@ extern "C" int mynah_cuda_decoder_note_batch(void *opaque, size_t items,
                                            std::memory_order_relaxed);
     backend->decoder_batch_frames.fetch_add((unsigned long long)frames,
                                             std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" int mynah_cuda_note_backbone_batch(void *opaque, size_t items) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || items == 0u) return -1;
+    backend->backbone_batch_calls.fetch_add(1ull, std::memory_order_relaxed);
+    backend->backbone_batch_items.fetch_add((unsigned long long)items,
+                                            std::memory_order_relaxed);
+    unsigned long long observed =
+        backend->backbone_batch_max_width.load(std::memory_order_relaxed);
+    const unsigned long long width = (unsigned long long)items;
+    while (observed < width &&
+           !backend->backbone_batch_max_width.compare_exchange_weak(
+               observed, width, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
     return 0;
 }
 

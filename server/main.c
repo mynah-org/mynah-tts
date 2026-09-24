@@ -1447,7 +1447,9 @@ static void handle_health(int fd) {
              "{\"h2d_bytes\":%llu,\"d2h_bytes\":%llu,"
              "\"h2d_calls\":%llu,\"d2h_calls\":%llu,\"sync_calls\":%llu,"
              "\"graph_captures\":%llu,\"graph_replays\":%llu,"
-             "\"graph_fallbacks\":%llu,\"decoder_steps\":%llu,"
+             "\"graph_fallbacks\":%llu,\"backbone_batch_calls\":%llu,"
+             "\"backbone_batch_items\":%llu,\"backbone_batch_max_width\":%llu,"
+             "\"decoder_steps\":%llu,"
              "\"decoder_batch_calls\":%llu,\"decoder_batch_items\":%llu,"
              "\"decoder_batch_frames\":%llu,\"decoder_failures\":%llu,"
              "\"resident_fallbacks\":%llu,\"matmul_calls\":%llu,"
@@ -1458,7 +1460,11 @@ static void handle_health(int fd) {
              backend_metrics.h2d_calls, backend_metrics.d2h_calls,
              backend_metrics.sync_calls,
              backend_metrics.graph_captures, backend_metrics.graph_replays,
-             backend_metrics.graph_fallbacks, backend_metrics.decoder_steps,
+             backend_metrics.graph_fallbacks,
+             backend_metrics.backbone_batch_calls,
+             backend_metrics.backbone_batch_items,
+             backend_metrics.backbone_batch_max_width,
+             backend_metrics.decoder_steps,
              backend_metrics.decoder_batch_calls,
              backend_metrics.decoder_batch_items,
              backend_metrics.decoder_batch_frames,
@@ -1751,6 +1757,18 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_graph_fallbacks_total counter\n"
            "mynah_backend_graph_fallbacks_total %llu\n",
            m.graph_fallbacks);
+    METRIC("# HELP mynah_backend_backbone_batch_calls_total Successful CUDA backbone batch calls.\n"
+           "# TYPE mynah_backend_backbone_batch_calls_total counter\n"
+           "mynah_backend_backbone_batch_calls_total %llu\n",
+           m.backbone_batch_calls);
+    METRIC("# HELP mynah_backend_backbone_batch_items_total Request rows processed by CUDA backbone batches.\n"
+           "# TYPE mynah_backend_backbone_batch_items_total counter\n"
+           "mynah_backend_backbone_batch_items_total %llu\n",
+           m.backbone_batch_items);
+    METRIC("# HELP mynah_backend_backbone_batch_max_width Maximum successful CUDA backbone batch width.\n"
+           "# TYPE mynah_backend_backbone_batch_max_width gauge\n"
+           "mynah_backend_backbone_batch_max_width %llu\n",
+           m.backbone_batch_max_width);
     METRIC("# HELP mynah_backend_decoder_steps_total Decoder steps submitted.\n"
            "# TYPE mynah_backend_decoder_steps_total counter\n"
            "mynah_backend_decoder_steps_total %llu\n",
@@ -2158,13 +2176,17 @@ static void dump_local_stats(void) {
             g.max_batch, g.max_active);
     fprintf(stderr,
             "[%s] backend=%s h2d=%llu d2h=%llu graph=%llu/%llu fallback=%llu "
-            "sync=%llu decoder_steps=%llu decoder_batch=%llu/%llu/%llu "
+            "sync=%llu backbone_batch=%llu/%llu max=%llu "
+            "decoder_steps=%llu decoder_batch=%llu/%llu/%llu "
             "decoder_failures=%llu resident_fallbacks=%llu matmul=%llu matvec=%llu "
             "vram=%llu/%llu flags=%u/%u/%u\n",
             who, g.info.device, backend_metrics.h2d_bytes,
             backend_metrics.d2h_bytes, backend_metrics.graph_captures,
             backend_metrics.graph_replays, backend_metrics.graph_fallbacks,
             backend_metrics.sync_calls,
+            backend_metrics.backbone_batch_calls,
+            backend_metrics.backbone_batch_items,
+            backend_metrics.backbone_batch_max_width,
             backend_metrics.decoder_steps,
             backend_metrics.decoder_batch_calls,
             backend_metrics.decoder_batch_items,

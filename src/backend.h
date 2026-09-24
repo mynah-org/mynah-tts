@@ -100,6 +100,10 @@ int mynah_backend_decoder_note_step(const mynah_backend *backend,
  * asynchronous CUDA decoder path; CPU and other backends treat it as a no-op. */
 int mynah_backend_decoder_note_batch(const mynah_backend *backend,
                                      size_t items, size_t frames);
+/* Record one successful cross-request Pocket backbone batch. CPU/Metal are
+ * intentionally no-ops; CUDA exposes the counters for server observability. */
+int mynah_backend_note_backbone_batch(const mynah_backend *backend,
+                                      size_t items);
 int mynah_backend_metrics_get(const mynah_backend *backend,
                                mynah_tts_backend_metrics *metrics);
 

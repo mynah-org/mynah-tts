@@ -27,6 +27,9 @@ typedef struct {
     unsigned long long graph_captures;
     unsigned long long graph_replays;
     unsigned long long graph_fallbacks;
+    unsigned long long backbone_batch_calls;
+    unsigned long long backbone_batch_items;
+    unsigned long long backbone_batch_max_width;
     unsigned long long decoder_steps;
     unsigned long long decoder_batch_calls;
     unsigned long long decoder_batch_items;
