@@ -3991,8 +3991,19 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
         scratch->cuda_host_kv == NULL || scratch->cuda_kv_shadow == NULL) {
         return 1;
     }
-    const size_t attn_dim = cfg->heads * cfg->head_dim;
-    const size_t shadow_row = 2u * attn_dim;
+    size_t attn_dim = 0u;
+    size_t shadow_row = 0u;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(2u, attn_dim, &shadow_row) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA attention size overflow");
+        return 1;
+    }
+    size_t shadow_floats = 0u;
+    if (pocket_mul(cfg->layers, count, &shadow_floats) != 0 ||
+        pocket_mul(shadow_floats, shadow_row, &shadow_floats) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA KV shadow size overflow");
+        return 1;
+    }
     int all_kv_valid = 1;
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
@@ -4131,12 +4142,9 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
                     scratch->cuda_vcache + l * scratch->cuda_batch_capacity,
                     scratch->cuda_positions,
                     scratch->cuda_cache_strides, count, cfg->heads,
-                    cfg->head_dim, scratch->cuda_kv_shadow, local,
-                    sizeof(local)) != 0 ||
-                mynah_backend_d2h(
-                    scratch->backend, scratch->cuda_kv_shadow,
-                    scratch->cuda_host_kv + l * count * shadow_row,
-                    count * shadow_row, local, sizeof(local)) != 0) goto fail;
+                    cfg->head_dim,
+                    scratch->cuda_kv_shadow + l * count * shadow_row, local,
+                    sizeof(local)) != 0) goto fail;
         }
         if (mynah_backend_layer_norm_dev(
                 scratch->backend, scratch->cuda_x, scratch->cuda_norm,
@@ -4146,6 +4154,9 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
             mynah_backend_d2h(scratch->backend, scratch->cuda_norm,
                               scratch->cuda_host_output,
                               count * cfg->hidden_dim, local,
+                              sizeof(local)) != 0 ||
+            mynah_backend_d2h(scratch->backend, scratch->cuda_kv_shadow,
+                              scratch->cuda_host_kv, shadow_floats, local,
                               sizeof(local)) != 0) goto fail;
 
         if (graph_capture) {
