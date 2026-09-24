@@ -2459,7 +2459,7 @@ static int decoder_alloc_workspace(mynah_backend_decoder *decoder,
     return 0;
 }
 
-static int decoder_conv1d(cuda_decoder_state *decoder, cuda_decoder_op *op,
+static int decoder_conv1d(mynah_backend_decoder *decoder, cuda_decoder_op *op,
                           const float *input, float *output, size_t length,
                           char *e, size_t ec) {
     if (length == 0u || length > op->max_in_len || op->stride != 1 ||
@@ -2512,7 +2512,7 @@ static int decoder_conv1d(cuda_decoder_state *decoder, cuda_decoder_op *op,
     return 0;
 }
 
-static int decoder_convtr(cuda_decoder_state *decoder, cuda_decoder_op *op,
+static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
                           const float *input, float *output, size_t length,
                           char *e, size_t ec) {
     if (length == 0u || length > op->max_in_len) return -1;
