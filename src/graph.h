@@ -17,12 +17,13 @@ void mynah_graph_local_projection_cache_free(void *cache);
  * min(requested, caps.max_batch, MYNAH_GRAPH_MAX_JOBS) contexts at once; a
  * separate active-slot ceiling is only for continuous services and does not
  * widen engine arithmetic. */
-#define MYNAH_GRAPH_MAX_JOBS 16u
+#define MYNAH_GRAPH_MAX_JOBS 64u
 
 /* Maximum resident request slots for a continuous service. A service can keep
  * more contexts alive than it submits in one engine microbatch, which is the
  * capacity seam needed for a C100 target. Offline/public array batching stays
- * capped by MYNAH_GRAPH_MAX_JOBS. */
+ * capped by MYNAH_GRAPH_MAX_JOBS (64). Individual engines may advertise a
+ * narrower safe width. */
 #define MYNAH_GRAPH_MAX_ACTIVE 128u
 
 /* Outcomes reported per request. Cancellation is distinct from failure on

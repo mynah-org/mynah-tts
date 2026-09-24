@@ -34,10 +34,12 @@
 #define POCKET_PATH_MAX 4096u
 #define POCKET_MANIFEST_MAX (4u * 1024u * 1024u)
 #define POCKET_QNAME_MAX 48u
-/* How many requests one backbone pass may serve.  The driver clamps this to its
- * own MYNAH_GRAPH_MAX_JOBS; the number here is what the engine can actually do
- * without the batch scratch becoming the dominant per-slot cost. */
-#define POCKET_MAX_BATCH 16u
+/* How many requests one resident backbone pass may serve.  CUDA's pointer
+ * metadata arena is sized for 64 rows; keeping the engine and driver ceilings
+ * equal lets a GPU worker form one real batch at C64 instead of four C16
+ * microbatches.  CPU still remains correct at the wider width, while its
+ * operator can choose a smaller --max-batch at serving time. */
+#define POCKET_MAX_BATCH 64u
 
 /* ------------------------------------------------------------------ errors */
 
@@ -5078,8 +5080,8 @@ static int pocket_all_finite(const float *v, size_t n) {
  * batch one context at a time to find whose data was refused, and that re-step
  * is only legal if the refused call moved nobody.  An engine that advances
  * 0..i-1 and then refuses i gets its survivors double-stepped, and no driver
- * can see that from the outside.  At the `max_batch` of 16 this engine
- * declares, that is one bad request corrupting fifteen strangers.
+ * can see that from the outside.  At the `max_batch` of 64 this engine
+ * declares, that is one bad request corrupting sixty-three strangers.
  *
  * It is enforced in three layers, in this order:
  *
