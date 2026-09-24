@@ -428,7 +428,7 @@ Completed in this slice:
 24L-02  converter guard: dynamic block count + mixed source dtype conversion      DONE
 24L-03  actual official 24L download, --dtype source conversion and pack verify   DONE
 24L-04  C loader/CPU inference/audio gate on the converted official 24L pack     DONE
-24L-05  CPU 6L regression: conversion, self-check and server audio smoke         DONE
+24L-05  CPU 6L regression: conversion, self-check, cloning and server audio     DONE
 24L-08  serial CPU resource report; GPU resource fields remain pending           PARTIAL
 ```
 
@@ -454,7 +454,9 @@ The actual official 24L checkpoint was converted with `--dtype source` and
 `--voices alba` into a temporary pack (358/358 tensors, mixed F32/BF16), then
 passed the pack verifier, the native Pocket self-check, CPU loading and a
 valid WAV inference. The existing 6L pack also passed the same native self-
-check and a server WAV smoke. No model or generated audio is committed.
+check and a server WAV smoke. CPU voice cloning passed on both packs from the
+same 10.32 s, 24 kHz reference: 129 voice frames and 130 KV positions, taking
+6.92 s on 6L and 16.17 s on 24L. No model or generated audio is committed.
 
 The correctness oracle used the official Python implementation and the C
 runtime with `MYNAH_QUANT_GROUPS=none`, so the C path retained the official
@@ -493,8 +495,8 @@ Current validation matrix:
 
 ```text
                          CPU                                      CUDA
-Pocket small / 6L        PASS: converted pack, self-check, server  NOT RUNTIME-TESTED
-Pocket large / 24L       PASS: official pack, self-check, oracle   NOT RUNTIME-TESTED
+Pocket small / 6L        PASS: converted pack, self-check, clone, server  NOT RUNTIME-TESTED
+Pocket large / 24L       PASS: official pack, self-check, clone, oracle   NOT RUNTIME-TESTED
 ```
 
 The CUDA path was audited for metadata-driven layer allocation/loops in the
