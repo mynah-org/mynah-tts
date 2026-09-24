@@ -3782,20 +3782,54 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
         return 1;
     }
     const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
     const size_t half = mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+    size_t attn_dim = 0;
+    size_t device_layer_half = 0;
     size_t layer_span = 0;
-    if (pocket_mul(half, 2u, &layer_span) != 0 ||
-        pocket_mul(cfg->layers, layer_span, &layer_span) != 0 ||
-        layer_span > ctx->cuda_backbone_kv_floats) {
+    size_t kv_floats = 0;
+    size_t valid_floats = 0;
+    const size_t position = mynah_transformer_ar_state_offset(ctx->backbone);
+    if (bc == NULL || position > bc->max_seq_len ||
+        pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(bc->max_seq_len, attn_dim, &device_layer_half) != 0 ||
+        pocket_mul(half, 2u, &layer_span) != 0 ||
+        pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
+        kv_floats > ctx->cuda_backbone_kv_floats ||
+        pocket_mul(position, attn_dim, &valid_floats) != 0 ||
+        valid_floats > half) {
         pocket_error(error, capacity, "pocket: CUDA KV upload size overflow");
         return -1;
     }
     for (size_t l = 0; l < cfg->layers; ++l) {
-        float *destination = ctx->cuda_backbone_kv + l * (half * 2u);
+        float *destination = ctx->cuda_backbone_kv + l * (device_layer_half * 2u);
         const float *source = mynah_transformer_ar_state_kv(ctx->backbone, l);
-        if (source == NULL ||
-            mynah_backend_h2d(ctx->state->backend, source, destination,
-                              half * 2u, error, capacity) != 0) {
+        if (source == NULL) {
+            ctx->cuda_backbone_valid = 0;
+            return -1;
+        }
+        /* The host cache is [K capacity][V capacity], but only the prefix up
+         * to the current offset can ever be read by attention.  Uploading the
+         * zero/unwritten tail made every new request pay for the full KV
+         * capacity (and, on 24L, dominated H2D traffic).  Keep the device
+         * layout unchanged and copy just the two live contiguous prefixes.
+         * A fully populated cache remains one copy, preserving the fast path
+         * for a future caller that legitimately fills the whole capacity. */
+        if (position == bc->max_seq_len && half == device_layer_half) {
+            if (mynah_backend_h2d(ctx->state->backend, source, destination,
+                                  layer_span / cfg->layers, error,
+                                  capacity) != 0) {
+                ctx->cuda_backbone_valid = 0;
+                return -1;
+            }
+        } else if (valid_floats > 0u &&
+                   (mynah_backend_h2d(ctx->state->backend, source, destination,
+                                      valid_floats, error, capacity) != 0 ||
+                    mynah_backend_h2d(ctx->state->backend,
+                                      source + half,
+                                      destination + device_layer_half,
+                                      valid_floats, error, capacity) != 0)) {
             ctx->cuda_backbone_valid = 0;
             return -1;
         }
