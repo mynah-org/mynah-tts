@@ -930,11 +930,14 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
  * between steps, so a request arriving mid-flight joins the batch that is
  * already running rather than waiting for it to drain. */
 static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
-                 mynah_graph_sink *sink, size_t want_batch, int strict_batch,
-                 int dump_all) {
+                 mynah_graph_sink *sink, size_t want_batch,
+                 size_t active_capacity, int strict_batch, int dump_all) {
     if (sink == NULL || sink->next_job == NULL) return -1;
     if (want_batch == 0u) return 0;
     if (want_batch > MYNAH_GRAPH_MAX_JOBS) return -1;
+    if (active_capacity == 0u) active_capacity = want_batch;
+    if (active_capacity > MYNAH_GRAPH_MAX_ACTIVE) return -1;
+    if (active_capacity < want_batch) want_batch = active_capacity;
     if (engine == NULL) {
         return refuse_all(sink, "model.json names an engine this build does not have");
     }
@@ -958,7 +961,16 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     /* The engine's ceiling wins over the caller's wish: a continuous-latent
      * engine declares 1 and stepping two of its contexts together is not a
      * slower path, it is an out-of-bounds write. */
-    const size_t max_batch = want_batch < caps.max_batch ? want_batch : caps.max_batch;
+    size_t max_batch = want_batch < caps.max_batch ? want_batch : caps.max_batch;
+    if (max_batch > active_capacity) max_batch = active_capacity;
+    if (max_batch == 0u) {
+        engine->model_free(state);
+        return refuse_all(sink, "the engine cannot serve an empty microbatch");
+    }
+    /* The active-slot array is intentionally independent of the arithmetic
+     * width. It is a capacity reservation, not a promise that one engine call
+     * contains every resident request. */
+    const size_t slot_capacity = active_capacity;
 
     /* Sized once, for the widest batch this driver will ever step, and never
      * resized. Sizing it on the slots that happen to be present is the bug
@@ -1005,7 +1017,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * threads run the decode and when its result is delivered, never the
      * ranges or their order, which is why the goldens do not care. */
     const int lane_on = mynah_lane_width() > 0 &&
-                        max_batch <= (size_t)MYNAH_LANE_SLOTS;
+                        slot_capacity <= (size_t)MYNAH_LANE_SLOTS;
     if (lane_on) {
         fprintf(stderr,
                 "driver: decoder lane ON (%d pinned threads). Decodes run per "
@@ -1024,9 +1036,13 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     size_t admitted = 0;
     /* Rotating cursor for the prefill pass; see slots_prefill_slice. */
     size_t prefill_rr = 0;
+    /* Active capacity may exceed the engine microbatch width. The step arrays
+     * are intentionally sized to max_batch, so walk the resident slots in a
+     * fair rotating order and submit at most one microbatch per iteration. */
+    size_t step_rr = 0;
     unsigned long long prep_seq_next = 0;
 
-    synth_slot slots[MYNAH_GRAPH_MAX_JOBS];
+    synth_slot slots[MYNAH_GRAPH_MAX_ACTIVE];
     mynah_engine_ctx *step_ctxs[MYNAH_GRAPH_MAX_JOBS];
     size_t step_slot[MYNAH_GRAPH_MAX_JOBS];
     mynah_engine_step_result results[MYNAH_GRAPH_MAX_JOBS];
@@ -1080,7 +1096,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * alone; it is not waited for here and never on another slot's
          * account. */
         if (lane_on) {
-            for (size_t i = 0; i < max_batch; ++i) {
+            for (size_t i = 0; i < slot_capacity; ++i) {
                 if (slots[i].in_use) lane_reap(&slots[i], i, 0);
             }
         }
@@ -1091,13 +1107,13 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * up waiting for an arrival that may not come. */
         const unsigned long long t_admit =
             mynah_costmap_level() ? mynah_costmap_now_ns() : 0ull;
-        while (!drained && used < max_batch &&
+        while (!drained && used < slot_capacity &&
                (sink->running == NULL || sink->running(sink->ud) != 0)) {
-            size_t index = max_batch;
-            for (size_t i = 0; i < max_batch; ++i) {
+            size_t index = slot_capacity;
+            for (size_t i = 0; i < slot_capacity; ++i) {
                 if (!slots[i].in_use) { index = i; break; }
             }
-            if (index == max_batch) break;
+            if (index == slot_capacity) break;
 
             mynah_graph_job job;
             memset(&job, 0, sizeof(job));
@@ -1152,7 +1168,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
 
         /* ---- cancellation --------------------------------------------- */
         if (sink->cancelled != NULL) {
-            for (size_t i = 0; i < max_batch; ++i) {
+            for (size_t i = 0; i < slot_capacity; ++i) {
                 /* A slot still prefilling is cancellable too, and has to be:
                  * otherwise a client that disconnects during a long prefill
                  * keeps a slot slicing to completion before anyone notices. */
@@ -1167,17 +1183,27 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
 
         /* ---- finish the prefills that are in flight -------------------- */
         if (engine->prepare_slice != NULL) {
-            slots_prefill_slice(engine, slots, max_batch, dump_all, &prefill_rr);
+            slots_prefill_slice(engine, slots, slot_capacity, dump_all, &prefill_rr);
         }
 
-        /* ---- one step over everything still live ---------------------- */
+        /* ---- one bounded step over the live set -----------------------
+         * A continuous service may retain 128 request contexts while the
+         * engine accepts B16 arithmetic. Never pass the resident count to
+         * the fixed B16 step arrays: rotate the selected slice so every live
+         * request advances without widening the engine call. */
         size_t live = 0;
-        for (size_t i = 0; i < max_batch; ++i) {
+        size_t next_step_rr = step_rr;
+        for (size_t offset = 0; offset < slot_capacity && live < max_batch;
+             ++offset) {
+            const size_t i = (step_rr + offset) % slot_capacity;
             if (!slots[i].in_use || !slots[i].active) continue;
             step_slot[live] = i;
             step_ctxs[live] = slots[i].ctx;
             ++live;
+            next_step_rr = (i + 1u) % slot_capacity;
         }
+        if (live > 0u) step_rr = next_step_rr;
+        else step_rr = (step_rr + 1u) % slot_capacity;
         if (serve_profile) {
             ++occ_frames;
             occ_hist[live <= max_batch ? live : max_batch] += 1u;
@@ -1199,7 +1225,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * Not after the whole group: the slot is the unit of capacity, and
          * holding a finished one until its neighbours catch up is exactly the
          * wait continuous admission exists to remove. */
-        for (size_t i = 0; i < max_batch; ++i) {
+        for (size_t i = 0; i < slot_capacity; ++i) {
             /* `preparing` is the third state this loop has to know about: not
              * active, and not finished either. Without it a sliced prefill
              * would be retired one iteration after it was admitted, which is a
@@ -1297,15 +1323,26 @@ int mynah_graph_serve_engine(const mynah_tts_engine *engine,
                              size_t max_batch, int strict_batch) {
     if (max_batch == 0u) max_batch = 1u;
     if (max_batch > MYNAH_GRAPH_MAX_JOBS) max_batch = MYNAH_GRAPH_MAX_JOBS;
-    return serve(engine, model, sink, max_batch, strict_batch, 0);
+    return serve(engine, model, sink, max_batch, max_batch, strict_batch, 0);
 }
 
 int mynah_graph_serve_continuous(const mynah_tts_model *model, size_t max_batch,
                                  mynah_graph_sink *sink) {
+    return mynah_graph_serve_continuous_capacity(model, max_batch, 0u, sink);
+}
+
+int mynah_graph_serve_continuous_capacity(const mynah_tts_model *model,
+                                          size_t max_batch,
+                                          size_t active_capacity,
+                                          mynah_graph_sink *sink) {
     if (model == NULL) return -1;
     if (max_batch == 0u) max_batch = 1u;
     if (max_batch > MYNAH_GRAPH_MAX_JOBS) max_batch = MYNAH_GRAPH_MAX_JOBS;
-    return serve(mynah_engine_lookup(model->info.engine), model, sink, max_batch, 0, 0);
+    if (active_capacity == 0u) active_capacity = max_batch;
+    if (active_capacity > MYNAH_GRAPH_MAX_ACTIVE)
+        active_capacity = MYNAH_GRAPH_MAX_ACTIVE;
+    return serve(mynah_engine_lookup(model->info.engine), model, sink,
+                 max_batch, active_capacity, 0, 0);
 }
 
 /* See mynah_tts.h. Builds the model-owned caches and throws the rest away.
@@ -1356,8 +1393,8 @@ int mynah_graph_synthesize_jobs(const mynah_tts_model *model,
     sink.ud = &state;
     sink.next_job = array_next_job;
     sink.on_done = array_on_done;
-    return serve(mynah_engine_lookup(model->info.engine), model, &sink, count, 1,
-                 count == 1u);
+    return serve(mynah_engine_lookup(model->info.engine), model, &sink, count,
+                 count, 1, count == 1u);
 }
 
 int mynah_graph_synthesize_stream(const mynah_tts_model *model,

@@ -276,7 +276,7 @@ typedef struct {
     int listen_fd;      /* already bound and listening; the parent keeps it */
     int workers;        /* W; <= 0 asks for a plan based on the cpu mask */
     int threads_per;    /* T; <= 0 derives it from W and the cpu mask */
-    int slots_per;      /* requests in flight per worker: the child's max_batch */
+    int slots_per;      /* resident requests per worker: child's active capacity */
     int quiet;          /* suppress the banner (tests) */
 
     /* ---- LANGUAGE GROUPS (E5-9) ----

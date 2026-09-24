@@ -41,6 +41,7 @@ struct mynah_backend {
     int (*decoder_step)(void *, mynah_backend_decoder *, const float *, size_t,
                         float *, char *, size_t);
     int (*decoder_note_step)(void *, mynah_backend_decoder *);
+    int (*decoder_note_batch)(void *, size_t, size_t);
     int (*metrics_get)(void *, mynah_tts_backend_metrics *);
     /* Device-side ops (NULL = CPU fallback in backend.c). */
     int (*upload)(void *, const float *, size_t, float **, char *, size_t);
@@ -186,6 +187,7 @@ extern int mynah_cuda_decoder_reset(void *, mynah_backend_decoder *, char *, siz
 extern int mynah_cuda_decoder_step(void *, mynah_backend_decoder *, const float *,
                                    size_t, float *, char *, size_t);
 extern int mynah_cuda_decoder_note_step(void *, mynah_backend_decoder *);
+extern int mynah_cuda_decoder_note_batch(void *, size_t, size_t);
 extern int mynah_cuda_metrics_get(void *, mynah_tts_backend_metrics *);
 #endif
 
@@ -668,6 +670,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->decoder_reset = mynah_cuda_decoder_reset;
         backend->decoder_step = mynah_cuda_decoder_step;
         backend->decoder_note_step = mynah_cuda_decoder_note_step;
+        backend->decoder_note_batch = mynah_cuda_decoder_note_batch;
         backend->metrics_get = mynah_cuda_metrics_get;
 #else
         free(backend);
@@ -796,6 +799,13 @@ int mynah_backend_decoder_note_step(const mynah_backend *backend,
     if (backend == NULL || decoder == NULL || backend->decoder_note_step == NULL)
         return 0;
     return backend->decoder_note_step(backend->state, decoder);
+}
+
+int mynah_backend_decoder_note_batch(const mynah_backend *backend,
+                                     size_t items, size_t frames) {
+    if (backend == NULL || items == 0u || frames == 0u ||
+        backend->decoder_note_batch == NULL) return 0;
+    return backend->decoder_note_batch(backend->state, items, frames);
 }
 
 int mynah_backend_metrics_get(const mynah_backend *backend,

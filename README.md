@@ -173,20 +173,28 @@ curl -X POST http://localhost:8080/v1/tts \
 curl http://localhost:8080/v1/voices          # ids and names
 curl http://localhost:8080/v1/models          # OpenAI-shaped listing
 curl http://localhost:8080/health             # liveness
+curl http://localhost:8080/metrics            # Prometheus counters/gauges
 ```
 
 Requests accept `seed`, `temperature`, `top_k`, `max_steps`, `language` and
 `"stream": true` for chunked PCM as it is generated, sample-identical to the
 batch response.
 
+For CUDA server experiments, `--max-batch` is the bounded engine microbatch and
+`--max-inflight` is the independent resident-slot ceiling (for example 16 and
+128). This prepares C100 concurrency without claiming a B100 kernel.
+
 **Concurrent requests are batched, vLLM-style.** Offline requests are not
 serialized behind a lock: a scheduler admits everything queued into one
 weight-stationary decode — per-request KV, RNG and EOS, one pass over the
-decode weights for all of them (up to 16 in flight). Measured 1.63x aggregate
+decode weights for each bounded engine microbatch (up to 16 by default).
+`--max-inflight` can retain more resident streaming slots without widening that
+microbatch. Measured 1.63x aggregate
 throughput at eight concurrent, and stronger than vLLM on one axis: each
 request's audio is **byte-identical** to the same request run alone, whatever
-it happened to batch with. Streaming requests run one at a time by design —
-their callback interleaves with generation.
+it happened to batch with. Streaming requests join the same bounded scheduler
+and their callbacks interleave with generation; the resident-slot ceiling is
+independent from the arithmetic microbatch width.
 
 The plumbing is what you would expect of a real server: a fixed worker pool
 (`-w`, default 4) drains a bounded connection queue, sheds load with `503` +

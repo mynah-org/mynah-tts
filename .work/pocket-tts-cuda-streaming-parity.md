@@ -305,11 +305,12 @@ Use the existing admission/scheduler/sink. For CUDA:
 * one process owns one selected GPU;
 * `--prefork` is rejected before startup, not after a request arrives;
 * `--max-batch` is constrained by the Pocket CUDA capability and VRAM budget;
-* cancellation, timeout, bounded queue, health and `/v1/audio/speech`/
-  `/v1/tts` streaming retain the CPU contract;
+* cancellation, timeout, bounded queue, health, `/metrics` and
+  `/v1/audio/speech`/`/v1/tts` streaming retain the CPU contract;
 * the scheduler exposes graph-hit, batch-width, H2D/D2H, sync and fallback
-  counters without allocating in the AR loop. `/health` carries backend
-  metrics for CPU (zero CUDA counters) and CUDA (live monotonic counters).
+  counters without allocating in the AR loop. `/health` and `/metrics` carry
+  backend metrics for CPU (zero CUDA counters) and CUDA (live monotonic
+  counters).
 
 Do not add a second HTTP implementation or a CUDA-specific response format.
 
@@ -345,6 +346,68 @@ throughput, p50/p95, VRAM, host RSS, graph hit rate, H2D/D2H bytes and sync
 counts. A C100 claim requires a 30-minute soak, audio/parity gates, no hidden
 CPU fallback, and a stable drift window. It cannot be inferred from an RTX,
 A100, or Qwen number.
+
+## 2026-09-24 implementation audit and next code slices
+
+The review against the current tree, `../qwen-tts`, and the official vLLM-Omni
+CUDA-graph/async-chunk designs found that the resident slice is a correct
+bring-up foundation, not yet a qualified C100 path. The important distinction is
+between **active request capacity** and **GPU microbatch width**: Pocket currently
+publishes `max_batch = 16`, so a CUDA server cannot express C100 concurrent slots
+without a scheduler/capacity seam even if the GPU executes only B8/B16 at a time.
+
+The current CUDA decoder is still context-serial arithmetically. The
+`decode_audio_batch()` path now prepares every context, submits resident decoder
+work and queues every D2H before one common stream drain behind
+`MYNAH_CUDA_DECODER_BATCH`; this is a launch/synchronization optimization and
+must not be described as true cross-request arithmetic batching. The scheduler
+also separates `--max-batch` (engine microbatch) from `--max-inflight` (resident
+slots, up to 128), so a C100 experiment can keep 100 live requests while
+executing bounded B1/B2/B4/B8/B16 work. The next slice owns B1/B2/B4/B8/B16
+decoder state arrays and padded `(batch, frames)` graph buckets.
+
+The following flags are explicit experiments, not hidden policy:
+
+```text
+MYNAH_CUDA_GRAPHS=0|1              graph capture/replay escape hatch
+MYNAH_CUDA_FAST_MATH=0|1           TF32/fast compute experiment; no parity claim
+MYNAH_CUDA_DECODER_BATCH=0|1       async decoder gang submission, default on for CUDA
+```
+
+`MYNAH_CUDA_DECODER_GEMM` and `MYNAH_CUDA_METRICS` are intentionally not
+accepted yet: they would be misleading no-op knobs until packed
+ConvTranspose/GEMM and per-stage/bucket timing instrumentation exist. Their
+work is tracked by CUDA-04 and CUDA-06/observability respectively.
+
+Metrics must distinguish monotonic backend counters from request timing sums and
+future histograms. The current `/metrics` surface includes queue wait, TTFA,
+E2E, RTF and audio seconds; TTFB, stage/batch width, decoder bucket hit/miss,
+and per-stage H2D/D2H timing remain follow-up work. The backend already exposes
+H2D/D2H bytes and calls, graph capture/replay/fallback reasons, sync count,
+device VRAM totals and resident fallback counts. Labels stay low-cardinality (`backend`, `arch`,
+`precision`, `stage`, `bucket`) so a request ID never enters Prometheus.
+
+The hosted GitHub job remains compile-only for `sm_70`, `sm_89` and `sm_90`.
+Its self-test command must not be used as a runtime gate without a device. A
+later optional/self-hosted GPU job will run model-free kernels, CPU↔CUDA stage
+parity, stream/offline parity, graph on/off, precision variants and
+`compute-sanitizer`; until then status is compile-verified, not runtime-verified.
+
+### Work item order
+
+Current slice status: CUDA-01, CUDA-02 and CUDA-03 are implemented in the
+local branch and covered by CPU/server gates; the CUDA behavior itself remains
+compile-only until an NVIDIA box is available.
+
+```text
+CUDA-01  async decoder gang submission + backend batch counters (implemented; GPU parity open)
+CUDA-02  Prometheus /metrics + GPU/graph/transfer/batch observability (implemented; TTFB/per-stage timing histograms open)
+CUDA-03  C100 capacity seam: inflight slots separate from microbatch width (implemented; runtime soak open)
+CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels and graph buckets
+CUDA-05  codec-transformer residency + H2D/D2H overlap
+CUDA-06  BF16/FP16/cuBLASLt/fused kernel ladder with stage parity gates
+CUDA-07  optional GPU CI, sanitizer and L40S qualification campaign
+```
 
 ## Acceptance gates before calling this done
 

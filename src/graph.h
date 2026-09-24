@@ -8,16 +8,22 @@
 void *mynah_graph_local_projection_cache_new(const mynah_tts_model *model);
 void mynah_graph_local_projection_cache_free(void *cache);
 
-/* Ceiling on the driver's fixed-size slot arrays.
+/* Ceiling on the driver's fixed-size microbatch arrays.
  *
  * This is the DRIVER's limit, and it is deliberately not the only one: the
  * authority on how wide a batch a model can actually take is the engine's
  * `caps.max_batch` (mynah_engine_caps), which a continuous-latent engine sets
- * to 1 until its batching has been measured. The driver always steps
- * min(requested, caps.max_batch, MYNAH_GRAPH_MAX_JOBS) contexts, so the two
- * numbers cannot drift apart into an out-of-bounds write the way two unlinked
- * constants would: one sizes the arrays here, the other is asked at run time. */
+ * to 1 until its batching has been measured. The driver steps
+ * min(requested, caps.max_batch, MYNAH_GRAPH_MAX_JOBS) contexts at once; a
+ * separate active-slot ceiling is only for continuous services and does not
+ * widen engine arithmetic. */
 #define MYNAH_GRAPH_MAX_JOBS 16u
+
+/* Maximum resident request slots for a continuous service. A service can keep
+ * more contexts alive than it submits in one engine microbatch, which is the
+ * capacity seam needed for a C100 target. Offline/public array batching stays
+ * capped by MYNAH_GRAPH_MAX_JOBS. */
+#define MYNAH_GRAPH_MAX_ACTIVE 128u
 
 /* Outcomes reported per request. Cancellation is distinct from failure on
  * purpose: a client that hung up did not hit a synthesis bug, and reporting it
@@ -84,6 +90,15 @@ typedef struct {
  * Returns 0 when every request served succeeded, -1 when any failed. */
 int mynah_graph_serve_continuous(const mynah_tts_model *model, size_t max_batch,
                                  mynah_graph_sink *sink);
+
+/* Continuous service with separate arithmetic width and resident capacity.
+ * `max_batch` is the largest engine call; `active_capacity` is the number of
+ * live request contexts the scheduler may retain. Passing zero for
+ * active_capacity preserves the legacy one-number behavior. */
+int mynah_graph_serve_continuous_capacity(const mynah_tts_model *model,
+                                          size_t max_batch,
+                                          size_t active_capacity,
+                                          mynah_graph_sink *sink);
 
 /* Synthesize up to MYNAH_GRAPH_MAX_JOBS requests together, sharing one pass
  * over the decoder weights per step instead of one per request.  Returns 0 when

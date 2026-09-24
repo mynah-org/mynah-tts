@@ -96,6 +96,10 @@ int mynah_backend_decoder_step(const mynah_backend *backend,
  * submissions.  CPU/unsupported backends treat it as a no-op. */
 int mynah_backend_decoder_note_step(const mynah_backend *backend,
                                     mynah_backend_decoder *decoder);
+/* Record one decoder gang submission. This is a diagnostic seam for the
+ * asynchronous CUDA decoder path; CPU and other backends treat it as a no-op. */
+int mynah_backend_decoder_note_batch(const mynah_backend *backend,
+                                     size_t items, size_t frames);
 int mynah_backend_metrics_get(const mynah_backend *backend,
                                mynah_tts_backend_metrics *metrics);
 

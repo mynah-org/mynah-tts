@@ -21,12 +21,25 @@ typedef enum {
 typedef struct {
     unsigned long long h2d_bytes;
     unsigned long long d2h_bytes;
+    unsigned long long h2d_calls;
+    unsigned long long d2h_calls;
+    unsigned long long sync_calls;
     unsigned long long graph_captures;
     unsigned long long graph_replays;
     unsigned long long graph_fallbacks;
     unsigned long long decoder_steps;
+    unsigned long long decoder_batch_calls;
+    unsigned long long decoder_batch_items;
+    unsigned long long decoder_batch_frames;
     unsigned long long decoder_failures;
     unsigned long long resident_fallbacks;
+    unsigned long long matmul_calls;
+    unsigned long long matvec_calls;
+    unsigned long long device_memory_bytes;
+    unsigned long long device_memory_free_bytes;
+    unsigned graphs_enabled;
+    unsigned fast_math_enabled;
+    unsigned decoder_batch_enabled;
 } mynah_tts_backend_metrics;
 
 typedef struct {

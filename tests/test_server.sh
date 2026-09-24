@@ -76,6 +76,12 @@ echo "health      $(curl -s "$BASE/health")"
 curl -s "$BASE/health" | grep -q '"status":"ok"' || fail "/health"
 curl -s "$BASE/health" | grep -q '"backend_metrics":{"h2d_bytes":' ||
     fail "/health backend_metrics"
+curl -s "$BASE/metrics" | grep -q '^mynah_backend_sync_calls_total ' ||
+    fail "/metrics backend counters"
+curl -s "$BASE/metrics" | grep -q '^mynah_server_max_batch ' ||
+    fail "/metrics server gauges"
+curl -s "$BASE/metrics" | grep -q '^mynah_server_timing_requests_total ' ||
+    fail "/metrics timing counters"
 
 curl -s "$BASE/v1/voices" | grep -q '"voices"' || fail "/v1/voices"
 
@@ -113,8 +119,10 @@ HEALTH="$(curl -s "$BASE/health")"
 hw=$(printf '%s' "$HEALTH" | grep -o '"workers":[0-9]*' | head -1 | cut -d: -f2)
 hb=$(printf '%s' "$HEALTH" | grep -o '"max_batch":[0-9]*' | head -1 | cut -d: -f2)
 [ -n "$hw" ] && [ -n "$hb" ] || fail "/health did not report workers and max_batch"
+ha=$(printf '%s' "$HEALTH" | grep -o '"active_slots":[0-9]*' | head -1 | cut -d: -f2)
+[ -n "$ha" ] || fail "/health did not report active_slots"
 [ "$hw" -ge "$hb" ] || fail "workers $hw is below max_batch $hb: non-streaming requests can never reach the advertised batch width"
-echo "batch ceiling ok (workers $hw >= max_batch $hb)"
+echo "batch ceiling ok (workers $hw >= max_batch $hb, active_slots $ha)"
 
 curl -s "$BASE/v1/models" | grep -q '"object":"list"' || fail "/v1/models"
 echo "models      ok"
@@ -156,6 +164,40 @@ else
     a=$(wc -c < "$TMP/batch.pcm" | tr -d ' ')
     b=$(wc -c < "$TMP/stream.pcm" | tr -d ' ')
     fail "streamed audio differs from batch (batch $a bytes, stream $b bytes)"
+fi
+TIMING_METRICS="$(curl -s "$BASE/metrics")"
+printf '%s\n' "$TIMING_METRICS" \
+    | grep -Eq '^mynah_server_timing_requests_total [1-9][0-9]*$' \
+    || fail "/metrics did not count completed timing samples"
+printf '%s\n' "$TIMING_METRICS" \
+    | grep -Eq '^mynah_server_audio_seconds_total [0-9]+\.[0-9]+$' \
+    || fail "/metrics did not expose audio timing"
+echo "metrics     ok (timing sums populated)"
+
+# The GPU capacity seam deliberately allows more resident contexts than one
+# engine microbatch. Exercise that branch with real concurrent streams when
+# the test was launched with --max-inflight above --max-batch; this catches a
+# fixed-array overrun that four-request parity checks cannot see.
+if [ "$ha" -gt "$hb" ]; then
+    capacity_pids=""
+    n=1
+    while [ "$n" -le 20 ]; do
+        curl -s --max-time 600 -X POST "$BASE/v1/audio/speech" \
+            -H 'Content-Type: application/json' \
+            -d "{\"input\":\"active capacity $n\",\"voice\":\"$VOICE\",\"seed\":$((100 + n)),\"stream\":true}" \
+            -o "$TMP/capacity$n.pcm" &
+        capacity_pids="$capacity_pids $!"
+        n=$((n + 1))
+    done
+    for p in $capacity_pids; do
+        wait "$p" || fail "active-capacity stream failed"
+    done
+    n=1
+    while [ "$n" -le 20 ]; do
+        [ -s "$TMP/capacity$n.pcm" ] || fail "active-capacity stream $n was empty"
+        n=$((n + 1))
+    done
+    echo "capacity    ok (20 resident streams above the microbatch width)"
 fi
 
 # --- Reproducibility -------------------------------------------------------

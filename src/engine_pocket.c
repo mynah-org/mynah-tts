@@ -3514,28 +3514,59 @@ static int pocket_cuda_decoder_alloc(mynah_engine_ctx *ctx) {
     return 0;
 }
 
-/* Return 0 when the resident decoder produced ctx->pcm, 1 when the optional
- * path is unavailable before it touched decoder state, and -1 after a launch
- * or output error. Once the GPU rings have advanced, silently switching to the
- * CPU rings would be wrong, so that last case is intentionally request-fatal. */
-static int pocket_cuda_decoder_step(mynah_engine_ctx *ctx, char *error,
-                                    size_t capacity) {
+/* Return the resident decoder's per-step buffer sizes.  Keeping this check in
+ * one place matters because the submit/collect split below is also used by the
+ * frame-major server gang: a failed size calculation must remain a pre-state
+ * optional-backend fallback, never a half-submitted decoder step. */
+static int pocket_cuda_decoder_sizes(const mynah_engine_ctx *ctx,
+                                     size_t *input_floats,
+                                     size_t *output_floats) {
+    if (input_floats != NULL) *input_floats = 0u;
+    if (output_floats != NULL) *output_floats = 0u;
+    if (ctx == NULL || ctx->state == NULL || input_floats == NULL ||
+        output_floats == NULL) return -1;
+    const pocket_config *cfg = &ctx->state->cfg;
+    if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, input_floats) != 0 ||
+        pocket_mul(cfg->audio_channels, cfg->samples_per_frame,
+                   output_floats) != 0) return -1;
+    return 0;
+}
+
+/* Return 0 when the resident decoder has queued this frame, 1 when the
+ * optional path is unavailable before it touched decoder state, and -1 after
+ * a launch/graph error. Once the GPU rings have advanced, silently switching
+ * to the CPU rings would be wrong, so that last case is request-fatal.
+ *
+ * This function intentionally stops before D2H and synchronization. The
+ * frame-major gang uses it for every active context, queues all output copies,
+ * then drains the common CUDA stream once. */
+static int pocket_cuda_decoder_submit(mynah_engine_ctx *ctx, char *error,
+                                      size_t capacity) {
     if (ctx == NULL || !ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL)
         return 1;
     const mynah_backend *backend = ctx->state->backend;
     const pocket_config *cfg = &ctx->state->cfg;
     size_t input_floats = 0u;
     size_t output_floats = 0u;
-    if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, &input_floats) != 0 ||
-        pocket_mul(cfg->audio_channels, cfg->samples_per_frame,
-                   &output_floats) != 0) {
+    if (pocket_cuda_decoder_sizes(ctx, &input_floats, &output_floats) != 0) {
+        if (ctx->cuda_decoder_started) {
+            pocket_error(error, capacity, "CUDA decoder size overflow after state advance");
+            return -1;
+        }
         pocket_cuda_decoder_release(ctx);
         return 1;
     }
+    (void)output_floats;
     char local[256];
     local[0] = '\0';
     if (mynah_backend_h2d(backend, ctx->codec_back, ctx->cuda_decoder_input,
                           input_floats, local, sizeof(local)) != 0) {
+        if (ctx->cuda_decoder_started) {
+            pocket_error(error, capacity, "%s", local[0] != '\0'
+                                               ? local
+                                               : "CUDA decoder input copy failed after state advance");
+            return -1;
+        }
         pocket_cuda_decoder_release(ctx);
         return 1;
     }
@@ -3548,6 +3579,12 @@ static int pocket_cuda_decoder_step(mynah_engine_ctx *ctx, char *error,
             backend, POCKET_CUDA_DECODER_GRAPH_KEY, ctx->cuda_decoder, &replay,
             local, sizeof(local));
         if (status < 0) {
+            if (ctx->cuda_decoder_started) {
+                pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                   ? local
+                                                   : "CUDA decoder graph setup failed after state advance");
+                return -1;
+            }
             pocket_cuda_decoder_release(ctx);
             return 1;
         }
@@ -3617,13 +3654,56 @@ static int pocket_cuda_decoder_step(mynah_engine_ctx *ctx, char *error,
         }
         (void)mynah_backend_decoder_note_step(backend, ctx->cuda_decoder);
     }
-    if (mynah_backend_d2h(backend, ctx->cuda_decoder_output, ctx->pcm,
-                          output_floats, local, sizeof(local)) != 0 ||
-        mynah_backend_sync(backend, local, sizeof(local)) != 0) {
+    return 0;
+}
+
+/* Queue the resident decoder output into its host PCM buffer.  No sync is
+ * allowed here; callers must drain the backend once after all contexts in the
+ * gang have submitted their copies. */
+static int pocket_cuda_decoder_collect(mynah_engine_ctx *ctx, char *error,
+                                       size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL)
+        return -1;
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+    if (pocket_cuda_decoder_sizes(ctx, &input_floats, &output_floats) != 0) {
+        pocket_error(error, capacity, "CUDA decoder output size overflow");
+        return -1;
+    }
+    (void)input_floats;
+    char local[256];
+    local[0] = '\0';
+    if (mynah_backend_d2h(ctx->state->backend, ctx->cuda_decoder_output,
+                          ctx->pcm, output_floats, local, sizeof(local)) != 0) {
+        pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                              : "CUDA decoder output copy failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* Single-context compatibility wrapper.  Offline and streaming callers keep
+ * exactly the old semantics; only the gang scheduler uses submit/collect
+ * directly. */
+static int pocket_cuda_decoder_step(mynah_engine_ctx *ctx, char *error,
+                                    size_t capacity) {
+    const int submitted = pocket_cuda_decoder_submit(ctx, error, capacity);
+    if (submitted != 0) return submitted;
+    if (pocket_cuda_decoder_collect(ctx, error, capacity) != 0) return -1;
+    char local[256];
+    local[0] = '\0';
+    if (mynah_backend_sync(ctx->state->backend, local, sizeof(local)) != 0) {
         pocket_error(error, capacity, "%s", local[0] != '\0' ? local
                                                               : "CUDA decoder synchronization failed");
         return -1;
     }
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+    if (pocket_cuda_decoder_sizes(ctx, &input_floats, &output_floats) != 0) {
+        pocket_error(error, capacity, "CUDA decoder output size overflow");
+        return -1;
+    }
+    (void)input_floats;
     if (!pocket_all_finite(ctx->pcm, output_floats)) {
         pocket_error(error, capacity, "CUDA decoder produced non-finite PCM");
         return -1;
@@ -5417,8 +5497,11 @@ static void pocket_truncate(mynah_engine_ctx *ctx, size_t frame_count) {
  * ring buffers, the decoder transformer's KV, the position counter -- so the
  * order in which contexts are visited cannot reach any of the numbers.
  */
-static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
-                               size_t capacity) {
+/* Prepare the host-owned portion of one codec frame.  Decoder submission is
+ * deliberately outside this helper so a gang can prepare every context before
+ * it queues any D2H or synchronization work. */
+static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
+                                       char *error, size_t capacity) {
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
     const size_t stride = cfg->upsample_stride;
@@ -5486,12 +5569,22 @@ static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
         memcpy(ctx->dump->codec_tf + slot * ctx->dump->codec_row, ctx->codec_out,
                ctx->dump->codec_row * sizeof(float));
     }
-    mynah_region_begin2(MYNAH_RGN_CODEC_CONV);
-    const int cuda_decode = pocket_cuda_decoder_step(ctx, error, capacity);
-    if (cuda_decode < 0) {
-        mynah_region_unwind(depth);
+    return 0;
+}
+
+/* Finish the common host-side state transition after either a CPU decoder or
+ * a resident CUDA decoder has produced ctx->pcm. */
+static int pocket_decode_frame_finish(mynah_engine_ctx *ctx, int cuda_decode,
+                                      char *error, size_t capacity) {
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const size_t stride = cfg->upsample_stride;
+    const int depth = mynah_region_depth();
+    if (cuda_decode < 0 || cuda_decode > 1) {
+        pocket_error(error, capacity, "pocket: invalid decoder completion state");
         return -1;
     }
+    mynah_region_begin2(MYNAH_RGN_CODEC_CONV);
     if (cuda_decode > 0 &&
         mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
                             ctx->pcm) != 0) {
@@ -5507,6 +5600,24 @@ static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
         ++ctx->dump->decoded;
     }
     return 0;
+}
+
+/* One context's compatibility schedule: prepare, submit/collect/sync, then
+ * finish.  The gang schedule below calls the same prepare/finish helpers but
+ * drains one shared backend stream for all resident decoder submissions. */
+static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
+                               size_t capacity) {
+    const int depth = mynah_region_depth();
+    if (pocket_decode_frame_prepare(ctx, frame, error, capacity) != 0) {
+        mynah_region_unwind(depth);
+        return -1;
+    }
+    const int cuda_decode = pocket_cuda_decoder_step(ctx, error, capacity);
+    if (cuda_decode < 0) {
+        mynah_region_unwind(depth);
+        return -1;
+    }
+    return pocket_decode_frame_finish(ctx, cuda_decode, error, capacity);
 }
 
 /*
@@ -5614,10 +5725,10 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
  * scheduling decision the driver remakes every step on timing, so anything that
  * crossed between rows would make a request's audio depend on server load. The
  * guarantee here is structural rather than tested-and-hoped: every frame goes
- * through `pocket_decode_frame` above, which touches this context's buffers and
- * no others, so the loop below is free to visit contexts in any order it likes
- * and there is no arithmetic anywhere that can see the row count. Nothing was
- * relaxed to make batching possible, which is the reason it is safe.
+ * through the prepare/finish helpers above, which touch this context's buffers
+ * and no others. The CUDA schedule may submit several resident decoders before
+ * one stream drain, but it never aliases their causal state or changes their
+ * arithmetic.
  *
  * ## Frame-major, and what that is and is not worth
  *
@@ -5630,14 +5741,12 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
  * step that actually shares work is local to this function instead of a
  * restructuring of it.
  *
- * What blocks that step is named rather than implied: the 41.8% item is the
- * decoder transformer, and sharing it across contexts needs a cross-request
- * PREFILL in `transformer_ar` -- `_step_batch` takes one position per state,
- * while a codec frame is `upsample_stride` consecutive positions of one state.
- * That module belongs to another lane. Until it exists the only cross-context
- * arithmetic available here is `quantizer.output_proj`, 32x512 against the
- * transformer's millions, and batching it would trade a measurable risk to
- * bit-identity for an unmeasurable gain. It was deliberately left alone.
+ * What blocks true cross-request arithmetic is named rather than implied: the
+ * 41.8% item is the decoder transformer, and sharing it across contexts needs
+ * a cross-request PREFILL in `transformer_ar` -- `_step_batch` takes one
+ * position per state, while a codec frame is `upsample_stride` consecutive
+ * positions of one state. The resident SEANet gang below is therefore a
+ * launch/overlap slice, not a claim that the decoder is already a Bx kernel.
  *
  * ## Blast radius
  *
@@ -5646,6 +5755,31 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
  * passes and every other context finishes its own range. The return value is
  * non-zero only for something that belongs to no single context.
  */
+static int pocket_cuda_decoder_batch_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_DECODER_BATCH");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+static void pocket_decode_batch_drop(mynah_engine_ctx *ctx, size_t index,
+                                     float **out_samples, size_t *out_count,
+                                     int *failed, int *reported,
+                                     const char *detail, char *error,
+                                     size_t capacity) {
+    if (ctx != NULL) ctx->broken = 1;
+    if (out_samples != NULL && out_samples[index] != NULL) {
+        free(out_samples[index]);
+        out_samples[index] = NULL;
+    }
+    if (out_count != NULL) out_count[index] = 0u;
+    if (failed != NULL) failed[index] = 1;
+    if (reported != NULL && !*reported) {
+        pocket_error(error, capacity, "%s", detail != NULL && detail[0] != '\0'
+                                             ? detail
+                                             : "pocket: decoding audio failed");
+        *reported = 1;
+    }
+}
+
 static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
                                      const size_t *first_frame,
                                      const size_t *frame_count, float **out_samples,
@@ -5715,34 +5849,157 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
     }
 
     if (longest == 0u) return 0;
-    mynah_region_begin(MYNAH_RGN_CODEC);
-    for (size_t f = 0; f < longest; ++f) {
+    const mynah_backend *batch_backend = NULL;
+    int use_async_decoder = pocket_cuda_decoder_batch_enabled();
+    if (use_async_decoder) {
         for (size_t i = 0; i < count; ++i) {
-            if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
-            mynah_engine_ctx *ctx = ctxs[i];
-            const size_t frame_samples = ctx->state->cfg.samples_per_frame;
-            one_error[0] = '\0';
-            if (pocket_decode_frame(ctx, first_frame[i] + f, one_error,
-                                    sizeof(one_error)) != 0) {
-                /* This context's codec advanced through frames nobody will hear
-                 * and cannot be rewound -- same reasoning as the single-range
-                 * path. Its neighbours are untouched and keep decoding. */
-                ctx->broken = 1;
-                free(out_samples[i]);
-                out_samples[i] = NULL;
-                out_count[i] = 0u;
-                failed[i] = 1;
-                if (!reported) {
-                    pocket_error(error, capacity, "%s",
-                                 one_error[0] != '\0'
-                                     ? one_error
-                                     : "pocket: decoding audio failed");
-                    reported = 1;
-                }
-                continue;
+            if (failed[i] || out_samples[i] == NULL) continue;
+            const mynah_backend *backend = ctxs[i]->state->backend;
+            if (backend == NULL ||
+                (batch_backend != NULL && backend != batch_backend)) {
+                use_async_decoder = 0;
+                break;
             }
-            memcpy(out_samples[i] + f * frame_samples, ctx->pcm,
-                   frame_samples * sizeof(float));
+            if (batch_backend == NULL) batch_backend = backend;
+        }
+        if (batch_backend == NULL ||
+            strcmp(mynah_backend_name(batch_backend), "cuda") != 0)
+            use_async_decoder = 0;
+    }
+
+    mynah_region_begin(MYNAH_RGN_CODEC);
+    if (!use_async_decoder) {
+        /* This is the unchanged CPU/compatibility schedule. */
+        for (size_t f = 0; f < longest; ++f) {
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                mynah_engine_ctx *ctx = ctxs[i];
+                const size_t frame_samples = ctx->state->cfg.samples_per_frame;
+                one_error[0] = '\0';
+                if (pocket_decode_frame(ctx, first_frame[i] + f, one_error,
+                                        sizeof(one_error)) != 0) {
+                    /* This context's codec advanced through frames nobody will
+                     * hear and cannot be rewound; its neighbours are untouched. */
+                    pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                             failed, &reported, one_error,
+                                             error, capacity);
+                    continue;
+                }
+                memcpy(out_samples[i] + f * frame_samples, ctx->pcm,
+                       frame_samples * sizeof(float));
+            }
+        }
+    } else {
+        /* Prepare all host state first, then queue every resident decoder.  A
+         * CUDA graph identity is per decoder, so graphs remain independent even
+         * though their launches share this backend stream. */
+        int prepared[POCKET_MAX_BATCH];
+        int submitted[POCKET_MAX_BATCH];
+        for (size_t f = 0; f < longest; ++f) {
+            memset(prepared, 0, sizeof(prepared));
+            memset(submitted, 0, sizeof(submitted));
+            size_t submitted_count = 0u;
+
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                one_error[0] = '\0';
+                if (pocket_decode_frame_prepare(ctxs[i], first_frame[i] + f,
+                                                one_error, sizeof(one_error)) != 0) {
+                    pocket_decode_batch_drop(ctxs[i], i, out_samples, out_count,
+                                             failed, &reported, one_error,
+                                             error, capacity);
+                    continue;
+                }
+                prepared[i] = 1;
+            }
+
+            for (size_t i = 0; i < count; ++i) {
+                if (!prepared[i] || failed[i]) continue;
+                mynah_engine_ctx *ctx = ctxs[i];
+                one_error[0] = '\0';
+                if (!ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL) {
+                    if (pocket_decode_frame_finish(ctx, 1, one_error,
+                                                   sizeof(one_error)) != 0)
+                        pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                                 failed, &reported, one_error,
+                                                 error, capacity);
+                    continue;
+                }
+                const int status = pocket_cuda_decoder_submit(
+                    ctx, one_error, sizeof(one_error));
+                if (status == 0) {
+                    submitted[i] = 1;
+                    ++submitted_count;
+                } else if (status > 0) {
+                    /* The device path was unavailable before state advance;
+                     * CPU remains an allowed per-request fallback. */
+                    if (pocket_decode_frame_finish(ctx, 1, one_error,
+                                                   sizeof(one_error)) != 0)
+                        pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                                 failed, &reported, one_error,
+                                                 error, capacity);
+                } else {
+                    pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                             failed, &reported, one_error,
+                                             error, capacity);
+                }
+            }
+
+            if (submitted_count > 0u) {
+                (void)mynah_backend_decoder_note_batch(batch_backend,
+                                                       submitted_count, 1u);
+                for (size_t i = 0; i < count; ++i) {
+                    if (!submitted[i] || failed[i]) continue;
+                    one_error[0] = '\0';
+                    if (pocket_cuda_decoder_collect(ctxs[i], one_error,
+                                                    sizeof(one_error)) != 0)
+                        pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                 out_count, failed, &reported,
+                                                 one_error, error, capacity);
+                }
+
+                char sync_error[256];
+                sync_error[0] = '\0';
+                const int sync_failed = mynah_backend_sync(
+                    batch_backend, sync_error, sizeof(sync_error)) != 0;
+                if (sync_failed) {
+                    for (size_t i = 0; i < count; ++i) {
+                        if (submitted[i] && !failed[i])
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, &reported,
+                                                     sync_error, error, capacity);
+                    }
+                } else {
+                    for (size_t i = 0; i < count; ++i) {
+                        if (!submitted[i] || failed[i]) continue;
+                        size_t input_floats = 0u;
+                        size_t output_floats = 0u;
+                        one_error[0] = '\0';
+                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
+                                                      &output_floats) != 0 ||
+                            !pocket_all_finite(ctxs[i]->pcm, output_floats)) {
+                            snprintf(one_error, sizeof(one_error),
+                                     "CUDA decoder produced non-finite PCM");
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, &reported,
+                                                     one_error, error, capacity);
+                            continue;
+                        }
+                        if (pocket_decode_frame_finish(ctxs[i], 0, one_error,
+                                                       sizeof(one_error)) != 0)
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, &reported,
+                                                     one_error, error, capacity);
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                const size_t frame_samples = ctxs[i]->state->cfg.samples_per_frame;
+                memcpy(out_samples[i] + f * frame_samples, ctxs[i]->pcm,
+                       frame_samples * sizeof(float));
+            }
         }
     }
     mynah_region_end(MYNAH_RGN_CODEC);

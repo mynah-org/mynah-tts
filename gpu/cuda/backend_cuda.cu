@@ -472,12 +472,21 @@ struct cuda_backend_state {
     std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
     std::atomic<unsigned long long> h2d_bytes;
     std::atomic<unsigned long long> d2h_bytes;
+    std::atomic<unsigned long long> h2d_calls;
+    std::atomic<unsigned long long> d2h_calls;
+    std::atomic<unsigned long long> sync_calls;
     std::atomic<unsigned long long> graph_captures;
     std::atomic<unsigned long long> graph_replays;
     std::atomic<unsigned long long> graph_fallbacks;
     std::atomic<unsigned long long> decoder_steps;
+    std::atomic<unsigned long long> decoder_batch_calls;
+    std::atomic<unsigned long long> decoder_batch_items;
+    std::atomic<unsigned long long> decoder_batch_frames;
     std::atomic<unsigned long long> decoder_failures;
     std::atomic<unsigned long long> resident_fallbacks;
+    std::atomic<unsigned long long> matmul_calls;
+    std::atomic<unsigned long long> matvec_calls;
+    bool decoder_batch_enabled;
 };
 
 enum cuda_decoder_op_kind {
@@ -524,10 +533,10 @@ struct mynah_backend_decoder {
 
 static constexpr size_t CUDA_BATCH_META_CAP = 64u;
 /* A server can retain one decoder graph per live context in addition to the
- * width-bucketed backbone and flow graphs. Sixteen entries made a full
- * max-batch server disable capture after warm-up. Keep the bound finite, but
- * large enough for the advertised request width plus the shared graph family. */
-static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 64u;
+ * width-bucketed backbone and flow graphs. The continuous service advertises
+ * up to 128 resident slots, so the cap must cover that experiment or later
+ * contexts silently lose graph capture after warm-up. Keep it finite. */
+static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 128u;
 
 static void set_error(char *e, size_t c, const char *m) {
     if (e && c > 0) std::snprintf(e, c, "%s", m);
@@ -557,6 +566,15 @@ static int cbe(cublasStatus_t s, char *e, size_t c) {
 static bool cuda_fast_math_enabled(void) {
     const char *value = std::getenv("MYNAH_CUDA_FAST_MATH");
     return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+static bool cuda_env_enabled(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    return value == nullptr ? fallback : std::strcmp(value, "0") != 0;
+}
+
+static bool cuda_decoder_batch_enabled(void) {
+    return cuda_env_enabled("MYNAH_CUDA_DECODER_BATCH", true);
 }
 
 static bool cuda_graphs_enabled(void) {
@@ -875,6 +893,7 @@ static int cuda_matmul_dev(void *opaque, const float *d_in, float *d_out,
     if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
     if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -956,18 +975,24 @@ extern "C" int mynah_cuda_upload(void *opaque, const float *host, size_t n,
     size_t bytes = n * sizeof(float);
     if (ensure_scratch(st, bytes, e, ec)) return -1;
     *dev_ptr = st->dev_scratch;
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->h2d_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(*dev_ptr, host, bytes, cudaMemcpyHostToDevice, st->stream), e, ec);
 }
 
 extern "C" int mynah_cuda_download(void *opaque, const float *dev_ptr, float *host,
                          size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->d2h_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(host, dev_ptr, n * sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
 
 extern "C" int mynah_cuda_sync(void *opaque, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    st->sync_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaStreamSynchronize(st->stream), e, ec);
 }
 
@@ -1433,15 +1458,24 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->dev_batch_cache_strides = nullptr;
     st->h2d_bytes.store(0ull, std::memory_order_relaxed);
     st->d2h_bytes.store(0ull, std::memory_order_relaxed);
+    st->h2d_calls.store(0ull, std::memory_order_relaxed);
+    st->d2h_calls.store(0ull, std::memory_order_relaxed);
+    st->sync_calls.store(0ull, std::memory_order_relaxed);
     st->graph_captures.store(0ull, std::memory_order_relaxed);
     st->graph_replays.store(0ull, std::memory_order_relaxed);
     st->graph_fallbacks.store(0ull, std::memory_order_relaxed);
     st->decoder_steps.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_calls.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_items.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_frames.store(0ull, std::memory_order_relaxed);
     st->decoder_failures.store(0ull, std::memory_order_relaxed);
     st->resident_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->matmul_calls.store(0ull, std::memory_order_relaxed);
+    st->matvec_calls.store(0ull, std::memory_order_relaxed);
     st->batch_meta_cap = CUDA_BATCH_META_CAP;
     st->fast_math = cuda_fast_math_enabled();
     st->graphs_enabled = cuda_graphs_enabled();
+    st->decoder_batch_enabled = cuda_decoder_batch_enabled();
     if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
     if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
         set_error(e,ec,"cuBLAS init"); cudaStreamDestroy(st->stream); delete st; return -1; }
@@ -1481,12 +1515,32 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
     if (st == nullptr || metrics == nullptr) return -1;
     metrics->h2d_bytes = st->h2d_bytes.load(std::memory_order_relaxed);
     metrics->d2h_bytes = st->d2h_bytes.load(std::memory_order_relaxed);
+    metrics->h2d_calls = st->h2d_calls.load(std::memory_order_relaxed);
+    metrics->d2h_calls = st->d2h_calls.load(std::memory_order_relaxed);
+    metrics->sync_calls = st->sync_calls.load(std::memory_order_relaxed);
     metrics->graph_captures = st->graph_captures.load(std::memory_order_relaxed);
     metrics->graph_replays = st->graph_replays.load(std::memory_order_relaxed);
     metrics->graph_fallbacks = st->graph_fallbacks.load(std::memory_order_relaxed);
     metrics->decoder_steps = st->decoder_steps.load(std::memory_order_relaxed);
+    metrics->decoder_batch_calls =
+        st->decoder_batch_calls.load(std::memory_order_relaxed);
+    metrics->decoder_batch_items =
+        st->decoder_batch_items.load(std::memory_order_relaxed);
+    metrics->decoder_batch_frames =
+        st->decoder_batch_frames.load(std::memory_order_relaxed);
     metrics->decoder_failures = st->decoder_failures.load(std::memory_order_relaxed);
     metrics->resident_fallbacks = st->resident_fallbacks.load(std::memory_order_relaxed);
+    metrics->matmul_calls = st->matmul_calls.load(std::memory_order_relaxed);
+    metrics->matvec_calls = st->matvec_calls.load(std::memory_order_relaxed);
+    size_t free_bytes = 0u;
+    size_t total_bytes = 0u;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+        metrics->device_memory_bytes = (unsigned long long)total_bytes;
+        metrics->device_memory_free_bytes = (unsigned long long)free_bytes;
+    }
+    metrics->graphs_enabled = st->graphs_enabled ? 1u : 0u;
+    metrics->fast_math_enabled = st->fast_math ? 1u : 0u;
+    metrics->decoder_batch_enabled = st->decoder_batch_enabled ? 1u : 0u;
     return 0;
 }
 
@@ -1531,6 +1585,7 @@ extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
     }
     st->h2d_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
                             std::memory_order_relaxed);
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(dev_ptr, host, n*sizeof(float),
                               cudaMemcpyHostToDevice, st->stream), e, ec);
 }
@@ -1545,6 +1600,7 @@ extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,
     }
     st->d2h_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
                             std::memory_order_relaxed);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(host, dev_ptr, n*sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
@@ -1584,6 +1640,7 @@ extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_o
     size_t bias_bytes = 0;
     if (bias && (!cuda_size_mul(N, sizeof(float), &bias_bytes) ||
                  cached_weight(st, bias, bias_bytes, &db, e, ec))) return -1;
+    st->matvec_calls.fetch_add(1ull, std::memory_order_relaxed);
     k_matvec<<<((int)N + 255) / 256, 256, 0, st->stream>>>(
         d_in, dw, db, d_out, (int)K, (int)N);
     if (ce(cudaGetLastError(), e, ec)) return -1;
@@ -1642,6 +1699,7 @@ extern "C" int mynah_cuda_matmul_d2d(void *opaque, const float *d_in, float *d_o
     if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
     if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -2652,6 +2710,19 @@ extern "C" int mynah_cuda_decoder_note_step(
     if (backend == nullptr || decoder == nullptr || decoder->backend != backend)
         return -1;
     backend->decoder_steps.fetch_add(1ull, std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" int mynah_cuda_decoder_note_batch(void *opaque, size_t items,
+                                               size_t frames) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || items == 0u || frames == 0u) return -1;
+    if (!backend->decoder_batch_enabled) return 0;
+    backend->decoder_batch_calls.fetch_add(1ull, std::memory_order_relaxed);
+    backend->decoder_batch_items.fetch_add((unsigned long long)items,
+                                           std::memory_order_relaxed);
+    backend->decoder_batch_frames.fetch_add((unsigned long long)frames,
+                                            std::memory_order_relaxed);
     return 0;
 }
 

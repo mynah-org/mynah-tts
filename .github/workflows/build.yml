@@ -420,10 +420,24 @@ jobs:
             echo 'CUDA dispatch row says the binary is CPU-only' >&2
             exit 1
           fi
-          ./build/cuda/mynah-tts --gpu-self-test cuda > selftest.txt 2>&1 || true
+          set +e
+          ./build/cuda/mynah-tts --gpu-self-test cuda > selftest.txt 2>&1
+          selftest_rc=$?
+          set -e
           cat selftest.txt
           if grep -q 'CUDA backend is not compiled' selftest.txt; then
             echo 'GPU self-test reached a CPU-only binary' >&2
+            exit 1
+          fi
+          if [ "$selftest_rc" -ne 0 ]; then
+            if grep -Eiq 'no CUDA device|no cuda device|no device' selftest.txt; then
+              echo 'CUDA self-test skipped: this compile-only runner has no device'
+            else
+              echo 'CUDA self-test failed for a reason other than missing device' >&2
+              exit "$selftest_rc"
+            fi
+          elif ! grep -q 'CUDA backend self-test: PASS' selftest.txt; then
+            echo 'CUDA self-test returned success without its PASS marker' >&2
             exit 1
           fi
           test -x build/cuda/mynah-tts-server
