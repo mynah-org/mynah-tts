@@ -31,7 +31,7 @@ static void usage(const char *program) {
     printf("Usage:\n");
     printf("  %s --self-test\n", program);
     printf("  %s --inspect MODEL_DIR\n", program);
-    printf("  %s --pocket-self-check MODEL_DIR\n", program);
+    printf("  %s --pocket-self-check MODEL_DIR [--device cpu|cuda]\n", program);
     printf("  %s --write-test-wav OUTPUT.wav\n", program);
     printf("  %s --synthesize MODEL_DIR --tokens IDS --output OUTPUT.wav [options]\n", program);
     printf("  %s --synthesize MODEL_DIR --text \"hello world\" --lang en --output OUTPUT.wav [options]\n", program);
@@ -40,7 +40,7 @@ static void usage(const char *program) {
     printf("               --batch N (step N requests together, seeds N..N+batch-1)\n");
     printf("  %s --clone-voice MODEL_DIR --reference REF.wav --output VOICE.safetensors --consent \"...\"\n", program);
     printf("  %s --gpu-self-test metal|cuda\n", program);
-    printf("\nNative Magpie inference is CPU-first; Metal/CUDA are explicit build variants.\n");
+    printf("\nMagpie and PocketTTS run on the CPU path; Metal/CUDA are explicit build variants.\n");
 }
 
 static void print_info(const mynah_tts_model_info *info) {
@@ -614,13 +614,38 @@ int main(int argc, char **argv) {
      * over the batch and `decode_audio_batch` is bit-identical per context.
      * Separate from `--self-test` because it needs a pack, which `--self-test`
      * deliberately does not. */
-    if (strcmp(argv[1], "--pocket-self-check") == 0 && argc == 3) {
+    if (strcmp(argv[1], "--pocket-self-check") == 0) {
+        if (argc < 3 || argc > 5) {
+            fprintf(stderr, "usage: %s --pocket-self-check MODEL_DIR "
+                    "[--device cpu|cuda]\n", argv[0]);
+            return 2;
+        }
+        mynah_tts_device device = MYNAH_TTS_DEVICE_CPU;
+        for (int i = 3; i < argc; ++i) {
+            if (strcmp(argv[i], "--device") != 0 || i + 1 >= argc ||
+                parse_device(argv[++i], &device) != 0) {
+                fprintf(stderr, "pocket self-check: invalid option %s\n", argv[i]);
+                return 2;
+            }
+        }
         mynah_tts_model *model = NULL;
         char error[512];
-        if (mynah_tts_model_open(argv[2], &model, error, sizeof(error)) != 0) {
+        if (mynah_tts_model_open_device(argv[2], device, &model, error,
+                                        sizeof(error)) != 0) {
             fprintf(stderr, "pocket self-check: %s\n", error);
             return 1;
         }
+        mynah_tts_model_info info;
+        memset(&info, 0, sizeof(info));
+        (void)mynah_tts_model_get_info(model, &info);
+        if (strcmp(info.engine, "pocket") != 0) {
+            fprintf(stderr, "pocket self-check: model engine is '%s', not 'pocket'\n",
+                    info.engine);
+            mynah_tts_model_close(model);
+            return 2;
+        }
+        printf("pocket self-check: device=%s revision=%s\n",
+               mynah_tts_device_name(device), info.revision);
         const int bad =
             mynah_engine_pocket_self_check(model, error, sizeof(error)) != 0;
         mynah_tts_model_close(model);

@@ -1308,11 +1308,13 @@ static void pocket_dump_flush(const mynah_engine_ctx *ctx) {
             continue;
         }
         for (size_t j = 0; j < len; ++j) {
-            /* U+2581 LOWER ONE EIGHTH BLOCK is SentencePiece's space. */
+            /* U+2581 LOWER ONE EIGHTH BLOCK is SentencePiece's word boundary.
+             * The tokenizer emits it on the first ordinary piece too, but it
+             * is not a leading space in the caller's text. */
             if (j + 2u < len && (unsigned char)piece[j] == 0xE2u &&
                 (unsigned char)piece[j + 1u] == 0x96u &&
                 (unsigned char)piece[j + 2u] == 0x81u) {
-                fputc(' ', f);
+                if (!(i == 0u && j == 0u)) fputc(' ', f);
                 j += 2u;
                 continue;
             }
@@ -6980,7 +6982,13 @@ static int pocket_check_set_new(mynah_engine_state *state,
         memset(&request, 0, sizeof(request));
         request.text_ids = ids;
         request.text_length = n_ids;
-        request.speaker = cases[i].speaker;
+        /* The atomicity/gang checks need a fixed row count even when a
+         * checkpoint was converted with one voice only (for example the
+         * official 24L verification pack).  Reuse available voices rather
+         * than silently shrinking the batch to voice_count rows. */
+        request.speaker = state->voice_count != 0u
+                              ? cases[i].speaker % state->voice_count
+                              : 0u;
         request.temperature = -1.0f;
         mynah_engine_ctx *ctx = NULL;
         const int bad = pocket_ctx_new(model, state, &request, max_steps,
@@ -6992,6 +7000,19 @@ static int pocket_check_set_new(mynah_engine_state *state,
         }
         set->ctx[set->count++] = ctx;
         if (pocket_prepare(ctx, error, capacity) != 0) {
+            pocket_check_set_free(set);
+            return -1;
+        }
+        /* Keep the rows available while the self-check deliberately exercises
+         * a refusal in the middle of a batch.  EOS timing is model-dependent:
+         * the 6L and 24L checkpoints can retire almost every row during the
+         * three warm-up steps, which would make the atomicity test fail before
+         * it had a victim and a predecessor to inspect.  This only extends the
+         * normal post-EOS tail of these private test contexts; it does not
+         * change inference or any production request setting. */
+        if (mynah_engine_pocket_set_frames_after_eos(ctx, max_steps) != 0) {
+            pocket_error(error, capacity,
+                         "self-check: unable to keep request %zu live", i);
             pocket_check_set_free(set);
             return -1;
         }
@@ -8074,7 +8095,6 @@ int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
     static const size_t widths[4] = {2u, 4u, 8u, 16u};
     for (size_t w = 0; w < 4u; ++w) {
         size_t count = widths[w];
-        if (count > state->voice_count) count = state->voice_count;
         if (count > POCKET_CHECK_MAX) count = POCKET_CHECK_MAX;
         mynah_engine_scratch *scratch = NULL;
         if (pocket_scratch_new(model, state, count, &scratch, error, capacity) != 0) {

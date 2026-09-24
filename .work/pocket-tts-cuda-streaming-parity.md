@@ -409,6 +409,100 @@ CUDA-06  BF16/FP16/cuBLASLt/fused kernel ladder with stage parity gates
 CUDA-07  optional GPU CI, sanitizer and L40S qualification campaign
 ```
 
+## 2026-09-24 24L compatibility audit and work items
+
+The official English pair at revision
+`492522650173a0653b7575cdc25ae09810e5d741` was inspected from safetensors
+headers without loading the full weights. The result is recorded in
+[`.work/pocket-tts-24l-compatibility.md`](pocket-tts-24l-compatibility.md):
+24L is the same graph with 24 backbone blocks, not a second engine. The only
+model-file differences are 18 additional blocks (144 tensors) and a source
+dtype policy change: 6L is all BF16, while 24L stores flow/backbone in F32 and
+Mimi in BF16. The corresponding 24L voice cache has 24 layers and an I64
+`pad` metadata tensor per layer; cache shape/head geometry is unchanged.
+
+Completed in this slice:
+
+```text
+24L-01  header/config audit, layer-0..5 shape comparison and full non-layer diff  DONE
+24L-02  converter guard: dynamic block count + mixed source dtype conversion      DONE
+24L-03  actual official 24L download, --dtype source conversion and pack verify   DONE
+24L-04  C loader/CPU inference/audio gate on the converted official 24L pack     DONE
+24L-05  CPU 6L regression: conversion, self-check and server audio smoke         DONE
+24L-08  serial CPU resource report; GPU resource fields remain pending           PARTIAL
+```
+
+Still required before 24L support is called complete:
+
+```text
+24L-06  CUDA metadata/KV/graph/pointer audit and real 6L stage/EOS parity
+24L-07  real 24L CUDA load/inference/stage/EOS parity on the same CUDA path
+24L-08  GPU resource report: model bytes, VRAM, TTFA, RTF when GPU exists
+24L-09  README support matrix and reproduce commands (TODO; CPU/GPU support was absent)
+```
+
+The C Pocket path already uses `cfg->layers` for backbone allocation, CPU
+state/KV, resident CUDA KV, batch pointer tables, graph metadata and all layer
+loops. The audit found no six-layer allocation in those paths. The remaining
+risk is not a second engine design; it is proving that the actual 24L pack's
+larger resident allocations and source precision survive the existing CUDA
+weight/cache contracts.
+
+## CPU validation gate
+
+The actual official 24L checkpoint was converted with `--dtype source` and
+`--voices alba` into a temporary pack (358/358 tensors, mixed F32/BF16), then
+passed the pack verifier, the native Pocket self-check, CPU loading and a
+valid WAV inference. The existing 6L pack also passed the same native self-
+check and a server WAV smoke. No model or generated audio is committed.
+
+The correctness oracle used the official Python implementation and the C
+runtime with `MYNAH_QUANT_GROUPS=none`, so the C path retained the official
+24L F32 flow/backbone precision. For the five-word prompt
+`Hello from Pocket TTS today.` with seed `1234`, temperature `0` and 40-step
+cap, selected stage comparisons were:
+
+```text
+stage / call                         max abs error       correlation
+out_norm hidden, first 3 calls      0.0003411           >= 0.999999977
+EOS logits, first 3 calls           0.0001841           --
+flow output, first 3 calls          0.0005670           >= 0.999999978
+waveform (37 frames, 2.96 s)        0.07311             0.99813
+```
+
+The shipped default quantized CPU path was also exercised and produced finite
+valid audio, but it is recorded separately from the FP32 oracle because the
+quantized stage tensors are not expected to be numerically identical.
+
+Serial one-worker server measurements on the local macOS host (`max_batch=1`,
+`max_inflight=1`, no warmup, one request; RSS is process RSS, not model size):
+
+| pack/path | model file | server RSS before/after/peak | TTFA | audio / RTF |
+|---|---:|---:|---:|---:|
+| 6L, shipped quantized CPU | 219.03 MB | 783.9 / 815.2 / 818.2 MB | 0.233 s | 1.84 s / 0.126 |
+| 24L, shipped quantized CPU | 1,304.21 MB | 1,947.7 / 2,006.6 / 2,019.0 MB | 0.890 s | 2.72 s / 0.327 |
+
+The 6L pack contains its local voice set while the 24L verification pack has
+only `alba`, so RSS is a deployment measurement, not a normalized model-size
+comparison. The 24L `alba` voice file is 12.39 MB in the pack (source F32
+voice state was 24.78 MB). The FP32 correctness CLI run took 2.307 s of
+synthesis for 2.96 s of audio (RTF 0.779). These are CPU/macOS numbers, not
+Axion or L40S projections.
+
+Current validation matrix:
+
+```text
+                         CPU                                      CUDA
+Pocket small / 6L        PASS: converted pack, self-check, server  NOT RUNTIME-TESTED
+Pocket large / 24L       PASS: official pack, self-check, oracle   NOT RUNTIME-TESTED
+```
+
+The CUDA path was audited for metadata-driven layer allocation/loops in the
+resident backbone, KV cache, graph pointer tables and decoder descriptors;
+the existing driverless CI compile is the available CUDA evidence here. A
+green `nvcc` build is not reported as CUDA inference parity. Real 6L and 24L
+CUDA gates remain blocked only by access to an NVIDIA runner/GPU.
+
 ## Acceptance gates before calling this done
 
 1. `make` and the existing CPU self-test/parity/server gates pass unchanged.

@@ -114,7 +114,7 @@ typedef struct {
     size_t d_model;     /* residual width, e.g. 1024                        */
     size_t num_heads;   /* e.g. 16                                          */
     size_t head_dim;    /* e.g. 64; 0 means d_model / num_heads             */
-    size_t num_layers;  /* e.g. 6                                           */
+    size_t num_layers;  /* e.g. 6 or 24; always supplied by the model         */
     size_t ffn_dim;     /* e.g. 4096                                        */
     size_t max_seq_len; /* KV capacity in positions, voice prefix included  */
     size_t context;     /* sliding attention window; 0 = unlimited          */

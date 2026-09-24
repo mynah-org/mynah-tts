@@ -108,11 +108,13 @@
 /* BF16 WEIGHT STORAGE, and why it is a separate encoding rather than a flag on
  * f16.
  *
- * Every current checkpoint in this project is stored bf16 (measured: all 214
- * tensors of models/pocket-en/tts.safetensors), and the pipeline today converts
- * bf16 -> f32 at load (src/weights.c) and then f32 -> f16 at cache-insert, so
- * the multiply runs on a THIRD representation of the same number. Keeping the
- * weights bf16 lets the hardware multiply them directly: BFDOT is two products
+ * The verified 6L Pocket checkpoint is stored bf16; the official 24L checkpoint
+ * is mixed (flow/backbone f32, Mimi bf16). Both arrive through the f32 graph
+ * view, so a quantized cache may still be the first compact representation used
+ * by a kernel. For bf16 source tensors the pipeline converts bf16 -> f32 at
+ * load (src/weights.c) and then f32 -> bf16 at cache-insert, so the multiply
+ * runs on a THIRD representation of the same number. Keeping the weights bf16
+ * lets the hardware multiply them directly: BFDOT is two products
  * per f32 lane -- 8 MACs per 128-bit instruction against the f16 path's 4 --
  * and it accumulates in f32, which is why the standing FMLAL rejection
  * (PLAN.md E10's rejected list: "needs the activation narrowed to f16") does
