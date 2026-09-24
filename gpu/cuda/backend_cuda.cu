@@ -3227,24 +3227,6 @@ extern "C" int mynah_cuda_self_attention_batch_dev(
             return -1;
         }
     }
-    if (std::getenv("MYNAH_CUDA_DEBUG_BATCH") != nullptr) {
-        std::fprintf(stderr, "cuda batch attention: batch=%zu heads=%zu head_width=%zu width=%zu\\n",
-                     batch, heads, head_width, width);
-        for (size_t i = 0; i < batch; ++i) {
-            cudaPointerAttributes ka{};
-            cudaPointerAttributes va{};
-            const cudaError_t kr = cudaPointerGetAttributes(&ka, kcache[i]);
-            const cudaError_t vr = cudaPointerGetAttributes(&va, vcache[i]);
-            std::fprintf(stderr,
-                         "  row=%zu k=%p v=%p pos=%zu stride=%zu k_attr=%d k_dev=%d v_attr=%d v_dev=%d\\n",
-                         i, (void *)kcache[i], (void *)vcache[i], positions[i],
-                         cache_strides[i], (int)kr,
-                         kr == cudaSuccess ? ka.device : -1, (int)vr,
-                         vr == cudaSuccess ? va.device : -1);
-            if (kr != cudaSuccess) cudaGetLastError();
-            if (vr != cudaSuccess) cudaGetLastError();
-        }
-    }
     if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
                            batch * sizeof(*kcache), cudaMemcpyHostToDevice,
                            st->stream), e, ec) ||

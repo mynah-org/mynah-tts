@@ -3956,7 +3956,6 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
         return 1;
     }
     const size_t attn_dim = cfg->heads * cfg->head_dim;
-    const size_t layer_half = first_config->max_seq_len * attn_dim;
     const size_t shadow_row = 2u * attn_dim;
     int all_kv_valid = 1;
     for (size_t i = 0; i < count; ++i) {
@@ -3973,11 +3972,17 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
             config->ffn_dim != first_config->ffn_dim ||
             config->max_period != first_config->max_period ||
             config->layernorm_eps != first_config->layernorm_eps) return 1;
+        if (config->max_seq_len == 0u ||
+            ctx->cuda_backbone_capacity != config->max_seq_len) return 1;
         scratch->cuda_positions[i] =
             mynah_transformer_ar_state_offset(ctx->backbone);
         if (scratch->cuda_positions[i] >= config->max_seq_len) return -1;
-        scratch->cuda_cache_strides[i] =
-            config->max_seq_len * attn_dim;
+        /* The resident KV allocation is [K/V][position][head].  max_seq_len
+         * is the extent of one cache plane, not the stride between positions.
+         * The old batch path multiplied by max_seq_len here, so the first
+         * multi-request step wrote past every per-request cache while the
+         * single-request path (which already uses attn_dim) stayed correct. */
+        scratch->cuda_cache_strides[i] = attn_dim;
         if (!ctx->cuda_backbone_valid) all_kv_valid = 0;
         memcpy(scratch->cuda_host_input + i * cfg->hidden_dim,
                ctx->step_input, cfg->hidden_dim * sizeof(float));
@@ -3988,7 +3993,15 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
      * memcpy nodes are replayed later with new requests. */
     for (size_t l = 0; l < cfg->layers; ++l) {
         for (size_t i = 0; i < count; ++i) {
-            const size_t layer_offset = l * 2u * layer_half;
+            const mynah_transformer_ar_config *config =
+                mynah_transformer_ar_state_config(ctxs[i]->backbone);
+            size_t layer_half = 0u;
+            size_t layer_span = 0u;
+            size_t layer_offset = 0u;
+            if (config == NULL ||
+                pocket_mul(config->max_seq_len, attn_dim, &layer_half) != 0 ||
+                pocket_mul(layer_half, 2u, &layer_span) != 0 ||
+                pocket_mul(l, layer_span, &layer_offset) != 0) return -1;
             const size_t metadata_offset = l * scratch->cuda_batch_capacity + i;
             scratch->cuda_kcache[metadata_offset] =
                 ctxs[i]->cuda_backbone_kv + layer_offset;
