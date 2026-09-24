@@ -16,7 +16,8 @@ one-step flow-head batch paths with per-width CUDA-Graph capture/replay, plus
 a resident single-context SEANet decoder with causal rings, transpose tails,
 PCM handoff and a per-context CUDA graph. The codec transformer boundary and
 cross-request decoder batching remain open. The target is a qualified C100 on
-a representative L40S later; no rented GPU is part of this work item.
+a representative L40S later; the RTX PRO 6000 is now the bring-up box, not a
+substitute for that production qualification.
 
 ## Decision
 
@@ -396,8 +397,10 @@ parity, stream/offline parity, graph on/off, precision variants and
 ### Work item order
 
 Current slice status: CUDA-01, CUDA-02 and CUDA-03 are implemented in the
-local branch and covered by CPU/server gates; the CUDA behavior itself remains
-compile-only until an NVIDIA box is available.
+local branch and covered by CPU/server gates. The RTX PRO 6000 model-backed
+bring-up below proves the resident 6L/24L path and server contract on a real
+Blackwell device; stage parity, multi-request arithmetic batching and L4/L40S
+qualification remain open.
 
 ```text
 CUDA-01  async decoder gang submission + backend batch counters (implemented; GPU parity open)
@@ -407,7 +410,7 @@ CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels and graph buckets
 CUDA-05  codec-transformer residency + H2D/D2H overlap
 CUDA-06  BF16/FP16/cuBLASLt/fused kernel ladder with stage parity gates
 CUDA-07  optional GPU CI, sanitizer and L40S qualification campaign
-CUDA-08  Blackwell/Ada architecture stamp, real-device self-test and no-hidden-fallback audit (bring-up partial; model gate open)
+CUDA-08  Blackwell/Ada architecture stamp, real-device self-test and no-hidden-fallback audit (sm120/sm89 build + model bring-up done; qualification open)
 ```
 
 ## 2026-09-24 24L compatibility audit and work items
@@ -436,9 +439,9 @@ Completed in this slice:
 Still required before 24L support is called complete:
 
 ```text
-24L-06  CUDA metadata/KV/graph/pointer audit and real 6L stage/EOS parity
-24L-07  real 24L CUDA load/inference/stage/EOS parity on the same CUDA path
-24L-08  GPU resource report: model bytes, VRAM, TTFA, RTF when GPU exists
+24L-06  CUDA metadata/KV/graph/pointer audit and real 6L stage/EOS parity     PARTIAL
+24L-07  real 24L CUDA load/inference/stage/EOS parity on the same CUDA path   PARTIAL
+24L-08  GPU resource report: model bytes, VRAM, TTFA, RTF when GPU exists     DONE (bring-up)
 24L-09  README support matrix and reproduce commands (TODO; CPU/GPU support was absent)
 ```
 
@@ -496,15 +499,16 @@ Current validation matrix:
 
 ```text
                          CPU                                      CUDA
-Pocket small / 6L        PASS: converted pack, self-check, clone, server  NOT RUNTIME-TESTED
-Pocket large / 24L       PASS: official pack, self-check, clone, oracle   NOT RUNTIME-TESTED
+Pocket small / 6L        PASS: converted pack, self-check, clone, server  PASS: CLI + server WAV + chunked PCM smoke
+Pocket large / 24L       PASS: official pack, self-check, clone, oracle   PASS: CLI + server WAV + chunked PCM smoke
 ```
 
 The CUDA path was audited for metadata-driven layer allocation/loops in the
 resident backbone, KV cache, graph pointer tables and decoder descriptors;
-the existing driverless CI compile is the available CUDA evidence here. A
-green `nvcc` build is not reported as CUDA inference parity. Real 6L and 24L
-CUDA gates remain blocked only by model access on the NVIDIA runner/GPU.
+the remote model-backed smoke now confirms both official packs load and finish
+inference on the same path. This is runtime bring-up evidence, not the final
+stage/EOS/batch parity gate: a green WAV alone does not prove every boundary
+matches CPU.
 
 ## 2026-09-24 RTX PRO 6000 Blackwell bring-up
 
@@ -533,11 +537,70 @@ per autoregressive step/frame. The first real model run must report these
 transfer counters and CPU utilization; CUDA-05 owns eliminating the remaining
 hot-path host boundaries before an AWS L4/L40S capacity claim.
 
-The remote host currently has no Hugging Face credential, and the official
-checkpoint URL returns HTTP 401. Local official 6L/24L packs have not been
-copied to the root-owned remote host without explicit authorization. Until a
-pack is present, the validation matrix remains runtime-pending even though the
-Blackwell kernel gate is green.
+The remote box was prepared with an isolated Hugging Face CLI environment and
+the official English 6L/24L pair at revision
+`492522650173a0653b7575cdc25ae09810e5d741`. The source checkpoints were
+converted remotely with `--dtype source` into `/root/pocket-6l-hf` and
+`/root/pocket-24l-hf`; no weights or generated audio are committed here.
+
+## 2026-09-24 real-model RTX PRO 6000 validation
+
+Build/runtime facts:
+
+* RTX PRO 6000 Blackwell Server Edition, 97,887 MiB VRAM, driver 580.178.04;
+  CUDA 13.2 toolkit and runtime 13.0.
+* Clean `CUDA_ARCH=sm_120` build plus model-free CUDA self-test passed on the
+  device. A clean `CUDA_ARCH=sm_89` build also compiled and linked for the
+  L4/L40S production profile. `compute-sanitizer --tool memcheck` passed on
+  the model-free CUDA self-test with zero reported errors.
+* Official remote conversion passed 214/214 tensors for 6L and 358/358 for
+  24L. The resulting packs report 6 and 24 backbone layers respectively,
+  `d_model=1024`, 16 heads of 64, FFN 4096, and the same flow/Mimi metadata.
+
+Model-backed smoke results, all with seed 1234, temperature 0, one worker and
+`MYNAH_CUDA_RESIDENT=1 MYNAH_CUDA_FLOW=1 MYNAH_CUDA_GRAPHS=1`:
+
+| case | result | output | measured synthesis |
+|---|---|---:|---:|
+| 6L CPU, `max_steps=8` | valid WAV, 24 kHz, finite | 0.48 s | 0.941 s, RTF 1.961 |
+| 24L CPU, `max_steps=8` | valid WAV, 24 kHz, finite | 0.64 s | 1.409 s, RTF 2.202 |
+| 6L CUDA CLI, `max_steps=8` | valid WAV, 24 kHz, finite | 0.48 s | 0.281 s, RTF 0.586 |
+| 24L CUDA CLI, `max_steps=8` | valid WAV, 24 kHz, finite | 0.64 s | 0.433 s, RTF 0.676 |
+
+The corresponding CPU/CUDA PCM smoke comparisons had the same sample counts;
+6L correlation was 0.942539 (max int16 difference 7924) and 24L correlation
+was 0.995967 (max int16 difference 854). These are useful execution checks,
+not the required stage/EOS parity claim; intermediate dumps and deterministic
+EOS comparison remain to be added.
+
+The CUDA HTTP server also completed both models with `--max-batch 4`,
+`--max-inflight 4`, one worker and no fallback counters. The serial server
+microbench used two warm-ups and five measured requests:
+
+| server model | measured wall time | sampled GPU peak | sampled VRAM | backend result |
+|---|---:|---:|---:|---|
+| 6L | 0.20 s (all 5) | 62% at 200 ms sampling | ~1,033 MiB | 7/7 jobs, graphs 8/8, fallbacks 0 |
+| 24L | 0.56 s (all 5) | 93% at 200 ms sampling | ~1,925 MiB | 7/7 jobs, graphs 10/10, fallbacks 0 |
+
+The server timing sums over the seven-request campaigns were 1.494708 s over
+17.2 s of 6L audio (RTF ~0.087) and 3.904544 s over 22.4 s of 24L audio
+(RTF ~0.174). These are resident Blackwell bring-up numbers, not L40S
+qualification numbers; the 200 ms utilization sample is not a sustained
+utilization measurement. Process RSS was about 1.25 GB for 6L and 2.43 GB for
+24L after requests, with peak RSS about 1.26 GB and 2.48 GB respectively.
+
+Both 6L and 24L also returned `200 audio/pcm` with `Transfer-Encoding:
+chunked`, 24 kHz headers and non-empty PCM for `stream:true`. The streaming
+requests reported `streams_total=1`, zero failed jobs, zero graph fallbacks,
+zero decoder failures and zero resident fallbacks. The test used one request;
+cross-request streaming batch parity is still open.
+
+The remaining residency cost is visible in the counters: for the 24L seven
+request campaign, 259,031,040 bytes H2D, 58,383,360 bytes D2H, 840
+synchronizations, 7 graph captures, 553 replays, 280 decoder steps and 26,880
+device matmul calls were recorded. The GPU path is real and useful, but this
+transfer/synchronization profile plus the CPU codec-transformer boundary is
+why no 99%-GPU or C100 claim is made yet.
 
 ## Acceptance gates before calling this done
 
