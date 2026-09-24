@@ -3689,8 +3689,9 @@ static int pocket_cuda_codec_sync_host_window(mynah_engine_ctx *ctx, char *error
  * It is intentionally the same layer order as transformer_ar.c: the only
  * host boundary is the 16-row input/output and the bounded K/V shadow needed
  * for a safe CPU retry. */
-static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx, char *error,
-                                           size_t capacity) {
+static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx,
+                                           mynah_engine_scratch *scratch,
+                                           char *error, size_t capacity) {
     if (ctx == NULL || !ctx->cuda_codec_enabled || ctx->state == NULL) return 1;
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
@@ -3704,6 +3705,24 @@ static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx, char *error,
         ctx->cuda_codec_qkv == NULL || ctx->cuda_codec_attn == NULL ||
         ctx->cuda_codec_proj == NULL || ctx->cuda_codec_ffn == NULL ||
         pocket_mul(stride, dim, &output_floats) != 0) return 1;
+    /* The server's single-request lane still goes through this function when
+     * the scheduler has no neighbour to batch with.  Use the same pinned
+     * staging that the true cross-request tile uses, when the shared scratch
+     * is available, so pageable host memory does not turn an async copy into
+     * an implicit CPU-side staging/synchronisation point.  The standalone
+     * offline API has no driver scratch and keeps its exact compatibility
+     * path. */
+    float *host_input = ctx->codec_seq;
+    float *host_output = ctx->codec_out;
+    int staged = 0;
+    if (scratch != NULL && scratch->cuda_codec_enabled &&
+        scratch->cuda_codec_batch_capacity > 0u &&
+        scratch->cuda_codec_host_input != NULL &&
+        scratch->cuda_codec_host_output != NULL) {
+        host_input = scratch->cuda_codec_host_input;
+        host_output = scratch->cuda_codec_host_output;
+        staged = 1;
+    }
     const size_t start = mynah_transformer_ar_state_offset(ctx->codec_transformer);
     size_t end = 0u;
     if (pocket_add(start, stride, &end) != 0 ||
@@ -3724,7 +3743,12 @@ static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx, char *error,
             goto fail_region;
         const size_t window_slot = window_absolute - ctx->cuda_codec_kv_base;
         const size_t attention_position = relative - window_slot;
-        if (mynah_backend_h2d(state->backend, ctx->codec_seq + t * dim,
+        if (staged)
+            memcpy(host_input, ctx->codec_seq + t * dim,
+                   dim * sizeof(float));
+        if (mynah_backend_h2d(state->backend, staged
+                                  ? host_input
+                                  : ctx->codec_seq + t * dim,
                               ctx->cuda_codec_x, dim, local, sizeof(local)) != 0)
             goto fail_region;
         for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
@@ -3778,13 +3802,16 @@ static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx, char *error,
                 goto fail_region;
         }
         if (mynah_backend_d2h(state->backend, ctx->cuda_codec_x,
-                              ctx->codec_out + t * dim, dim, local,
+                              host_output + t * dim, dim, local,
                               sizeof(local)) != 0)
             goto fail_region;
     }
     mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
-    if (mynah_backend_sync(state->backend, local, sizeof(local)) != 0 ||
-        !pocket_all_finite(ctx->codec_out, output_floats)) goto fail;
+    if (mynah_backend_sync(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    if (staged)
+        memcpy(ctx->codec_out, host_output, output_floats * sizeof(float));
+    if (!pocket_all_finite(ctx->codec_out, output_floats)) goto fail;
     if (mynah_transformer_ar_state_set_offset(ctx->codec_transformer, end, local,
                                               sizeof(local)) != 0)
         goto fail;
@@ -6028,7 +6055,7 @@ static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
     if (ctx->cuda_codec_enabled) {
         ctx->cuda_codec_pending = 1;
         if (defer_cuda) return 0;
-        if (pocket_cuda_codec_transform_one(ctx, error, capacity) == 0)
+        if (pocket_cuda_codec_transform_one(ctx, NULL, error, capacity) == 0)
             return pocket_decode_frame_transform_finish(ctx, error, capacity);
         /* The resident attempt did not advance the host offset. Disable this
          * context's device mirror after restoring its bounded KV mirror, then
@@ -6253,7 +6280,7 @@ static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
                                               char *error, size_t capacity) {
     if (ctxs == NULL || count == 0u) return 0;
     if (count == 1u)
-        return pocket_cuda_codec_transform_one(ctxs[0], error, capacity);
+        return pocket_cuda_codec_transform_one(ctxs[0], scratch, error, capacity);
     if (scratch == NULL || !scratch->cuda_codec_enabled ||
         scratch->cuda_codec_x == NULL || scratch->cuda_codec_norm == NULL ||
         scratch->cuda_codec_qkv == NULL || scratch->cuda_codec_attn == NULL ||
@@ -6266,7 +6293,8 @@ static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
         int failed = 0;
         for (size_t i = 0; i < count; ++i) {
             if (ctxs[i] == NULL || !ctxs[i]->cuda_codec_pending) continue;
-            if (pocket_cuda_codec_transform_one(ctxs[i], error, capacity) != 0)
+            if (pocket_cuda_codec_transform_one(ctxs[i], scratch, error,
+                                                capacity) != 0)
                 failed = 1;
         }
         return failed;

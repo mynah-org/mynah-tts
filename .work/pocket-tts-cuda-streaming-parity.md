@@ -661,6 +661,10 @@ promoted to a CUDA result because the Blackwell box is off and this Mac has no
   FFN/GELU → LayerScale residual for every Mimi decoder-transformer layer.
   The batch path uses row-wise LayerScale; a flat elementwise scale would be
   wrong for every request after row zero.
+* A scheduler singleton uses the same reusable pinned host staging as the true
+  gang path, one codec row at a time, so pageable `codec_seq`/`codec_out` do not
+  force an implicit CUDA copy synchronisation when no neighbour is available.
+  The standalone CPU/offline compatibility path is unchanged.
 * Host KV is not copied back on every frame. It is refreshed only before a
   window rebase or when a failed resident tile needs the CPU retry oracle.
   `MYNAH_CUDA_POCKET_CODEC=0` disables this optional slice for a clean A/B
