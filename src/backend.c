@@ -81,6 +81,8 @@ struct mynah_backend {
     int (*layer_norm_inplace)(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
     int (*matmul_to_dev)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*matmul_d2d)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+    int (*matmul_q8_d2d)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+    int (*q8_reserve)(void *, size_t, size_t, size_t, char *, size_t);
     int (*im2col)(void *, const float *, float *, int, int, int, int, char *, size_t);
     int (*conv1d)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
     int (*conv1d_dev)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
@@ -174,6 +176,8 @@ extern int mynah_cuda_residual_inplace(void *, float *, const float *, size_t, c
 extern int mynah_cuda_layer_norm_inplace(void *, const float *, float *, const float *, size_t, size_t, char *, size_t);
 extern int mynah_cuda_matmul_to_dev(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 extern int mynah_cuda_matmul_d2d(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_cuda_matmul_q8_d2d(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_cuda_q8_reserve(void *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_im2col(void *, const float *, float *, int, int, int, int, char *, size_t);
 extern int mynah_cuda_conv1d(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 extern int mynah_cuda_conv1d_dev(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
@@ -674,6 +678,8 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->layer_norm_inplace = mynah_cuda_layer_norm_inplace;
         backend->matmul_to_dev = mynah_cuda_matmul_to_dev;
         backend->matmul_d2d = mynah_cuda_matmul_d2d;
+        backend->matmul_q8_d2d = mynah_cuda_matmul_q8_d2d;
+        backend->q8_reserve = mynah_cuda_q8_reserve;
         backend->im2col = mynah_cuda_im2col;
         backend->conv1d = mynah_cuda_conv1d;
         backend->conv1d_dev = mynah_cuda_conv1d_dev;
@@ -1398,6 +1404,25 @@ int mynah_backend_matmul_d2d(const mynah_backend *bk, const float *din, float *d
                              char *e, size_t ec) {
     if (bk && bk->matmul_d2d)
         return bk->matmul_d2d(bk->state, din, dout, rows, iw, ow, w, b, e, ec);
+    return -1;
+}
+
+int mynah_backend_matmul_q8_d2d(const mynah_backend *bk, const float *din,
+                                float *dout, size_t rows, size_t iw,
+                                size_t ow, const float *w, const float *b,
+                                char *e, size_t ec) {
+    if (bk && bk->matmul_q8_d2d)
+        return bk->matmul_q8_d2d(bk->state, din, dout, rows, iw, ow, w, b,
+                                 e, ec);
+    return -1;
+}
+
+int mynah_backend_q8_reserve(const mynah_backend *bk, size_t activation_count,
+                             size_t rows, size_t output_count, char *e,
+                             size_t ec) {
+    if (bk != NULL && bk->q8_reserve != NULL)
+        return bk->q8_reserve(bk->state, activation_count, rows, output_count,
+                              e, ec);
     return -1;
 }
 

@@ -147,8 +147,10 @@ on an RTX PRO 6000 Blackwell (`sm_120`). CUDA has resident implementations for
 the backbone, flow head, Mimi decoder-transformer, quantizer/causal upsample and
 causal SEANet decoder, but each stage is capability- and precision-gated. The
 default Pocket CPU quantization profile intentionally keeps several groups
-quantized; those groups remain on the CPU oracle until matching CUDA quantized
-kernels exist. A raw-F32 resident bring-up therefore uses
+quantized. Resident CUDA now has an explicit Q8 linear path for batched
+backbone/flow/Mimi projections (device activation quantization, INT8 GEMM,
+cached per-row weight scales and f32 epilogue); convolution groups still use
+the CPU oracle until their own CUDA Q8 kernel passes parity. A raw-F32 resident bring-up therefore uses
 `MYNAH_QUANT_GROUPS=none`, shown below. The current path still keeps generation
 control (EOS/sampling/RNG) and the final PCM boundary on the host, and its
 decoder counter records asynchronous per-request gang submission, not true
@@ -220,6 +222,22 @@ stage dumps force the mirror back on.
 forcing Pocket's Mimi decoder transformer through its CPU oracle for A/B parity.
 The older `MYNAH_CUDA_CODEC=0` remains a compatibility kill switch for both
 the generic NanoCodec experiment and Pocket.
+
+To exercise the opt-in CUDA Q8 linear path, select only INT8 linear groups and
+enable it explicitly; unsupported convolution groups remain on the CPU oracle:
+
+```bash
+MYNAH_CUDA_Q8=1 \
+MYNAH_QUANT_GROUPS=backbone:int8,flow_net:int8,codec_transformer:int8 \
+MYNAH_CUDA_RESIDENT=1 MYNAH_CUDA_FLOW=1 MYNAH_CUDA_POCKET_CODEC=1 \
+  ./build/cuda/mynah-tts-server --device cuda --max-batch 16 \
+  --max-inflight 128 -m models/pocket-6l
+```
+
+The startup line reports `q8=on` and resident eligibility. `/health` and
+`/metrics` expose Q8 matmul calls, rows, cached-weight bytes and quantized
+activation bytes. Q8 changes numerics and is not a quality/performance claim
+until the selected checkpoint passes the CUDA stage/EOS/audio parity gate.
 
 **Concurrent requests are batched, vLLM-style.** Offline requests are not
 serialized behind a lock: a scheduler admits everything queued into one

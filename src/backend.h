@@ -123,6 +123,16 @@ int mynah_backend_residual_inplace(const mynah_backend *, float *, const float *
 int mynah_backend_layer_norm_inplace(const mynah_backend *, const float *, float *, const float *, size_t, size_t, char *, size_t);
 int mynah_backend_matmul_to_dev(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 int mynah_backend_matmul_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+/* Device INT8/Q8 matmul. Activations are quantized per row on device, weights
+ * are cached as per-output-row symmetric int8 plus scales, and the f32 result
+ * is written to `dout` with the optional bias epilogue. CUDA-only: callers
+ * must use it only after the backend capability/policy gate accepts Q8. */
+int mynah_backend_matmul_q8_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+/* Reserve the persistent Q8 activation/accumulator workspace before a graph
+ * capture. It is unsupported on non-CUDA backends. */
+int mynah_backend_q8_reserve(const mynah_backend *, size_t activation_count,
+                             size_t rows, size_t output_count,
+                             char *, size_t);
 int mynah_backend_im2col(const mynah_backend *, const float *, float *, int, int, int, int, char *, size_t);
 int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 /* Device-resident causal conv1d.  `input` and `output` are backend-owned
@@ -213,6 +223,9 @@ void mynah_backend_graph_forget(const mynah_backend *backend,
 typedef struct {
     const float *weight;
     const float *bias;
+    /* 0 = original f32 view, 1 = CUDA Q8 path. Other encodings are rejected
+     * by the resident backend until a matching device kernel exists. */
+    int qtype;
 } mynah_backend_flow_linear;
 
 typedef struct {

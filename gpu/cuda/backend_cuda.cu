@@ -284,6 +284,56 @@ __global__ static void k_f16_to_f32(const half *in, float *out, int n) {
     if (i < n) out[i] = __half2float(in[i]);
 }
 
+/* Q8 activation packing used by the resident Pocket linear path.  The CPU
+ * qmat reference uses symmetric per-row absmax, ties-away-from-zero rounding
+ * and the signed range [-127, 127].  Keep those choices explicit here: CUDA's
+ * default round-to-nearest-even would otherwise make the AR trajectory depend
+ * on the backend at exact half-integers. */
+__global__ static void k_q8_quantize_rows(const float *in, int8_t *out,
+                                          float *scales, int rows, int cols) {
+    const int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    const int tid = (int)threadIdx.x;
+    __shared__ float maxima[256];
+    const float *src = in + (size_t)row * (size_t)cols;
+    float amax = 0.0f;
+    for (int col = tid; col < cols; col += (int)blockDim.x) {
+        const float value = fabsf(src[col]);
+        if (value > amax) amax = value;
+    }
+    maxima[tid] = amax;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && maxima[tid + stride] > maxima[tid])
+            maxima[tid] = maxima[tid + stride];
+        __syncthreads();
+    }
+    const float scale = maxima[0] == 0.0f ? 0.0f : maxima[0] / 127.0f;
+    if (tid == 0) scales[row] = scale;
+    const float inv = scale == 0.0f ? 0.0f : 127.0f / scale;
+    for (int col = tid; col < cols; col += (int)blockDim.x) {
+        const float value = src[col] * inv;
+        /* Truncation toward zero after adding/subtracting 0.5 is ties-away. */
+        int q = __float2int_rz(value >= 0.0f ? value + 0.5f : value - 0.5f);
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        out[(size_t)row * (size_t)cols + (size_t)col] = (int8_t)q;
+    }
+}
+
+__global__ static void k_q8_epilogue(const int32_t *accum, const float *act_scale,
+                                     const float *weight_scale, const float *bias,
+                                     float *out, int rows, int cols) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = rows * cols;
+    if (index >= total) return;
+    const int row = index / cols;
+    const int col = index - row * cols;
+    const float value = (float)accum[index] *
+                        (act_scale[row] * weight_scale[col]);
+    out[index] = value + (bias == nullptr ? 0.0f : bias[col]);
+}
+
 __global__ static void k_copy_strided(float *dst, const float *src,
                                       int dst_stride, int src_stride,
                                       int width, int rows) {
@@ -496,6 +546,14 @@ struct cuda_cached_fp16 {
     half *device_ptr;
 };
 
+struct cuda_cached_int8 {
+    const void *host_pointer;
+    size_t rows;
+    size_t cols;
+    int8_t *device_q;
+    float *device_scale;
+};
+
 struct cuda_graph_entry {
     size_t rows;
     size_t iw;
@@ -529,9 +587,16 @@ struct cuda_backend_state {
     cudaStream_t stream;
     std::vector<cuda_cached_buffer> weights;
     std::vector<cuda_cached_fp16> weights_fp16;
+    std::vector<cuda_cached_int8> weights_int8;
     /* Device scratch for activations (grows on demand). */
     float *dev_scratch;
     size_t dev_scratch_cap;   /* bytes */
+    int8_t *dev_q8_activation;
+    float *dev_q8_activation_scale;
+    int32_t *dev_q8_accum;
+    size_t dev_q8_activation_cap;
+    size_t dev_q8_rows_cap;
+    size_t dev_q8_accum_cap;
     /* Pinned host buffer for H2D/D2H. */
     float *host_buf;
     float *dev_buf;           /* mapped device pointer for host_buf */
@@ -574,6 +639,12 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> resident_fallbacks;
     std::atomic<unsigned long long> matmul_calls;
     std::atomic<unsigned long long> matvec_calls;
+    std::atomic<unsigned long long> q8_matmul_calls;
+    std::atomic<unsigned long long> q8_rows;
+    std::atomic<unsigned long long> q8_weight_uploads;
+    std::atomic<unsigned long long> q8_weight_bytes;
+    std::atomic<unsigned long long> q8_activation_bytes;
+    bool q8_enabled;
     bool decoder_batch_enabled;
 };
 
@@ -775,6 +846,177 @@ static int cached_weight_fp16(cuda_backend_state *st, const float *hp, size_t n,
     st->weights_fp16.push_back({hp, n, d16});
     *dp = d16;
     return 0;
+}
+
+static int cuda_q8_round(float value) {
+    int q = (int)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+    return q;
+}
+
+/* Host-side packing is intentionally the same small scalar formula as
+ * src/qmat.c. It runs once per immutable weight tensor, not in the decode
+ * loop; using it here also makes the device cache's bytes reproducible across
+ * CUDA versions. */
+static int cuda_pack_weight_q8(const float *host, size_t rows, size_t cols,
+                              std::vector<int8_t> *q,
+                              std::vector<float> *scales,
+                              char *e, size_t ec) {
+    if (host == nullptr || q == nullptr || scales == nullptr || rows == 0u ||
+        cols == 0u || rows > (size_t)INT_MAX || cols > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA Q8 weight dimensions");
+        return -1;
+    }
+    size_t elements = 0u;
+    if (!cuda_size_mul(rows, cols, &elements)) {
+        set_error(e, ec, "CUDA Q8 weight size overflow");
+        return -1;
+    }
+    try {
+        q->assign(elements, (int8_t)0);
+        scales->assign(rows, 1.0f);
+    } catch (const std::bad_alloc &) {
+        set_error(e, ec, "out of host memory packing CUDA Q8 weight");
+        return -1;
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        const float *src = host + row * cols;
+        float amax = 0.0f;
+        for (size_t col = 0; col < cols; ++col) {
+            const float value = std::fabs(src[col]);
+            if (value > amax) amax = value;
+        }
+        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+        (*scales)[row] = scale;
+        const float inv = 1.0f / scale;
+        int8_t *dst = q->data() + row * cols;
+        for (size_t col = 0; col < cols; ++col)
+            dst[col] = (int8_t)cuda_q8_round(src[col] * inv);
+    }
+    return 0;
+}
+
+static int cached_weight_q8(cuda_backend_state *st, const float *host,
+                            size_t rows, size_t cols, int8_t **device_q,
+                            float **device_scale, char *e, size_t ec) {
+    if (st == nullptr || host == nullptr || device_q == nullptr ||
+        device_scale == nullptr || rows == 0u || cols == 0u) {
+        set_error(e, ec, "invalid CUDA Q8 weight cache request");
+        return -1;
+    }
+    for (auto &entry : st->weights_int8) {
+        if (entry.host_pointer == host && entry.rows == rows &&
+            entry.cols == cols) {
+            *device_q = entry.device_q;
+            *device_scale = entry.device_scale;
+            return 0;
+        }
+    }
+    std::vector<int8_t> host_q;
+    std::vector<float> host_scale;
+    if (cuda_pack_weight_q8(host, rows, cols, &host_q, &host_scale, e, ec) != 0)
+        return -1;
+    size_t q_bytes = 0u;
+    size_t scale_bytes = 0u;
+    if (!cuda_size_mul(host_q.size(), sizeof(int8_t), &q_bytes) ||
+        !cuda_size_mul(host_scale.size(), sizeof(float), &scale_bytes)) {
+        set_error(e, ec, "CUDA Q8 weight byte size overflow");
+        return -1;
+    }
+    int8_t *q = nullptr;
+    float *scale = nullptr;
+    if (ce(cudaMalloc((void **)&q, q_bytes), e, ec) != 0 ||
+        ce(cudaMalloc((void **)&scale, scale_bytes), e, ec) != 0) {
+        if (q != nullptr) cudaFree(q);
+        if (scale != nullptr) cudaFree(scale);
+        return -1;
+    }
+    if (ce(cudaMemcpy(q, host_q.data(), q_bytes, cudaMemcpyHostToDevice), e,
+           ec) != 0 ||
+        ce(cudaMemcpy(scale, host_scale.data(), scale_bytes,
+                      cudaMemcpyHostToDevice), e, ec) != 0) {
+        cudaFree(q);
+        cudaFree(scale);
+        return -1;
+    }
+    try {
+        st->weights_int8.push_back({host, rows, cols, q, scale});
+    } catch (const std::bad_alloc &) {
+        cudaFree(q);
+        cudaFree(scale);
+        set_error(e, ec, "out of host memory indexing CUDA Q8 weight");
+        return -1;
+    }
+    st->q8_weight_uploads.fetch_add(1ull, std::memory_order_relaxed);
+    st->q8_weight_bytes.fetch_add((unsigned long long)(q_bytes + scale_bytes),
+                                  std::memory_order_relaxed);
+    *device_q = q;
+    *device_scale = scale;
+    return 0;
+}
+
+static int ensure_q8_workspace(cuda_backend_state *st, size_t activation_count,
+                               size_t rows, size_t output_count, char *e,
+                               size_t ec) {
+    if (st == nullptr || activation_count == 0u || rows == 0u ||
+        output_count == 0u) {
+        set_error(e, ec, "invalid CUDA Q8 workspace dimensions");
+        return -1;
+    }
+    if (st->dev_q8_activation_cap >= activation_count &&
+        st->dev_q8_rows_cap >= rows && st->dev_q8_accum_cap >= output_count)
+        return 0;
+    size_t activation_bytes = 0u;
+    size_t row_bytes = 0u;
+    size_t output_bytes = 0u;
+    if (!cuda_size_mul(activation_count, sizeof(int8_t), &activation_bytes) ||
+        !cuda_size_mul(rows, sizeof(float), &row_bytes) ||
+        !cuda_size_mul(output_count, sizeof(int32_t), &output_bytes)) {
+        set_error(e, ec, "CUDA Q8 workspace size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec) != 0) return -1;
+    destroy_graphs(st);
+    if (st->dev_q8_activation_cap < activation_count) {
+        if (st->dev_q8_activation != nullptr) cudaFree(st->dev_q8_activation);
+        st->dev_q8_activation = nullptr;
+        st->dev_q8_activation_cap = 0u;
+        if (ce(cudaMalloc((void **)&st->dev_q8_activation,
+                          activation_bytes), e, ec) != 0)
+            return -1;
+        st->dev_q8_activation_cap = activation_count;
+    }
+    if (st->dev_q8_rows_cap < rows) {
+        if (st->dev_q8_activation_scale != nullptr)
+            cudaFree(st->dev_q8_activation_scale);
+        st->dev_q8_activation_scale = nullptr;
+        st->dev_q8_rows_cap = 0u;
+        if (ce(cudaMalloc((void **)&st->dev_q8_activation_scale,
+                          row_bytes), e, ec) != 0)
+            return -1;
+        st->dev_q8_rows_cap = rows;
+    }
+    if (st->dev_q8_accum_cap < output_count) {
+        if (st->dev_q8_accum != nullptr) cudaFree(st->dev_q8_accum);
+        st->dev_q8_accum = nullptr;
+        st->dev_q8_accum_cap = 0u;
+        if (ce(cudaMalloc((void **)&st->dev_q8_accum,
+                          output_bytes), e, ec) != 0)
+            return -1;
+        st->dev_q8_accum_cap = output_count;
+    }
+    return 0;
+}
+
+/* Graph callers reserve this before capture.  A resize synchronizes and
+ * invalidates graphs, so allowing the first larger batch to discover the
+ * allocation from inside a captured projection would make capture fail. */
+extern "C" int mynah_cuda_q8_reserve(void *opaque, size_t activation_count,
+                                      size_t rows, size_t output_count,
+                                      char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return ensure_q8_workspace(st, activation_count, rows, output_count, e, ec);
 }
 
 static int validate_cuda_matmul(const void *input, const void *output,
@@ -1777,6 +2019,82 @@ fail:
 /*  Self-test                                                          */
 /* ------------------------------------------------------------------ */
 
+/* Defined with the resident matmul entry points below. */
+extern "C" int mynah_cuda_matmul_q8_d2d(void *, const float *, float *, size_t,
+                                         size_t, size_t, const float *,
+                                         const float *, char *, size_t);
+
+static int cuda_q8_self_test(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) return -1;
+    const float input[6] = {1.0f, 2.0f, 3.0f, -1.0f, 0.5f, 2.0f};
+    const float weight[12] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+                              0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    const float bias[4] = {0.5f, -0.5f, 1.0f, 2.0f};
+    std::vector<int8_t> qweight;
+    std::vector<float> wscale;
+    if (cuda_pack_weight_q8(weight, 4u, 3u, &qweight, &wscale, e, ec) != 0)
+        return -1;
+    int8_t qinput[6] = {0};
+    float xscale[2] = {0.0f, 0.0f};
+    for (size_t row = 0; row < 2u; ++row) {
+        float amax = 0.0f;
+        for (size_t col = 0; col < 3u; ++col)
+            amax = std::fmax(amax, std::fabs(input[row * 3u + col]));
+        xscale[row] = amax == 0.0f ? 0.0f : amax / 127.0f;
+        const float inv = xscale[row] == 0.0f ? 0.0f : 127.0f / xscale[row];
+        for (size_t col = 0; col < 3u; ++col)
+            qinput[row * 3u + col] = (int8_t)cuda_q8_round(
+                input[row * 3u + col] * inv);
+    }
+    float *d_input = nullptr;
+    float *d_output = nullptr;
+    if (ce(cudaMalloc((void **)&d_input, sizeof(input)), e, ec) != 0 ||
+        ce(cudaMalloc((void **)&d_output, 8u * sizeof(float)), e, ec) != 0) {
+        if (d_input != nullptr) cudaFree(d_input);
+        if (d_output != nullptr) cudaFree(d_output);
+        return -1;
+    }
+    int result = 0;
+    do {
+        if (ce(cudaMemcpy(d_input, input, sizeof(input), cudaMemcpyHostToDevice),
+               e, ec) != 0 ||
+            mynah_cuda_matmul_q8_d2d(st, d_input, d_output, 2u, 3u, 4u,
+                                     weight, bias, e, ec) != 0 ||
+            ce(cudaStreamSynchronize(st->stream), e, ec) != 0) {
+            result = -1;
+            break;
+        }
+        float output[8] = {0.0f};
+        if (ce(cudaMemcpy(output, d_output, sizeof(output),
+                          cudaMemcpyDeviceToHost), e, ec) != 0) {
+            result = -1;
+            break;
+        }
+        for (size_t row = 0; row < 2u && result == 0; ++row) {
+            for (size_t col = 0; col < 4u; ++col) {
+                int32_t dot = 0;
+                for (size_t k = 0; k < 3u; ++k)
+                    dot += (int32_t)qinput[row * 3u + k] *
+                           (int32_t)qweight[col * 3u + k];
+                const float expected = (float)dot *
+                                           (xscale[row] * wscale[col]) +
+                                       bias[col];
+                if (std::fabs(output[row * 4u + col] - expected) > 2.0e-5f) {
+                    std::snprintf(e, ec, "Q8 matmul mismatch %zu: %f != %f",
+                                  row * 4u + col, output[row * 4u + col],
+                                  expected);
+                    result = -1;
+                    break;
+                }
+            }
+        }
+    } while (false);
+    cudaFree(d_input);
+    cudaFree(d_output);
+    return result;
+}
+
 static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float in[6]={1,2,3,-1,0.5f,2};
     const float w[12]={1,0,0,0,1,0,0,0,1,1,1,1};
@@ -1791,7 +2109,8 @@ static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float en[8]={1,2,3,6,-1,0.5f,2,1.5f};
     for (int i=0;i<8;i++) if (std::fabs(so[i]-en[i])>1e-4f) {
         std::snprintf(e,ec,"sgemm mismatch %d: %f!=%f",i,so[i],en[i]); return -1; }
-    return cuda_resident_kernel_self_test(opaque, e, ec);
+    if (cuda_resident_kernel_self_test(opaque, e, ec) != 0) return -1;
+    return cuda_q8_self_test(opaque, e, ec);
 }
 
 static void cuda_close(void *opaque) {
@@ -1800,7 +2119,14 @@ static void cuda_close(void *opaque) {
     destroy_graphs(st);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
+    for (auto &c : st->weights_int8) {
+        cudaFree(c.device_q);
+        cudaFree(c.device_scale);
+    }
     if (st->dev_scratch) cudaFree(st->dev_scratch);
+    if (st->dev_q8_activation) cudaFree(st->dev_q8_activation);
+    if (st->dev_q8_activation_scale) cudaFree(st->dev_q8_activation_scale);
+    if (st->dev_q8_accum) cudaFree(st->dev_q8_accum);
     if (st->host_buf) cudaFreeHost(st->host_buf);
     if (st->dev_argmax) cudaFree(st->dev_argmax);
     if (st->cublas_workspace) cudaFree(st->cublas_workspace);
@@ -1829,6 +2155,12 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     auto *st = new (std::nothrow) cuda_backend_state();
     if (!st) { set_error(e,ec,"oom"); return -1; }
     st->dev_scratch = nullptr; st->dev_scratch_cap = 0;
+    st->dev_q8_activation = nullptr;
+    st->dev_q8_activation_scale = nullptr;
+    st->dev_q8_accum = nullptr;
+    st->dev_q8_activation_cap = 0u;
+    st->dev_q8_rows_cap = 0u;
+    st->dev_q8_accum_cap = 0u;
     st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
     st->dev_argmax = nullptr;
     st->cublas_workspace = nullptr; st->cublas_workspace_cap = 0;
@@ -1860,9 +2192,15 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->resident_fallbacks.store(0ull, std::memory_order_relaxed);
     st->matmul_calls.store(0ull, std::memory_order_relaxed);
     st->matvec_calls.store(0ull, std::memory_order_relaxed);
+    st->q8_matmul_calls.store(0ull, std::memory_order_relaxed);
+    st->q8_rows.store(0ull, std::memory_order_relaxed);
+    st->q8_weight_uploads.store(0ull, std::memory_order_relaxed);
+    st->q8_weight_bytes.store(0ull, std::memory_order_relaxed);
+    st->q8_activation_bytes.store(0ull, std::memory_order_relaxed);
     st->batch_meta_cap = CUDA_BATCH_META_CAP;
     st->fast_math = cuda_fast_math_enabled();
     st->graphs_enabled = cuda_graphs_enabled();
+    st->q8_enabled = true;
     st->decoder_batch_enabled = cuda_decoder_batch_enabled();
     if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
     if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
@@ -1936,6 +2274,15 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
     metrics->resident_fallbacks = st->resident_fallbacks.load(std::memory_order_relaxed);
     metrics->matmul_calls = st->matmul_calls.load(std::memory_order_relaxed);
     metrics->matvec_calls = st->matvec_calls.load(std::memory_order_relaxed);
+    metrics->q8_matmul_calls =
+        st->q8_matmul_calls.load(std::memory_order_relaxed);
+    metrics->q8_rows = st->q8_rows.load(std::memory_order_relaxed);
+    metrics->q8_weight_uploads =
+        st->q8_weight_uploads.load(std::memory_order_relaxed);
+    metrics->q8_weight_bytes =
+        st->q8_weight_bytes.load(std::memory_order_relaxed);
+    metrics->q8_activation_bytes =
+        st->q8_activation_bytes.load(std::memory_order_relaxed);
     size_t free_bytes = 0u;
     size_t total_bytes = 0u;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
@@ -1945,6 +2292,7 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
     metrics->graphs_enabled = st->graphs_enabled ? 1u : 0u;
     metrics->fast_math_enabled = st->fast_math ? 1u : 0u;
     metrics->decoder_batch_enabled = st->decoder_batch_enabled ? 1u : 0u;
+    metrics->q8_enabled = st->q8_enabled ? 1u : 0u;
     return 0;
 }
 
@@ -2120,6 +2468,78 @@ extern "C" int mynah_cuda_matmul_d2d(void *opaque, const float *d_in, float *d_o
     return 0; /* no sync */
 }
 
+/* Resident Q8 matmul. The activation is quantized on device per row, then a
+ * signed INT8 x INT8 -> INT32 cuBLAS GEMM reads each cached weight row once for
+ * the whole request batch. The small f32 epilogue restores the CPU qmat
+ * representation (activation scale x weight-row scale + bias) into the normal
+ * resident f32 activation buffer. No host copy or stream sync is performed. */
+extern "C" int mynah_cuda_matmul_q8_d2d(void *opaque, const float *d_in,
+                                         float *d_out, size_t rows, size_t iw,
+                                         size_t ow, const float *weight,
+                                         const float *bias, char *e,
+                                         size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0u;
+    size_t out_n = 0u;
+    size_t weight_n = 0u;
+    size_t total_n = 0u;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &weight_n,
+                                               &total_n, e, ec) != 0 ||
+        out_n > (size_t)INT_MAX) {
+        if (st != nullptr && out_n > (size_t)INT_MAX)
+            set_error(e, ec, "CUDA Q8 output is too large for one launch");
+        return -1;
+    }
+    int8_t *device_weight = nullptr;
+    float *device_weight_scale = nullptr;
+    if (cached_weight_q8(st, weight, ow, iw, &device_weight,
+                         &device_weight_scale, e, ec) != 0)
+        return -1;
+    float *device_bias = nullptr;
+    if (bias != nullptr &&
+        cached_weight(st, bias, ow * sizeof(float), &device_bias, e, ec) != 0)
+        return -1;
+    if (ensure_q8_workspace(st, in_n, rows, out_n, e, ec) != 0) return -1;
+    if (rows > (size_t)INT_MAX || iw > (size_t)INT_MAX || ow > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA Q8 GEMM dimensions exceed cuBLAS limits");
+        return -1;
+    }
+    size_t quantize_blocks = 0u;
+    size_t epilogue_blocks = 0u;
+    if (!cuda_size_add(out_n, 255u, &epilogue_blocks) ||
+        !cuda_size_add(rows, 255u, &quantize_blocks) ||
+        (epilogue_blocks /= 256u) > (size_t)INT_MAX ||
+        (quantize_blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA Q8 launch size overflow");
+        return -1;
+    }
+    k_q8_quantize_rows<<<(int)rows, 256, 0, st->stream>>>(
+        d_in, st->dev_q8_activation, st->dev_q8_activation_scale,
+        (int)rows, (int)iw);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    cublasSetStream(st->cublas, st->stream);
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &alpha, device_weight, CUDA_R_8I, (int)iw,
+                         st->dev_q8_activation, CUDA_R_8I, (int)iw,
+                         &beta, st->dev_q8_accum, CUDA_R_32I, (int)ow,
+                         CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), e, ec) != 0)
+        return -1;
+    k_q8_epilogue<<<(int)epilogue_blocks, 256, 0, st->stream>>>(
+        st->dev_q8_accum, st->dev_q8_activation_scale,
+        device_weight_scale, device_bias, d_out, (int)rows, (int)ow);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->q8_matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->q8_rows.fetch_add((unsigned long long)rows, std::memory_order_relaxed);
+    st->q8_activation_bytes.fetch_add((unsigned long long)in_n,
+                                      std::memory_order_relaxed);
+    return 0;
+}
+
 static int cuda_flow_layer_norm(cuda_backend_state *st, const float *in,
                                 float *out, const float *gain,
                                 const float *bias, size_t rows, size_t width,
@@ -2142,6 +2562,14 @@ static int cuda_flow_linear(cuda_backend_state *st, const float *in, float *out,
                             char *e, size_t ec) {
     if (linear == nullptr || linear->weight == nullptr) {
         set_error(e, ec, "missing CUDA flow projection");
+        return -1;
+    }
+    if (linear->qtype == 1)
+        return mynah_cuda_matmul_q8_d2d(st, in, out, rows, input_width,
+                                        output_width, linear->weight,
+                                        linear->bias, e, ec);
+    if (linear->qtype != 0) {
+        set_error(e, ec, "unsupported CUDA flow projection precision");
         return -1;
     }
     return mynah_cuda_matmul_d2d(st, in, out, rows, input_width, output_width,

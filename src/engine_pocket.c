@@ -823,6 +823,7 @@ struct mynah_engine_state {
     mynah_qmat_cache *qcache;
     const mynah_backend *backend;
     unsigned qgroups; /* resolved MYNAH_QUANT_GROUPS, 0 when quant is off */
+    int cuda_q8_enabled; /* explicit MYNAH_CUDA_Q8=1 policy for int8 groups */
     signed char qgroup_qtype[POCKET_QG_BITS]; /* per-bit override, -1 = cache */
     signed char cond_in_qtype;
     signed char cond_eos_qtype;
@@ -880,6 +881,10 @@ struct mynah_engine_state {
  * correctly refuse for a quantized group. */
 static int pocket_cuda_groups_are_f32(const mynah_engine_state *state,
                                       unsigned selected);
+static int pocket_cuda_groups_are_resident_compatible(
+    const mynah_engine_state *state, unsigned selected);
+static int pocket_cuda_resident_requested(const mynah_engine_state *state);
+static int pocket_cuda_q8_requested(void);
 
 /* Defined below, next to the writer; the context only holds a pointer. */
 typedef struct pocket_dump pocket_dump;
@@ -1515,6 +1520,123 @@ static int pocket_proj_row(const pocket_proj *p, const float *weight,
 static int pocket_cs_qtype(const pocket_proj *p) {
     return mynah_qmat_qtype_resolved(
         p->qtype >= 0 ? p->qtype : mynah_qmat_cache_qtype(p->qcache));
+}
+
+static int pocket_cuda_tar_qtype(const mynah_engine_state *state,
+                                 size_t layer,
+                                 mynah_transformer_ar_linear_kind kind) {
+    pocket_proj proj;
+    if (state == NULL || pocket_tar_proj(&state->backbone_hook, layer, kind,
+                                         &proj) != 0 || !proj.quantized)
+        return 0;
+    return pocket_cs_qtype(&proj);
+}
+
+static int pocket_cuda_codec_qtype(const mynah_engine_state *state,
+                                   size_t layer,
+                                   mynah_transformer_ar_linear_kind kind) {
+    pocket_proj proj;
+    if (state == NULL || pocket_tar_proj(&state->codec_hook, layer, kind,
+                                         &proj) != 0 || !proj.quantized)
+        return 0;
+    return pocket_cs_qtype(&proj);
+}
+
+static int pocket_cuda_flow_qtype(const mynah_engine_state *state,
+                                  size_t index, mynah_flow_linear_kind kind) {
+    pocket_proj proj;
+    if (state == NULL || pocket_flow_proj(&state->flow_hook, index, kind,
+                                          &proj) != 0 || !proj.quantized)
+        return 0;
+    return pocket_cs_qtype(&proj);
+}
+
+static int pocket_cuda_linear_d2d(const mynah_engine_state *state,
+                                  const float *input, float *output,
+                                  size_t rows, size_t input_width,
+                                  size_t output_width, const float *weight,
+                                  const float *bias, int qtype, char *error,
+                                  size_t error_capacity) {
+    if (state == NULL || state->backend == NULL) return -1;
+    if (qtype == 1 && state->cuda_q8_enabled)
+        return mynah_backend_matmul_q8_d2d(
+            state->backend, input, output, rows, input_width, output_width,
+            weight, bias, error, error_capacity);
+    if (qtype != 0 && qtype != 1) {
+        pocket_error(error, error_capacity,
+                     "pocket: CUDA resident projection precision is unsupported");
+        return -1;
+    }
+    return mynah_backend_matmul_d2d(
+        state->backend, input, output, rows, input_width, output_width, weight,
+        bias, error, error_capacity);
+}
+
+/* Q8 uses one reusable activation/scale/accumulator arena.  Reserve it for
+ * the widest scheduler batch before any CUDA graph can be captured.  The
+ * arena is deliberately sized from all Pocket linear shapes, not multiplied
+ * by layer count: every projection reuses the same buffers. */
+static int pocket_cuda_q8_reserve_for_batch(mynah_engine_state *state,
+                                            size_t batch, char *error,
+                                            size_t capacity) {
+    if (state == NULL || !state->cuda_q8_enabled ||
+        !pocket_cuda_resident_requested(state) || batch == 0u)
+        return 0;
+    const unsigned selected = state->qgroups;
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    int q8_used = 0;
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        if (mynah_qmat_qtype_resolved(qtype) == 1) {
+            q8_used = 1;
+            break;
+        }
+    }
+    if (!q8_used) return 0;
+
+    const pocket_config *cfg = &state->cfg;
+    size_t attn_dim = 0u;
+    size_t qkv_width = 0u;
+    size_t codec_qkv_width = 0u;
+    size_t flow_freq_width = 0u;
+    size_t flow_three = 0u;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(attn_dim, 3u, &qkv_width) != 0 ||
+        pocket_mul(cfg->codec_tf_dim, 3u, &codec_qkv_width) != 0 ||
+        pocket_mul(cfg->flow_freqs, 2u, &flow_freq_width) != 0 ||
+        pocket_mul(cfg->flow_dim, 3u, &flow_three) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA Q8 reserve size overflow");
+        return -1;
+    }
+    size_t input_width = cfg->hidden_dim;
+    size_t output_width = qkv_width;
+    if (attn_dim > input_width) input_width = attn_dim;
+    if (cfg->ffn_dim > input_width) input_width = cfg->ffn_dim;
+    if (cfg->codec_tf_dim > input_width) input_width = cfg->codec_tf_dim;
+    if (cfg->codec_tf_ffn > input_width) input_width = cfg->codec_tf_ffn;
+    if (cfg->latent_dim > input_width) input_width = cfg->latent_dim;
+    if (cfg->flow_dim > input_width) input_width = cfg->flow_dim;
+    if (flow_freq_width > input_width) input_width = flow_freq_width;
+    if (codec_qkv_width > output_width) output_width = codec_qkv_width;
+    if (cfg->ffn_dim > output_width) output_width = cfg->ffn_dim;
+    if (cfg->codec_tf_ffn > output_width) output_width = cfg->codec_tf_ffn;
+    if (flow_three > output_width) output_width = flow_three;
+    if (cfg->hidden_dim > output_width) output_width = cfg->hidden_dim;
+    if (cfg->latent_dim > output_width) output_width = cfg->latent_dim;
+    size_t activation_count = 0u;
+    size_t output_count = 0u;
+    if (pocket_mul(batch, input_width, &activation_count) != 0 ||
+        pocket_mul(batch, output_width, &output_count) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA Q8 reserve count overflow");
+        return -1;
+    }
+    return mynah_backend_q8_reserve(state->backend, activation_count, batch,
+                                    output_count, error, capacity);
 }
 
 
@@ -3325,6 +3447,10 @@ static int pocket_model_init(const mynah_tts_model *model,
      * `flow_head` compute with no hook at all. */
     state->backend = model->backend;
     state->qcache = model->qcache;
+    state->cuda_q8_enabled =
+        state->backend != NULL &&
+        strcmp(mynah_backend_name(state->backend), "cuda") == 0 &&
+        pocket_cuda_q8_requested();
     for (size_t b = 0; b < POCKET_QG_BITS; ++b) state->qgroup_qtype[b] = -1;
     state->qgroups = 0u;
     if (mynah_qmat_cache_enabled(state->qcache)) {
@@ -3357,10 +3483,20 @@ static int pocket_model_init(const mynah_tts_model *model,
                                 state->codec_convtr_qtype != 1;
         fprintf(stderr,
                 "mynah-tts: pocket backend=cuda resident=%s qgroups=0x%04x "
+                "q8=%s resident{backbone=%s flow=%s codec_transformer=%s} "
                 "raw_f32{backbone=%s flow=%s codec_transformer=%s "
                 "quantizer_upsample=%s decoder=%s}; "
-                "quantized groups stay on the CPU oracle\n",
+                "non-Q8 quantized groups stay on the CPU oracle\n",
                 resident_on ? "on" : "off", state->qgroups,
+                state->cuda_q8_enabled ? "on" : "off",
+                pocket_cuda_groups_are_resident_compatible(
+                    state, POCKET_QG_ATTENTION | POCKET_QG_FFN) ? "on" : "off",
+                pocket_cuda_groups_are_resident_compatible(state,
+                                                            POCKET_QG_FLOW_NET)
+                    ? "on" : "off",
+                pocket_cuda_groups_are_resident_compatible(state,
+                                                            POCKET_QG_CODEC_TF)
+                    ? "on" : "off",
                 pocket_cuda_groups_are_f32(state, POCKET_QG_ATTENTION | POCKET_QG_FFN)
                     ? "on" : "off",
                 pocket_cuda_groups_are_f32(state, POCKET_QG_FLOW_NET) ? "on" : "off",
@@ -3478,6 +3614,11 @@ static int pocket_cuda_resident_requested(const mynah_engine_state *state) {
     return setting == NULL || strcmp(setting, "0") != 0;
 }
 
+static int pocket_cuda_q8_requested(void) {
+    const char *setting = getenv("MYNAH_CUDA_Q8");
+    return setting != NULL && strcmp(setting, "0") != 0;
+}
+
 /* Pageable CUDA copies are allowed by the API but commonly turn an
  * ostensibly asynchronous transfer into a host-side staging/synchronisation
  * point.  These small request buffers sit exactly on the single-request seam
@@ -3553,9 +3694,32 @@ static int pocket_cuda_groups_are_f32(const mynah_engine_state *state,
     return 1;
 }
 
+/* The resident projection kernels currently accept original f32 and explicit
+ * INT8/Q8. F16/BF16/INT4 continue to use the CPU oracle until their exact
+ * device representations and parity gates exist. */
+static int pocket_cuda_groups_are_resident_compatible(
+    const mynah_engine_state *state, unsigned groups) {
+    if (state == NULL || groups == 0u) return 0;
+    const unsigned selected = state->qgroups & groups;
+    if (selected == 0u) return 1;
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        qtype = mynah_qmat_qtype_resolved(qtype);
+        if (qtype != 0 && !(qtype == 1 && state->cuda_q8_enabled)) return 0;
+    }
+    return 1;
+}
+
 static int pocket_cuda_flow_requested(const mynah_engine_state *state) {
     if (!pocket_cuda_resident_requested(state)) return 0;
-    if (!pocket_cuda_groups_are_f32(state, POCKET_QG_FLOW_NET)) return 0;
+    if (!pocket_cuda_groups_are_resident_compatible(state,
+                                                    POCKET_QG_FLOW_NET)) return 0;
     const char *setting = getenv("MYNAH_CUDA_FLOW");
     return setting == NULL || strcmp(setting, "0") != 0;
 }
@@ -3678,11 +3842,11 @@ static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
     const mynah_backend *backend = state->backend;
-    const int codec_tf_f32 =
-        pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_TF);
+    const int codec_tf_resident =
+        pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_CODEC_TF);
     const int codec_conv_f32 =
         pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_CONV);
-    if (!codec_tf_f32) return 0;
+    if (!codec_tf_resident) return 0;
     const mynah_transformer_ar_config *tc =
         mynah_transformer_ar_state_config(ctx->codec_transformer);
     if (backend == NULL || tc == NULL || cfg->codec_tf_layers == 0u ||
@@ -4155,10 +4319,12 @@ static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx,
                     state->backend, ctx->cuda_codec_x, ctx->cuda_codec_norm,
                     layer->norm1_weight, layer->norm1_bias, 1u, dim, local,
                     sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, ctx->cuda_codec_norm, ctx->cuda_codec_qkv,
-                    1u, dim, 3u * dim, layer->in_proj_weight,
-                    layer->in_proj_bias, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_norm, ctx->cuda_codec_qkv, 1u, dim,
+                    3u * dim, layer->in_proj_weight, layer->in_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_rope_dev(state->backend, ctx->cuda_codec_qkv,
                                        absolute, cfg->codec_tf_heads,
                                        dim / cfg->codec_tf_heads, tc->max_period,
@@ -4172,9 +4338,11 @@ static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx,
                     dim / cfg->codec_tf_heads,
                     1.0f / sqrtf((float)(dim / cfg->codec_tf_heads)),
                     ctx->cuda_codec_attn, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, ctx->cuda_codec_attn, ctx->cuda_codec_proj,
-                    1u, dim, dim, layer->out_proj_weight, layer->out_proj_bias,
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_attn, ctx->cuda_codec_proj, 1u,
+                    dim, dim, layer->out_proj_weight, layer->out_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_OUT_PROJ),
                     local, sizeof(local)) != 0 ||
                 mynah_backend_scaled_residual_add_dev(
                     state->backend, ctx->cuda_codec_x, ctx->cuda_codec_proj,
@@ -4183,16 +4351,20 @@ static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx,
                     state->backend, ctx->cuda_codec_x, ctx->cuda_codec_norm,
                     layer->norm2_weight, layer->norm2_bias, 1u, dim, local,
                     sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, ctx->cuda_codec_norm, ctx->cuda_codec_ffn,
-                    1u, dim, cfg->codec_tf_ffn, layer->linear1_weight,
-                    layer->linear1_bias, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_norm, ctx->cuda_codec_ffn, 1u, dim,
+                    cfg->codec_tf_ffn, layer->linear1_weight,
+                    layer->linear1_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN1),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_gelu_dev(state->backend, ctx->cuda_codec_ffn,
                                        cfg->codec_tf_ffn, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, ctx->cuda_codec_ffn, ctx->cuda_codec_proj,
-                    1u, cfg->codec_tf_ffn, dim, layer->linear2_weight,
-                    layer->linear2_bias, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_ffn, ctx->cuda_codec_proj, 1u,
+                    cfg->codec_tf_ffn, dim, layer->linear2_weight,
+                    layer->linear2_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN2),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_scaled_residual_add_dev(
                     state->backend, ctx->cuda_codec_x, ctx->cuda_codec_proj,
                     layer->layer_scale_2, dim, local, sizeof(local)) != 0)
@@ -4528,11 +4700,11 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     if (ctx == NULL || !ctx->cuda_backbone_enabled || ctx->backbone == NULL) {
         return 0;
     }
-    if (!pocket_cuda_groups_are_f32(ctx->state,
-                                    POCKET_QG_ATTENTION | POCKET_QG_FFN)) {
-        /* The resident block is deliberately raw-FP32 today.  Keep the CPU
-         * qmat graph authoritative for a selected backbone precision instead
-         * of mixing an f32 CUDA AR step after a quantized CPU prefill. */
+    if (!pocket_cuda_groups_are_resident_compatible(
+            ctx->state, POCKET_QG_ATTENTION | POCKET_QG_FFN)) {
+        /* Keep the CPU qmat graph authoritative for encodings that do not yet
+         * have a matching resident CUDA epilogue. Explicit INT8 is admitted
+         * only through MYNAH_CUDA_Q8. */
         ctx->cuda_backbone_enabled = 0;
         return 0;
     }
@@ -4698,10 +4870,12 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
                                          layer->norm1_weight, layer->norm1_bias,
                                          1u, cfg->hidden_dim, local,
                                          sizeof(local)) != 0 ||
-            mynah_backend_matmul_d2d(backend, ctx->cuda_norm, ctx->cuda_qkv,
-                                     1u, cfg->hidden_dim, 3u * attn_dim,
-                                     layer->in_proj_weight, layer->in_proj_bias,
-                                     local, sizeof(local)) != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_norm, ctx->cuda_qkv, 1u,
+                cfg->hidden_dim, 3u * attn_dim, layer->in_proj_weight,
+                layer->in_proj_bias,
+                pocket_cuda_tar_qtype(ctx->state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                local, sizeof(local)) != 0 ||
             mynah_backend_rope_dev(backend, ctx->cuda_qkv, position, cfg->heads,
                                    cfg->head_dim, bc->max_period, local,
                                    sizeof(local)) != 0) goto fail;
@@ -4711,10 +4885,12 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
                 position, attn_dim, position + 1u, cfg->heads, cfg->head_dim,
                 1.0f / sqrtf((float)cfg->head_dim), ctx->cuda_attn, local,
                 sizeof(local)) != 0 ||
-            mynah_backend_matmul_d2d(backend, ctx->cuda_attn, ctx->cuda_proj,
-                                     1u, attn_dim, cfg->hidden_dim,
-                                     layer->out_proj_weight, layer->out_proj_bias,
-                                     local, sizeof(local)) != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_attn, ctx->cuda_proj, 1u, attn_dim,
+                cfg->hidden_dim, layer->out_proj_weight, layer->out_proj_bias,
+                pocket_cuda_tar_qtype(ctx->state, l,
+                                      MYNAH_TAR_LINEAR_OUT_PROJ),
+                local, sizeof(local)) != 0 ||
             mynah_backend_residual_add_dev(backend, ctx->cuda_x, ctx->cuda_proj,
                                            cfg->hidden_dim, local,
                                            sizeof(local)) != 0 ||
@@ -4722,16 +4898,20 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
                                          layer->norm2_weight, layer->norm2_bias,
                                          1u, cfg->hidden_dim, local,
                                          sizeof(local)) != 0 ||
-            mynah_backend_matmul_d2d(backend, ctx->cuda_norm, ctx->cuda_ffn,
-                                     1u, cfg->hidden_dim, cfg->ffn_dim,
-                                     layer->linear1_weight, layer->linear1_bias,
-                                     local, sizeof(local)) != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_norm, ctx->cuda_ffn, 1u,
+                cfg->hidden_dim, cfg->ffn_dim, layer->linear1_weight,
+                layer->linear1_bias,
+                pocket_cuda_tar_qtype(ctx->state, l, MYNAH_TAR_LINEAR_FFN1),
+                local, sizeof(local)) != 0 ||
             mynah_backend_gelu_dev(backend, ctx->cuda_ffn, cfg->ffn_dim, local,
                                    sizeof(local)) != 0 ||
-            mynah_backend_matmul_d2d(backend, ctx->cuda_ffn, ctx->cuda_proj,
-                                     1u, cfg->ffn_dim, cfg->hidden_dim,
-                                     layer->linear2_weight, layer->linear2_bias,
-                                     local, sizeof(local)) != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_ffn, ctx->cuda_proj, 1u,
+                cfg->ffn_dim, cfg->hidden_dim, layer->linear2_weight,
+                layer->linear2_bias,
+                pocket_cuda_tar_qtype(ctx->state, l, MYNAH_TAR_LINEAR_FFN2),
+                local, sizeof(local)) != 0 ||
             mynah_backend_residual_add_dev(backend, ctx->cuda_x, ctx->cuda_proj,
                                            cfg->hidden_dim, local,
                                            sizeof(local)) != 0) goto fail;
@@ -4908,11 +5088,12 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
                     scratch->backend, scratch->cuda_x, scratch->cuda_norm,
                     layer->norm1_weight, layer->norm1_bias, count,
                     cfg->hidden_dim, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    scratch->backend, scratch->cuda_norm, scratch->cuda_qkv,
-                    count, cfg->hidden_dim, 3u * attn_dim,
-                    layer->in_proj_weight, layer->in_proj_bias, local,
-                    sizeof(local)) != 0) goto fail;
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_norm, scratch->cuda_qkv, count,
+                    cfg->hidden_dim, 3u * attn_dim, layer->in_proj_weight,
+                    layer->in_proj_bias,
+                    pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                    local, sizeof(local)) != 0) goto fail;
             if (mynah_backend_rope_batch_dev(
                     scratch->backend, scratch->cuda_qkv,
                     scratch->cuda_positions, count, cfg->heads, cfg->head_dim,
@@ -4926,10 +5107,13 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
                     scratch->cuda_cache_strides, count, cfg->heads,
                     cfg->head_dim, 1.0f / sqrtf((float)cfg->head_dim),
                     scratch->cuda_attn, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    scratch->backend, scratch->cuda_attn, scratch->cuda_proj,
-                    count, attn_dim, cfg->hidden_dim, layer->out_proj_weight,
-                    layer->out_proj_bias, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_attn, scratch->cuda_proj, count,
+                    attn_dim, cfg->hidden_dim, layer->out_proj_weight,
+                    layer->out_proj_bias,
+                    pocket_cuda_tar_qtype(state, l,
+                                          MYNAH_TAR_LINEAR_OUT_PROJ),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_residual_add_dev(
                     scratch->backend, scratch->cuda_x, scratch->cuda_proj,
                     count * cfg->hidden_dim, local, sizeof(local)) != 0 ||
@@ -4937,19 +5121,21 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
                     scratch->backend, scratch->cuda_x, scratch->cuda_norm,
                     layer->norm2_weight, layer->norm2_bias, count,
                     cfg->hidden_dim, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    scratch->backend, scratch->cuda_norm, scratch->cuda_ffn,
-                    count, cfg->hidden_dim, cfg->ffn_dim,
-                    layer->linear1_weight, layer->linear1_bias, local,
-                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_norm, scratch->cuda_ffn, count,
+                    cfg->hidden_dim, cfg->ffn_dim, layer->linear1_weight,
+                    layer->linear1_bias,
+                    pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_FFN1),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_gelu_dev(scratch->backend, scratch->cuda_ffn,
                                        count * cfg->ffn_dim, local,
                                        sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    scratch->backend, scratch->cuda_ffn, scratch->cuda_proj,
-                    count, cfg->ffn_dim, cfg->hidden_dim,
-                    layer->linear2_weight, layer->linear2_bias, local,
-                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_ffn, scratch->cuda_proj, count,
+                    cfg->ffn_dim, cfg->hidden_dim, layer->linear2_weight,
+                    layer->linear2_bias,
+                    pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_FFN2),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_residual_add_dev(
                     scratch->backend, scratch->cuda_x, scratch->cuda_proj,
                     count * cfg->hidden_dim, local, sizeof(local)) != 0 ||
@@ -6939,11 +7125,13 @@ static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
                     state->backend, scratch->cuda_codec_x,
                     scratch->cuda_codec_norm, layer->norm1_weight,
                     layer->norm1_bias, count, dim, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, scratch->cuda_codec_norm,
-                    scratch->cuda_codec_qkv, count, dim, 3u * dim,
-                    layer->in_proj_weight, layer->in_proj_bias, local,
-                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_norm, scratch->cuda_codec_qkv,
+                    count, dim, 3u * dim, layer->in_proj_weight,
+                    layer->in_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_rope_batch_dev(
                     state->backend, scratch->cuda_codec_qkv,
                     absolute_positions, count,
@@ -6961,11 +7149,13 @@ static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
                     count, cfg->codec_tf_heads, dim / cfg->codec_tf_heads,
                     1.0f / sqrtf((float)(dim / cfg->codec_tf_heads)),
                     scratch->cuda_codec_attn, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, scratch->cuda_codec_attn,
-                    scratch->cuda_codec_proj, count, dim, dim,
-                    layer->out_proj_weight, layer->out_proj_bias, local,
-                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_attn, scratch->cuda_codec_proj,
+                    count, dim, dim, layer->out_proj_weight,
+                    layer->out_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_OUT_PROJ),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_scaled_residual_rows_dev(
                     state->backend, scratch->cuda_codec_x,
                     scratch->cuda_codec_proj, layer->layer_scale_1, rows,
@@ -6974,18 +7164,20 @@ static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
                     state->backend, scratch->cuda_codec_x,
                     scratch->cuda_codec_norm, layer->norm2_weight,
                     layer->norm2_bias, count, dim, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, scratch->cuda_codec_norm,
-                    scratch->cuda_codec_ffn, count, dim, cfg->codec_tf_ffn,
-                    layer->linear1_weight, layer->linear1_bias, local,
-                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_norm, scratch->cuda_codec_ffn,
+                    count, dim, cfg->codec_tf_ffn, layer->linear1_weight,
+                    layer->linear1_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN1),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_gelu_dev(state->backend, scratch->cuda_codec_ffn,
                                        ffn_rows, local, sizeof(local)) != 0 ||
-                mynah_backend_matmul_d2d(
-                    state->backend, scratch->cuda_codec_ffn,
-                    scratch->cuda_codec_proj, count, cfg->codec_tf_ffn, dim,
-                    layer->linear2_weight, layer->linear2_bias, local,
-                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_ffn, scratch->cuda_codec_proj,
+                    count, cfg->codec_tf_ffn, dim, layer->linear2_weight,
+                    layer->linear2_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN2),
+                    local, sizeof(local)) != 0 ||
                 mynah_backend_scaled_residual_rows_dev(
                     state->backend, scratch->cuda_codec_x,
                     scratch->cuda_codec_proj, layer->layer_scale_2, rows,
@@ -7594,6 +7786,21 @@ static int pocket_scratch_new(const mynah_tts_model *model,
         return -1;
     }
 
+    /* Q8 workspace growth is forbidden during CUDA graph capture. Reserve
+     * every linear shape once for the scheduler's maximum microbatch; the
+     * per-layer path then reuses it without a sync, malloc or graph teardown. */
+    if (state->cuda_q8_enabled) {
+        char q8_error[256];
+        q8_error[0] = '\0';
+        if (pocket_cuda_q8_reserve_for_batch(state, batch, q8_error,
+                                             sizeof(q8_error)) != 0) {
+            fprintf(stderr,
+                    "mynah-tts: disabling resident CUDA Q8 workspace: %s\n",
+                    q8_error[0] != '\0' ? q8_error : "reserve failed");
+            state->cuda_q8_enabled = 0;
+        }
+    }
+
     /* Reserve the cross-request resident workspace up front.  If the optional
      * CUDA buffers cannot be created, the already-correct CPU batch remains
      * available; no decode call allocates a smaller emergency workspace. */
@@ -7906,10 +8113,16 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                                 src->mlp_in.weight;
                             scratch->cuda_flow_time_mlp_in[t].bias =
                                 src->mlp_in.bias;
+                            scratch->cuda_flow_time_mlp_in[t].qtype =
+                                pocket_cuda_flow_qtype(
+                                    state, t, MYNAH_FLOW_LINEAR_TIME_MLP_IN);
                             scratch->cuda_flow_time_mlp_out[t].weight =
                                 src->mlp_out.weight;
                             scratch->cuda_flow_time_mlp_out[t].bias =
                                 src->mlp_out.bias;
+                            scratch->cuda_flow_time_mlp_out[t].qtype =
+                                pocket_cuda_flow_qtype(
+                                    state, t, MYNAH_FLOW_LINEAR_TIME_MLP_OUT);
                             scratch->cuda_flow_time_alpha[t] = src->alpha;
                         }
                         for (size_t b = 0; b < cfg->flow_depth; ++b) {
@@ -7921,27 +8134,45 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                             dst->in_ln_bias = src->in_ln_bias;
                             dst->adaln.weight = src->adaln.weight;
                             dst->adaln.bias = src->adaln.bias;
+                            dst->adaln.qtype = pocket_cuda_flow_qtype(
+                                state, b, MYNAH_FLOW_LINEAR_BLOCK_ADALN);
                             dst->mlp_in.weight = src->mlp_in.weight;
                             dst->mlp_in.bias = src->mlp_in.bias;
+                            dst->mlp_in.qtype = pocket_cuda_flow_qtype(
+                                state, b, MYNAH_FLOW_LINEAR_BLOCK_MLP_IN);
                             dst->mlp_out.weight = src->mlp_out.weight;
                             dst->mlp_out.bias = src->mlp_out.bias;
+                            dst->mlp_out.qtype = pocket_cuda_flow_qtype(
+                                state, b, MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT);
                         }
                         scratch->cuda_flow_cond_embed.weight =
                             state->flow.cond_embed.weight;
                         scratch->cuda_flow_cond_embed.bias =
                             state->flow.cond_embed.bias;
+                        scratch->cuda_flow_cond_embed.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_COND_EMBED);
                         scratch->cuda_flow_input_proj.weight =
                             state->flow.input_proj.weight;
                         scratch->cuda_flow_input_proj.bias =
                             state->flow.input_proj.bias;
+                        scratch->cuda_flow_input_proj.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_INPUT_PROJ);
                         scratch->cuda_flow_final_adaln.weight =
                             state->flow.final_adaln.weight;
                         scratch->cuda_flow_final_adaln.bias =
                             state->flow.final_adaln.bias;
+                        scratch->cuda_flow_final_adaln.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_FINAL_ADALN);
                         scratch->cuda_flow_final_linear.weight =
                             state->flow.final_linear.weight;
                         scratch->cuda_flow_final_linear.bias =
                             state->flow.final_linear.bias;
+                        scratch->cuda_flow_final_linear.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_FINAL_LINEAR);
                     }
                 }
             }

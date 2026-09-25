@@ -1458,9 +1458,13 @@ static void handle_health(int fd) {
              "\"decoder_batch_calls\":%llu,\"decoder_batch_items\":%llu,"
              "\"decoder_batch_frames\":%llu,\"decoder_failures\":%llu,"
              "\"resident_fallbacks\":%llu,\"matmul_calls\":%llu,"
-             "\"matvec_calls\":%llu,\"device_memory_bytes\":%llu,"
+             "\"matvec_calls\":%llu,\"q8_matmul_calls\":%llu,"
+             "\"q8_rows\":%llu,\"q8_weight_uploads\":%llu,"
+             "\"q8_weight_bytes\":%llu,\"q8_activation_bytes\":%llu,"
+             "\"device_memory_bytes\":%llu,"
              "\"device_memory_free_bytes\":%llu,\"graphs_enabled\":%u,"
-             "\"fast_math_enabled\":%u,\"decoder_batch_enabled\":%u}",
+             "\"fast_math_enabled\":%u,\"decoder_batch_enabled\":%u,"
+             "\"q8_enabled\":%u}",
              backend_metrics.h2d_bytes, backend_metrics.d2h_bytes,
              backend_metrics.h2d_calls, backend_metrics.d2h_calls,
              backend_metrics.sync_calls,
@@ -1481,10 +1485,13 @@ static void handle_health(int fd) {
              backend_metrics.decoder_failures,
              backend_metrics.resident_fallbacks,
              backend_metrics.matmul_calls, backend_metrics.matvec_calls,
+             backend_metrics.q8_matmul_calls, backend_metrics.q8_rows,
+             backend_metrics.q8_weight_uploads, backend_metrics.q8_weight_bytes,
+             backend_metrics.q8_activation_bytes,
              backend_metrics.device_memory_bytes,
              backend_metrics.device_memory_free_bytes,
              backend_metrics.graphs_enabled, backend_metrics.fast_math_enabled,
-             backend_metrics.decoder_batch_enabled);
+             backend_metrics.decoder_batch_enabled, backend_metrics.q8_enabled);
 
     /* THE COUNTERS THIS PROCESS CANNOT KNOW.
      *
@@ -1831,6 +1838,26 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_matvec_calls_total counter\n"
            "mynah_backend_matvec_calls_total %llu\n",
            m.matvec_calls);
+    METRIC("# HELP mynah_backend_q8_matmul_calls_total Resident CUDA Q8 matmul calls.\n"
+           "# TYPE mynah_backend_q8_matmul_calls_total counter\n"
+           "mynah_backend_q8_matmul_calls_total %llu\n",
+           m.q8_matmul_calls);
+    METRIC("# HELP mynah_backend_q8_rows_total Rows processed by resident CUDA Q8.\n"
+           "# TYPE mynah_backend_q8_rows_total counter\n"
+           "mynah_backend_q8_rows_total %llu\n",
+           m.q8_rows);
+    METRIC("# HELP mynah_backend_q8_weight_uploads_total CUDA Q8 weight uploads.\n"
+           "# TYPE mynah_backend_q8_weight_uploads_total counter\n"
+           "mynah_backend_q8_weight_uploads_total %llu\n",
+           m.q8_weight_uploads);
+    METRIC("# HELP mynah_backend_q8_weight_bytes_total CUDA Q8 cached weight bytes.\n"
+           "# TYPE mynah_backend_q8_weight_bytes_total counter\n"
+           "mynah_backend_q8_weight_bytes_total %llu\n",
+           m.q8_weight_bytes);
+    METRIC("# HELP mynah_backend_q8_activation_bytes_total CUDA Q8 activation bytes quantized.\n"
+           "# TYPE mynah_backend_q8_activation_bytes_total counter\n"
+           "mynah_backend_q8_activation_bytes_total %llu\n",
+           m.q8_activation_bytes);
     METRIC("# HELP mynah_backend_device_memory_bytes CUDA device memory.\n"
            "# TYPE mynah_backend_device_memory_bytes gauge\n"
            "mynah_backend_device_memory_bytes %llu\n",
@@ -1848,6 +1875,9 @@ static void handle_metrics(int fd) {
     METRIC("# HELP mynah_backend_decoder_batch_enabled Whether decoder gang submission is enabled.\n"
            "# TYPE mynah_backend_decoder_batch_enabled gauge\n"
            "mynah_backend_decoder_batch_enabled %u\n", m.decoder_batch_enabled);
+    METRIC("# HELP mynah_backend_q8_enabled Whether resident CUDA Q8 is available.\n"
+           "# TYPE mynah_backend_q8_enabled gauge\n"
+           "mynah_backend_q8_enabled %u\n", m.q8_enabled);
 #undef METRIC
     send_status(fd, "200 OK", "text/plain; version=0.0.4", body, n);
 }
@@ -2211,7 +2241,8 @@ static void dump_local_stats(void) {
             "codec_upsample=%llu fallback=%llu "
             "decoder_steps=%llu decoder_batch=%llu/%llu/%llu "
             "decoder_failures=%llu resident_fallbacks=%llu matmul=%llu matvec=%llu "
-            "vram=%llu/%llu flags=%u/%u/%u\n",
+            "q8=%llu/%llu weights=%llu/%llu "
+            "vram=%llu/%llu flags=%u/%u/%u q8=%u\n",
             who, g.info.device, backend_metrics.h2d_bytes,
             backend_metrics.d2h_bytes, backend_metrics.graph_captures,
             backend_metrics.graph_replays, backend_metrics.graph_fallbacks,
@@ -2232,11 +2263,16 @@ static void dump_local_stats(void) {
             backend_metrics.resident_fallbacks,
             backend_metrics.matmul_calls,
             backend_metrics.matvec_calls,
+            backend_metrics.q8_matmul_calls,
+            backend_metrics.q8_rows,
+            backend_metrics.q8_weight_uploads,
+            backend_metrics.q8_weight_bytes,
             backend_metrics.device_memory_free_bytes,
             backend_metrics.device_memory_bytes,
             backend_metrics.graphs_enabled,
             backend_metrics.fast_math_enabled,
-            backend_metrics.decoder_batch_enabled);
+            backend_metrics.decoder_batch_enabled,
+            backend_metrics.q8_enabled);
     fflush(stderr);
 }
 
