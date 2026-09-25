@@ -3821,6 +3821,7 @@ static int pocket_cuda_codec_import_upsample_tail(mynah_engine_ctx *ctx,
         return -1;
     }
     char local[256];
+    local[0] = '\0';
     if (mynah_backend_d2h(ctx->state->backend, ctx->cuda_codec_up_partial,
                           ctx->codec_up, count, local, sizeof(local)) != 0 ||
         mynah_backend_sync(ctx->state->backend, local, sizeof(local)) != 0 ||
@@ -3879,6 +3880,7 @@ static int pocket_cuda_codec_upsample_prepare(mynah_engine_ctx *ctx,
                      sizeof(local)) != 0;
     if (failed) {
         char drain[256];
+        drain[0] = '\0';
         if (mynah_backend_sync(state->backend, drain, sizeof(drain)) != 0 ||
             pocket_cuda_codec_import_upsample_tail(ctx, error, capacity) != 0) {
             if (error != NULL && capacity > 0u && error[0] == '\0')
