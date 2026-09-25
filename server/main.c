@@ -4,6 +4,7 @@
  *   GET  /v1/voices         the pack's speakers, by id and name
  *   GET  /v1/models         OpenAI-shaped model listing
  *   GET  /health            liveness
+ *   GET  /metrics           Prometheus-compatible process/backend counters
  *
  * Concurrency note, stated plainly because it shapes the design: a
  * mynah_tts_model carries mutable caches (quantized weights, codec filters,
@@ -77,6 +78,7 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -115,7 +117,8 @@ static struct {
     size_t voice_count;
     unsigned default_speaker;
     int worker_count;
-    size_t max_batch;
+    size_t max_batch;       /* engine/CUDA microbatch width */
+    size_t max_active;      /* resident request slots; 0 follows max_batch */
     size_t max_pending;
     unsigned request_timeout_ms;
     int cancel_on_disconnect;   /* default on; --no-cancel-on-disconnect turns it off */
@@ -178,6 +181,15 @@ static struct {
     atomic_ulong failed;
     atomic_ulong streams_active;
     atomic_ulong streams_total;
+    /* Timing is exported as monotonic sums plus a sample count, which keeps
+     * the endpoint cheap and lets Prometheus derive rates/means without a
+     * request-id label or a lock in the scheduler. Values are microseconds. */
+    atomic_ulong timing_requests;
+    atomic_ulong queue_wait_us;
+    atomic_ulong ttfa_us;
+    atomic_ulong service_us;
+    atomic_ulong e2e_us;
+    atomic_ulong audio_us;
     /* Its own counter, never folded into `rejected`. A capacity refusal says
      * "come back"; this one says "this server will never serve that, look at
      * /health". An operator who sees these climbing has a routing or a
@@ -233,6 +245,9 @@ typedef struct {
     stream_out *out;
     double deadline_ms;      /* monotonic, 0 when no deadline was configured */
     int expired;
+    double first_audio_ms;
+    int first_audio_seen;
+    size_t audio_samples;
     /* Written and read only on the scheduler thread (sink_cancelled and
      * sink_on_done are both driver callbacks), so it needs no atomic. It
      * exists so the outcome can say WHY the stream stopped: a client that
@@ -289,6 +304,10 @@ typedef struct synth_job {
     int abandoned;                 /* submitter gave up: discard the result */
 
     atomic_int refs;
+    double created_ms;
+    double admitted_ms;
+    double first_audio_ms;
+    int first_audio_seen;
     struct synth_job *next;
 } synth_job;
 
@@ -311,6 +330,7 @@ static synth_job *job_new(int fd) {
     atomic_init(&j->fd_claimed, 0);
     atomic_init(&j->gave_up, 0);
     atomic_init(&j->refs, 1);
+    j->created_ms = now_ms();
     if (pthread_mutex_init(&j->mu, NULL) != 0) { free(j); return NULL; }
     if (pthread_cond_init(&j->done_cv, NULL) != 0) {
         pthread_mutex_destroy(&j->mu);
@@ -459,7 +479,41 @@ static int stream_callback(const float *samples, size_t count, void *user_data) 
         return -1;
     }
     if (count == 0) return stream_out_failed(sink->out) ? -1 : 0;
-    return stream_out_enqueue(sink->out, samples, count);
+    const int rc = stream_out_enqueue(sink->out, samples, count);
+    if (rc == 0) {
+        if (!sink->first_audio_seen) {
+            sink->first_audio_ms = now_ms();
+            sink->first_audio_seen = 1;
+        }
+        if (count <= SIZE_MAX - sink->audio_samples)
+            sink->audio_samples += count;
+        else
+            sink->audio_samples = SIZE_MAX;
+    }
+    return rc;
+}
+
+static unsigned long timing_us(double milliseconds) {
+    if (!(milliseconds > 0.0)) return 0ul;
+    const double value = milliseconds * 1000.0;
+    return value >= (double)ULONG_MAX ? ULONG_MAX : (unsigned long)value;
+}
+
+static void record_job_timing(const synth_job *j, double finished_ms,
+                              double audio_seconds) {
+    if (j == NULL || j->is_warmup) return;
+    const double first_ms = j->first_audio_seen
+        ? j->first_audio_ms : finished_ms;
+    atomic_fetch_add(&g_stats.timing_requests, 1ul);
+    atomic_fetch_add(&g_stats.queue_wait_us,
+                     timing_us(j->admitted_ms - j->created_ms));
+    atomic_fetch_add(&g_stats.ttfa_us,
+                     timing_us(first_ms - j->created_ms));
+    atomic_fetch_add(&g_stats.service_us,
+                     timing_us(finished_ms - j->admitted_ms));
+    atomic_fetch_add(&g_stats.e2e_us,
+                     timing_us(finished_ms - j->created_ms));
+    atomic_fetch_add(&g_stats.audio_us, timing_us(audio_seconds * 1000.0));
 }
 
 /* ------------------------------------------------------- the driver's sink
@@ -502,6 +556,7 @@ static int sink_next_job(void *ud, mynah_graph_job *job, void **tag, int block) 
             job_release(j);
             continue;
         }
+        j->admitted_ms = now_ms();
 
         if (j->is_stream) {
             const int fd = job_claim_fd(j);
@@ -546,6 +601,8 @@ static void sink_on_done(void *ud, void *tag, int result) {
     synth_assert_scheduler();
     atomic_fetch_sub(&g_stats.active, 1ul);
 
+    const double finished_ms = now_ms();
+
     if (j->is_stream) {
         stream_out *out = j->sink.out;
         stream_out_finish(out);
@@ -553,6 +610,8 @@ static void sink_on_done(void *ud, void *tag, int result) {
         stream_out_stats stats;
         memset(&stats, 0, sizeof(stats));   /* the getter is a no-op on NULL */
         stream_out_get_stats(out, &stats);
+        j->first_audio_ms = j->sink.first_audio_ms;
+        j->first_audio_seen = j->sink.first_audio_seen;
         /* A mid-stream failure cannot become an HTTP status -- the header is
          * long gone -- so the writer truncates the body and the reason is
          * logged rather than sent. An aborted stream is never silent. */
@@ -580,6 +639,10 @@ static void sink_on_done(void *ud, void *tag, int result) {
         } else if (result == MYNAH_GRAPH_OK) {
             atomic_fetch_add(&g_stats.completed, 1ul);
         }
+        record_job_timing(j, finished_ms,
+                          g.info.sample_rate > 0u
+                              ? (double)j->sink.audio_samples / g.info.sample_rate
+                              : 0.0);
         j->sink.out = NULL;
         stream_out_release(out);
         job_release(j);
@@ -596,6 +659,15 @@ static void sink_on_done(void *ud, void *tag, int result) {
         job_finish(j, result == MYNAH_GRAPH_OK ? 0 : -1, NULL);
         return;
     }
+
+    if (result == MYNAH_GRAPH_OK) {
+        j->first_audio_ms = finished_ms;
+        j->first_audio_seen = 1;
+    }
+    record_job_timing(j, finished_ms,
+                      g.info.sample_rate > 0u
+                          ? (double)j->count / g.info.sample_rate
+                          : 0.0);
 
     if (result == MYNAH_GRAPH_OK) atomic_fetch_add(&g_stats.completed, 1ul);
     else if (result == MYNAH_GRAPH_CANCELLED) atomic_fetch_add(&g_stats.timed_out, 1ul);
@@ -671,7 +743,8 @@ static void *scheduler_main(void *arg) {
     sink.running = sink_running;
     /* Returns -1 if any single request failed, which is routine; the only
      * interesting case is coming back before anyone asked it to stop. */
-    (void)mynah_graph_serve_continuous(g.model, g.max_batch, &sink);
+    (void)mynah_graph_serve_continuous_capacity(g.model, g.max_batch,
+                                                g.max_active, &sink);
     if (atomic_load(&g_batch.stopping) == 0) {
         fprintf(stderr, "the synthesis driver stopped on its own; "
                         "queued requests will be refused\n");
@@ -1366,6 +1439,67 @@ static void handle_health(int fd) {
     const size_t rss_now = mynah_rss_bytes();
     const size_t rss_shared = mynah_rss_shared_bytes();
 
+    mynah_tts_backend_metrics backend_metrics;
+    memset(&backend_metrics, 0, sizeof(backend_metrics));
+    (void)mynah_tts_model_get_backend_metrics(g.model, &backend_metrics);
+    char backend_stats[4096];
+    snprintf(backend_stats, sizeof(backend_stats),
+             "{\"h2d_bytes\":%llu,\"d2h_bytes\":%llu,"
+             "\"h2d_calls\":%llu,\"d2h_calls\":%llu,\"sync_calls\":%llu,"
+             "\"graph_captures\":%llu,\"graph_replays\":%llu,"
+             "\"graph_fallbacks\":%llu,\"backbone_batch_calls\":%llu,"
+             "\"backbone_batch_items\":%llu,\"backbone_batch_max_width\":%llu,"
+             "\"codec_transformer_batch_calls\":%llu,"
+             "\"codec_transformer_batch_items\":%llu,"
+             "\"codec_transformer_batch_max_width\":%llu,"
+             "\"codec_upsample_steps\":%llu,"
+             "\"codec_upsample_fallbacks\":%llu,"
+             "\"decoder_steps\":%llu,"
+             "\"decoder_batch_calls\":%llu,\"decoder_batch_items\":%llu,"
+             "\"decoder_batch_max_width\":%llu,\"decoder_batch_frames\":%llu,"
+             "\"decoder_graph_captures\":%llu,\"decoder_graph_replays\":%llu,"
+             "\"decoder_graph_fallbacks\":%llu,"
+             "\"decoder_failures\":%llu,"
+             "\"resident_fallbacks\":%llu,\"matmul_calls\":%llu,"
+             "\"matvec_calls\":%llu,\"q8_matmul_calls\":%llu,"
+             "\"q8_rows\":%llu,\"q8_weight_uploads\":%llu,"
+             "\"q8_weight_bytes\":%llu,\"q8_activation_bytes\":%llu,"
+             "\"device_memory_bytes\":%llu,"
+             "\"device_memory_free_bytes\":%llu,\"graphs_enabled\":%u,"
+             "\"fast_math_enabled\":%u,\"decoder_batch_enabled\":%u,"
+             "\"q8_enabled\":%u}",
+             backend_metrics.h2d_bytes, backend_metrics.d2h_bytes,
+             backend_metrics.h2d_calls, backend_metrics.d2h_calls,
+             backend_metrics.sync_calls,
+             backend_metrics.graph_captures, backend_metrics.graph_replays,
+             backend_metrics.graph_fallbacks,
+             backend_metrics.backbone_batch_calls,
+             backend_metrics.backbone_batch_items,
+             backend_metrics.backbone_batch_max_width,
+             backend_metrics.codec_transformer_batch_calls,
+             backend_metrics.codec_transformer_batch_items,
+             backend_metrics.codec_transformer_batch_max_width,
+             backend_metrics.codec_upsample_steps,
+             backend_metrics.codec_upsample_fallbacks,
+             backend_metrics.decoder_steps,
+             backend_metrics.decoder_batch_calls,
+             backend_metrics.decoder_batch_items,
+             backend_metrics.decoder_batch_max_width,
+             backend_metrics.decoder_batch_frames,
+             backend_metrics.decoder_graph_captures,
+             backend_metrics.decoder_graph_replays,
+             backend_metrics.decoder_graph_fallbacks,
+             backend_metrics.decoder_failures,
+             backend_metrics.resident_fallbacks,
+             backend_metrics.matmul_calls, backend_metrics.matvec_calls,
+             backend_metrics.q8_matmul_calls, backend_metrics.q8_rows,
+             backend_metrics.q8_weight_uploads, backend_metrics.q8_weight_bytes,
+             backend_metrics.q8_activation_bytes,
+             backend_metrics.device_memory_bytes,
+             backend_metrics.device_memory_free_bytes,
+             backend_metrics.graphs_enabled, backend_metrics.fast_math_enabled,
+             backend_metrics.decoder_batch_enabled, backend_metrics.q8_enabled);
+
     /* THE COUNTERS THIS PROCESS CANNOT KNOW.
      *
      * `jobs` above is THIS WORKER's, and always was. What it can never contain
@@ -1400,7 +1534,7 @@ static void handle_health(int fd) {
         }
     }
 
-    char body[3072];
+    char body[4096];
     const int n = snprintf(body, sizeof(body),
                            "{\"status\":\"ok\",\"model\":\"%s\",\"engine\":\"%s\","
                            "\"sample_rate\":%u,\"voices\":%zu,"
@@ -1415,6 +1549,7 @@ static void handle_health(int fd) {
                            "\"failed\":%lu,\"rejected\":%lu,\"timed_out\":%lu,"
                            "\"disconnected\":%lu,\"language_refused\":%lu},"
                            "\"streams\":{\"active\":%lu,\"total\":%lu},"
+                           "\"backend_metrics\":%s,"
                            "\"router\":%s,"
                            /* A policy that is on by default has to be
                             * READABLE, or an operator cannot tell a server
@@ -1429,7 +1564,8 @@ static void handle_health(int fd) {
                             * computing capacity from it got 64 places instead
                             * of 128. `workers` keeps its meaning so existing
                             * consumers do not silently change behaviour. */
-                           "\"limits\":{\"max_batch\":%zu,\"queue_capacity\":%zu,"
+                           "\"limits\":{\"max_batch\":%zu,\"active_slots\":%zu,"
+                           "\"queue_capacity\":%zu,"
                            "\"workers\":%d,\"prefork\":%d,\"request_places\":%zu,"
                            "\"request_timeout_ms\":%u,"
                            "\"cancel_on_disconnect\":%s,"
@@ -1501,11 +1637,12 @@ static void handle_health(int fd) {
                            atomic_load(&g_stats.language_refused),
                            atomic_load(&g_stats.streams_active),
                            atomic_load(&g_stats.streams_total),
+                           backend_stats,
                            router,
-                           g.max_batch, g.max_pending, g.worker_count,
+                           g.max_batch, g.max_active, g.max_pending, g.worker_count,
                            prefork_total, prefork_total > 0
-                               ? (size_t)prefork_total * g.max_batch
-                               : g.max_batch,
+                               ? (size_t)prefork_total * g.max_active
+                               : g.max_active,
                            g.request_timeout_ms,
                            g.cancel_on_disconnect ? "true" : "false",
                            g.warmups, g.warmups_done,
@@ -1519,6 +1656,253 @@ static void handle_health(int fd) {
                            rss_now > rss_shared ? rss_now - rss_shared : 0,
                            mynah_rss_peak_bytes());
     if (n > 0) send_status(fd, "200 OK", "application/json", body, (size_t)n);
+}
+
+/* Prometheus-compatible counters for operators and load tests.  This endpoint
+ * is intentionally read-only and reuses the same cheap relaxed snapshots as
+ * /health; it does not synchronize CUDA or take the scheduler mutex.  Request
+ * timing is exported as monotonic sums; per-stage GPU timing still belongs in
+ * an explicitly enabled profiling mode. */
+static void handle_metrics(int fd) {
+    mynah_tts_backend_metrics m;
+    memset(&m, 0, sizeof(m));
+    (void)mynah_tts_model_get_backend_metrics(g.model, &m);
+    const unsigned long timing_requests = atomic_load(&g_stats.timing_requests);
+    const unsigned long queue_wait_us = atomic_load(&g_stats.queue_wait_us);
+    const unsigned long ttfa_us = atomic_load(&g_stats.ttfa_us);
+    const unsigned long service_us = atomic_load(&g_stats.service_us);
+    const unsigned long e2e_us = atomic_load(&g_stats.e2e_us);
+    const unsigned long audio_us = atomic_load(&g_stats.audio_us);
+    const double rtf = audio_us > 0ul
+        ? (double)service_us / (double)audio_us : 0.0;
+    char body[8192];
+    size_t n = 0u;
+#define METRIC(...) do { \
+        if (n < sizeof(body)) { \
+            const int _w = snprintf(body + n, sizeof(body) - n, __VA_ARGS__); \
+            if (_w > 0) n += (size_t)_w < sizeof(body) - n \
+                ? (size_t)_w : sizeof(body) - n; \
+        } \
+    } while (0)
+    METRIC("# HELP mynah_server_jobs_queued Jobs waiting for synthesis.\n"
+           "# TYPE mynah_server_jobs_queued gauge\n"
+           "mynah_server_jobs_queued %lu\n",
+           atomic_load(&g_stats.queued));
+    METRIC("# HELP mynah_server_jobs_active Requests inside the synthesis driver.\n"
+           "# TYPE mynah_server_jobs_active gauge\n"
+           "mynah_server_jobs_active %lu\n",
+           atomic_load(&g_stats.active));
+    METRIC("# HELP mynah_server_jobs_completed_total Completed requests.\n"
+           "# TYPE mynah_server_jobs_completed_total counter\n"
+           "mynah_server_jobs_completed_total %lu\n",
+           atomic_load(&g_stats.completed));
+    METRIC("# HELP mynah_server_jobs_failed_total Failed requests.\n"
+           "# TYPE mynah_server_jobs_failed_total counter\n"
+           "mynah_server_jobs_failed_total %lu\n",
+           atomic_load(&g_stats.failed));
+    METRIC("# HELP mynah_server_jobs_rejected_total Requests refused by capacity.\n"
+           "# TYPE mynah_server_jobs_rejected_total counter\n"
+           "mynah_server_jobs_rejected_total %lu\n",
+           atomic_load(&g_stats.rejected));
+    METRIC("# HELP mynah_server_jobs_timed_out_total Requests cancelled by deadline.\n"
+           "# TYPE mynah_server_jobs_timed_out_total counter\n"
+           "mynah_server_jobs_timed_out_total %lu\n",
+           atomic_load(&g_stats.timed_out));
+    METRIC("# HELP mynah_server_streams_active Active streaming responses.\n"
+           "# TYPE mynah_server_streams_active gauge\n"
+           "mynah_server_streams_active %lu\n",
+           atomic_load(&g_stats.streams_active));
+    METRIC("# HELP mynah_server_streams_total Accepted streaming responses.\n"
+           "# TYPE mynah_server_streams_total counter\n"
+           "mynah_server_streams_total %lu\n",
+           atomic_load(&g_stats.streams_total));
+    METRIC("# HELP mynah_server_timing_requests_total Requests in timing sums.\n"
+           "# TYPE mynah_server_timing_requests_total counter\n"
+           "mynah_server_timing_requests_total %lu\n",
+           timing_requests);
+    METRIC("# HELP mynah_server_queue_wait_seconds_total Scheduler queue wait.\n"
+           "# TYPE mynah_server_queue_wait_seconds_total counter\n"
+           "mynah_server_queue_wait_seconds_total %.6f\n",
+           (double)queue_wait_us / 1.0e6);
+    METRIC("# HELP mynah_server_ttfa_seconds_total Time to first audio.\n"
+           "# TYPE mynah_server_ttfa_seconds_total counter\n"
+           "mynah_server_ttfa_seconds_total %.6f\n",
+           (double)ttfa_us / 1.0e6);
+    METRIC("# HELP mynah_server_service_seconds_total Synthesis service time.\n"
+           "# TYPE mynah_server_service_seconds_total counter\n"
+           "mynah_server_service_seconds_total %.6f\n",
+           (double)service_us / 1.0e6);
+    METRIC("# HELP mynah_server_e2e_seconds_total End-to-end scheduler time.\n"
+           "# TYPE mynah_server_e2e_seconds_total counter\n"
+           "mynah_server_e2e_seconds_total %.6f\n",
+           (double)e2e_us / 1.0e6);
+    METRIC("# HELP mynah_server_audio_seconds_total Audio represented by jobs.\n"
+           "# TYPE mynah_server_audio_seconds_total counter\n"
+           "mynah_server_audio_seconds_total %.6f\n",
+           (double)audio_us / 1.0e6);
+    METRIC("# HELP mynah_server_rtf Average synthesis real-time factor.\n"
+           "# TYPE mynah_server_rtf gauge\n"
+           "mynah_server_rtf %.6f\n", rtf);
+    METRIC("# HELP mynah_server_max_batch Configured scheduler batch ceiling.\n"
+           "# TYPE mynah_server_max_batch gauge\n"
+           "mynah_server_max_batch %zu\n", g.max_batch);
+    METRIC("# HELP mynah_server_active_slots Configured resident request slots.\n"
+           "# TYPE mynah_server_active_slots gauge\n"
+           "mynah_server_active_slots %zu\n", g.max_active);
+    METRIC("# HELP mynah_backend_h2d_bytes_total Host-to-device bytes submitted.\n"
+           "# TYPE mynah_backend_h2d_bytes_total counter\n"
+           "mynah_backend_h2d_bytes_total %llu\n",
+           m.h2d_bytes);
+    METRIC("# HELP mynah_backend_d2h_bytes_total Device-to-host bytes submitted.\n"
+           "# TYPE mynah_backend_d2h_bytes_total counter\n"
+           "mynah_backend_d2h_bytes_total %llu\n",
+           m.d2h_bytes);
+    METRIC("# HELP mynah_backend_h2d_calls_total Host-to-device copies.\n"
+           "# TYPE mynah_backend_h2d_calls_total counter\n"
+           "mynah_backend_h2d_calls_total %llu\n",
+           m.h2d_calls);
+    METRIC("# HELP mynah_backend_d2h_calls_total Device-to-host copies.\n"
+           "# TYPE mynah_backend_d2h_calls_total counter\n"
+           "mynah_backend_d2h_calls_total %llu\n",
+           m.d2h_calls);
+    METRIC("# HELP mynah_backend_sync_calls_total Stream synchronizations.\n"
+           "# TYPE mynah_backend_sync_calls_total counter\n"
+           "mynah_backend_sync_calls_total %llu\n",
+           m.sync_calls);
+    METRIC("# HELP mynah_backend_graph_captures_total CUDA graph captures.\n"
+           "# TYPE mynah_backend_graph_captures_total counter\n"
+           "mynah_backend_graph_captures_total %llu\n",
+           m.graph_captures);
+    METRIC("# HELP mynah_backend_graph_replays_total CUDA graph replays.\n"
+           "# TYPE mynah_backend_graph_replays_total counter\n"
+           "mynah_backend_graph_replays_total %llu\n",
+           m.graph_replays);
+    METRIC("# HELP mynah_backend_graph_fallbacks_total CUDA graph fallbacks.\n"
+           "# TYPE mynah_backend_graph_fallbacks_total counter\n"
+           "mynah_backend_graph_fallbacks_total %llu\n",
+           m.graph_fallbacks);
+    METRIC("# HELP mynah_backend_backbone_batch_calls_total Successful CUDA backbone batch calls.\n"
+           "# TYPE mynah_backend_backbone_batch_calls_total counter\n"
+           "mynah_backend_backbone_batch_calls_total %llu\n",
+           m.backbone_batch_calls);
+    METRIC("# HELP mynah_backend_backbone_batch_items_total Request rows processed by CUDA backbone batches.\n"
+           "# TYPE mynah_backend_backbone_batch_items_total counter\n"
+           "mynah_backend_backbone_batch_items_total %llu\n",
+           m.backbone_batch_items);
+    METRIC("# HELP mynah_backend_backbone_batch_max_width Maximum successful CUDA backbone batch width.\n"
+           "# TYPE mynah_backend_backbone_batch_max_width gauge\n"
+           "mynah_backend_backbone_batch_max_width %llu\n",
+           m.backbone_batch_max_width);
+    METRIC("# HELP mynah_backend_codec_transformer_batch_calls_total Resident Mimi decoder-transformer tiles.\n"
+           "# TYPE mynah_backend_codec_transformer_batch_calls_total counter\n"
+           "mynah_backend_codec_transformer_batch_calls_total %llu\n",
+           m.codec_transformer_batch_calls);
+    METRIC("# HELP mynah_backend_codec_transformer_batch_items_total Requests in resident Mimi decoder-transformer tiles.\n"
+           "# TYPE mynah_backend_codec_transformer_batch_items_total counter\n"
+           "mynah_backend_codec_transformer_batch_items_total %llu\n",
+           m.codec_transformer_batch_items);
+    METRIC("# HELP mynah_backend_codec_transformer_batch_max_width Maximum resident Mimi decoder-transformer batch width.\n"
+           "# TYPE mynah_backend_codec_transformer_batch_max_width gauge\n"
+           "mynah_backend_codec_transformer_batch_max_width %llu\n",
+           m.codec_transformer_batch_max_width);
+    METRIC("# HELP mynah_backend_codec_upsample_steps_total Resident quantizer and causal upsample steps.\n"
+           "# TYPE mynah_backend_codec_upsample_steps_total counter\n"
+           "mynah_backend_codec_upsample_steps_total %llu\n",
+           m.codec_upsample_steps);
+    METRIC("# HELP mynah_backend_codec_upsample_fallbacks_total Resident quantizer/upsample fallback imports.\n"
+           "# TYPE mynah_backend_codec_upsample_fallbacks_total counter\n"
+           "mynah_backend_codec_upsample_fallbacks_total %llu\n",
+           m.codec_upsample_fallbacks);
+    METRIC("# HELP mynah_backend_decoder_steps_total Decoder steps submitted.\n"
+           "# TYPE mynah_backend_decoder_steps_total counter\n"
+           "mynah_backend_decoder_steps_total %llu\n",
+           m.decoder_steps);
+    METRIC("# HELP mynah_backend_decoder_batch_calls_total Cross-request CUDA decoder arithmetic batches.\n"
+           "# TYPE mynah_backend_decoder_batch_calls_total counter\n"
+           "mynah_backend_decoder_batch_calls_total %llu\n",
+           m.decoder_batch_calls);
+    METRIC("# HELP mynah_backend_decoder_batch_items_total Requests processed by cross-request decoder arithmetic batches.\n"
+           "# TYPE mynah_backend_decoder_batch_items_total counter\n"
+           "mynah_backend_decoder_batch_items_total %llu\n",
+           m.decoder_batch_items);
+    METRIC("# HELP mynah_backend_decoder_batch_max_width Maximum cross-request decoder batch width observed.\n"
+           "# TYPE mynah_backend_decoder_batch_max_width gauge\n"
+           "mynah_backend_decoder_batch_max_width %llu\n",
+           m.decoder_batch_max_width);
+    METRIC("# HELP mynah_backend_decoder_batch_frames_total Frame steps processed by cross-request decoder arithmetic batches.\n"
+           "# TYPE mynah_backend_decoder_batch_frames_total counter\n"
+           "mynah_backend_decoder_batch_frames_total %llu\n",
+           m.decoder_batch_frames);
+    METRIC("# HELP mynah_backend_decoder_graph_captures_total Cross-request CUDA decoder graph captures.\n"
+           "# TYPE mynah_backend_decoder_graph_captures_total counter\n"
+           "mynah_backend_decoder_graph_captures_total %llu\n",
+           m.decoder_graph_captures);
+    METRIC("# HELP mynah_backend_decoder_graph_replays_total Cross-request CUDA decoder graph replays.\n"
+           "# TYPE mynah_backend_decoder_graph_replays_total counter\n"
+           "mynah_backend_decoder_graph_replays_total %llu\n",
+           m.decoder_graph_replays);
+    METRIC("# HELP mynah_backend_decoder_graph_fallbacks_total Cross-request CUDA decoder graph fallbacks.\n"
+           "# TYPE mynah_backend_decoder_graph_fallbacks_total counter\n"
+           "mynah_backend_decoder_graph_fallbacks_total %llu\n",
+           m.decoder_graph_fallbacks);
+    METRIC("# HELP mynah_backend_decoder_failures_total Decoder failures.\n"
+           "# TYPE mynah_backend_decoder_failures_total counter\n"
+           "mynah_backend_decoder_failures_total %llu\n",
+           m.decoder_failures);
+    METRIC("# HELP mynah_backend_resident_fallbacks_total Resident fallback events.\n"
+           "# TYPE mynah_backend_resident_fallbacks_total counter\n"
+           "mynah_backend_resident_fallbacks_total %llu\n",
+           m.resident_fallbacks);
+    METRIC("# HELP mynah_backend_matmul_calls_total Device matmul calls.\n"
+           "# TYPE mynah_backend_matmul_calls_total counter\n"
+           "mynah_backend_matmul_calls_total %llu\n",
+           m.matmul_calls);
+    METRIC("# HELP mynah_backend_matvec_calls_total Device matvec calls.\n"
+           "# TYPE mynah_backend_matvec_calls_total counter\n"
+           "mynah_backend_matvec_calls_total %llu\n",
+           m.matvec_calls);
+    METRIC("# HELP mynah_backend_q8_matmul_calls_total Resident CUDA Q8 matmul calls.\n"
+           "# TYPE mynah_backend_q8_matmul_calls_total counter\n"
+           "mynah_backend_q8_matmul_calls_total %llu\n",
+           m.q8_matmul_calls);
+    METRIC("# HELP mynah_backend_q8_rows_total Rows processed by resident CUDA Q8.\n"
+           "# TYPE mynah_backend_q8_rows_total counter\n"
+           "mynah_backend_q8_rows_total %llu\n",
+           m.q8_rows);
+    METRIC("# HELP mynah_backend_q8_weight_uploads_total CUDA Q8 weight uploads.\n"
+           "# TYPE mynah_backend_q8_weight_uploads_total counter\n"
+           "mynah_backend_q8_weight_uploads_total %llu\n",
+           m.q8_weight_uploads);
+    METRIC("# HELP mynah_backend_q8_weight_bytes_total CUDA Q8 cached weight bytes.\n"
+           "# TYPE mynah_backend_q8_weight_bytes_total counter\n"
+           "mynah_backend_q8_weight_bytes_total %llu\n",
+           m.q8_weight_bytes);
+    METRIC("# HELP mynah_backend_q8_activation_bytes_total CUDA Q8 activation bytes quantized.\n"
+           "# TYPE mynah_backend_q8_activation_bytes_total counter\n"
+           "mynah_backend_q8_activation_bytes_total %llu\n",
+           m.q8_activation_bytes);
+    METRIC("# HELP mynah_backend_device_memory_bytes CUDA device memory.\n"
+           "# TYPE mynah_backend_device_memory_bytes gauge\n"
+           "mynah_backend_device_memory_bytes %llu\n",
+           m.device_memory_bytes);
+    METRIC("# HELP mynah_backend_device_memory_free_bytes CUDA free device memory.\n"
+           "# TYPE mynah_backend_device_memory_free_bytes gauge\n"
+           "mynah_backend_device_memory_free_bytes %llu\n",
+           m.device_memory_free_bytes);
+    METRIC("# HELP mynah_backend_graphs_enabled Whether CUDA graphs are enabled.\n"
+           "# TYPE mynah_backend_graphs_enabled gauge\n"
+           "mynah_backend_graphs_enabled %u\n", m.graphs_enabled);
+    METRIC("# HELP mynah_backend_fast_math_enabled Whether fast math is enabled.\n"
+           "# TYPE mynah_backend_fast_math_enabled gauge\n"
+           "mynah_backend_fast_math_enabled %u\n", m.fast_math_enabled);
+    METRIC("# HELP mynah_backend_decoder_batch_enabled Whether cross-request CUDA decoder arithmetic batching is enabled.\n"
+           "# TYPE mynah_backend_decoder_batch_enabled gauge\n"
+           "mynah_backend_decoder_batch_enabled %u\n", m.decoder_batch_enabled);
+    METRIC("# HELP mynah_backend_q8_enabled Whether resident CUDA Q8 is available.\n"
+           "# TYPE mynah_backend_q8_enabled gauge\n"
+           "mynah_backend_q8_enabled %u\n", m.q8_enabled);
+#undef METRIC
+    send_status(fd, "200 OK", "text/plain; version=0.0.4", body, n);
 }
 
 /* ------------------------------------------------------------- routing
@@ -1538,6 +1922,7 @@ typedef enum {
     ROUTE_VOICES,
     ROUTE_MODELS,
     ROUTE_HEALTH,
+    ROUTE_METRICS,
     ROUTE_NONE,        /* no such path: the caller answers 404 */
     ROUTE_ANSWERED     /* the precheck already replied (405/415/400) */
 } route_id;
@@ -1552,6 +1937,7 @@ static const struct {
     { "/v1/voices",       "GET",  ROUTE_VOICES },
     { "/v1/models",       "GET",  ROUTE_MODELS },
     { "/health",          "GET",  ROUTE_HEALTH },
+    { "/metrics",         "GET",  ROUTE_METRICS },
 };
 
 /* Resolves method+path to a route, answering the protocol-level refusals
@@ -1781,6 +2167,7 @@ static void handle_connection(int fd) {
             case ROUTE_VOICES:   handle_voices(fd); break;
             case ROUTE_MODELS:   handle_models(fd); break;
             case ROUTE_HEALTH:   handle_health(fd); break;
+            case ROUTE_METRICS:  handle_metrics(fd); break;
             case ROUTE_ANSWERED: break;
             case ROUTE_NONE:
             default:
@@ -1854,9 +2241,13 @@ static void dump_local_stats(void) {
     char who[48];
     if (idx >= 0) snprintf(who, sizeof(who), "worker %d pid %d", idx, (int)getpid());
     else snprintf(who, sizeof(who), "server pid %d", (int)getpid());
+    mynah_tts_backend_metrics backend_metrics;
+    memset(&backend_metrics, 0, sizeof(backend_metrics));
+    (void)mynah_tts_model_get_backend_metrics(g.model, &backend_metrics);
     fprintf(stderr,
             "[%s] queued=%lu active=%lu completed=%lu failed=%lu rejected=%lu "
-            "timed_out=%lu disconnected=%lu streams=%lu/%lu · threads=%d max_batch=%zu\n",
+            "timed_out=%lu disconnected=%lu streams=%lu/%lu · threads=%d "
+            "max_batch=%zu active_slots=%zu\n",
             who,
             atomic_load(&g_stats.queued), atomic_load(&g_stats.active),
             atomic_load(&g_stats.completed), atomic_load(&g_stats.failed),
@@ -1865,14 +2256,55 @@ static void dump_local_stats(void) {
             atomic_load(&g_stats.streams_active), atomic_load(&g_stats.streams_total),
             mynah_prefork_worker_threads() > 0 ? mynah_prefork_worker_threads()
                                                : mynah_num_threads(),
-            g.max_batch);
+            g.max_batch, g.max_active);
+    fprintf(stderr,
+            "[%s] backend=%s h2d=%llu d2h=%llu graph=%llu/%llu fallback=%llu "
+            "sync=%llu backbone_batch=%llu/%llu max=%llu "
+            "codec_transformer_batch=%llu/%llu max=%llu "
+            "codec_upsample=%llu fallback=%llu "
+            "decoder_steps=%llu decoder_batch=%llu/%llu/max%llu/%llu "
+            "decoder_failures=%llu resident_fallbacks=%llu matmul=%llu matvec=%llu "
+            "q8=%llu/%llu weights=%llu/%llu "
+            "vram=%llu/%llu flags=%u/%u/%u q8=%u\n",
+            who, g.info.device, backend_metrics.h2d_bytes,
+            backend_metrics.d2h_bytes, backend_metrics.graph_captures,
+            backend_metrics.graph_replays, backend_metrics.graph_fallbacks,
+            backend_metrics.sync_calls,
+            backend_metrics.backbone_batch_calls,
+            backend_metrics.backbone_batch_items,
+            backend_metrics.backbone_batch_max_width,
+            backend_metrics.codec_transformer_batch_calls,
+            backend_metrics.codec_transformer_batch_items,
+            backend_metrics.codec_transformer_batch_max_width,
+            backend_metrics.codec_upsample_steps,
+            backend_metrics.codec_upsample_fallbacks,
+            backend_metrics.decoder_steps,
+            backend_metrics.decoder_batch_calls,
+            backend_metrics.decoder_batch_items,
+            backend_metrics.decoder_batch_max_width,
+            backend_metrics.decoder_batch_frames,
+            backend_metrics.decoder_failures,
+            backend_metrics.resident_fallbacks,
+            backend_metrics.matmul_calls,
+            backend_metrics.matvec_calls,
+            backend_metrics.q8_matmul_calls,
+            backend_metrics.q8_rows,
+            backend_metrics.q8_weight_uploads,
+            backend_metrics.q8_weight_bytes,
+            backend_metrics.device_memory_free_bytes,
+            backend_metrics.device_memory_bytes,
+            backend_metrics.graphs_enabled,
+            backend_metrics.fast_math_enabled,
+            backend_metrics.decoder_batch_enabled,
+            backend_metrics.q8_enabled);
     fflush(stderr);
 }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s -m MODEL_DIR [-m MODEL_DIR ...] [-p PORT] [--host ADDR] [-w WORKERS]\n"
-            "       [--device cpu|metal|cuda] [--max-batch N] [--max-pending N]\n"
+            "       [--device cpu|metal|cuda] [--max-batch N] [--max-inflight N]\n"
+            "       [--max-pending N]\n"
             "       [--request-timeout-ms MS] [--no-cancel-on-disconnect]\n"
             "       [--warmup N] [--prefork W] [--prefork-threads T] [--prefork-plan]\n"
             "       [--decoder-lane N]\n"
@@ -1948,6 +2380,7 @@ int main(int argc, char **argv) {
     mynah_tts_device device = MYNAH_TTS_DEVICE_CPU;
     g.worker_count = 4;
     g.max_batch = 8;
+    g.max_active = 0u;
     g.max_pending = JOB_QUEUE_CAP;
     g.request_timeout_ms = REQUEST_TIMEOUT_MS;
     /* Default ON. Synthesizing for a socket whose peer is gone spends a slot
@@ -1990,6 +2423,8 @@ int main(int argc, char **argv) {
             workers_explicit = 1;
         } else if (strcmp(argv[i], "--max-batch") == 0 && i + 1 < argc) {
             g.max_batch = (size_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--max-inflight") == 0 && i + 1 < argc) {
+            g.max_active = (size_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-pending") == 0 && i + 1 < argc) {
             const int v = atoi(argv[++i]);
             g.max_pending = v > 0 ? (size_t)v : JOB_QUEUE_CAP;
@@ -2035,7 +2470,7 @@ int main(int argc, char **argv) {
         plan.listen_fd = -1;
         plan.workers = prefork_workers;
         plan.threads_per = prefork_threads;
-        plan.slots_per = (int)g.max_batch;
+        plan.slots_per = (int)(g.max_active > 0u ? g.max_active : g.max_batch);
         plan.lane_cpus = decoder_lane;
         mynah_prefork_print_plan(&plan, stdout);
         return 0;
@@ -2078,6 +2513,8 @@ int main(int argc, char **argv) {
     if (g.worker_count > 64) g.worker_count = 64;
     if (g.max_batch < 1u) g.max_batch = 1u;
     if (g.max_batch > mynah_tts_max_batch()) g.max_batch = mynah_tts_max_batch();
+    if (g.max_active > MYNAH_GRAPH_MAX_ACTIVE)
+        g.max_active = MYNAH_GRAPH_MAX_ACTIVE;
 
     /* THE HTTP WORKER COUNT IS THE BATCH CEILING FOR NON-STREAMING REQUESTS,
      * and it used to be one silently.
@@ -2257,6 +2694,14 @@ int main(int argc, char **argv) {
         const size_t engine_max = mynah_tts_model_max_batch(packs[i]);
         if (g.max_batch > engine_max) g.max_batch = engine_max;
     }
+    if (g.max_active == 0u) g.max_active = g.max_batch;
+    if (g.max_active < g.max_batch) {
+        fprintf(stderr,
+                "note: --max-inflight %zu is below --max-batch %zu; reducing "
+                "the engine microbatch to %zu\n",
+                g.max_active, g.max_batch, g.max_active);
+        g.max_batch = g.max_active;
+    }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -2305,7 +2750,7 @@ int main(int argc, char **argv) {
     int accept_fd = listen_fd;
     if (prefork_workers > 0) {
         pf.listen_fd = listen_fd;
-        pf.slots_per = (int)g.max_batch;
+        pf.slots_per = (int)g.max_active;
         pf.lane_cpus = decoder_lane;
         /* The authoritative answer to "is a GPU backend resident in this
          * process?", which prefork refuses to fork across. Its own scan of the
@@ -2454,7 +2899,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "mynah-tts server on http://%s:%d  model=%s  device=%s  voices=%zu  "
-            "workers=%d  max_batch=%zu  queue=%zu  timeout=%ums%s\n"
+            "workers=%d  max_batch=%zu  active_slots=%zu  queue=%zu  timeout=%ums%s\n"
             "note: one scheduler thread synthesizes; requests join the running\n"
             "      batch as slots free up, streaming and batch alike\n"
             "transport: TCP_NODELAY on every accepted socket; threads named\n"
@@ -2464,7 +2909,8 @@ int main(int argc, char **argv) {
             "language: %s\n"
             "cancel-on-disconnect: %s\n",
             host, port, g.model_id, mynah_tts_device_name(device), g.voice_count,
-            g.worker_count, g.max_batch, g.max_pending, g.request_timeout_ms,
+            g.worker_count, g.max_batch, g.max_active, g.max_pending,
+            g.request_timeout_ms,
             chan_fd >= 0 ? "  [prefork worker]" : "",
             /* What is RUNNING, not what was requested. A lane that refused to
              * engage prints "off" here and its reason in the prefork line

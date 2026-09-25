@@ -11,7 +11,9 @@ batching, and optional Metal/CUDA matmul backends. Oracle parity is closed.
 Current work is the **second engine**: PocketTTS, a continuous-latent AR model,
 which requires the engine seam that has been outstanding since July.
 
-**Current focus is CPU — ARM and x86 together. GPU work is deferred.**
+**Current focus remains CPU — ARM and x86 together.** GPU is still opt-in and
+deferred for Magpie; the newly opened E15 is the PocketTTS CUDA/server track
+and does not change the CPU default or its qualification gates.
 
 **Priority order, from the author of the reference implementation** (who reached
 **C20/C22 real-time streams on 32 ARM cores with a 0.6B model**) — see
@@ -1375,6 +1377,39 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
       cache-resident than DRAM*). Both are ten-minute measurements
 - [x] E5-8 **done** `89070f8` — proven through HTTP at C=2/4/8, both routes, either arrival order, ragged, single-process and across 4 prefork processes, with two injected contamination mutants caught · gate: **N concurrent streams byte-identical to the same request run alone**
 
+### E15 — PocketTTS CUDA and Linux GPU streaming → [`.work/pocket-tts-cuda-streaming-parity.md`](.work/pocket-tts-cuda-streaming-parity.md)
+
+New, opt-in track. CPU remains the oracle/default; CUDA gets a separate server
+artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
+“GPU Pocket”. The target is a measured C100 on an L40S, not an extrapolation.
+
+- [x] E15-0 as-is audit: Pocket CPU driver/state, current CUDA backend, `../qwen-tts` resident CUDA/CI patterns, and vLLM-Omni CUDA-graph/async-chunk designs
+- [~] E15-1 add `make cuda-server`; compile/link CLI + server in CI for explicit `sm_70`, `sm_89` (L40S) and `sm_90`; model-free check distinguishes compiled CUDA from no device — latest green gate is Build & Test `36124116814`, Code Quality `36124116761`, Memory Safety `36124116778`, including `sm_120`
+- [~] E15-2 explicit backend capability/lifecycle: backend-owned weights, graphs, batch metadata and scratch; host/device conv split and safe CPU retry are implemented, with backend health/capability counters now exposed and runtime validation remaining
+- [~] E15-3 scalar-reference CUDA kernels: projection matmul, LayerNorm, GELU, residual, softmax, RoPE, attention and resident conv primitives plus model-free self-tests are implemented; sm120 GPU self-test and compute-sanitizer pass, while exhaustive shape sweeps remain
+- [~] E15-4 resident Pocket prefill/AR + flow batch: per-request KV, batched matmul→matmat, device transformer/flow steps, cross-request attention, pinned staging, bounded host K/V/latent handoff and per-scratch `(batch-width)` CUDA-Graph capture/replay buckets are implemented; official 6L/24L smoke runs pass on Blackwell, while stage/EOS parity remains open
+- [~] E15-5 resident Pocket SEANet/decoder streaming: single-context causal conv/residual/transpose-conv state, persistent device scratch, device Mimi→SEANet handoff, graph capture and CPU-reference model-free CUDA self-tests are implemented; raw-F32 quantizer/upsample is resident when eligible, and true cross-request SEANet arithmetic batching now reuses per-request causal state, while GPU parity remains open
+- [~] E15-6 CUDA server integration: one process/GPU build boundary, prefork refusal and existing queue/cancel/stream contract are present; `/health`, `/metrics` and SIGUSR1 stats expose graph/H2D/D2H/decoder/fallback plus request timing counters, and the Blackwell server path is model-backed for 6L/24L; per-stage GPU timing and L4/L40S qualification remain
+- [~] E15-9 decouple active request capacity from GPU microbatch width: continuous service now exposes `--max-inflight` (up to 128) separately from the engine/CUDA `--max-batch` microbatch, with both gauges in `/health` and `/metrics`; C100 runtime capacity/soak remains open
+- [~] E15-10 resident decoder gang submission and true batch kernels: Mimi decoder-transformer frame tiles and stateful SEANet `(batch, frames)` kernels now execute true cross-request arithmetic with packed pointer tables, batched Conv1d GEMM, batched ConvTranspose/elementwise kernels and per-request causal state; the decoder now captures/replays a bounded graph for an exact stable gang with persistent pointer metadata (`MYNAH_CUDA_DECODER_GRAPHS=0` escape hatch), while physical row-arena width buckets and GPU parity remain
+- [~] E15-20 resident Mimi decoder-transformer: metadata-validated compact KV windows, absolute-RoPE window rebases, device LayerScale, pinned singleton staging and row-wise cross-request frame-tile batching are implemented behind `MYNAH_CUDA_POCKET_CODEC` (with legacy `MYNAH_CUDA_CODEC=0` honored); real 6L/24L stage parity, graph capture and failure-injection validation remain
+- [~] E15-11 CUDA precision/fusion ladder: explicit resident Q8/INT8 batched linear path now covers backbone/flow/Mimi plus latent/EOS control projections with device activation quantization, cached per-row scales, INT8 GEMM and f32 epilogue behind `MYNAH_CUDA_Q8=1`; BF16/FP16/INT4, CUDA convolution quantization, cuBLASLt/fused kernels and parity/quality qualification remain
+- [~] E15-12 CUDA graph runner: warmup, padded multi-axis buckets, output trimming, capture/replay/fallback reasons, cache memory and per-bucket hit/miss counters; the resident backbone now uses separate stable graph keys for host-input and already-device-resident control batches, and the SEANet batch graph has persistent per-upload metadata; startup graph warmup, physical row buckets and decoder graph cache histograms remain
+- [~] E15-13 server observability: read-only `/metrics` now exposes queue/active/completion gauges/counters, active capacity, transfer calls/bytes, sync/graph/backbone/codec-transformer/true decoder-batch/upsample/matmul/Q8 counters, VRAM/backend flags and TTFA/E2E/RTF/audio timing sums; TTFB, per-stage timing and bucket histograms remain
+- [~] E15-14 runtime CUDA CI: hosted `nvcc` compile gates now fail on unexpected self-test errors while accepting an explicit no-device result; the RTX PRO 6000 model-free memcheck passes, and the official CUDA 12.8.1 `sm_120` compile gate is green in `36124116814`, while optional GPU CI and the B1/B2/B4/B8 graph/precision matrix remain
+- [~] E15-19 real NVIDIA bring-up: RTX PRO 6000 `sm_120` model-free self-test and model-backed 6L/24L CLI/server/stream smoke pass; `sm_89` (L4/L40S) compiles, while stage parity, sustained CPU-utilization audit and production qualification remain
+- [~] E15-7 CPU↔CUDA stage/EOS/audio parity and solo↔batch/stream parity on a real CUDA device; official 6L/24L inference and single-stream PCM smoke pass, while intermediate-stage/EOS and multi-request contamination gates remain; CPU gates stay green
+- [ ] E15-8 L40S qualification campaign: warmups, serial A/B, batch sweep, C ladder, VRAM/RSS/transfer metrics and 30-minute C100 cadence soak
+- [x] E15-15 official Pocket 6L/24L schema audit: 24L is the same graph with 18 additional backbone blocks; flow/Mimi/lookup/projection shapes and tokenizer are compatible; mixed source dtypes and 24L voice-cache metadata are recorded in [`.work/pocket-tts-24l-compatibility.md`](.work/pocket-tts-24l-compatibility.md)
+- [~] E15-16 depth-driven Pocket converter/runtime: converter accepts 6L/24L block counts and mixed BF16/F32 source tensors with `--dtype source`; official 24L conversion, CPU load/inference and CUDA load/inference are green, while CUDA stage parity remains
+- [~] E15-17 2x2 Pocket validation matrix (6L/24L × CPU/CUDA): official packs now convert, load and complete inference on both backends, with RAM/VRAM, TTFA and RTF smoke numbers recorded; stage/EOS/audio and solo↔batch parity remain before final qualification
+- [~] E15-18 README now names the experimental Pocket CPU/CUDA paths, precision gates, raw-F32 bring-up profile and links the CUDA work item; full CPU/CUDA support matrix and L4/L40S reproduction/qualification commands remain
+- [~] E15-21 CUDA async lifetime/fallback audit: independent frame/layer/request metadata tables, pinned singleton staging, race-free causal upsample-tail state (including tail/stride edge cases), teardown draining, causal upsample-tail import and explicit 1.6.0 metrics ABI bump are implemented; fresh nvcc, compute-sanitizer and injected mid-stream failure runs remain
+- [~] E15-22 CUDA capability truthfulness: startup reports raw-F32 plus opt-in Q8 stage eligibility; latent/EOS projection is batched on CUDA while threshold/RNG/LSD control remains host-side; unsupported quantized groups stay on the CPU oracle; CUDA INT4/BF16/FP16 and convolution quantization remain open, while raw-F32 SEANet arithmetic is now cross-request batched
+- [~] E15-23 CUDA Q8 resident linear path: device per-row activation quantization, INT8 cuBLAS GEMM, cached weight scales, pre-capture workspace reservation, flow-descriptor precision metadata, batched latent/EOS control projections, model-free self-test and `/health`/Prometheus counters are implemented; fresh nvcc/GPU parity, Q8 quality, memory and L4/L40S throughput gates remain
+- [~] E15-24 model-owned voice KV cache: validated prefixes are decoded once into immutable host storage (lazy by default, `MYNAH_POCKET_VOICE_CACHE=all` startup preload, `0` compatibility escape hatch) and copied into private request KV; batched text prefill is now present, while device-resident voice prefixes remain open
+- [~] E15-25 CUDA cross-request text prefill: the append-only driver hook advances ragged rows through one resident backbone batch/graph topology, keeps the host KV mirror for safe fallback, and preserves the scalar CPU path; right-padded static row arenas, device voice-prefix copies and physical width-bucket graphs remain open
+
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)
 
 - [ ] E6-1 `speakers.json`: `source_dataset`, `license`, `commercial_use` per voice
@@ -1397,8 +1432,9 @@ single pool (`1x32` at C8: STREAM 1.55, 62% of frames stalling past 500 ms).
   `may be used uninitialized` in `json.c`). Still open: the AVX-512 execution
   gap on hosted runners (stated in the note, not implied by a green tick) and
   `--self-test` across the whole link-only matrix.
-- [-] GPU (Metal/CUDA) work — existing backends stay as they are. Metal measured
-  *slower* than CPU on Apple Silicon (`docs/performance.md:71-80`).
+- [-] Generic Magpie GPU expansion — existing partial backends stay as they are;
+  Metal measured *slower* than CPU on Apple Silicon (`docs/performance.md:71-80`).
+  Pocket-specific CUDA work is now tracked in E15 and does not reopen this item.
 - [-] `*_24l` PocketTTS variants — non-distilled previews, 672 MB-1.3 GB each,
   same schema with `num_layers: 24`. French exists **only** in this form.
 - [-] dots.tts (§9) and Chatterbox (§10) — unchanged as later engines.

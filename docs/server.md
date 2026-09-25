@@ -6,7 +6,45 @@ framework, no dependencies — plain sockets in C, one binary.
 ```bash
 make server
 ./build/cpu/mynah-tts-server -m models/magpie-v2607-pack -p 8080
+
+# CUDA sizing: bounded engine calls with many resident request slots.
+# Runtime qualification on a real NVIDIA box is still required.
+./build/cuda/mynah-tts-server -m models/pocket-en --device cuda \
+  --max-batch 16 --max-inflight 128 -p 8080
 ```
+
+The CPU and CUDA servers are separate artifacts. The CPU binary is never
+silently promoted to CUDA; build the opt-in server explicitly when the CUDA
+toolkit is available (a device is required only when running it):
+
+```bash
+make cuda-server CUDA_ARCH=sm_89
+./build/cuda/mynah-tts-server -m models/magpie-v2607-pack \
+  --device cuda -p 8080
+```
+
+`cuda-server` proves the CUDA-linked server builds without a GPU. PocketTTS
+resident CUDA execution and its parity/serving qualification are tracked in
+[the CUDA work item](../.work/pocket-tts-cuda-streaming-parity.md). Failure to
+open an explicitly requested CUDA backend is reported; inside a compatible
+Pocket request, recoverable resident-backbone or flow-head allocation, launch
+or graph-capture failures retry the same stage on the CPU path. The Pocket
+SEANet decoder has a resident causal CUDA path; its CPU↔CUDA stage parity and
+true cross-request batch-kernel gate remain open.
+
+The current opt-in controls are:
+
+| environment | effect |
+|---|---|
+| `MYNAH_CUDA_RESIDENT=0` | disable Pocket's resident transformer slice and use the CPU engine path |
+| `MYNAH_CUDA_FLOW=0` | disable the optional resident Pocket flow-head batch path; CPU flow remains the fallback |
+| `MYNAH_CUDA_FAST_MATH=1` | opt into FP16/Tensor-Core GEMM; default is FP32 parity mode |
+| `MYNAH_CUDA_GRAPHS=0` | disable resident Pocket batch CUDA-Graph capture/replay; graphs are enabled by default and fall back to ordinary stream submission when capture is unavailable |
+| `MYNAH_CUDA_DECODER_BATCH=0` | disable the async resident decoder gang submit/one-drain path; default is enabled for CUDA |
+| `MYNAH_CUDA_DECODER_GRAPHS=0` | disable cross-request SEANet decoder graph capture/replay; default is enabled, with a bounded cache keyed by the exact stable decoder gang |
+| `MYNAH_CUDA_PREFILL_BATCH=0` | disable cross-request CUDA text prefill and use scalar resumable prefill; CPU is unchanged |
+| `MYNAH_POCKET_VOICE_CACHE=0|all|startup` | disable model-owned voice KV caching, or preload every voice at startup; default is lazy first-use caching |
+| `MYNAH_CUDA_CODEC=1` | opt into the existing generic NanoCodec resident path; it is not Pocket's SEANet decoder and is not a qualification claim |
 
 | flag | meaning |
 |---|---|
@@ -14,6 +52,8 @@ make server
 | `-p, --port N` | listen port (default 8080) |
 | `--host ADDR` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose) |
 | `-w, --workers N` | connection workers (default 4) — see Concurrency |
+| `--max-batch N` | engine/CUDA microbatch width (Pocket default 8 at the server layer, capped by model metadata) |
+| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`, maximum 128); does not widen one engine call |
 | `--device cpu\|metal\|cuda` | backend, same rules as the CLI |
 
 It binds to loopback by default. Exposing it means `--host 0.0.0.0`, which is a
@@ -126,6 +166,20 @@ OpenAI-shaped listing of the single pack this process serves.
 
 ```json
 {"status":"ok","model":"magpie-v2607","engine":"magpie","sample_rate":22050,"voices":5}
+```
+
+## GET /metrics
+
+Read-only Prometheus text for scheduler gauges and backend counters. It is
+safe to poll while synthesis is running and does not synchronize CUDA. CPU
+builds expose the same names with zero CUDA values; CUDA builds additionally
+report transfer calls/bytes, graph activity, resident decoder batches,
+matmul/matvec calls and device memory. Request timing is exported as monotonic
+sums for queue wait, TTFA, synthesis service, E2E and represented audio, plus
+an average RTF gauge; TTFB and per-stage timing histograms are future work.
+
+```bash
+curl http://localhost:8080/metrics
 ```
 
 ## Concurrency

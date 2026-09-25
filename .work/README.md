@@ -42,3 +42,4 @@ that holds the detail. Nothing in `PLAN.md` should need more than one line.
 | [prefill-ttfa.md](prefill-ttfa.md) | E9-1 — what is serial inside `prep.decoder_prefill` |
 | [ternary-feasibility.md](ternary-feasibility.md) | E11 — does the checkpoint tolerate W1.58 at all, before any kernel |
 | [int8-backbone.md](int8-backbone.md) | E12 — `backbone:bf16` → `backbone:int8`, and what would actually prove it |
+| [pocket-tts-cuda-streaming-parity.md](pocket-tts-cuda-streaming-parity.md) | E15 — PocketTTS CUDA residency, parity, and Linux GPU streaming |

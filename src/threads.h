@@ -316,7 +316,8 @@ void mynah_pool_narrow_stats(long long *capped, long long *precheck_skips);
 
 /* Both sides of the split need at least this many cpus. See the sweep above. */
 #define MYNAH_LANE_MIN_CPUS 4
-/* One mailbox entry per driver slot; MYNAH_GRAPH_MAX_JOBS is 16. */
+/* One mailbox entry per lane-enabled driver slot. The continuous active-slot
+ * service can be wider, so the lane is deliberately disabled above this. */
 #define MYNAH_LANE_SLOTS    16
 
 /* Build the lane team on `cpus[count - lane_cpus .. count)` and narrow the

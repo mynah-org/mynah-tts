@@ -17,7 +17,7 @@
  *     voice   -> KV cache loaded straight into the backbone (T positions)
  *     text    -> conditioner.embed -> backbone prefill      (n_tok positions)
  *     step k:  input_linear(k == 0 ? bos_emb : latent[k-1])   [latent]->[d]
- *              backbone (6 layers) -> out_norm             -> hidden [d]
+ *              backbone (N layers from model.json) -> out_norm -> hidden [d]
  *              out_eos(hidden)  > eos_threshold            -> remember the step
  *              flow_head(cond = hidden, s = 0, t = 1, x0 = noise) -> v
  *              latent[k] = noise + v                         (LSD, one step)
@@ -66,7 +66,7 @@
  *     frame at a time so that offline and streaming are the same code path
  *     (AGENTS.md rule 7).
  *
- * No dimension is compiled in.  Everything comes from the pack: `model.json`
+ * No dimension or backbone depth is compiled in.  Everything comes from the pack: `model.json`
  * for the declared numbers, `speakers.json` for the voice table, and the
  * tensor shapes themselves for the handful of SEANet parameters the manifest
  * does not declare (filters, residual depth, compression, kernel sizes).  The

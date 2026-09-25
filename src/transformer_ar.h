@@ -114,7 +114,7 @@ typedef struct {
     size_t d_model;     /* residual width, e.g. 1024                        */
     size_t num_heads;   /* e.g. 16                                          */
     size_t head_dim;    /* e.g. 64; 0 means d_model / num_heads             */
-    size_t num_layers;  /* e.g. 6                                           */
+    size_t num_layers;  /* e.g. 6 or 24; always supplied by the model         */
     size_t ffn_dim;     /* e.g. 4096                                        */
     size_t max_seq_len; /* KV capacity in positions, voice prefix included  */
     size_t context;     /* sliding attention window; 0 = unlimited          */
@@ -248,6 +248,21 @@ float *mynah_transformer_ar_state_kv(mynah_transformer_ar_state *state,
 /* Floats in one half (K or V) of a layer's block: max_seq_len*heads*head_dim. */
 size_t mynah_transformer_ar_state_kv_half_floats(
     const mynah_transformer_ar_state *state);
+
+/* Windowed-cache accessors for a resident backend. Unlike `state_kv()`, these
+ * are valid for both the unwindowed backbone cache and Mimi's compact sliding
+ * window. `value == 0` selects K and `value == 1` selects V; the returned row
+ * starts at the current absolute `kv_base`. */
+float *mynah_transformer_ar_state_kv_window(mynah_transformer_ar_state *state,
+                                            size_t layer, int value);
+size_t mynah_transformer_ar_state_kv_positions(
+    const mynah_transformer_ar_state *state);
+size_t mynah_transformer_ar_state_kv_base(
+    const mynah_transformer_ar_state *state);
+
+/* Make room for an exclusive end position without advancing the state. */
+int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
+                                               size_t end_position);
 
 /*
  * Copies a voice prefix into layer `layer`.  `kv` is

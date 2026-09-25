@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYNAH_TTS_VERSION "1.4.0"
+#define MYNAH_TTS_VERSION "1.8.0"
 
 typedef struct mynah_tts_model mynah_tts_model;
 
@@ -13,6 +13,56 @@ typedef enum {
     MYNAH_TTS_DEVICE_METAL = 1,
     MYNAH_TTS_DEVICE_CUDA = 2,
 } mynah_tts_device;
+
+/* Backend counters are process-local diagnostics. The public metrics layout
+ * changed in 1.8.0 when resident Pocket CUDA decoder-graph counters were
+ * added; consumers
+ * that cache the struct layout must rebuild against this header. Counters are
+ * intentionally monotonically increasing and may be sampled while synthesis
+ * is running;
+ * callers must not treat one snapshot as a transactional view. CPU builds
+ * return zero for CUDA-only fields. */
+typedef struct {
+    unsigned long long h2d_bytes;
+    unsigned long long d2h_bytes;
+    unsigned long long h2d_calls;
+    unsigned long long d2h_calls;
+    unsigned long long sync_calls;
+    unsigned long long graph_captures;
+    unsigned long long graph_replays;
+    unsigned long long graph_fallbacks;
+    unsigned long long backbone_batch_calls;
+    unsigned long long backbone_batch_items;
+    unsigned long long backbone_batch_max_width;
+    unsigned long long codec_transformer_batch_calls;
+    unsigned long long codec_transformer_batch_items;
+    unsigned long long codec_transformer_batch_max_width;
+    unsigned long long codec_upsample_steps;
+    unsigned long long codec_upsample_fallbacks;
+    unsigned long long decoder_steps;
+    unsigned long long decoder_batch_calls;
+    unsigned long long decoder_batch_items;
+    unsigned long long decoder_batch_max_width;
+    unsigned long long decoder_batch_frames;
+    unsigned long long decoder_graph_captures;
+    unsigned long long decoder_graph_replays;
+    unsigned long long decoder_graph_fallbacks;
+    unsigned long long decoder_failures;
+    unsigned long long resident_fallbacks;
+    unsigned long long matmul_calls;
+    unsigned long long matvec_calls;
+    unsigned long long q8_matmul_calls;
+    unsigned long long q8_rows;
+    unsigned long long q8_weight_uploads;
+    unsigned long long q8_weight_bytes;
+    unsigned long long q8_activation_bytes;
+    unsigned long long device_memory_bytes;
+    unsigned long long device_memory_free_bytes;
+    unsigned graphs_enabled;
+    unsigned fast_math_enabled;
+    unsigned decoder_batch_enabled;
+    unsigned q8_enabled;
+} mynah_tts_backend_metrics;
 
 typedef struct {
     char engine[32];
@@ -102,6 +152,8 @@ int mynah_tts_model_warm(mynah_tts_model *model, char *error,
                          size_t error_capacity);
 int mynah_tts_model_get_info(const mynah_tts_model *model,
                              mynah_tts_model_info *info);
+int mynah_tts_model_get_backend_metrics(const mynah_tts_model *model,
+                                        mynah_tts_backend_metrics *metrics);
 
 const char *mynah_tts_device_name(mynah_tts_device device);
 int mynah_tts_device_self_test(mynah_tts_device device, char *error,
