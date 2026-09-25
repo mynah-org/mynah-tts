@@ -802,6 +802,7 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> decoder_steps;
     std::atomic<unsigned long long> decoder_batch_calls;
     std::atomic<unsigned long long> decoder_batch_items;
+    std::atomic<unsigned long long> decoder_batch_max_width;
     std::atomic<unsigned long long> decoder_batch_frames;
     std::atomic<unsigned long long> decoder_failures;
     std::atomic<unsigned long long> resident_fallbacks;
@@ -2368,6 +2369,7 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->decoder_steps.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_calls.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_items.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_max_width.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_frames.store(0ull, std::memory_order_relaxed);
     st->decoder_failures.store(0ull, std::memory_order_relaxed);
     st->resident_fallbacks.store(0ull, std::memory_order_relaxed);
@@ -2457,6 +2459,8 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         st->decoder_batch_calls.load(std::memory_order_relaxed);
     metrics->decoder_batch_items =
         st->decoder_batch_items.load(std::memory_order_relaxed);
+    metrics->decoder_batch_max_width =
+        st->decoder_batch_max_width.load(std::memory_order_relaxed);
     metrics->decoder_batch_frames =
         st->decoder_batch_frames.load(std::memory_order_relaxed);
     metrics->decoder_failures = st->decoder_failures.load(std::memory_order_relaxed);
@@ -4294,6 +4298,14 @@ extern "C" int mynah_cuda_decoder_note_batch(void *opaque, size_t items,
     backend->decoder_batch_calls.fetch_add(1ull, std::memory_order_relaxed);
     backend->decoder_batch_items.fetch_add((unsigned long long)items,
                                            std::memory_order_relaxed);
+    unsigned long long observed =
+        backend->decoder_batch_max_width.load(std::memory_order_relaxed);
+    const unsigned long long width = (unsigned long long)items;
+    while (observed < width &&
+           !backend->decoder_batch_max_width.compare_exchange_weak(
+               observed, width, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
     backend->decoder_batch_frames.fetch_add((unsigned long long)frames,
                                             std::memory_order_relaxed);
     return 0;

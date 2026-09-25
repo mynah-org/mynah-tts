@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYNAH_TTS_VERSION "1.6.0"
+#define MYNAH_TTS_VERSION "1.7.0"
 
 typedef struct mynah_tts_model mynah_tts_model;
 
@@ -15,7 +15,8 @@ typedef enum {
 } mynah_tts_device;
 
 /* Backend counters are process-local diagnostics. The public metrics layout
- * changed in 1.6.0 when resident Pocket CUDA Q8 counters were added; consumers
+ * changed in 1.7.0 when resident Pocket CUDA decoder-batch width counters were
+ * added; consumers
  * that cache the struct layout must rebuild against this header. Counters are
  * intentionally monotonically increasing and may be sampled while synthesis
  * is running;
@@ -41,6 +42,7 @@ typedef struct {
     unsigned long long decoder_steps;
     unsigned long long decoder_batch_calls;
     unsigned long long decoder_batch_items;
+    unsigned long long decoder_batch_max_width;
     unsigned long long decoder_batch_frames;
     unsigned long long decoder_failures;
     unsigned long long resident_fallbacks;

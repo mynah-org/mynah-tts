@@ -637,7 +637,9 @@ The final 24L C64 wave used the current `max_batch=64` path, prefix-only KV
 upload and coalesced backbone KV readback. It completed 64/64 requests with
 zero failures and zero resident fallbacks, but was **NOT STREAMABLE**:
 `STREAM_RTF p95=2.398`, `TTFA p95=10.09 s`, `stall@500 ms=91%`, aggregate
-throughput 9.77 audio-s/wall-s and aggregate RTF 0.102. Health recorded
+throughput 9.77 audio-s/wall-s and aggregate RTF 0.102. This historical run
+predates the true SEANet arithmetic batch; its legacy decoder gang fields are
+not comparable with the new `decoder_batch_max_width` metric. Health recorded
 `backbone_batch_calls=82`, `items=1485`, `max_width=27`, `decoder_batch_calls=107`,
 `decoder_batch_items=1447`, 1.762 GB H2D, 303 MB D2H, 3,031 D2H calls, 323
 synchronizations, zero graph fallbacks and peak RSS about 3.96 GB. Sampled
@@ -759,7 +761,8 @@ SEANet batching   raw-F32 decoder arithmetic is now cross-request batched with
 codec graphs      Mimi decoder-transformer frame tiles do not yet have a captured
                    graph bucket; dynamic window/pointer metadata still uses ordinary launches
 observability     counters expose bytes/calls/fallbacks, tile widths and true
-                   decoder-batch widths; per-stage GPU time and bucket histograms remain
+                   decoder-batch width (including max observed width); per-stage
+                   GPU time and bucket histograms remain
 validation        current source needs a fresh nvcc build, GPU self-test, stage parity,
                    compute-sanitizer and failure-injection run on the next NVIDIA box
 ```

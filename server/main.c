@@ -1456,7 +1456,8 @@ static void handle_health(int fd) {
              "\"codec_upsample_fallbacks\":%llu,"
              "\"decoder_steps\":%llu,"
              "\"decoder_batch_calls\":%llu,\"decoder_batch_items\":%llu,"
-             "\"decoder_batch_frames\":%llu,\"decoder_failures\":%llu,"
+             "\"decoder_batch_max_width\":%llu,\"decoder_batch_frames\":%llu,"
+             "\"decoder_failures\":%llu,"
              "\"resident_fallbacks\":%llu,\"matmul_calls\":%llu,"
              "\"matvec_calls\":%llu,\"q8_matmul_calls\":%llu,"
              "\"q8_rows\":%llu,\"q8_weight_uploads\":%llu,"
@@ -1481,6 +1482,7 @@ static void handle_health(int fd) {
              backend_metrics.decoder_steps,
              backend_metrics.decoder_batch_calls,
              backend_metrics.decoder_batch_items,
+             backend_metrics.decoder_batch_max_width,
              backend_metrics.decoder_batch_frames,
              backend_metrics.decoder_failures,
              backend_metrics.resident_fallbacks,
@@ -1818,6 +1820,10 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_decoder_batch_items_total counter\n"
            "mynah_backend_decoder_batch_items_total %llu\n",
            m.decoder_batch_items);
+    METRIC("# HELP mynah_backend_decoder_batch_max_width Maximum cross-request decoder batch width observed.\n"
+           "# TYPE mynah_backend_decoder_batch_max_width gauge\n"
+           "mynah_backend_decoder_batch_max_width %llu\n",
+           m.decoder_batch_max_width);
     METRIC("# HELP mynah_backend_decoder_batch_frames_total Frame steps processed by cross-request decoder arithmetic batches.\n"
            "# TYPE mynah_backend_decoder_batch_frames_total counter\n"
            "mynah_backend_decoder_batch_frames_total %llu\n",
@@ -2239,7 +2245,7 @@ static void dump_local_stats(void) {
             "sync=%llu backbone_batch=%llu/%llu max=%llu "
             "codec_transformer_batch=%llu/%llu max=%llu "
             "codec_upsample=%llu fallback=%llu "
-            "decoder_steps=%llu decoder_batch=%llu/%llu/%llu "
+            "decoder_steps=%llu decoder_batch=%llu/%llu/max%llu/%llu "
             "decoder_failures=%llu resident_fallbacks=%llu matmul=%llu matvec=%llu "
             "q8=%llu/%llu weights=%llu/%llu "
             "vram=%llu/%llu flags=%u/%u/%u q8=%u\n",
@@ -2258,6 +2264,7 @@ static void dump_local_stats(void) {
             backend_metrics.decoder_steps,
             backend_metrics.decoder_batch_calls,
             backend_metrics.decoder_batch_items,
+            backend_metrics.decoder_batch_max_width,
             backend_metrics.decoder_batch_frames,
             backend_metrics.decoder_failures,
             backend_metrics.resident_fallbacks,
