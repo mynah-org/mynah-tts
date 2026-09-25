@@ -53,8 +53,9 @@ resident slice. `--device cuda` may run Pocket's transformer backbone,
 one-step flow head, Mimi decoder transformer, quantizer/causal upsample and
 SEANet decoder resident when their metadata and resolved precision are
 compatible. With `MYNAH_CUDA_Q8=1`, INT8 linear groups in the backbone, flow
-head and Mimi transformer use the resident Q8 path; unsupported encodings and
-convolution groups fall back to the CPU oracle. `MYNAH_CUDA_POCKET_CODEC=0` is the explicit A/B escape hatch for
+head, Mimi transformer and batched latent/EOS control projections use the
+resident Q8 path; unsupported encodings and convolution groups fall back to the
+CPU oracle. `MYNAH_CUDA_POCKET_CODEC=0` is the explicit A/B escape hatch for
 the CPU decoder-transformer oracle. With raw-F32 groups, the resident
 transformer keeps activations and KV on device, stages one bounded output tile
 per frame gang, and refreshes the host KV oracle only on a window rebase or
@@ -129,10 +130,10 @@ The existing backend is a useful foundation but is not a Pocket CUDA engine.
   but that still has host-round-trip semantics. Quantized/f16 qmat paths are
   CPU code today (`src/qmat.c:mynah_qmat_linear_resolved_qt()` and its batched
   twin).
-* The resident Pocket flow head currently uses raw FP32 model pointers for its
-  cached CUDA projections. This is deliberate for the first parity path; it is
-  not evidence that the CPU qmat/f16 representation is already reproduced on
-  the GPU.
+* The resident Pocket flow head uses raw FP32 model pointers by default, or the
+  explicit resident Q8 projection cache when `MYNAH_CUDA_Q8=1` and the selected
+  group is INT8. Other CPU qmat/f16 representations are still not reproduced
+  on the GPU.
 * `pocket_decode_audio_batch()` walks ranges frame-major and invokes the
   resident causal decoder once per context when CUDA is active. Decoder state
   is device-resident, but cross-request SEANet batching and the
@@ -288,7 +289,8 @@ seam. Keep
 The first implementation uses f32 accumulation with the CPU-approved weight
 representation and explicitly disables TF32/fast-math shortcuts until the
 stage tolerances are measured. An explicit `MYNAH_CUDA_Q8=1` path now accepts
-INT8 linear groups in the resident backbone, flow head and Mimi transformer:
+INT8 linear groups in the resident backbone, flow head, Mimi transformer and
+batched latent/EOS control projections:
 activations are quantized per row on device, cached weights are stored as
 INT8 plus output-row scales, and one INT8 GEMM serves the whole engine
 microbatch. Codec convolution groups remain CPU-gated; this is not yet a Q8
@@ -744,10 +746,11 @@ source. The following source-level hazards were found and corrected locally:
 The audit also confirms what is still genuinely missing outside these fixes:
 
 ```text
-control seam       EOS projection, RNG/sampling, and LSD bookkeeping still run on CPU;
-                   backbone hidden and flow latent cross the host boundary each AR step
+control seam       latent/EOS projection is batched on the resident stream;
+                   EOS thresholding, RNG/sampling and LSD bookkeeping remain CPU,
+                   while backbone hidden and flow latent still cross the host boundary
 quantized CUDA    Q8 resident linear path is implemented for backbone/flow/Mimi
-                  projections behind MYNAH_CUDA_Q8; its activation/accumulator
+                  and latent/EOS control projections behind MYNAH_CUDA_Q8; its activation/accumulator
                   arena is reserved before graph capture and reused across layers;
                   INT4/BF16/FP16 and CUDA convolution quantization remain CPU-gated
 SEANet batching   decoder gang submission is asynchronous but arithmetic is still

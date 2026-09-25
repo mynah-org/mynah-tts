@@ -148,11 +148,13 @@ the backbone, flow head, Mimi decoder-transformer, quantizer/causal upsample and
 causal SEANet decoder, but each stage is capability- and precision-gated. The
 default Pocket CPU quantization profile intentionally keeps several groups
 quantized. Resident CUDA now has an explicit Q8 linear path for batched
-backbone/flow/Mimi projections (device activation quantization, INT8 GEMM,
-cached per-row weight scales and f32 epilogue); convolution groups still use
-the CPU oracle until their own CUDA Q8 kernel passes parity. A raw-F32 resident bring-up therefore uses
+backbone/flow/Mimi and latent/EOS control projections (device activation
+quantization, INT8 GEMM, cached per-row weight scales and f32 epilogue);
+convolution groups still use the CPU oracle until their own CUDA Q8 kernel
+passes parity. A raw-F32 resident bring-up therefore uses
 `MYNAH_QUANT_GROUPS=none`, shown below. The current path still keeps generation
-control (EOS/sampling/RNG) and the final PCM boundary on the host, and its
+control (EOS thresholding/sampling/RNG) and the final PCM boundary on the host;
+the EOS projection itself is batched on the resident stream, and its
 decoder counter records asynchronous per-request gang submission, not true
 cross-request SEANet arithmetic batching. CUDA remains opt-in and model-specific;
 L4/L40S qualification, stage parity and sustained high-concurrency streaming are
@@ -227,7 +229,7 @@ To exercise the opt-in CUDA Q8 linear path, select only INT8 linear groups and
 enable it explicitly; unsupported convolution groups remain on the CPU oracle:
 
 ```bash
-MYNAH_CUDA_Q8=1 \
+MYNAH_QUANT=int8 MYNAH_CUDA_Q8=1 \
 MYNAH_QUANT_GROUPS=backbone:int8,flow_net:int8,codec_transformer:int8 \
 MYNAH_CUDA_RESIDENT=1 MYNAH_CUDA_FLOW=1 MYNAH_CUDA_POCKET_CODEC=1 \
   ./build/cuda/mynah-tts-server --device cuda --max-batch 16 \

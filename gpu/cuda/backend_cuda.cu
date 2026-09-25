@@ -329,9 +329,9 @@ __global__ static void k_q8_epilogue(const int32_t *accum, const float *act_scal
     if (index >= total) return;
     const int row = index / cols;
     const int col = index - row * cols;
-    const float value = (float)accum[index] *
-                        (act_scale[row] * weight_scale[col]);
-    out[index] = value + (bias == nullptr ? 0.0f : bias[col]);
+    const float row_scale = act_scale[row] * weight_scale[col];
+    out[index] = fmaf((float)accum[index], row_scale,
+                      bias == nullptr ? 0.0f : bias[col]);
 }
 
 __global__ static void k_copy_strided(float *dst, const float *src,
@@ -692,10 +692,12 @@ struct mynah_backend_decoder {
 
 static constexpr size_t CUDA_BATCH_META_CAP = 64u;
 /* A server can retain one decoder graph per live context in addition to the
- * width-bucketed backbone and flow graphs. The continuous service advertises
- * up to 128 resident slots, so the cap must cover that experiment or later
- * contexts silently lose graph capture after warm-up. Keep it finite. */
-static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 128u;
+ * width-bucketed backbone/flow graphs.  The condition-projection input graph
+ * is a separate bucket because its input is already resident in `cuda_x` and
+ * must not accidentally replay an H2D node from the ordinary bucket.  Keep
+ * enough finite room for 128 request decoders plus the three 64-width bucket
+ * families. */
+static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 384u;
 
 static void set_error(char *e, size_t c, const char *m) {
     if (e && c > 0) std::snprintf(e, c, "%s", m);
@@ -2077,9 +2079,9 @@ static int cuda_q8_self_test(void *opaque, char *e, size_t ec) {
                 for (size_t k = 0; k < 3u; ++k)
                     dot += (int32_t)qinput[row * 3u + k] *
                            (int32_t)qweight[col * 3u + k];
-                const float expected = (float)dot *
-                                           (xscale[row] * wscale[col]) +
-                                       bias[col];
+                const float row_scale = xscale[row] * wscale[col];
+                const float expected = std::fmaf((float)dot, row_scale,
+                                                 bias[col]);
                 if (std::fabs(output[row * 4u + col] - expected) > 2.0e-5f) {
                     std::snprintf(e, ec, "Q8 matmul mismatch %zu: %f != %f",
                                   row * 4u + col, output[row * 4u + col],

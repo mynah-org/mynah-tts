@@ -40,6 +40,7 @@
  * microbatches.  CPU still remains correct at the wider width, while its
  * operator can choose a smaller --max-batch at serving time. */
 #define POCKET_MAX_BATCH 64u
+#define POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE ((size_t)0x300000u)
 
 /* ------------------------------------------------------------------ errors */
 
@@ -1075,10 +1076,16 @@ struct mynah_engine_scratch {
     float *cuda_attn;
     float *cuda_proj;
     float *cuda_ffn;
+    /* Optional control-seam projections.  The host copies are intentionally
+     * reused from the transformer staging arena; these two device rows are
+     * only the latent->hidden input projection, not another per-layer arena. */
+    float *cuda_condition_input;
     size_t cuda_batch_capacity;
     int cuda_batch_enabled;
     int cuda_graph_enabled;
     int cuda_graph_ready;
+    int cuda_condition_ready;
+    int cuda_backbone_output_ready;
     size_t cuda_kv_shadow_floats;
 
     /* Shared CUDA Mimi decoder-transformer workspace.  Per-request KV remains
@@ -1570,6 +1577,161 @@ static int pocket_cuda_linear_d2d(const mynah_engine_state *state,
     return mynah_backend_matmul_d2d(
         state->backend, input, output, rows, input_width, output_width, weight,
         bias, error, error_capacity);
+}
+
+static int pocket_all_finite(const float *v, size_t n);
+static int pocket_cuda_groups_are_resident_compatible(
+    const mynah_engine_state *state, unsigned groups);
+
+static int pocket_cuda_control_qtype(const mynah_engine_state *state,
+                                     unsigned group, int requested) {
+    if (state == NULL || (state->qgroups & group) == 0u) return 0;
+    int qtype = requested;
+    if (qtype < 0 && state->qcache != NULL)
+        qtype = mynah_qmat_cache_qtype(state->qcache);
+    return mynah_qmat_qtype_resolved(qtype);
+}
+
+/* The latent->hidden projection is a small but unavoidable host seam in the
+ * original batching path.  On a CPU-poor GPU worker, doing one 32x1024 qmat
+ * per request is needlessly expensive and also means the first stage is not
+ * actually continuous-batched.  Stack the previous latent rows, run the same
+ * resolved f32/Q8 projection on the resident stream, and download only the
+ * resulting hidden rows needed by the CPU fallback/finite gate.  The device
+ * result remains in `cuda_x`, so a successful backbone batch consumes it
+ * without another H2D copy.
+ *
+ * This helper is deliberately optional: a failed transfer/launch is drained
+ * and returns 1 before any request state advances, so the existing CPU
+ * projection remains the correctness fallback. */
+static int pocket_cuda_condition_batch(mynah_engine_ctx *const *ctxs,
+                                        size_t count,
+                                        mynah_engine_scratch *scratch,
+                                        char *error, size_t capacity) {
+    (void)error;
+    (void)capacity;
+    if (ctxs == NULL || scratch == NULL || count < 2u ||
+        scratch->backend == NULL || scratch->cuda_condition_input == NULL ||
+        scratch->cuda_x == NULL || scratch->cuda_host_input == NULL ||
+        scratch->cuda_host_output == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0)
+        return 1;
+    const mynah_engine_state *state = ctxs[0] == NULL ? NULL : ctxs[0]->state;
+    if (state == NULL || state->input_linear == NULL ||
+        !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_IN))
+        return 1;
+    const pocket_config *cfg = &state->cfg;
+    const int qtype = pocket_cuda_control_qtype(
+        state, POCKET_QG_COND_IN, state->cond_in_qtype);
+    size_t input_count = 0u;
+    size_t output_count = 0u;
+    if (pocket_mul(count, cfg->latent_dim, &input_count) != 0 ||
+        pocket_mul(count, cfg->hidden_dim, &output_count) != 0 ||
+        input_count == 0u || output_count == 0u ||
+        cfg->latent_dim > cfg->hidden_dim ||
+        count > (size_t)INT_MAX || cfg->latent_dim > (size_t)INT_MAX ||
+        cfg->hidden_dim > (size_t)INT_MAX)
+        return 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || ctx->step_input == NULL)
+            return 1;
+        const float *previous = ctx->frames > 0u
+            ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
+            : state->bos_emb;
+        memcpy(scratch->cuda_host_input + i * cfg->latent_dim,
+               previous, cfg->latent_dim * sizeof(float));
+    }
+
+    char local[256];
+    local[0] = '\0';
+    int failed = mynah_backend_batch_begin(scratch->backend, local,
+                                            sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_h2d(scratch->backend, scratch->cuda_host_input,
+                                   scratch->cuda_condition_input, input_count,
+                                   local, sizeof(local)) != 0;
+    if (!failed)
+        failed = pocket_cuda_linear_d2d(
+                     state, scratch->cuda_condition_input, scratch->cuda_x,
+                     count, cfg->latent_dim, cfg->hidden_dim,
+                     state->input_linear, NULL, qtype, local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_d2h(scratch->backend, scratch->cuda_x,
+                                   scratch->cuda_host_output, output_count,
+                                   local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0;
+    if (failed) {
+        char drain[256];
+        drain[0] = '\0';
+        (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+        return 1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        memcpy(ctxs[i]->step_input,
+               scratch->cuda_host_output + i * cfg->hidden_dim,
+               cfg->hidden_dim * sizeof(float));
+        if (!pocket_all_finite(ctxs[i]->step_input, cfg->hidden_dim)) return 1;
+    }
+    scratch->cuda_condition_ready = 1;
+    return 0;
+}
+
+/* EOS is control data, but its one-output projection is still a regular
+ * resident linear.  Keep the scalar EOS decision on the host while moving the
+ * hidden->logit matmul into the same microbatch as the AR step. */
+static int pocket_cuda_eos_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                                 mynah_engine_scratch *scratch, char *error,
+                                 size_t capacity) {
+    (void)error;
+    (void)capacity;
+    if (ctxs == NULL || scratch == NULL || count < 2u ||
+        !scratch->cuda_backbone_output_ready || scratch->backend == NULL ||
+        scratch->cuda_norm == NULL || scratch->cuda_proj == NULL ||
+        scratch->cuda_host_input == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0)
+        return 1;
+    const mynah_engine_state *state = ctxs[0] == NULL ? NULL : ctxs[0]->state;
+    if (state == NULL || state->out_eos_weight == NULL ||
+        !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_EOS))
+        return 1;
+    const pocket_config *cfg = &state->cfg;
+    const int qtype = pocket_cuda_control_qtype(
+        state, POCKET_QG_COND_EOS, state->cond_eos_qtype);
+    if (count > (size_t)INT_MAX || cfg->hidden_dim > (size_t)INT_MAX)
+        return 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i] == NULL || ctxs[i]->state != state ||
+            ctxs[i]->hidden == NULL)
+            return 1;
+    }
+    char local[256];
+    local[0] = '\0';
+    int failed = mynah_backend_batch_begin(scratch->backend, local,
+                                            sizeof(local)) != 0;
+    if (!failed)
+        failed = pocket_cuda_linear_d2d(
+                     state, scratch->cuda_norm, scratch->cuda_proj, count,
+                     cfg->hidden_dim, 1u, state->out_eos_weight,
+                     state->out_eos_bias, qtype, local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_d2h(scratch->backend, scratch->cuda_proj,
+                                   scratch->cuda_host_input, count, local,
+                                   sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0;
+    if (failed) {
+        char drain[256];
+        drain[0] = '\0';
+        (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+        scratch->cuda_backbone_output_ready = 0;
+        return 1;
+    }
+    for (size_t i = 0; i < count; ++i) ctxs[i]->eos_logit = scratch->cuda_host_input[i];
+    scratch->cuda_backbone_output_ready = 0;
+    return 0;
 }
 
 /* Q8 uses one reusable activation/scale/accumulator arena.  Reserve it for
@@ -4974,6 +5136,7 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
         count > scratch->cuda_batch_capacity || count > POCKET_MAX_BATCH) {
         return 1;
     }
+    scratch->cuda_backbone_output_ready = 0;
     mynah_engine_ctx *first = ctxs[0];
     if (first == NULL || first->state == NULL ||
         strcmp(mynah_backend_name(scratch->backend), "cuda") != 0) return 1;
@@ -5058,18 +5221,22 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
     char drain_error[256];
     int graph_replay = 0;
     int graph_capture = 0;
+    const size_t graph_key = scratch->cuda_condition_ready
+        ? POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE + count
+        : count;
     local[0] = '\0';
     if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0)
         goto fail;
     if (scratch->cuda_graph_enabled && scratch->cuda_graph_ready && all_kv_valid) {
         const int graph_rc = mynah_backend_graph_begin(
-            scratch->backend, count, scratch, &graph_replay, local,
+            scratch->backend, graph_key, scratch, &graph_replay, local,
             sizeof(local));
+        if (graph_rc < 0) goto fail;
         if (graph_rc == 0) graph_capture = !graph_replay;
     }
 
     if (graph_replay) {
-        if (mynah_backend_graph_launch(scratch->backend, count, scratch, local,
+        if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch, local,
                                        sizeof(local)) != 0) goto fail;
     } else {
         for (size_t i = 0; i < count; ++i) {
@@ -5078,7 +5245,8 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
                 pocket_cuda_backbone_upload(ctx, local, sizeof(local)) != 0)
                 goto fail;
         }
-        if (mynah_backend_h2d(scratch->backend, scratch->cuda_host_input,
+        if (!scratch->cuda_condition_ready &&
+            mynah_backend_h2d(scratch->backend, scratch->cuda_host_input,
                               scratch->cuda_x, count * cfg->hidden_dim, local,
                               sizeof(local)) != 0) goto fail;
 
@@ -5163,14 +5331,14 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
                               sizeof(local)) != 0) goto fail;
 
         if (graph_capture) {
-            if (mynah_backend_graph_end(scratch->backend, count, scratch,
+            if (mynah_backend_graph_end(scratch->backend, graph_key, scratch,
                                          local, sizeof(local)) != 0) {
                 scratch->cuda_graph_ready = 0;
-                mynah_backend_graph_abort(scratch->backend, count, scratch);
+                mynah_backend_graph_abort(scratch->backend, graph_key, scratch);
                 return 1;
             }
             graph_capture = 0;
-            if (mynah_backend_graph_launch(scratch->backend, count, scratch,
+            if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
                                             local, sizeof(local)) != 0) goto fail;
         }
     }
@@ -5212,13 +5380,17 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
             goto fail;
         }
     }
+    scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = 1;
     if (scratch->cuda_graph_enabled) scratch->cuda_graph_ready = 1;
     if (error != NULL && capacity > 0u) error[0] = '\0';
     return 0;
 
 fail:
+    scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = 0;
     if (graph_capture) {
-        mynah_backend_graph_abort(scratch->backend, count, scratch);
+        mynah_backend_graph_abort(scratch->backend, graph_key, scratch);
     }
     if (scratch->cuda_graph_enabled) {
         scratch->cuda_graph_ready = 0;
@@ -5301,6 +5473,14 @@ static int pocket_cuda_flow_step_batch(const mynah_engine_state *state,
     if (scratch->cuda_flow_graph_enabled && scratch->cuda_flow_graph_ready) {
         const int graph_rc = mynah_backend_graph_begin(
             scratch->backend, graph_key, scratch, &replay, local, sizeof(local));
+        if (graph_rc < 0) {
+            pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                 ? local
+                                                 : "CUDA flow graph setup failed");
+            scratch->cuda_flow_enabled = 0;
+            scratch->cuda_flow_graph_ready = 0;
+            return 1;
+        }
         if (graph_rc == 0) capturing = !replay;
     }
 
@@ -6253,10 +6433,18 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                           : mynah_transformer_ar_batch_capacity(scratch->backbone_batch);
     const int can_gather = scratch != NULL && scratch->backbone_batch != NULL &&
                            scratch->states != NULL && count <= batch_capacity;
+    if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
 
     /* ---- 2. the fallible mutation, before anything advances --------------- */
     mynah_region_begin(MYNAH_RGN_STEP);
     mynah_region_begin2(MYNAH_RGN_STEP_EMBED);
+    int cuda_condition_used = 0;
+    int all_will_step = can_gather && count > 1u;
+    for (size_t i = 0; i < count; ++i)
+        if (!will_step[i]) all_will_step = 0;
+    if (all_will_step && scratch != NULL &&
+        pocket_cuda_condition_batch(ctxs, count, scratch, NULL, 0u) == 0)
+        cuda_condition_used = 1;
     size_t live = 0;
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
@@ -6269,7 +6457,8 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         /* The previous latent's embedding is [1024][32], 128 KB: small enough
          * that stacking it would cost more bookkeeping than it saves traffic,
          * so it stays per request -- and it is its own quantization group. */
-        if (pocket_single_linear(state, POCKET_QG_COND_IN, state->cond_in_key,
+        if (!cuda_condition_used &&
+            pocket_single_linear(state, POCKET_QG_COND_IN, state->cond_in_key,
                                  state->cond_in_qtype, state->input_linear, NULL,
                                  previous, ctx->step_input, cfg->latent_dim,
                                  cfg->hidden_dim) != 0) {
@@ -6312,6 +6501,8 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         if (cuda_rc == 0) {
             cuda_used = 1;
             (void)mynah_backend_note_backbone_batch(scratch->backend, count);
+        } else if (scratch != NULL) {
+            scratch->cuda_condition_ready = 0;
         }
     }
     if (live == 1u) {
@@ -6419,6 +6610,19 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     size_t gathered = 0;
     const size_t flow_capacity =
         (scratch == NULL) ? 0u : mynah_flow_head_batch_capacity(scratch->flow_batch);
+    int cuda_eos_used = 0;
+    if (scratch != NULL && scratch->cuda_backbone_output_ready && count > 1u) {
+        int eligible = 1;
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i] == NULL || ctxs[i]->budget_exhausted) {
+                eligible = 0;
+                break;
+            }
+        }
+        if (eligible && pocket_cuda_eos_batch(ctxs, count, scratch, NULL, 0u) == 0)
+            cuda_eos_used = 1;
+    }
+    if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
 
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
@@ -6443,10 +6647,11 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
 
         mynah_region_begin(MYNAH_RGN_EMIT);
         mynah_region_begin(MYNAH_RGN_STEP_HEAD);
-        if (pocket_single_linear(state, POCKET_QG_COND_EOS, state->cond_eos_key,
-                                 state->cond_eos_qtype, state->out_eos_weight, state->out_eos_bias,
-                                 ctx->hidden, &ctx->eos_logit, cfg->hidden_dim,
-                                 1u) != 0) {
+        if (!cuda_eos_used &&
+            pocket_single_linear(state, POCKET_QG_COND_EOS, state->cond_eos_key,
+                                 state->cond_eos_qtype, state->out_eos_weight,
+                                 state->out_eos_bias, ctx->hidden,
+                                 &ctx->eos_logit, cfg->hidden_dim, 1u) != 0) {
             mynah_region_end(MYNAH_RGN_STEP_HEAD);
             mynah_region_end(MYNAH_RGN_EMIT);
             pocket_error(error, capacity,
@@ -6537,6 +6742,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     }
     mynah_region_end(MYNAH_RGN_FLOW);
     mynah_region_end(MYNAH_RGN_EMIT);
+    if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
 
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
@@ -7700,6 +7906,7 @@ static void pocket_scratch_free(mynah_engine_scratch *scratch) {
         mynah_backend_dev_free(scratch->backend, scratch->cuda_attn);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_proj);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_ffn);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_condition_input);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_kv_shadow);
         mynah_backend_host_free(scratch->backend, scratch->cuda_host_input);
         mynah_backend_host_free(scratch->backend, scratch->cuda_host_output);
@@ -7709,6 +7916,7 @@ static void pocket_scratch_free(mynah_engine_scratch *scratch) {
         free(scratch->cuda_host_input);
         free(scratch->cuda_host_output);
         free(scratch->cuda_host_kv);
+        free(scratch->cuda_condition_input);
         free(scratch->cuda_kv_shadow);
     }
     if (scratch->backend != NULL) {
@@ -7806,10 +8014,12 @@ static int pocket_scratch_new(const mynah_tts_model *model,
      * available; no decode call allocates a smaller emergency workspace. */
     if (pocket_cuda_resident_requested(state)) {
         size_t rows_hidden = 0, rows_qkv = 0, rows_attn = 0, rows_ffn = 0;
+        size_t condition_inputs = 0;
         if (pocket_mul(batch, cfg->hidden_dim, &rows_hidden) == 0 &&
             pocket_mul(batch, qkv_width, &rows_qkv) == 0 &&
             pocket_mul(batch, attn_dim, &rows_attn) == 0 &&
-            pocket_mul(batch, cfg->ffn_dim, &rows_ffn) == 0) {
+            pocket_mul(batch, cfg->ffn_dim, &rows_ffn) == 0 &&
+            pocket_mul(batch, cfg->latent_dim, &condition_inputs) == 0) {
             scratch->cuda_host_input = NULL;
             scratch->cuda_host_output = NULL;
             scratch->cuda_host_kv = NULL;
@@ -7846,6 +8056,15 @@ static int pocket_scratch_new(const mynah_tts_model *model,
             POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_ffn, rows_ffn);
             POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_kv_shadow, kv_shadow_floats);
 #undef POCKET_CUDA_SCRATCH_ALLOC
+            /* The control projection is optional.  A model whose latent width
+             * does not fit the generic resident arena simply keeps this small
+             * seam on the CPU; the main CUDA batch remains available. */
+            if (!device_failed && condition_inputs > 0u &&
+                mynah_backend_dev_alloc(state->backend, condition_inputs,
+                                        &scratch->cuda_condition_input, ignored,
+                                        sizeof(ignored)) != 0) {
+                scratch->cuda_condition_input = NULL;
+            }
             if (!device_failed &&
                 kv_metadata > SIZE_MAX / sizeof(*scratch->cuda_kcache)) {
                 device_failed = 1;
