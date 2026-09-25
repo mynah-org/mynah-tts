@@ -1442,7 +1442,7 @@ static void handle_health(int fd) {
     mynah_tts_backend_metrics backend_metrics;
     memset(&backend_metrics, 0, sizeof(backend_metrics));
     (void)mynah_tts_model_get_backend_metrics(g.model, &backend_metrics);
-    char backend_stats[2200];
+    char backend_stats[4096];
     snprintf(backend_stats, sizeof(backend_stats),
              "{\"h2d_bytes\":%llu,\"d2h_bytes\":%llu,"
              "\"h2d_calls\":%llu,\"d2h_calls\":%llu,\"sync_calls\":%llu,"
@@ -1457,6 +1457,8 @@ static void handle_health(int fd) {
              "\"decoder_steps\":%llu,"
              "\"decoder_batch_calls\":%llu,\"decoder_batch_items\":%llu,"
              "\"decoder_batch_max_width\":%llu,\"decoder_batch_frames\":%llu,"
+             "\"decoder_graph_captures\":%llu,\"decoder_graph_replays\":%llu,"
+             "\"decoder_graph_fallbacks\":%llu,"
              "\"decoder_failures\":%llu,"
              "\"resident_fallbacks\":%llu,\"matmul_calls\":%llu,"
              "\"matvec_calls\":%llu,\"q8_matmul_calls\":%llu,"
@@ -1484,6 +1486,9 @@ static void handle_health(int fd) {
              backend_metrics.decoder_batch_items,
              backend_metrics.decoder_batch_max_width,
              backend_metrics.decoder_batch_frames,
+             backend_metrics.decoder_graph_captures,
+             backend_metrics.decoder_graph_replays,
+             backend_metrics.decoder_graph_fallbacks,
              backend_metrics.decoder_failures,
              backend_metrics.resident_fallbacks,
              backend_metrics.matmul_calls, backend_metrics.matvec_calls,
@@ -1828,6 +1833,18 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_decoder_batch_frames_total counter\n"
            "mynah_backend_decoder_batch_frames_total %llu\n",
            m.decoder_batch_frames);
+    METRIC("# HELP mynah_backend_decoder_graph_captures_total Cross-request CUDA decoder graph captures.\n"
+           "# TYPE mynah_backend_decoder_graph_captures_total counter\n"
+           "mynah_backend_decoder_graph_captures_total %llu\n",
+           m.decoder_graph_captures);
+    METRIC("# HELP mynah_backend_decoder_graph_replays_total Cross-request CUDA decoder graph replays.\n"
+           "# TYPE mynah_backend_decoder_graph_replays_total counter\n"
+           "mynah_backend_decoder_graph_replays_total %llu\n",
+           m.decoder_graph_replays);
+    METRIC("# HELP mynah_backend_decoder_graph_fallbacks_total Cross-request CUDA decoder graph fallbacks.\n"
+           "# TYPE mynah_backend_decoder_graph_fallbacks_total counter\n"
+           "mynah_backend_decoder_graph_fallbacks_total %llu\n",
+           m.decoder_graph_fallbacks);
     METRIC("# HELP mynah_backend_decoder_failures_total Decoder failures.\n"
            "# TYPE mynah_backend_decoder_failures_total counter\n"
            "mynah_backend_decoder_failures_total %llu\n",

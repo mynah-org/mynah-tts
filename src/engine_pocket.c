@@ -41,6 +41,7 @@
  * operator can choose a smaller --max-batch at serving time. */
 #define POCKET_MAX_BATCH 64u
 #define POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE ((size_t)0x300000u)
+#define POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE ((size_t)0x400000u)
 
 /* ------------------------------------------------------------------ errors */
 
@@ -369,6 +370,13 @@ typedef struct {
     char *name;
     char *file;    /* relative to the pack directory                          */
     size_t frames; /* positions speakers.json declares; 0 = not declared      */
+    size_t positions; /* validated KV positions; zero until the pack sweep     */
+    /* Model-owned f32 [layers][K/V][positions][heads*head_dim].  This is
+     * populated once per voice (lazily by default) and copied into each
+     * request's transformer state during reset.  Keeping it at model scope
+     * removes the safetensors decode from every request without making a
+     * request share mutable KV state. */
+    float *kv;
 } pocket_voice;
 
 /* ------------------------------------------------------ quantization groups
@@ -871,6 +879,9 @@ struct mynah_engine_state {
 
     pocket_voice *voices;
     size_t voice_count;
+    int voice_cache_enabled;
+    pthread_mutex_t voice_cache_mutex;
+    int voice_cache_mutex_ready;
 
     mynah_sp *tokenizer;
 };
@@ -2629,9 +2640,13 @@ static void pocket_voices_free(pocket_voice *voices, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         free(voices[i].name);
         free(voices[i].file);
+        free(voices[i].kv);
     }
     free(voices);
 }
+
+static int pocket_voice_cache_load(mynah_engine_state *state, size_t index,
+                                   char *error, size_t capacity);
 
 static int pocket_voices_load(mynah_engine_state *state, const char *path,
                               char *error, size_t capacity) {
@@ -2764,6 +2779,7 @@ static int pocket_voices_load(mynah_engine_state *state, const char *path,
                                   error, capacity) != 0;
         ingot_st_close(file);
         if (bad) return -1;
+        voices[i].positions = positions;
         if (voices[i].frames != 0u && positions != voices[i].frames) {
             pocket_error(error, capacity,
                          "voice %s holds %zu positions, %s declares %zu; this file "
@@ -2772,7 +2788,97 @@ static int pocket_voices_load(mynah_engine_state *state, const char *path,
             return -1;
         }
     }
+
+    /* A request never mutates this cache: it only copies one voice's prefix
+     * into its private transformer KV.  Lazy loading is the default so a
+     * large pack does not pay for voices it never serves.  `all`/`startup`
+     * are explicit deployment choices for a server that wants every voice
+     * resident before accepting traffic; `0` retains the old per-context
+     * safetensors path for replacement/debug experiments. */
+    const char *cache_mode = getenv("MYNAH_POCKET_VOICE_CACHE");
+    state->voice_cache_enabled = cache_mode == NULL || strcmp(cache_mode, "0") != 0;
+    if (state->voice_cache_enabled && cache_mode != NULL &&
+        (strcmp(cache_mode, "all") == 0 || strcmp(cache_mode, "startup") == 0)) {
+        for (size_t i = 0; i < count; ++i) {
+            if (pocket_voice_cache_load(state, i, error, capacity) != 0) return -1;
+        }
+    }
     return 0;
+}
+
+/* Decode one voice exactly once into model-owned immutable f32 storage.  The
+ * safetensors file is still opened and schema-validated on this first use,
+ * preserving the pack provenance checks while keeping all later resets on the
+ * resident path.  The mutex covers lazy first use when contexts are admitted
+ * concurrently. */
+static int pocket_voice_cache_load(mynah_engine_state *state, size_t index,
+                                   char *error, size_t capacity) {
+    if (state == NULL || index >= state->voice_count) {
+        pocket_error(error, capacity, "pocket: invalid voice cache index");
+        return -1;
+    }
+    if (state->voice_cache_mutex_ready) pthread_mutex_lock(&state->voice_cache_mutex);
+
+    pocket_voice *voice = &state->voices[index];
+    if (voice->kv != NULL) {
+        if (state->voice_cache_mutex_ready) pthread_mutex_unlock(&state->voice_cache_mutex);
+        return 0;
+    }
+
+    char path[POCKET_PATH_MAX];
+    ingot_st *file = NULL;
+    float *cache = NULL;
+    int result = -1;
+    size_t positions = 0;
+    size_t attn_dim = 0;
+    size_t layer_stride = 0;
+    size_t total = 0;
+    if (pocket_join(path, sizeof(path), state->model_dir, voice->file, error,
+                    capacity) != 0 ||
+        ingot_st_open(&file, path, error, capacity) != 0 ||
+        pocket_voice_validate(file, &state->cfg, voice->name, &positions, error,
+                              capacity) != 0) {
+        goto done;
+    }
+    if (voice->frames != 0u && positions != voice->frames) {
+        pocket_error(error, capacity,
+                     "voice %s holds %zu positions, the pack declares %zu; this "
+                     "file does not belong to this pack",
+                     voice->name, positions, voice->frames);
+        goto done;
+    }
+    if (pocket_mul(state->cfg.heads, state->cfg.head_dim, &attn_dim) != 0 ||
+        pocket_mul(2u, positions, &layer_stride) != 0 ||
+        pocket_mul(layer_stride, attn_dim, &layer_stride) != 0 ||
+        pocket_mul(state->cfg.layers, layer_stride, &total) != 0) {
+        pocket_error(error, capacity, "voice %s KV size overflows size_t",
+                     voice->name);
+        goto done;
+    }
+    cache = mynah_alloc_floats(total, error, capacity);
+    if (cache == NULL) goto done;
+
+    char name[POCKET_NAME_MAX];
+    for (size_t layer = 0; layer < state->cfg.layers; ++layer) {
+        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", layer);
+        const ingot_st_tensor *tensor = ingot_st_find(file, name);
+        if (tensor == NULL ||
+            ingot_st_to_f32(file, tensor, cache + layer * layer_stride) != 0) {
+            pocket_error(error, capacity, "cannot cache %s from voice %s", name,
+                         voice->name);
+            goto done;
+        }
+    }
+    voice->positions = positions;
+    voice->kv = cache;
+    cache = NULL;
+    result = 0;
+
+done:
+    free(cache);
+    ingot_st_close(file);
+    if (state->voice_cache_mutex_ready) pthread_mutex_unlock(&state->voice_cache_mutex);
+    return result;
 }
 
 /* ------------------------------------------------------ weight resolution */
@@ -3233,6 +3339,10 @@ static void pocket_model_free(mynah_engine_state *state) {
     if (state == NULL) return;
     mynah_sp_close(state->tokenizer);
     pocket_voices_free(state->voices, state->voice_count);
+    if (state->voice_cache_mutex_ready) {
+        pthread_mutex_destroy(&state->voice_cache_mutex);
+        state->voice_cache_mutex_ready = 0;
+    }
     free(state->backbone_layers);
     free(state->time_embed);
     free(state->res_blocks);
@@ -3537,6 +3647,12 @@ static int pocket_model_init(const mynah_tts_model *model,
         pocket_error(error, capacity, "out of memory creating the pocket engine");
         return -1;
     }
+    if (pthread_mutex_init(&state->voice_cache_mutex, NULL) != 0) {
+        free(state);
+        pocket_error(error, capacity, "cannot initialise the pocket voice cache");
+        return -1;
+    }
+    state->voice_cache_mutex_ready = 1;
     state->model_dir = pocket_strdup(model->model_dir, strlen(model->model_dir));
     if (state->model_dir == NULL) {
         pocket_model_free(state);
@@ -4809,9 +4925,11 @@ static int pocket_cuda_decoder_submit(mynah_engine_ctx *ctx, char *error,
  * same resident topology, stages the device inputs, and preserves the
  * pre-state optional fallback contract used by the single-request path.
  *
- * No graph is captured here: pointer-table uploads and per-request causal
- * state make a graph a poor identity for a changing scheduler gang.  The
- * individual decoder graph remains available for width-one/fallback work. */
+ * The CUDA backend may capture this exact stable decoder gang.  Its graph
+ * owns persistent pointer-table metadata, so the scheduler can change the
+ * input values every frame without retaining stack addresses.  A changing
+ * gang falls back to eager arithmetic; the individual decoder graph remains
+ * available for width-one/fallback work. */
 static int pocket_cuda_decoder_submit_batch(
     mynah_engine_ctx *const *ctxs, size_t count, char *error, size_t capacity) {
     if (ctxs == NULL || count < 2u || count > POCKET_MAX_BATCH) return 1;
@@ -5224,15 +5342,17 @@ fail:
  * 1 means "not eligible" and leaves all host state untouched; -1 means a CUDA
  * failure after submission and invalidates the resident caches so the caller
  * can retry the same rows through the CPU implementation. */
-static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
-                                           size_t count,
-                                           mynah_engine_scratch *scratch,
-                                           char *error, size_t capacity) {
+static int pocket_cuda_backbone_step_batch(
+    mynah_engine_ctx *const *ctxs, size_t count, mynah_engine_scratch *scratch,
+    const float *const *input_rows, float *const *output_rows, int mirror_host,
+    char *error, size_t capacity) {
     if (ctxs == NULL || scratch == NULL || count < 2u ||
         !scratch->cuda_batch_enabled || scratch->backend == NULL ||
         count > scratch->cuda_batch_capacity || count > POCKET_MAX_BATCH) {
         return 1;
     }
+    const int prefill = input_rows != NULL;
+    if (prefill) scratch->cuda_condition_ready = 0;
     scratch->cuda_backbone_output_ready = 0;
     mynah_engine_ctx *first = ctxs[0];
     if (first == NULL || first->state == NULL ||
@@ -5288,8 +5408,10 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
          * single-request path (which already uses attn_dim) stayed correct. */
         scratch->cuda_cache_strides[i] = attn_dim;
         if (!ctx->cuda_backbone_valid) all_kv_valid = 0;
-        memcpy(scratch->cuda_host_input + i * cfg->hidden_dim,
-               ctx->step_input, cfg->hidden_dim * sizeof(float));
+        const float *input = input_rows != NULL ? input_rows[i] : ctx->step_input;
+        if (input == NULL) return 1;
+        memcpy(scratch->cuda_host_input + i * cfg->hidden_dim, input,
+               cfg->hidden_dim * sizeof(float));
     }
     /* Graph replay reads one persistent host pointer table per transformer
      * layer.  The table cannot be a stack array and it cannot be shared by all
@@ -5318,9 +5440,11 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
     char drain_error[256];
     int graph_replay = 0;
     int graph_capture = 0;
-    const size_t graph_key = scratch->cuda_condition_ready
-        ? POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE + count
-        : count;
+    const size_t graph_key = prefill
+        ? POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE + count
+        : (scratch->cuda_condition_ready
+               ? POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE + count
+               : count);
     local[0] = '\0';
     if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0)
         goto fail;
@@ -5404,28 +5528,31 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
                 mynah_backend_residual_add_dev(
                     scratch->backend, scratch->cuda_x, scratch->cuda_proj,
                     count * cfg->hidden_dim, local, sizeof(local)) != 0 ||
-                mynah_backend_gather_kv_batch(
-                    scratch->backend,
-                    scratch->cuda_kcache + l * scratch->cuda_batch_capacity,
-                    scratch->cuda_vcache + l * scratch->cuda_batch_capacity,
-                    scratch->cuda_positions,
-                    scratch->cuda_cache_strides, count, cfg->heads,
-                    cfg->head_dim,
-                    scratch->cuda_kv_shadow + l * count * shadow_row, local,
-                    sizeof(local)) != 0) goto fail;
+                (mirror_host &&
+                 mynah_backend_gather_kv_batch(
+                     scratch->backend,
+                     scratch->cuda_kcache + l * scratch->cuda_batch_capacity,
+                     scratch->cuda_vcache + l * scratch->cuda_batch_capacity,
+                     scratch->cuda_positions,
+                     scratch->cuda_cache_strides, count, cfg->heads,
+                     cfg->head_dim,
+                     scratch->cuda_kv_shadow + l * count * shadow_row, local,
+                     sizeof(local)) != 0)) goto fail;
         }
         if (mynah_backend_layer_norm_dev(
                 scratch->backend, scratch->cuda_x, scratch->cuda_norm,
                 state->backbone.out_norm_weight,
                 state->backbone.out_norm_bias, count, cfg->hidden_dim, local,
                 sizeof(local)) != 0 ||
-            mynah_backend_d2h(scratch->backend, scratch->cuda_norm,
-                              scratch->cuda_host_output,
-                              count * cfg->hidden_dim, local,
-                              sizeof(local)) != 0 ||
-            mynah_backend_d2h(scratch->backend, scratch->cuda_kv_shadow,
-                              scratch->cuda_host_kv, shadow_floats, local,
-                              sizeof(local)) != 0) goto fail;
+            ( (!prefill || output_rows != NULL) &&
+              mynah_backend_d2h(scratch->backend, scratch->cuda_norm,
+                                scratch->cuda_host_output,
+                                count * cfg->hidden_dim, local,
+                                sizeof(local)) != 0) ||
+            (mirror_host &&
+             mynah_backend_d2h(scratch->backend, scratch->cuda_kv_shadow,
+                               scratch->cuda_host_kv, shadow_floats, local,
+                               sizeof(local)) != 0)) goto fail;
 
         if (graph_capture) {
             if (mynah_backend_graph_end(scratch->backend, graph_key, scratch,
@@ -5440,30 +5567,37 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
         }
     }
     if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) goto fail;
-    for (size_t i = 0; i < count; ++i) {
-        if (!pocket_all_finite(scratch->cuda_host_output + i * cfg->hidden_dim,
-                               cfg->hidden_dim)) goto fail;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        memcpy(ctxs[i]->hidden, scratch->cuda_host_output + i * cfg->hidden_dim,
-               cfg->hidden_dim * sizeof(float));
+    if (!prefill || output_rows != NULL) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!pocket_all_finite(
+                    scratch->cuda_host_output + i * cfg->hidden_dim,
+                    cfg->hidden_dim)) goto fail;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            float *output = output_rows != NULL ? output_rows[i] : ctxs[i]->hidden;
+            if (output == NULL) goto fail;
+            memcpy(output, scratch->cuda_host_output + i * cfg->hidden_dim,
+                   cfg->hidden_dim * sizeof(float));
+        }
     }
     /* The graph and the ordinary path both gather only the newly appended
      * slot.  Commit it to the host shadow after the one stream sync; the large
      * prefix remains device-resident. */
-    for (size_t l = 0; l < cfg->layers; ++l) {
-        for (size_t i = 0; i < count; ++i) {
-            mynah_engine_ctx *ctx = ctxs[i];
-            float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
-            const size_t host_half =
-                mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
-            const size_t host_slot = scratch->cuda_positions[i] * attn_dim;
-            const float *shadow = scratch->cuda_host_kv +
-                l * count * shadow_row + i * shadow_row;
-            if (host_kv == NULL) goto fail;
-            memcpy(host_kv + host_slot, shadow, attn_dim * sizeof(float));
-            memcpy(host_kv + host_half + host_slot, shadow + attn_dim,
-                   attn_dim * sizeof(float));
+    if (mirror_host) {
+        for (size_t l = 0; l < cfg->layers; ++l) {
+            for (size_t i = 0; i < count; ++i) {
+                mynah_engine_ctx *ctx = ctxs[i];
+                float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
+                const size_t host_half =
+                    mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+                const size_t host_slot = scratch->cuda_positions[i] * attn_dim;
+                const float *shadow = scratch->cuda_host_kv +
+                    l * count * shadow_row + i * shadow_row;
+                if (host_kv == NULL) goto fail;
+                memcpy(host_kv + host_slot, shadow, attn_dim * sizeof(float));
+                memcpy(host_kv + host_half + host_slot, shadow + attn_dim,
+                       attn_dim * sizeof(float));
+            }
         }
     }
     for (size_t i = 0; i < count; ++i) {
@@ -5477,8 +5611,12 @@ static int pocket_cuda_backbone_step_batch(mynah_engine_ctx *const *ctxs,
             goto fail;
         }
     }
+    /* The upload above establishes the device prefix for every row.  Mark it
+     * valid only after the complete step, so the next batch neither reuploads
+     * the whole voice/text prefix nor suppresses graph capture forever. */
+    for (size_t i = 0; i < count; ++i) ctxs[i]->cuda_backbone_valid = 1;
     scratch->cuda_condition_ready = 0;
-    scratch->cuda_backbone_output_ready = 1;
+    scratch->cuda_backbone_output_ready = (!prefill || output_rows != NULL) ? 1 : 0;
     if (scratch->cuda_graph_enabled) scratch->cuda_graph_ready = 1;
     if (error != NULL && capacity > 0u) error[0] = '\0';
     return 0;
@@ -5738,12 +5876,22 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     free(ctx);
 }
 
-/* Opens the voice and reads its length, without loading anything yet: the KV
- * itself is copied in `prepare`, so a reset costs no allocation. */
+/* Opens the voice and resolves its model-owned KV prefix.  With the default
+ * cache mode the first context decodes the prefix once; subsequent contexts
+ * only copy from immutable model storage into their private transformer state.
+ * `MYNAH_POCKET_VOICE_CACHE=0` keeps the previous per-context file path. */
 static int pocket_voice_open(mynah_engine_ctx *ctx, char *error, size_t capacity) {
-    const mynah_engine_state *state = ctx->state;
+    mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
-    const pocket_voice *voice = &state->voices[ctx->speaker];
+    pocket_voice *voice = &state->voices[ctx->speaker];
+
+    if (state->voice_cache_enabled) {
+        if (pocket_voice_cache_load(state, ctx->speaker, error, capacity) != 0)
+            return -1;
+        ctx->voice_positions = voice->positions;
+        return 0;
+    }
+
     char path[POCKET_PATH_MAX];
     if (pocket_join(path, sizeof(path), state->model_dir, voice->file, error,
                     capacity) != 0) {
@@ -5949,7 +6097,12 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
 
-    ctx->voice_kv = mynah_alloc_floats(voice_floats, error, capacity);
+    /* The default model-owned voice cache is immutable and is copied directly
+     * into the request transformer state during seeding.  Do not retain a
+     * second decoded voice prefix per request; the legacy file-backed mode
+     * still allocates its private decode buffer below. */
+    if (!state->voice_cache_enabled)
+        ctx->voice_kv = mynah_alloc_floats(voice_floats, error, capacity);
     ctx->text_embed = mynah_alloc_floats(text_floats, error, capacity);
     ctx->step_input = pocket_cuda_host_buffer(state, cfg->hidden_dim,
                                               &ctx->step_input_host_pinned,
@@ -5982,7 +6135,8 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     }
     if (ctx->pcm == NULL)
         ctx->pcm = mynah_alloc_floats(pcm_floats, error, capacity);
-    if (ctx->voice_kv == NULL || ctx->text_embed == NULL || ctx->step_input == NULL ||
+    if ((!state->voice_cache_enabled && ctx->voice_kv == NULL) ||
+        ctx->text_embed == NULL || ctx->step_input == NULL ||
         ctx->hidden == NULL || ctx->noise == NULL || ctx->flow_out == NULL ||
         ctx->latents == NULL || ctx->denorm == NULL || ctx->codec_in == NULL ||
         ctx->codec_up == NULL || ctx->codec_seq == NULL || ctx->codec_out == NULL ||
@@ -6251,17 +6405,32 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
         ctx->dump->decoded = 0;
     }
 
+    const pocket_voice *voice = &state->voices[ctx->speaker];
+    size_t attn_dim = 0;
+    size_t layer_stride = 0;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(2u, ctx->voice_positions, &layer_stride) != 0 ||
+        pocket_mul(layer_stride, attn_dim, &layer_stride) != 0) {
+        pocket_error(error, capacity, "pocket: voice KV size overflows size_t");
+        return -1;
+    }
     char name[POCKET_NAME_MAX];
     for (size_t l = 0; l < cfg->layers; ++l) {
-        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", l);
-        const ingot_st_tensor *tensor = ingot_st_find(ctx->voice_file, name);
-        if (tensor == NULL ||
-            ingot_st_to_f32(ctx->voice_file, tensor, ctx->voice_kv) != 0) {
-            pocket_error(error, capacity, "cannot read %s from voice %s", name,
-                         state->voices[ctx->speaker].name);
-            return -1;
+        const float *layer_kv = NULL;
+        if (voice->kv != NULL) {
+            layer_kv = voice->kv + l * layer_stride;
+        } else {
+            snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", l);
+            const ingot_st_tensor *tensor = ingot_st_find(ctx->voice_file, name);
+            if (tensor == NULL ||
+                ingot_st_to_f32(ctx->voice_file, tensor, ctx->voice_kv) != 0) {
+                pocket_error(error, capacity, "cannot read %s from voice %s", name,
+                             state->voices[ctx->speaker].name);
+                return -1;
+            }
+            layer_kv = ctx->voice_kv;
         }
-        if (mynah_transformer_ar_state_load_kv(ctx->backbone, l, ctx->voice_kv,
+        if (mynah_transformer_ar_state_load_kv(ctx->backbone, l, layer_kv,
                                                ctx->voice_positions, error,
                                                capacity) != 0) {
             return -1;
@@ -6353,6 +6522,158 @@ static int pocket_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
     mynah_region_unwind(depth);
     mynah_region_end(MYNAH_RGN_PREPARE);
     return rc;
+}
+
+static size_t pocket_prepare_target(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return 0u;
+    if (!ctx->text_open) return ctx->text_length;
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    if (tile == 0u) return ctx->text_length;
+    return (ctx->text_length / tile) * tile;
+}
+
+static int pocket_cuda_prefill_batch_enabled(void) {
+    const char *env = getenv("MYNAH_CUDA_PREFILL_BATCH");
+    return env == NULL || strcmp(env, "0") != 0;
+}
+
+/* Cross-request CUDA text prefill.  Each iteration advances one token in every
+ * active row, which keeps absolute RoPE/KV positions ragged-safe while allowing
+ * the resident transformer graph to amortise launches across requests.  The
+ * host K/V shadow is intentionally kept current in this first implementation:
+ * a later CUDA failure can therefore still fall back to the CPU oracle without
+ * replaying the voice or text prefix. */
+static int pocket_prepare_slice_batch(
+    mynah_engine_ctx *const *ctxs, size_t count, size_t budget, int *done,
+    mynah_engine_scratch *scratch, char *error, size_t capacity) {
+    if (ctxs == NULL || done == NULL || scratch == NULL || count < 2u ||
+        count > POCKET_MAX_BATCH || count > scratch->cuda_batch_capacity) return 1;
+    if (!pocket_cuda_prefill_batch_enabled()) return 1;
+    for (size_t i = 0; i < count; ++i) done[i] = 0;
+
+    mynah_engine_ctx *first = ctxs[0];
+    if (first == NULL || first->state == NULL || first->state->backend == NULL ||
+        strcmp(mynah_backend_name(first->state->backend), "cuda") != 0 ||
+        !first->cuda_backbone_enabled) return 1;
+    mynah_engine_state *state = first->state;
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || ctx->prepared || ctx->broken ||
+            !ctx->cuda_backbone_enabled || ctx->text_embed == NULL) return 1;
+    }
+
+    mynah_region_begin(MYNAH_RGN_PREPARE);
+    const int depth = mynah_region_depth();
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i]->seeding) continue;
+        if (pocket_seed_prologue(ctxs[i], error, capacity) != 0) {
+            mynah_region_unwind(depth);
+            mynah_region_end(MYNAH_RGN_PREPARE);
+            return -1;
+        }
+        ctxs[i]->seeding = 1;
+    }
+
+    mynah_engine_ctx *work[POCKET_MAX_BATCH];
+    const float *inputs[POCKET_MAX_BATCH];
+    size_t work_index[POCKET_MAX_BATCH];
+    size_t units = 0u;
+    const size_t unit_limit = budget == 0u ? SIZE_MAX : budget;
+    int rc = 0;
+    int no_batch_work = 0;
+    while (units < unit_limit) {
+        size_t work_count = 0u;
+        for (size_t i = 0; i < count; ++i) {
+            mynah_engine_ctx *ctx = ctxs[i];
+            if (ctx->text_prefilled >= pocket_prepare_target(ctx)) continue;
+            work[work_count] = ctx;
+            work_index[work_count] = i;
+            inputs[work_count] =
+                ctx->text_embed + ctx->text_prefilled * state->cfg.hidden_dim;
+            ++work_count;
+        }
+        if (work_count < 2u) {
+            /* If no row could be advanced, let the scalar hook take the
+             * single-row/zero-target edge case on the next branch.  After at
+             * least one batched unit, keep the remaining singleton resumable;
+             * completed peers are committed below and the driver will call the
+             * scalar hook for that one on the next tick. */
+            if (units == 0u && work_count != 0u) no_batch_work = 1;
+            break;
+        }
+
+        char cuda_error[256];
+        cuda_error[0] = '\0';
+        rc = pocket_cuda_backbone_step_batch(
+            work, work_count, scratch, inputs, NULL, 1, cuda_error,
+            sizeof(cuda_error));
+        if (rc == 1) {
+            /* A failed first graph capture did not execute its commands.  The
+             * batch helper disables only graph replay for the next attempt, so
+             * retry once eagerly before considering the scalar CPU fallback. */
+            rc = pocket_cuda_backbone_step_batch(
+                work, work_count, scratch, inputs, NULL, 1, cuda_error,
+                sizeof(cuda_error));
+        }
+        if (rc != 0) {
+            if (rc < 0) {
+                /* The batch helper commits neither host KV nor host offsets
+                 * until its complete stream has drained.  On a launch/sync
+                 * failure it also disables the resident path for these rows,
+                 * so the scalar oracle can safely finish the same tile from
+                 * the authoritative host state below. */
+                rc = 1;
+            }
+            break;
+        }
+        (void)mynah_backend_note_backbone_batch(state->backend, work_count);
+        for (size_t j = 0; j < work_count; ++j)
+            ++ctxs[work_index[j]]->text_prefilled;
+        ++units;
+    }
+
+    if (rc == 0 && no_batch_work) rc = 1;
+    if (rc == 1) {
+        /* A graph/capability miss or a resident launch failure lands here.
+         * The scalar path is safe at a tile boundary; if a prior GPU unit
+         * left an open request between boundaries, refuse rather than
+         * silently changing its state machine. */
+        const size_t tile = mynah_transformer_ar_prefill_tile();
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i]->text_open && tile != 0u &&
+                (ctxs[i]->text_prefilled % tile) != 0u) {
+                pocket_error(error, capacity,
+                             "pocket: CUDA prefill became unavailable between text tiles");
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return -1;
+            }
+            const size_t before = ctxs[i]->text_prefilled;
+            if (pocket_text_flush_limited(ctxs[i], !ctxs[i]->text_open,
+                                          budget, error, capacity) != 0) {
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return -1;
+            }
+            if (ctxs[i]->text_prefilled != before)
+                ctxs[i]->cuda_backbone_valid = 0;
+        }
+        rc = 0;
+    } else if (rc < 0) {
+        mynah_region_unwind(depth);
+        mynah_region_end(MYNAH_RGN_PREPARE);
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i]->text_prefilled < pocket_prepare_target(ctxs[i])) continue;
+        ctxs[i]->prepared = 1;
+        ctxs[i]->seeding = 0;
+        done[i] = 1;
+    }
+    mynah_region_unwind(depth);
+    mynah_region_end(MYNAH_RGN_PREPARE);
+    return 0;
 }
 
 static int pocket_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
@@ -6594,7 +6915,8 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         char cuda_error[256];
         cuda_error[0] = '\0';
         const int cuda_rc = pocket_cuda_backbone_step_batch(
-            ctxs, count, scratch, cuda_error, sizeof(cuda_error));
+            ctxs, count, scratch, NULL, NULL, 1, cuda_error,
+            sizeof(cuda_error));
         if (cuda_rc == 0) {
             cuda_used = 1;
             (void)mynah_backend_note_backbone_batch(scratch->backend, count);
@@ -8677,6 +8999,7 @@ static const mynah_tts_engine pocket_engine = {
     NULL,                      /* debug_dump: the dump is written in ctx_free */
     pocket_decode_audio_batch, /* APPENDED, never inserted (tts_engine.h) */
     pocket_prepare_slice,      /* APPENDED */
+    pocket_prepare_slice_batch,/* APPENDED */
 };
 
 const mynah_tts_engine *mynah_engine_pocket(void) { return &pocket_engine; }

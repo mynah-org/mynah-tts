@@ -226,6 +226,23 @@ forcing Pocket's Mimi decoder transformer through its CPU oracle for A/B parity.
 The older `MYNAH_CUDA_CODEC=0` remains a compatibility kill switch for both
 the generic NanoCodec experiment and Pocket.
 
+`MYNAH_CUDA_DECODER_GRAPHS=0` disables the cross-request SEANet graph path.
+When enabled, the CUDA backend captures the complete batched decoder topology
+with persistent pointer metadata and replays it for the same stable gang; a
+changing gang falls back to eager batched arithmetic. This is already a real
+decoder graph, but not yet the final physical row-arena/power-of-two bucket
+design needed to claim the external L4/L40S throughput numbers.
+
+`MYNAH_POCKET_VOICE_CACHE` controls the model-owned voice KV prefix cache:
+the default is lazy first-use caching, `all` preloads every voice before the
+server accepts traffic, and `0` retains the per-context safetensors path for
+replacement/debug experiments. Request transformer state remains private;
+only the immutable decoded prefix is shared.
+
+`MYNAH_CUDA_PREFILL_BATCH=0` disables the optional cross-request CUDA text
+prefill hook and keeps the existing scalar resumable prefill scheduler. This
+is an A/B and recovery switch; it does not change the CPU path.
+
 To exercise the opt-in CUDA Q8 linear path, select only INT8 linear groups and
 enable it explicitly; unsupported convolution groups remain on the CPU oracle:
 

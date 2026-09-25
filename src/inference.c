@@ -423,12 +423,92 @@ static int prefill_fifo(void) {
     return cached;
 }
 
-static void slots_prefill_slice(const mynah_tts_engine *engine, synth_slot *slots,
-                                size_t max_batch, int dump, size_t *rr) {
+static void slots_prefill_slice(const mynah_tts_engine *engine,
+                                mynah_engine_scratch *scratch,
+                                synth_slot *slots, size_t resident_rows,
+                                size_t batch_limit, int dump, size_t *rr) {
+    if (resident_rows == 0u) return;
     const size_t budget = prefill_slice_budget();
     const double step_budget = prefill_step_budget_s();
     const double t0 = (step_budget > 0.0) ? mynah_phase_seconds() : 0.0;
     const int fifo = prefill_fifo();
+
+    /* A CUDA engine can do the same prefill unit for several rows while the
+     * driver still retains its scalar hook as the compatibility fallback.  The
+     * selected rows are one gang, not one request repeated in a loop.  Keep the
+     * batch bounded by the engine arithmetic width: the active slot capacity is
+     * intentionally allowed to be wider than one microbatch. */
+    if (engine->prepare_slice_batch != NULL && batch_limit > 1u) {
+        if (batch_limit > MYNAH_GRAPH_MAX_JOBS) batch_limit = MYNAH_GRAPH_MAX_JOBS;
+        mynah_engine_ctx *batch_ctxs[MYNAH_GRAPH_MAX_JOBS];
+        size_t batch_slots[MYNAH_GRAPH_MAX_JOBS];
+        int batch_done[MYNAH_GRAPH_MAX_JOBS];
+        size_t batch_count = 0u;
+        for (size_t pass = 0u; pass < resident_rows && batch_count < batch_limit;
+             ++pass) {
+            size_t selected = resident_rows;
+            if (fifo) {
+                unsigned long long best_seq = 0ull;
+                for (size_t k = 0u; k < resident_rows; ++k) {
+                    const synth_slot *candidate = &slots[k];
+                    if (!candidate->in_use || !candidate->preparing) continue;
+                    int already = 0;
+                    for (size_t j = 0u; j < batch_count; ++j)
+                        if (batch_slots[j] == k) already = 1;
+                    if (already) continue;
+                    if (selected == resident_rows || candidate->prep_seq < best_seq) {
+                        selected = k;
+                        best_seq = candidate->prep_seq;
+                    }
+                }
+            } else {
+                const size_t candidate = (*rr + pass) % resident_rows;
+                if (slots[candidate].in_use && slots[candidate].preparing)
+                    selected = candidate;
+            }
+            if (selected == resident_rows) continue;
+            batch_slots[batch_count] = selected;
+            batch_ctxs[batch_count] = slots[selected].ctx;
+            batch_done[batch_count] = 0;
+            ++batch_count;
+        }
+        if (batch_count > 1u) {
+            char batch_error[256];
+            batch_error[0] = '\0';
+            const int batch_rc = engine->prepare_slice_batch(
+                batch_ctxs, batch_count, budget, batch_done, scratch,
+                batch_error, sizeof(batch_error));
+            if (batch_rc == 0) {
+                for (size_t j = 0u; j < batch_count; ++j) {
+                    synth_slot *slot = &slots[batch_slots[j]];
+                    if (!batch_done[j]) continue;
+                    slot->preparing = 0;
+                    if (dump && engine->debug_dump != NULL) {
+                        engine->debug_dump(slot->ctx, "encoder");
+                        engine->debug_dump(slot->ctx, "prefill");
+                    }
+                    slot->active = 1;
+                }
+                *rr = (batch_slots[batch_count - 1u] + 1u) % resident_rows;
+                /* A successful batched call owns this slice.  This avoids
+                 * immediately taking a remaining row through the scalar hook
+                 * and gives the next service tick a chance to form a new gang. */
+                return;
+            }
+            if (batch_rc < 0) {
+                for (size_t j = 0u; j < batch_count; ++j) {
+                    slots[batch_slots[j]].preparing = 0;
+                    (void)slot_fail(&slots[batch_slots[j]],
+                                    batch_error[0] != '\0' ? batch_error
+                                                            : "batched prefill failed");
+                }
+                return;
+            }
+            /* 1 means not eligible and must not have changed any row.  The
+             * established scalar loop below is the compatibility path. */
+        }
+    }
+
     size_t served = 0;
     /* FIFO keeps picking the SAME oldest prefill until it finishes, which is
      * the whole point: serving each waiting slot once per step in a different
@@ -436,24 +516,24 @@ static void slots_prefill_slice(const mynah_tts_engine *engine, synth_slot *slot
      * loop bound is generous rather than exact -- the step budget is what
      * actually stops this, and a slot that completes clears its `preparing`
      * flag so the next pick moves on by itself. */
-    const size_t passes = fifo ? max_batch * 4u : max_batch;
+    const size_t passes = fifo ? resident_rows * 4u : resident_rows;
     for (size_t n = 0; n < passes; ++n) {
         size_t i;
         if (fifo) {
-            size_t best = max_batch;
+            size_t best = resident_rows;
             unsigned long long best_seq = 0ull;
-            for (size_t k = 0; k < max_batch; ++k) {
+            for (size_t k = 0; k < resident_rows; ++k) {
                 const synth_slot *c = &slots[k];
                 if (!c->in_use || !c->preparing) continue;
-                if (best == max_batch || c->prep_seq < best_seq) {
+                if (best == resident_rows || c->prep_seq < best_seq) {
                     best = k;
                     best_seq = c->prep_seq;
                 }
             }
-            if (best == max_batch) break;   /* nothing left to prefill */
+            if (best == resident_rows) break;   /* nothing left to prefill */
             i = best;
         } else {
-            i = (*rr + n) % max_batch;
+            i = (*rr + n) % resident_rows;
         }
         synth_slot *slot = &slots[i];
         if (!slot->in_use || !slot->preparing) continue;
@@ -1051,6 +1131,11 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     int result = 0;
     size_t used = 0;      /* slots holding a request, live or just finished */
     int drained = 0;      /* the sink said there will be no more work */
+    /* CUDA's batched decoder does not use the CPU lane, so its physical slot
+     * array can stay dense: when a row retires, the last resident row is
+     * swapped into the hole.  This is the scheduler half of a row arena; the
+     * engine contexts still own their model/KV state and are never copied. */
+    const int compact_rows = !lane_on;
 
     /* ---- serving-loop occupancy (E10-11), MYNAH_SERVE_PROFILE=1 ----------
      *
@@ -1110,8 +1195,12 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         while (!drained && used < slot_capacity &&
                (sink->running == NULL || sink->running(sink->ud) != 0)) {
             size_t index = slot_capacity;
-            for (size_t i = 0; i < slot_capacity; ++i) {
-                if (!slots[i].in_use) { index = i; break; }
+            if (compact_rows) {
+                index = used;
+            } else {
+                for (size_t i = 0; i < slot_capacity; ++i) {
+                    if (!slots[i].in_use) { index = i; break; }
+                }
             }
             if (index == slot_capacity) break;
 
@@ -1183,7 +1272,10 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
 
         /* ---- finish the prefills that are in flight -------------------- */
         if (engine->prepare_slice != NULL) {
-            slots_prefill_slice(engine, slots, slot_capacity, dump_all, &prefill_rr);
+            const size_t prefill_rows = compact_rows ? used : slot_capacity;
+            if (prefill_rows != 0u)
+                slots_prefill_slice(engine, scratch, slots, prefill_rows,
+                                    max_batch, dump_all, &prefill_rr);
         }
 
         /* ---- one bounded step over the live set -----------------------
@@ -1193,17 +1285,18 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * request advances without widening the engine call. */
         size_t live = 0;
         size_t next_step_rr = step_rr;
-        for (size_t offset = 0; offset < slot_capacity && live < max_batch;
+        const size_t resident_rows = compact_rows ? used : slot_capacity;
+        for (size_t offset = 0; offset < resident_rows && live < max_batch;
              ++offset) {
-            const size_t i = (step_rr + offset) % slot_capacity;
+            const size_t i = (step_rr + offset) % resident_rows;
             if (!slots[i].in_use || !slots[i].active) continue;
             step_slot[live] = i;
             step_ctxs[live] = slots[i].ctx;
             ++live;
-            next_step_rr = (i + 1u) % slot_capacity;
+            next_step_rr = (i + 1u) % resident_rows;
         }
         if (live > 0u) step_rr = next_step_rr;
-        else step_rr = (step_rr + 1u) % slot_capacity;
+        else step_rr = (step_rr + 1u) % resident_rows;
         if (serve_profile) {
             ++occ_frames;
             occ_hist[live <= max_batch ? live : max_batch] += 1u;
@@ -1225,21 +1318,37 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * Not after the whole group: the slot is the unit of capacity, and
          * holding a finished one until its neighbours catch up is exactly the
          * wait continuous admission exists to remove. */
-        for (size_t i = 0; i < slot_capacity; ++i) {
-            /* `preparing` is the third state this loop has to know about: not
-             * active, and not finished either. Without it a sliced prefill
-             * would be retired one iteration after it was admitted, which is a
-             * request silently returning no audio. */
-            if (!slots[i].in_use || slots[i].active || slots[i].preparing) continue;
-            /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates the
-             * frame history and frees the context; a unit still reading it
-             * would be reading freed memory and writing into a slot that no
-             * longer belongs to this request. This is the second and last
-             * place the driver blocks on the lane, and like the first it
-             * blocks only on the slot it is about to take away. */
-            lane_reap(&slots[i], i, 1);
-            if (slot_retire(engine, sink, &slots[i], dump_all) != 0) result = -1;
-            --used;
+        if (compact_rows) {
+            /* Dense rows make this a real swap-remove.  Do not advance `i`
+             * after the move: the last row may itself already be finished. */
+            size_t i = 0u;
+            while (i < used) {
+                if (!slots[i].in_use || slots[i].active || slots[i].preparing) {
+                    ++i;
+                    continue;
+                }
+                if (slot_retire(engine, sink, &slots[i], dump_all) != 0)
+                    result = -1;
+                --used;
+                if (i != used) {
+                    slots[i] = slots[used];
+                    memset(&slots[used], 0, sizeof(slots[used]));
+                }
+            }
+        } else {
+            for (size_t i = 0; i < slot_capacity; ++i) {
+                /* `preparing` is the third state this loop has to know about:
+                 * not active, and not finished either. */
+                if (!slots[i].in_use || slots[i].active || slots[i].preparing)
+                    continue;
+                /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates
+                 * the frame history and frees the context; a unit still
+                 * reading it would be reading freed memory. */
+                lane_reap(&slots[i], i, 1);
+                if (slot_retire(engine, sink, &slots[i], dump_all) != 0)
+                    result = -1;
+                --used;
+            }
         }
     }
     if (serve_profile) {

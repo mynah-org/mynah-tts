@@ -323,7 +323,9 @@ Mimi KV window resident, handles absolute RoPE after window rebases, and
 executes frame-major cross-request tiles with row-wise LayerScale. The
 quantizer/upsample boundary remains host-side; real-device codec stage parity,
 same-backend stream/offline parity and fully batched SEANet kernels are still
-required.
+required. The decoder batch now also captures/replays one complete exact-gang
+topology with persistent pointer metadata; changing gangs safely use eager
+batched arithmetic until physical row buckets exist.
 
 ### P5 — Linux server integration → **build boundary, graph batch path and metrics implemented**
 
@@ -399,6 +401,8 @@ The following flags are explicit experiments, not hidden policy:
 MYNAH_CUDA_GRAPHS=0|1              graph capture/replay escape hatch
 MYNAH_CUDA_FAST_MATH=0|1           TF32/fast compute experiment; no parity claim
 MYNAH_CUDA_DECODER_BATCH=0|1       true cross-request SEANet decoder batch, default on for CUDA
+MYNAH_CUDA_DECODER_GRAPHS=0|1      exact stable-gang SEANet graph capture/replay, default on
+MYNAH_CUDA_PREFILL_BATCH=0|1       cross-request CUDA text prefill, default on; 0 keeps scalar resumable prefill
 MYNAH_CUDA_POCKET_CODEC=0|1        resident Pocket Mimi decoder transformer, default on for CUDA
 MYNAH_CUDA_CODEC=0                  legacy global codec kill switch (also disables Pocket)
 MYNAH_CUDA_CODEC_HOST_MIRROR=0|1  keep codec-transformer D2H mirror; default on
@@ -410,6 +414,12 @@ MYNAH_QUANT_GROUPS=none             raw-F32 resident parity/bring-up profile
 accepted yet: they would be misleading no-op knobs until packed
 ConvTranspose/GEMM and per-stage/bucket timing instrumentation exist. Their
 work is tracked by CUDA-04 and CUDA-06/observability respectively.
+
+`MYNAH_POCKET_VOICE_CACHE` is independent of CUDA precision: default lazy
+first-use caching decodes each validated voice prefix once into immutable host
+f32 storage; `all` preloads the pack at startup and `0` keeps the old
+per-context safetensors path. Request KV remains private, so reset and
+cross-request state cannot alias.
 
 Metrics must distinguish monotonic backend counters from request timing sums and
 future histograms. The current `/metrics` surface includes queue wait, TTFA,
@@ -438,11 +448,12 @@ qualification remain open.
 CUDA-01  true cross-request decoder arithmetic batch + backend counters (implemented; GPU parity open)
 CUDA-02  Prometheus /metrics + GPU/graph/transfer/batch observability (implemented; TTFB/per-stage timing histograms open)
 CUDA-03  C100 capacity seam: inflight slots separate from microbatch width (implemented; runtime soak open)
-CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels (raw-F32 batch implemented; graph buckets and width sweep open)
+CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels (raw-F32 batch and exact-gang graph implemented; physical row buckets and width sweep open)
 CUDA-05  codec-transformer residency + H2D/D2H overlap (resident frame-tile path implemented; GPU parity/overlap open)
 CUDA-06  BF16/FP16/cuBLASLt/fused kernel ladder with stage parity gates
 CUDA-07  optional GPU CI, sanitizer and L40S qualification campaign
 CUDA-08  Blackwell/Ada architecture stamp, real-device self-test and no-hidden-fallback audit (sm120/sm89 build + model bring-up done; qualification open)
+CUDA-09  row-arena serving seam: scheduler swap-remove and CUDA cross-request text prefill are implemented; device voice-prefix copies, host-mirror removal, BF16 KV and physical width-bucket graphs remain for the final low-CPU path
 ```
 
 ## 2026-09-24 24L compatibility audit and work items

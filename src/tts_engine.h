@@ -251,6 +251,33 @@ typedef struct {
      * alignment is asserted inside `pocket_text_flush`, not assumed here. */
     int  (*prepare_slice)(mynah_engine_ctx *ctx, size_t budget, int *done,
                           char *error, size_t error_capacity);
+
+    /* ---- batched resumable prefill (APPENDED) ----------------------------
+     *
+     * OPTIONAL; NULL means that the engine only supports the scalar
+     * `prepare_slice` hook.  The driver passes distinct contexts from one
+     * model/state and a reusable scratch arena.  `done[i]` is written by the
+     * engine for each row; a row that is not done remains resumable and is
+     * passed again on a later service tick.
+     *
+     * Return values have the same opt-in shape as the other optional backend
+     * hooks: 0 means the call ran (including a partial budget), 1 means "not
+     * eligible" and leaves the contexts untouched so the driver may use the
+     * scalar hook, and -1 is a shared failure that the driver attributes to
+     * this prefill gang.  The engine must not return 1 after advancing only a
+     * subset of rows.
+     *
+     * The audio/state result must be the same model computation as scalar
+     * prefill, subject only to the backend's existing CPU/GPU numerical parity
+     * tolerance; it must not depend on gang width or row order.
+     *
+     * This is deliberately after `prepare_slice`.  The public driver can add
+     * a CUDA-only batched implementation without changing engines that do not
+     * know about it or shifting their positional vtables. */
+    int  (*prepare_slice_batch)(mynah_engine_ctx *const *ctxs, size_t count,
+                                size_t budget, int *done,
+                                mynah_engine_scratch *scratch,
+                                char *error, size_t error_capacity);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

@@ -740,8 +740,35 @@ struct cuda_pipeline_graph_entry {
     bool capturing;
 };
 
+/* A batched decoder graph owns its pointer metadata.  The eager decoder batch
+ * path reuses four backend-wide device tables and fills them from small stack
+ * arrays.  That is correct for eager execution, but a graph would retain
+ * those host source pointers after the call returned and later uploads would
+ * overwrite the same device table before its captured kernel used it.
+ *
+ * A graph is therefore keyed by the exact stable decoder gang.  Each captured
+ * pointer-table upload gets its own pinned host table and device table.  The
+ * request data itself still changes every frame through the already-resident
+ * input/output/state buffers; only the addresses are immutable.  This is a
+ * bounded bridge until the scheduler has a physical row arena and can use one
+ * graph per width bucket rather than one graph per changing gang. */
+struct cuda_decoder_batch_graph_entry {
+    size_t batch;
+    size_t encoder_frames;
+    std::vector<mynah_backend_decoder *> decoders;
+    std::vector<const float *> inputs;
+    std::vector<float *> outputs;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    float **device_tables;
+    float **host_tables;
+    size_t upload_slots;
+    bool valid;
+};
+
 struct cuda_backend_state;
 static void destroy_graphs(cuda_backend_state *st);
+static void destroy_decoder_batch_graphs(cuda_backend_state *st);
 
 struct cuda_backend_state {
     cublasHandle_t cublas;
@@ -783,6 +810,10 @@ struct cuda_backend_state {
     bool graphs_enabled;
     std::vector<cuda_graph_entry> graph_cache;
     std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
+    std::vector<cuda_decoder_batch_graph_entry *> decoder_batch_graphs;
+    cuda_decoder_batch_graph_entry *active_decoder_batch_graph;
+    size_t active_decoder_upload_slot;
+    float **active_decoder_tables[4];
     std::atomic<unsigned long long> h2d_bytes;
     std::atomic<unsigned long long> d2h_bytes;
     std::atomic<unsigned long long> h2d_calls;
@@ -804,6 +835,9 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> decoder_batch_items;
     std::atomic<unsigned long long> decoder_batch_max_width;
     std::atomic<unsigned long long> decoder_batch_frames;
+    std::atomic<unsigned long long> decoder_graph_captures;
+    std::atomic<unsigned long long> decoder_graph_replays;
+    std::atomic<unsigned long long> decoder_graph_fallbacks;
     std::atomic<unsigned long long> decoder_failures;
     std::atomic<unsigned long long> resident_fallbacks;
     std::atomic<unsigned long long> matmul_calls;
@@ -860,6 +894,7 @@ struct mynah_backend_decoder {
 };
 
 static constexpr size_t CUDA_BATCH_META_CAP = 64u;
+static constexpr size_t CUDA_DECODER_GRAPH_CAP = 64u;
 /* A server can retain one decoder graph per live context in addition to the
  * width-bucketed backbone/flow graphs.  The condition-projection input graph
  * is a separate bucket because its input is already resident in `cuda_x` and
@@ -2290,6 +2325,11 @@ static int cuda_self_test(void *opaque, char *e, size_t ec) {
 static void cuda_close(void *opaque) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (!st) return;
+    /* Decoder graph entries own device pointer tables used by the stream.  A
+     * model close normally arrives after request teardown, but make the
+     * backend lifetime ordering explicit for direct library users too. */
+    (void)cudaStreamSynchronize(st->stream);
+    destroy_decoder_batch_graphs(st);
     destroy_graphs(st);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
@@ -2350,6 +2390,9 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->dev_decoder_ptr1 = nullptr;
     st->dev_decoder_ptr2 = nullptr;
     st->dev_decoder_ptr3 = nullptr;
+    st->active_decoder_batch_graph = nullptr;
+    st->active_decoder_upload_slot = 0u;
+    for (size_t i = 0; i < 4u; ++i) st->active_decoder_tables[i] = nullptr;
     st->h2d_bytes.store(0ull, std::memory_order_relaxed);
     st->d2h_bytes.store(0ull, std::memory_order_relaxed);
     st->h2d_calls.store(0ull, std::memory_order_relaxed);
@@ -2371,6 +2414,9 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->decoder_batch_items.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_max_width.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_frames.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_captures.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_replays.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_fallbacks.store(0ull, std::memory_order_relaxed);
     st->decoder_failures.store(0ull, std::memory_order_relaxed);
     st->resident_fallbacks.store(0ull, std::memory_order_relaxed);
     st->matmul_calls.store(0ull, std::memory_order_relaxed);
@@ -2463,6 +2509,12 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         st->decoder_batch_max_width.load(std::memory_order_relaxed);
     metrics->decoder_batch_frames =
         st->decoder_batch_frames.load(std::memory_order_relaxed);
+    metrics->decoder_graph_captures =
+        st->decoder_graph_captures.load(std::memory_order_relaxed);
+    metrics->decoder_graph_replays =
+        st->decoder_graph_replays.load(std::memory_order_relaxed);
+    metrics->decoder_graph_fallbacks =
+        st->decoder_graph_fallbacks.load(std::memory_order_relaxed);
     metrics->decoder_failures = st->decoder_failures.load(std::memory_order_relaxed);
     metrics->resident_fallbacks = st->resident_fallbacks.load(std::memory_order_relaxed);
     metrics->matmul_calls = st->matmul_calls.load(std::memory_order_relaxed);
@@ -3686,6 +3738,25 @@ static int decoder_upload_ptrs(cuda_backend_state *backend, float **device,
         set_error(e, ec, "invalid resident decoder pointer table");
         return -1;
     }
+    cuda_decoder_batch_graph_entry *graph =
+        backend->active_decoder_batch_graph;
+    if (graph != nullptr) {
+        const size_t channel = decoder_table_channel(backend, device);
+        if (channel >= 4u || batch != graph->batch ||
+            backend->active_decoder_upload_slot >= graph->upload_slots) {
+            set_error(e, ec, "resident decoder graph pointer-table overflow");
+            return -1;
+        }
+        const size_t slot = backend->active_decoder_upload_slot++;
+        float **host_table = decoder_graph_host_table(graph, slot, channel);
+        std::memcpy(host_table, host, batch * sizeof(*host));
+        float **device_table = decoder_graph_table(graph, slot, channel);
+        backend->active_decoder_tables[channel] = device_table;
+        return ce(cudaMemcpyAsync(device_table, host_table,
+                                  batch * sizeof(*host),
+                                  cudaMemcpyHostToDevice, backend->stream),
+                  e, ec);
+    }
     return ce(cudaMemcpyAsync(device, host, batch * sizeof(*host),
                               cudaMemcpyHostToDevice, backend->stream),
               e, ec);
@@ -3712,6 +3783,235 @@ static bool decoder_ops_compatible(const cuda_decoder_op *a,
            a->weight == b->weight && a->bias == b->bias;
 }
 
+static bool cuda_decoder_graphs_enabled(void) {
+    return cuda_env_enabled("MYNAH_CUDA_DECODER_GRAPHS", true);
+}
+
+static size_t decoder_conv1d_upload_count(const cuda_decoder_op *op) {
+    /* causal-window pointers, columns pointers, output/weight pointers and
+     * the tail copy pointers; the tail-free case has no window or tail copy. */
+    return op != nullptr && op->tail > 0u ? 9u : 4u;
+}
+
+static size_t decoder_convtr_upload_count(const cuda_decoder_op *op) {
+    /* full-input/output, optional partial-tail fold, final prefix output. */
+    return op != nullptr ? 4u + (op->tail > 0u ? 2u : 0u) : 0u;
+}
+
+/* Count the pointer-table uploads made by decoder_step_batch_impl.  The count
+ * is used before capture to reserve stable metadata storage; allocating during
+ * CUDA stream capture is illegal. */
+static bool decoder_batch_upload_bound(const mynah_backend_decoder *decoder,
+                                       size_t *out) {
+    if (decoder == nullptr || out == nullptr || decoder->ops.empty()) return false;
+    size_t count = 0u;
+    for (size_t index = 0u; index < decoder->ops.size();) {
+        const cuda_decoder_op *op = &decoder->ops[index++];
+        size_t add = 0u;
+        if (op->kind == CUDA_DECODER_RESBLOCK) {
+            if (index + 1u >= decoder->ops.size()) return false;
+            const cuda_decoder_op *rb1 = &decoder->ops[index++];
+            const cuda_decoder_op *rb2 = &decoder->ops[index++];
+            add = 2u + decoder_conv1d_upload_count(rb1) + 2u +
+                  decoder_conv1d_upload_count(rb2) + 2u;
+        } else {
+            add = (op->pre_elu != 0 ? 2u : 0u) +
+                  (op->kind == CUDA_DECODER_CONV
+                       ? decoder_conv1d_upload_count(op)
+                       : op->kind == CUDA_DECODER_CONVTR
+                             ? decoder_convtr_upload_count(op)
+                             : 0u);
+        }
+        if (!decoder_add(count, add, &count)) return false;
+    }
+    *out = count;
+    return count != 0u;
+}
+
+/* These helpers are defined with the graph-cache utilities below, but the
+ * pointer-table upload path is the first place that needs them.  Keep the
+ * declarations here so the CUDA translation unit remains valid with both the
+ * older and newer toolkit front ends. */
+static float **decoder_graph_table(cuda_decoder_batch_graph_entry *entry,
+                                   size_t slot, size_t channel);
+static float **decoder_graph_host_table(cuda_decoder_batch_graph_entry *entry,
+                                        size_t slot, size_t channel);
+static size_t decoder_table_channel(const cuda_backend_state *backend,
+                                    float **device);
+
+static void decoder_batch_graph_free(cuda_decoder_batch_graph_entry *entry) {
+    if (entry == nullptr) return;
+    if (entry->exec != nullptr) cudaGraphExecDestroy(entry->exec);
+    if (entry->graph != nullptr) cudaGraphDestroy(entry->graph);
+    if (entry->device_tables != nullptr) cudaFree(entry->device_tables);
+    if (entry->host_tables != nullptr) cudaFreeHost(entry->host_tables);
+    entry->exec = nullptr;
+    entry->graph = nullptr;
+    entry->device_tables = nullptr;
+    entry->host_tables = nullptr;
+    delete entry;
+}
+
+static void decoder_batch_graph_remove(cuda_backend_state *backend,
+                                       cuda_decoder_batch_graph_entry *entry) {
+    if (backend == nullptr || entry == nullptr) return;
+    for (size_t i = 0u; i < backend->decoder_batch_graphs.size(); ++i) {
+        if (backend->decoder_batch_graphs[i] != entry) continue;
+        backend->decoder_batch_graphs.erase(
+            backend->decoder_batch_graphs.begin() + i);
+        decoder_batch_graph_free(entry);
+        return;
+    }
+}
+
+static void destroy_decoder_batch_graphs(cuda_backend_state *backend) {
+    if (backend == nullptr) return;
+    for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs)
+        decoder_batch_graph_free(entry);
+    backend->decoder_batch_graphs.clear();
+    backend->active_decoder_batch_graph = nullptr;
+    backend->active_decoder_upload_slot = 0u;
+    for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
+}
+
+static void destroy_decoder_batch_graphs_for(
+    cuda_backend_state *backend, const mynah_backend_decoder *decoder) {
+    if (backend == nullptr || decoder == nullptr) return;
+    for (size_t i = 0u; i < backend->decoder_batch_graphs.size();) {
+        cuda_decoder_batch_graph_entry *entry =
+            backend->decoder_batch_graphs[i];
+        bool hit = false;
+        for (mynah_backend_decoder *row : entry->decoders) {
+            if (row == decoder) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            ++i;
+            continue;
+        }
+        backend->decoder_batch_graphs.erase(
+            backend->decoder_batch_graphs.begin() + i);
+        decoder_batch_graph_free(entry);
+    }
+}
+
+static cuda_decoder_batch_graph_entry *find_decoder_batch_graph(
+    cuda_backend_state *backend, mynah_backend_decoder *const *decoders,
+    const float *const *inputs, float *const *outputs, size_t batch,
+    size_t encoder_frames) {
+    if (backend == nullptr || decoders == nullptr || inputs == nullptr ||
+        outputs == nullptr) return nullptr;
+    for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs) {
+        if (!entry->valid || entry->batch != batch ||
+            entry->encoder_frames != encoder_frames ||
+            entry->decoders.size() != batch)
+            continue;
+        bool same = true;
+        for (size_t i = 0u; i < batch; ++i) {
+            if (entry->decoders[i] != decoders[i] ||
+                entry->inputs[i] != inputs[i] ||
+                entry->outputs[i] != outputs[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return entry;
+    }
+    return nullptr;
+}
+
+static cuda_decoder_batch_graph_entry *decoder_batch_graph_create(
+    cuda_backend_state *backend, mynah_backend_decoder *const *decoders,
+    const float *const *inputs, float *const *outputs, size_t batch,
+    size_t encoder_frames, char *e, size_t ec) {
+    if (backend == nullptr || decoders == nullptr || inputs == nullptr ||
+        outputs == nullptr || batch < 2u || batch > backend->batch_meta_cap ||
+        backend->decoder_batch_graphs.size() >= CUDA_DECODER_GRAPH_CAP)
+        return nullptr;
+    size_t upload_slots = 0u;
+    if (!decoder_batch_upload_bound(decoders[0], &upload_slots) ||
+        upload_slots > 4096u) return nullptr;
+    size_t table_count = 0u;
+    size_t table_bytes = 0u;
+    if (!decoder_mul(upload_slots, 4u, &table_count) ||
+        !decoder_mul(table_count, batch, &table_count) ||
+        !decoder_mul(table_count, sizeof(float *), &table_bytes)) {
+        set_error(e, ec, "resident decoder graph metadata size overflow");
+        return nullptr;
+    }
+    auto *entry = new (std::nothrow) cuda_decoder_batch_graph_entry();
+    if (entry == nullptr) {
+        set_error(e, ec, "out of memory creating resident decoder graph");
+        return nullptr;
+    }
+    entry->batch = batch;
+    entry->encoder_frames = encoder_frames;
+    entry->graph = nullptr;
+    entry->exec = nullptr;
+    entry->device_tables = nullptr;
+    entry->host_tables = nullptr;
+    entry->upload_slots = upload_slots;
+    entry->valid = false;
+    try {
+        entry->decoders.assign(decoders, decoders + batch);
+        entry->inputs.assign(inputs, inputs + batch);
+        entry->outputs.assign(outputs, outputs + batch);
+    } catch (const std::bad_alloc &) {
+        decoder_batch_graph_free(entry);
+        set_error(e, ec, "out of memory storing resident decoder graph rows");
+        return nullptr;
+    }
+    if (ce(cudaMalloc((void **)&entry->device_tables, table_bytes), e, ec) != 0 ||
+        ce(cudaHostAlloc((void **)&entry->host_tables, table_bytes,
+                         cudaHostAllocPortable), e, ec) != 0) {
+        decoder_batch_graph_free(entry);
+        return nullptr;
+    }
+    std::memset(entry->host_tables, 0, table_bytes);
+    try {
+        backend->decoder_batch_graphs.push_back(entry);
+    } catch (const std::bad_alloc &) {
+        decoder_batch_graph_free(entry);
+        set_error(e, ec, "out of memory indexing resident decoder graphs");
+        return nullptr;
+    }
+    return entry;
+}
+
+static float **decoder_graph_table(cuda_decoder_batch_graph_entry *entry,
+                                   size_t slot, size_t channel) {
+    return entry->device_tables +
+           (slot * 4u + channel) * entry->batch;
+}
+
+static float **decoder_graph_host_table(cuda_decoder_batch_graph_entry *entry,
+                                        size_t slot, size_t channel) {
+    return entry->host_tables +
+           (slot * 4u + channel) * entry->batch;
+}
+
+static size_t decoder_table_channel(const cuda_backend_state *backend,
+                                    float **device) {
+    if (backend == nullptr || device == nullptr) return SIZE_MAX;
+    if (device == backend->dev_decoder_ptr0) return 0u;
+    if (device == backend->dev_decoder_ptr1) return 1u;
+    if (device == backend->dev_decoder_ptr2) return 2u;
+    if (device == backend->dev_decoder_ptr3) return 3u;
+    return SIZE_MAX;
+}
+
+static float **decoder_current_table(const cuda_backend_state *backend,
+                                     float **ordinary) {
+    const size_t channel = decoder_table_channel(backend, ordinary);
+    if (backend != nullptr && channel < 4u &&
+        backend->active_decoder_batch_graph != nullptr &&
+        backend->active_decoder_tables[channel] != nullptr)
+        return backend->active_decoder_tables[channel];
+    return ordinary;
+}
+
 static int decoder_elu_batch(cuda_backend_state *backend,
                              float *const *inputs, float *const *outputs,
                              size_t batch, size_t elements, float alpha,
@@ -3726,7 +4026,9 @@ static int decoder_elu_batch(cuda_backend_state *backend,
                             e, ec) != 0)
         return -1;
     k_decoder_elu_batch<<<blocks, 256, 0, backend->stream>>>(
-        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
         (int)elements, alpha);
     return ce(cudaGetLastError(), e, ec);
 }
@@ -3745,7 +4047,9 @@ static int decoder_residual_batch(cuda_backend_state *backend,
                             e, ec) != 0)
         return -1;
     k_decoder_residual_batch<<<blocks, 256, 0, backend->stream>>>(
-        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
         (int)elements);
     return ce(cudaGetLastError(), e, ec);
 }
@@ -3808,8 +4112,10 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
                                 e, ec) != 0)
             return -1;
         k_decoder_causal_window_batch<<<blocks, 256, 0, backend->stream>>>(
-            backend->dev_decoder_ptr0, backend->dev_decoder_ptr1,
-            backend->dev_decoder_ptr2, (int)batch, op->in_channels, (int)length,
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            decoder_current_table(backend, backend->dev_decoder_ptr1),
+            decoder_current_table(backend, backend->dev_decoder_ptr2),
+            (int)batch, op->in_channels, (int)length,
             (int)op->tail);
         if (ce(cudaGetLastError(), e, ec) != 0) return -1;
         for (size_t i = 0; i < batch; ++i) p0[i] = ops[i]->window;
@@ -3832,7 +4138,9 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
                             ec) != 0)
         return -1;
     k_decoder_causal_columns_batch<<<blocks, 256, 0, backend->stream>>>(
-        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
         op->in_channels, (int)out_len, op->kernel, op->dilation, op->stride,
         (int)op->tail);
     if (ce(cudaGetLastError(), e, ec) != 0 ||
@@ -3841,7 +4149,8 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         return -1;
     if (!decoder_batch_launch_range(output_elements, &blocks)) return -1;
     k_decoder_bias_batch<<<blocks, 256, 0, backend->stream>>>(
-        backend->dev_decoder_ptr2, op->bias, (int)batch, op->out_channels,
+        decoder_current_table(backend, backend->dev_decoder_ptr2), op->bias,
+        (int)batch, op->out_channels,
         (int)out_len);
     if (ce(cudaGetLastError(), e, ec) != 0) return -1;
     if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr3, p3, batch, e,
@@ -3853,9 +4162,12 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
     if (cbe(cublasSgemmBatched(
                 backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                 (int)out_len, op->out_channels, (int)inner, &alpha,
-                (const float *const *)backend->dev_decoder_ptr1, (int)out_len,
-                (const float *const *)backend->dev_decoder_ptr3, (int)inner,
-                &beta, backend->dev_decoder_ptr2, (int)out_len,
+                (const float *const *)decoder_current_table(
+                    backend, backend->dev_decoder_ptr1), (int)out_len,
+                (const float *const *)decoder_current_table(
+                    backend, backend->dev_decoder_ptr3), (int)inner,
+                &beta, decoder_current_table(backend, backend->dev_decoder_ptr2),
+                (int)out_len,
                 (int)batch),
             e, ec) != 0)
         return -1;
@@ -3875,7 +4187,9 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
             return -1;
         if (!decoder_batch_launch_range(tail_elements, &blocks)) return -1;
         k_decoder_copy_tail_batch<<<blocks, 256, 0, backend->stream>>>(
-            backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            decoder_current_table(backend, backend->dev_decoder_ptr1),
+            (int)batch,
             op->in_channels, (int)length, (int)op->tail);
         if (ce(cudaGetLastError(), e, ec) != 0) return -1;
     }
@@ -3919,7 +4233,8 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
                             ec) != 0)
         return -1;
     k_decoder_convtr_batch<<<blocks, 256, 0, backend->stream>>>(
-        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, op->weight,
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1), op->weight,
         op->bias, (int)batch, op->in_channels, op->out_channels, (int)length,
         (int)full_len, op->kernel, op->stride, op->groups);
     if (ce(cudaGetLastError(), e, ec) != 0) return -1;
@@ -3938,7 +4253,8 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
                                 e, ec) != 0)
             return -1;
         k_decoder_convtr_fold_batch<<<blocks, 256, 0, backend->stream>>>(
-            backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, op->bias,
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            decoder_current_table(backend, backend->dev_decoder_ptr1), op->bias,
             (int)batch, op->out_channels, (int)full_len, (int)op->tail);
         if (ce(cudaGetLastError(), e, ec) != 0) return -1;
     }
@@ -3956,7 +4272,9 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
                             ec) != 0)
         return -1;
     k_decoder_copy_prefix_batch<<<blocks, 256, 0, backend->stream>>>(
-        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
         op->out_channels, (int)full_len, (int)output_len);
     return ce(cudaGetLastError(), e, ec);
 }
@@ -4205,7 +4523,10 @@ extern "C" int mynah_cuda_decoder_open(
 extern "C" void mynah_cuda_decoder_close(void *opaque,
                                            mynah_backend_decoder *decoder) {
     auto *backend = static_cast<cuda_backend_state *>(opaque);
-    if (backend != nullptr) (void)cudaStreamSynchronize(backend->stream);
+    if (backend != nullptr) {
+        (void)cudaStreamSynchronize(backend->stream);
+        destroy_decoder_batch_graphs_for(backend, decoder);
+    }
     decoder_destroy(decoder);
 }
 
@@ -4270,19 +4591,161 @@ extern "C" int mynah_cuda_decoder_step_batch(
         dev_outputs == nullptr || batch < 2u ||
         batch > backend->batch_meta_cap || encoder_frames == 0u)
         return 1;
-    const int result = decoder_step_batch_impl(
-        backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs, e,
-        ec);
-    if (result == 0) {
+    auto eager = [&]() -> int {
+        const int result = decoder_step_batch_impl(
+            backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs,
+            e, ec);
+        if (result == 0) {
+            backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                             std::memory_order_relaxed);
+        } else if (result < 0) {
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+        }
+        return result;
+    };
+
+    /* The graph is an optimization of the already-correct arithmetic batch.
+     * It is deliberately separate from the single-request graph: a changing
+     * scheduler gang must never replay a graph containing another request's
+     * causal rings. */
+    if (!backend->graphs_enabled || !cuda_decoder_graphs_enabled()) {
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        return eager();
+    }
+
+    cuda_decoder_batch_graph_entry *entry = find_decoder_batch_graph(
+        backend, decoders, dev_inputs, dev_outputs, batch, encoder_frames);
+    if (entry != nullptr) {
+        if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(
+                1ull, std::memory_order_relaxed);
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+            return -1;
+        }
+        backend->decoder_graph_replays.fetch_add(1ull,
+                                                 std::memory_order_relaxed);
         backend->decoder_steps.fetch_add((unsigned long long)batch,
                                          std::memory_order_relaxed);
-    } else if (result < 0) {
+        return 0;
+    }
+
+    entry = decoder_batch_graph_create(backend, decoders, dev_inputs,
+                                       dev_outputs, batch, encoder_frames, e,
+                                       ec);
+    if (entry == nullptr) {
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        return eager();
+    }
+
+    /* cuBLAS may request its workspace on the first batched convolution GEMM.
+     * Reserve/configure it before capture so a lazy allocator cannot turn a
+     * valid decoder graph into a capture-time failure.  The same workspace is
+     * shared with the other resident graph families on this backend. */
+    if (backend->cublas_workspace == nullptr) {
+        backend->cublas_workspace_cap = 8u * 1024u * 1024u;
+        if (ce(cudaMalloc(&backend->cublas_workspace,
+                          backend->cublas_workspace_cap), e, ec) != 0) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(
+                1ull, std::memory_order_relaxed);
+            return eager();
+        }
+    }
+    if (cbe(cublasSetWorkspace(backend->cublas, backend->cublas_workspace,
+                               backend->cublas_workspace_cap), e, ec) != 0 ||
+        cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0) {
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(
+            1ull, std::memory_order_relaxed);
+        return eager();
+    }
+
+    cudaError_t begin = cudaStreamBeginCapture(backend->stream,
+                                                cudaStreamCaptureModeRelaxed);
+    if (begin != cudaSuccess) {
+        ce(begin, e, ec);
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        return eager();
+    }
+    backend->active_decoder_batch_graph = entry;
+    backend->active_decoder_upload_slot = 0u;
+    for (size_t i = 0u; i < 4u; ++i)
+        backend->active_decoder_tables[i] =
+            i == 0u ? backend->dev_decoder_ptr0
+            : i == 1u ? backend->dev_decoder_ptr1
+            : i == 2u ? backend->dev_decoder_ptr2
+                      : backend->dev_decoder_ptr3;
+    const int build = decoder_step_batch_impl(
+        backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs, e,
+        ec);
+    backend->active_decoder_batch_graph = nullptr;
+    for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t end = cudaStreamEndCapture(backend->stream, &graph);
+    if (build != 0 || end != cudaSuccess || graph == nullptr) {
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        /* A validation failure is the normal optional-path result.  A launch
+         * failure must stay fatal to the CUDA batch; the caller's state was
+         * not allowed to advance through an unlaunched graph. */
+        if (build < 0) {
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+            return -1;
+        }
+        if (end != cudaSuccess) ce(end, e, ec);
+        return 1;
+    }
+
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t instantiate = cudaGraphInstantiate(&exec, graph, 0);
+    if (instantiate != cudaSuccess || exec == nullptr) {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        entry->graph = nullptr;
+        entry->exec = nullptr;
+        decoder_batch_graph_remove(backend, entry);
+        if (instantiate != cudaSuccess) ce(instantiate, e, ec);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        /* Capture does not execute the recorded decoder.  Instantiation is
+         * therefore safe to fall back from to one ordinary arithmetic batch. */
+        return eager();
+    }
+    entry->graph = graph;
+    entry->exec = exec;
+    entry->valid = true;
+    backend->decoder_graph_captures.fetch_add(1ull,
+                                             std::memory_order_relaxed);
+    if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
         backend->decoder_failures.fetch_add((unsigned long long)batch,
                                             std::memory_order_relaxed);
         backend->resident_fallbacks.fetch_add((unsigned long long)batch,
-                                             std::memory_order_relaxed);
+                                               std::memory_order_relaxed);
+        return -1;
     }
-    return result;
+    backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                     std::memory_order_relaxed);
+    return 0;
 }
 
 extern "C" int mynah_cuda_decoder_note_step(
