@@ -81,11 +81,20 @@ condition/noise/time staging and one bounded latent download per gathered
 batch. These paths are source-implemented but not yet launched on this host.
 
 This host has neither `nvcc` nor an NVIDIA device, so CUDA launch/self-test,
-stage parity and L40S measurements remain explicitly open. GitHub Actions run
-`35877105405` is green for the CLI and Linux CUDA server compile matrix
-(`sm_70`, `sm_89`, `sm_90`), with Code Quality `35877105452` and Memory Safety
-`35877105478` also green. These compile-only jobs do not substitute for a GPU
-gate.
+stage parity and L40S measurements remain explicitly open. The latest GitHub
+Actions gate for commit `c7717da` is green: Build & Test `36124116814`, Code
+Quality `36124116761`, and Memory Safety `36124116778`. Its compile-only CUDA
+matrix covers `sm_70`, `sm_89` (Ada/L4/L40S target), `sm_90`, and `sm_120`
+(Blackwell). A prior compile failure in `628aa33` was a batch-decoder workspace
+type error; `c7717da` fixes it by passing the per-decoder `columns` workspace
+explicitly. These compile-only jobs do not substitute for a GPU gate.
+
+The current CUDA contract is intentionally asymmetric by precision: raw-F32
+SEANet arithmetic is resident and cross-request batched, while opt-in CUDA Q8
+covers the backbone, flow head, Mimi transformer and latent/EOS/control linear
+projections. Selecting INT8 SEANet convolution groups still disables only the
+resident decoder and uses the CPU convolution oracle; no unsupported quantized
+group is silently treated as raw F32 on the GPU.
 
 ## Verified as-is: CPU PocketTTS
 
