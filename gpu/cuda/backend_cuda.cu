@@ -3751,13 +3751,15 @@ static int decoder_residual_batch(cuda_backend_state *backend,
 }
 
 static int decoder_conv1d_batch(cuda_backend_state *backend,
+                                mynah_backend_decoder *const *decoders,
                                 cuda_decoder_op *const *ops,
                                 float *const *inputs, float *const *outputs,
                                 size_t batch, size_t length, char *e,
                                 size_t ec) {
-    if (backend == nullptr || ops == nullptr || inputs == nullptr ||
+    if (backend == nullptr || decoders == nullptr || ops == nullptr ||
+        inputs == nullptr ||
         outputs == nullptr || batch == 0u || batch > backend->batch_meta_cap ||
-        ops[0] == nullptr || length == 0u ||
+        decoders[0] == nullptr || ops[0] == nullptr || length == 0u ||
         length > ops[0]->max_in_len || ops[0]->stride != 1 ||
         length % (size_t)ops[0]->stride != 0u)
         return -1;
@@ -3815,8 +3817,10 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         for (size_t i = 0; i < batch; ++i) p0[i] = inputs[i];
     }
     for (size_t i = 0; i < batch; ++i) {
-        if (ops[i] == nullptr || ops[i]->columns == nullptr) return -1;
-        p1[i] = ops[i]->columns;
+        if (decoders[i] == nullptr || decoders[i]->columns == nullptr ||
+            ops[i] == nullptr)
+            return -1;
+        p1[i] = decoders[i]->columns;
         p2[i] = outputs[i];
         p3[i] = op->weight;
     }
@@ -4102,8 +4106,8 @@ static int decoder_step_batch_impl(
                 hidden_elements > (size_t)INT_MAX ||
                 decoder_elu_batch(backend, current, scratch, batch, elements,
                                   first->elu_alpha, e, ec) != 0 ||
-                decoder_conv1d_batch(backend, op_rows, scratch, other, batch,
-                                     length, e, ec) != 0)
+                decoder_conv1d_batch(backend, decoders, op_rows, scratch, other,
+                                     batch, length, e, ec) != 0)
                 return -1;
             for (size_t i = 0; i < batch; ++i) {
                 op_rows[i] = &decoders[i]->ops[index - 1u];
@@ -4112,8 +4116,8 @@ static int decoder_step_batch_impl(
             if (decoder_elu_batch(backend, other, other, batch,
                                   hidden_elements,
                                   first->elu_alpha, e, ec) != 0 ||
-                decoder_conv1d_batch(backend, op_rows, other, scratch, batch,
-                                     length, e, ec) != 0 ||
+                decoder_conv1d_batch(backend, decoders, op_rows, other, scratch,
+                                     batch, length, e, ec) != 0 ||
                 decoder_residual_batch(backend, current, scratch, batch,
                                        elements, e, ec) != 0)
                 return -1;
@@ -4141,8 +4145,8 @@ static int decoder_step_batch_impl(
                 destination[i] = decoders[i]->work_a;
         }
         if (op->kind == CUDA_DECODER_CONV) {
-            if (decoder_conv1d_batch(backend, op_rows, current, destination,
-                                     batch, length, e, ec) != 0)
+            if (decoder_conv1d_batch(backend, decoders, op_rows, current,
+                                     destination, batch, length, e, ec) != 0)
                 return -1;
             channels = (size_t)op->out_channels;
         } else if (op->kind == CUDA_DECODER_CONVTR) {
