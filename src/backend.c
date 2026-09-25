@@ -44,6 +44,7 @@ struct mynah_backend {
     int (*decoder_note_batch)(void *, size_t, size_t);
     int (*backbone_note_batch)(void *, size_t);
     int (*codec_transformer_note_batch)(void *, size_t, size_t);
+    void (*codec_upsample_note)(void *, int);
     int (*metrics_get)(void *, mynah_tts_backend_metrics *);
     /* Device-side ops (NULL = CPU fallback in backend.c). */
     int (*upload)(void *, const float *, size_t, float **, char *, size_t);
@@ -84,6 +85,11 @@ struct mynah_backend {
     int (*conv1d)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
     int (*conv1d_dev)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
     int (*conv_transpose_dev)(void *, const float *, float *, int, int, int, int, int, int, int, const float *, const float *, char *, size_t);
+    int (*conv_transpose_causal_step_dev)(void *, const float *, float *, float *, int, int, int, const float *, const float *, char *, size_t);
+    int (*scatter_row_to_channels_dev)(void *, const float *, float *, size_t, size_t, size_t, char *, size_t);
+    int (*scatter_rows_to_channels_dev)(void *, const float *, float *const *, size_t, size_t, size_t, size_t, char *, size_t);
+    int (*gather_rows_to_batch_dev)(void *, float *const *, float *, size_t, size_t, char *, size_t);
+    int (*zero_dev)(void *, float *, size_t, char *, size_t);
     int (*gelu_host)(void *, float *, size_t, char *, size_t);
     int (*gelu_host_f64)(void *, float *, size_t, char *, size_t);
     int (*matmul_graph)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
@@ -172,6 +178,11 @@ extern int mynah_cuda_im2col(void *, const float *, float *, int, int, int, int,
 extern int mynah_cuda_conv1d(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 extern int mynah_cuda_conv1d_dev(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 extern int mynah_cuda_conv_transpose_dev(void *, const float *, float *, int, int, int, int, int, int, int, const float *, const float *, char *, size_t);
+extern int mynah_cuda_conv_transpose_causal_step_dev(void *, const float *, float *, float *, int, int, int, const float *, const float *, char *, size_t);
+extern int mynah_cuda_scatter_row_to_channels_dev(void *, const float *, float *, size_t, size_t, size_t, char *, size_t);
+extern int mynah_cuda_scatter_rows_to_channels_dev(void *, const float *, float *const *, size_t, size_t, size_t, size_t, char *, size_t);
+extern int mynah_cuda_gather_rows_to_batch_dev(void *, float *const *, float *, size_t, size_t, char *, size_t);
+extern int mynah_cuda_zero_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_gelu_host(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_gelu_host_f64(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_matmul_graph(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
@@ -196,6 +207,7 @@ extern int mynah_cuda_decoder_note_step(void *, mynah_backend_decoder *);
 extern int mynah_cuda_decoder_note_batch(void *, size_t, size_t);
 extern int mynah_cuda_note_backbone_batch(void *, size_t);
 extern int mynah_cuda_note_codec_transformer_batch(void *, size_t, size_t);
+extern void mynah_cuda_note_codec_upsample(void *, int);
 extern int mynah_cuda_metrics_get(void *, mynah_tts_backend_metrics *);
 #endif
 
@@ -666,6 +678,11 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->conv1d = mynah_cuda_conv1d;
         backend->conv1d_dev = mynah_cuda_conv1d_dev;
         backend->conv_transpose_dev = mynah_cuda_conv_transpose_dev;
+        backend->conv_transpose_causal_step_dev = mynah_cuda_conv_transpose_causal_step_dev;
+        backend->scatter_row_to_channels_dev = mynah_cuda_scatter_row_to_channels_dev;
+        backend->scatter_rows_to_channels_dev = mynah_cuda_scatter_rows_to_channels_dev;
+        backend->gather_rows_to_batch_dev = mynah_cuda_gather_rows_to_batch_dev;
+        backend->zero_dev = mynah_cuda_zero_dev;
         backend->gelu_host = mynah_cuda_gelu_host;
         backend->gelu_host_f64 = mynah_cuda_gelu_host_f64;
         backend->matmul_graph = mynah_cuda_matmul_graph;
@@ -683,6 +700,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->decoder_note_batch = mynah_cuda_decoder_note_batch;
         backend->backbone_note_batch = mynah_cuda_note_backbone_batch;
         backend->codec_transformer_note_batch = mynah_cuda_note_codec_transformer_batch;
+        backend->codec_upsample_note = mynah_cuda_note_codec_upsample;
         backend->metrics_get = mynah_cuda_metrics_get;
 #else
         free(backend);
@@ -833,6 +851,12 @@ int mynah_backend_note_codec_transformer_batch(const mynah_backend *backend,
         backend->codec_transformer_note_batch == NULL)
         return 0;
     return backend->codec_transformer_note_batch(backend->state, items, width);
+}
+
+void mynah_backend_note_codec_upsample(const mynah_backend *backend,
+                                       int fallback) {
+    if (backend == NULL || backend->codec_upsample_note == NULL) return;
+    backend->codec_upsample_note(backend->state, fallback != 0);
 }
 
 int mynah_backend_metrics_get(const mynah_backend *backend,
@@ -1419,6 +1443,55 @@ int mynah_backend_conv_transpose_dev(const mynah_backend *bk, const float *input
     return bk->conv_transpose_dev(bk->state, input, output, in_ch, out_ch,
                                   length, output_length, kernel, stride, groups,
                                   weight, bias, e, ec);
+}
+
+int mynah_backend_conv_transpose_causal_step_dev(
+    const mynah_backend *bk, const float *input, float *output, float *partial,
+    int channels, int kernel, int stride, const float *weight,
+    const float *bias, char *e, size_t ec) {
+    if (bk == NULL || bk->conv_transpose_causal_step_dev == NULL) return -1;
+    return bk->conv_transpose_causal_step_dev(
+        bk->state, input, output, partial, channels, kernel, stride, weight,
+        bias, e, ec);
+}
+
+int mynah_backend_scatter_row_to_channels_dev(
+    const mynah_backend *bk, const float *row, float *output, size_t width,
+    size_t length, size_t position, char *e, size_t ec) {
+    if (bk == NULL || bk->scatter_row_to_channels_dev == NULL) return -1;
+    return bk->scatter_row_to_channels_dev(bk->state, row, output, width,
+                                            length, position, e, ec);
+}
+
+int mynah_backend_scatter_rows_to_channels_dev(
+    const mynah_backend *bk, const float *rows, float *const *outputs,
+    size_t batch, size_t width, size_t length, size_t position, char *e,
+    size_t ec) {
+    if (bk == NULL || bk->scatter_rows_to_channels_dev == NULL) return -1;
+    return bk->scatter_rows_to_channels_dev(bk->state, rows, outputs, batch,
+                                             width, length, position, e, ec);
+}
+
+int mynah_backend_gather_rows_to_batch_dev(
+    const mynah_backend *bk, float *const *inputs, float *rows, size_t batch,
+    size_t width, char *e, size_t ec) {
+    if (bk == NULL || bk->gather_rows_to_batch_dev == NULL) return -1;
+    return bk->gather_rows_to_batch_dev(bk->state, inputs, rows, batch, width,
+                                        e, ec);
+}
+
+int mynah_backend_zero_dev(const mynah_backend *bk, float *data, size_t n,
+                           char *e, size_t ec) {
+    if (bk == NULL || data == NULL || n == 0u) return -1;
+    if (bk->zero_dev != NULL)
+        return bk->zero_dev(bk->state, data, n, e, ec);
+    if (bk->device != MYNAH_TTS_DEVICE_CPU) return -1;
+    if (n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "device-zero size overflow");
+        return -1;
+    }
+    memset(data, 0, n * sizeof(float));
+    return 0;
 }
 
 int mynah_backend_gelu_host(const mynah_backend *bk, float *data, size_t n,

@@ -399,6 +399,70 @@ __global__ static void k_decoder_copy_prefix(const float *full, float *output,
     output[index] = full[(size_t)channel * (size_t)full_len + (size_t)pos];
 }
 
+/* The Mimi decoder-transformer produces one row-major [width] activation,
+ * while SEANet consumes a channel-major [width][length] frame.  Keep this
+ * layout conversion on the device so the next decoder step does not need an
+ * avoidable host transpose plus H2D upload. */
+__global__ static void k_scatter_row_to_channels(
+    const float *row, float *output, int width, int length, int position) {
+    const int channel = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (channel >= width) return;
+    output[(size_t)channel * (size_t)length + (size_t)position] = row[channel];
+}
+
+__global__ static void k_scatter_rows_to_channels(
+    const float *rows, float *const *outputs, int batch, int width, int length,
+    int position) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * width;
+    if (index >= total) return;
+    const int request = index / width;
+    const int channel = index - request * width;
+    outputs[request][(size_t)channel * (size_t)length + (size_t)position] =
+        rows[index];
+}
+
+/* Mimi's quantizer upsample is a depthwise causal ConvTranspose1d with one
+ * input sample per call.  The first `stride` positions are returned in
+ * row-major form for the resident codec transformer; the remaining
+ * `kernel-stride` positions become the next call's carried tail. */
+__global__ static void k_conv_transpose_causal_depthwise_step(
+    const float *input, float *output, float *partial, const float *weight,
+    const float *bias, int channels, int kernel, int stride, int tail) {
+    /* One thread owns one channel and walks the short kernel serially.  The
+     * old implementation assigned one thread to each output position and
+     * read/wrote `partial` in the same launch.  For the normal Mimi shape
+     * tail == stride, position 0 reads partial[0] while position stride writes
+     * partial[0]: that is a real read/write race, not merely an ordering
+     * concern.  Keeping the per-channel loop also handles tail > stride,
+     * where the newly emitted tail overlaps the carried prefix. */
+    const int channel = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (channel >= channels) return;
+    const float channel_bias = bias == nullptr ? 0.0f : bias[channel];
+    for (int position = 0; position < kernel; ++position) {
+        float value = channel_bias +
+            input[channel] * weight[channel * kernel + position];
+        if (position < tail)
+            value += partial[channel * tail + position];
+        if (position < stride) {
+            output[position * channels + channel] = value;
+        } else if (tail > 0) {
+            partial[channel * tail + (position - stride)] = value - channel_bias;
+        }
+    }
+}
+
+__global__ static void k_gather_rows_to_batch(
+    float *const *inputs, float *rows, int batch, int width) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * width;
+    if (index >= total) return;
+    const int request = index / width;
+    const int column = index - request * width;
+    const float *input = inputs[request];
+    if (input != nullptr) rows[index] = input[column];
+}
+
 __global__ static void k_argmax(const float *logits, unsigned *result,
                                 int vocab, int codebook_size, unsigned eos_id,
                                 int allow_eos) {
@@ -500,6 +564,8 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> codec_transformer_batch_calls;
     std::atomic<unsigned long long> codec_transformer_batch_items;
     std::atomic<unsigned long long> codec_transformer_batch_max_width;
+    std::atomic<unsigned long long> codec_upsample_steps;
+    std::atomic<unsigned long long> codec_upsample_fallbacks;
     std::atomic<unsigned long long> decoder_steps;
     std::atomic<unsigned long long> decoder_batch_calls;
     std::atomic<unsigned long long> decoder_batch_items;
@@ -1216,6 +1282,17 @@ extern "C" int mynah_cuda_conv_transpose_dev(void *, const float *, float *, int
                                               int, int, int, int, int, int,
                                               const float *, const float *, char *,
                                               size_t);
+extern "C" int mynah_cuda_conv_transpose_causal_step_dev(
+    void *, const float *, float *, float *, int, int, int, const float *,
+    const float *, char *, size_t);
+extern "C" int mynah_cuda_scatter_row_to_channels_dev(
+    void *, const float *, float *, size_t, size_t, size_t, char *, size_t);
+extern "C" int mynah_cuda_scatter_rows_to_channels_dev(
+    void *, const float *, float *const *, size_t, size_t, size_t, size_t,
+    char *, size_t);
+extern "C" int mynah_cuda_gather_rows_to_batch_dev(
+    void *, float *const *, float *, size_t, size_t, char *, size_t);
+extern "C" int mynah_cuda_zero_dev(void *, float *, size_t, char *, size_t);
 static int cuda_decoder_self_test(void *opaque, char *e, size_t ec);
 extern "C" int mynah_cuda_decoder_open(
     void *, const mynah_backend_decoder_desc *, size_t,
@@ -1259,6 +1336,37 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
     const float convt_weight[2] = {2.0f, 3.0f};
     const float convt_expected[4] = {2.5f, 3.5f, 4.5f, 6.5f};
     float convt_output[4] = {0.0f};
+    const float causal_step_weight[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float causal_step_input[1] = {2.0f};
+    const float causal_step_input_next[1] = {3.0f};
+    const float causal_step_expected[2] = {2.5f, 4.5f};
+    const float causal_step_expected_next[2] = {9.5f, 14.5f};
+    float causal_step_output[2] = {0.0f};
+    float causal_step_partial[2] = {0.0f};
+    /* Also cover tail < stride.  The production Mimi shape is kernel ==
+     * 2*stride, but the backend primitive is intentionally generic and used
+     * to index a negative partial slot for this valid causal shape. */
+    const float causal_short_weight[3] = {1.0f, 2.0f, 3.0f};
+    const float causal_short_expected[2] = {2.5f, 4.5f};
+    const float causal_short_expected_next[2] = {9.5f, 6.5f};
+    float causal_short_output[2] = {0.0f};
+    float causal_short_partial[1] = {0.0f};
+    /* Cover tail > stride as well.  This shape makes the carried prefix
+     * overlap the newly produced tail, which is exactly where an in-place
+     * parallel update can otherwise observe the wrong generation of state. */
+    const float causal_long_weight[5] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+    const float causal_long_expected[2] = {2.5f, 4.5f};
+    const float causal_long_expected_next[2] = {9.5f, 14.5f};
+    float causal_long_output[2] = {0.0f};
+    float causal_long_partial[3] = {0.0f};
+    const float scatter_rows[8] = {1.0f, 2.0f, 3.0f, 4.0f,
+                                   5.0f, 6.0f, 7.0f, 8.0f};
+    float scatter_output[16] = {0.0f};
+    float *scatter_dest[2] = {nullptr, nullptr};
+    const float gather_input_a[4] = {9.0f, 8.0f, 7.0f, 6.0f};
+    const float gather_input_b[4] = {5.0f, 4.0f, 3.0f, 2.0f};
+    float gather_output[8] = {0.0f};
+    float *gather_inputs[2] = {nullptr, nullptr};
     float *kcache[2] = {nullptr, nullptr};
     float *vcache[2] = {nullptr, nullptr};
     size_t positions[2] = {0u, 0u};
@@ -1358,6 +1466,185 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
     for (size_t i = 0; i < 4u; ++i) {
         if (fabsf(convt_output[i] - convt_expected[i]) > 2.0e-4f) {
             std::snprintf(e, ec, "CUDA transpose-conv self-test mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_zero_dev(st, d_k0, 2u, e, ec) != 0 ||
+        ce(cudaMemcpy(d_in, causal_step_input, sizeof(causal_step_input),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k0, 1, 4, 2, causal_step_weight, conv_bias, e,
+            ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_step_output, d_out, sizeof(causal_step_output),
+                      cudaMemcpyDeviceToHost), e, ec) ||
+        ce(cudaMemcpy(causal_step_partial, d_k0, sizeof(causal_step_partial),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_step_output[i] - causal_step_expected[i]) > 2.0e-4f ||
+            fabsf(causal_step_partial[i] - (i == 0u ? 6.0f : 8.0f)) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA causal transpose first-step mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (ce(cudaMemcpy(d_in, causal_step_input_next, sizeof(causal_step_input_next),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k0, 1, 4, 2, causal_step_weight, conv_bias, e,
+            ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_step_output, d_out, sizeof(causal_step_output),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_step_output[i] - causal_step_expected_next[i]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA causal transpose second-step mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_zero_dev(st, d_k1, 1u, e, ec) != 0 ||
+        ce(cudaMemcpy(d_in, causal_step_input, sizeof(causal_step_input),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 3, 2, causal_short_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_short_output, d_out,
+                      sizeof(causal_short_output), cudaMemcpyDeviceToHost),
+           e, ec) ||
+        ce(cudaMemcpy(causal_short_partial, d_k1,
+                      sizeof(causal_short_partial), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_short_output[i] - causal_short_expected[i]) > 2.0e-4f ||
+            (i == 0u && fabsf(causal_short_partial[0] - 6.0f) > 2.0e-4f)) {
+            std::snprintf(e, ec,
+                          "CUDA short-tail causal transpose first-step mismatch at %zu",
+                          i);
+            goto fail;
+        }
+    }
+    if (ce(cudaMemcpy(d_in, causal_step_input_next, sizeof(causal_step_input_next),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 3, 2, causal_short_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_short_output, d_out,
+                      sizeof(causal_short_output), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_short_output[i] - causal_short_expected_next[i]) >
+            2.0e-4f) {
+            std::snprintf(e, ec,
+                          "CUDA short-tail causal transpose second-step mismatch at %zu",
+                          i);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_zero_dev(st, d_k1, 3u, e, ec) != 0 ||
+        ce(cudaMemcpy(d_in, causal_step_input, sizeof(causal_step_input),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 5, 2, causal_long_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_long_output, d_out,
+                      sizeof(causal_long_output), cudaMemcpyDeviceToHost),
+           e, ec) ||
+        ce(cudaMemcpy(causal_long_partial, d_k1,
+                      sizeof(causal_long_partial), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_long_output[i] - causal_long_expected[i]) >
+                2.0e-4f ||
+            fabsf(causal_long_partial[i] -
+                  (i == 0u ? 6.0f : i == 1u ? 8.0f : 10.0f)) > 2.0e-4f) {
+            std::snprintf(e, ec,
+                          "CUDA long-tail causal transpose first-step mismatch at %zu",
+                          i);
+            goto fail;
+        }
+    }
+    if (fabsf(causal_long_partial[2] - 10.0f) > 2.0e-4f) {
+        std::snprintf(e, ec,
+                      "CUDA long-tail causal transpose first tail mismatch");
+        goto fail;
+    }
+    if (ce(cudaMemcpy(d_in, causal_step_input_next, sizeof(causal_step_input_next),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 5, 2, causal_long_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_long_output, d_out,
+                      sizeof(causal_long_output), cudaMemcpyDeviceToHost),
+           e, ec) ||
+        ce(cudaMemcpy(causal_long_partial, d_k1,
+                      sizeof(causal_long_partial), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    if (fabsf(causal_long_output[0] - causal_long_expected_next[0]) >
+            2.0e-4f ||
+        fabsf(causal_long_output[1] - causal_long_expected_next[1]) >
+            2.0e-4f ||
+        fabsf(causal_long_partial[0] - 15.0f) > 2.0e-4f ||
+        fabsf(causal_long_partial[1] - 12.0f) > 2.0e-4f ||
+        fabsf(causal_long_partial[2] - 15.0f) > 2.0e-4f) {
+        std::snprintf(e, ec,
+                      "CUDA long-tail causal transpose second-step mismatch");
+        goto fail;
+    }
+    if (ce(cudaMemcpy(d_in, scatter_rows, sizeof(scatter_rows),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemset(d_out, 0, 16u * sizeof(float)), e, ec) ||
+        mynah_cuda_scatter_row_to_channels_dev(st, d_in, d_out, 4u, 2u, 1u,
+                                               e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(scatter_output, d_out, 8u * sizeof(float),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t c = 0; c < 4u; ++c) {
+        if (scatter_output[c * 2u] != 0.0f ||
+            fabsf(scatter_output[c * 2u + 1u] - scatter_rows[c]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA row scatter self-test mismatch at %zu", c);
+            goto fail;
+        }
+    }
+    scatter_dest[0] = d_out;
+    scatter_dest[1] = d_out + 8u;
+    if (ce(cudaMemset(d_out, 0, 16u * sizeof(float)), e, ec) ||
+        mynah_cuda_scatter_rows_to_channels_dev(st, d_in, scatter_dest, 2u,
+                                                4u, 2u, 1u, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(scatter_output, d_out, 16u * sizeof(float),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t request = 0; request < 2u; ++request) {
+        for (size_t c = 0; c < 4u; ++c) {
+            const size_t at = request * 8u + c * 2u;
+            if (scatter_output[at] != 0.0f ||
+                fabsf(scatter_output[at + 1u] -
+                      scatter_rows[request * 4u + c]) > 2.0e-4f) {
+                std::snprintf(e, ec,
+                              "CUDA batched row scatter self-test mismatch at %zu",
+                              request * 4u + c);
+                goto fail;
+            }
+        }
+    }
+    gather_inputs[0] = d_k0;
+    gather_inputs[1] = d_k1;
+    if (ce(cudaMemcpy(d_k0, gather_input_a, sizeof(gather_input_a),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemcpy(d_k1, gather_input_b, sizeof(gather_input_b),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemset(d_out, 0, sizeof(gather_output)), e, ec) ||
+        mynah_cuda_gather_rows_to_batch_dev(st, gather_inputs, d_out, 2u, 4u,
+                                            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(gather_output, d_out, sizeof(gather_output),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 4u; ++i) {
+        if (gather_output[i] != gather_input_a[i] ||
+            gather_output[4u + i] != gather_input_b[i]) {
+            std::snprintf(e, ec, "CUDA row gather self-test mismatch at %zu", i);
             goto fail;
         }
     }
@@ -1563,6 +1850,8 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->codec_transformer_batch_calls.store(0ull, std::memory_order_relaxed);
     st->codec_transformer_batch_items.store(0ull, std::memory_order_relaxed);
     st->codec_transformer_batch_max_width.store(0ull, std::memory_order_relaxed);
+    st->codec_upsample_steps.store(0ull, std::memory_order_relaxed);
+    st->codec_upsample_fallbacks.store(0ull, std::memory_order_relaxed);
     st->decoder_steps.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_calls.store(0ull, std::memory_order_relaxed);
     st->decoder_batch_items.store(0ull, std::memory_order_relaxed);
@@ -1632,6 +1921,10 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         st->codec_transformer_batch_items.load(std::memory_order_relaxed);
     metrics->codec_transformer_batch_max_width =
         st->codec_transformer_batch_max_width.load(std::memory_order_relaxed);
+    metrics->codec_upsample_steps =
+        st->codec_upsample_steps.load(std::memory_order_relaxed);
+    metrics->codec_upsample_fallbacks =
+        st->codec_upsample_fallbacks.load(std::memory_order_relaxed);
     metrics->decoder_steps = st->decoder_steps.load(std::memory_order_relaxed);
     metrics->decoder_batch_calls =
         st->decoder_batch_calls.load(std::memory_order_relaxed);
@@ -2220,6 +2513,121 @@ extern "C" int mynah_cuda_conv_transpose_dev(
         input, dw, db, output, in_ch, out_ch, length, output_length,
         kernel, stride, groups);
     return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_conv_transpose_causal_step_dev(
+    void *opaque, const float *input, float *output, float *partial,
+    int channels, int kernel, int stride, const float *weight,
+    const float *bias, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    size_t weight_count = 0u;
+    size_t weight_bytes = 0u;
+    size_t bias_bytes = 0u;
+    if (st == nullptr || input == nullptr || output == nullptr ||
+        weight == nullptr || channels <= 0 ||
+        kernel <= 0 || stride <= 0 || kernel < stride ||
+        (size_t)channels > (size_t)INT_MAX / (size_t)kernel ||
+        !cuda_size_mul((size_t)channels, (size_t)kernel, &total) ||
+        total > (size_t)INT_MAX ||
+        !cuda_size_mul((size_t)channels, (size_t)kernel, &weight_count) ||
+        !cuda_size_mul(weight_count, sizeof(float), &weight_bytes) ||
+        !cuda_size_mul((size_t)channels, sizeof(float), &bias_bytes)) {
+        set_error(e, ec, "invalid CUDA causal transpose dimensions");
+        return -1;
+    }
+    if (kernel > stride && partial == nullptr) {
+        set_error(e, ec, "missing CUDA causal transpose tail");
+        return -1;
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_bytes, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias != nullptr && cached_weight(st, bias, bias_bytes, &db, e, ec))
+        return -1;
+    k_conv_transpose_causal_depthwise_step<<<
+        (int)((total + 255u) / 256u), 256, 0, st->stream>>>(
+        input, output, partial, dw, db, channels, kernel, stride,
+        kernel - stride);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_scatter_row_to_channels_dev(
+    void *opaque, const float *row, float *output, size_t width,
+    size_t length, size_t position, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || row == nullptr || output == nullptr || width == 0u ||
+        length == 0u || position >= length || width > (size_t)INT_MAX ||
+        length > (size_t)INT_MAX || position > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA row-to-channel scatter dimensions");
+        return -1;
+    }
+    k_scatter_row_to_channels<<<((int)width + 255) / 256, 256, 0, st->stream>>>(
+        row, output, (int)width, (int)length, (int)position);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_scatter_rows_to_channels_dev(
+    void *opaque, const float *rows, float *const *outputs, size_t batch,
+    size_t width, size_t length, size_t position, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    if (st == nullptr || rows == nullptr || outputs == nullptr || batch == 0u ||
+        batch > st->batch_meta_cap || width == 0u || length == 0u ||
+        position >= length || batch > (size_t)INT_MAX || width > (size_t)INT_MAX ||
+        length > (size_t)INT_MAX || position > (size_t)INT_MAX ||
+        !cuda_size_mul(batch, width, &total) || total > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA batched row-to-channel scatter dimensions");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (outputs[i] == nullptr) {
+            set_error(e, ec, "invalid CUDA batched scatter output");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, outputs,
+                           batch * sizeof(*outputs), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    k_scatter_rows_to_channels<<<((int)total + 255) / 256, 256, 0, st->stream>>>(
+        rows, st->dev_batch_k_cache, (int)batch, (int)width, (int)length,
+        (int)position);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_gather_rows_to_batch_dev(
+    void *opaque, float *const *inputs, float *rows, size_t batch,
+    size_t width, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    size_t pointer_bytes = 0u;
+    if (st == nullptr || inputs == nullptr || rows == nullptr || batch == 0u ||
+        batch > st->batch_meta_cap || width == 0u ||
+        batch > (size_t)INT_MAX || width > (size_t)INT_MAX ||
+        !cuda_size_mul(batch, width, &total) || total > (size_t)INT_MAX ||
+        !cuda_size_mul(batch, sizeof(*inputs), &pointer_bytes)) {
+        set_error(e, ec, "invalid CUDA batched row-gather dimensions");
+        return -1;
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, inputs, pointer_bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec))
+        return -1;
+    k_gather_rows_to_batch<<<(int)((total + 255u) / 256u), 256, 0,
+                             st->stream>>>(st->dev_batch_k_cache, rows,
+                                           (int)batch, (int)width);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_zero_dev(void *opaque, float *data, size_t n,
+                                    char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t bytes = 0u;
+    if (st == nullptr || data == nullptr || n == 0u ||
+        !cuda_size_mul(n, sizeof(float), &bytes)) {
+        set_error(e, ec, "invalid CUDA device-zero request");
+        return -1;
+    }
+    return ce(cudaMemsetAsync(data, 0, bytes, st->stream), e, ec);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2873,6 +3281,18 @@ extern "C" int mynah_cuda_note_codec_transformer_batch(void *opaque,
                std::memory_order_relaxed)) {
     }
     return 0;
+}
+
+extern "C" void mynah_cuda_note_codec_upsample(void *opaque, int fallback) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr) return;
+    if (fallback != 0) {
+        backend->codec_upsample_fallbacks.fetch_add(
+            1ull, std::memory_order_relaxed);
+    } else {
+        backend->codec_upsample_steps.fetch_add(
+            1ull, std::memory_order_relaxed);
+    }
 }
 
 /* Model-free end-to-end check for the resident causal decoder.  The generic

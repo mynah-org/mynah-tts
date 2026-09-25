@@ -50,14 +50,16 @@ partial CUDA graph is fully resident.
 
 The `make cuda-server` target is a build boundary plus the entry point for the
 resident slice. `--device cuda` may run Pocket's transformer backbone,
-one-step flow head and Mimi decoder transformer resident when their metadata is
-compatible. The flow path is disabled with `MYNAH_CUDA_FLOW=0`, uses raw FP32
-weights in this bring-up, and falls back to the CPU flow head on a recoverable
-failure. `MYNAH_CUDA_POCKET_CODEC=0` is the explicit A/B escape hatch for the CPU
-decoder-transformer oracle. Quantizer/upsample inputs remain host-owned for
-now; the resident transformer keeps activations and KV on device, stages one
-bounded output tile per frame gang, and refreshes the host KV oracle only on a
-window rebase or retry.
+one-step flow head, Mimi decoder transformer, quantizer/causal upsample and
+SEANet decoder resident when their metadata and resolved precision are
+compatible. The flow and raw-F32 codec paths fall back to the CPU oracle when a
+quantized group is selected; this is intentional until matching CUDA quantized
+kernels exist. `MYNAH_CUDA_POCKET_CODEC=0` is the explicit A/B escape hatch for
+the CPU decoder-transformer oracle. With raw-F32 groups, the resident
+transformer keeps activations and KV on device, stages one bounded output tile
+per frame gang, and refreshes the host KV oracle only on a window rebase or
+retry. The optional `MYNAH_CUDA_CODEC_HOST_MIRROR=0` skips the normal
+codec-transformer D2H mirror only when the resident SEANet handoff is active.
 
 ## Validation snapshot — 2026-09-23
 
@@ -383,6 +385,8 @@ MYNAH_CUDA_FAST_MATH=0|1           TF32/fast compute experiment; no parity claim
 MYNAH_CUDA_DECODER_BATCH=0|1       async decoder gang submission, default on for CUDA
 MYNAH_CUDA_POCKET_CODEC=0|1        resident Pocket Mimi decoder transformer, default on for CUDA
 MYNAH_CUDA_CODEC=0                  legacy global codec kill switch (also disables Pocket)
+MYNAH_CUDA_CODEC_HOST_MIRROR=0|1  keep codec-transformer D2H mirror; default on
+MYNAH_QUANT_GROUPS=none             raw-F32 resident parity/bring-up profile
 ```
 
 `MYNAH_CUDA_DECODER_GEMM` and `MYNAH_CUDA_METRICS` are intentionally not
@@ -693,6 +697,65 @@ The next-box gate is intentionally narrow:
 Until those six checks pass on real hardware, the 2x2 matrix above remains the
 previous Blackwell smoke result and this new codec-transformer path is marked
 **source-implemented / runtime validation pending**.
+
+## 2026-09-24 deep CUDA audit and lifetime corrections
+
+This audit was performed after the previous Blackwell smoke, so the old WAV
+result must not be read as proof for the current resident decoder-transformer
+source. The following source-level hazards were found and corrected locally:
+
+* Codec-transformer batch metadata now has independent pinned host slices for
+  every `(upsample position, layer, request)` K/V pointer table. The previous
+  implementation reused a layer-sized table across positions while
+  `cudaMemcpyAsync` was still allowed to consume it.
+* The codec input/output pointer tables and position/stride arrays already use
+  per-position slices; the singleton path now uses the same capacity-strided
+  pinned staging instead of overwriting one host row while an async copy may be
+  pending.
+* If resident causal Mimi upsample fails after it has touched its device tail,
+  the bounded tail is imported into the CPU SEANet state before disabling the
+  optional path. If that import cannot be completed, the request fails rather
+  than silently losing causal history.
+* The causal depthwise ConvTranspose step no longer reads and writes the same
+  tail slots from different CUDA threads. One thread owns each channel and
+  walks the short kernel, preserving the old tail for both `tail == stride`
+  (the production shape) and the `tail > stride` overlap case. Destruction of
+  request/scratch device state now drains the backend stream first, including
+  cancellation and error teardown.
+* The single-request seams (`step_input`, hidden, denorm, codec rows and PCM)
+  prefer CUDA-pinned host buffers. Allocation failure remains a safe pageable
+  fallback and is visible through transfer counters.
+* Raw CUDA stages are now explicitly precision-gated. The resident FP32 CUDA
+  kernels do not replace CPU int8/f16/bf16 qmat results. CUDA model startup
+  prints the resolved Pocket capability, and `MYNAH_QUANT_GROUPS=none` is the
+  reproducible raw-F32 bring-up profile.
+* The public backend metrics layout was extended for upsample counters and the
+  library version was bumped to 1.5.0 so consumers do not silently keep the
+  old struct contract.
+* Hosted CI now has a separate official CUDA 12.8.1 `sm_120` compile/link job;
+  the legacy CUDA 12.6 matrix remains for `sm_70`, `sm_89` and `sm_90`.
+
+The audit also confirms what is still genuinely missing outside these fixes:
+
+```text
+control seam       EOS projection, RNG/sampling, and LSD bookkeeping still run on CPU;
+                   backbone hidden and flow latent cross the host boundary each AR step
+quantized CUDA    no qmat int8/int4/bf16/f16 resident implementation yet; raw FP32 only
+SEANet batching   decoder gang submission is asynchronous but arithmetic is still
+                   one request/graph at a time; this is not true cross-request batching
+codec graphs      Mimi decoder-transformer frame tiles do not yet have a captured
+                   graph bucket; dynamic window/pointer metadata still uses ordinary launches
+observability     counters expose bytes/calls/fallbacks and tile widths, but not per-stage
+                   GPU time or a separate true-arithmetic-vs-gang decoder counter
+validation        current source needs a fresh nvcc build, GPU self-test, stage parity,
+                   compute-sanitizer and failure-injection run on the next NVIDIA box
+```
+
+These are capability gaps, not hidden fallbacks: the CPU oracle is deliberately
+selected when a raw CUDA stage cannot preserve the resolved CPU precision. A
+99%-GPU or C100 claim remains invalid until the control seam, quantized profile
+and true decoder arithmetic are either implemented or measured as acceptable
+on the target L4/L40S workload.
 
 ## Acceptance gates before calling this done
 

@@ -451,6 +451,53 @@ jobs:
         run: |
           echo "::notice title=CUDA::CLI and server compiled and linked for ${{ matrix.arch }} with no GPU present. Backend presence was checked; no kernel correctness, performance, or launch was tested."
 
+  # CUDA 12.6 deliberately remains the portable legacy matrix above.  It does
+  # not cover the Blackwell SM120 compiler target, so keep that check in the
+  # toolkit line that officially supports SM120 instead of pretending the
+  # older image exercises Blackwell.  This is still compile-only: the hosted
+  # runner has no NVIDIA device.
+  cuda-blackwell-compile:
+    name: "compile-only: CUDA sm_120 (Blackwell, no GPU)"
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates
+          nvcc --version
+
+      - uses: actions/checkout@v7
+
+      - name: Compile and link the CUDA CLI and server builds
+        run: make cuda cuda-server CUDA_ARCH=sm_120
+
+      - name: Prove the Blackwell CUDA backend is linked
+        run: |
+          set -eu
+          ./build/cuda/mynah-tts --dispatch-map > dispatch.txt
+          grep -q 'backend.cuda' dispatch.txt
+          test -x build/cuda/mynah-tts-server
+          set +e
+          ./build/cuda/mynah-tts --gpu-self-test cuda > selftest.txt 2>&1
+          rc=$?
+          set -e
+          cat selftest.txt
+          if grep -q 'CUDA backend is not compiled' selftest.txt; then
+            echo 'CUDA backend was not linked for sm_120' >&2
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ] && ! grep -Eiq 'no CUDA device|no cuda device|no device|driver version is insufficient|no NVIDIA driver' selftest.txt; then
+            exit "$rc"
+          elif [ "$rc" -eq 0 ] && ! grep -q 'CUDA backend self-test: PASS' selftest.txt; then
+            echo 'CUDA self-test returned success without its PASS marker' >&2
+            exit 1
+          fi
+
+      - name: Say what this did and did not prove
+        run: |
+          echo "::notice title=CUDA Blackwell::CLI and server compiled and linked for sm_120 with CUDA 12.8.1 and no GPU present. No launch, parity, or performance was tested."
+
   metal-compile:
     name: "compile-only: Metal (shaders + backend)"
     runs-on: macos-latest

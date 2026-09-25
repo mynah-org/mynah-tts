@@ -107,6 +107,10 @@ int mynah_backend_note_backbone_batch(const mynah_backend *backend,
 /* Record one resident Mimi decoder-transformer tile. */
 int mynah_backend_note_codec_transformer_batch(const mynah_backend *backend,
                                                size_t items, size_t width);
+/* Record the resident quantizer/causal upsample handoff.  `fallback` is one
+ * when a submitted optional step had to be imported back to the CPU oracle. */
+void mynah_backend_note_codec_upsample(const mynah_backend *backend,
+                                       int fallback);
 int mynah_backend_metrics_get(const mynah_backend *backend,
                                mynah_tts_backend_metrics *metrics);
 
@@ -127,6 +131,29 @@ int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int
  * contract is host input/output and may synchronize. */
 int mynah_backend_conv1d_dev(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 int mynah_backend_conv_transpose_dev(const mynah_backend *, const float *, float *, int, int, int, int, int, int, int, const float *, const float *, char *, size_t);
+/* One causal depthwise ConvTranspose1d sample.  Input is [channels] for one
+ * latent frame; output is row-major [stride][channels].  `partial` is the
+ * persistent [channels][kernel-stride] tail and is updated in-place. */
+int mynah_backend_conv_transpose_causal_step_dev(
+    const mynah_backend *, const float *, float *, float *, int, int, int,
+    const float *, const float *, char *, size_t);
+/* Device-side handoff from transformer row-major output to the decoder's
+ * channel-major [width][length] input. */
+int mynah_backend_scatter_row_to_channels_dev(
+    const mynah_backend *, const float *, float *, size_t, size_t, size_t,
+    char *, size_t);
+int mynah_backend_scatter_rows_to_channels_dev(
+    const mynah_backend *, const float *, float *const *, size_t, size_t,
+    size_t, size_t, char *, size_t);
+/* Gather one row from each device pointer into a stacked row-major batch.
+ * A NULL input pointer leaves that output row untouched, which lets callers
+ * mix resident and host-staged requests without a second kernel. */
+int mynah_backend_gather_rows_to_batch_dev(
+    const mynah_backend *, float *const *, float *, size_t, size_t, char *,
+    size_t);
+/* Asynchronously clear a device buffer. */
+int mynah_backend_zero_dev(const mynah_backend *, float *, size_t, char *,
+                           size_t);
 int mynah_backend_gelu_host(const mynah_backend *, float *, size_t, char *, size_t);
 int mynah_backend_gelu_host_f64(const mynah_backend *, float *, size_t, char *, size_t);
 int mynah_backend_matmul_graph(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);

@@ -143,13 +143,18 @@ make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
 
 Pocket-TTS support is currently an experimental engine path: official 6-layer
 and 24-layer packs run on CPU, and the Linux CUDA server path has been exercised
-on an RTX PRO 6000 Blackwell (`sm_120`) with resident backbone, flow and causal
-SEANet decoder work. The current CUDA branch also contains a resident Mimi
-decoder-transformer path with compact per-request KV windows and true
-cross-request frame-tile batching; it is guarded by `MYNAH_CUDA_POCKET_CODEC=0` for
-bring-up and still needs real-device stage parity. CUDA remains opt-in and
-model-specific; L4/L40S qualification and sustained high-concurrency streaming
-are tracked in [PLAN.md](PLAN.md) and the [CUDA work item](.work/pocket-tts-cuda-streaming-parity.md).
+on an RTX PRO 6000 Blackwell (`sm_120`). CUDA has resident implementations for
+the backbone, flow head, Mimi decoder-transformer, quantizer/causal upsample and
+causal SEANet decoder, but each stage is capability- and precision-gated. The
+default Pocket CPU quantization profile intentionally keeps several groups
+quantized; those groups remain on the CPU oracle until matching CUDA quantized
+kernels exist. A raw-F32 resident bring-up therefore uses
+`MYNAH_QUANT_GROUPS=none`, shown below. The current path still keeps generation
+control (EOS/sampling/RNG) and the final PCM boundary on the host, and its
+decoder counter records asynchronous per-request gang submission, not true
+cross-request SEANet arithmetic batching. CUDA remains opt-in and model-specific;
+L4/L40S qualification, stage parity and sustained high-concurrency streaming are
+tracked in [PLAN.md](PLAN.md) and the [CUDA work item](.work/pocket-tts-cuda-streaming-parity.md).
 
 A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
@@ -198,10 +203,18 @@ On Linux/NVIDIA, the reproducible build entry point is:
 
 ```bash
 make cuda-server CUDA_ARCH=sm_89
+MYNAH_QUANT_GROUPS=none \
 MYNAH_CUDA_RESIDENT=1 MYNAH_CUDA_FLOW=1 MYNAH_CUDA_POCKET_CODEC=1 \
   ./build/cuda/mynah-tts-server --device cuda --max-batch 16 \
   --max-inflight 128 -m models/pocket-6l
 ```
+
+The CUDA startup log prints the resolved resident capability for each Pocket
+stage. `MYNAH_QUANT_GROUPS=none` is a parity/bring-up profile, not a claim that
+the shipped CPU quantization is supported by CUDA. Once device parity is
+qualified, `MYNAH_CUDA_CODEC_HOST_MIRROR=0` removes the optional Mimi
+decoder-transformer D2H mirror when the resident SEANet handoff is active;
+stage dumps force the mirror back on.
 
 `MYNAH_CUDA_POCKET_CODEC=0` keeps the resident backbone/flow/SEANet path while
 forcing Pocket's Mimi decoder transformer through its CPU oracle for A/B parity.
