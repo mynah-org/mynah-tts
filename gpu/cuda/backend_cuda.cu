@@ -3730,6 +3730,17 @@ static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
     return ce(cudaGetLastError(), e, ec);
 }
 
+/* These helpers are defined with the graph-cache utilities below, but the
+ * pointer-table upload path is the first place that needs them.  Keep the
+ * declarations here so the CUDA translation unit remains valid with both the
+ * older and newer toolkit front ends. */
+static float **decoder_graph_table(cuda_decoder_batch_graph_entry *entry,
+                                   size_t slot, size_t channel);
+static float **decoder_graph_host_table(cuda_decoder_batch_graph_entry *entry,
+                                        size_t slot, size_t channel);
+static size_t decoder_table_channel(const cuda_backend_state *backend,
+                                    float **device);
+
 static int decoder_upload_ptrs(cuda_backend_state *backend, float **device,
                                float *const *host, size_t batch, char *e,
                                size_t ec) {
@@ -3827,17 +3838,6 @@ static bool decoder_batch_upload_bound(const mynah_backend_decoder *decoder,
     *out = count;
     return count != 0u;
 }
-
-/* These helpers are defined with the graph-cache utilities below, but the
- * pointer-table upload path is the first place that needs them.  Keep the
- * declarations here so the CUDA translation unit remains valid with both the
- * older and newer toolkit front ends. */
-static float **decoder_graph_table(cuda_decoder_batch_graph_entry *entry,
-                                   size_t slot, size_t channel);
-static float **decoder_graph_host_table(cuda_decoder_batch_graph_entry *entry,
-                                        size_t slot, size_t channel);
-static size_t decoder_table_channel(const cuda_backend_state *backend,
-                                    float **device);
 
 static void decoder_batch_graph_free(cuda_decoder_batch_graph_entry *entry) {
     if (entry == nullptr) return;
