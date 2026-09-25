@@ -1810,15 +1810,15 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_decoder_steps_total counter\n"
            "mynah_backend_decoder_steps_total %llu\n",
            m.decoder_steps);
-    METRIC("# HELP mynah_backend_decoder_batch_calls_total Decoder gang submissions.\n"
+    METRIC("# HELP mynah_backend_decoder_batch_calls_total Cross-request CUDA decoder arithmetic batches.\n"
            "# TYPE mynah_backend_decoder_batch_calls_total counter\n"
            "mynah_backend_decoder_batch_calls_total %llu\n",
            m.decoder_batch_calls);
-    METRIC("# HELP mynah_backend_decoder_batch_items_total Decoder requests in gangs.\n"
+    METRIC("# HELP mynah_backend_decoder_batch_items_total Requests processed by cross-request decoder arithmetic batches.\n"
            "# TYPE mynah_backend_decoder_batch_items_total counter\n"
            "mynah_backend_decoder_batch_items_total %llu\n",
            m.decoder_batch_items);
-    METRIC("# HELP mynah_backend_decoder_batch_frames_total Decoder frames in gangs.\n"
+    METRIC("# HELP mynah_backend_decoder_batch_frames_total Frame steps processed by cross-request decoder arithmetic batches.\n"
            "# TYPE mynah_backend_decoder_batch_frames_total counter\n"
            "mynah_backend_decoder_batch_frames_total %llu\n",
            m.decoder_batch_frames);
@@ -1872,7 +1872,7 @@ static void handle_metrics(int fd) {
     METRIC("# HELP mynah_backend_fast_math_enabled Whether fast math is enabled.\n"
            "# TYPE mynah_backend_fast_math_enabled gauge\n"
            "mynah_backend_fast_math_enabled %u\n", m.fast_math_enabled);
-    METRIC("# HELP mynah_backend_decoder_batch_enabled Whether decoder gang submission is enabled.\n"
+    METRIC("# HELP mynah_backend_decoder_batch_enabled Whether cross-request CUDA decoder arithmetic batching is enabled.\n"
            "# TYPE mynah_backend_decoder_batch_enabled gauge\n"
            "mynah_backend_decoder_batch_enabled %u\n", m.decoder_batch_enabled);
     METRIC("# HELP mynah_backend_q8_enabled Whether resident CUDA Q8 is available.\n"

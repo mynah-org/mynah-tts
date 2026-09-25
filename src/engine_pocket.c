@@ -4804,6 +4804,103 @@ static int pocket_cuda_decoder_submit(mynah_engine_ctx *ctx, char *error,
     return 0;
 }
 
+/* Queue one true cross-request SEANet step.  The CUDA backend owns the
+ * arithmetic batch; this layer only validates that every request has the
+ * same resident topology, stages the device inputs, and preserves the
+ * pre-state optional fallback contract used by the single-request path.
+ *
+ * No graph is captured here: pointer-table uploads and per-request causal
+ * state make a graph a poor identity for a changing scheduler gang.  The
+ * individual decoder graph remains available for width-one/fallback work. */
+static int pocket_cuda_decoder_submit_batch(
+    mynah_engine_ctx *const *ctxs, size_t count, char *error, size_t capacity) {
+    if (ctxs == NULL || count < 2u || count > POCKET_MAX_BATCH) return 1;
+
+    const mynah_backend *backend = NULL;
+    mynah_backend_decoder *decoders[POCKET_MAX_BATCH];
+    const float *inputs[POCKET_MAX_BATCH];
+    float *outputs[POCKET_MAX_BATCH];
+    size_t encoder_frames = 0u;
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+
+    /* Validate the complete gang before queuing any H2D copy.  A mixed model
+     * or a request that has already fallen back must not leave a half-staged
+     * batch behind the per-request compatibility loop. */
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state == NULL ||
+            !ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL ||
+            ctx->state->backend == NULL ||
+            strcmp(mynah_backend_name(ctx->state->backend), "cuda") != 0)
+            return 1;
+        if (backend == NULL) backend = ctx->state->backend;
+        if (ctx->state->backend != backend) return 1;
+
+        const size_t this_frames = ctx->state->cfg.upsample_stride;
+        size_t this_input = 0u;
+        size_t this_output = 0u;
+        if (pocket_cuda_decoder_sizes(ctx, &this_input, &this_output) != 0) {
+            if (ctx->cuda_decoder_started) {
+                pocket_error(error, capacity,
+                             "CUDA decoder batch input size overflow after state advance");
+                return -1;
+            }
+            return 1;
+        }
+        if (i == 0u) {
+            encoder_frames = this_frames;
+            input_floats = this_input;
+            output_floats = this_output;
+        } else if (this_frames != encoder_frames ||
+                   this_input != input_floats || this_output != output_floats) {
+            return 1;
+        }
+        decoders[i] = ctx->cuda_decoder;
+        inputs[i] = ctx->cuda_decoder_input;
+        outputs[i] = ctx->cuda_decoder_output;
+        if (inputs[i] == NULL || outputs[i] == NULL) return 1;
+    }
+
+    char local[256];
+    local[0] = '\0';
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx->cuda_codec_device_output_ready) continue;
+        if (mynah_backend_h2d(backend, ctx->codec_back,
+                              ctx->cuda_decoder_input, input_floats, local,
+                              sizeof(local)) != 0) {
+            if (ctx->cuda_decoder_started) {
+                pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                     ? local
+                                                     : "CUDA decoder batch input copy failed after state advance");
+                return -1;
+            }
+            /* This context never reached a decoder step.  It can safely be
+             * released and CPU-finished while the other candidates continue
+             * through the single-request compatibility path. */
+            pocket_cuda_decoder_release(ctx);
+            return 1;
+        }
+    }
+
+    const int result = mynah_backend_decoder_step_batch(
+        backend, decoders, inputs, count, encoder_frames, outputs, local,
+        sizeof(local));
+    if (result > 0) return 1;
+    if (result < 0) {
+        pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                 ? local
+                                                 : "CUDA decoder batch launch failed");
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        ctxs[i]->cuda_decoder_started = 1;
+        ctxs[i]->cuda_codec_device_output_ready = 0;
+    }
+    return 0;
+}
+
 /* Queue the resident decoder output into its host PCM buffer.  No sync is
  * allowed here; callers must drain the backend once after all contexts in the
  * gang have submitted their copies. */
@@ -7117,19 +7214,20 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
  * crossed between rows would make a request's audio depend on server load. The
  * guarantee here is structural rather than tested-and-hoped: every frame goes
  * through the prepare/finish helpers above, which touch this context's buffers
- * and no others. The CUDA schedule may submit several resident decoders before
- * one stream drain, but it never aliases their causal state or changes their
- * arithmetic.
+ * and no others. The CUDA schedule may submit one resident arithmetic batch
+ * before a stream drain, but it never aliases their causal state or changes
+ * their arithmetic.
  *
  * ## Frame-major, and what that is and is not worth
  *
  * The gang is walked frame index by frame index, all contexts at each index,
- * rather than context by context. The Mimi decoder-transformer tile now uses
- * a true cross-request CUDA batch: each request contributes
- * `upsample_stride` consecutive positions, with independent absolute RoPE and
- * compact KV windows. SEANet still has per-request causal state and the
- * quantizer/upsample boundary remains host-side, so this is not yet a claim
- * that the complete decoder is a single fused Bx kernel.
+ * rather than context by context. The Mimi decoder-transformer tile and the
+ * raw-F32 SEANet decoder use true cross-request CUDA arithmetic batches: each
+ * request keeps independent absolute RoPE/KV and causal convolution state,
+ * while elementwise/Conv1d/ConvTranspose work is launched for the whole gang.
+ * The quantizer/upsample boundary still has a small host control seam when its
+ * resident path is unavailable, and final PCM must be copied to the stream
+ * sink, so this is not a claim that a complete request is one fused kernel.
  *
  * ## Blast radius
  *
@@ -7576,6 +7674,7 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
             memset(prepared, 0, sizeof(prepared));
             memset(submitted, 0, sizeof(submitted));
             size_t submitted_count = 0u;
+            int decoder_batch_used = 0;
 
             for (size_t i = 0; i < count; ++i) {
                 if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
@@ -7652,6 +7751,9 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                 }
             }
 
+            mynah_engine_ctx *decoder_candidates[POCKET_MAX_BATCH];
+            size_t decoder_candidate_indices[POCKET_MAX_BATCH];
+            size_t decoder_candidate_count = 0u;
             for (size_t i = 0; i < count; ++i) {
                 if (!prepared[i] || failed[i]) continue;
                 mynah_engine_ctx *ctx = ctxs[i];
@@ -7662,8 +7764,43 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                         pocket_decode_batch_drop(ctx, i, out_samples, out_count,
                                                  failed, &reported, one_error,
                                                  error, capacity);
-                    continue;
+                } else if (decoder_candidate_count < POCKET_MAX_BATCH) {
+                    decoder_candidates[decoder_candidate_count] = ctx;
+                    decoder_candidate_indices[decoder_candidate_count++] = i;
                 }
+            }
+
+            /* The scheduler's normal width is now a real SEANet arithmetic
+             * batch.  If topology/state validation says the optional path is
+             * unavailable, the exact old per-request queue remains the
+             * fallback for every candidate. */
+            if (decoder_candidate_count > 1u) {
+                one_error[0] = '\0';
+                const int batch_status = pocket_cuda_decoder_submit_batch(
+                    decoder_candidates, decoder_candidate_count, one_error,
+                    sizeof(one_error));
+                if (batch_status == 0) {
+                    decoder_batch_used = 1;
+                    for (size_t p = 0; p < decoder_candidate_count; ++p) {
+                        const size_t i = decoder_candidate_indices[p];
+                        submitted[i] = 1;
+                        ++submitted_count;
+                    }
+                } else if (batch_status < 0) {
+                    for (size_t p = 0; p < decoder_candidate_count; ++p) {
+                        const size_t i = decoder_candidate_indices[p];
+                        pocket_decode_batch_drop(
+                            decoder_candidates[p], i, out_samples, out_count,
+                            failed, &reported, one_error, error, capacity);
+                    }
+                }
+            }
+
+            for (size_t p = 0; p < decoder_candidate_count; ++p) {
+                const size_t i = decoder_candidate_indices[p];
+                if (submitted[i] || failed[i]) continue;
+                mynah_engine_ctx *ctx = decoder_candidates[p];
+                one_error[0] = '\0';
                 const int status = pocket_cuda_decoder_submit(
                     ctx, one_error, sizeof(one_error));
                 if (status == 0) {
@@ -7685,8 +7822,9 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
             }
 
             if (submitted_count > 0u) {
-                (void)mynah_backend_decoder_note_batch(batch_backend,
-                                                       submitted_count, 1u);
+                if (decoder_batch_used)
+                    (void)mynah_backend_decoder_note_batch(
+                        batch_backend, decoder_candidate_count, 1u);
                 for (size_t i = 0; i < count; ++i) {
                     if (!submitted[i] || failed[i]) continue;
                     one_error[0] = '\0';

@@ -449,6 +449,167 @@ __global__ static void k_decoder_copy_prefix(const float *full, float *output,
     output[index] = full[(size_t)channel * (size_t)full_len + (size_t)pos];
 }
 
+/* The per-request decoder state is independent, but its elementwise and
+ * causal convolution work has the same topology for every request in a
+ * scheduler gang. These kernels keep the request pointer tables on device
+ * and give one launch to the whole gang. They deliberately preserve the
+ * scalar decoder's channel-major layout and accumulation order. */
+__global__ static void k_decoder_elu_batch(float *const *inputs,
+                                           float *const *outputs,
+                                           int batch, int n, float alpha) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * n;
+    if (index >= total) return;
+    const int request = index / n;
+    const int offset = index - request * n;
+    const float x = inputs[request][offset];
+    outputs[request][offset] = x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+}
+
+__global__ static void k_decoder_residual_batch(float *const *base,
+                                                float *const *add, int batch,
+                                                int n) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * n;
+    if (index >= total) return;
+    const int request = index / n;
+    const int offset = index - request * n;
+    base[request][offset] += add[request][offset];
+}
+
+__global__ static void k_decoder_bias_batch(float *const *outputs,
+                                            const float *bias, int batch,
+                                            int channels, int length) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int offset = index - request * per_request;
+    outputs[request][offset] = bias == nullptr ? 0.0f : bias[offset / length];
+}
+
+__global__ static void k_decoder_causal_window_batch(
+    float *const *previous, float *const *inputs, float *const *windows,
+    int batch, int channels, int length, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int window_len = tail + length;
+    const int per_request = channels * window_len;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / window_len;
+    const int pos = local - channel * window_len;
+    windows[request][local] = pos < tail
+        ? previous[request][(size_t)channel * (size_t)tail + (size_t)pos]
+        : inputs[request][(size_t)channel * (size_t)length +
+                          (size_t)(pos - tail)];
+}
+
+__global__ static void k_decoder_causal_columns_batch(
+    float *const *windows, float *const *columns, int batch, int channels,
+    int length, int kernel, int dilation, int stride, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * kernel * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int out_pos = local % length;
+    const int tap_channel = local / length;
+    const int tap = tap_channel % kernel;
+    const int channel = tap_channel / kernel;
+    const int window_len = tail + length;
+    const int source = out_pos * stride + tap * dilation;
+    columns[request][local] = source >= 0 && source < window_len
+        ? windows[request][(size_t)channel * (size_t)window_len +
+                           (size_t)source]
+        : 0.0f;
+}
+
+__global__ static void k_decoder_copy_tail_batch(float *const *windows,
+                                                 float *const *previous,
+                                                 int batch, int channels,
+                                                 int length, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * tail;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / tail;
+    const int pos = local - channel * tail;
+    const int window_len = tail + length;
+    previous[request][local] = windows[request][
+        (size_t)channel * (size_t)window_len + (size_t)(window_len - tail + pos)];
+}
+
+__global__ static void k_decoder_convtr_batch(
+    float *const *inputs, float *const *full, const float *weight,
+    const float *bias, int batch, int in_channels, int out_channels,
+    int length, int full_len, int kernel, int stride, int groups) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = out_channels * full_len;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int t = local % full_len;
+    const int output_channel = local / full_len;
+    const int in_per_group = in_channels / groups;
+    const int out_per_group = out_channels / groups;
+    const int group = output_channel / out_per_group;
+    const int out_local = output_channel % out_per_group;
+    float value = bias == nullptr ? 0.0f : bias[output_channel];
+    for (int k = 0; k < kernel; ++k) {
+        if (t < k || ((t - k) % stride) != 0) continue;
+        const int input_t = (t - k) / stride;
+        if (input_t >= length) continue;
+        for (int input_local = 0; input_local < in_per_group; ++input_local) {
+            const int input_channel = group * in_per_group + input_local;
+            const size_t weight_index =
+                ((size_t)input_channel * (size_t)out_per_group +
+                 (size_t)out_local) * (size_t)kernel + (size_t)k;
+            value += inputs[request][(size_t)input_channel * (size_t)length +
+                                    (size_t)input_t] * weight[weight_index];
+        }
+    }
+    full[request][local] = value;
+}
+
+__global__ static void k_decoder_convtr_fold_batch(
+    float *const *full, float *const *partial, const float *bias, int batch,
+    int channels, int full_len, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * tail;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / tail;
+    const int pos = local - channel * tail;
+    float *row = full[request] + (size_t)channel * (size_t)full_len;
+    row[pos] += partial[request][local];
+    partial[request][local] = row[full_len - tail + pos] -
+        (bias == nullptr ? 0.0f : bias[channel]);
+}
+
+__global__ static void k_decoder_copy_prefix_batch(
+    float *const *full, float *const *outputs, int batch, int channels,
+    int full_len, int output_len) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * output_len;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / output_len;
+    const int pos = local - channel * output_len;
+    outputs[request][local] = full[request][
+        (size_t)channel * (size_t)full_len + (size_t)pos];
+}
+
 /* The Mimi decoder-transformer produces one row-major [width] activation,
  * while SEANet consumes a channel-major [width][length] frame.  Keep this
  * layout conversion on the device so the next decoder step does not need an
@@ -610,6 +771,13 @@ struct cuda_backend_state {
     float **dev_batch_v_cache;
     size_t *dev_batch_positions;
     size_t *dev_batch_cache_strides;
+    /* Pointer tables for the cross-request causal decoder.  Each table is
+     * reused for one topology operation at a time; decoder state itself stays
+     * in the per-request objects. */
+    float **dev_decoder_ptr0;
+    float **dev_decoder_ptr1;
+    float **dev_decoder_ptr2;
+    float **dev_decoder_ptr3;
     size_t batch_meta_cap;
     bool fast_math;
     bool graphs_enabled;
@@ -1547,6 +1715,9 @@ extern "C" int mynah_cuda_decoder_reset(void *, mynah_backend_decoder *,
 extern "C" int mynah_cuda_decoder_step(void *, mynah_backend_decoder *,
                                          const float *, size_t, float *, char *,
                                          size_t);
+extern "C" int mynah_cuda_decoder_step_batch(
+    void *, mynah_backend_decoder *const *, const float *const *, size_t,
+    size_t, float *const *, char *, size_t);
 
 static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
@@ -2136,6 +2307,10 @@ static void cuda_close(void *opaque) {
     if (st->dev_batch_v_cache) cudaFree(st->dev_batch_v_cache);
     if (st->dev_batch_positions) cudaFree(st->dev_batch_positions);
     if (st->dev_batch_cache_strides) cudaFree(st->dev_batch_cache_strides);
+    if (st->dev_decoder_ptr0) cudaFree(st->dev_decoder_ptr0);
+    if (st->dev_decoder_ptr1) cudaFree(st->dev_decoder_ptr1);
+    if (st->dev_decoder_ptr2) cudaFree(st->dev_decoder_ptr2);
+    if (st->dev_decoder_ptr3) cudaFree(st->dev_decoder_ptr3);
     cublasDestroy(st->cublas);
     cudaStreamDestroy(st->stream);
     delete st;
@@ -2170,6 +2345,10 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->dev_batch_v_cache = nullptr;
     st->dev_batch_positions = nullptr;
     st->dev_batch_cache_strides = nullptr;
+    st->dev_decoder_ptr0 = nullptr;
+    st->dev_decoder_ptr1 = nullptr;
+    st->dev_decoder_ptr2 = nullptr;
+    st->dev_decoder_ptr3 = nullptr;
     st->h2d_bytes.store(0ull, std::memory_order_relaxed);
     st->d2h_bytes.store(0ull, std::memory_order_relaxed);
     st->h2d_calls.store(0ull, std::memory_order_relaxed);
@@ -2214,7 +2393,15 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
         ce(cudaMalloc(&st->dev_batch_positions,
                       CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_positions)), e, ec) ||
         ce(cudaMalloc(&st->dev_batch_cache_strides,
-                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_cache_strides)), e, ec)) {
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_cache_strides)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr0,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr0)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr1,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr1)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr2,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr2)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr3,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr3)), e, ec)) {
         cuda_close(st);
         return -1;
     }
@@ -3487,6 +3674,285 @@ static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
     return ce(cudaGetLastError(), e, ec);
 }
 
+static int decoder_upload_ptrs(cuda_backend_state *backend, float **device,
+                               float *const *host, size_t batch, char *e,
+                               size_t ec) {
+    if (backend == nullptr || device == nullptr || host == nullptr ||
+        batch == 0u || batch > backend->batch_meta_cap) {
+        set_error(e, ec, "invalid resident decoder pointer table");
+        return -1;
+    }
+    return ce(cudaMemcpyAsync(device, host, batch * sizeof(*host),
+                              cudaMemcpyHostToDevice, backend->stream),
+              e, ec);
+}
+
+static bool decoder_batch_launch_range(size_t elements, int *blocks) {
+    if (elements == 0u || elements > (size_t)INT_MAX) return false;
+    size_t rounded = 0u;
+    if (!decoder_add(elements, 255u, &rounded)) return false;
+    const size_t count = rounded / 256u;
+    if (count == 0u || count > (size_t)INT_MAX) return false;
+    *blocks = (int)count;
+    return true;
+}
+
+static bool decoder_ops_compatible(const cuda_decoder_op *a,
+                                   const cuda_decoder_op *b) {
+    return a != nullptr && b != nullptr && a->kind == b->kind &&
+           a->pre_elu == b->pre_elu && a->in_channels == b->in_channels &&
+           a->out_channels == b->out_channels && a->kernel == b->kernel &&
+           a->stride == b->stride && a->dilation == b->dilation &&
+           a->groups == b->groups && a->max_in_len == b->max_in_len &&
+           a->tail == b->tail && a->max_full_len == b->max_full_len &&
+           a->weight == b->weight && a->bias == b->bias;
+}
+
+static int decoder_elu_batch(cuda_backend_state *backend,
+                             float *const *inputs, float *const *outputs,
+                             size_t batch, size_t elements, float alpha,
+                             char *e, size_t ec) {
+    size_t total = 0u;
+    int blocks = 0;
+    if (!decoder_mul(batch, elements, &total) ||
+        !decoder_batch_launch_range(total, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, inputs, batch,
+                            e, ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, outputs, batch,
+                            e, ec) != 0)
+        return -1;
+    k_decoder_elu_batch<<<blocks, 256, 0, backend->stream>>>(
+        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        (int)elements, alpha);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int decoder_residual_batch(cuda_backend_state *backend,
+                                  float *const *base, float *const *add,
+                                  size_t batch, size_t elements, char *e,
+                                  size_t ec) {
+    size_t total = 0u;
+    int blocks = 0;
+    if (!decoder_mul(batch, elements, &total) ||
+        !decoder_batch_launch_range(total, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, base, batch,
+                            e, ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, add, batch,
+                            e, ec) != 0)
+        return -1;
+    k_decoder_residual_batch<<<blocks, 256, 0, backend->stream>>>(
+        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        (int)elements);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int decoder_conv1d_batch(cuda_backend_state *backend,
+                                cuda_decoder_op *const *ops,
+                                float *const *inputs, float *const *outputs,
+                                size_t batch, size_t length, char *e,
+                                size_t ec) {
+    if (backend == nullptr || ops == nullptr || inputs == nullptr ||
+        outputs == nullptr || batch == 0u || batch > backend->batch_meta_cap ||
+        ops[0] == nullptr || length == 0u ||
+        length > ops[0]->max_in_len || ops[0]->stride != 1 ||
+        length % (size_t)ops[0]->stride != 0u)
+        return -1;
+    cuda_decoder_op *op = ops[0];
+    const size_t out_len = length / (size_t)op->stride;
+    size_t window_len = 0u;
+    size_t window_elements = 0u;
+    size_t inner = 0u;
+    size_t columns = 0u;
+    size_t output_elements = 0u;
+    if (!decoder_add(op->tail, length, &window_len) ||
+        !decoder_mul((size_t)op->in_channels, (size_t)op->kernel, &inner) ||
+        !decoder_mul(inner, out_len, &columns) ||
+        !decoder_mul((size_t)op->out_channels, out_len, &output_elements) ||
+        !decoder_mul(window_len, (size_t)op->in_channels, &window_elements) ||
+        !decoder_mul(batch, window_elements, &window_elements) ||
+        !decoder_mul(batch, columns, &columns) ||
+        !decoder_mul(batch, output_elements, &output_elements)) {
+        set_error(e, ec, "resident decoder batched conv shape overflow");
+        return -1;
+    }
+    if (window_elements > (size_t)INT_MAX || columns > (size_t)INT_MAX ||
+        output_elements > (size_t)INT_MAX)
+        return -1;
+
+    float *p0[CUDA_BATCH_META_CAP];
+    float *p1[CUDA_BATCH_META_CAP];
+    float *p2[CUDA_BATCH_META_CAP];
+    float *p3[CUDA_BATCH_META_CAP];
+    if (op->tail > 0u) {
+        for (size_t i = 0; i < batch; ++i) {
+            if (ops[i] == nullptr || ops[i]->window == nullptr ||
+                ops[i]->previous == nullptr)
+                return -1;
+            p0[i] = ops[i]->previous;
+            p1[i] = inputs[i];
+            p2[i] = ops[i]->window;
+        }
+        int blocks = 0;
+        if (!decoder_batch_launch_range(window_elements, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch,
+                                e, ec) != 0)
+            return -1;
+        k_decoder_causal_window_batch<<<blocks, 256, 0, backend->stream>>>(
+            backend->dev_decoder_ptr0, backend->dev_decoder_ptr1,
+            backend->dev_decoder_ptr2, (int)batch, op->in_channels, (int)length,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+        for (size_t i = 0; i < batch; ++i) p0[i] = ops[i]->window;
+    } else {
+        for (size_t i = 0; i < batch; ++i) p0[i] = inputs[i];
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (ops[i] == nullptr || ops[i]->columns == nullptr) return -1;
+        p1[i] = ops[i]->columns;
+        p2[i] = outputs[i];
+        p3[i] = op->weight;
+    }
+    int blocks = 0;
+    if (!decoder_batch_launch_range(columns, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                            ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
+                            ec) != 0)
+        return -1;
+    k_decoder_causal_columns_batch<<<blocks, 256, 0, backend->stream>>>(
+        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        op->in_channels, (int)out_len, op->kernel, op->dilation, op->stride,
+        (int)op->tail);
+    if (ce(cudaGetLastError(), e, ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch, e,
+                            ec) != 0)
+        return -1;
+    if (!decoder_batch_launch_range(output_elements, &blocks)) return -1;
+    k_decoder_bias_batch<<<blocks, 256, 0, backend->stream>>>(
+        backend->dev_decoder_ptr2, op->bias, (int)batch, op->out_channels,
+        (int)out_len);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr3, p3, batch, e,
+                            ec) != 0 ||
+        cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+        return -1;
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    if (cbe(cublasSgemmBatched(
+                backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                (int)out_len, op->out_channels, (int)inner, &alpha,
+                (const float *const *)backend->dev_decoder_ptr1, (int)out_len,
+                (const float *const *)backend->dev_decoder_ptr3, (int)inner,
+                &beta, backend->dev_decoder_ptr2, (int)out_len,
+                (int)batch),
+            e, ec) != 0)
+        return -1;
+    if (op->tail > 0u) {
+        for (size_t i = 0; i < batch; ++i) {
+            p0[i] = ops[i]->window;
+            p1[i] = ops[i]->previous;
+        }
+        if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch,
+                                e, ec) != 0)
+            return -1;
+        size_t tail_elements = 0u;
+        if (!decoder_mul(batch, (size_t)op->in_channels, &tail_elements) ||
+            !decoder_mul(tail_elements, op->tail, &tail_elements))
+            return -1;
+        if (!decoder_batch_launch_range(tail_elements, &blocks)) return -1;
+        k_decoder_copy_tail_batch<<<blocks, 256, 0, backend->stream>>>(
+            backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+            op->in_channels, (int)length, (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    }
+    return 0;
+}
+
+static int decoder_convtr_batch(cuda_backend_state *backend,
+                                cuda_decoder_op *const *ops,
+                                float *const *inputs, float *const *outputs,
+                                size_t batch, size_t length, char *e,
+                                size_t ec) {
+    if (backend == nullptr || ops == nullptr || inputs == nullptr ||
+        outputs == nullptr || batch == 0u || batch > backend->batch_meta_cap ||
+        ops[0] == nullptr || length == 0u || length > ops[0]->max_in_len)
+        return -1;
+    cuda_decoder_op *op = ops[0];
+    size_t output_len = 0u;
+    size_t full_len = 0u;
+    if (!decoder_mul(length, (size_t)op->stride, &output_len) ||
+        !decoder_add(output_len, op->tail, &full_len)) {
+        set_error(e, ec, "resident decoder batched transpose shape overflow");
+        return -1;
+    }
+    size_t full_elements = 0u;
+    if (!decoder_mul((size_t)op->out_channels, full_len, &full_elements) ||
+        !decoder_mul(batch, full_elements, &full_elements) ||
+        full_elements > (size_t)INT_MAX)
+        return -1;
+    float *p0[CUDA_BATCH_META_CAP];
+    float *p1[CUDA_BATCH_META_CAP];
+    for (size_t i = 0; i < batch; ++i) {
+        if (ops[i] == nullptr || ops[i]->full == nullptr) return -1;
+        p0[i] = inputs[i];
+        p1[i] = ops[i]->full;
+    }
+    int blocks = 0;
+    if (!decoder_batch_launch_range(full_elements, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                            ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
+                            ec) != 0)
+        return -1;
+    k_decoder_convtr_batch<<<blocks, 256, 0, backend->stream>>>(
+        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, op->weight,
+        op->bias, (int)batch, op->in_channels, op->out_channels, (int)length,
+        (int)full_len, op->kernel, op->stride, op->groups);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    if (op->tail > 0u) {
+        for (size_t i = 0; i < batch; ++i) {
+            p0[i] = ops[i]->full;
+            p1[i] = ops[i]->partial;
+        }
+        size_t tail_elements = 0u;
+        if (!decoder_mul(batch, (size_t)op->out_channels, &tail_elements) ||
+            !decoder_mul(tail_elements, op->tail, &tail_elements) ||
+            !decoder_batch_launch_range(tail_elements, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch,
+                                e, ec) != 0)
+            return -1;
+        k_decoder_convtr_fold_batch<<<blocks, 256, 0, backend->stream>>>(
+            backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, op->bias,
+            (int)batch, op->out_channels, (int)full_len, (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        p0[i] = ops[i]->full;
+        p1[i] = outputs[i];
+    }
+    size_t output_elements = 0u;
+    if (!decoder_mul(batch, (size_t)op->out_channels, &output_elements) ||
+        !decoder_mul(output_elements, output_len, &output_elements) ||
+        !decoder_batch_launch_range(output_elements, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                            ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
+                            ec) != 0)
+        return -1;
+    k_decoder_copy_prefix_batch<<<blocks, 256, 0, backend->stream>>>(
+        backend->dev_decoder_ptr0, backend->dev_decoder_ptr1, (int)batch,
+        op->out_channels, (int)full_len, (int)output_len);
+    return ce(cudaGetLastError(), e, ec);
+}
+
 static int decoder_step_impl(mynah_backend_decoder *decoder,
                              const float *input, size_t encoder_frames,
                              float *output, char *e, size_t ec) {
@@ -3553,6 +4019,140 @@ static int decoder_step_impl(mynah_backend_decoder *decoder,
             set_error(e, ec, "resident decoder operation kind is invalid");
             return -1;
         }
+    }
+    return 0;
+}
+
+/* One causal decoder topology, many independent request states.  The
+ * per-request work/tail buffers remain owned by each decoder object, while
+ * elementwise kernels and the conv1d GEMM use one launch/batched cuBLAS call
+ * for the whole gang. */
+static int decoder_step_batch_impl(
+    cuda_backend_state *backend, mynah_backend_decoder *const *decoders,
+    const float *const *inputs, size_t batch, size_t encoder_frames,
+    float *const *outputs, char *e, size_t ec) {
+    if (backend == nullptr || decoders == nullptr || inputs == nullptr ||
+        outputs == nullptr || batch < 2u || batch > backend->batch_meta_cap ||
+        encoder_frames == 0u || decoders[0] == nullptr ||
+        decoders[0]->backend != backend ||
+        encoder_frames > decoders[0]->max_encoder_frames)
+        return 1;
+    if (!backend->decoder_batch_enabled) return 1;
+    mynah_backend_decoder *first = decoders[0];
+    const size_t op_count = first->ops.size();
+    if (op_count == 0u) return -1;
+    for (size_t i = 0; i < batch; ++i) {
+        mynah_backend_decoder *decoder = decoders[i];
+        if (decoder == nullptr || decoder->backend != backend ||
+            decoder->channels != first->channels ||
+            decoder->dimension != first->dimension ||
+            decoder->n_filters != first->n_filters ||
+            decoder->elu_alpha != first->elu_alpha ||
+            decoder->max_encoder_frames != first->max_encoder_frames ||
+            decoder->ops.size() != op_count || inputs[i] == nullptr ||
+            outputs[i] == nullptr)
+            return 1;
+        for (size_t op = 0; op < op_count; ++op) {
+            if (!decoder_ops_compatible(&first->ops[op], &decoder->ops[op]))
+                return 1;
+        }
+    }
+    if (cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+        return -1;
+
+    float *current[CUDA_BATCH_META_CAP];
+    float *other[CUDA_BATCH_META_CAP];
+    float *scratch[CUDA_BATCH_META_CAP];
+    float *destination[CUDA_BATCH_META_CAP];
+    cuda_decoder_op *op_rows[CUDA_BATCH_META_CAP];
+    for (size_t i = 0; i < batch; ++i)
+        current[i] = const_cast<float *>(inputs[i]);
+
+    size_t length = encoder_frames;
+    size_t channels = first->dimension;
+    for (size_t index = 0; index < op_count;) {
+        cuda_decoder_op *op = &first->ops[index++];
+        if (op->kind == CUDA_DECODER_RESBLOCK) {
+            if (index + 1u >= op_count) {
+                set_error(e, ec, "resident decoder residual topology is truncated");
+                return -1;
+            }
+            index += 2u;
+            const cuda_decoder_op *rb1 = &first->ops[index - 2u];
+            for (size_t i = 0; i < batch; ++i) {
+                op_rows[i] = &decoders[i]->ops[index - 2u];
+                if (current[i] == decoders[i]->work_a)
+                    other[i] = decoders[i]->work_b;
+                else if (current[i] == decoders[i]->work_b)
+                    other[i] = decoders[i]->work_a;
+                else
+                    other[i] = decoders[i]->work_a;
+                scratch[i] = decoders[i]->work_c;
+            }
+            size_t elements = 0u;
+            size_t hidden_elements = 0u;
+            if (!decoder_mul(channels, length, &elements) ||
+                !decoder_mul((size_t)rb1->out_channels, length,
+                             &hidden_elements) ||
+                elements > (size_t)INT_MAX ||
+                hidden_elements > (size_t)INT_MAX ||
+                decoder_elu_batch(backend, current, scratch, batch, elements,
+                                  first->elu_alpha, e, ec) != 0 ||
+                decoder_conv1d_batch(backend, op_rows, scratch, other, batch,
+                                     length, e, ec) != 0)
+                return -1;
+            for (size_t i = 0; i < batch; ++i) {
+                op_rows[i] = &decoders[i]->ops[index - 1u];
+                scratch[i] = other[i];
+            }
+            if (decoder_elu_batch(backend, other, other, batch,
+                                  hidden_elements,
+                                  first->elu_alpha, e, ec) != 0 ||
+                decoder_conv1d_batch(backend, op_rows, other, scratch, batch,
+                                     length, e, ec) != 0 ||
+                decoder_residual_batch(backend, current, scratch, batch,
+                                       elements, e, ec) != 0)
+                return -1;
+            continue;
+        }
+
+        for (size_t i = 0; i < batch; ++i) {
+            op_rows[i] = &decoders[i]->ops[index - 1u];
+        }
+        if (op->pre_elu) {
+            size_t elements = 0u;
+            if (!decoder_mul(channels, length, &elements) ||
+                elements > (size_t)INT_MAX ||
+                decoder_elu_batch(backend, current, current, batch, elements,
+                                  first->elu_alpha, e, ec) != 0)
+                return -1;
+        }
+        const bool last = index == op_count;
+        for (size_t i = 0; i < batch; ++i) {
+            if (last)
+                destination[i] = outputs[i];
+            else if (current[i] == decoders[i]->work_a)
+                destination[i] = decoders[i]->work_b;
+            else
+                destination[i] = decoders[i]->work_a;
+        }
+        if (op->kind == CUDA_DECODER_CONV) {
+            if (decoder_conv1d_batch(backend, op_rows, current, destination,
+                                     batch, length, e, ec) != 0)
+                return -1;
+            channels = (size_t)op->out_channels;
+        } else if (op->kind == CUDA_DECODER_CONVTR) {
+            if (decoder_convtr_batch(backend, op_rows, current, destination,
+                                     batch, length, e, ec) != 0)
+                return -1;
+            channels = (size_t)op->out_channels;
+            if (!decoder_mul(length, (size_t)op->stride, &length))
+                return -1;
+        } else {
+            set_error(e, ec, "resident decoder operation kind is invalid");
+            return -1;
+        }
+        for (size_t i = 0; i < batch; ++i) current[i] = destination[i];
     }
     return 0;
 }
@@ -3649,6 +4249,30 @@ extern "C" int mynah_cuda_decoder_step(void *opaque,
     if (result != 0) {
         backend->decoder_failures.fetch_add(1ull, std::memory_order_relaxed);
         backend->resident_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    return result;
+}
+
+extern "C" int mynah_cuda_decoder_step_batch(
+    void *opaque, mynah_backend_decoder *const *decoders,
+    const float *const *dev_inputs, size_t batch, size_t encoder_frames,
+    float *const *dev_outputs, char *e, size_t ec) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoders == nullptr || dev_inputs == nullptr ||
+        dev_outputs == nullptr || batch < 2u ||
+        batch > backend->batch_meta_cap || encoder_frames == 0u)
+        return 1;
+    const int result = decoder_step_batch_impl(
+        backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs, e,
+        ec);
+    if (result == 0) {
+        backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                         std::memory_order_relaxed);
+    } else if (result < 0) {
+        backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                            std::memory_order_relaxed);
+        backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                             std::memory_order_relaxed);
     }
     return result;
 }
@@ -3868,6 +4492,109 @@ static int cuda_decoder_self_test(void *opaque, char *e, size_t ec) {
     if (dev_output != nullptr) cudaFree(dev_output);
     if (decoder != nullptr) mynah_cuda_decoder_close(st, decoder);
     if (cpu_state != nullptr) mynah_seanet_state_destroy(cpu_state);
+
+    /* Exercise the same topology with two independent causal states.  This
+     * is deliberately separate from the single-request check above: a batch
+     * kernel can be correct for request zero while indexing request one with
+     * the wrong window/tail stride.  The environment switch is a runtime
+     * feature gate, so a deliberately disabled decoder batch remains a valid
+     * self-test configuration. */
+    if (result == 0 && st->decoder_batch_enabled) {
+        mynah_backend_decoder *batch_decoders[2] = {nullptr, nullptr};
+        mynah_seanet_state *batch_cpu[2] = {nullptr, nullptr};
+        float *batch_inputs_dev[2] = {nullptr, nullptr};
+        float *batch_outputs_dev[2] = {nullptr, nullptr};
+        const float batch_inputs[2][2][2] = {
+            {{0.17f, -0.22f}, {-0.28f, 0.31f}},
+            {{-0.09f, 0.14f}, {0.36f, -0.19f}}
+        };
+        float batch_cpu_output[2][2];
+        float batch_gpu_output[2][2];
+        local[0] = '\0';
+        int batch_ok = 1;
+        for (size_t i = 0; i < 2u && batch_ok; ++i) {
+            batch_cpu[i] = mynah_seanet_state_create(
+                &cpu_config, nullptr, 2u, local, sizeof(local));
+            batch_ok = batch_cpu[i] != nullptr &&
+                       mynah_cuda_decoder_open(
+                           st, &desc, 1u, &batch_decoders[i], local,
+                           sizeof(local)) == 0 && batch_decoders[i] != nullptr;
+            if (batch_ok)
+                batch_ok = mynah_cuda_decoder_reset(
+                               st, batch_decoders[i], local, sizeof(local)) == 0 &&
+                           ce(cudaMalloc((void **)&batch_inputs_dev[i],
+                                         2u * sizeof(float)),
+                              local, sizeof(local)) == 0 &&
+                           ce(cudaMalloc((void **)&batch_outputs_dev[i],
+                                         2u * sizeof(float)),
+                              local, sizeof(local)) == 0;
+        }
+        mynah_backend_decoder *decoder_rows[2] = {
+            batch_decoders[0], batch_decoders[1]};
+        const float *input_rows[2] = {
+            batch_inputs_dev[0], batch_inputs_dev[1]};
+        float *output_rows[2] = {
+            batch_outputs_dev[0], batch_outputs_dev[1]};
+        for (size_t step = 0; step < 2u && batch_ok; ++step) {
+            for (size_t request = 0; request < 2u; ++request) {
+                if (ce(cudaMemcpyAsync(
+                           batch_inputs_dev[request],
+                           batch_inputs[request][step], 2u * sizeof(float),
+                           cudaMemcpyHostToDevice, st->stream),
+                       local, sizeof(local)) != 0) {
+                    batch_ok = 0;
+                    break;
+                }
+            }
+            if (!batch_ok ||
+                mynah_cuda_decoder_step_batch(
+                    st, decoder_rows, input_rows, 2u, 1u, output_rows, local,
+                    sizeof(local)) != 0 ||
+                mynah_cuda_sync(st, local, sizeof(local)) != 0) {
+                batch_ok = 0;
+                break;
+            }
+            for (size_t request = 0; request < 2u; ++request) {
+                if (ce(cudaMemcpy(batch_gpu_output[request],
+                                  batch_outputs_dev[request],
+                                  2u * sizeof(float), cudaMemcpyDeviceToHost),
+                       local, sizeof(local)) != 0 ||
+                    mynah_seanet_decode(batch_cpu[request], &cpu_weights,
+                                        batch_inputs[request][step], 1u,
+                                        batch_cpu_output[request]) != 0) {
+                    batch_ok = 0;
+                    break;
+                }
+                for (size_t d = 0; d < 2u; ++d) {
+                    if (fabsf(batch_cpu_output[request][d] -
+                              batch_gpu_output[request][d]) > 3.0e-3f) {
+                        std::snprintf(
+                            local, sizeof(local),
+                            "CUDA batched resident decoder mismatch at step %zu request %zu",
+                            step, request);
+                        batch_ok = 0;
+                        break;
+                    }
+                }
+                if (!batch_ok) break;
+            }
+        }
+        if (!batch_ok) {
+            result = -1;
+            if (e != nullptr && ec > 0u)
+                std::snprintf(e, ec, "%s", local[0] != '\0'
+                                  ? local
+                                  : "CUDA batched resident decoder self-test failed");
+        }
+        for (size_t i = 0; i < 2u; ++i) {
+            if (batch_inputs_dev[i] != nullptr) cudaFree(batch_inputs_dev[i]);
+            if (batch_outputs_dev[i] != nullptr) cudaFree(batch_outputs_dev[i]);
+            if (batch_decoders[i] != nullptr)
+                mynah_cuda_decoder_close(st, batch_decoders[i]);
+            if (batch_cpu[i] != nullptr)
+                mynah_seanet_state_destroy(batch_cpu[i]);
+        }
+    }
     return result;
 }
 

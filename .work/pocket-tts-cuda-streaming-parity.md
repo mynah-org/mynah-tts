@@ -98,7 +98,7 @@ The sources of truth are `src/engine_pocket.c`, `src/tts_engine.h`,
 |---|---|---|
 | Model graph | Continuous latent AR; `step_batch` is the shared engine hook. Pocket publishes a config-driven `max_batch` and one latent frame per AR step. | Keep the same batch and EOS contract; do not encode Pocket as Magpie codebooks. |
 | Prefill/AR | Backbone and flow projections are composed through the Pocket engine and shared driver. The CPU path has model-owned qmat/cache state and reused scratch. | A GPU path needs a model-owned resident weight cache and per-request device KV/scratch, not `mynah_backend_matmul()` in every projection. |
-| Audio decode | `pocket_decode_audio_batch()` validates a gang but currently decodes each context through `pocket_decode_frame()`; SEANet/decoder state is per request. | A first CUDA implementation can preserve this semantics, but the C100 target needs a batched/resident SEANet path rather than a serial host decoder. |
+| Audio decode | `pocket_decode_audio_batch()` is frame-major. Mimi and raw-F32 SEANet now execute true cross-request CUDA arithmetic batches while causal state remains per request; final audio is still copied back for the stream sink. | Validate batch-vs-solo parity and measure the remaining host boundary on L4/L40S. |
 | Streaming | Offline and HTTP streaming enter the same inference driver. Pocket carries codec state and a monotonic frame position; it does not replay a large audio context. | GPU chunk boundaries must use the same contiguous range contract and must not reset causal state. |
 | Precision | The repo has measured f32/f16/bf16/int8 variants and per-group resolution. The shipped ARM profile uses the qualified CPU precision/configuration; int8 experiments are not a free CUDA default. | Start with the exact CPU-approved weight representation. Add int8 only after a separate tensor-level parity gate. |
 | Correctness | Oracle stages, tokenizer, stream/offline behaviour, and server stream/batch identity are already tested. | CPU remains the reference for token/frame/EOS checks; floating-point audio uses explicit tolerances, not byte identity across devices. |
@@ -389,7 +389,7 @@ The following flags are explicit experiments, not hidden policy:
 ```text
 MYNAH_CUDA_GRAPHS=0|1              graph capture/replay escape hatch
 MYNAH_CUDA_FAST_MATH=0|1           TF32/fast compute experiment; no parity claim
-MYNAH_CUDA_DECODER_BATCH=0|1       async decoder gang submission, default on for CUDA
+MYNAH_CUDA_DECODER_BATCH=0|1       true cross-request SEANet decoder batch, default on for CUDA
 MYNAH_CUDA_POCKET_CODEC=0|1        resident Pocket Mimi decoder transformer, default on for CUDA
 MYNAH_CUDA_CODEC=0                  legacy global codec kill switch (also disables Pocket)
 MYNAH_CUDA_CODEC_HOST_MIRROR=0|1  keep codec-transformer D2H mirror; default on
@@ -426,10 +426,10 @@ Blackwell device; stage parity, multi-request arithmetic batching and L4/L40S
 qualification remain open.
 
 ```text
-CUDA-01  async decoder gang submission + backend batch counters (implemented; GPU parity open)
+CUDA-01  true cross-request decoder arithmetic batch + backend counters (implemented; GPU parity open)
 CUDA-02  Prometheus /metrics + GPU/graph/transfer/batch observability (implemented; TTFB/per-stage timing histograms open)
 CUDA-03  C100 capacity seam: inflight slots separate from microbatch width (implemented; runtime soak open)
-CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels and graph buckets
+CUDA-04  true stateful decoder B1/B2/B4/B8/B16 kernels (raw-F32 batch implemented; graph buckets and width sweep open)
 CUDA-05  codec-transformer residency + H2D/D2H overlap (resident frame-tile path implemented; GPU parity/overlap open)
 CUDA-06  BF16/FP16/cuBLASLt/fused kernel ladder with stage parity gates
 CUDA-07  optional GPU CI, sanitizer and L40S qualification campaign
@@ -753,12 +753,13 @@ quantized CUDA    Q8 resident linear path is implemented for backbone/flow/Mimi
                   and latent/EOS control projections behind MYNAH_CUDA_Q8; its activation/accumulator
                   arena is reserved before graph capture and reused across layers;
                   INT4/BF16/FP16 and CUDA convolution quantization remain CPU-gated
-SEANet batching   decoder gang submission is asynchronous but arithmetic is still
-                   one request/graph at a time; this is not true cross-request batching
+SEANet batching   raw-F32 decoder arithmetic is now cross-request batched with
+                   per-request causal tails/workspaces; graph buckets and GPU
+                   parity are still open
 codec graphs      Mimi decoder-transformer frame tiles do not yet have a captured
                    graph bucket; dynamic window/pointer metadata still uses ordinary launches
-observability     counters expose bytes/calls/fallbacks and tile widths, but not per-stage
-                   GPU time or a separate true-arithmetic-vs-gang decoder counter
+observability     counters expose bytes/calls/fallbacks, tile widths and true
+                   decoder-batch widths; per-stage GPU time and bucket histograms remain
 validation        current source needs a fresh nvcc build, GPU self-test, stage parity,
                    compute-sanitizer and failure-injection run on the next NVIDIA box
 ```

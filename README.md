@@ -151,12 +151,13 @@ quantized. Resident CUDA now has an explicit Q8 linear path for batched
 backbone/flow/Mimi and latent/EOS control projections (device activation
 quantization, INT8 GEMM, cached per-row weight scales and f32 epilogue);
 convolution groups still use the CPU oracle until their own CUDA Q8 kernel
-passes parity. A raw-F32 resident bring-up therefore uses
+passes parity. The resident SEANet decoder is now cross-request batched in
+raw-F32 mode, with causal tails/workspaces kept per request. A raw-F32 resident bring-up therefore uses
 `MYNAH_QUANT_GROUPS=none`, shown below. The current path still keeps generation
 control (EOS thresholding/sampling/RNG) and the final PCM boundary on the host;
 the EOS projection itself is batched on the resident stream, and its
-decoder counter records asynchronous per-request gang submission, not true
-cross-request SEANet arithmetic batching. CUDA remains opt-in and model-specific;
+decoder counters distinguish true cross-request SEANet arithmetic batches from
+ordinary single-request/fallback steps. CUDA remains opt-in and model-specific;
 L4/L40S qualification, stage parity and sustained high-concurrency streaming are
 tracked in [PLAN.md](PLAN.md) and the [CUDA work item](.work/pocket-tts-cuda-streaming-parity.md).
 

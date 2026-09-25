@@ -90,14 +90,24 @@ int mynah_backend_decoder_step(const mynah_backend *backend,
                                size_t encoder_frames,
                                float *dev_output,
                                char *error, size_t error_capacity);
+/* Submit one causal SEANet step for independent request decoders as one device
+ * batch.  The decoder objects retain their own causal tails/workspaces; only
+ * the arithmetic is shared.  Return 0 when submitted, 1 when this optional
+ * backend path is unavailable before touching decoder state, and -1 after a
+ * validation/launch failure.  CPU/unsupported backends return 1. */
+int mynah_backend_decoder_step_batch(
+    const mynah_backend *backend, mynah_backend_decoder *const *decoders,
+    const float *const *dev_inputs, size_t batch, size_t encoder_frames,
+    float *const *dev_outputs, char *error, size_t error_capacity);
 /* A decoder step recorded inside a CUDA graph is submitted during capture but
  * does not execute until the graph is launched.  Backends use this hook to
  * keep the process-local step counter logical rather than counting capture
  * submissions.  CPU/unsupported backends treat it as a no-op. */
 int mynah_backend_decoder_note_step(const mynah_backend *backend,
                                     mynah_backend_decoder *decoder);
-/* Record one decoder gang submission. This is a diagnostic seam for the
- * asynchronous CUDA decoder path; CPU and other backends treat it as a no-op. */
+/* Record one successful cross-request decoder arithmetic batch. CPU and other
+ * backends treat it as a no-op. Width-one/fallback decoder submissions do not
+ * increment this counter. */
 int mynah_backend_decoder_note_batch(const mynah_backend *backend,
                                      size_t items, size_t frames);
 /* Record one successful cross-request Pocket backbone batch. CPU/Metal are

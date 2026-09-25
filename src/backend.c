@@ -40,6 +40,9 @@ struct mynah_backend {
     int (*decoder_reset)(void *, mynah_backend_decoder *, char *, size_t);
     int (*decoder_step)(void *, mynah_backend_decoder *, const float *, size_t,
                         float *, char *, size_t);
+    int (*decoder_step_batch)(void *, mynah_backend_decoder *const *,
+                              const float *const *, size_t, size_t,
+                              float *const *, char *, size_t);
     int (*decoder_note_step)(void *, mynah_backend_decoder *);
     int (*decoder_note_batch)(void *, size_t, size_t);
     int (*backbone_note_batch)(void *, size_t);
@@ -207,6 +210,9 @@ extern void mynah_cuda_decoder_close(void *, mynah_backend_decoder *);
 extern int mynah_cuda_decoder_reset(void *, mynah_backend_decoder *, char *, size_t);
 extern int mynah_cuda_decoder_step(void *, mynah_backend_decoder *, const float *,
                                    size_t, float *, char *, size_t);
+extern int mynah_cuda_decoder_step_batch(
+    void *, mynah_backend_decoder *const *, const float *const *, size_t, size_t,
+    float *const *, char *, size_t);
 extern int mynah_cuda_decoder_note_step(void *, mynah_backend_decoder *);
 extern int mynah_cuda_decoder_note_batch(void *, size_t, size_t);
 extern int mynah_cuda_note_backbone_batch(void *, size_t);
@@ -702,6 +708,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->decoder_close = mynah_cuda_decoder_close;
         backend->decoder_reset = mynah_cuda_decoder_reset;
         backend->decoder_step = mynah_cuda_decoder_step;
+        backend->decoder_step_batch = mynah_cuda_decoder_step_batch;
         backend->decoder_note_step = mynah_cuda_decoder_note_step;
         backend->decoder_note_batch = mynah_cuda_decoder_note_batch;
         backend->backbone_note_batch = mynah_cuda_note_backbone_batch;
@@ -828,6 +835,20 @@ int mynah_backend_decoder_step(const mynah_backend *backend,
     return backend->decoder_step(backend->state, decoder, dev_input,
                                  encoder_frames, dev_output, error,
                                  error_capacity);
+}
+
+int mynah_backend_decoder_step_batch(
+    const mynah_backend *backend, mynah_backend_decoder *const *decoders,
+    const float *const *dev_inputs, size_t batch, size_t encoder_frames,
+    float *const *dev_outputs, char *error, size_t error_capacity) {
+    if (backend == NULL || decoders == NULL || dev_inputs == NULL ||
+        dev_outputs == NULL || batch == 0u || encoder_frames == 0u ||
+        backend->decoder_step_batch == NULL) {
+        return 1;
+    }
+    return backend->decoder_step_batch(
+        backend->state, decoders, dev_inputs, batch, encoder_frames,
+        dev_outputs, error, error_capacity);
 }
 
 int mynah_backend_decoder_note_step(const mynah_backend *backend,
