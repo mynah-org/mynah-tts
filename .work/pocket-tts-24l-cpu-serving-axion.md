@@ -496,3 +496,36 @@ The load tool's `--json --marks` does NOT carry per-request chunk marks in soak
 mode (only summaries and windows), so a single stall cannot be attributed to a
 segment transition or a prefill from the client side today; extending the tool
 to dump per-request records is the prerequisite for that diagnosis.
+
+### Codec conv campaign: analysed, stopped by the agreed criterion
+
+Stop rule agreed with the owner: 2-3 profiled conv candidates; continue only
+with >= ~3% real serving gain, otherwise freeze the 24L baseline.
+
+Conv stack per frame (K2+K4 build, 2 threads, 78 frames, `MYNAH_CONVQ8_PROFILE`
++ `MYNAH_SEANET_PROFILE`; note the int8 rows are numeric, do not grep for
+words):
+
+| op | shape m x n x k x taps | ms/frame | GMAC/s |
+|---|---|---|---|
+| first conv int8 | 512 x 16 x 512 x 7 | 0.17 | ~171 |
+| convtr stage 1 int8 | 3072 x 16 x 512 x 1 | 0.15 | ~169 |
+| convtr stage 2 int8 | 1280 x 96 x 256 x 1 | 0.22 | ~145 |
+| convtr stage 3 int8 | 512 x 480 x 128 x 1 | 0.31 | ~103 |
+| 32-channel residual conv, f32 | 32 x 1920 x 64 x 3 | 0.46 | ~26 |
+| ELU, 10 passes | ~530 K elements | 0.36 | -- |
+
+Int8 quantisation of the window is 8.7% of the int8 time. Candidates:
+1. int8 conv/convtr GEMMs already at ~30-45% of SDOT peak and K3 showed a
+   wider kernel does not move them: no low-risk lever.
+2. ELU fusion into the following conv: upper bound ~3.4% of the wall if ELU
+   vanished entirely; touches carried frame tails and the residual branch.
+3. The 32-channel stage runs f32 ON PURPOSE: admitting it to int8 moved
+   log-mel correlation 0.9976 -> 0.9785 (`src/convq8.c`, `m < 64` refusal).
+   A faster byte-identical f32 kernel for that shape is worth ~2% at most.
+
+No candidate credibly reaches 3% real serving gain at acceptable risk (K5
+showed a ~2% local win evaporating in serving), so the campaign stops here.
+**Frozen 24L CPU baseline: C96 qualified GOOD** (K2 + K4 + segmentation,
+branch `pocket-24l-cpu-segments` at `05b5c03`); C104-C112 is a rare-stall
+edge with RTF p95 ~0.86-0.88.
