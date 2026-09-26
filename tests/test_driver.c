@@ -38,6 +38,9 @@ typedef struct {
     size_t multi_member_gangs;    /* gangs that batched more than one context */
     size_t rode_along;            /* members decoded alongside a bigger member */
     size_t withheld;              /* times ready work was NOT decoded: must be 0 */
+    size_t stepped_unprepared;    /* steps of a context mid-reprepare: must be 0 */
+    size_t reprepares;            /* segment boundaries the engine reported */
+    size_t slices;                /* prepare_slice calls */
     size_t quantum[LOG_MAX];      /* frames asked for, in call order */
     uint64_t quantum_seed[LOG_MAX];
     size_t quanta;
@@ -80,6 +83,14 @@ struct mynah_engine_ctx {
     size_t frames;         /* appended so far */
     size_t decoded;        /* handed to the driver so far */
     long   refuse_step;    /* < 0 never; otherwise refuse this step forever */
+    /* Segmented requests (the reprepare contract): the request's frames are
+     * split evenly over `segments`; each boundary needs two prepare_slice
+     * calls before the context may be stepped again. */
+    size_t segments;
+    size_t seg_index;
+    size_t seg_frames;     /* frames appended in the current segment */
+    int    prepared;
+    int    slices_done;
 };
 
 /* Pure in (seed, absolute frame, sample): independent of how the frames were
@@ -147,6 +158,8 @@ static int fake_ctx_new(const mynah_tts_model *model, mynah_engine_state *state,
     ctx->seed = seed;
     ctx->total_frames = request->topk;
     ctx->refuse_step = request->speaker == 0u ? -1 : (long)request->speaker - 1;
+    ctx->segments = request->segment_count > 1u ? request->segment_count : 1u;
+    ctx->prepared = 1;
     *out_ctx = ctx;
     return 0;
 }
@@ -167,6 +180,26 @@ static int fake_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
 
 static void fake_ctx_free(mynah_engine_ctx *ctx) { free(ctx); }
 
+/* Resumable prepare: a fresh context is ready after one call, a context back
+ * from a segment boundary after two, so the driver has to keep slicing it
+ * across steps rather than stepping it too early. */
+static int fake_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
+                              char *error, size_t capacity) {
+    (void)budget;
+    (void)error;
+    (void)capacity;
+    if (ctx == NULL || done == NULL) return -1;
+    ++g_obs.slices;
+    *done = 0;
+    if (ctx->prepared) { *done = 1; return 0; }
+    if (++ctx->slices_done >= 2) {
+        ctx->prepared = 1;
+        ctx->slices_done = 0;
+        *done = 1;
+    }
+    return 0;
+}
+
 /* Atomic over the batch, as tts_engine.h requires: every context is checked
  * before any of them is advanced, so a refusal leaves the batch exactly as it
  * found it and the driver's isolation pass is re-stepping, not double-stepping. */
@@ -186,6 +219,9 @@ static int fake_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
             pending >= expected_quantum(ctx->decoded, FAKE_EMIT_FRAMES)) {
             ++g_obs.withheld;
         }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!ctxs[i]->prepared) ++g_obs.stepped_unprepared;
     }
     for (size_t i = 0; i < count; ++i) {
         if (ctxs[i]->refuse_step >= 0 &&
@@ -210,8 +246,19 @@ static int fake_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     (void)capacity;
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
-        ctx->frames += 1u;
         memset(&results[i], 0, sizeof(results[i]));
+        const size_t per_segment = ctx->total_frames / ctx->segments;
+        if (ctx->seg_index + 1u < ctx->segments && ctx->seg_frames == per_segment) {
+            /* The boundary step appends nothing, as PocketTTS's does. */
+            ++g_obs.reprepares;
+            ++ctx->seg_index;
+            ctx->seg_frames = 0u;
+            ctx->prepared = 0;
+            results[i].reprepare = 1;
+            continue;
+        }
+        ctx->frames += 1u;
+        ctx->seg_frames += 1u;
         results[i].frames_appended = 1u;
         results[i].eos_frame = 1u;
         results[i].eos = ctx->frames >= ctx->total_frames;
@@ -335,6 +382,20 @@ static const mynah_tts_engine fake_engine_gang = {
     fake_scratch_new, fake_scratch_free,
     NULL,
     fake_decode_audio_batch,
+};
+
+/* The gang engine plus the resumable prefill: what a segmenting engine looks
+ * like to the driver. */
+static const mynah_tts_engine fake_engine_segments = {
+    "fake-segments",
+    fake_model_init, fake_model_free, fake_caps,
+    fake_ctx_new, fake_prepare, fake_reset, fake_ctx_free,
+    fake_step_batch, fake_emit_batch,
+    fake_frame_count, fake_truncate, fake_decode_audio,
+    fake_scratch_new, fake_scratch_free,
+    NULL,
+    fake_decode_audio_batch,
+    fake_prepare_slice,
 };
 
 /* ---- sinks -------------------------------------------------------------- */
@@ -631,6 +692,62 @@ int main(void) {
             }
         }
         release(got, REQUESTS);
+    }
+
+    /* ---- 6. segments: reprepare keeps one stream and never steps early ---- *
+     * Every request split into segments. Each boundary reports reprepare,
+     * the driver slices the next prefill (two calls here) before stepping
+     * again, and the audio is byte-identical to the unsegmented run: the frame
+     * history is one contiguous stream across the boundaries. */
+    {
+        const scenario even[REQUESTS] = {
+            {24u, 0u}, {12u, 0u}, {30u, 0u}, {6u, 0u},
+            {18u, 0u}, {9u, 0u},  {21u, 0u}, {15u, 0u},
+        };
+        const size_t segs[REQUESTS] = {3u, 2u, 3u, 2u, 3u, 3u, 3u, 3u};
+        size_t lens[REQUESTS][3];
+        mynah_tts_request plain[REQUESTS], split[REQUESTS];
+        capture want[REQUESTS], got[REQUESTS];
+        build_requests(plain, even, REQUESTS);
+        build_requests(split, even, REQUESTS);
+        size_t boundaries = 0u;
+        for (size_t i = 0; i < REQUESTS; ++i) {
+            /* The fake ignores the lengths; they only have to be a valid
+             * segmentation of the request's text for the struct's contract. */
+            for (size_t k = 0; k < segs[i]; ++k) lens[i][k] = 1u;
+            lens[i][segs[i] - 1u] = split[i].text_length - (segs[i] - 1u);
+            split[i].segment_lengths = lens[i];
+            split[i].segment_count = segs[i];
+            boundaries += segs[i] - 1u;
+        }
+        memset(&g_obs, 0, sizeof(g_obs));
+        if (run(&fake_engine_segments, plain, REQUESTS, BATCH_WIDTH, want, results,
+                errors) != 0) {
+            release(want, REQUESTS);
+            return fail("the unsegmented reference run reported a failure");
+        }
+        memset(&g_obs, 0, sizeof(g_obs));
+        if (run(&fake_engine_segments, split, REQUESTS, BATCH_WIDTH, got, results,
+                errors) != 0) {
+            release(want, REQUESTS);
+            release(got, REQUESTS);
+            return fail("the segmented run reported a failure");
+        }
+        int bad = 0;
+        for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+            if (results[i] != MYNAH_GRAPH_OK) bad = 1;
+            else if (!same_audio(&got[i], &want[i])) bad = 2;
+        }
+        if (bad == 0 && g_obs.stepped_unprepared != 0u) bad = 3;
+        if (bad == 0 && g_obs.reprepares != boundaries) bad = 4;
+        if (bad == 0 && g_obs.slices < REQUESTS + 2u * boundaries) bad = 5;
+        release(want, REQUESTS);
+        release(got, REQUESTS);
+        if (bad == 1) return fail("a segmented request failed");
+        if (bad == 2) return fail("segmentation changed a request's audio stream");
+        if (bad == 3) return fail("the driver stepped a context mid-reprepare");
+        if (bad == 4) return fail("the engine's segment boundaries were not all reached");
+        if (bad == 5) return fail("a boundary's prefill was not sliced again");
     }
 
     /* Restore the healthy requests for anything added after this point. */

@@ -1035,6 +1035,18 @@ struct mynah_engine_ctx {
     /* A resumable prefill is in flight: the prologue has run and the text is
      * partly in the KV cache. Never 1 at the same time as `prepared`. */
     int seeding;
+    /* Text segmentation (mynah_tts_request.segment_lengths). `text_ids` and
+     * `text_length` always describe the CURRENT segment; `seg_all` keeps every
+     * segment's ids so the next one can be copied in. Each segment is its own
+     * utterance from the voice prefix -- upstream's per-chunk generation --
+     * while the frame history and the codec state run straight through, so the
+     * driver sees one monotonic stream. NULL/0 means one segment. */
+    int *seg_all;
+    size_t *seg_lengths;
+    size_t seg_count;
+    size_t seg_index;
+    size_t seg_frame0;     /* first frame of the current segment */
+    int segment_pending;   /* the segment ended; the next one needs its prologue */
     int eos;
     /* The step budget was reached before EOS.  Kept as a flag rather than
      * reported as an error: the driver has no budget check of its own, and a
@@ -1648,7 +1660,7 @@ static int pocket_cuda_condition_batch(mynah_engine_ctx *const *ctxs,
         mynah_engine_ctx *ctx = ctxs[i];
         if (ctx == NULL || ctx->state != state || ctx->step_input == NULL)
             return 1;
-        const float *previous = ctx->frames > 0u
+        const float *previous = ctx->frames > ctx->seg_frame0
             ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
             : state->bos_emb;
         memcpy(scratch->cuda_host_input + i * cfg->latent_dim,
@@ -5851,6 +5863,8 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     ingot_st_close(ctx->voice_file);
     free(ctx->voice_kv);
     free(ctx->text_ids);
+    free(ctx->seg_all);
+    free(ctx->seg_lengths);
     free(ctx->text_embed);
     pocket_cuda_host_buffer_free(ctx->state, ctx->step_input,
                                  ctx->step_input_host_pinned);
@@ -6005,6 +6019,39 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
             return -1;
         }
         ctx->text_ids[i] = id;
+    }
+
+    /* Segments, when the caller split the text (src/text_segment.h). The whole
+     * text stays the allocation ceiling (`text_capacity`), and `text_length`
+     * becomes the first segment's: every later path already reads the current
+     * text through those two fields. */
+    if (request->segment_count > 1u) {
+        size_t sum = 0u;
+        int bad = request->segment_lengths == NULL;
+        for (size_t s = 0; !bad && s < request->segment_count; ++s) {
+            const size_t len = request->segment_lengths[s];
+            if (len == 0u || pocket_add(sum, len, &sum) != 0) bad = 1;
+        }
+        if (bad || sum != ctx->text_length) {
+            pocket_ctx_free(ctx);
+            pocket_error(error, capacity,
+                         "pocket: %zu text segments do not add up to the %zu text "
+                         "tokens", request->segment_count, ctx->text_length);
+            return -1;
+        }
+        ctx->seg_all = (int *)malloc(ctx->text_length * sizeof(*ctx->seg_all));
+        ctx->seg_lengths =
+            (size_t *)malloc(request->segment_count * sizeof(*ctx->seg_lengths));
+        if (ctx->seg_all == NULL || ctx->seg_lengths == NULL) {
+            pocket_ctx_free(ctx);
+            pocket_error(error, capacity, "out of memory copying the text segments");
+            return -1;
+        }
+        memcpy(ctx->seg_all, ctx->text_ids, ctx->text_length * sizeof(*ctx->seg_all));
+        memcpy(ctx->seg_lengths, request->segment_lengths,
+               request->segment_count * sizeof(*ctx->seg_lengths));
+        ctx->seg_count = request->segment_count;
+        ctx->text_length = ctx->seg_lengths[0];
     }
 
     /* ---- the text-chunk seam, E2-5 -------------------------------------
@@ -6362,9 +6409,45 @@ static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
  * The split is where it is because of the measurement: this part is ~15 ms and
  * flat in text length, the part after it is 190 ms for a long text and linear
  * in it. Only the linear part is worth interrupting. */
+static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capacity);
+
+/* Point `text_ids`/`text_length` at segment `index`. */
+static void pocket_segment_select(mynah_engine_ctx *ctx, size_t index) {
+    size_t start = 0u;
+    for (size_t s = 0; s < index; ++s) start += ctx->seg_lengths[s];
+    memcpy(ctx->text_ids, ctx->seg_all + start,
+           ctx->seg_lengths[index] * sizeof(*ctx->text_ids));
+    ctx->text_length = ctx->seg_lengths[index];
+    ctx->seg_index = index;
+}
+
+/* The prologue of segment 2..N. Upstream generates each chunk from a fresh
+ * copy of the voice state, so the backbone, its KV, the flow head and the EOS
+ * bookkeeping restart exactly as for a new request. What does NOT restart is
+ * everything the driver sees -- the frame count, the step count and budget,
+ * the RNG and the codec. The codec is a deliberate divergence: upstream opens a
+ * new Mimi state per chunk and concatenates the audio; here the causal decoder
+ * runs straight through the boundary, which avoids a decoder warm-up transient
+ * inside one response. The first latent of the segment is conditioned on BOS
+ * (`seg_frame0`), not on the previous segment's last latent. */
+static int pocket_segment_prologue(mynah_engine_ctx *ctx, char *error,
+                                   size_t capacity) {
+    pocket_segment_select(ctx, ctx->seg_index + 1u);
+    ctx->seg_frame0 = ctx->frames;
+    ctx->segment_pending = 0;
+    mynah_transformer_ar_state_reset(ctx->backbone);
+    mynah_flow_head_reset(ctx->flow);
+    ctx->eos_step = SIZE_MAX;
+    ctx->eos_logit = 0.0f;
+    ctx->cuda_backbone_valid = 0;
+    return pocket_seed_backbone(ctx, error, capacity);
+}
+
 static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capacity) {
     const mynah_engine_state *state = ctx->state;
-    const pocket_config *cfg = &state->cfg;
+    if (ctx->seg_count > 1u) pocket_segment_select(ctx, 0u);
+    ctx->seg_frame0 = 0u;
+    ctx->segment_pending = 0;
 
     mynah_transformer_ar_state_reset(ctx->backbone);
     mynah_transformer_ar_state_reset(ctx->codec_transformer);
@@ -6404,7 +6487,15 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
         ctx->dump->frames = 0;
         ctx->dump->decoded = 0;
     }
+    return pocket_seed_backbone(ctx, error, capacity);
+}
 
+/* The voice KV prefix and the conditioner lookup of the current text: the part
+ * of a prologue that every utterance -- a request or one of its segments --
+ * starts from. It ends with the text prefill at zero. */
+static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capacity) {
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
     const pocket_voice *voice = &state->voices[ctx->speaker];
     size_t attn_dim = 0;
     size_t layer_stride = 0;
@@ -6501,7 +6592,8 @@ static int pocket_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
     const int depth = mynah_region_depth();
     int rc = 0;
     if (!ctx->seeding) {
-        rc = pocket_seed_prologue(ctx, error, capacity);
+        rc = ctx->segment_pending ? pocket_segment_prologue(ctx, error, capacity)
+                                  : pocket_seed_prologue(ctx, error, capacity);
         if (rc == 0) ctx->seeding = 1;
     } else {
         rc = pocket_text_flush_limited(ctx, !ctx->text_open, budget, error, capacity);
@@ -6566,7 +6658,9 @@ static int pocket_prepare_slice_batch(
     const int depth = mynah_region_depth();
     for (size_t i = 0; i < count; ++i) {
         if (ctxs[i]->seeding) continue;
-        if (pocket_seed_prologue(ctxs[i], error, capacity) != 0) {
+        if ((ctxs[i]->segment_pending
+                 ? pocket_segment_prologue(ctxs[i], error, capacity)
+                 : pocket_seed_prologue(ctxs[i], error, capacity)) != 0) {
             mynah_region_unwind(depth);
             mynah_region_end(MYNAH_RGN_PREPARE);
             return -1;
@@ -6869,7 +6963,7 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         if (!will_step[i]) continue;
         /* BOS is a tracked fact, not a NaN: no latent yet means bos_emb. */
         const float *previous =
-            (ctx->frames > 0)
+            (ctx->frames > ctx->seg_frame0)
                 ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
                 : state->bos_emb;
         /* The previous latent's embedding is [1024][32], 128 KB: small enough
@@ -7083,7 +7177,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             ++ctx->dump->steps;
         }
         if (ctx->eos_step == SIZE_MAX && ctx->eos_logit > cfg->eos_threshold &&
-            ctx->frames >= cfg->min_audio_frames) {
+            ctx->frames - ctx->seg_frame0 >= cfg->min_audio_frames) {
             ctx->eos_step = ctx->step;
         }
         /* The crossing itself does not end the request: upstream emits its
@@ -7092,8 +7186,21 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
          * single frame is invalid, hence eos_frame 0 and nothing appended. */
         if (ctx->eos_step != SIZE_MAX &&
             ctx->step >= ctx->eos_step + ctx->frames_after_eos) {
-            ctx->eos = 1;
             ++ctx->step;
+            if (ctx->seg_index + 1u < ctx->seg_count) {
+                /* End of a segment, not of the request: the next segment's
+                 * prologue and prefill run through `prepare_slice`, and until
+                 * they finish the context must not look ready to anyone. */
+                ctx->prepared = 0;
+                ctx->seeding = 0;
+                ctx->segment_pending = 1;
+                results[i].reprepare = 1;
+                results[i].eos_frame = 0u;
+                results[i].frames_appended = 0u;
+                mynah_region_end(MYNAH_RGN_EMIT);
+                continue;
+            }
+            ctx->eos = 1;
             results[i].eos = 1;
             results[i].eos_frame = 0u;
             results[i].frames_appended = 0u;

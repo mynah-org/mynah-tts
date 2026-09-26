@@ -70,6 +70,7 @@
 #include "mynah_util.h"   /* mynah_rss_bytes / _peak: E12-11 */
 #include "mynah_tts.h"
 #include "tokenizer_sentencepiece.h"
+#include "text_segment.h"
 #include "tokenizer.h"
 #include "threads.h"
 
@@ -259,6 +260,7 @@ typedef struct synth_job {
     /* Filled in before the job is published; read-only from then on. */
     mynah_tts_request request;
     int *text_ids;                 /* owned: the request points into this */
+    size_t *segment_lengths;       /* owned, NULL unless the text was segmented */
     int want_pcm;
 
     /* E5-20. A warm-up job is an ordinary job with no client behind it: same
@@ -374,6 +376,7 @@ static void job_release(synth_job *j) {
      * life by exactly the number of warm-ups it ran. */
     if (!j->is_warmup) mynah_prefork_conn_done();
     free(j->text_ids);
+    free(j->segment_lengths);
     mynah_tts_free_samples(j->samples);
     pthread_cond_destroy(&j->done_cv);
     pthread_mutex_destroy(&j->mu);
@@ -1219,8 +1222,19 @@ static int handle_speech(int fd, const mynah_json_value *body) {
 
     int *ids = NULL;
     size_t id_count = 0;
+    size_t *segment_lengths = NULL;
+    size_t segment_count = 0;
     char err[512];
-    const int encode_failed = g.sp != NULL
+    /* Upstream Pocket's per-chunk generation (src/text_segment.h), opt-in
+     * while it is being measured: MYNAH_POCKET_SEGMENT_TOKENS=50 is upstream's
+     * max_tokens. Only a SentencePiece (Pocket) pack has the engine hook. */
+    const size_t segment_tokens = mynah_text_segment_tokens_from_env();
+    const int encode_failed = g.sp != NULL && segment_tokens > 0u
+        ? mynah_text_segment(g.sp, text, segment_tokens,
+                             mynah_text_segment_first_tokens_from_env(), &ids,
+                             &id_count, &segment_lengths, &segment_count, err,
+                             sizeof(err))
+        : g.sp != NULL
         ? mynah_sp_encode(g.sp, text, strlen(text), &ids, &id_count, err, sizeof(err))
         : mynah_tokenizer_encode(g.tokenizer, language, text, &ids, &id_count,
                                  err, sizeof(err));
@@ -1239,6 +1253,8 @@ static int handle_speech(int fd, const mynah_json_value *body) {
     request.topk = topk > 0.0 ? (unsigned)topk : g.info.default_topk;
     request.use_local_transformer = 1;
     request.seed = (uint64_t)seed;
+    request.segment_lengths = segment_lengths;
+    request.segment_count = segment_count;
 
     /* From here the descriptor belongs to the job. Every exit below answers
      * through job_claim_fd, so no path can close it twice, and job_release
@@ -1250,6 +1266,7 @@ static int handle_speech(int fd, const mynah_json_value *body) {
     synth_job *job = job_new(fd);
     if (job == NULL) {
         free(ids);
+        free(segment_lengths);
         send_error(fd, "503 Service Unavailable", "server_error",
                    "out of memory accepting the request");
         return 0;
@@ -1257,6 +1274,8 @@ static int handle_speech(int fd, const mynah_json_value *body) {
     job->request = request;
     job->text_ids = ids;             /* the job owns the ids, and outlives us */
     job->request.text_ids = job->text_ids;
+    job->segment_lengths = segment_lengths;
+    job->request.segment_lengths = job->segment_lengths;
     job->want_pcm = want_pcm;
     job->is_stream = stream;
     /* Rung 4 of the admission ladder, enforced where it is legal to enforce it.

@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "axion-c4a-32c-pocket-en-24l",
+    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English 24L (english_2026-04_24l) streaming. C96 is the qualified operating point (30 min, GOOD), measured with text segmentation, the int8 backbone, the wide I8MM kernel and pooled attention. Host-scoped: not a generic Arm profile.",
+    "engine": "pocket",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [
+        1,
+        120
+      ],
+      "preferred_concurrency": 96,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_family": "Google Axion / Arm Neoverse-V2",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "ram_gib": 62,
+    "isa_features_used": [
+      "asimddp",
+      "i8mm"
+    ],
+    "smt_policy": "OFF; one thread per physical core",
+    "canonical_topology": "16 workers x 2 threads, no pinning",
+    "notes": "GCP c4a, no SMT. The load generator ran on the same box for every number here, which costs ~13% coalesced client reads: the cadence percentiles are upper bounds on server lateness, not the server's true emission."
+  },
+  "build": {
+    "target": "make && make server",
+    "blas": "none",
+    "simd": "auto (arm64/native)",
+    "compiler": "gcc 15.2",
+    "requirements": {
+      "blas": "BLAS=none is the Linux default and the only setting these numbers describe. A codec measurement taken under Accelerate puts the phases in a different order and is not comparable.",
+      "isa": "ASIMDDP for the int8 codec kernels"
+    }
+  },
+  "server": {
+    "prefork_workers": 16,
+    "threads_per_worker": 2,
+    "max_batch": 8,
+    "why": "16x2 measured against 4x8 (31.5 vs ~69 audio-s/s at C48, before K2/K4) and 32x1 (worse on every column at C48): the 24L keeps the 6L's topology. max_batch 8 is reached at C112-C120 (B7/B8 modal); at C96 the modal width is B6."
+  },
+  "runtime": {
+    "matches_shipped_default": false,
+    "quant_groups": {
+      "codec_transformer": "int8",
+      "codec_conv": "int8",
+      "codec_convtr": "int8",
+      "backbone": "int8",
+      "flow_net": "f16",
+      "conditioner": "f16"
+    },
+    "environment": {
+      "MYNAH_QUANT_GROUPS": {
+        "value": "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,backbone:int8,flow_net:f16,conditioner:f16",
+        "why": "REQUIRED. The 24L's per-step weight pass is large enough that halving its bytes pays: int8 beat bf16 in serving at C48 (+16% throughput, TTFA p95 830 -> 752 ms) and passed the ASR gate (WER long 0.83% vs f32 0.87%) and a listening check. The spec replaces the whole default, so every codec group is respelled at its shipped value."
+      },
+      "MYNAH_POCKET_SEGMENT_TOKENS": {
+        "value": "50",
+        "why": "REQUIRED. Upstream's max_tokens per chunk. Without it a long text's whole prefill sits in front of the first audio: at C48 TTFA p95 743 -> 275 ms and stall@250 9 -> 0 with it."
+      },
+      "MYNAH_POCKET_FIRST_SEGMENT_TOKENS": {
+        "value": "24",
+        "why": "REQUIRED. A tighter first chunk bounds the prefill in front of first audio: ~55 ms of TTFA p95 over plain 50 at C48."
+      },
+      "MYNAH_PREFILL_SLICE": {
+        "value": "16",
+        "why": "REQUIRED. One prefill tile (TAR_PREFILL_TILE = 16): 32 gave max_gap p95 ~210 ms and stalls@500 on 24L, 16 gives ~134 ms and none. Values below 16 round up to one tile, so 8/16/24 all run 16."
+      },
+      "MYNAH_PREFILL_STEP_MS": {
+        "value": null,
+        "why": "Must be ABSENT. Inert on 24L: one 16-token slice already exceeds any cap tried (20/30/40/60 ms measured identical)."
+      },
+      "MYNAH_QMAT_I8MM_WIDE": {
+        "value": null,
+        "why": "Must be ABSENT: the wide SMMLA kernel (K2) is the default and =0 is the A/B escape hatch."
+      },
+      "MYNAH_TAR_ATTN_PARALLEL": {
+        "value": null,
+        "why": "Must be ABSENT: pooled attention (K4) is the default and =0 is the A/B escape hatch."
+      }
+    }
+  },
+  "gates": {
+    "mandatory": {
+      "rtf_p95_below": 1.0,
+      "stall_ms": 500,
+      "completed_equals_launched": true
+    },
+    "preferred": {
+      "ttfb_p95_ms": 100.0,
+      "ttfa_p95_ms": 500.0,
+      "rtf_p95": 0.9,
+      "prebuffer_p95_ms": 500.0,
+      "safe_start_p95_ms": 1000.0,
+      "stall_ms": 250
+    },
+    "drift": {
+      "rtf_tolerance": 0.05,
+      "prebuffer_tolerance_ms": 150.0,
+      "min_windows": 3
+    },
+    "soak": {
+      "bank": "tests/load_texts_en_v2.txt",
+      "bank_version": "v2 / bank-sha256 55b286369ef8dd44 / 277 texts",
+      "seconds": 1800,
+      "warmup_seconds": 40,
+      "window_seconds": 180
+    },
+    "client_contract": {
+      "prebuffer_ms": 250,
+      "why": "At the operating point the required prebuffer is 2.8 ms at p95 and max_gap p95 is 121 ms against an 80 ms frame, so the 250 ms contract holds with room. Raising MYNAH_PREFILL_STEP_MS from 30 to 40 moved max_gap p95 from 103 to 121 and bought 60 ms of TTFA: that trade is the reason the cap is a measured quantity rather than a derived one."
+    }
+  },
+  "qualification": {
+    "status": "qualified",
+    "model": "/dev/shm/p24/pocket-en-24l (official english_2026-04_24l, rev 492522650173a0653b7575cdc25ae09810e5d741, converted --dtype source)",
+    "workload": "Mixed v2 bank, streaming route /v1/audio/speech, PCM, one language pack, load generator on the same host.",
+    "operating_point": {
+      "date": "2026-09-26",
+      "version": "branch pocket-24l-cpu-segments 05b5c03",
+      "configuration": "environment-override",
+      "concurrency": 96,
+      "verdict": "GOOD",
+      "soak_seconds": 1800,
+      "requests": 43113,
+      "ttfb_p95_ms": 81.4,
+      "ttfa_p95_ms": 281.7,
+      "rtf_p95": 0.763,
+      "prebuffer_p95_ms": 14.9,
+      "safe_start_p95_ms": 285.2,
+      "max_gap_p95_ms": 267.9,
+      "stalls_250ms": 0,
+      "stalls_500ms": 0,
+      "throughput_audio_s_per_s": 126.0,
+      "evidence": "reports/20260926-24l-axion/soak96attn-30min-20260926-1533.log"
+    },
+    "ceiling": [
+      {
+        "date": "2026-09-26",
+        "version": "branch pocket-24l-cpu-segments 05b5c03",
+        "configuration": "environment-override",
+        "concurrency": 112,
+        "verdict": "MARGINAL",
+        "soak_seconds": 180,
+        "requests": 4357,
+        "ttfb_p95_ms": 89.6,
+        "ttfa_p95_ms": 322,
+        "rtf_p95": 0.872,
+        "stalls_250ms": 1,
+        "stalls_500ms": 0,
+        "evidence": ".work/pocket-tts-24l-cpu-serving-axion.md (K5 ABBA control arms; re-runs 0/0)",
+        "why_not_promoted": "A rare-stall edge: 0 to 3 stalls@250 per ~4350 requests across four 3-minute runs, RTF p95 0.86-0.88. Frontier, not a declared capacity."
+      },
+      {
+        "date": "2026-09-26",
+        "version": "branch pocket-24l-cpu-segments 05b5c03",
+        "configuration": "environment-override",
+        "concurrency": 120,
+        "verdict": "NOT STREAMABLE",
+        "soak_seconds": 180,
+        "requests": 4433,
+        "ttfb_p95_ms": 95.4,
+        "ttfa_p95_ms": 344,
+        "rtf_p95": 0.951,
+        "stalls_250ms": 7,
+        "stalls_500ms": 1,
+        "evidence": ".work/pocket-tts-24l-cpu-serving-axion.md (K2+K4 ladder)",
+        "why_not_promoted": "Throughput plateau ~114 audio-s/s: RTF p95 0.951 and a stall@500."
+      }
+    ],
+    "history": [
+      {
+        "date": "2026-09-25",
+        "configuration": "environment-override",
+        "concurrency": 64,
+        "verdict": "NOT QUOTABLE",
+        "soak_seconds": 600,
+        "requests": 8391,
+        "stalls_250ms": 707,
+        "stalls_500ms": 241,
+        "evidence": ".work/pocket-tts-24l-cpu-serving-axion.md",
+        "why_not_promoted": "Before segmentation: RTF p95 0.974, long-text prefill in front of first audio."
+      },
+      {
+        "date": "2026-09-26",
+        "version": "segmentation, pair I8MM kernel",
+        "configuration": "environment-override",
+        "concurrency": 64,
+        "verdict": "MARGINAL",
+        "soak_seconds": 1800,
+        "requests": 28328,
+        "ttfb_p95_ms": 102.8,
+        "ttfa_p95_ms": 341.1,
+        "rtf_p95": 0.78,
+        "stalls_250ms": 20,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 82.8,
+        "evidence": "reports/20260926-24l-axion/soak64-30min-20260926-1135.log"
+      },
+      {
+        "date": "2026-09-26",
+        "version": "segmentation + K2 wide I8MM",
+        "configuration": "environment-override",
+        "concurrency": 80,
+        "verdict": "MARGINAL",
+        "soak_seconds": 1800,
+        "requests": 35175,
+        "ttfb_p95_ms": 86.3,
+        "ttfa_p95_ms": 311.7,
+        "rtf_p95": 0.771,
+        "stalls_250ms": 1,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 102.9,
+        "evidence": "reports/20260926-24l-axion/soak80wide-30min-20260926-1422.log"
+      },
+      {
+        "date": "2026-09-26",
+        "version": "branch pocket-24l-cpu-segments 05b5c03",
+        "configuration": "environment-override",
+        "concurrency": 96,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 43113,
+        "ttfb_p95_ms": 81.4,
+        "ttfa_p95_ms": 281.7,
+        "rtf_p95": 0.763,
+        "prebuffer_p95_ms": 14.9,
+        "safe_start_p95_ms": 285.2,
+        "max_gap_p95_ms": 267.9,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 126.0,
+        "evidence": "reports/20260926-24l-axion/soak96attn-30min-20260926-1533.log"
+      }
+    ],
+    "notes": "~C48 (2026-09-25) -> C64 with text segmentation -> C80 with the wide I8MM kernel -> C96 qualified GOOD with pooled attention, on one host and one bank; the 6L small is qualified at C120 on the same host. K3 (wide conv dots) and K5 (NEON attention schedule) were measured and rejected. The codec conv stack was analysed and left alone: no candidate clears ~3% serving gain."
+  }
+}

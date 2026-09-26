@@ -64,6 +64,12 @@ typedef struct {
     unsigned eos_frame;
     unsigned frames_appended;
     int      failed;                /* per request; siblings keep running */
+    /* The request finished a text segment and has another one: it is NOT
+     * finished, but it is not ready for the next step either. The driver moves
+     * it back to preparing and finishes the next segment's prefill through
+     * `prepare_slice`, behind the audio it has already emitted. Only an engine
+     * that has `prepare_slice` may set it. Appended; see the vtable note. */
+    int      reprepare;
 } mynah_engine_step_result;
 
 /* The vtable below is APPENDABLE, and that is a load-bearing property rather
