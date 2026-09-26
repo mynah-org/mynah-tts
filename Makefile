@@ -169,7 +169,7 @@ STAMP_WRITE := $(shell mkdir -p $(BUILD_DIR) && \
 	fi)
 
 
-CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/sgemm_rt.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/sgemm_rt.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/text_segment.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
 # E14-4.  On x86 src/sgemm.c is built TWICE and src/sgemm_rt.c picks between
 # them at runtime; everywhere else it is built once as before.  The reason it
