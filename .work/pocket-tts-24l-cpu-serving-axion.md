@@ -529,3 +529,24 @@ showed a ~2% local win evaporating in serving), so the campaign stops here.
 **Frozen 24L CPU baseline: C96 qualified GOOD** (K2 + K4 + segmentation,
 branch `pocket-24l-cpu-segments` at `05b5c03`); C104-C112 is a rare-stall
 edge with RTF p95 ~0.86-0.88.
+
+### 6L regression check of the branch (2026-09-26 16:47 UTC)
+
+Shipped default (nothing exported, segmentation off), 6L `models/pocket-en`,
+C120, 16x2 mb8, 3 minutes, ABBA `bea336c` vs branch `pocket-24l-cpu-segments`
+(`reports/20260926-24l-axion/small-*`):
+
+| | bea336c | branch (K2 + K4) |
+|---|---|---|
+| verdict | GOOD, GOOD | GOOD, GOOD |
+| TTFA p95 | 321, 326 ms | **244, 245 ms** |
+| TTFB p95 | 76.0, 76.0 ms | 65.5, 63.9 ms |
+| RTF p95 | 0.809, 0.813 | **0.671, 0.667** |
+| stall@250 / @500 | 0/0, 0/0 | 0/0, 0/0 |
+| audio-s/s | 139.5, 138.9 | **170.3, 171.1 (+22%)** |
+
+No regression: WAV byte-identical to `bea336c` in the default configuration, and
+the runtime-general changes (K4 pooled attention on the bf16 backbone and the
+codec, K2 on the int8 codec transformer) lift the 6L too. The 6L ceiling above
+C120 on this branch is unmeasured; `configs/perf/axion-c4a-32c-pocket-en.json`
+still describes `bea336c` numbers.
