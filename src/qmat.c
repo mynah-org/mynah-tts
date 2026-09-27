@@ -3766,6 +3766,124 @@ static void matvec_q8_pair_i8mm(float *out0, float *out1,
                   bias == NULL ? NULL : bias + row, rows - row, cols, QMAT_U8_OFF);
     }
 }
+
+/* Up to eight activations against one pass over a weight block: 2*NP
+ * activations (NP SMMLA pairs) x four weight rows per iteration.
+ *
+ * WHY. The pair kernel above reads the whole weight matrix once per TWO
+ * activations, so a B4 decode step walks the 24L backbone's 302 MB twice and a
+ * 16-row prefill or codec tile eight times. Measured on Axion (Neoverse-V2,
+ * 2 threads, 24L int8): the pair path costs ~12.5 ms per weight pass, and
+ * forcing the SDOT x4 kernel instead (MYNAH_QMAT_I8MM=0, one pass per four
+ * activations) already cut B4 29.2 -> 25.0 ms and the prefill projections by
+ * 41% with byte-identical audio. This kernel keeps SMMLA's 32 MACs per
+ * instruction AND reads each weight block once per eight activations.
+ *
+ * LAYOUT. Both operands are loaded 16 bytes at a time and split into SMMLA's
+ * 2x8 operand form with a 64-bit zip, so neither weights nor activations are
+ * repacked: vzip1q_s64(w0, w1) is (w0[j:j+8], w1[j:j+8]).
+ *
+ * EXACT. Every (weight row, activation) dot product is an int32 sum of the same
+ * products as SDOT and the pair kernel compute; only the grouping of exact
+ * integer additions changes. The float epilogue is the shared
+ * qmat_row_scale()/qmat_row_epilogue(), so a row rounds identically on every
+ * path -- the property self_test_batch_membership() and the forced on/off
+ * comparison in mynah_qmat_self_test() check. A padded activation slot repeats
+ * a real one and writes the same address with the same value. */
+__attribute__((target("+i8mm"))) __attribute__((always_inline))
+static inline void matvec_q8_i8mm_np(int np, float *const *out,
+                                     const int8_t *const *x, const float *sx,
+                                     const int8_t *weights, const float *scales,
+                                     const float *bias, size_t rows, size_t cols) {
+    size_t row = 0;
+    for (; row + 4u <= rows; row += 4u) {
+        const int8_t *w0 = weights + row * cols;
+        const int8_t *w1 = w0 + cols;
+        const int8_t *w2 = w1 + cols;
+        const int8_t *w3 = w2 + cols;
+        int32x4_t acc01[4], acc23[4];
+        for (int p = 0; p < np; ++p) {
+            acc01[p] = vdupq_n_s32(0);
+            acc23[p] = vdupq_n_s32(0);
+        }
+        size_t j = 0;
+        for (; j + 16u <= cols; j += 16u) {
+            const int64x2_t r0 = vreinterpretq_s64_s8(vld1q_s8(w0 + j));
+            const int64x2_t r1 = vreinterpretq_s64_s8(vld1q_s8(w1 + j));
+            const int64x2_t r2 = vreinterpretq_s64_s8(vld1q_s8(w2 + j));
+            const int64x2_t r3 = vreinterpretq_s64_s8(vld1q_s8(w3 + j));
+            const int8x16_t w01lo = vreinterpretq_s8_s64(vzip1q_s64(r0, r1));
+            const int8x16_t w01hi = vreinterpretq_s8_s64(vzip2q_s64(r0, r1));
+            const int8x16_t w23lo = vreinterpretq_s8_s64(vzip1q_s64(r2, r3));
+            const int8x16_t w23hi = vreinterpretq_s8_s64(vzip2q_s64(r2, r3));
+            for (int p = 0; p < np; ++p) {
+                const int64x2_t xa = vreinterpretq_s64_s8(vld1q_s8(x[2 * p] + j));
+                const int64x2_t xb = vreinterpretq_s64_s8(vld1q_s8(x[2 * p + 1] + j));
+                const int8x16_t xlo = vreinterpretq_s8_s64(vzip1q_s64(xa, xb));
+                const int8x16_t xhi = vreinterpretq_s8_s64(vzip2q_s64(xa, xb));
+                acc01[p] = vmmlaq_s32(acc01[p], w01lo, xlo);
+                acc23[p] = vmmlaq_s32(acc23[p], w23lo, xlo);
+                acc01[p] = vmmlaq_s32(acc01[p], w01hi, xhi);
+                acc23[p] = vmmlaq_s32(acc23[p], w23hi, xhi);
+            }
+        }
+        for (int p = 0; p < np; ++p) {
+            /* lanes: (wA . xa, wA . xb, wB . xa, wB . xb) */
+            int32_t s[4][2];
+            s[0][0] = vgetq_lane_s32(acc01[p], 0); s[0][1] = vgetq_lane_s32(acc01[p], 1);
+            s[1][0] = vgetq_lane_s32(acc01[p], 2); s[1][1] = vgetq_lane_s32(acc01[p], 3);
+            s[2][0] = vgetq_lane_s32(acc23[p], 0); s[2][1] = vgetq_lane_s32(acc23[p], 1);
+            s[3][0] = vgetq_lane_s32(acc23[p], 2); s[3][1] = vgetq_lane_s32(acc23[p], 3);
+            const int8_t *wr[4] = {w0, w1, w2, w3};
+            for (int h = 0; h < 2; ++h) {
+                const int8_t *xv = x[2 * p + h];
+                for (size_t t = j; t < cols; ++t)
+                    for (int r = 0; r < 4; ++r) s[r][h] += (int32_t)wr[r][t] * (int32_t)xv[t];
+                for (int r = 0; r < 4; ++r) {
+                    const size_t rr = row + (size_t)r;
+                    out[2 * p + h][rr] = qmat_row_epilogue(
+                        s[r][h], qmat_row_scale(scales[rr], sx[2 * p + h]),
+                        bias == NULL ? 0.0f : bias[rr]);
+                }
+            }
+        }
+    }
+    if (row < rows) {
+        for (int a = 0; a < 2 * np; ++a)
+            matvec_q8(out[a] + row, x[a], sx[a], weights + row * cols, scales + row,
+                      NULL, bias == NULL ? NULL : bias + row, rows - row, cols,
+                      QMAT_U8_OFF);
+    }
+}
+
+__attribute__((target("+i8mm")))
+static void matvec_q8_i8mm_x4(float *const *out, const int8_t *const *x,
+                              const float *sx, const int8_t *w, const float *sc,
+                              const float *bias, size_t rows, size_t cols) {
+    matvec_q8_i8mm_np(2, out, x, sx, w, sc, bias, rows, cols);
+}
+__attribute__((target("+i8mm")))
+static void matvec_q8_i8mm_x6(float *const *out, const int8_t *const *x,
+                              const float *sx, const int8_t *w, const float *sc,
+                              const float *bias, size_t rows, size_t cols) {
+    matvec_q8_i8mm_np(3, out, x, sx, w, sc, bias, rows, cols);
+}
+__attribute__((target("+i8mm")))
+static void matvec_q8_i8mm_x8(float *const *out, const int8_t *const *x,
+                              const float *sx, const int8_t *w, const float *sc,
+                              const float *bias, size_t rows, size_t cols) {
+    matvec_q8_i8mm_np(4, out, x, sx, w, sc, bias, rows, cols);
+}
+
+/* MYNAH_QMAT_I8MM_WIDE=0 keeps the pair kernel for every width (A/B switch). */
+static int qmat_i8mm_wide(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("MYNAH_QMAT_I8MM_WIDE");
+        cached = !(env != NULL && strcmp(env, "0") == 0);
+    }
+    return cached;
+}
 #endif /* MYNAH_QMAT_ARM_I8MM */
 
 /* ------------------------------------------------- weight-stationary batching
@@ -3850,6 +3968,28 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         const float *sc = e->scales + row0;
         const float *bs = j->bias == NULL ? NULL : j->bias + row0;
         size_t b = 0;
+        /* Groups of up to eight share one pass over the weight block. A short
+         * group pads by repeating its last activation (same address, same
+         * integer, same bits). One or two left fall through to the pair and
+         * single kernels exactly as before. */
+        while (qmat_i8mm_wide() && j->batch - b >= 3u) {
+            size_t take = j->batch - b;
+            if (take > 8u) take = 8u;
+            const size_t lanes = take <= 4u ? 4u : (take <= 6u ? 6u : 8u);
+            float *o[8];
+            const int8_t *xs[8];
+            float s[8];
+            for (size_t a = 0; a < lanes; ++a) {
+                const size_t src = b + (a < take ? a : take - 1u);
+                o[a] = j->out[src] + row0;
+                xs[a] = qx + src * j->cols;
+                s[a] = j->sx[src];
+            }
+            if (lanes == 4u) matvec_q8_i8mm_x4(o, xs, s, wb, sc, bs, count, j->cols);
+            else if (lanes == 6u) matvec_q8_i8mm_x6(o, xs, s, wb, sc, bs, count, j->cols);
+            else matvec_q8_i8mm_x8(o, xs, s, wb, sc, bs, count, j->cols);
+            b += take;
+        }
         for (; b + 2u <= j->batch; b += 2u) {
             matvec_q8_pair_i8mm(j->out[b] + row0, j->out[b + 1u] + row0,
                                 qx + b * j->cols, qx + (b + 1u) * j->cols,
@@ -6336,7 +6476,7 @@ static int self_test_i8mm_ab(char *error, size_t error_capacity) {
     /* Odd and even on both axes; K covers a k with and without a 16-byte tail. */
     static const size_t rows[4] = { 96u, 13u, 64u, 7u };
     static const size_t cols[4] = { 256u, 37u, 128u, 40u };
-    enum { BMAX = 5 };
+    enum { BMAX = 9 };   /* 9 = one x8 group plus a single */
     int status = -1;
     const int saved = mynah_qmat_i8mm_force(-1);
     mynah_qmat_cache *cache = mynah_qmat_cache_new(QMAT_INT8);

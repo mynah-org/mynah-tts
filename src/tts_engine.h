@@ -53,6 +53,11 @@ typedef struct {
      * branching on this is the bug this whole seam exists to prevent. */
     unsigned is_discrete_codec;
     unsigned latent_dim;            /* 0 when is_discrete_codec */
+    /* Tokens per resumable prefill slice when MYNAH_PREFILL_SLICE is unset;
+     * 0 = the driver's default. A property of what one prefill token costs
+     * for this model, which is why the engine and not the driver owns it.
+     * Appended; see the vtable note. */
+    unsigned prefill_slice_tokens;
 } mynah_engine_caps;
 
 typedef struct {
@@ -64,6 +69,12 @@ typedef struct {
     unsigned eos_frame;
     unsigned frames_appended;
     int      failed;                /* per request; siblings keep running */
+    /* The request finished a text segment and has another one: it is NOT
+     * finished, but it is not ready for the next step either. The driver moves
+     * it back to preparing and finishes the next segment's prefill through
+     * `prepare_slice`, behind the audio it has already emitted. Only an engine
+     * that has `prepare_slice` may set it. Appended; see the vtable note. */
+    int      reprepare;
 } mynah_engine_step_result;
 
 /* The vtable below is APPENDABLE, and that is a load-bearing property rather

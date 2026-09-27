@@ -187,6 +187,14 @@ typedef struct {
     /* Admission order, for the FIFO prefill policy. Monotone per serve loop;
      * only compared, never used as an index. */
     unsigned long long prep_seq;
+    /* The engine finished a text segment and the slot went back to preparing
+     * for the next one; the serve loop gives it a fresh `prep_seq`, which puts
+     * it BEHIND every prefill already waiting -- a continuation has audio in
+     * the client's buffer, a new request has none. */
+    int requeue;
+    /* Profiling only: the slot is preparing a continuation segment, not its
+     * first one. Cleared when that prefill completes. */
+    int continuation;
     /* decoder lane (E5-21). `lane_busy` means this slot owns mailbox entry
      * `index` -- a unit is running, or has finished and not been reaped.
      * `streamed_frames` is advanced at SUBMIT, not at delivery, so the range
@@ -230,19 +238,27 @@ static int slot_fail(synth_slot *slot, const char *message) {
  *
  * 32 with a 60 ms cap is the qualified point: C90 for thirty minutes, 53265
  * requests, every gate passed. `MYNAH_PREFILL_SLICE=0` restores the one-shot
- * prefill exactly, which is how the first table was measured. */
-static size_t prefill_slice_budget(void) {
-    static size_t cached = SIZE_MAX;
-    if (cached != SIZE_MAX) return cached;
-    const char *env = getenv("MYNAH_PREFILL_SLICE");
-    long v = 32;
-    if (env != NULL && *env != '\0') {
-        char *end = NULL;
-        const long parsed = strtol(env, &end, 10);
-        if (end != env && parsed >= 0 && parsed < 1000000L) v = parsed;
+ * prefill exactly, which is how the first table was measured.
+ *
+ * 32 is the driver's default; an engine whose prefill token costs more says so
+ * through `caps->prefill_slice_tokens` (Pocket 24L: 16), and an exported
+ * MYNAH_PREFILL_SLICE overrides both. */
+static size_t prefill_slice_budget(const mynah_engine_caps *caps) {
+    /* -1: not read yet, -2: unset, else the exported value. */
+    static long env_value = -1;
+    if (env_value == -1) {
+        const char *env = getenv("MYNAH_PREFILL_SLICE");
+        long v = -2;
+        if (env != NULL && *env != '\0') {
+            char *end = NULL;
+            const long parsed = strtol(env, &end, 10);
+            if (end != env && parsed >= 0 && parsed < 1000000L) v = parsed;
+        }
+        env_value = v;
     }
-    cached = (size_t)v;
-    return cached;
+    if (env_value >= 0) return (size_t)env_value;
+    if (caps != NULL && caps->prefill_slice_tokens > 0u) return caps->prefill_slice_tokens;
+    return 32u;
 }
 
 /* Validate the request and the sink, then hand everything else to the engine.
@@ -273,7 +289,7 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
                         slot->error, slot->error_capacity) != 0) {
         return slot_fail(slot, NULL);
     }
-    if (engine->prepare_slice != NULL && prefill_slice_budget() != 0u) {
+    if (engine->prepare_slice != NULL && prefill_slice_budget(caps) != 0u) {
         /* Not one byte of prefill here: the whole point is that admission stops
          * being a place where the batch can lose several frame periods. */
         slot->preparing = 1;
@@ -423,12 +439,22 @@ static int prefill_fifo(void) {
     return cached;
 }
 
+/* MYNAH_SERVE_PROFILE accounting of the prefill pass: wall seconds and slice
+ * counts, split into first-segment [0] and continuation-segment [1] work. */
+typedef struct {
+    double seconds[2];
+    size_t slices[2];
+    size_t completed[2];
+} prefill_acct;
+
 static void slots_prefill_slice(const mynah_tts_engine *engine,
+                                const mynah_engine_caps *caps,
                                 mynah_engine_scratch *scratch,
                                 synth_slot *slots, size_t resident_rows,
-                                size_t batch_limit, int dump, size_t *rr) {
+                                size_t batch_limit, int dump, size_t *rr,
+                                prefill_acct *acct) {
     if (resident_rows == 0u) return;
-    const size_t budget = prefill_slice_budget();
+    const size_t budget = prefill_slice_budget(caps);
     const double step_budget = prefill_step_budget_s();
     const double t0 = (step_budget > 0.0) ? mynah_phase_seconds() : 0.0;
     const int fifo = prefill_fifo();
@@ -544,13 +570,23 @@ static void slots_prefill_slice(const mynah_tts_engine *engine,
         }
         ++served;
         int done = 0;
-        if (engine->prepare_slice(slot->ctx, budget, &done,
-                                  slot->error, slot->error_capacity) != 0) {
+        const int kind = slot->continuation ? 1 : 0;
+        const double t_slice = acct != NULL ? mynah_phase_seconds() : 0.0;
+        const int slice_failed = engine->prepare_slice(slot->ctx, budget, &done,
+                                                       slot->error,
+                                                       slot->error_capacity) != 0;
+        if (acct != NULL) {
+            acct->seconds[kind] += mynah_phase_seconds() - t_slice;
+            ++acct->slices[kind];
+            if (done) ++acct->completed[kind];
+        }
+        if (slice_failed) {
             slot->preparing = 0;
             (void)slot_fail(slot, NULL);
             continue;
         }
         if (!done) continue;
+        slot->continuation = 0;
         slot->preparing = 0;
         if (dump && engine->debug_dump != NULL) {
             engine->debug_dump(slot->ctx, "encoder");
@@ -997,7 +1033,18 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     for (size_t j = 0; j < live; ++j) {
         synth_slot *slot = &slots[step_slot[j]];
         if (slot->failed) continue;
-        if (results[j].eos) slot->active = 0;
+        if (results[j].eos) {
+            slot->active = 0;
+        } else if (results[j].reprepare) {
+            if (engine->prepare_slice == NULL) {
+                slot_fail(slot, "the engine asked for a re-prepare it cannot run");
+                continue;
+            }
+            slot->active = 0;
+            slot->preparing = 1;
+            slot->requeue = 1;
+            slot->continuation = 1;
+        }
     }
 }
 
@@ -1152,6 +1199,9 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * distinction that decides whether a level failed on capacity or on
      * variance. */
     const int serve_profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
+    const double t_profile0 = serve_profile ? mynah_phase_seconds() : 0.0;
+    prefill_acct prefill_profile;
+    memset(&prefill_profile, 0, sizeof(prefill_profile));
     size_t occ_hist[MYNAH_GRAPH_MAX_JOBS + 1u];
     size_t occ_frames = 0, occ_admits = 0, occ_free_nothing_queued = 0;
     double occ_blocked_s = 0.0;
@@ -1274,8 +1324,9 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         if (engine->prepare_slice != NULL) {
             const size_t prefill_rows = compact_rows ? used : slot_capacity;
             if (prefill_rows != 0u)
-                slots_prefill_slice(engine, scratch, slots, prefill_rows,
-                                    max_batch, dump_all, &prefill_rr);
+                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
+                                    max_batch, dump_all, &prefill_rr,
+                                    serve_profile ? &prefill_profile : NULL);
         }
 
         /* ---- one bounded step over the live set -----------------------
@@ -1305,6 +1356,11 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             const double t_step = serve_profile ? mynah_phase_seconds() : 0.0;
             step_live(engine, &caps, scratch, slots, step_ctxs, step_slot, results,
                       live, dump_all, lane_on);
+            for (size_t i = 0; i < resident_rows; ++i) {
+                if (!slots[i].requeue) continue;
+                slots[i].requeue = 0;
+                slots[i].prep_seq = prep_seq_next++;
+            }
             if (serve_profile) {
                 const double took = mynah_phase_seconds() - t_step;
                 const size_t b = live <= max_batch ? live : max_batch;
@@ -1392,6 +1448,25 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 "spent %.1f%% of wall blocked waiting for an arrival -- high "
                 "here means the box is IDLE, not saturated\n",
                 occ_free_nothing_queued, wall > 0.0 ? 100.0 * occ_blocked_s / wall : 0.0);
+        /* Where this worker's loop wall went. `step` is step_live: the AR step,
+         * emit and the codec decode of the delivered frames. `other` is the
+         * rest of the loop -- admission, retire, and the blocked wait above. */
+        double step_s = 0.0;
+        for (size_t b = 0; b <= max_batch; ++b) step_s += occ_time[b];
+        const double loop_s = mynah_phase_seconds() - t_profile0;
+        const double pre0 = prefill_profile.seconds[0];
+        const double pre1 = prefill_profile.seconds[1];
+        const double pct = loop_s > 0.0 ? 100.0 / loop_s : 0.0;
+        fprintf(stderr,
+                "[SERVE] loop %.1f s: step %.1f%%  prefill-first %.1f%% (%zu slices, "
+                "%zu done, %.1f ms/slice)  prefill-cont %.1f%% (%zu slices, %zu done, "
+                "%.1f ms/slice)  other %.1f%% (blocked %.1f%%)\n",
+                loop_s, step_s * pct,
+                pre0 * pct, prefill_profile.slices[0], prefill_profile.completed[0],
+                prefill_profile.slices[0] ? 1e3 * pre0 / (double)prefill_profile.slices[0] : 0.0,
+                pre1 * pct, prefill_profile.slices[1], prefill_profile.completed[1],
+                prefill_profile.slices[1] ? 1e3 * pre1 / (double)prefill_profile.slices[1] : 0.0,
+                (loop_s - step_s - pre0 - pre1) * pct, occ_blocked_s * pct);
     }
     if (timing) {
         t_ar = mynah_phase_seconds();
