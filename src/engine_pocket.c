@@ -11012,8 +11012,15 @@ static int pocket_lf_synth(mynah_engine_state *state, const mynah_tts_model *mod
     return bad ? -1 : 0;
 }
 
-static int pocket_lf_same(const char *what, const float *a, size_t an,
-                          const float *b, size_t bn, char *error, size_t capacity) {
+static int pocket_lf_same(const mynah_engine_state *state, const char *what,
+                          const float *a, size_t an, const float *b, size_t bn,
+                          char *error, size_t capacity) {
+    /* Bit identity is the contract on a batch-invariant backend. With cuBLAS
+     * or tensor-core GEMMs the prefill of "the text in pieces" runs at a
+     * different M from "the text whole", so only the tolerance gate applies. */
+    const float tol = mynah_backend_batch_invariant(state->backend)
+                          ? 0.0f
+                          : POCKET_BATCH_PARITY_ATOL_TC;
     if (an != bn) {
         pocket_error(error, capacity,
                      "long-form (%s): %zu samples against %zu -- the split "
@@ -11021,7 +11028,11 @@ static int pocket_lf_same(const char *what, const float *a, size_t an,
         return -1;
     }
     for (size_t i = 0; i < an; ++i) {
-        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+        const int differs = tol > 0.0f
+            ? (!isfinite(a[i]) || !isfinite(b[i]) ||
+               fabsf(a[i] - b[i]) > tol + tol * fmaxf(fabsf(a[i]), fabsf(b[i])))
+            : memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        if (differs) {
             pocket_error(error, capacity,
                          "long-form (%s): sample %zu of %zu differs, %.9g against "
                          "%.9g -- pushing the text in pieces is not identical to "
@@ -11201,7 +11212,7 @@ static int pocket_check_lf_refusals(mynah_engine_state *state,
                             capacity) != 0) {
         goto done;
     }
-    if (pocket_lf_same("three refusals, then the accepted text", ref, ref_n, got,
+    if (pocket_lf_same(state, "three refusals, then the accepted text", ref, ref_n, got,
                        got_n, error, capacity) != 0) {
         goto done;
     }
@@ -11330,7 +11341,7 @@ static int pocket_lf_compare(mynah_engine_state *state,
     char control_what[160];
     snprintf(control_what, sizeof(control_what),
              "%s, a ceiling four times the text, still one push", profile);
-    if (pocket_lf_same(control_what, base, base_n, control, control_n, error,
+    if (pocket_lf_same(state, control_what, base, base_n, control, control_n, error,
                        capacity) != 0) {
         goto done;
     }
@@ -11375,7 +11386,7 @@ static int pocket_lf_compare(mynah_engine_state *state,
         }
         char what[160];
         snprintf(what, sizeof(what), "%s, %s", profile, patterns[p].name);
-        if (pocket_lf_same(what, base, base_n, got, got_n, error, capacity) != 0) {
+        if (pocket_lf_same(state, what, base, base_n, got, got_n, error, capacity) != 0) {
             goto done;
         }
         free(got);
