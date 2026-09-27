@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile": {
     "id": "axion-c4a-32c-pocket-en-24l",
-    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English 24L (english_2026-04_24l) streaming. C96 is the qualified operating point (30 min, GOOD), measured with text segmentation, the int8 backbone, the wide I8MM kernel and pooled attention. Host-scoped: not a generic Arm profile.",
+    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English 24L (english_2026-04_24l) streaming. C88 is the qualified operating point (30 min, GOOD, 0/0 stalls) on the shipped default with nothing exported: the runtime picks the int8 backbone and 16-token prefill slices from the pack's depth, and segments text by default. Host-scoped: not a generic Arm profile.",
     "engine": "pocket",
     "objective": {
       "primary": "realtime_factor",
@@ -11,7 +11,7 @@
         1,
         120
       ],
-      "preferred_concurrency": 96,
+      "preferred_concurrency": 88,
       "quality_changes_allowed": false
     }
   },
@@ -48,7 +48,7 @@
     "why": "16x2 measured against 4x8 (31.5 vs ~69 audio-s/s at C48, before K2/K4) and 32x1 (worse on every column at C48): the 24L keeps the 6L's topology. max_batch 8 is reached at C112-C120 (B7/B8 modal); at C96 the modal width is B6."
   },
   "runtime": {
-    "matches_shipped_default": false,
+    "matches_shipped_default": true,
     "quant_groups": {
       "codec_transformer": "int8",
       "codec_conv": "int8",
@@ -59,20 +59,20 @@
     },
     "environment": {
       "MYNAH_QUANT_GROUPS": {
-        "value": "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,backbone:int8,flow_net:f16,conditioner:f16",
-        "why": "REQUIRED. The 24L's per-step weight pass is large enough that halving its bytes pays: int8 beat bf16 in serving at C48 (+16% throughput, TTFA p95 830 -> 752 ms) and passed the ASR gate (WER long 0.83% vs f32 0.87%) and a listening check. The spec replaces the whole default, so every codec group is respelled at its shipped value."
+        "value": null,
+        "why": "Must be ABSENT. Since 2026-09-27 a pack with >= 24 backbone layers on the CPU backend defaults to the int8 backbone (POCKET_QG_DEFAULT_SPEC_PINNED_DEEP in src/engine_pocket.c), which is exactly the spec every 24L point below was measured with; the audio is byte-identical to the old explicit export. Before: int8 beat bf16 at C48 (+16% throughput, TTFA p95 830 -> 752 ms) and passed the ASR gate."
       },
       "MYNAH_POCKET_SEGMENT_TOKENS": {
-        "value": "50",
-        "why": "REQUIRED. Upstream's max_tokens per chunk. Without it a long text's whole prefill sits in front of the first audio: at C48 TTFA p95 743 -> 275 ms and stall@250 9 -> 0 with it."
+        "value": null,
+        "why": "Must be ABSENT. Segmentation is on by default since 2026-09-27 (50 tokens, upstream's max_tokens); 0 turns it off. Without it a long text's whole prefill sits in front of the first audio: at C48 TTFA p95 743 -> 275 ms and stall@250 9 -> 0 with it."
       },
       "MYNAH_POCKET_FIRST_SEGMENT_TOKENS": {
-        "value": "24",
-        "why": "REQUIRED. A tighter first chunk bounds the prefill in front of first audio: ~55 ms of TTFA p95 over plain 50 at C48."
+        "value": null,
+        "why": "Must be ABSENT. The default first chunk is 24 tokens: ~55 ms of TTFA p95 over plain 50 at C48."
       },
       "MYNAH_PREFILL_SLICE": {
-        "value": "16",
-        "why": "REQUIRED. One prefill tile (TAR_PREFILL_TILE = 16): 32 gave max_gap p95 ~210 ms and stalls@500 on 24L, 16 gives ~134 ms and none. Values below 16 round up to one tile, so 8/16/24 all run 16."
+        "value": null,
+        "why": "Must be ABSENT. The Pocket engine reports prefill_slice_tokens = 16 for a 24-layer pack (one TAR_PREFILL_TILE); 32 gave max_gap p95 ~210 ms and stalls@500 on 24L, 16 gives ~134 ms and none."
       },
       "MYNAH_PREFILL_STEP_MS": {
         "value": null,
@@ -121,28 +121,45 @@
   },
   "qualification": {
     "status": "qualified",
-    "model": "/dev/shm/p24/pocket-en-24l (official english_2026-04_24l, rev 492522650173a0653b7575cdc25ae09810e5d741, converted --dtype source)",
+    "model": "models/pocket-en-24l (official english_2026-04_24l, rev 492522650173a0653b7575cdc25ae09810e5d741, converted --dtype source)",
     "workload": "Mixed v2 bank, streaming route /v1/audio/speech, PCM, one language pack, load generator on the same host.",
     "operating_point": {
-      "date": "2026-09-26",
-      "version": "branch pocket-24l-cpu-segments 05b5c03",
-      "configuration": "environment-override",
-      "concurrency": 96,
+      "date": "2026-09-27",
+      "version": "branch pocket-24l-cpu-segments (defaults commit)",
+      "configuration": "shipped-default",
+      "concurrency": 88,
       "verdict": "GOOD",
       "soak_seconds": 1800,
-      "requests": 43113,
-      "ttfb_p95_ms": 81.4,
-      "ttfa_p95_ms": 281.7,
-      "rtf_p95": 0.763,
-      "prebuffer_p95_ms": 14.9,
-      "safe_start_p95_ms": 285.2,
-      "max_gap_p95_ms": 267.9,
+      "requests": 41458,
+      "ttfb_p95_ms": 79.0,
+      "ttfa_p95_ms": 278,
+      "rtf_p95": 0.756,
+      "prebuffer_p95_ms": 11.0,
+      "safe_start_p95_ms": 283,
+      "max_gap_p95_ms": 274.5,
       "stalls_250ms": 0,
       "stalls_500ms": 0,
-      "throughput_audio_s_per_s": 126.0,
-      "evidence": "reports/20260926-24l-axion/soak96attn-30min-20260926-1533.log"
+      "throughput_audio_s_per_s": 121.4,
+      "evidence": "reports/20260927-axion/chain3-20260927-1043/l24-soak-c88.log"
     },
     "ceiling": [
+      {
+        "date": "2026-09-27",
+        "version": "branch pocket-24l-cpu-segments (defaults commit)",
+        "configuration": "shipped-default",
+        "concurrency": 96,
+        "verdict": "MARGINAL",
+        "soak_seconds": 1800,
+        "requests": 42310,
+        "ttfb_p95_ms": 82.7,
+        "ttfa_p95_ms": 292,
+        "rtf_p95": 0.776,
+        "stalls_250ms": 1,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 123.8,
+        "evidence": "reports/20260927-axion/chain2-20260927-0904/l24-soak-c96.log",
+        "why_not_promoted": "One stall@250 in 42310 on a configuration byte-identical to the 2026-09-26 C96 run that had 0 in 43113: C96 is a rare-event edge (~1 in 40-80k), so the zero-stall bar is certified one step lower, at C88."
+      },
       {
         "date": "2026-09-26",
         "version": "branch pocket-24l-cpu-segments 05b5c03",
@@ -239,8 +256,27 @@
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 126.0,
         "evidence": "reports/20260926-24l-axion/soak96attn-30min-20260926-1533.log"
+      },
+      {
+        "date": "2026-09-27",
+        "version": "branch pocket-24l-cpu-segments (defaults commit)",
+        "configuration": "shipped-default",
+        "concurrency": 88,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 41458,
+        "ttfb_p95_ms": 79.0,
+        "ttfa_p95_ms": 278,
+        "rtf_p95": 0.756,
+        "prebuffer_p95_ms": 11.0,
+        "safe_start_p95_ms": 283,
+        "max_gap_p95_ms": 274.5,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 121.4,
+        "evidence": "reports/20260927-axion/chain3-20260927-1043/l24-soak-c88.log"
       }
     ],
-    "notes": "~C48 (2026-09-25) -> C64 with text segmentation -> C80 with the wide I8MM kernel -> C96 qualified GOOD with pooled attention, on one host and one bank; the 6L small is qualified at C120 on the same host. K3 (wide conv dots) and K5 (NEON attention schedule) were measured and rejected. The codec conv stack was analysed and left alone: no candidate clears ~3% serving gain."
+    "notes": "~C48 (2026-09-25) -> C64 with text segmentation -> C80 with the wide I8MM kernel -> C96 GOOD with pooled attention (2026-09-26, env override) -> the same configuration made the shipped default on 2026-09-27: C88 qualified GOOD 0/0, C96 one stall in 42310. The 6L small on the same build is in axion-c4a-32c-pocket-en.json. K3 (wide conv dots) and K5 (NEON attention schedule) were measured and rejected; the codec conv stack was analysed and left alone."
   }
 }
