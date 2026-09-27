@@ -6937,6 +6937,9 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             .start = row_start,
             .count = row_take,
             .kv_bf16 = ctxs[0]->cuda_backbone_kv_bf16,
+            /* Text arrives in pieces (segments, appends); every piece must
+             * land in the cache exactly as a one-shot prefill would put it. */
+            .fixed_order = 1,
         };
         mynah_region_begin(MYNAH_RGN_PREFILL);
         const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,

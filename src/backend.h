@@ -388,6 +388,10 @@ typedef struct {
     const size_t *count;        /* [rows] tokens per row; NULL = positions */
     const size_t *rings;        /* [rows] slots per row; NULL = `ring`    */
     int kv_bf16;                /* the caches hold BF16 instead of f32    */
+    /* Use only fixed-order kernels so the result does not depend on how the
+     * rows were split across calls (a prefill pushed in pieces must equal one
+     * pushed whole). Costs tensor-core speed; the prefill can afford it. */
+    int fixed_order;
 } mynah_backend_tile_desc;
 /* 1 when a row's result cannot depend on the other rows of a batched call
  * (every kernel reduces in a fixed order). 0 when the backend runs cuBLAS

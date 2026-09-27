@@ -892,6 +892,7 @@ struct cuda_tile_workspace {
     float *splitk = nullptr;
     size_t splitk_cap = 0u; /* floats */
     int sms = 0;
+    bool fixed_order = false; /* the current call asked for invariant GEMMs */
 };
 
 struct cuda_backend_state {
@@ -6250,7 +6251,7 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
     if (hb != nullptr && cached_weight(st, hb, N * sizeof(float), &db, e, ec))
         return -1;
     cuda_tile_workspace &w = st->tile;
-    if (st->tile_cublas) {
+    if (st->tile_cublas && !w.fixed_order) {
         /* Tensor-core GEMM through cuBLAS: faster, but cuBLAS picks its
          * algorithm by M, so a row's bits can depend on its batch. */
         if (cbe(cublasSetStream(st->cublas, st->stream), e, ec)) return -1;
@@ -6431,6 +6432,7 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
     const int heads = (int)d->heads;
     const int head_width = dim / heads;
     const int total = (int)(M * d->dim);
+    w.fixed_order = d->fixed_order != 0;
     k_tile_gather<<<(total + 255) / 256, 256, 0, st->stream>>>(d_in, d_map, w.x,
                                                                dim, total);
     if (ce(cudaGetLastError(), e, ec)) return -1;
