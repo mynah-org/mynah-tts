@@ -1486,7 +1486,11 @@ static void handle_health(int fd) {
              "\"device_memory_bytes\":%llu,"
              "\"device_memory_free_bytes\":%llu,\"graphs_enabled\":%u,"
              "\"fast_math_enabled\":%u,\"decoder_batch_enabled\":%u,"
-             "\"q8_enabled\":%u}",
+             "\"q8_enabled\":%u,"
+             "\"codec_gang_upsample_calls\":%llu,"
+             "\"codec_gang_upsample_rows\":%llu,"
+             "\"codec_gang_pcm_calls\":%llu,"
+             "\"codec_gang_pcm_rows\":%llu}",
              backend_metrics.h2d_bytes, backend_metrics.d2h_bytes,
              backend_metrics.h2d_calls, backend_metrics.d2h_calls,
              backend_metrics.sync_calls,
@@ -1517,7 +1521,11 @@ static void handle_health(int fd) {
              backend_metrics.device_memory_bytes,
              backend_metrics.device_memory_free_bytes,
              backend_metrics.graphs_enabled, backend_metrics.fast_math_enabled,
-             backend_metrics.decoder_batch_enabled, backend_metrics.q8_enabled);
+             backend_metrics.decoder_batch_enabled, backend_metrics.q8_enabled,
+             backend_metrics.codec_gang_calls[0],
+             backend_metrics.codec_gang_rows[0],
+             backend_metrics.codec_gang_calls[1],
+             backend_metrics.codec_gang_rows[1]);
 
     /* THE COUNTERS THIS PROCESS CANNOT KNOW.
      *
@@ -1845,6 +1853,31 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_codec_upsample_fallbacks_total counter\n"
            "mynah_backend_codec_upsample_fallbacks_total %llu\n",
            m.codec_upsample_fallbacks);
+    {
+        /* MYNAH_CUDA_CODEC_GANG: one submission per frame for the whole
+         * gang's quantizer/upsample, one D2H for its PCM. rows/calls is the
+         * mean width actually served. */
+        static const char *const gang_stage[2] = {"upsample", "pcm"};
+        static const char *const bucket_name[8] = {"1", "2", "4", "8", "16",
+                                                   "32", "64", "inf"};
+        METRIC("# HELP mynah_backend_codec_gang_calls_total Cross-request codec gang submissions by stage.\n"
+               "# TYPE mynah_backend_codec_gang_calls_total counter\n");
+        for (int stage = 0; stage < 2; ++stage)
+            METRIC("mynah_backend_codec_gang_calls_total{stage=\"%s\"} %llu\n",
+                   gang_stage[stage], m.codec_gang_calls[stage]);
+        METRIC("# HELP mynah_backend_codec_gang_rows_total Requests served by cross-request codec gang submissions.\n"
+               "# TYPE mynah_backend_codec_gang_rows_total counter\n");
+        for (int stage = 0; stage < 2; ++stage)
+            METRIC("mynah_backend_codec_gang_rows_total{stage=\"%s\"} %llu\n",
+                   gang_stage[stage], m.codec_gang_rows[stage]);
+        METRIC("# HELP mynah_backend_codec_gang_width_calls_total Codec gang submissions by width bucket (upper bound, not cumulative).\n"
+               "# TYPE mynah_backend_codec_gang_width_calls_total counter\n");
+        for (int stage = 0; stage < 2; ++stage)
+            for (int bucket = 0; bucket < 8; ++bucket)
+                METRIC("mynah_backend_codec_gang_width_calls_total{stage=\"%s\",le=\"%s\"} %llu\n",
+                       gang_stage[stage], bucket_name[bucket],
+                       m.codec_gang_width_hist[stage][bucket]);
+    }
     METRIC("# HELP mynah_backend_decoder_steps_total Decoder steps submitted.\n"
            "# TYPE mynah_backend_decoder_steps_total counter\n"
            "mynah_backend_decoder_steps_total %llu\n",

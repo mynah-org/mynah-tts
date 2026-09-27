@@ -48,6 +48,9 @@ struct mynah_backend {
     int (*backbone_note_batch)(void *, size_t);
     int (*codec_transformer_note_batch)(void *, size_t, size_t);
     void (*codec_upsample_note)(void *, int);
+    void (*codec_gang_note)(void *, int, size_t);
+    int (*codec_upsample_batch_dev)(void *, const mynah_backend_upsample_batch_desc *, char *, size_t);
+    int (*gather_rows_d2h)(void *, const float *const *, size_t, size_t, const float **, char *, size_t);
     int (*metrics_get)(void *, mynah_tts_backend_metrics *);
     /* Device-side ops (NULL = CPU fallback in backend.c). */
     int (*upload)(void *, const float *, size_t, float **, char *, size_t);
@@ -236,6 +239,9 @@ extern int mynah_cuda_decoder_note_batch(void *, size_t, size_t);
 extern int mynah_cuda_note_backbone_batch(void *, size_t);
 extern int mynah_cuda_note_codec_transformer_batch(void *, size_t, size_t);
 extern void mynah_cuda_note_codec_upsample(void *, int);
+extern void mynah_cuda_note_codec_gang(void *, int, size_t);
+extern int mynah_cuda_codec_upsample_batch_dev(void *, const mynah_backend_upsample_batch_desc *, char *, size_t);
+extern int mynah_cuda_gather_rows_d2h(void *, const float *const *, size_t, size_t, const float **, char *, size_t);
 extern int mynah_cuda_metrics_get(void *, mynah_tts_backend_metrics *);
 #endif
 
@@ -741,6 +747,9 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->backbone_note_batch = mynah_cuda_note_backbone_batch;
         backend->codec_transformer_note_batch = mynah_cuda_note_codec_transformer_batch;
         backend->codec_upsample_note = mynah_cuda_note_codec_upsample;
+        backend->codec_gang_note = mynah_cuda_note_codec_gang;
+        backend->codec_upsample_batch_dev = mynah_cuda_codec_upsample_batch_dev;
+        backend->gather_rows_d2h = mynah_cuda_gather_rows_d2h;
         backend->metrics_get = mynah_cuda_metrics_get;
 #else
         free(backend);
@@ -911,6 +920,33 @@ void mynah_backend_note_codec_upsample(const mynah_backend *backend,
                                        int fallback) {
     if (backend == NULL || backend->codec_upsample_note == NULL) return;
     backend->codec_upsample_note(backend->state, fallback != 0);
+}
+
+void mynah_backend_note_codec_gang(const mynah_backend *backend, int stage,
+                                   size_t rows) {
+    if (backend == NULL || rows == 0u || backend->codec_gang_note == NULL)
+        return;
+    backend->codec_gang_note(backend->state, stage, rows);
+}
+
+int mynah_backend_codec_upsample_batch_dev(
+    const mynah_backend *backend, const mynah_backend_upsample_batch_desc *desc,
+    char *error, size_t error_capacity) {
+    if (backend == NULL || desc == NULL ||
+        backend->codec_upsample_batch_dev == NULL)
+        return 1;
+    return backend->codec_upsample_batch_dev(backend->state, desc, error,
+                                             error_capacity);
+}
+
+int mynah_backend_gather_rows_d2h(const mynah_backend *backend,
+                                  const float *const *dev_rows, size_t rows,
+                                  size_t width, const float **host_out,
+                                  char *error, size_t error_capacity) {
+    if (host_out != NULL) *host_out = NULL;
+    if (backend == NULL || backend->gather_rows_d2h == NULL) return 1;
+    return backend->gather_rows_d2h(backend->state, dev_rows, rows, width,
+                                    host_out, error, error_capacity);
 }
 
 int mynah_backend_metrics_get(const mynah_backend *backend,

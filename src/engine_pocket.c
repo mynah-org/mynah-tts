@@ -1031,6 +1031,12 @@ struct mynah_engine_ctx {
     size_t cuda_codec_up_tail;
     int cuda_codec_upsample_enabled;
     int cuda_codec_device_input_ready;
+    /* Set by the cross-request codec gang (MYNAH_CUDA_CODEC_GANG) when this
+     * frame's denormalised latent, quantizer projection and causal upsample
+     * were already queued for the whole gang; the per-request prepare then
+     * consumes the device input instead of queueing its own copy. Valid for
+     * exactly one prepare. */
+    int cuda_codec_gang_upsampled;
     /* Set after the resident codec-transformer has written the current frame
      * directly into the resident SEANet input.  It suppresses the old
      * codec_back -> decoder_input H2D copy for this frame only. */
@@ -4381,6 +4387,7 @@ static void pocket_cuda_codec_upsample_disable(mynah_engine_ctx *ctx) {
     ctx->cuda_codec_up_tail = 0u;
     ctx->cuda_codec_upsample_enabled = 0;
     ctx->cuda_codec_device_input_ready = 0;
+    ctx->cuda_codec_gang_upsampled = 0;
 }
 
 /* The CPU SEANet state is reset at request start. Mirror that reset on the
@@ -4388,6 +4395,7 @@ static void pocket_cuda_codec_upsample_disable(mynah_engine_ctx *ctx) {
 static void pocket_cuda_codec_upsample_reset(mynah_engine_ctx *ctx) {
     if (ctx == NULL) return;
     ctx->cuda_codec_device_input_ready = 0;
+    ctx->cuda_codec_gang_upsampled = 0;
     if (!ctx->cuda_codec_upsample_enabled ||
         ctx->cuda_codec_up_partial == NULL || ctx->state == NULL) return;
     size_t count = 0u;
@@ -4675,6 +4683,20 @@ static int pocket_cuda_codec_device_handoff_enabled(void) {
 static int pocket_cuda_codec_upsample_enabled(void) {
     const char *value = getenv("MYNAH_CUDA_CODEC_UPSAMPLE");
     return value == NULL || strcmp(value, "0") != 0;
+}
+
+/* Cross-request codec gang on CUDA: one submission for every request's
+ * quantizer projection + causal upsample, and one D2H for every request's
+ * PCM, instead of one set of copies/launches per request.  Each row keeps
+ * the single-request reduction order, so it is on by default;
+ * MYNAH_CUDA_CODEC_GANG=0 restores the per-request schedule exactly. */
+static int pocket_cuda_codec_gang_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_CODEC_GANG");
+        cached = (value == NULL || strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return cached;
 }
 
 /* One complete Mimi decoder-transformer frame on the resident CUDA stream.
@@ -8048,6 +8070,125 @@ static int pocket_decode_frame_transform_finish(mynah_engine_ctx *ctx,
     return 0;
 }
 
+/* The one place a latent frame is denormalised, shared by the per-request
+ * prepare and the CUDA codec gang so both hand the device the same bits. */
+static void pocket_denorm_latent(mynah_engine_ctx *ctx, size_t frame) {
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const float *latent = ctx->latents + frame * cfg->latent_dim;
+    for (size_t d = 0; d < cfg->latent_dim; ++d) {
+        ctx->denorm[d] = latent[d] * state->emb_std[d] + state->emb_mean[d];
+    }
+}
+
+/* Queue the quantizer projection + causal upsample of one frame for every
+ * eligible request of a gang in one backend submission (CUDA only).
+ * `frames[i]` is the frame to prepare for ctxs[i], SIZE_MAX to skip it.
+ *
+ * Eligibility is exactly the per-request resident upsample's; a request that
+ * is not eligible, or a backend without the path, is left untouched and goes
+ * through pocket_decode_frame_prepare's own schedule.  Each row advances only
+ * its own device tail, with the single-request reduction order.  On a
+ * queueing failure every row is restored the way the per-request path
+ * restores itself (drain, import the carried tail, drop the device upsample);
+ * a row whose tail cannot be recovered is reported in `row_failed`. */
+static void pocket_cuda_codec_gang_upsample(mynah_engine_ctx *const *ctxs,
+                                            size_t count, const size_t *frames,
+                                            int *row_failed, char *error,
+                                            size_t capacity) {
+    if (!pocket_cuda_codec_gang_enabled() ||
+        !pocket_cuda_codec_upsample_enabled())
+        return;
+    const mynah_engine_state *state = NULL;
+    const float *host_input[POCKET_MAX_BATCH];
+    float *output[POCKET_MAX_BATCH];
+    float *partial[POCKET_MAX_BATCH];
+    size_t index[POCKET_MAX_BATCH];
+    size_t rows = 0u;
+    size_t tail = 0u;
+    for (size_t i = 0; i < count && i < POCKET_MAX_BATCH; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (frames[i] == SIZE_MAX || ctx == NULL || ctx->state == NULL) continue;
+        ctx->cuda_codec_gang_upsampled = 0;
+        const pocket_config *cfg = &ctx->state->cfg;
+        if (!ctx->cuda_codec_enabled || !ctx->cuda_codec_upsample_enabled ||
+            cfg->codec_tf_dim != cfg->codec_dim || ctx->cuda_codec_up == NULL ||
+            ctx->codec_transformer == NULL || ctx->state->backend == NULL ||
+            (ctx->cuda_codec_up_tail > 0u && ctx->cuda_codec_up_partial == NULL))
+            continue;
+        if (state == NULL) {
+            if (strcmp(mynah_backend_name(ctx->state->backend), "cuda") != 0 ||
+                !pocket_cuda_groups_are_f32(ctx->state, POCKET_QG_CODEC_CONV))
+                continue;
+            state = ctx->state;
+            tail = ctx->cuda_codec_up_tail;
+        }
+        /* One model per call: the weights are shared by every row. */
+        if (ctx->state != state || ctx->cuda_codec_up_tail != tail) continue;
+        pocket_denorm_latent(ctx, frames[i]);
+        host_input[rows] = ctx->denorm;
+        output[rows] = ctx->cuda_codec_up;
+        partial[rows] = ctx->cuda_codec_up_partial;
+        index[rows++] = i;
+    }
+    if (rows == 0u) return;
+    const pocket_config *cfg = &state->cfg;
+    size_t kernel = 0u;
+    if (pocket_add(cfg->upsample_stride, tail, &kernel) != 0) return;
+    const mynah_backend_upsample_batch_desc desc = {
+        .rows = rows,
+        .in_dim = cfg->latent_dim,
+        .channels = cfg->codec_dim,
+        .kernel = kernel,
+        .stride = cfg->upsample_stride,
+        .host_input = host_input,
+        .output = output,
+        .partial = partial,
+        .proj_weight = state->quantizer_proj,
+        .proj_bias = NULL,
+        .up_weight = state->upsample.weight,
+        .up_bias = state->upsample.bias,
+    };
+    char local[256];
+    local[0] = '\0';
+    mynah_region_begin2(MYNAH_RGN_CODEC_EMBED);
+    const int rc = mynah_backend_codec_upsample_batch_dev(state->backend, &desc,
+                                                          local, sizeof(local));
+    mynah_region_end2(MYNAH_RGN_CODEC_EMBED);
+    if (rc > 0) return;
+    if (rc == 0) {
+        for (size_t r = 0; r < rows; ++r) {
+            mynah_engine_ctx *ctx = ctxs[index[r]];
+            ctx->cuda_codec_device_input_ready = 1;
+            ctx->cuda_codec_gang_upsampled = 1;
+        }
+        mynah_backend_note_codec_gang(state->backend, 0, rows);
+        return;
+    }
+    char drain[256];
+    drain[0] = '\0';
+    const int drained =
+        mynah_backend_sync(state->backend, drain, sizeof(drain)) == 0;
+    for (size_t r = 0; r < rows; ++r) {
+        mynah_engine_ctx *ctx = ctxs[index[r]];
+        char one[256];
+        one[0] = '\0';
+        if (!drained ||
+            pocket_cuda_codec_import_upsample_tail(ctx, one, sizeof(one)) != 0) {
+            row_failed[index[r]] = 1;
+            pocket_error(error, capacity, "%s",
+                         one[0] != '\0' ? one
+                                        : (drain[0] != '\0'
+                                               ? drain
+                                               : (local[0] != '\0'
+                                                      ? local
+                                                      : "pocket: CUDA codec gang upsample lost its causal state")));
+        }
+        mynah_backend_note_codec_upsample(state->backend, 1);
+        pocket_cuda_codec_upsample_disable(ctx);
+    }
+}
+
 /* Prepare the host-owned portion of one codec frame. Decoder submission is
  * deliberately outside this helper so a gang can prepare every context before
  * it queues any D2H or synchronization work. `defer_cuda` is set only by the
@@ -8067,16 +8208,23 @@ static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
     const int depth = mynah_region_depth();
     int device_input = 0;
 
-    const float *latent = ctx->latents + frame * cfg->latent_dim;
     mynah_region_begin2(MYNAH_RGN_CODEC_EMBED);
-    for (size_t d = 0; d < cfg->latent_dim; ++d) {
-        ctx->denorm[d] = latent[d] * state->emb_std[d] + state->emb_mean[d];
-    }
     /* quantizer.output_proj is Conv1d(32, codec_dim, 1): one matvec per
      * frame. When the resident codec transformer is active and its model
      * width matches the upsample width, keep both operations on device. The
      * CPU sequence below remains the exact fallback and oracle. */
-    if (pocket_cuda_codec_upsample_enabled() && ctx->cuda_codec_enabled &&
+    const int gang_input = ctx->cuda_codec_gang_upsampled != 0;
+    if (gang_input) {
+        /* The gang already denormalised this frame into ctx->denorm and
+         * queued its projection/upsample (pocket_cuda_codec_gang_upsample). */
+        ctx->cuda_codec_gang_upsampled = 0;
+        mynah_backend_note_codec_upsample(state->backend, 0);
+        device_input = 1;
+    } else {
+        pocket_denorm_latent(ctx, frame);
+    }
+    if (!gang_input &&
+        pocket_cuda_codec_upsample_enabled() && ctx->cuda_codec_enabled &&
         ctx->cuda_codec_upsample_enabled &&
         cfg->codec_tf_dim == cfg->codec_dim) {
         char upsample_error[256];
@@ -8986,6 +9134,30 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
             size_t submitted_count = 0u;
             int decoder_batch_used = 0;
 
+            /* Queue every request's quantizer + upsample for this frame in
+             * one submission before the per-request host preparation. */
+            {
+                size_t gang_frames[POCKET_MAX_BATCH];
+                int gang_failed[POCKET_MAX_BATCH];
+                for (size_t i = 0; i < count; ++i) {
+                    gang_failed[i] = 0;
+                    gang_frames[i] = (failed[i] || out_samples[i] == NULL ||
+                                      f >= frame_count[i])
+                                         ? SIZE_MAX
+                                         : first_frame[i] + f;
+                }
+                one_error[0] = '\0';
+                pocket_cuda_codec_gang_upsample(ctxs, count, gang_frames,
+                                                gang_failed, one_error,
+                                                sizeof(one_error));
+                for (size_t i = 0; i < count; ++i) {
+                    if (gang_failed[i])
+                        pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                 out_count, failed, &reported,
+                                                 one_error, error, capacity);
+                }
+            }
+
             for (size_t i = 0; i < count; ++i) {
                 if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
                 one_error[0] = '\0';
@@ -9152,7 +9324,41 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                 if (decoder_batch_used)
                     (void)mynah_backend_decoder_note_batch(
                         batch_backend, decoder_candidate_count, 1u);
-                for (size_t i = 0; i < count; ++i) {
+                /* One gather + one D2H for the whole gang's PCM.  Any
+                 * refusal leaves nothing queued and falls back to the
+                 * per-request copies below. */
+                const float *gang_pcm = NULL;
+                size_t gang_pcm_rows = 0u;
+                size_t gang_pcm_floats = 0u;
+                size_t gang_pcm_index[POCKET_MAX_BATCH];
+                if (pocket_cuda_codec_gang_enabled() && submitted_count > 1u) {
+                    const float *sources[POCKET_MAX_BATCH];
+                    int uniform = 1;
+                    for (size_t i = 0; i < count && uniform; ++i) {
+                        if (!submitted[i] || failed[i]) continue;
+                        size_t input_floats = 0u;
+                        size_t output_floats = 0u;
+                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
+                                                      &output_floats) != 0 ||
+                            ctxs[i]->cuda_decoder_output == NULL ||
+                            (gang_pcm_rows > 0u &&
+                             output_floats != gang_pcm_floats)) {
+                            uniform = 0;
+                            break;
+                        }
+                        gang_pcm_floats = output_floats;
+                        sources[gang_pcm_rows] = ctxs[i]->cuda_decoder_output;
+                        gang_pcm_index[gang_pcm_rows++] = i;
+                    }
+                    one_error[0] = '\0';
+                    if (!uniform || gang_pcm_rows < 2u ||
+                        mynah_backend_gather_rows_d2h(
+                            batch_backend, sources, gang_pcm_rows,
+                            gang_pcm_floats, &gang_pcm, one_error,
+                            sizeof(one_error)) != 0)
+                        gang_pcm = NULL;
+                }
+                for (size_t i = 0; i < count && gang_pcm == NULL; ++i) {
                     if (!submitted[i] || failed[i]) continue;
                     one_error[0] = '\0';
                     if (pocket_cuda_decoder_collect(ctxs[i], one_error,
@@ -9174,6 +9380,14 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                                                      sync_error, error, capacity);
                     }
                 } else {
+                    if (gang_pcm != NULL) {
+                        for (size_t r = 0; r < gang_pcm_rows; ++r)
+                            memcpy(ctxs[gang_pcm_index[r]]->pcm,
+                                   gang_pcm + r * gang_pcm_floats,
+                                   gang_pcm_floats * sizeof(float));
+                        mynah_backend_note_codec_gang(batch_backend, 1,
+                                                      gang_pcm_rows);
+                    }
                     for (size_t i = 0; i < count; ++i) {
                         if (!submitted[i] || failed[i]) continue;
                         size_t input_floats = 0u;
