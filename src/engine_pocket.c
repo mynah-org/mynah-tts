@@ -3762,9 +3762,17 @@ static int pocket_model_init(const mynah_tts_model *model,
         pocket_cuda_q8_requested();
     for (size_t b = 0; b < POCKET_QG_BITS; ++b) state->qgroup_qtype[b] = -1;
     state->qgroups = 0u;
+    const char *qgroups_spec = "none";
     if (mynah_qmat_cache_enabled(state->qcache)) {
         const char *spec = mynah_qmat_groups_spec();
-        if (strcmp(spec, "default") == 0) {
+        if (strcmp(spec, "default") == 0 && pocket_cuda_resident_requested(state) &&
+            !state->cuda_q8_enabled) {
+            /* The CPU defaults below select bf16/f16 encodings the resident
+             * CUDA kernels do not accept, so inheriting them would quietly run
+             * the backbone, flow and Mimi on the CPU oracle of a CUDA build.
+             * The resident path's measured baseline is raw f32 weights. */
+            spec = "none";
+        } else if (strcmp(spec, "default") == 0) {
             /* With no MYNAH_QUANT to obey, the default names its own encodings
              * rather than inheriting a base that has changed underneath it. */
             spec = (mynah_qmat_qtype_from_env() >= 0) ? POCKET_QG_DEFAULT_SPEC
@@ -3774,6 +3782,7 @@ static int pocket_model_init(const mynah_tts_model *model,
                      ? POCKET_QG_DEFAULT_SPEC_PINNED_DEEP
                      : POCKET_QG_DEFAULT_SPEC_PINNED;
         }
+        qgroups_spec = spec;
         if (pocket_qgroups_parse(spec, &state->qgroups, state->qgroup_qtype, error,
                                  capacity) != 0) {
             pocket_model_free(state);
@@ -3816,6 +3825,49 @@ static int pocket_model_init(const mynah_tts_model *model,
                 pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_TF) ? "on" : "off",
                 pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_CONV) ? "on" : "off",
                 decoder_raw ? "on" : "off");
+        /* A CUDA build asked for the resident path must not run a hot stage
+         * on the CPU because of a quantization spec: that is a 20-30x slower
+         * server that still reports device=cuda. The explicit per-stage kill
+         * switches (MYNAH_CUDA_FLOW=0, MYNAH_CUDA_POCKET_CODEC=0) are A/B
+         * choices and are not affected; only an incompatible encoding is. */
+        static const struct {
+            const char *name;
+            unsigned groups;
+        } hot[] = {
+            {"backbone", POCKET_QG_ATTENTION | POCKET_QG_FFN},
+            {"flow_net", POCKET_QG_FLOW_NET},
+            {"codec_transformer", POCKET_QG_CODEC_TF},
+        };
+        char cpu_stages[96] = "";
+        for (size_t i = 0; resident_on && i < sizeof(hot) / sizeof(hot[0]); ++i) {
+            if (pocket_cuda_groups_are_resident_compatible(state, hot[i].groups)) {
+                continue;
+            }
+            const size_t used = strlen(cpu_stages);
+            snprintf(cpu_stages + used, sizeof(cpu_stages) - used, "%s%s",
+                     used ? "," : "", hot[i].name);
+        }
+        if (cpu_stages[0] != '\0') {
+            const char *allow = getenv("MYNAH_CUDA_ALLOW_CPU_STAGES");
+            const int allowed = allow != NULL && strcmp(allow, "0") != 0;
+            fprintf(stderr,
+                    "mynah-tts: %s: MYNAH_QUANT_GROUPS='%s' keeps %s on the "
+                    "CPU oracle of a CUDA build; the resident kernels accept "
+                    "f32 (MYNAH_QUANT_GROUPS=none) or int8 with "
+                    "MYNAH_CUDA_Q8=1%s\n",
+                    allowed ? "WARNING" : "error", qgroups_spec, cpu_stages,
+                    allowed ? " (allowed by MYNAH_CUDA_ALLOW_CPU_STAGES)"
+                            : "; set MYNAH_CUDA_ALLOW_CPU_STAGES=1 to run "
+                              "it anyway");
+            if (!allowed) {
+                pocket_error(error, capacity,
+                             "CUDA resident path requested but %s would run on "
+                             "the CPU (MYNAH_QUANT_GROUPS='%s')",
+                             cpu_stages, qgroups_spec);
+                pocket_model_free(state);
+                return -1;
+            }
+        }
     }
     {
         static const unsigned bb_kinds[4] = {POCKET_QG_BB_QKV, POCKET_QG_BB_OPROJ,
