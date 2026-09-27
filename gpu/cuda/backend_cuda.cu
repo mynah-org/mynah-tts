@@ -554,6 +554,52 @@ __global__ static void k_decoder_causal_columns_batch(
         : 0.0f;
 }
 
+/* One-GEMM variant: every request's im2col columns side by side in one
+ * [inner][batch * length] buffer, so a single GEMM reads the weights once for
+ * the whole gang instead of once per request. */
+__global__ static void k_decoder_causal_columns_shared(
+    float *const *windows, float *columns, int batch, int channels,
+    int length, int kernel, int dilation, int stride, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * kernel * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int out_pos = local % length;
+    const int tap_channel = local / length;
+    const int tap = tap_channel % kernel;
+    const int channel = tap_channel / kernel;
+    const int window_len = tail + length;
+    const int source = out_pos * stride + tap * dilation;
+    columns[(size_t)tap_channel * (size_t)batch * length +
+            (size_t)request * length + out_pos] =
+        source >= 0 && source < window_len
+            ? windows[request][(size_t)channel * (size_t)window_len +
+                               (size_t)source]
+            : 0.0f;
+}
+
+/* [channels][batch * length] back to each request's [channels][length],
+ * adding the bias. */
+__global__ static void k_decoder_scatter_bias(const float *shared,
+                                              float *const *outputs,
+                                              const float *bias, int batch,
+                                              int channels, int length) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int offset = index - request * per_request;
+    const int channel = offset / length;
+    const int t = offset - channel * length;
+    outputs[request][offset] =
+        shared[(size_t)channel * (size_t)batch * length +
+               (size_t)request * length + t] +
+        (bias == nullptr ? 0.0f : bias[channel]);
+}
+
 __global__ static void k_decoder_copy_tail_batch(float *const *windows,
                                                  float *const *previous,
                                                  int batch, int channels,
@@ -600,6 +646,44 @@ __global__ static void k_decoder_convtr_batch(
             value += inputs[request][(size_t)input_channel * (size_t)length +
                                     (size_t)input_t] * weight[weight_index];
         }
+    }
+    full[request][local] = value;
+}
+
+/* GEMM form of the batched transposed convolution (groups == 1): gather
+ * every request's input into one [in][batch * length] matrix, one GEMM makes
+ * Y[(out, tap)][batch * length], and this fold adds the taps back onto time. */
+__global__ static void k_decoder_convtr_gather(float *const *inputs, float *x,
+                                               int batch, int channels,
+                                               int length) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int n = batch * length;
+    if (index >= channels * n) return;
+    const int channel = index / n;
+    const int j = index - channel * n;
+    const int request = j / length;
+    const int t = j - request * length;
+    x[index] = inputs[request][(size_t)channel * length + t];
+}
+
+__global__ static void k_decoder_convtr_overlap(const float *y, float *const *full,
+                                                const float *bias, int batch,
+                                                int out_channels, int length,
+                                                int full_len, int kernel,
+                                                int stride) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = out_channels * full_len;
+    if (index >= batch * per_request) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int oc = local / full_len;
+    const int t = local - oc * full_len;
+    const size_t m = (size_t)out_channels * kernel;
+    float value = bias == nullptr ? 0.0f : bias[oc];
+    for (int k = t % stride; k < kernel && k <= t; k += stride) {
+        const int i = (t - k) / stride;
+        if (i >= length) continue;
+        value += y[(size_t)oc * kernel + k + (size_t)(request * length + i) * m];
     }
     full[request][local] = value;
 }
@@ -892,6 +976,11 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> width_hist[3][8];
     std::atomic<unsigned long long> tile_rows;
     cuda_tile_workspace tile;
+    float *dec_cols = nullptr;   /* one-GEMM decoder: [inner][batch*len] */
+    float *dec_out = nullptr;    /* one-GEMM decoder: [out][batch*len]   */
+    size_t dec_cols_cap = 0u, dec_out_cap = 0u; /* floats */
+    float *dec_tr_x = nullptr, *dec_tr_y = nullptr; /* convtr GEMM buffers */
+    size_t dec_tr_x_cap = 0u, dec_tr_y_cap = 0u;
     std::atomic<unsigned long long> q8_rows;
     std::atomic<unsigned long long> q8_weight_uploads;
     std::atomic<unsigned long long> q8_weight_bytes;
@@ -2420,6 +2509,10 @@ static void cuda_close(void *opaque) {
     destroy_decoder_batch_graphs(st);
     destroy_graphs(st);
     tile_release(st);
+    cudaFree(st->dec_cols);
+    cudaFree(st->dec_out);
+    cudaFree(st->dec_tr_x);
+    cudaFree(st->dec_tr_y);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
     for (auto &c : st->weights_int8) {
@@ -2561,7 +2654,7 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     /* The parity path must not silently use TF32 on Ampere/Ada.  Fast math is
      * an explicit opt-in experiment; its Tensor-Core error budget is a later
      * stage gate, not the default CUDA result. */
-    st->tf32 = !st->fast_math && cuda_env_enabled("MYNAH_CUDA_TF32", false);
+    st->tf32 = !st->fast_math && cuda_env_enabled("MYNAH_CUDA_TF32", true);
     const cublasMath_t math_mode = st->fast_math
         ? CUBLAS_DEFAULT_MATH
         : (st->tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH);
@@ -3813,6 +3906,66 @@ static int decoder_alloc_workspace(mynah_backend_decoder *decoder,
     return 0;
 }
 
+/* The one-GEMM decoder shares two backend buffers sized for the widest gang
+ * the batch metadata allows. They are reserved when a decoder opens, because
+ * a batched call may be captured into a graph, where nothing can allocate. */
+static bool decoder_convtr_gemm_enabled(void) {
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_CONVTR_GEMM", true);
+    return on;
+}
+
+static int decoder_reserve_one_gemm(cuda_backend_state *st,
+                                    const mynah_backend_decoder *decoder,
+                                    char *e, size_t ec) {
+    if (decoder_convtr_gemm_enabled()) {
+        size_t x_need = 0u, y_need = 0u;
+        for (const auto &op : decoder->ops) {
+            if (op.kind != CUDA_DECODER_CONVTR || op.groups != 1) continue;
+            const size_t n = st->batch_meta_cap * op.max_in_len;
+            const size_t x = (size_t)op.in_channels * n;
+            const size_t y = (size_t)op.out_channels * (size_t)op.kernel * n;
+            if (x > x_need) x_need = x;
+            if (y > y_need) y_need = y;
+        }
+        if (x_need > st->dec_tr_x_cap) {
+            cudaFree(st->dec_tr_x);
+            st->dec_tr_x = nullptr;
+            st->dec_tr_x_cap = 0u;
+            if (ce(cudaMalloc(&st->dec_tr_x, x_need * sizeof(float)), e, ec)) return -1;
+            st->dec_tr_x_cap = x_need;
+        }
+        if (y_need > st->dec_tr_y_cap) {
+            cudaFree(st->dec_tr_y);
+            st->dec_tr_y = nullptr;
+            st->dec_tr_y_cap = 0u;
+            if (ce(cudaMalloc(&st->dec_tr_y, y_need * sizeof(float)), e, ec)) return -1;
+            st->dec_tr_y_cap = y_need;
+        }
+    }
+    if (!cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false)) return 0;
+    size_t cols = 0u, out = 0u;
+    if (!decoder_mul(decoder->columns_floats, st->batch_meta_cap, &cols) ||
+        !decoder_mul(decoder->work_floats, st->batch_meta_cap, &out)) {
+        set_error(e, ec, "decoder one-GEMM reservation overflow");
+        return -1;
+    }
+    if (cols > st->dec_cols_cap) {
+        cudaFree(st->dec_cols);
+        st->dec_cols = nullptr;
+        st->dec_cols_cap = 0u;
+        if (ce(cudaMalloc(&st->dec_cols, cols * sizeof(float)), e, ec)) return -1;
+        st->dec_cols_cap = cols;
+    }
+    if (out > st->dec_out_cap) {
+        cudaFree(st->dec_out);
+        st->dec_out = nullptr;
+        st->dec_out_cap = 0u;
+        if (ce(cudaMalloc(&st->dec_out, out * sizeof(float)), e, ec)) return -1;
+        st->dec_out_cap = out;
+    }
+    return 0;
+}
+
 static int decoder_conv1d(mynah_backend_decoder *decoder, cuda_decoder_op *op,
                           const float *input, float *output, size_t length,
                           char *e, size_t ec) {
@@ -4284,6 +4437,67 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
     } else {
         for (size_t i = 0; i < batch; ++i) p0[i] = inputs[i];
     }
+    static const bool one_gemm = cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false);
+    if (one_gemm && batch > 1u) {
+        size_t cols_need = 0u, out_need = 0u;
+        if (!decoder_mul(inner, batch * out_len, &cols_need) ||
+            !decoder_mul((size_t)op->out_channels, batch * out_len, &out_need))
+            return -1;
+        if (cols_need > backend->dec_cols_cap || out_need > backend->dec_out_cap) {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(backend->stream, &capture) != cudaSuccess ||
+                capture != cudaStreamCaptureStatusNone) {
+                set_error(e, ec, "decoder one-GEMM buffers cannot grow in a capture");
+                return -1;
+            }
+            if (cols_need > backend->dec_cols_cap) {
+                cudaFree(backend->dec_cols);
+                backend->dec_cols = nullptr;
+                backend->dec_cols_cap = 0u;
+                if (ce(cudaMalloc(&backend->dec_cols, cols_need * sizeof(float)), e, ec))
+                    return -1;
+                backend->dec_cols_cap = cols_need;
+            }
+            if (out_need > backend->dec_out_cap) {
+                cudaFree(backend->dec_out);
+                backend->dec_out = nullptr;
+                backend->dec_out_cap = 0u;
+                if (ce(cudaMalloc(&backend->dec_out, out_need * sizeof(float)), e, ec))
+                    return -1;
+                backend->dec_out_cap = out_need;
+            }
+        }
+        for (size_t i = 0; i < batch; ++i) p2[i] = outputs[i];
+        int blocks = 0;
+        if (!decoder_batch_launch_range(columns, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                                ec) != 0)
+            return -1;
+        k_decoder_causal_columns_shared<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            backend->dec_cols, (int)batch, op->in_channels, (int)out_len,
+            op->kernel, op->dilation, op->stride, (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0 ||
+            cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+            return -1;
+        const float alpha = 1.0f, beta = 0.0f;
+        const int m = (int)(batch * out_len);
+        if (cbe(cublasSgemm(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m,
+                            op->out_channels, (int)inner, &alpha,
+                            backend->dec_cols, m, op->weight, (int)inner, &beta,
+                            backend->dec_out, m),
+                e, ec) != 0)
+            return -1;
+        if (!decoder_batch_launch_range(output_elements, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch, e,
+                                ec) != 0)
+            return -1;
+        k_decoder_scatter_bias<<<blocks, 256, 0, backend->stream>>>(
+            backend->dec_out,
+            decoder_current_table(backend, backend->dev_decoder_ptr2), op->bias,
+            (int)batch, op->out_channels, (int)out_len);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    } else {
     for (size_t i = 0; i < batch; ++i) {
         if (decoders[i] == nullptr || decoders[i]->columns == nullptr ||
             ops[i] == nullptr)
@@ -4333,7 +4547,9 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
                 (int)batch),
             e, ec) != 0)
         return -1;
+    }
     if (op->tail > 0u) {
+        int blocks = 0;
         for (size_t i = 0; i < batch; ++i) {
             p0[i] = ops[i]->window;
             p1[i] = ops[i]->previous;
@@ -4394,12 +4610,42 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
                             ec) != 0)
         return -1;
+    const size_t gemm_n = batch * length;
+    if (decoder_convtr_gemm_enabled() && op->groups == 1 &&
+        (size_t)op->in_channels * gemm_n <= backend->dec_tr_x_cap &&
+        (size_t)op->out_channels * (size_t)op->kernel * gemm_n <=
+            backend->dec_tr_y_cap) {
+        const int m = op->out_channels * op->kernel;
+        const int n = (int)gemm_n;
+        const int x_total = op->in_channels * n;
+        k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            backend->dec_tr_x, (int)batch, op->in_channels, (int)length);
+        if (ce(cudaGetLastError(), e, ec) != 0 ||
+            cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+            return -1;
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m, n,
+                             op->in_channels, &alpha, op->weight, CUDA_R_32F, m,
+                             backend->dec_tr_x, CUDA_R_32F, n, &beta,
+                             backend->dec_tr_y, CUDA_R_32F, m,
+                             cuda_compute_type(backend), cuda_gemm_algo(backend)),
+                e, ec) != 0)
+            return -1;
+        k_decoder_convtr_overlap<<<blocks, 256, 0, backend->stream>>>(
+            backend->dec_tr_y,
+            decoder_current_table(backend, backend->dev_decoder_ptr1), op->bias,
+            (int)batch, op->out_channels, (int)length, (int)full_len, op->kernel,
+            op->stride);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    } else {
     k_decoder_convtr_batch<<<blocks, 256, 0, backend->stream>>>(
         decoder_current_table(backend, backend->dev_decoder_ptr0),
         decoder_current_table(backend, backend->dev_decoder_ptr1), op->weight,
         op->bias, (int)batch, op->in_channels, op->out_channels, (int)length,
         (int)full_len, op->kernel, op->stride, op->groups);
     if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    }
     if (op->tail > 0u) {
         for (size_t i = 0; i < batch; ++i) {
             p0[i] = ops[i]->full;
@@ -4669,7 +4915,8 @@ extern "C" int mynah_cuda_decoder_open(
     decoder->elu_alpha = desc->elu_alpha;
     try {
         if (decoder_build(decoder, desc, e, ec) != 0 ||
-            decoder_alloc_workspace(decoder, e, ec) != 0) {
+            decoder_alloc_workspace(decoder, e, ec) != 0 ||
+            decoder_reserve_one_gemm(backend, decoder, e, ec) != 0) {
             decoder_destroy(decoder);
             return -1;
         }
@@ -5678,6 +5925,11 @@ static int tile_gemm_splits(int sms, int N, int K) {
     return S < 1 ? 1 : S;
 }
 
+__global__ static void k_bias_rows(float *C, const float *bias, int M, int N) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < M * N) C[i] += bias[i % N];
+}
+
 /* The tile's rows are packed: row m is token `rowmap[m].y` of request
  * `rowmap[m].x`, so requests may contribute different token counts. */
 __global__ static void k_tile_gather(const float *const *inputs,
@@ -5814,6 +6066,103 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
     }
 }
 
+/* Grouped variant: one block per (group of up to TILE_ATTN_Q consecutive
+ * tokens of one request, head). The K/V window is streamed through shared
+ * memory in TILE_ATTN_CH-position chunks that every query of the group
+ * reuses, instead of each (token, head) warp reading the whole window from
+ * global memory. One warp per query, online softmax over the chunks. The
+ * result depends only on the request's own tokens and cache. */
+#define TILE_ATTN_Q 16
+#define TILE_ATTN_CH 32
+#define TILE_ATTN_HW 128
+template <typename KV>
+__global__ static void k_tile_attention_grouped(
+    const float *qkv, void *const *kv, const long long *start,
+    const int2 *rowmap, const int2 *groups, int layer, int layers, int heads,
+    int head_width, long long context, const long long *rings, float scale,
+    float *out) {
+    __shared__ float ks[TILE_ATTN_CH][TILE_ATTN_HW + 1];
+    __shared__ float vs[TILE_ATTN_CH][TILE_ATTN_HW];
+    __shared__ float qs[TILE_ATTN_Q][TILE_ATTN_HW];
+    const int2 group = groups[blockIdx.x];   /* x = first packed row, y = rows */
+    const int h = (int)blockIdx.y;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int dim = heads * head_width;
+    const int2 rt0 = rowmap[group.x];
+    const int r = rt0.x;
+    const long long ring = rings[r];
+    const long long abs0 = start[r] + rt0.y;
+    const long long abs_last = abs0 + group.y - 1;
+    const long long lo = (context > 0 && abs0 + 1 > context) ? abs0 + 1 - context : 0;
+    const KV *kbase = static_cast<const KV *>(kv[(size_t)r * layers + layer]);
+    const KV *vbase = kbase + (size_t)ring * dim;
+    for (int i = (int)threadIdx.x; i < group.y * head_width; i += (int)blockDim.x) {
+        const int q = i / head_width, d = i % head_width;
+        qs[q][d] = qkv[(size_t)(group.x + q) * 3u * dim + (size_t)h * head_width + d];
+    }
+    const bool active = warp < group.y;
+    const long long my_abs = abs0 + warp;
+    const long long my_first =
+        (context > 0 && my_abs + 1 > context) ? my_abs + 1 - context : 0;
+    float running_max = -INFINITY, running_sum = 0.0f;
+    float acc[TILE_ATTN_HW / 32];
+    for (int k = 0; k < TILE_ATTN_HW / 32; ++k) acc[k] = 0.0f;
+    for (long long c0 = lo; c0 <= abs_last; c0 += TILE_ATTN_CH) {
+        __syncthreads();
+        for (int i = (int)threadIdx.x; i < TILE_ATTN_CH * head_width;
+             i += (int)blockDim.x) {
+            const int j = i / head_width, d = i % head_width;
+            const long long p = c0 + j;
+            float kval = 0.0f, vval = 0.0f;
+            if (p <= abs_last) {
+                const size_t slot = (size_t)(p % ring) * dim + (size_t)h * head_width + d;
+                kval = tile_kv_load(kbase + slot);
+                vval = tile_kv_load(vbase + slot);
+            }
+            ks[j][d] = kval;
+            vs[j][d] = vval;
+        }
+        __syncthreads();
+        if (!active) continue;
+        const long long p = c0 + lane;
+        float score = -INFINITY;
+        if (p >= my_first && p <= my_abs) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_width; ++d) dot = fmaf(qs[warp][d], ks[lane][d], dot);
+            score = dot * scale;
+        }
+        float chunk_max = score;
+        for (int off = 16; off > 0; off >>= 1)
+            chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, off));
+        if (chunk_max == -INFINITY) continue;
+        const float next_max = fmaxf(running_max, chunk_max);
+        const float correction = running_max == -INFINITY ? 0.0f : expf(running_max - next_max);
+        const float prob = score == -INFINITY ? 0.0f : expf(score - next_max);
+        float chunk_sum = prob;
+        for (int off = 16; off > 0; off >>= 1)
+            chunk_sum += __shfl_xor_sync(0xffffffffu, chunk_sum, off);
+        running_sum = running_sum * correction + chunk_sum;
+        running_max = next_max;
+        for (int k = 0; k < TILE_ATTN_HW / 32; ++k) acc[k] *= correction;
+        for (int j = 0; j < TILE_ATTN_CH; ++j) {
+            const float pj = __shfl_sync(0xffffffffu, prob, j);
+            if (pj == 0.0f) continue;
+            for (int k = 0; k < TILE_ATTN_HW / 32; ++k) {
+                const int d = lane + 32 * k;
+                if (d < head_width) acc[k] = fmaf(pj, vs[j][d], acc[k]);
+            }
+        }
+    }
+    if (!active) return;
+    const float inv = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    float *o = out + (size_t)(group.x + warp) * dim + (size_t)h * head_width;
+    for (int k = 0; k < TILE_ATTN_HW / 32; ++k) {
+        const int d = lane + 32 * k;
+        if (d < head_width) o[d] = acc[k] * inv;
+    }
+}
+
 static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
                         size_t ffn, size_t meta_bytes, char *e, size_t ec) {
     cuda_tile_workspace &w = st->tile;
@@ -5899,6 +6248,24 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
     if (hb != nullptr && cached_weight(st, hb, N * sizeof(float), &db, e, ec))
         return -1;
     cuda_tile_workspace &w = st->tile;
+    static const bool use_cublas = cuda_env_enabled("MYNAH_CUDA_TILE_CUBLAS", true);
+    if (use_cublas) {
+        /* Tensor-core GEMM through cuBLAS: faster, but cuBLAS picks its
+         * algorithm by M, so a row's bits can depend on its batch. */
+        if (cbe(cublasSetStream(st->cublas, st->stream), e, ec)) return -1;
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)N,
+                             (int)M, (int)K, &alpha, dw, CUDA_R_32F, (int)K, A,
+                             CUDA_R_32F, (int)K, &beta, C, CUDA_R_32F, (int)N,
+                             cuda_compute_type(st), cuda_gemm_algo(st)),
+                e, ec))
+            return -1;
+        if (db == nullptr) return 0;
+        const int total = (int)(M * N);
+        k_bias_rows<<<(total + 255) / 256, 256, 0, st->stream>>>(C, db, (int)M,
+                                                                 (int)N);
+        return ce(cudaGetLastError(), e, ec);
+    }
     static const bool splitk_on = cuda_env_enabled("MYNAH_CUDA_TILE_SPLITK", true);
     const int S = tile_gemm_splits(w.sms > 0 ? w.sms : 40, (int)N, (int)K);
     if (splitk_on && S > 1 && w.splitk != nullptr && (size_t)S * M * N <= w.splitk_cap) {
@@ -5993,8 +6360,15 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
         return -1;
     }
     const size_t kv_count = d->rows * d->layers;
+    /* Attention groups: up to TILE_ATTN_Q consecutive tokens of one request. */
+    size_t group_count = 0u;
+    for (size_t r = 0; r < d->rows; ++r) {
+        const size_t n = d->count != nullptr ? d->count[r] : d->positions;
+        group_count += (n + TILE_ATTN_Q - 1u) / TILE_ATTN_Q;
+    }
     const size_t meta_bytes = (2u * d->rows + kv_count) * sizeof(void *) +
-                              2u * d->rows * sizeof(long long) + M * sizeof(int2);
+                              2u * d->rows * sizeof(long long) + M * sizeof(int2) +
+                              group_count * sizeof(int2);
     if (tile_reserve(st, M, d->dim, d->ffn, meta_bytes, e, ec)) return -1;
     cuda_tile_workspace &w = st->tile;
 
@@ -6016,11 +6390,16 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
     long long *host_start = reinterpret_cast<long long *>(host + off_start);
     long long *host_ring = reinterpret_cast<long long *>(host + off_ring);
     int2 *host_map = reinterpret_cast<int2 *>(host + off_map);
-    size_t m = 0u;
+    const size_t off_groups = off_map + M * sizeof(int2);
+    int2 *host_groups = reinterpret_cast<int2 *>(host + off_groups);
+    size_t m = 0u, g = 0u;
     for (size_t r = 0; r < d->rows; ++r) {
         host_start[r] = (long long)d->start[r];
         host_ring[r] = (long long)(d->rings != nullptr ? d->rings[r] : d->ring);
         const size_t n = d->count != nullptr ? d->count[r] : d->positions;
+        for (size_t t = 0; t < n; t += TILE_ATTN_Q)
+            host_groups[g++] = make_int2((int)(m + t),
+                                         (int)(n - t < TILE_ATTN_Q ? n - t : TILE_ATTN_Q));
         for (size_t t = 0; t < n; ++t) host_map[m++] = make_int2((int)r, (int)t);
     }
     if (ce(cudaMemcpyAsync(w.meta_dev, w.meta_host, meta_bytes,
@@ -6034,6 +6413,10 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
     const long long *d_start = reinterpret_cast<const long long *>(dev + off_start);
     const long long *d_ring = reinterpret_cast<const long long *>(dev + off_ring);
     const int2 *d_map = reinterpret_cast<const int2 *>(dev + off_map);
+    const int2 *d_groups = reinterpret_cast<const int2 *>(dev + off_groups);
+    static const bool grouped = cuda_env_enabled("MYNAH_CUDA_TILE_ATTN_GROUPED", true);
+    const bool use_grouped = grouped && (d->dim / d->heads) <= TILE_ATTN_HW;
+    const dim3 group_grid((unsigned)group_count, (unsigned)d->heads);
 
     const int dim = (int)d->dim;
     const int heads = (int)d->heads;
@@ -6061,6 +6444,12 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
             k_tile_rope_store<uint16_t><<<(int)M, 256, 0, st->stream>>>(
                 w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
                 head_width, d_ring, d->max_period);
+            if (use_grouped)
+                k_tile_attention_grouped<uint16_t><<<group_grid, TILE_ATTN_Q * 32, 0,
+                                                     st->stream>>>(
+                    w.qkv, d_kv, d_start, d_map, d_groups, (int)l, (int)d->layers,
+                    heads, head_width, (long long)d->context, d_ring, scale, w.att);
+            else
             k_tile_attention<uint16_t><<<blocks, warps_per_block * 32, smem,
                                           st->stream>>>(
                 w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
@@ -6070,6 +6459,12 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
             k_tile_rope_store<float><<<(int)M, 256, 0, st->stream>>>(
                 w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
                 head_width, d_ring, d->max_period);
+            if (use_grouped)
+                k_tile_attention_grouped<float><<<group_grid, TILE_ATTN_Q * 32, 0,
+                                                  st->stream>>>(
+                    w.qkv, d_kv, d_start, d_map, d_groups, (int)l, (int)d->layers,
+                    heads, head_width, (long long)d->context, d_ring, scale, w.att);
+            else
             k_tile_attention<float><<<blocks, warps_per_block * 32, smem,
                                        st->stream>>>(
                 w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
