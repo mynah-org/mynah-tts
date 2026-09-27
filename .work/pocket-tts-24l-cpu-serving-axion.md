@@ -1,8 +1,10 @@
 # PocketTTS 24L on CPU: streaming capacity on Axion
 
-Status: **open** · sessions 2026-09-25 and 2026-09-26 · **C64 passes every
-mandatory gate over 30 minutes**, two preferred gates miss by a hair · board
-item `PLAN.md` E15-26.
+Status: **done** · sessions 2026-09-25 to 2026-09-27 · everything below is the
+shipped default since 2026-09-27: **6L qualified C164, 24L qualified C88**
+(30 min, GOOD, 0/0 stalls, nothing exported; see the last section) · board
+item `PLAN.md` E15-26. The "Where we stand" block below is the 2026-09-26
+morning state, kept as history.
 
 Every number below was measured on the target host. A screen never promotes.
 
@@ -550,3 +552,68 @@ the runtime-general changes (K4 pooled attention on the bf16 backbone and the
 codec, K2 on the int8 codec transformer) lift the 6L too. The 6L ceiling above
 C120 on this branch is unmeasured; `configs/perf/axion-c4a-32c-pocket-en.json`
 still describes `bea336c` numbers.
+
+## 2026-09-27: the novelties become the shipped default; both packs re-qualified
+
+Commit `feat: ship Pocket segmentation and the 24L CPU config as defaults`:
+segmentation on by default (50 / first 24; `MYNAH_POCKET_SEGMENT_TOKENS=0`
+turns it off); a CPU pack with >= 24 backbone layers defaults to the int8
+backbone (`POCKET_QG_DEFAULT_SPEC_PINNED_DEEP`); the prefill slice is an
+engine capability (`prefill_slice_tokens` = 32 * 6 / layers rounded to the
+tile: 32 on 6L, 16 on 24L; `MYNAH_PREFILL_SLICE` still overrides). CUDA keeps
+its previous spec and slice. With nothing exported the WAV is byte-identical
+to the old explicit env recipe on both packs (Axion, seed 7, 3-segment text).
+
+All runs: Axion c4a-highcpu-32, 16x2, nothing exported, same-host client
+(coalescing 10-12%, QUOTABLE warn). Evidence `reports/20260927-axion/`.
+
+### 6L small
+
+3-minute screens:
+
+| C | slots | TTFA p95 | TTFB p95 | RTF p95 | stalls 250/500 | audio-s/s | verdict |
+|---|---|---|---|---|---|---|---|
+| 120, segmentation OFF | 8 | 246 | 65.3 | 0.668 | 0/0 | 170.4 | GOOD |
+| 120 | 8 | **143** | 63.8 | 0.647 | 0/0 | 173.3 | GOOD |
+| 136 | 12 | 155 | 69.1 | 0.743 | 0/0 | 174.0 | GOOD |
+| 152 | 12 | 174 | 77.9 | 0.809 | 0/0 | 174.1 | GOOD |
+| 168 | 12 | 183 | 82.9 | 0.887 | 0/0 | 173.0 | GOOD |
+| 176 | 12 | 194 | 87.1 | **0.906** | 0/0 | 176.3 | MARGINAL (RTF) |
+
+Segmentation alone, same build, C120: TTFA p95 246 -> 143 ms, RTF p95
+0.668 -> 0.647, prebuffer p95 3 -> 0 ms. `--max-batch 12` removes the
+128-place wall of 16x8 (the old C130 TTFB jump); from C120 up the screens'
+throughput is flat at ~173-176 audio-s/s, i.e. the CPU is saturated and a
+higher level trades per-stream pace (RTF) for listeners.
+
+30-minute soaks:
+
+| C | requests | TTFA p95 | TTFB p95 | RTF p95 | stalls 250/500 | max_gap p95 | audio-s/s | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 152 | 77088 | 175 | 78.5 | 0.816 | **0/0** | 158 | 191.4 | **GOOD** |
+| 168 | 78235 | 182 | 82.8 | 0.891 | 1/0 | 172 | 194.3 | MARGINAL (one stall@250) |
+| 160 | 77555 | 178 | 80.0 | 0.836 | **0/0** | 165 | 192.5 | **GOOD** |
+| **164** | 77819 | 179 | 81.5 | 0.881 | **0/0** | 169 | 193.3 | **GOOD -- qualified** |
+
+**Qualified 6L on the shipped default: C164** (16x2, `--max-batch 12`), up
+from C126 on 2026-09-21 (+30%); C168 is the edge (one stall@250 in 78235, RTF
+p95 0.891 against the 0.90 gate).
+
+(30-minute throughput reads ~10% above the 3-minute screens at the same
+level, as noted on 2026-09-26: compare like with like.)
+
+ASR gate (nemotron, pieces <= 12 s), 6L bf16 default, seeds 1-2: WER long
+0.78% (segmentation off) vs 1.07% (on), medium 0.42% both -- the same
+pattern as 24L.
+
+### 24L large
+
+| C | requests | TTFA p95 | TTFB p95 | RTF p95 | stalls 250/500 | max_gap p95 | audio-s/s | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 96 | 42310 | 292 | 82.7 | 0.776 | 1/0 | 298 | 123.8 | MARGINAL (one stall@250) |
+| **88** | 41458 | 278 | 79.0 | 0.756 | **0/0** | 275 | 121.4 | **GOOD** |
+
+C96 had 0/0 in 43113 on 2026-09-26 with a byte-identical configuration: it
+is a rare-event edge (~1 in 40-80k). **Qualified on the shipped default:
+C88.** `configs/perf/axion-c4a-32c-pocket-en-24l.json` now says so and
+requires nothing exported.

@@ -935,3 +935,25 @@ produced ~20% faster than it plays at C130, so this is the queue and not compute
 `stall_rate@250ms == 0` with **3 stalls (0.005%)**. TTFA p95 336.3 ms, TTFB p95
 77.4 ms, RTF p95 0.818, throughput **158.2 audio-s/s**, ten 180 s windows flat,
 both drift checks PASS. C120 remains the qualified operating point.
+
+## 2026-09-27 · PocketTTS 6L and 24L on the shipped default — GCP Axion, 32 cores
+
+Text segmentation (50 tokens, first 24), the wide I8MM kernel and pooled
+attention are the default since 2026-09-27; a 24-layer pack also gets the int8
+backbone and 16-token prefill slices from the engine. Nothing exported, 16
+workers x 2 threads, same-host client, mixed v2 bank, 30-minute soaks:
+
+| pack | C | slots | requests | TTFA p95 | TTFB p95 | RTF p95 | stalls 250/500 | audio-s/s | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| 6L | **164** | 12 | 77819 | 179 ms | 81.5 ms | 0.881 | 0/0 | 193.3 | GOOD, qualified |
+| 6L | 168 | 12 | 78235 | 182 ms | 82.8 ms | 0.891 | 1/0 | 194.3 | MARGINAL |
+| 24L | **88** | 8 | 41458 | 278 ms | 79.0 ms | 0.756 | 0/0 | 121.4 | GOOD, qualified |
+| 24L | 96 | 8 | 42310 | 292 ms | 82.7 ms | 0.776 | 1/0 | 123.8 | MARGINAL |
+
+The 6L was qualified at C126 (157 audio-s/s, TTFA p95 330 ms) on 2026-09-21:
+the kernels give +22% throughput at equal load with byte-identical audio,
+segmentation halves TTFA (C120: 246 -> 143 ms), and `--max-batch 12` removes
+the 128-place wall of 16 x 8. Segmentation costs ~0.1-0.3 WER points on long
+texts (ASR gate), nothing on single-chunk texts. Detail, including the failed
+experiments: `.work/pocket-tts-24l-cpu-serving-axion.md`; profiles
+`configs/perf/axion-c4a-32c-pocket-en.json` and `-24l.json`.
