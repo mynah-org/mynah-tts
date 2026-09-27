@@ -1225,9 +1225,9 @@ static int handle_speech(int fd, const mynah_json_value *body) {
     size_t *segment_lengths = NULL;
     size_t segment_count = 0;
     char err[512];
-    /* Upstream Pocket's per-chunk generation (src/text_segment.h), opt-in
-     * while it is being measured: MYNAH_POCKET_SEGMENT_TOKENS=50 is upstream's
-     * max_tokens. Only a SentencePiece (Pocket) pack has the engine hook. */
+    /* Upstream Pocket's per-chunk generation (src/text_segment.h), on by
+     * default; MYNAH_POCKET_SEGMENT_TOKENS=0 turns it off. Only a
+     * SentencePiece (Pocket) pack has the engine hook. */
     const size_t segment_tokens = mynah_text_segment_tokens_from_env();
     const int encode_failed = g.sp != NULL && segment_tokens > 0u
         ? mynah_text_segment(g.sp, text, segment_tokens,

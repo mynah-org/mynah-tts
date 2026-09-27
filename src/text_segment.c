@@ -253,9 +253,10 @@ done:
     return rc;
 }
 
-static size_t seg_env_size(const char *name) {
+/* Unset or empty: the shipped default. "0" (or any value <= 0): off. */
+static size_t seg_env_size(const char *name, size_t fallback) {
     const char *env = getenv(name);
-    if (env == NULL || *env == '\0') return 0u;
+    if (env == NULL || *env == '\0') return fallback;
     char *end = NULL;
     const long value = strtol(env, &end, 10);
     if (end == env || value <= 0 || value > 100000L) return 0u;
@@ -263,9 +264,10 @@ static size_t seg_env_size(const char *name) {
 }
 
 size_t mynah_text_segment_tokens_from_env(void) {
-    return seg_env_size("MYNAH_POCKET_SEGMENT_TOKENS");
+    return seg_env_size("MYNAH_POCKET_SEGMENT_TOKENS", MYNAH_TEXT_SEGMENT_DEFAULT_TOKENS);
 }
 
 size_t mynah_text_segment_first_tokens_from_env(void) {
-    return seg_env_size("MYNAH_POCKET_FIRST_SEGMENT_TOKENS");
+    return seg_env_size("MYNAH_POCKET_FIRST_SEGMENT_TOKENS",
+                        MYNAH_TEXT_SEGMENT_DEFAULT_FIRST_TOKENS);
 }

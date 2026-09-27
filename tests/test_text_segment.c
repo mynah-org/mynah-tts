@@ -21,7 +21,27 @@ static int hex_value(int c) {
     return -1;
 }
 
+/* The env readers: unset is the shipped default (on, 50/24), "0" is off. */
+static int check_env_defaults(void) {
+    int bad = 0;
+    unsetenv("MYNAH_POCKET_SEGMENT_TOKENS");
+    unsetenv("MYNAH_POCKET_FIRST_SEGMENT_TOKENS");
+    bad |= mynah_text_segment_tokens_from_env() != MYNAH_TEXT_SEGMENT_DEFAULT_TOKENS;
+    bad |= mynah_text_segment_first_tokens_from_env() != MYNAH_TEXT_SEGMENT_DEFAULT_FIRST_TOKENS;
+    setenv("MYNAH_POCKET_SEGMENT_TOKENS", "0", 1);
+    setenv("MYNAH_POCKET_FIRST_SEGMENT_TOKENS", "0", 1);
+    bad |= mynah_text_segment_tokens_from_env() != 0u;
+    bad |= mynah_text_segment_first_tokens_from_env() != 0u;
+    setenv("MYNAH_POCKET_SEGMENT_TOKENS", "40", 1);
+    bad |= mynah_text_segment_tokens_from_env() != 40u;
+    unsetenv("MYNAH_POCKET_SEGMENT_TOKENS");
+    unsetenv("MYNAH_POCKET_FIRST_SEGMENT_TOKENS");
+    if (bad) fprintf(stderr, "segmentation env defaults: FAIL\n");
+    return bad;
+}
+
 int main(int argc, char **argv) {
+    if (check_env_defaults() != 0) return 1;
     if (argc != 3) {
         fprintf(stderr, "usage: %s MODEL.model CASES.jsonl\n", argv[0]);
         return 2;

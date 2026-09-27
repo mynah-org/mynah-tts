@@ -570,6 +570,24 @@ enum {
     "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"                \
     "backbone:bf16,flow_net:f16,conditioner:f16"
 
+/* The same default for a DEEP backbone: int8 instead of bf16, everything else
+ * identical. Chosen by the pack's own `transformer_layers`, not by a name.
+ *
+ * On the 6L pack bf16 beats int8 in serving (the step is small and bf16 is
+ * native on the production CPU). On the 24L pack it is the other way round:
+ * the backbone is 4x the weight traffic per step, int8 halves it, and the wide
+ * I8MM kernel (src/qmat.c, matvec_q8_i8mm_np) reads it once per eight rows.
+ * Measured on the Axion, 16x2 mb8, 2026-09-25/26: int8 is the configuration
+ * every 24L capacity point was qualified on (C96 GOOD for thirty minutes), and
+ * the ASR gate puts int8 at 0.94% WER against 1.12% for bf16 on the same texts
+ * (reports/20260926-24l-axion). Only 6 and 24 layers exist and were measured;
+ * the threshold sits at the measured deep point rather than being interpolated.
+ * CPU only: the CUDA backend keeps the spec it was measured with. */
+#define POCKET_QG_DEFAULT_SPEC_PINNED_DEEP                                     \
+    "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"                \
+    "backbone:int8,flow_net:f16,conditioner:f16"
+#define POCKET_DEEP_BACKBONE_LAYERS 24u
+
 typedef struct {
     const char *name;
     unsigned mask;
@@ -3748,8 +3766,12 @@ static int pocket_model_init(const mynah_tts_model *model,
         if (strcmp(spec, "default") == 0) {
             /* With no MYNAH_QUANT to obey, the default names its own encodings
              * rather than inheriting a base that has changed underneath it. */
-            spec = (mynah_qmat_qtype_from_env() < 0) ? POCKET_QG_DEFAULT_SPEC_PINNED
-                                                      : POCKET_QG_DEFAULT_SPEC;
+            spec = (mynah_qmat_qtype_from_env() >= 0) ? POCKET_QG_DEFAULT_SPEC
+                 : (state->cfg.layers >= POCKET_DEEP_BACKBONE_LAYERS &&
+                    (state->backend == NULL ||
+                     strcmp(mynah_backend_name(state->backend), "cuda") != 0))
+                     ? POCKET_QG_DEFAULT_SPEC_PINNED_DEEP
+                     : POCKET_QG_DEFAULT_SPEC_PINNED;
         }
         if (pocket_qgroups_parse(spec, &state->qgroups, state->qgroup_qtype, error,
                                  capacity) != 0) {
@@ -3856,6 +3878,25 @@ static int pocket_model_init(const mynah_tts_model *model,
  * pack knows (the streaming emit threshold, the latent width) stay zero rather
  * than being guessed.  The driver always passes a real state and checks the
  * fields it needs, so it cannot pick up a half-answer by accident. */
+/* Tokens per prefill slice, sized so one slice costs about what 32 tokens cost
+ * on the 6L pack: 32 * 6 / layers, rounded down to the backbone's prefill tile
+ * and never below one tile (a slice smaller than the tile runs the tile anyway).
+ * 6 layers -> 32, the value C120 was qualified on; 24 layers -> 16, the value
+ * every 24L capacity point was qualified on (slices of 8, 16 and 24 all run 16
+ * tokens there, and 32 puts ~160 ms of prefill in front of a batch step). CPU
+ * only: 0 leaves the CUDA path on the driver's default. */
+static unsigned pocket_prefill_slice_tokens(const mynah_engine_state *state) {
+    if (state->backend != NULL && strcmp(mynah_backend_name(state->backend), "cuda") == 0)
+        return 0u;
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    const size_t layers = state->cfg.layers > 0u ? state->cfg.layers : 1u;
+    size_t tokens = (32u * 6u) / layers;
+    if (tokens > 32u) tokens = 32u;
+    tokens -= tokens % tile;
+    if (tokens < tile) tokens = tile;
+    return (unsigned)tokens;
+}
+
 static int pocket_caps(const mynah_tts_model *model,
                        const mynah_engine_state *state, mynah_engine_caps *out) {
     if (out == NULL) return -1;
@@ -3888,6 +3929,7 @@ static int pocket_caps(const mynah_tts_model *model,
     out->needs_cfg = 0u;
     out->is_discrete_codec = 0u;
     out->latent_dim = (unsigned)cfg->latent_dim;
+    out->prefill_slice_tokens = pocket_prefill_slice_tokens(state);
     return 0;
 }
 

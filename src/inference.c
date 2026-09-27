@@ -238,19 +238,27 @@ static int slot_fail(synth_slot *slot, const char *message) {
  *
  * 32 with a 60 ms cap is the qualified point: C90 for thirty minutes, 53265
  * requests, every gate passed. `MYNAH_PREFILL_SLICE=0` restores the one-shot
- * prefill exactly, which is how the first table was measured. */
-static size_t prefill_slice_budget(void) {
-    static size_t cached = SIZE_MAX;
-    if (cached != SIZE_MAX) return cached;
-    const char *env = getenv("MYNAH_PREFILL_SLICE");
-    long v = 32;
-    if (env != NULL && *env != '\0') {
-        char *end = NULL;
-        const long parsed = strtol(env, &end, 10);
-        if (end != env && parsed >= 0 && parsed < 1000000L) v = parsed;
+ * prefill exactly, which is how the first table was measured.
+ *
+ * 32 is the driver's default; an engine whose prefill token costs more says so
+ * through `caps->prefill_slice_tokens` (Pocket 24L: 16), and an exported
+ * MYNAH_PREFILL_SLICE overrides both. */
+static size_t prefill_slice_budget(const mynah_engine_caps *caps) {
+    /* -1: not read yet, -2: unset, else the exported value. */
+    static long env_value = -1;
+    if (env_value == -1) {
+        const char *env = getenv("MYNAH_PREFILL_SLICE");
+        long v = -2;
+        if (env != NULL && *env != '\0') {
+            char *end = NULL;
+            const long parsed = strtol(env, &end, 10);
+            if (end != env && parsed >= 0 && parsed < 1000000L) v = parsed;
+        }
+        env_value = v;
     }
-    cached = (size_t)v;
-    return cached;
+    if (env_value >= 0) return (size_t)env_value;
+    if (caps != NULL && caps->prefill_slice_tokens > 0u) return caps->prefill_slice_tokens;
+    return 32u;
 }
 
 /* Validate the request and the sink, then hand everything else to the engine.
@@ -281,7 +289,7 @@ static int slot_start(const mynah_tts_engine *engine, const mynah_tts_model *mod
                         slot->error, slot->error_capacity) != 0) {
         return slot_fail(slot, NULL);
     }
-    if (engine->prepare_slice != NULL && prefill_slice_budget() != 0u) {
+    if (engine->prepare_slice != NULL && prefill_slice_budget(caps) != 0u) {
         /* Not one byte of prefill here: the whole point is that admission stops
          * being a place where the batch can lose several frame periods. */
         slot->preparing = 1;
@@ -440,12 +448,13 @@ typedef struct {
 } prefill_acct;
 
 static void slots_prefill_slice(const mynah_tts_engine *engine,
+                                const mynah_engine_caps *caps,
                                 mynah_engine_scratch *scratch,
                                 synth_slot *slots, size_t resident_rows,
                                 size_t batch_limit, int dump, size_t *rr,
                                 prefill_acct *acct) {
     if (resident_rows == 0u) return;
-    const size_t budget = prefill_slice_budget();
+    const size_t budget = prefill_slice_budget(caps);
     const double step_budget = prefill_step_budget_s();
     const double t0 = (step_budget > 0.0) ? mynah_phase_seconds() : 0.0;
     const int fifo = prefill_fifo();
@@ -1315,7 +1324,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         if (engine->prepare_slice != NULL) {
             const size_t prefill_rows = compact_rows ? used : slot_capacity;
             if (prefill_rows != 0u)
-                slots_prefill_slice(engine, scratch, slots, prefill_rows,
+                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
                                     max_batch, dump_all, &prefill_rr,
                                     serve_profile ? &prefill_profile : NULL);
         }

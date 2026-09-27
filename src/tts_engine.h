@@ -53,6 +53,11 @@ typedef struct {
      * branching on this is the bug this whole seam exists to prevent. */
     unsigned is_discrete_codec;
     unsigned latent_dim;            /* 0 when is_discrete_codec */
+    /* Tokens per resumable prefill slice when MYNAH_PREFILL_SLICE is unset;
+     * 0 = the driver's default. A property of what one prefill token costs
+     * for this model, which is why the engine and not the driver owns it.
+     * Appended; see the vtable note. */
+    unsigned prefill_slice_tokens;
 } mynah_engine_caps;
 
 typedef struct {

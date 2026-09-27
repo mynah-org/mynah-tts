@@ -31,8 +31,18 @@ int mynah_text_segment(const mynah_sp *sp, const char *text, size_t max_tokens,
                        size_t **out_lengths, size_t *out_segments,
                        char *error, size_t error_capacity);
 
-/* Reads MYNAH_POCKET_SEGMENT_TOKENS (0 or unset: segmentation off) and
- * MYNAH_POCKET_FIRST_SEGMENT_TOKENS (0 or unset: same as the first). */
+/* The shipped default is ON: upstream's max_tokens (50) and a tighter first
+ * chunk (24), because the first chunk's prefill is the only one in front of
+ * the first audio. Measured on the Axion (2026-09-26/27, 16x2 mb8): on the 24L
+ * pack TTFA p95 743 -> 275 ms at C48, and the capacity climb C48 -> C96 starts
+ * here; on the 6L pack see configs/perf/axion-c4a-32c-pocket-en.json. With it
+ * off the audio is byte-identical to the unsegmented path; a text that fits in
+ * one chunk is one segment either way.
+ *
+ * MYNAH_POCKET_SEGMENT_TOKENS: unset = 50, 0 = segmentation off.
+ * MYNAH_POCKET_FIRST_SEGMENT_TOKENS: unset = 24, 0 = same as the rest. */
+#define MYNAH_TEXT_SEGMENT_DEFAULT_TOKENS 50u
+#define MYNAH_TEXT_SEGMENT_DEFAULT_FIRST_TOKENS 24u
 size_t mynah_text_segment_tokens_from_env(void);
 size_t mynah_text_segment_first_tokens_from_env(void);
 
