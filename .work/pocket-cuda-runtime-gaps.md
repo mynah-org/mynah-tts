@@ -131,6 +131,44 @@ C68. This makes BF16 a useful capacity gate, not yet a production quality or
 repeated TTFA/RTF/audio-parity runs. The 6L CUDA self-check also passes with
 the BF16 path, preserving the small-model CPU oracle and the FP32 default.
 
+## Q8/INT8 experiment on the L4
+
+The resident Q8 path was exercised with the 24L pack using device activation
+quantization, cached per-row weight scales, INT8 GEMM and an FP32 epilogue for
+`backbone`, `flow_net` and `codec_transformer`, while retaining BF16 backbone
+KV. The first Q8 self-check found a real error-path defect: non-finite host
+K/V values could be uploaded before the atomicity check rejected the step. The
+upload path now validates both live K and V prefixes (or the complete cache)
+before any H2D mutation; this is an upload-only check and is not in the steady
+state frame loop.
+
+After that fix, the Q8 self-check reached the audio parity gate but did not
+pass it:
+
+```text
+decode gang: request 0 of 2 differs from its solo decode
+first differing sample: 1313
+max_abs: 1.59025e-4
+codec_max_abs: 0
+codec_back_max_abs: 0
+```
+
+This is recorded as a precision/parity failure, not hidden by weakening the
+tolerance. The Q8 server still completed one valid chunked PCM smoke request
+with no request or decoder failures, but it was not a performance win on this
+L4: 24L warm-up was about 14.2 s, TTFA 6.249 s, service/E2E 6.346 s, 0.560 s
+of audio and RTF 11.33. The process RSS peak was about 2.73 GiB; `nvidia-smi`
+reported about 596 MiB for the compute process after the request, and the
+resident Q8 weight cache reported 319,012,992 bytes. The smoke had four graph
+captures, 37 replays, zero graph fallbacks and zero decoder failures. These
+are diagnostic numbers only: Q8 remains opt-in and unqualified for production.
+
+The current safe capacity lever is therefore BF16 backbone KV, not Q8. The
+next Q8 work should isolate which projection/group causes the waveform delta,
+then compare a quality-approved Q8 subset against the same single-request and
+batch gates. INT8 KV is not part of this item: it would require a separate
+scale/format contract and has a higher attention-quality risk than BF16.
+
 ## Post-merge regression
 
 After integrating the CPU 6L/24L serving changes into the CUDA branch, the
@@ -178,6 +216,10 @@ request policy and remains enabled after the merge.
   audio tolerance and a real repeated throughput win remain acceptance gates.
 - [ ] Add startup graph capture only for buckets that fit the selected model and
   device memory; never make startup capture block the HTTP event loop.
+- [~] Q8/INT8 qualification: the resident path and counters are implemented,
+  and its host K/V upload atomicity guard is fixed; the 24L L4 parity gate and
+  performance smoke fail (audio delta `1.59025e-4`, RTF `11.33`), so Q8 is
+  diagnostic/opt-in only until a quality-preserving subset is identified.
 
 ## Reproduction
 

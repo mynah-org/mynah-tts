@@ -5305,8 +5305,16 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
          * capacity (and, on 24L, dominated H2D traffic).  Keep the device
          * layout unchanged and copy just the two live contiguous prefixes.
          * A fully populated cache remains one copy, preserving the fast path
-         * for a future caller that legitimately fills the whole capacity. */
+         * for a future caller that legitimately fills the whole capacity.
+         * Validate the host shadow before the first H2D so an injected or
+         * corrupted value cannot leave a partially updated device cache. */
         if (position == bc->max_seq_len && half == device_layer_half) {
+            if (!pocket_all_finite(source, layer_span)) {
+                ctx->cuda_backbone_valid = 0;
+                pocket_error(error, capacity,
+                             "pocket: CUDA KV upload has non-finite host data");
+                return -1;
+            }
             const int failed = ctx->cuda_backbone_kv_bf16
                 ? mynah_backend_h2d_bf16(ctx->state->backend, source,
                                          destination, layer_span, error,
@@ -5318,24 +5326,36 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
                 ctx->cuda_backbone_valid = 0;
                 return -1;
             }
-        } else if (valid_floats > 0u &&
-                   ((ctx->cuda_backbone_kv_bf16
-                         ? mynah_backend_h2d_bf16(
-                               ctx->state->backend, source, destination,
-                               valid_floats, error, capacity)
-                         : mynah_backend_h2d(
-                               ctx->state->backend, source, (float *)destination,
-                               valid_floats, error, capacity)) != 0 ||
-                    (ctx->cuda_backbone_kv_bf16
-                         ? mynah_backend_h2d_bf16(
-                               ctx->state->backend, source + half, destination_v,
-                               valid_floats, error, capacity)
-                         : mynah_backend_h2d(
-                               ctx->state->backend, source + half,
-                               (float *)destination_v, valid_floats, error,
-                               capacity)) != 0)) {
-            ctx->cuda_backbone_valid = 0;
-            return -1;
+        } else if (valid_floats > 0u) {
+            if (!pocket_all_finite(source, valid_floats) ||
+                !pocket_all_finite(source + half, valid_floats)) {
+                ctx->cuda_backbone_valid = 0;
+                pocket_error(error, capacity,
+                             "pocket: CUDA KV upload has non-finite host data");
+                return -1;
+            }
+            const int failed = ctx->cuda_backbone_kv_bf16
+                ? mynah_backend_h2d_bf16(ctx->state->backend, source,
+                                         destination, valid_floats, error,
+                                         capacity)
+                : mynah_backend_h2d(ctx->state->backend, source,
+                                    (float *)destination, valid_floats, error,
+                                    capacity);
+            if (failed != 0) {
+                ctx->cuda_backbone_valid = 0;
+                return -1;
+            }
+            const int failed_v = ctx->cuda_backbone_kv_bf16
+                ? mynah_backend_h2d_bf16(ctx->state->backend, source + half,
+                                         destination_v, valid_floats, error,
+                                         capacity)
+                : mynah_backend_h2d(ctx->state->backend, source + half,
+                                    (float *)destination_v, valid_floats, error,
+                                    capacity);
+            if (failed_v != 0) {
+                ctx->cuda_backbone_valid = 0;
+                return -1;
+            }
         }
     }
     ctx->cuda_backbone_valid = 1;
