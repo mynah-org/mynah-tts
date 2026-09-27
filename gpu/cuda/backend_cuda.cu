@@ -805,6 +805,9 @@ struct cuda_tile_workspace {
     void *meta_dev = nullptr, *meta_host = nullptr;
     size_t meta_cap = 0u;
     cudaEvent_t meta_event = nullptr;
+    float *splitk = nullptr;
+    size_t splitk_cap = 0u; /* floats */
+    int sms = 0;
 };
 
 struct cuda_backend_state {
@@ -848,6 +851,7 @@ struct cuda_backend_state {
     float **dev_decoder_ptr3;
     size_t batch_meta_cap;
     bool fast_math;
+    bool tf32; /* MYNAH_CUDA_TF32: FP32 GEMMs on TF32 tensor cores */
     bool graphs_enabled;
     std::vector<cuda_graph_entry> graph_cache;
     std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
@@ -993,13 +997,13 @@ static bool cuda_graphs_enabled(void) {
 }
 
 static cublasComputeType_t cuda_compute_type(const cuda_backend_state *st) {
-    return st->fast_math ? CUBLAS_COMPUTE_32F_FAST_16F
-                                    : CUBLAS_COMPUTE_32F;
+    if (st->fast_math) return CUBLAS_COMPUTE_32F_FAST_16F;
+    return st->tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 }
 
 static cublasGemmAlgo_t cuda_gemm_algo(const cuda_backend_state *st) {
-    return st->fast_math ? CUBLAS_GEMM_DEFAULT_TENSOR_OP
-                                    : CUBLAS_GEMM_DEFAULT;
+    return st->fast_math || st->tf32 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP
+                                     : CUBLAS_GEMM_DEFAULT;
 }
 
 static int ensure_scratch(cuda_backend_state *st, size_t bytes, char *e, size_t ec) {
@@ -2557,8 +2561,10 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     /* The parity path must not silently use TF32 on Ampere/Ada.  Fast math is
      * an explicit opt-in experiment; its Tensor-Core error budget is a later
      * stage gate, not the default CUDA result. */
+    st->tf32 = !st->fast_math && cuda_env_enabled("MYNAH_CUDA_TF32", false);
     const cublasMath_t math_mode = st->fast_math
-        ? CUBLAS_DEFAULT_MATH : CUBLAS_PEDANTIC_MATH;
+        ? CUBLAS_DEFAULT_MATH
+        : (st->tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH);
     if (cublasSetMathMode(st->cublas, math_mode) != CUBLAS_STATUS_SUCCESS) {
         set_error(e, ec, "cuBLAS math mode setup failed");
         cuda_close(st);
@@ -5583,41 +5589,144 @@ __global__ static void k_tile_gemm(const float *A, const float *W,
     }
 }
 
-__global__ static void k_tile_gather(const float *const *inputs, float *x,
-                                     int positions, int dim, int total) {
-    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-    if (i >= total) return;
-    const int per_row = positions * dim;
-    x[i] = inputs[i / per_row][i % per_row];
+/* Split-K variant of k_tile_gemm. The number of splits S depends on the
+ * weight's shape (N, K) and the SM count only, never on M; split s is one
+ * ascending fma chain over its own k range, and the partials are added in the
+ * fixed order ((P0 + P1) + P2) + ... . A row's bits therefore still do not
+ * depend on how many other rows share the call, while small-M tiles get
+ * enough independent blocks to fill the card. (Same scheme as the mynah-asr
+ * cohort GEMM.) */
+__global__ static void k_tile_gemm_part(const float *A, const float *W, float *P,
+                                        int M, int N, int K, int KC) {
+    __shared__ float As[TILE_GEMM_BK][TILE_GEMM_BM + 4];
+    __shared__ float Ws[TILE_GEMM_BK][TILE_GEMM_BN + 4];
+    const int tid = (int)threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int m0 = (int)blockIdx.y * TILE_GEMM_BM;
+    const int n0 = (int)blockIdx.x * TILE_GEMM_BN;
+    const int kb = (int)blockIdx.z * KC;
+    const int ke = min(K, kb + KC);
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    const int lrow = tid >> 2, lk = (tid & 3) * 4;
+    for (int k0 = kb; k0 < ke; k0 += TILE_GEMM_BK) {
+        {
+            const int m = m0 + lrow;
+            const float *src = A + (size_t)m * K + k0 + lk;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int k = k0 + lk + u;
+                As[lk + u][lrow] = (m < M && k < ke) ? src[u] : 0.0f;
+            }
+        }
+        {
+            const int n = n0 + lrow;
+            const float *src = W + (size_t)n * K + k0 + lk;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int k = k0 + lk + u;
+                Ws[lk + u][lrow] = (n < N && k < ke) ? src[u] : 0.0f;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < TILE_GEMM_BK; ++k) {
+            float a[4], w[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = As[k][ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) w[j] = Ws[k][tx * 4 + j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], w[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float *Ps = P + (size_t)blockIdx.z * (size_t)M * (size_t)N;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + tx * 4 + j;
+            if (n < N) Ps[(size_t)m * N + n] = acc[i][j];
+        }
+    }
 }
 
-/* Row-major [row*positions + t][dim] to each request's channel-major
- * [dim][positions] decoder input. */
-__global__ static void k_tile_scatter(const float *x, float *const *outputs,
-                                      int positions, int dim, int total) {
+__global__ static void k_tile_gemm_reduce(const float *P, int S, int M, int N,
+                                          const float *bias, float *C) {
+    const int n = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int m = (int)blockIdx.y;
+    if (n >= N || m >= M) return;
+    const size_t mn = (size_t)M * (size_t)N, o = (size_t)m * N + n;
+    float v = P[o];
+    for (int sp = 1; sp < S; ++sp) v += P[(size_t)sp * mn + o];
+    C[o] = v + (bias != nullptr ? bias[n] : 0.0f);
+}
+
+static int tile_gemm_splits(int sms, int N, int K) {
+    const int ntiles = (N + TILE_GEMM_BN - 1) / TILE_GEMM_BN;
+    int S = (2 * sms + ntiles - 1) / ntiles;
+    const int smax = K / 256;
+    if (S > smax) S = smax;
+    return S < 1 ? 1 : S;
+}
+
+/* The tile's rows are packed: row m is token `rowmap[m].y` of request
+ * `rowmap[m].x`, so requests may contribute different token counts. */
+__global__ static void k_tile_gather(const float *const *inputs,
+                                     const int2 *rowmap, float *x, int dim,
+                                     int total) {
     const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     if (i >= total) return;
-    const int m = i / dim;
-    const int c = i % dim;
-    outputs[m / positions][(size_t)c * positions + (m % positions)] = x[i];
+    const int2 rt = rowmap[i / dim];
+    x[i] = inputs[rt.x][(size_t)rt.y * dim + (i % dim)];
+}
+
+/* Row-major [m][dim] to each request's channel-major [dim][positions]. */
+__global__ static void k_tile_scatter(const float *x, float *const *outputs,
+                                      const int2 *rowmap, int positions,
+                                      int dim, int total) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    const int2 rt = rowmap[i / dim];
+    outputs[rt.x][(size_t)(i % dim) * positions + rt.y] = x[i];
+}
+
+__device__ static inline float tile_kv_load(const float *p) { return *p; }
+__device__ static inline float tile_kv_load(const uint16_t *p) {
+    return cuda_bf16_to_float(*p);
+}
+__device__ static inline void tile_kv_store(float *p, float v) { *p = v; }
+__device__ static inline void tile_kv_store(uint16_t *p, float v) {
+    *p = cuda_bf16_from_float(v);
 }
 
 /* RoPE on q and k at each row's absolute position (the formula of k_rope_qk),
- * then k and v into the request's ring. One block per row. */
-__global__ static void k_tile_rope_store(float *qkv, float *const *kv,
-                                         const long long *start, int layer,
-                                         int layers, int positions, int heads,
-                                         int head_width, int ring,
-                                         float max_period) {
+ * then k and v into the request's cache at slot (absolute % ring), layout
+ * [K ring][V ring] per layer. One block per row. */
+template <typename KV>
+__global__ static void k_tile_rope_store(float *qkv, void *const *kv,
+                                         const long long *start,
+                                         const int2 *rowmap, int layer,
+                                         int layers, int heads, int head_width,
+                                         const long long *rings, float max_period) {
     const int m = (int)blockIdx.x;
-    const int r = m / positions;
-    const long long absolute = start[r] + (m % positions);
+    const int2 rt = rowmap[m];
+    const long long ring = rings[rt.x];
+    const long long absolute = start[rt.x] + rt.y;
     const int half = head_width / 2;
     const int dim = heads * head_width;
     float *row = qkv + (size_t)m * 3u * (size_t)dim;
-    float *kbase = kv[(size_t)r * layers + layer];
-    float *kslot = kbase + (size_t)(absolute % ring) * dim;
-    float *vslot = kbase + (size_t)ring * dim + (size_t)(absolute % ring) * dim;
+    KV *kbase = static_cast<KV *>(kv[(size_t)rt.x * layers + layer]);
+    KV *kslot = kbase + (size_t)(absolute % ring) * dim;
+    KV *vslot = kbase + (size_t)ring * dim + (size_t)(absolute % ring) * dim;
     const float slope = (float)(-log((double)max_period) * 2.0 /
                                 (double)head_width);
     for (int pair = (int)threadIdx.x; pair < heads * half;
@@ -5745,6 +5854,29 @@ static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
     if (w.meta_event == nullptr &&
         ce(cudaEventCreateWithFlags(&w.meta_event, cudaEventDisableTiming), e, ec))
         return -1;
+    if (w.sms == 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&w.sms, cudaDevAttrMultiProcessorCount, dev) !=
+                cudaSuccess || w.sms <= 0)
+            w.sms = 40;
+    }
+    /* The widest split-K partial buffer any projection of this tile needs. */
+    const size_t shapes[4][2] = {{3u * dim, dim}, {dim, dim}, {ffn, dim}, {dim, ffn}};
+    size_t need = 0u;
+    for (const auto &shape : shapes) {
+        const int S = tile_gemm_splits(w.sms, (int)shape[0], (int)shape[1]);
+        if (S <= 1) continue;
+        const size_t floats = (size_t)S * rows * shape[0];
+        if (floats > need) need = floats;
+    }
+    if (need > w.splitk_cap) {
+        cudaFree(w.splitk);
+        w.splitk = nullptr;
+        w.splitk_cap = 0u;
+        if (ce(cudaMalloc(&w.splitk, need * sizeof(float)), e, ec)) return -1;
+        w.splitk_cap = need;
+    }
     return 0;
 }
 
@@ -5753,6 +5885,7 @@ static void tile_release(cuda_backend_state *st) {
     cudaFree(w.x); cudaFree(w.xn); cudaFree(w.qkv);
     cudaFree(w.att); cudaFree(w.proj); cudaFree(w.ffn_buf);
     cudaFree(w.meta_dev);
+    cudaFree(w.splitk);
     if (w.meta_host != nullptr) cudaFreeHost(w.meta_host);
     if (w.meta_event != nullptr) cudaEventDestroy(w.meta_event);
     w = cuda_tile_workspace();
@@ -5765,6 +5898,23 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
     if (cached_weight(st, hw, N * K * sizeof(float), &dw, e, ec)) return -1;
     if (hb != nullptr && cached_weight(st, hb, N * sizeof(float), &db, e, ec))
         return -1;
+    cuda_tile_workspace &w = st->tile;
+    static const bool splitk_on = cuda_env_enabled("MYNAH_CUDA_TILE_SPLITK", true);
+    const int S = tile_gemm_splits(w.sms > 0 ? w.sms : 40, (int)N, (int)K);
+    if (splitk_on && S > 1 && w.splitk != nullptr && (size_t)S * M * N <= w.splitk_cap) {
+        int KC = (int)((K + (size_t)S - 1u) / (size_t)S);
+        KC = (KC + TILE_GEMM_BK - 1) / TILE_GEMM_BK * TILE_GEMM_BK;
+        const dim3 grid((unsigned)((N + TILE_GEMM_BN - 1) / TILE_GEMM_BN),
+                        (unsigned)((M + TILE_GEMM_BM - 1) / TILE_GEMM_BM),
+                        (unsigned)S);
+        k_tile_gemm_part<<<grid, 256, 0, st->stream>>>(A, dw, w.splitk, (int)M,
+                                                       (int)N, (int)K, KC);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        const dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
+        k_tile_gemm_reduce<<<g2, 256, 0, st->stream>>>(w.splitk, S, (int)M,
+                                                       (int)N, db, C);
+        return ce(cudaGetLastError(), e, ec);
+    }
     const dim3 grid((unsigned)((N + TILE_GEMM_BN - 1) / TILE_GEMM_BN),
                     (unsigned)((M + TILE_GEMM_BM - 1) / TILE_GEMM_BM));
     k_tile_gemm<<<grid, 256, 0, st->stream>>>(A, dw, db, C, (int)M, (int)N,
