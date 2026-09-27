@@ -131,6 +131,29 @@ C68. This makes BF16 a useful capacity gate, not yet a production quality or
 repeated TTFA/RTF/audio-parity runs. The 6L CUDA self-check also passes with
 the BF16 path, preserving the small-model CPU oracle and the FP32 default.
 
+## Post-merge regression
+
+After integrating the CPU 6L/24L serving changes into the CUDA branch, the
+same L4 was rebuilt from the unified checkout:
+
+```text
+make clean && make cuda-server cuda CUDA_ARCH=sm_89       EXIT:0
+6L CUDA BF16 pocket self-check + batching self-check       PASS
+24L CUDA BF16 pocket self-check + batching self-check      PASS
+```
+
+The 24L post-merge HTTP smoke used one CUDA server process, one engine thread,
+BF16 backbone KV, resident flow/Mimi/decoder and graph capture. It returned
+HTTP 200 chunked PCM with 126,720 bytes (2.64 s), 0 failed requests, TTFA
+199 ms, scheduler E2E 893 ms and RTF 0.338. The process reported four graph
+captures, 95 graph replays, zero graph fallbacks and zero decoder failures;
+cross-request batch counters were zero because this was deliberately a single
+request smoke, not a throughput measurement.
+
+The CLI self-check still warns that its intentionally long 96-token probe is
+not segmented; the server-side CPU/HTTP segmentation path is a separate
+request policy and remains enabled after the merge.
+
 ## Plan and acceptance gates
 
 - [x] Raise shared scheduler/CUDA metadata/decoder graph capacity to 128 and
