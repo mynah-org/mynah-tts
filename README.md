@@ -142,8 +142,9 @@ make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
 ```
 
 Pocket-TTS support is currently an experimental engine path: official 6-layer
-and 24-layer packs run on CPU, and the Linux CUDA server path has been exercised
-on an RTX PRO 6000 Blackwell (`sm_120`). CUDA has resident implementations for
+and 24-layer packs run on CPU, with the CPU server using model-aware text
+segmentation and the same depth-driven runtime for both packs. The Linux CUDA
+server path has been exercised on Blackwell (`sm_120`) and Ada (`sm_89`). CUDA has resident implementations for
 the backbone, flow head, Mimi decoder-transformer, quantizer/causal upsample and
 causal SEANet decoder, but each stage is capability- and precision-gated. The
 default Pocket CPU quantization profile intentionally keeps several groups
@@ -212,6 +213,20 @@ MYNAH_QUANT_GROUPS=none \
 MYNAH_CUDA_RESIDENT=1 MYNAH_CUDA_FLOW=1 MYNAH_CUDA_POCKET_CODEC=1 \
   ./build/cuda/mynah-tts-server --device cuda --max-batch 16 \
   --max-inflight 128 -m models/pocket-6l
+```
+
+For a 24-layer capacity experiment, `MYNAH_CUDA_KV_DTYPE=bf16` stores only the
+backbone K/V cache in BF16 while retaining FP32 projections, attention
+accumulation, host fallback state and codec state. It is opt-in and keeps the
+FP32 default unchanged; it must pass the same stage/audio gates before being a
+production precision choice:
+
+```bash
+MYNAH_QUANT_GROUPS=none MYNAH_CUDA_KV_DTYPE=bf16 \
+MYNAH_CUDA_RESIDENT=1 MYNAH_CUDA_FLOW=1 MYNAH_CUDA_POCKET_CODEC=1 \
+MYNAH_CUDA_POCKET_DECODER=1 MYNAH_CUDA_DECODER_GRAPHS=1 \
+  ./build/cuda/mynah-tts-server --device cuda --max-batch 64 \
+  --max-inflight 128 -m models/pocket-24l
 ```
 
 The CUDA startup log prints the resolved resident capability for each Pocket
