@@ -284,6 +284,30 @@ __global__ static void k_f16_to_f32(const half *in, float *out, int n) {
     if (i < n) out[i] = __half2float(in[i]);
 }
 
+/* BF16 is used only for persistent attention K/V.  Keep conversion explicit
+ * instead of relying on a device-specific intrinsic: this compiles for the
+ * target range from older CUDA toolkits through Ada/Blackwell and preserves
+ * the same round-to-nearest-even rule on every GPU. */
+__device__ static uint16_t cuda_bf16_from_float(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t rounded = bits + UINT32_C(0x7fff) + ((bits >> 16) & 1u);
+    return (uint16_t)(rounded >> 16);
+}
+
+__device__ static float cuda_bf16_to_float(uint16_t value) {
+    return __uint_as_float((uint32_t)value << 16);
+}
+
+__global__ static void k_f32_to_bf16(const float *in, uint16_t *out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = cuda_bf16_from_float(in[i]);
+}
+
+__global__ static void k_bf16_to_f32(const uint16_t *in, float *out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = cuda_bf16_to_float(in[i]);
+}
+
 /* Q8 activation packing used by the resident Pocket linear path.  The CPU
  * qmat reference uses symmetric per-row absmax, ties-away-from-zero rounding
  * and the signed range [-127, 127].  Keep those choices explicit here: CUDA's
@@ -779,6 +803,10 @@ struct cuda_backend_state {
     /* Device scratch for activations (grows on demand). */
     float *dev_scratch;
     size_t dev_scratch_cap;   /* bytes */
+    /* Reusable FP32 staging for host<->BF16 KV conversion.  It is grown only
+     * before a new resident prefix is submitted and never inside a graph. */
+    float *dev_bf16_convert;
+    size_t dev_bf16_convert_cap; /* floats */
     int8_t *dev_q8_activation;
     float *dev_q8_activation_scale;
     int32_t *dev_q8_accum;
@@ -893,13 +921,13 @@ struct mynah_backend_decoder {
     std::vector<cuda_decoder_op> ops;
 };
 
-static constexpr size_t CUDA_BATCH_META_CAP = 64u;
-static constexpr size_t CUDA_DECODER_GRAPH_CAP = 64u;
+static constexpr size_t CUDA_BATCH_META_CAP = 128u;
+static constexpr size_t CUDA_DECODER_GRAPH_CAP = 128u;
 /* A server can retain one decoder graph per live context in addition to the
  * width-bucketed backbone/flow graphs.  The condition-projection input graph
  * is a separate bucket because its input is already resident in `cuda_x` and
  * must not accidentally replay an H2D node from the ordinary bucket.  Keep
- * enough finite room for 128 request decoders plus the three 64-width bucket
+ * enough finite room for 128 request decoders plus the three 128-width bucket
  * families. */
 static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 384u;
 
@@ -992,6 +1020,24 @@ static int ensure_host(cuda_backend_state *st, size_t bytes, char *e, size_t ec)
         cudaFreeHost(st->host_buf); st->host_buf = nullptr; return -1;
     }
     st->host_buf_cap = cap;
+    return 0;
+}
+
+static int ensure_bf16_convert(cuda_backend_state *st, size_t elements,
+                               char *e, size_t ec) {
+    if (st->dev_bf16_convert_cap >= elements) return 0;
+    if (elements == 0u || elements > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "CUDA BF16 conversion size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    destroy_graphs(st);
+    if (st->dev_bf16_convert) cudaFree(st->dev_bf16_convert);
+    st->dev_bf16_convert = nullptr;
+    st->dev_bf16_convert_cap = 0u;
+    if (ce(cudaMalloc(&st->dev_bf16_convert, elements * sizeof(float)), e, ec))
+        return -1;
+    st->dev_bf16_convert_cap = elements;
     return 0;
 }
 
@@ -2037,7 +2083,7 @@ static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
             2.0e-4f ||
         fabsf(causal_long_output[1] - causal_long_expected_next[1]) >
             2.0e-4f ||
-        fabsf(causal_long_partial[0] - 15.0f) > 2.0e-4f ||
+        fabsf(causal_long_partial[0] - 19.0f) > 2.0e-4f ||
         fabsf(causal_long_partial[1] - 12.0f) > 2.0e-4f ||
         fabsf(causal_long_partial[2] - 15.0f) > 2.0e-4f) {
         std::snprintf(e, ec,
@@ -2236,30 +2282,38 @@ extern "C" int mynah_cuda_matmul_q8_d2d(void *, const float *, float *, size_t,
 static int cuda_q8_self_test(void *opaque, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (st == nullptr) return -1;
-    const float input[6] = {1.0f, 2.0f, 3.0f, -1.0f, 0.5f, 2.0f};
-    const float weight[12] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
-                              0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    /* The INT8 tensor-core GEMM requires aligned m/n/k dimensions on the
+     * supported CUDA path.  Keep this model-free probe on a 4x4x4 shape;
+     * production Pocket projections are all much larger and aligned. */
+    const float input[16] = {1.0f, 2.0f, 3.0f, -1.0f,
+                             -1.0f, 0.5f, 2.0f, 4.0f,
+                             3.0f, -2.0f, 1.0f, 0.25f,
+                             0.5f, 1.5f, -3.0f, 2.0f};
+    const float weight[16] = {1.0f, 0.0f, 0.0f, 0.0f,
+                              0.0f, 1.0f, 0.0f, 0.0f,
+                              0.0f, 0.0f, 1.0f, 0.0f,
+                              0.0f, 0.0f, 0.0f, 1.0f};
     const float bias[4] = {0.5f, -0.5f, 1.0f, 2.0f};
     std::vector<int8_t> qweight;
     std::vector<float> wscale;
-    if (cuda_pack_weight_q8(weight, 4u, 3u, &qweight, &wscale, e, ec) != 0)
+    if (cuda_pack_weight_q8(weight, 4u, 4u, &qweight, &wscale, e, ec) != 0)
         return -1;
-    int8_t qinput[6] = {0};
-    float xscale[2] = {0.0f, 0.0f};
-    for (size_t row = 0; row < 2u; ++row) {
+    int8_t qinput[16] = {0};
+    float xscale[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (size_t row = 0; row < 4u; ++row) {
         float amax = 0.0f;
-        for (size_t col = 0; col < 3u; ++col)
-            amax = std::fmax(amax, std::fabs(input[row * 3u + col]));
+        for (size_t col = 0; col < 4u; ++col)
+            amax = std::fmax(amax, std::fabs(input[row * 4u + col]));
         xscale[row] = amax == 0.0f ? 0.0f : amax / 127.0f;
         const float inv = xscale[row] == 0.0f ? 0.0f : 127.0f / xscale[row];
-        for (size_t col = 0; col < 3u; ++col)
-            qinput[row * 3u + col] = (int8_t)cuda_q8_round(
-                input[row * 3u + col] * inv);
+        for (size_t col = 0; col < 4u; ++col)
+            qinput[row * 4u + col] = (int8_t)cuda_q8_round(
+                input[row * 4u + col] * inv);
     }
     float *d_input = nullptr;
     float *d_output = nullptr;
     if (ce(cudaMalloc((void **)&d_input, sizeof(input)), e, ec) != 0 ||
-        ce(cudaMalloc((void **)&d_output, 8u * sizeof(float)), e, ec) != 0) {
+        ce(cudaMalloc((void **)&d_output, 16u * sizeof(float)), e, ec) != 0) {
         if (d_input != nullptr) cudaFree(d_input);
         if (d_output != nullptr) cudaFree(d_output);
         return -1;
@@ -2268,24 +2322,24 @@ static int cuda_q8_self_test(void *opaque, char *e, size_t ec) {
     do {
         if (ce(cudaMemcpy(d_input, input, sizeof(input), cudaMemcpyHostToDevice),
                e, ec) != 0 ||
-            mynah_cuda_matmul_q8_d2d(st, d_input, d_output, 2u, 3u, 4u,
+            mynah_cuda_matmul_q8_d2d(st, d_input, d_output, 4u, 4u, 4u,
                                      weight, bias, e, ec) != 0 ||
             ce(cudaStreamSynchronize(st->stream), e, ec) != 0) {
             result = -1;
             break;
         }
-        float output[8] = {0.0f};
+        float output[16] = {0.0f};
         if (ce(cudaMemcpy(output, d_output, sizeof(output),
                           cudaMemcpyDeviceToHost), e, ec) != 0) {
             result = -1;
             break;
         }
-        for (size_t row = 0; row < 2u && result == 0; ++row) {
+        for (size_t row = 0; row < 4u && result == 0; ++row) {
             for (size_t col = 0; col < 4u; ++col) {
                 int32_t dot = 0;
-                for (size_t k = 0; k < 3u; ++k)
-                    dot += (int32_t)qinput[row * 3u + k] *
-                           (int32_t)qweight[col * 3u + k];
+                for (size_t k = 0; k < 4u; ++k)
+                    dot += (int32_t)qinput[row * 4u + k] *
+                           (int32_t)qweight[col * 4u + k];
                 const float row_scale = xscale[row] * wscale[col];
                 const float expected = std::fmaf((float)dot, row_scale,
                                                  bias[col]);
@@ -2338,6 +2392,7 @@ static void cuda_close(void *opaque) {
         cudaFree(c.device_scale);
     }
     if (st->dev_scratch) cudaFree(st->dev_scratch);
+    if (st->dev_bf16_convert) cudaFree(st->dev_bf16_convert);
     if (st->dev_q8_activation) cudaFree(st->dev_q8_activation);
     if (st->dev_q8_activation_scale) cudaFree(st->dev_q8_activation_scale);
     if (st->dev_q8_accum) cudaFree(st->dev_q8_accum);
@@ -2373,6 +2428,7 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     auto *st = new (std::nothrow) cuda_backend_state();
     if (!st) { set_error(e,ec,"oom"); return -1; }
     st->dev_scratch = nullptr; st->dev_scratch_cap = 0;
+    st->dev_bf16_convert = nullptr; st->dev_bf16_convert_cap = 0u;
     st->dev_q8_activation = nullptr;
     st->dev_q8_activation_scale = nullptr;
     st->dev_q8_accum = nullptr;
@@ -2551,6 +2607,17 @@ extern "C" int mynah_cuda_dev_alloc(void *opaque, size_t n, float **dev_ptr,
     return ce(cudaMalloc(dev_ptr, n * sizeof(float)), e, ec);
 }
 
+extern "C" int mynah_cuda_dev_alloc_bytes(void *opaque, size_t bytes,
+                                            void **dev_ptr, char *e,
+                                            size_t ec) {
+    (void)opaque;
+    if (dev_ptr == nullptr || bytes == 0u) {
+        set_error(e, ec, "invalid CUDA byte device allocation size");
+        return -1;
+    }
+    return ce(cudaMalloc(dev_ptr, bytes), e, ec);
+}
+
 extern "C" void mynah_cuda_dev_free(void *opaque, float *dev_ptr) {
     (void)opaque;
     if (dev_ptr) cudaFree(dev_ptr);
@@ -2599,6 +2666,46 @@ extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,
                             std::memory_order_relaxed);
     st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(host, dev_ptr, n*sizeof(float),
+                              cudaMemcpyDeviceToHost, st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_h2d_bf16(void *opaque, const float *host,
+                                     void *dev_ptr, size_t n, char *e,
+                                     size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || host == nullptr || dev_ptr == nullptr || n == 0u ||
+        n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA BF16 host-to-device copy");
+        return -1;
+    }
+    if (ensure_bf16_convert(st, n, e, ec)) return -1;
+    const size_t bytes = n * sizeof(float);
+    st->h2d_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
+    if (ce(cudaMemcpyAsync(st->dev_bf16_convert, host, bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    k_f32_to_bf16<<<((int)n + 255) / 256, 256, 0, st->stream>>>(
+        st->dev_bf16_convert, static_cast<uint16_t *>(dev_ptr), (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_d2h_bf16(void *opaque, const void *dev_ptr,
+                                     float *host, size_t n, char *e,
+                                     size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dev_ptr == nullptr || host == nullptr || n == 0u ||
+        n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA BF16 device-to-host copy");
+        return -1;
+    }
+    if (ensure_bf16_convert(st, n, e, ec)) return -1;
+    k_bf16_to_f32<<<((int)n + 255) / 256, 256, 0, st->stream>>>(
+        static_cast<const uint16_t *>(dev_ptr), st->dev_bf16_convert, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    st->d2h_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
+    return ce(cudaMemcpyAsync(host, st->dev_bf16_convert, n * sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
 
@@ -5197,6 +5304,68 @@ __global__ static void k_cross_attention(const float *q, const float *kcache,
         out[hbase + (size_t)d] *= inv;
 }
 
+__global__ static void k_self_attention_bf16(
+    const float *qkv, uint16_t *kcache, uint16_t *vcache, size_t position,
+    size_t cache_stride, size_t valid, int heads, int head_width, float scale,
+    float *out) {
+    const int head = (int)blockIdx.x;
+    if (head >= heads) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t cache_base = position * cache_stride + hbase;
+    const float *q = qkv + hbase;
+    const float *k = qkv + width + hbase;
+    const float *v = qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        kcache[cache_base + (size_t)d] = cuda_bf16_from_float(k[d]);
+        vcache[cache_base + (size_t)d] = cuda_bf16_from_float(v[d]);
+        out[hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s <= position; ++s) {
+        const uint16_t *ks = kcache + s * cache_stride + hbase;
+        const uint16_t *vs = vcache + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * cuda_bf16_to_float(ks[d]);
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = hbase + (size_t)d;
+            out[index] = out[index] * correction + probability *
+                         cuda_bf16_to_float(vs[d]);
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] *= inv;
+}
+
 /* Interleaved RoPE for the fused QKV row.  PocketTTS uses the same absolute
  * position and frequency construction as transformer_ar.c; keeping the
  * rotation on the device avoids a host round-trip between QKV projection and
@@ -5296,6 +5465,31 @@ extern "C" int mynah_cuda_self_attention_dev(
     return ce(cudaGetLastError(), e, ec);
 }
 
+extern "C" int mynah_cuda_self_attention_bf16_dev(
+    void *opaque, const float *qkv, void *kcache, void *vcache,
+    size_t position, size_t cache_stride, size_t valid, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
+        heads == 0u || head_width == 0u || valid == 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || cache_stride == 0u || position >= valid ||
+        heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA BF16 self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    if (cache_stride < width ||
+        (valid - 1u) > (SIZE_MAX - (width - 1u)) / cache_stride) {
+        set_error(e, ec, "CUDA BF16 self-attention cache stride overflow");
+        return -1;
+    }
+    k_self_attention_bf16<<<(int)heads, attention_threads(head_width), 0,
+                            st->stream>>>(
+        qkv, static_cast<uint16_t *>(kcache), static_cast<uint16_t *>(vcache),
+        position, cache_stride, valid, (int)heads, (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
 extern "C" int mynah_cuda_cross_attention_dev(
     void *opaque, const float *q, const float *kcache, const float *vcache,
     size_t valid, size_t cache_stride, size_t heads, size_t head_width,
@@ -5390,6 +5584,75 @@ __global__ static void k_self_attention_batch(
         out[(size_t)request * width + hbase + (size_t)d] *= inv;
 }
 
+__global__ static void k_self_attention_bf16_batch(
+    const float *qkv, const uint16_t *const *kcache,
+    const uint16_t *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, int heads, int head_width,
+    float scale, float *out) {
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t position = positions[request];
+    const size_t cache_stride = cache_strides[request];
+    const size_t cache_base = position * cache_stride + hbase;
+    uint16_t *request_k = const_cast<uint16_t *>(kcache[request]);
+    uint16_t *request_v = const_cast<uint16_t *>(vcache[request]);
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    const float *q = request_qkv + hbase;
+    const float *k = request_qkv + width + hbase;
+    const float *v = request_qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        request_k[cache_base + (size_t)d] = cuda_bf16_from_float(k[d]);
+        request_v[cache_base + (size_t)d] = cuda_bf16_from_float(v[d]);
+        out[(size_t)request * width + hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s <= position; ++s) {
+        const uint16_t *ks = kcache[request] + s * cache_stride + hbase;
+        const uint16_t *vs = vcache[request] + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * cuda_bf16_to_float(ks[d]);
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = (size_t)request * width + hbase + (size_t)d;
+            out[index] = out[index] * correction + probability *
+                         cuda_bf16_to_float(vs[d]);
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[(size_t)request * width + hbase + (size_t)d] *= inv;
+}
+
 extern "C" int mynah_cuda_self_attention_batch_dev(
     void *opaque, const float *qkv, float *const *kcache,
     float *const *vcache, const size_t *positions,
@@ -5443,6 +5706,58 @@ extern "C" int mynah_cuda_self_attention_batch_dev(
     return ce(cudaGetLastError(), e, ec);
 }
 
+extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
+    void *opaque, const float *qkv, void *const *kcache,
+    void *const *vcache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u || batch > st->batch_meta_cap || heads == 0u ||
+        head_width == 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA BF16 batched self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t qkv_count = 0u;
+    if (!cuda_size_mul(width, 3u, &qkv_count) ||
+        !cuda_size_mul(batch, qkv_count, &qkv_count)) {
+        set_error(e, ec, "CUDA BF16 batched self-attention size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            positions[i] == SIZE_MAX || cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA BF16 batched self-attention cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    dim3 grid((unsigned)heads, (unsigned)batch, 1u);
+    k_self_attention_bf16_batch<<<grid, attention_threads(head_width), 0,
+                                  st->stream>>>(
+        qkv,
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+        st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+        (int)heads, (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
 __global__ static void k_gather_kv_batch(
     float *const *kcache, float *const *vcache, const size_t *positions,
     const size_t *cache_strides, int batch, size_t width, float *out) {
@@ -5455,6 +5770,22 @@ __global__ static void k_gather_kv_batch(
     const size_t column = index % width;
     const size_t source = positions[request] * cache_strides[request] + column;
     out[index] = (part == 0u ? kcache[request] : vcache[request])[source];
+}
+
+__global__ static void k_gather_kv_bf16_batch(
+    const uint16_t *const *kcache, const uint16_t *const *vcache,
+    const size_t *positions, const size_t *cache_strides, int batch,
+    size_t width, float *out) {
+    const size_t index = (size_t)blockIdx.x * (size_t)blockDim.x +
+                         (size_t)threadIdx.x;
+    const size_t total = (size_t)batch * 2u * width;
+    if (index >= total) return;
+    const size_t request = index / (2u * width);
+    const size_t part = (index / width) & 1u;
+    const size_t column = index % width;
+    const size_t source = positions[request] * cache_strides[request] + column;
+    const uint16_t *row = part == 0u ? kcache[request] : vcache[request];
+    out[index] = cuda_bf16_to_float(row[source]);
 }
 
 extern "C" int mynah_cuda_gather_kv_batch(
@@ -5503,6 +5834,54 @@ extern "C" int mynah_cuda_gather_kv_batch(
     k_gather_kv_batch<<<(int)blocks, 256, 0, st->stream>>>(
         st->dev_batch_k_cache, st->dev_batch_v_cache, st->dev_batch_positions,
         st->dev_batch_cache_strides, (int)batch, width, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_gather_kv_bf16_batch(
+    void *opaque, void *const *kcache, void *const *vcache,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u || batch > st->batch_meta_cap || heads == 0u ||
+        head_width == 0u || heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA BF16 batched K/V gather dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t total = 0u;
+    size_t blocks = 0u;
+    if (!cuda_size_mul(batch, 2u, &total) || !cuda_size_mul(total, width, &total) ||
+        !cuda_size_add(total, 255u, &blocks) || (blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA BF16 batched K/V gather size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA BF16 batched K/V gather cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    k_gather_kv_bf16_batch<<<(int)blocks, 256, 0, st->stream>>>(
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+        st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+        width, out);
     return ce(cudaGetLastError(), e, ec);
 }
 

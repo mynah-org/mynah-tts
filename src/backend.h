@@ -357,6 +357,20 @@ int mynah_backend_self_attention_batch_dev(
     const size_t *positions, const size_t *cache_strides, size_t batch,
     size_t heads, size_t head_width, float scale, float *dev_out,
     char *error, size_t error_capacity);
+/* BF16-cache variants. QKV, output and attention accumulation remain FP32;
+ * only persistent K/V elements use two-byte bfloat16 storage. */
+int mynah_backend_self_attention_bf16_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    void *dev_k_cache, void *dev_v_cache,
+    size_t position, size_t cache_stride, size_t valid, size_t heads,
+    size_t head_width, float scale, float *dev_out,
+    char *error, size_t error_capacity);
+int mynah_backend_self_attention_bf16_batch_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    void *const *dev_k_cache, void *const *dev_v_cache,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float scale, float *dev_out,
+    char *error, size_t error_capacity);
 /* Gather the newly-written K/V slot of each independent request into one
  * fixed device buffer.  The pointer/position metadata is copied by the
  * backend, so the operation remains graph-capturable while requests rotate
@@ -364,6 +378,11 @@ int mynah_backend_self_attention_batch_dev(
 int mynah_backend_gather_kv_batch(
     const mynah_backend *backend, float *const *dev_k_cache,
     float *const *dev_v_cache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float *dev_out, char *error, size_t error_capacity);
+int mynah_backend_gather_kv_bf16_batch(
+    const mynah_backend *backend, void *const *dev_k_cache,
+    void *const *dev_v_cache, const size_t *positions,
     const size_t *cache_strides, size_t batch, size_t heads,
     size_t head_width, float *dev_out, char *error, size_t error_capacity);
 int mynah_backend_cross_attention_dev(const mynah_backend *backend,
@@ -395,6 +414,12 @@ int mynah_backend_h2d(const mynah_backend *backend, const float *host,
 int mynah_backend_d2h(const mynah_backend *backend, const float *dev_ptr,
                       float *host, size_t n,
                       char *error, size_t error_capacity);
+int mynah_backend_h2d_bf16(const mynah_backend *backend, const float *host,
+                           void *dev_ptr, size_t n,
+                           char *error, size_t error_capacity);
+int mynah_backend_d2h_bf16(const mynah_backend *backend, const void *dev_ptr,
+                           float *host, size_t n,
+                           char *error, size_t error_capacity);
 
 /* Device-side buffer helpers and constrained greedy argmax.  The argmax
  * returns one scalar token because the next autoregressive position depends
@@ -417,6 +442,9 @@ int mynah_backend_argmax_dev(const mynah_backend *backend, const float *dev_logi
  * The caller owns the buffer and must free it with mynah_backend_dev_free. */
 int mynah_backend_dev_alloc(const mynah_backend *backend, size_t n,
                             float **dev_ptr, char *error, size_t error_capacity);
+int mynah_backend_dev_alloc_bytes(const mynah_backend *backend, size_t bytes,
+                                  void **dev_ptr, char *error,
+                                  size_t error_capacity);
 void mynah_backend_dev_free(const mynah_backend *backend, float *dev_ptr);
 
 /* Allocate pinned host staging when the backend can provide it.  CPU and

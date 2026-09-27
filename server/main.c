@@ -2510,7 +2510,11 @@ int main(int argc, char **argv) {
         decoder_lane = 0;
     }
     if (g.worker_count < 1) g.worker_count = 1;
-    if (g.worker_count > 64) g.worker_count = 64;
+    /* Keep the HTTP worker array aligned with the shared active-slot ceiling.
+     * The old private 64 limit became a stack overwrite as soon as a wider
+     * CUDA microbatch raised the default worker count to --max-batch. */
+    if ((size_t)g.worker_count > MYNAH_GRAPH_MAX_ACTIVE)
+        g.worker_count = (int)MYNAH_GRAPH_MAX_ACTIVE;
     if (g.max_batch < 1u) g.max_batch = 1u;
     if (g.max_batch > mynah_tts_max_batch()) g.max_batch = mynah_tts_max_batch();
     if (g.max_active > MYNAH_GRAPH_MAX_ACTIVE)
@@ -2962,7 +2966,7 @@ int main(int argc, char **argv) {
     }
 
     queue_init(&g_queue);
-    pthread_t workers[64];
+    pthread_t workers[MYNAH_GRAPH_MAX_ACTIVE];
     int worker_count = g.worker_count;
     for (int i = 0; i < worker_count; ++i) {
         /* The index travels as the argument rather than through a shared
