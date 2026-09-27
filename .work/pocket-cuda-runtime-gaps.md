@@ -169,6 +169,19 @@ then compare a quality-approved Q8 subset against the same single-request and
 batch gates. INT8 KV is not part of this item: it would require a separate
 scale/format contract and has a higher attention-quality risk than BF16.
 
+A focused follow-up quantized only `backbone:int8` and kept Flow/Mimi in FP32.
+The 24L solo↔batch self-check passed, so the failure above is not an
+unavoidable batch-contamination defect. It still did not meet the serving goal
+on the same one-thread L4 smoke: 30,720 PCM bytes (0.640 s), TTFA 6.214 s,
+service/E2E 6.324/6.325 s and RTF 9.88. The Q8 weight cache was 302,874,624
+bytes, process RSS peak was about 2.73 GiB and `nvidia-smi` showed about 650 MiB
+after the request; there were zero request/decoder errors, four graph captures,
+21 replays and zero graph fallbacks. It is therefore a valid diagnostic
+profile, not a promotion: the custom Q8 launch/dequantization overhead costs
+far more than the small device-memory saving on this model. A future Q8 change
+needs a CPU↔CUDA audio/quality gate and a measured throughput win before it can
+be considered for a low-VRAM deployment.
+
 ## Post-merge regression
 
 After integrating the CPU 6L/24L serving changes into the CUDA branch, the
@@ -218,8 +231,10 @@ request policy and remains enabled after the merge.
   device memory; never make startup capture block the HTTP event loop.
 - [~] Q8/INT8 qualification: the resident path and counters are implemented,
   and its host K/V upload atomicity guard is fixed; the 24L L4 parity gate and
-  performance smoke fail (audio delta `1.59025e-4`, RTF `11.33`), so Q8 is
-  diagnostic/opt-in only until a quality-preserving subset is identified.
+  all-group performance smoke fail (audio delta `1.59025e-4`, RTF `11.33`). A
+  backbone-only Q8 self-check passes but its L4 smoke is still RTF `9.88`, so
+  Q8 is diagnostic/opt-in only until a quality-preserving and faster subset is
+  identified.
 
 ## Reproduction
 
