@@ -162,3 +162,44 @@ of `pocket-tts-cuda-streaming-parity.md`; no code. It was deleted on
   2.38 ms/frame, SEANet 1.59 s); backbone 1.08 s over 114 steps; flow 0.05 s;
 - /health counters, same wave: 1.76 GB H2D, 303 MB D2H, 105 graph captures,
   1,467 replays, backbone width max 27 (about 18 mean).
+
+### Experiment board (2026-09-27, one L4, 24L, BF16 KV, short runs)
+
+| candidate | baseline audio-s/s | candidate audio-s/s | RTF p95 | failures | decision |
+|---|---:|---:|---:|---:|---|
+| Mimi tile | 2.9 (C8) | 10.3 | 1.76 -> 0.85 | 0 | KEEP (default) |
+| prefill tile + device voice cache | 8.5 (C32) | 30.5 | 2.94 -> 0.87 | 0 | KEEP (default) |
+| split-K tile GEMM | ~26 (C32) | ~27 | ~ | 0 | KEEP (neutral) |
+| TF32 tensor cores for cuBLAS FP32 GEMMs | 22.0 (C32, ABAB) | 27.7 | 0.95 -> 0.73 | 0 | KEEP (default) |
+| one-GEMM causal conv (decoder) | ~23.9 (C48, ABAB) | ~22.0 | ~ | 0 | REVERT (opt-in, off) |
+| ConvTranspose as one GEMM (decoder) | 24.5 (C48) | 48.7 | 1.06 -> 0.67 | 0 | KEEP (default) |
+| grouped shared-memory tile attention | 48.7 (C48) | 43.9 | 0.67 -> 0.76 | 0 | noisy; default, re-check |
+| cuBLAS tile GEMM | 43.9 (C48) | 58.1 | 0.76 -> 0.55 | 0 | KEEP (default) |
+| scheduler multi-token prefill (agent) | superseded by prefill tile | - | - | - | REJECT |
+| codec gang upsample + one PCM D2H (agent, old base) | 6.46 (C8) | 7.74 | 1.09 -> 0.97 | 0 | pending merge + re-measure |
+
+Best configuration so far (all CUDA defaults): C60 66.8 audio-s/s, stream RTF
+p95 0.62, TTFA p95 122 ms, zero stalls and failures; C64 68.3 audio-s/s,
+RTF p95 0.65. C80 throughput holds (66 audio-s/s) but TTFA grows because
+`--max-inflight 64` queues the extra requests. These are 20 s runs, not a
+qualification soak. Open: the solo-vs-gang self-check now differs by
+2.5e-4 (TF32/cuBLAS in SEANet) against a 1e-4 tolerance.
+
+### Confirmation with all CUDA defaults (95c5ad3), GPU serialised
+
+| model | C | window | audio-s/s | RTF p95 | TTFA p95 | stalls | ok/failed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 24L | 60 | 30 s | 79.0 / 78.2 (two runs) | 0.61 / 0.62 | 119 / 118 ms | 0 | 344/0, 338/0 |
+| 24L | 60 | 180 s | 92.9 | 0.63 | 122 ms | 0 | 2034/0 |
+| 6L | 60 | 30 s | 128.5 | 0.43 | 88 ms | 0 | 612/0 |
+| 6L | 96 | 30 s | 121.5 | 0.46 | 1.95 s (queued past `--max-inflight 64`) | 0 | 604/0 |
+
+The 30 s windows understate steady state: requests in flight at the window
+start occupy capacity but are not counted, so the 180 s figure is the closer
+one. GPU utilisation is ~66% at 24L C60 with the scheduler thread at ~110%
+CPU, so the next limiter is the host loop, not the GPU. VRAM ~12 GB.
+
+Open before any production claim: the 30-minute Poisson soak; the BF16 KV
+quality gate; the 24L/6L self-check solo-vs-gang tolerance (1e-4) now fails
+at ~2.5e-4 with TF32 in SEANet; merge and re-measure the two agent branches
+(`pocket-cuda-codec-gang` d18ebbc, `MYNAH_CUDA_QUANT` + BF16 weights 80c9880).
