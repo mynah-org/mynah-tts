@@ -355,8 +355,10 @@ int mynah_backend_self_attention_dev(const mynah_backend *backend,
  * ring of `ring` slots per layer (slot = absolute % ring, layout [2][ring][dim])
  * and attends to at most the last `context` positions.  Inputs are per-request
  * device rows [positions][dim]; outputs are written channel-major
- * [dim][positions] into per-request device buffers.  All pointer arrays are
- * host arrays of device pointers; `kv` has rows * layers entries, request-major.
+ * [dim][positions] into per-request device buffers, or skipped when `output`
+ * is NULL (a prefill only wants the cache). Rows may carry fewer than
+ * `positions` tokens (`count`). All pointer arrays are host arrays of device
+ * pointers; `kv` has rows * layers entries, request-major.
  *
  * The projections use a fixed per-element reduction order, so one request's
  * result does not depend on how many others share the call. Nothing here
@@ -374,13 +376,18 @@ typedef struct {
     const float *layer_scale_2;
 } mynah_transformer_tile_layer;
 typedef struct {
-    size_t rows, positions, dim, heads, ffn, layers, context, ring;
+    size_t rows, positions, dim, heads, ffn, layers;
+    size_t context; /* attention window; 0 = the whole prefix           */
+    size_t ring;    /* cache slots per layer; slot = absolute % ring      */
     float max_period, layernorm_eps;
     const mynah_transformer_tile_layer *layer; /* [layers], host pointers */
-    const float *const *input;
-    float *const *output;
-    float *const *kv;
-    const size_t *start;
+    const float *const *input;  /* [rows] device, [count][dim]            */
+    float *const *output;       /* [rows] device, [dim][positions]; NULL  */
+    void *const *kv;            /* [rows * layers] device, f32 or bf16    */
+    const size_t *start;        /* [rows] absolute position of token 0    */
+    const size_t *count;        /* [rows] tokens per row; NULL = positions */
+    const size_t *rings;        /* [rows] slots per row; NULL = `ring`    */
+    int kv_bf16;                /* the caches hold BF16 instead of f32    */
 } mynah_backend_tile_desc;
 int mynah_backend_has_tile_transformer(const mynah_backend *backend);
 int mynah_backend_tile_transformer_dev(const mynah_backend *backend,
@@ -465,6 +472,12 @@ int mynah_backend_d2h_bf16(const mynah_backend *backend, const void *dev_ptr,
 int mynah_backend_copy_dev(const mynah_backend *backend, float *dev_dst,
                            const float *dev_src, size_t n,
                            char *error, size_t error_capacity);
+/* Raw device-to-device bytes, for caches whose element type the caller owns
+ * (BF16 K/V). Asynchronous on the backend stream; returns 1 when the backend
+ * has no device memory of its own. */
+int mynah_backend_copy_dev_bytes(const mynah_backend *backend, void *dev_dst,
+                                 const void *dev_src, size_t bytes,
+                                 char *error, size_t error_capacity);
 int mynah_backend_scale_dev(const mynah_backend *backend, float *dev_data,
                             size_t n, float scale,
                             char *error, size_t error_capacity);

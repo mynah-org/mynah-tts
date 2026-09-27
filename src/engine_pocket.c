@@ -900,6 +900,12 @@ struct mynah_engine_state {
     int voice_cache_enabled;
     pthread_mutex_t voice_cache_mutex;
     int voice_cache_mutex_ready;
+    /* Device copies of the voice KV prefixes for the CUDA prefill tile, in the
+     * backbone cache's element type, built on first use of each voice. */
+    void **cuda_voice_kv;
+    int cuda_voice_kv_bf16;
+    float *cuda_prefill_in;
+    size_t cuda_prefill_in_floats;
 
     mynah_sp *tokenizer;
 };
@@ -915,6 +921,10 @@ static int pocket_cuda_groups_are_resident_compatible(
     const mynah_engine_state *state, unsigned selected);
 static int pocket_cuda_resident_requested(const mynah_engine_state *state);
 static int pocket_cuda_q8_requested(void);
+
+static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                    int final, char *error, size_t capacity);
+static size_t pocket_prepare_target(const mynah_engine_ctx *ctx);
 
 /* Defined below, next to the writer; the context only holds a pointer. */
 typedef struct pocket_dump pocket_dump;
@@ -986,6 +996,12 @@ struct mynah_engine_ctx {
     int cuda_backbone_kv_bf16;
     int cuda_backbone_enabled;
     int cuda_backbone_valid;
+    /* Set when this request's backbone K/V was built on the device by the
+     * prefill tile (MYNAH_CUDA_PREFILL_TILE): the voice prefix copied from the
+     * device voice cache and the text prefilled in one pass. The host cache
+     * then holds nothing valid, so nothing may upload it or step on the CPU. */
+    int cuda_backbone_device_owned;
+    int cuda_voice_pending;
 
     /* Optional resident CUDA Mimi decoder transformer. The host transformer
      * remains the correctness/fallback state; the device owns a compact KV
@@ -3373,6 +3389,12 @@ static int pocket_resolve_singles(mynah_engine_state *state, char *error,
 
 static void pocket_model_free(mynah_engine_state *state) {
     if (state == NULL) return;
+    if (state->cuda_voice_kv != NULL) {
+        for (size_t v = 0; v < state->voice_count; ++v)
+            mynah_backend_dev_free(state->backend, (float *)state->cuda_voice_kv[v]);
+        free(state->cuda_voice_kv);
+    }
+    mynah_backend_dev_free(state->backend, state->cuda_prefill_in);
     mynah_sp_close(state->tokenizer);
     pocket_voices_free(state->voices, state->voice_count);
     if (state->voice_cache_mutex_ready) {
@@ -5321,6 +5343,12 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
         ctx->cuda_backbone_kv == NULL) {
         return 1;
     }
+    if (ctx->cuda_backbone_device_owned) {
+        pocket_error(error, capacity,
+                     "pocket: refusing to upload a stale host cache over a "
+                     "device-owned backbone");
+        return -1;
+    }
     const pocket_config *cfg = &ctx->state->cfg;
     const mynah_transformer_ar_config *bc =
         mynah_transformer_ar_state_config(ctx->backbone);
@@ -6603,6 +6631,13 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
  * caller's `final`, which is what it always meant. */
 static int pocket_text_flush_limited(mynah_engine_ctx *ctx, int final, size_t limit,
                                      char *error, size_t capacity) {
+    if (ctx->cuda_backbone_device_owned) {
+        /* No host prefill for a device-owned cache; the tile takes whatever
+         * text is available, regardless of the slice budget. */
+        (void)limit;
+        mynah_engine_ctx *one[1] = {ctx};
+        return pocket_cuda_prefill_tile(one, 1u, final, error, capacity);
+    }
     const pocket_config *cfg = &ctx->state->cfg;
     const size_t tile = mynah_transformer_ar_prefill_tile();
     size_t want = (final || tile == 0u)
@@ -6679,6 +6714,254 @@ static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
  * The split is where it is because of the measurement: this part is ~15 ms and
  * flat in text length, the part after it is 190 ms for a long text and linear
  * in it. Only the linear part is worth interrupting. */
+/* On by default for CUDA: on the L4 (24L, BF16 KV) it took C32 from 8.5 to
+ * 30.5 audio-s/s with prefill slices from ~160 ms to ~1.5 ms.
+ * MYNAH_CUDA_PREFILL_TILE=0 restores the host-seeded token-by-token prefill. */
+static int pocket_cuda_prefill_tile_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_PREFILL_TILE");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+/* The prefill tile needs a resident backbone whose cache is laid out
+ * [layer][K capacity][V capacity], a host voice KV to seed the device voice
+ * cache from, and an attention width equal to the model width. */
+static int pocket_cuda_prefill_tile_usable(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !pocket_cuda_prefill_tile_enabled() ||
+        !ctx->cuda_backbone_enabled || ctx->cuda_backbone_kv == NULL ||
+        ctx->state == NULL || ctx->state->backend == NULL ||
+        !mynah_backend_has_tile_transformer(ctx->state->backend))
+        return 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    if (cfg->heads * cfg->head_dim != cfg->hidden_dim ||
+        ctx->speaker >= state->voice_count ||
+        state->voices[ctx->speaker].kv == NULL ||
+        ctx->voice_positions > ctx->cuda_backbone_capacity)
+        return 0;
+    return 1;
+}
+
+/* The device voice cache entry for `speaker`, uploaded on first use in the
+ * backbone cache's element type. NULL on failure. */
+static void *pocket_cuda_voice_kv(mynah_engine_state *state, size_t speaker,
+                                  size_t positions, int bf16, char *error,
+                                  size_t capacity) {
+    if (state->cuda_voice_kv == NULL) {
+        state->cuda_voice_kv =
+            (void **)calloc(state->voice_count, sizeof(*state->cuda_voice_kv));
+        if (state->cuda_voice_kv == NULL) return NULL;
+        state->cuda_voice_kv_bf16 = bf16;
+    }
+    if (state->cuda_voice_kv_bf16 != bf16) {
+        pocket_error(error, capacity, "pocket: mixed CUDA KV element types");
+        return NULL;
+    }
+    if (state->cuda_voice_kv[speaker] != NULL) return state->cuda_voice_kv[speaker];
+    const pocket_config *cfg = &state->cfg;
+    size_t floats = 0u, bytes = 0u;
+    if (pocket_mul(cfg->layers, 2u * positions * cfg->heads * cfg->head_dim,
+                   &floats) != 0 ||
+        pocket_mul(floats, bf16 ? sizeof(uint16_t) : sizeof(float), &bytes) != 0)
+        return NULL;
+    const float *host = state->voices[speaker].kv;
+    void *device = NULL;
+    if (host == NULL ||
+        mynah_backend_dev_alloc_bytes(state->backend, bytes, &device, error,
+                                      capacity) != 0)
+        return NULL;
+    const int failed = bf16
+        ? mynah_backend_h2d_bf16(state->backend, host, device, floats, error,
+                                 capacity)
+        : mynah_backend_h2d(state->backend, host, (float *)device, floats, error,
+                            capacity);
+    if (failed != 0) {
+        mynah_backend_dev_free(state->backend, (float *)device);
+        return NULL;
+    }
+    state->cuda_voice_kv[speaker] = device;
+    return device;
+}
+
+/* Prefill every pending text token of `ctxs` in one pass of the backbone
+ * tile, after copying each fresh request's voice prefix device-to-device.
+ * Rows are packed, each attends to its own prefix. On success every context
+ * has its whole available text in the device cache and is marked valid; on
+ * failure nothing on the host moved and the requests must fail. */
+static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                    int final, char *error, size_t capacity) {
+    if (count == 0u) return 0;
+    mynah_engine_state *state = ctxs[0]->state;
+    const pocket_config *cfg = &state->cfg;
+    const size_t layers = cfg->layers;
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    if (count > POCKET_MAX_BATCH || layers > 64u) {
+        pocket_error(error, capacity, "pocket: CUDA prefill tile too wide");
+        return -1;
+    }
+    size_t take[POCKET_MAX_BATCH];
+    size_t start[POCKET_MAX_BATCH];
+    size_t total = 0u, widest = 0u;
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx->state != state || !ctx->cuda_backbone_device_owned) {
+            pocket_error(error, capacity, "pocket: CUDA prefill tile row mismatch");
+            return -1;
+        }
+        /* `final` is the seal: it arrives while the text still reads as open,
+         * and must take the tail that an open text would hold back. */
+        const size_t target = final ? ctx->text_length : pocket_prepare_target(ctx);
+        take[i] = target > ctx->text_prefilled ? target - ctx->text_prefilled : 0u;
+        start[i] = ctx->voice_positions + ctx->text_prefilled;
+        total += take[i];
+        if (take[i] > widest) widest = take[i];
+    }
+    const size_t kv_elem = ctxs[0]->cuda_backbone_kv_bf16 ? sizeof(uint16_t)
+                                                          : sizeof(float);
+    char local[256];
+    local[0] = '\0';
+    /* Voice prefixes first: one D2D per layer and plane per fresh request. */
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (!ctx->cuda_voice_pending) continue;
+        if (ctx->cuda_backbone_kv_bf16 != ctxs[0]->cuda_backbone_kv_bf16) {
+            pocket_error(error, capacity, "pocket: CUDA prefill tile layout mismatch");
+            return -1;
+        }
+        const size_t span = ctx->voice_positions * attn_dim;
+        const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
+        const unsigned char *voice = (const unsigned char *)pocket_cuda_voice_kv(
+            state, ctx->speaker, ctx->voice_positions, ctx->cuda_backbone_kv_bf16,
+            local, sizeof(local));
+        if (voice == NULL) {
+            pocket_error(error, capacity, "pocket: CUDA voice cache: %s", local);
+            return -1;
+        }
+        unsigned char *base = (unsigned char *)ctx->cuda_backbone_kv;
+        for (size_t l = 0; l < layers && span > 0u; ++l) {
+            const unsigned char *src = voice + l * 2u * span * kv_elem;
+            unsigned char *dst = base + l * 2u * layer_half * kv_elem;
+            if (mynah_backend_copy_dev_bytes(state->backend, dst, src,
+                                             span * kv_elem, local,
+                                             sizeof(local)) != 0 ||
+                mynah_backend_copy_dev_bytes(state->backend,
+                                             dst + layer_half * kv_elem,
+                                             src + span * kv_elem,
+                                             span * kv_elem, local,
+                                             sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA voice copy: %s", local);
+                return -1;
+            }
+        }
+    }
+    if (total > 0u) {
+        /* Text embeddings: one packed device buffer, owned by the model and
+         * grown outside any graph. */
+        size_t floats = 0u;
+        if (pocket_mul(total, cfg->hidden_dim, &floats) != 0) return -1;
+        if (floats > state->cuda_prefill_in_floats) {
+            mynah_backend_dev_free(state->backend, state->cuda_prefill_in);
+            state->cuda_prefill_in = NULL;
+            state->cuda_prefill_in_floats = 0u;
+            if (mynah_backend_dev_alloc(state->backend, floats,
+                                        &state->cuda_prefill_in, local,
+                                        sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA prefill input: %s", local);
+                return -1;
+            }
+            state->cuda_prefill_in_floats = floats;
+        }
+        const float *input[POCKET_MAX_BATCH];
+        void *kv[POCKET_MAX_BATCH * 64u];
+        size_t rows = 0u, offset = 0u;
+        size_t row_take[POCKET_MAX_BATCH], row_start[POCKET_MAX_BATCH];
+        size_t row_ring[POCKET_MAX_BATCH];
+        for (size_t i = 0; i < count; ++i) {
+            mynah_engine_ctx *ctx = ctxs[i];
+            if (take[i] == 0u) continue;
+            float *dst = state->cuda_prefill_in + offset * cfg->hidden_dim;
+            if (mynah_backend_h2d(state->backend,
+                                  ctx->text_embed +
+                                      ctx->text_prefilled * cfg->hidden_dim,
+                                  dst, take[i] * cfg->hidden_dim, local,
+                                  sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA prefill H2D: %s", local);
+                return -1;
+            }
+            input[rows] = dst;
+            row_take[rows] = take[i];
+            row_start[rows] = start[i];
+            row_ring[rows] = ctx->cuda_backbone_capacity;
+            const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
+            for (size_t l = 0; l < layers; ++l)
+                kv[rows * layers + l] = (unsigned char *)ctx->cuda_backbone_kv +
+                                        l * 2u * layer_half * kv_elem;
+            offset += take[i];
+            ++rows;
+        }
+        mynah_transformer_tile_layer layer[64];
+        for (size_t l = 0; l < layers; ++l) {
+            const mynah_transformer_ar_layer *src = &state->backbone_layers[l];
+            layer[l].norm1_weight = src->norm1_weight;
+            layer[l].norm1_bias = src->norm1_bias;
+            layer[l].in_proj_weight = src->in_proj_weight;
+            layer[l].in_proj_bias = src->in_proj_bias;
+            layer[l].out_proj_weight = src->out_proj_weight;
+            layer[l].out_proj_bias = src->out_proj_bias;
+            layer[l].layer_scale_1 = src->layer_scale_1;
+            layer[l].norm2_weight = src->norm2_weight;
+            layer[l].norm2_bias = src->norm2_bias;
+            layer[l].linear1_weight = src->linear1_weight;
+            layer[l].linear1_bias = src->linear1_bias;
+            layer[l].linear2_weight = src->linear2_weight;
+            layer[l].linear2_bias = src->linear2_bias;
+            layer[l].layer_scale_2 = src->layer_scale_2;
+        }
+        const mynah_transformer_ar_config *bc =
+            mynah_transformer_ar_state_config(ctxs[0]->backbone);
+        const mynah_backend_tile_desc desc = {
+            .rows = rows,
+            .positions = widest,
+            .dim = cfg->hidden_dim,
+            .heads = cfg->heads,
+            .ffn = cfg->ffn_dim,
+            .layers = layers,
+            .context = 0u,
+            .ring = ctxs[0]->cuda_backbone_capacity,
+            .rings = row_ring,
+            .max_period = bc->max_period,
+            .layernorm_eps = cfg->layernorm_eps,
+            .layer = layer,
+            .input = input,
+            .output = NULL,
+            .kv = kv,
+            .start = row_start,
+            .count = row_take,
+            .kv_bf16 = ctxs[0]->cuda_backbone_kv_bf16,
+        };
+        mynah_region_begin(MYNAH_RGN_PREFILL);
+        const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
+                                                          local, sizeof(local));
+        mynah_region_end(MYNAH_RGN_PREFILL);
+        if (rc != 0) {
+            pocket_error(error, capacity, "pocket: CUDA prefill tile: %s",
+                         local[0] != '\0' ? local : "unavailable");
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (mynah_transformer_ar_state_set_offset(
+                ctx->backbone, start[i] + take[i], local, sizeof(local)) != 0) {
+            pocket_error(error, capacity, "pocket: CUDA prefill offset: %s", local);
+            return -1;
+        }
+        ctx->text_prefilled += take[i];
+        ctx->cuda_voice_pending = 0;
+        ctx->cuda_backbone_valid = 1;
+    }
+    return 0;
+}
+
 static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capacity);
 
 /* Point `text_ids`/`text_length` at segment `index`. */
@@ -6710,6 +6993,8 @@ static int pocket_segment_prologue(mynah_engine_ctx *ctx, char *error,
     ctx->eos_step = SIZE_MAX;
     ctx->eos_logit = 0.0f;
     ctx->cuda_backbone_valid = 0;
+    ctx->cuda_backbone_device_owned = 0;
+    ctx->cuda_voice_pending = 0;
     return pocket_seed_backbone(ctx, error, capacity);
 }
 
@@ -6750,6 +7035,8 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
     ctx->cuda_codec_pending = 0;
     ctx->cuda_codec_device_output_ready = 0;
     ctx->cuda_mimi_tile_owned = 0;
+    ctx->cuda_backbone_device_owned = 0;
+    ctx->cuda_voice_pending = 0;
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
     ctx->spare = 0.0f;
@@ -6775,6 +7062,25 @@ static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capac
         pocket_mul(layer_stride, attn_dim, &layer_stride) != 0) {
         pocket_error(error, capacity, "pocket: voice KV size overflows size_t");
         return -1;
+    }
+    if (pocket_cuda_prefill_tile_usable(ctx)) {
+        /* The voice prefix goes device-to-device and the text through the
+         * prefill tile; the host cache only tracks the offset. */
+        if (mynah_transformer_ar_state_set_offset(ctx->backbone,
+                                                  ctx->voice_positions, error,
+                                                  capacity) != 0)
+            return -1;
+        ctx->cuda_backbone_device_owned = 1;
+        ctx->cuda_voice_pending = 1;
+        ctx->cuda_backbone_valid = 0;
+        for (size_t i = 0; i < ctx->text_length; ++i) {
+            const size_t id = (size_t)ctx->text_ids[i];
+            memcpy(ctx->text_embed + i * cfg->hidden_dim,
+                   state->embed_table + id * cfg->hidden_dim,
+                   cfg->hidden_dim * sizeof(float));
+        }
+        ctx->text_prefilled = 0;
+        return 0;
     }
     char name[POCKET_NAME_MAX];
     for (size_t l = 0; l < cfg->layers; ++l) {
@@ -6939,6 +7245,36 @@ static int pocket_prepare_slice_batch(
         ctxs[i]->seeding = 1;
     }
 
+    {
+        /* Device-owned rows: one prefill tile for all of them. */
+        mynah_engine_ctx *owned[POCKET_MAX_BATCH];
+        size_t owned_count = 0u, others = 0u;
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i]->cuda_backbone_device_owned) owned[owned_count++] = ctxs[i];
+            else ++others;
+        }
+        if (owned_count > 0u) {
+            if (pocket_cuda_prefill_tile(owned, owned_count, 0, error, capacity) != 0) {
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return -1;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                if (!ctxs[i]->cuda_backbone_device_owned ||
+                    ctxs[i]->text_prefilled < pocket_prepare_target(ctxs[i]))
+                    continue;
+                ctxs[i]->prepared = 1;
+                ctxs[i]->seeding = 0;
+                done[i] = 1;
+            }
+            if (others == 0u) {
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return 0;
+            }
+        }
+    }
+
     mynah_engine_ctx *work[POCKET_MAX_BATCH];
     const float *inputs[POCKET_MAX_BATCH];
     size_t work_index[POCKET_MAX_BATCH];
@@ -6950,6 +7286,7 @@ static int pocket_prepare_slice_batch(
         size_t work_count = 0u;
         for (size_t i = 0; i < count; ++i) {
             mynah_engine_ctx *ctx = ctxs[i];
+            if (ctx->cuda_backbone_device_owned) continue;
             if (ctx->text_prefilled >= pocket_prepare_target(ctx)) continue;
             work[work_count] = ctx;
             work_index[work_count] = i;
@@ -7276,15 +7613,34 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     int failed = 0;
     size_t failed_at = 0;
     int cuda_used = 0;
-    if (live > 1u && live == count) {
+    int any_owned = 0, all_owned = 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!will_step[i]) continue;
+        if (ctxs[i]->cuda_backbone_device_owned) any_owned = 1;
+        else all_owned = 0;
+    }
+    if (live > 1u && (live == count || any_owned)) {
         char cuda_error[256];
         cuda_error[0] = '\0';
+        mynah_engine_ctx *subset[POCKET_MAX_BATCH];
+        mynah_engine_ctx *const *rows = ctxs;
+        if (live != count) {
+            /* A retired row leaves the device input projection misaligned;
+             * the host step inputs are current, so use those. */
+            size_t n = 0u;
+            for (size_t i = 0; i < count; ++i)
+                if (will_step[i]) subset[n++] = ctxs[i];
+            rows = subset;
+            if (scratch != NULL) scratch->cuda_condition_ready = 0;
+        }
+        /* The host K/V mirror only feeds a CPU retry, which a device-owned
+         * row can never take. */
         const int cuda_rc = pocket_cuda_backbone_step_batch(
-            ctxs, count, scratch, NULL, NULL, 1, cuda_error,
+            rows, live, scratch, NULL, NULL, all_owned ? 0 : 1, cuda_error,
             sizeof(cuda_error));
         if (cuda_rc == 0) {
             cuda_used = 1;
-            (void)mynah_backend_note_backbone_batch(scratch->backend, count);
+            (void)mynah_backend_note_backbone_batch(scratch->backend, live);
         } else if (scratch != NULL) {
             scratch->cuda_condition_ready = 0;
         }
@@ -7306,6 +7662,34 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         const int cuda_rc = pocket_cuda_backbone_step(
             single, cuda_error, sizeof(cuda_error));
         if (cuda_rc == 0) cuda_used = 1;
+    }
+    if (!cuda_used && any_owned && live > 1u) {
+        /* No batch scratch: the same device step one row at a time. A row that
+         * fails leaves its offset where the rollback below puts it back. */
+        cuda_used = 1;
+        for (size_t i = 0; i < count && !failed; ++i) {
+            if (!will_step[i]) continue;
+            char cuda_error[256];
+            cuda_error[0] = '\0';
+            const int rc = !ctxs[i]->cuda_backbone_device_owned
+                ? 1
+                : pocket_cuda_backbone_step(ctxs[i], cuda_error,
+                                            sizeof(cuda_error));
+            if (rc != 0) {
+                failed = 1;
+                failed_at = i;
+                fprintf(stderr, "pocket: device-owned row %zu step rc=%d: %s\n",
+                        i, rc, cuda_error);
+            }
+        }
+    }
+    if (!cuda_used && any_owned) {
+        mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
+        mynah_region_end(MYNAH_RGN_STEP);
+        pocket_error(error, capacity,
+                     "pocket: the CUDA backbone step failed for a device-owned "
+                     "request; there is no host cache to retry it on");
+        return -1;
     }
     if (!cuda_used && live > 1u && can_gather) {
         failed = mynah_transformer_ar_step_batch(scratch->states, live,
@@ -8069,7 +8453,7 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
     const pocket_config *cfg = &state->cfg;
     const size_t layers = cfg->codec_tf_layers;
     if (layers == 0u || layers > 8u) return 0;
-    float *kv[POCKET_MAX_BATCH * 8u];
+    void *kv[POCKET_MAX_BATCH * 8u];
     mynah_transformer_tile_layer layer[8];
     size_t ring = SIZE_MAX;
     for (size_t r = 0; r < rows; ++r) {
@@ -11284,6 +11668,12 @@ int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
         char what[96];
         int bad = 0;
         for (size_t m = 0; m < 2u && !bad; ++m) {
+            /* The cached-NaN fault is written into the host K/V and reaches the
+             * backbone through a re-upload. A device-owned cache (the CUDA
+             * prefill tile) is never uploaded from the host -- the upload is
+             * refused by design -- so that fault has nothing to exercise. */
+            if (modes[m] == POCKET_INJECT_KV_NAN && pocket_cuda_prefill_tile_enabled())
+                continue;
             snprintf(what, sizeof(what), "step atomicity at width %zu (batched, %s)",
                      count, mode_name[m]);
             bad = pocket_check_atomic(state, model, cases, count, 12u, scratch,

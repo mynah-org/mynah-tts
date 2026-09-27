@@ -77,6 +77,7 @@ struct mynah_backend {
     int (*h2d_bf16)(void *, const float *, void *, size_t, char *, size_t);
     int (*d2h_bf16)(void *, const void *, float *, size_t, char *, size_t);
     int (*copy_dev)(void *, float *, const float *, size_t, char *, size_t);
+    int (*copy_dev_bytes)(void *, void *, const void *, size_t, char *, size_t);
     int (*scale_dev)(void *, float *, size_t, float, char *, size_t);
     int (*clip_dev)(void *, float *, size_t, char *, size_t);
     int (*argmax_dev)(void *, const float *, size_t, size_t, size_t, int,
@@ -205,6 +206,7 @@ extern int mynah_cuda_gelu_host_f64(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_matmul_graph(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 extern int mynah_cuda_batch_begin(void *, char *, size_t);
 extern int mynah_cuda_copy_dev(void *, float *, const float *, size_t, char *, size_t);
+extern int mynah_cuda_copy_dev_bytes(void *, void *, const void *, size_t, char *, size_t);
 extern int mynah_cuda_scale_dev(void *, float *, size_t, float, char *, size_t);
 extern int mynah_cuda_clip_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_argmax_dev(void *, const float *, size_t, size_t, size_t, int, unsigned *, char *, size_t);
@@ -692,6 +694,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->h2d_bf16 = mynah_cuda_h2d_bf16;
         backend->d2h_bf16 = mynah_cuda_d2h_bf16;
         backend->copy_dev = mynah_cuda_copy_dev;
+        backend->copy_dev_bytes = mynah_cuda_copy_dev_bytes;
         backend->scale_dev = mynah_cuda_scale_dev;
         backend->clip_dev = mynah_cuda_clip_dev;
         backend->argmax_dev = mynah_cuda_argmax_dev;
@@ -1415,6 +1418,15 @@ int mynah_backend_d2h_bf16(const mynah_backend *backend, const void *dev_ptr,
     if (backend == NULL || backend->d2h_bf16 == NULL) return -1;
     return backend->d2h_bf16(backend->state, dev_ptr, host, n, error,
                               error_capacity);
+}
+
+int mynah_backend_copy_dev_bytes(const mynah_backend *backend, void *dev_dst,
+                                 const void *dev_src, size_t bytes,
+                                 char *error, size_t error_capacity) {
+    if (backend == NULL || dev_dst == NULL || dev_src == NULL) return -1;
+    if (backend->copy_dev_bytes == NULL) return 1;
+    return backend->copy_dev_bytes(backend->state, dev_dst, dev_src, bytes,
+                                   error, error_capacity);
 }
 
 int mynah_backend_copy_dev(const mynah_backend *backend, float *dev_dst,
