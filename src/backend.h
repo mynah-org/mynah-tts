@@ -51,6 +51,22 @@ typedef int (*mynah_backend_sgemm_fn)(void *, int trans_a, int trans_b,
                                       float *c, size_t ldc,
                                       char *, size_t);
 
+/* MYNAH_CUDA_QUANT: the one operator-facing weight-precision switch of the
+ * resident CUDA path.  f32 (default) keeps the raw f32 GEMMs; bf16 keeps the
+ * CPU representation f32 and gives the resident backbone, flow net and Mimi
+ * transformer BF16 weight copies on tensor cores; int8 turns on the Q8
+ * policy, the int8 qmat cache and the resident-compatible int8 groups.  The
+ * low-level variables (MYNAH_CUDA_Q8, MYNAH_QUANT, MYNAH_QUANT_GROUPS) remain
+ * expert overrides and win when set.  It never changes a CPU backend. */
+typedef enum {
+    MYNAH_CUDA_QUANT_INVALID = -1,
+    MYNAH_CUDA_QUANT_F32 = 0,
+    MYNAH_CUDA_QUANT_BF16 = 1,
+    MYNAH_CUDA_QUANT_INT8 = 2
+} mynah_cuda_quant_mode;
+mynah_cuda_quant_mode mynah_cuda_quant_from_env(void);
+const char *mynah_cuda_quant_name(mynah_cuda_quant_mode mode);
+
 int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
                        char *error, size_t error_capacity);
 void mynah_backend_close(mynah_backend *backend);
@@ -143,6 +159,14 @@ int mynah_backend_matmul_q8_d2d(const mynah_backend *, const float *, float *, s
 int mynah_backend_q8_reserve(const mynah_backend *, size_t activation_count,
                              size_t rows, size_t output_count,
                              char *, size_t);
+/* Resident BF16-weight matmul (CUDA only): the f32 weight is converted once
+ * to a cached device BF16 copy, the activation rows are rounded to BF16 on
+ * device, and cuBLAS runs a BF16 x BF16 -> FP32 tensor-core GEMM with FP32
+ * accumulation.  The reserve call sizes the activation workspace before any
+ * graph capture, exactly like the Q8 reserve. */
+int mynah_backend_matmul_bf16_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+int mynah_backend_bf16_reserve(const mynah_backend *, size_t activation_count,
+                               char *, size_t);
 int mynah_backend_im2col(const mynah_backend *, const float *, float *, int, int, int, int, char *, size_t);
 int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 /* Device-resident causal conv1d.  `input` and `output` are backend-owned
@@ -230,10 +254,18 @@ void mynah_backend_graph_forget(const mynah_backend *backend,
 /* Pocket flow-head descriptor. The engine owns the host weights and device
  * scratch; CUDA owns cached weight copies and the chained kernels. No CUDA or
  * cuBLAS type crosses this seam, and the operation is asynchronous. */
+/* Resident-only projection encoding for BF16 weights.  Deliberately outside
+ * the qmat qtype range (0..4): the CPU oracle never sees it, and a CPU qmat
+ * bf16 group (qtype 4, weights bf16 x f32 activations) is a different
+ * representation from the device path (bf16 x bf16 on tensor cores). */
+#define MYNAH_BACKEND_QTYPE_BF16 16
+
 typedef struct {
     const float *weight;
     const float *bias;
-    /* 0 = original f32 view, 1 = CUDA Q8 path. Other encodings are rejected
+    /* 0 = original f32 view, 1 = CUDA Q8 path,
+     * MYNAH_BACKEND_QTYPE_BF16 = resident BF16-weight tensor-core path.
+     * Other encodings are rejected
      * by the resident backend until a matching device kernel exists. */
     int qtype;
 } mynah_backend_flow_linear;
@@ -388,6 +420,9 @@ typedef struct {
     const size_t *count;        /* [rows] tokens per row; NULL = positions */
     const size_t *rings;        /* [rows] slots per row; NULL = `ring`    */
     int kv_bf16;                /* the caches hold BF16 instead of f32    */
+    /* 1: the tile GEMMs read resident BF16 copies of the projection weights
+     * (same deterministic fp32-accumulating kernel, bf16-rounded weights). */
+    int weight_bf16;
 } mynah_backend_tile_desc;
 /* 1 when a row's result cannot depend on the other rows of a batched call
  * (every kernel reduces in a fixed order). 0 when the backend runs cuBLAS

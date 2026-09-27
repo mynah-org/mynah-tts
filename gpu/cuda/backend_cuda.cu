@@ -817,6 +817,14 @@ struct cuda_cached_fp16 {
     half *device_ptr;
 };
 
+/* Resident BF16 copy of an f32 projection weight (MYNAH_CUDA_QUANT=bf16).
+ * Stored as raw bf16 bit patterns; cuBLAS reads them as CUDA_R_16BF. */
+struct cuda_cached_bf16 {
+    const void *host_pointer;
+    size_t n;          /* element count */
+    uint16_t *device_ptr;
+};
+
 struct cuda_cached_int8 {
     const void *host_pointer;
     size_t rows;
@@ -900,6 +908,11 @@ struct cuda_backend_state {
     std::vector<cuda_cached_buffer> weights;
     std::vector<cuda_cached_fp16> weights_fp16;
     std::vector<cuda_cached_int8> weights_int8;
+    std::vector<cuda_cached_bf16> weights_bf16;
+    /* BF16 activation rows for the resident BF16-weight GEMM; reserved
+     * before graph capture like the Q8 workspace. */
+    uint16_t *dev_bf16_activation;
+    size_t dev_bf16_activation_cap; /* elements */
     /* Device scratch for activations (grows on demand). */
     float *dev_scratch;
     size_t dev_scratch_cap;   /* bytes */
@@ -937,6 +950,10 @@ struct cuda_backend_state {
     bool fast_math;
     bool tf32; /* MYNAH_CUDA_TF32: FP32 GEMMs on TF32 tensor cores */
     bool tile_cublas; /* MYNAH_CUDA_TILE_CUBLAS: tile projections via cuBLAS */
+    /* MYNAH_CUDA_QUANT=bf16|int8 (or MYNAH_CUDA_Q8=1): the engine may hand
+     * the GEMMs reduced-precision weights, whose tensor-core paths are not
+     * batch-invariant. */
+    bool quant_weights;
     bool graphs_enabled;
     std::vector<cuda_graph_entry> graph_cache;
     std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
@@ -986,6 +1003,9 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> q8_weight_uploads;
     std::atomic<unsigned long long> q8_weight_bytes;
     std::atomic<unsigned long long> q8_activation_bytes;
+    std::atomic<unsigned long long> bf16_matmul_calls;
+    std::atomic<unsigned long long> bf16_rows;
+    std::atomic<unsigned long long> bf16_weight_bytes;
     bool q8_enabled;
     bool decoder_batch_enabled;
 };
@@ -1070,6 +1090,19 @@ static int cbe(cublasStatus_t s, char *e, size_t c) {
 static bool cuda_fast_math_enabled(void) {
     const char *value = std::getenv("MYNAH_CUDA_FAST_MATH");
     return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+/* Mirrors the engine's resolution of MYNAH_CUDA_QUANT (f32|bf16|int8) and
+ * the explicit MYNAH_CUDA_Q8 override, without linking the C helper. */
+static bool cuda_env_enabled(const char *name, bool fallback);
+static bool cuda_quant_weights_requested(void) {
+    if (getenv("MYNAH_CUDA_Q8") != nullptr &&
+        cuda_env_enabled("MYNAH_CUDA_Q8", false))
+        return true;
+    const char *v = getenv("MYNAH_CUDA_QUANT");
+    if (v == nullptr || v[0] == '\0') return false;
+    return strcmp(v, "bf16") == 0 || strcmp(v, "bfloat16") == 0 ||
+           strcmp(v, "int8") == 0 || strcmp(v, "q8") == 0;
 }
 
 static bool cuda_env_enabled(const char *name, bool fallback) {
@@ -1209,6 +1242,82 @@ static int cached_weight_fp16(cuda_backend_state *st, const float *hp, size_t n,
     st->weights_fp16.push_back({hp, n, d16});
     *dp = d16;
     return 0;
+}
+
+/* Same shape as cached_weight_fp16: one H2D of the f32 tensor into a
+ * temporary, one device RNE conversion, then the f32 temporary is released.
+ * The first (uncaptured) call of every resident stage warms this cache; a
+ * graph capture then only records the GEMM reading the cached pointer. */
+static int cached_weight_bf16(cuda_backend_state *st, const float *hp,
+                              size_t n, uint16_t **dp, char *e, size_t ec) {
+    size_t bytes = 0u;
+    size_t bf16_bytes = 0u;
+    if (st == nullptr || hp == nullptr || dp == nullptr || n == 0u ||
+        n > (size_t)INT_MAX || !cuda_size_mul(n, sizeof(float), &bytes) ||
+        !cuda_size_mul(n, sizeof(uint16_t), &bf16_bytes)) {
+        set_error(e, ec, "invalid CUDA BF16 weight cache request");
+        return -1;
+    }
+    for (auto &c : st->weights_bf16)
+        if (c.host_pointer == hp && c.n == n) { *dp = c.device_ptr; return 0; }
+    float *tmp = nullptr;
+    uint16_t *d16 = nullptr;
+    if (ce(cudaMalloc(&tmp, bytes), e, ec)) return -1;
+    if (ce(cudaMalloc((void **)&d16, bf16_bytes), e, ec)) {
+        cudaFree(tmp);
+        return -1;
+    }
+    if (ce(cudaMemcpyAsync(tmp, hp, bytes, cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    k_f32_to_bf16<<<((int)n + 255) / 256, 256, 0, st->stream>>>(tmp, d16,
+                                                                 (int)n);
+    if (ce(cudaGetLastError(), e, ec) ||
+        ce(cudaStreamSynchronize(st->stream), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    cudaFree(tmp);
+    try {
+        st->weights_bf16.push_back({hp, n, d16});
+    } catch (const std::bad_alloc &) {
+        cudaFree(d16);
+        set_error(e, ec, "out of host memory indexing CUDA BF16 weight");
+        return -1;
+    }
+    st->bf16_weight_bytes.fetch_add((unsigned long long)bf16_bytes,
+                                    std::memory_order_relaxed);
+    *dp = d16;
+    return 0;
+}
+
+static int ensure_bf16_activation(cuda_backend_state *st, size_t elements,
+                                  char *e, size_t ec) {
+    if (st == nullptr || elements == 0u || elements > SIZE_MAX / 2u) {
+        set_error(e, ec, "invalid CUDA BF16 activation workspace size");
+        return -1;
+    }
+    if (st->dev_bf16_activation_cap >= elements) return 0;
+    if (ce(cudaStreamSynchronize(st->stream), e, ec) != 0) return -1;
+    destroy_graphs(st);
+    if (st->dev_bf16_activation != nullptr) cudaFree(st->dev_bf16_activation);
+    st->dev_bf16_activation = nullptr;
+    st->dev_bf16_activation_cap = 0u;
+    if (ce(cudaMalloc((void **)&st->dev_bf16_activation,
+                      elements * sizeof(uint16_t)), e, ec) != 0)
+        return -1;
+    st->dev_bf16_activation_cap = elements;
+    return 0;
+}
+
+extern "C" int mynah_cuda_bf16_reserve(void *opaque, size_t activation_count,
+                                        char *e, size_t ec) {
+    return ensure_bf16_activation(static_cast<cuda_backend_state *>(opaque),
+                                  activation_count, e, ec);
 }
 
 static int cuda_q8_round(float value) {
@@ -2520,6 +2629,8 @@ static void cuda_close(void *opaque) {
         cudaFree(c.device_q);
         cudaFree(c.device_scale);
     }
+    for (auto &c : st->weights_bf16) cudaFree(c.device_ptr);
+    if (st->dev_bf16_activation) cudaFree(st->dev_bf16_activation);
     if (st->dev_scratch) cudaFree(st->dev_scratch);
     if (st->dev_bf16_convert) cudaFree(st->dev_bf16_convert);
     if (st->dev_q8_activation) cudaFree(st->dev_q8_activation);
@@ -2574,6 +2685,8 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->dev_q8_activation_cap = 0u;
     st->dev_q8_rows_cap = 0u;
     st->dev_q8_accum_cap = 0u;
+    st->dev_bf16_activation = nullptr;
+    st->dev_bf16_activation_cap = 0u;
     st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
     st->dev_argmax = nullptr;
     st->cublas_workspace = nullptr; st->cublas_workspace_cap = 0;
@@ -2625,6 +2738,9 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->q8_weight_uploads.store(0ull, std::memory_order_relaxed);
     st->q8_weight_bytes.store(0ull, std::memory_order_relaxed);
     st->q8_activation_bytes.store(0ull, std::memory_order_relaxed);
+    st->bf16_matmul_calls.store(0ull, std::memory_order_relaxed);
+    st->bf16_rows.store(0ull, std::memory_order_relaxed);
+    st->bf16_weight_bytes.store(0ull, std::memory_order_relaxed);
     st->batch_meta_cap = CUDA_BATCH_META_CAP;
     st->fast_math = cuda_fast_math_enabled();
     st->graphs_enabled = cuda_graphs_enabled();
@@ -2657,6 +2773,7 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
      * stage gate, not the default CUDA result. */
     st->tf32 = !st->fast_math && cuda_env_enabled("MYNAH_CUDA_TF32", true);
     st->tile_cublas = cuda_env_enabled("MYNAH_CUDA_TILE_CUBLAS", true);
+    st->quant_weights = cuda_quant_weights_requested();
     const cublasMath_t math_mode = st->fast_math
         ? CUBLAS_DEFAULT_MATH
         : (st->tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH);
@@ -2734,6 +2851,11 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         st->q8_weight_bytes.load(std::memory_order_relaxed);
     metrics->q8_activation_bytes =
         st->q8_activation_bytes.load(std::memory_order_relaxed);
+    metrics->bf16_matmul_calls =
+        st->bf16_matmul_calls.load(std::memory_order_relaxed);
+    metrics->bf16_rows = st->bf16_rows.load(std::memory_order_relaxed);
+    metrics->bf16_weight_bytes =
+        st->bf16_weight_bytes.load(std::memory_order_relaxed);
     size_t free_bytes = 0u;
     size_t total_bytes = 0u;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
@@ -3042,6 +3164,54 @@ extern "C" int mynah_cuda_matmul_q8_d2d(void *opaque, const float *d_in,
     return 0;
 }
 
+/* Resident BF16-weight matmul.  Activations are rounded to BF16 on device
+ * (RNE, the same helper as the BF16 KV cache), then one cuBLAS BF16 x BF16
+ * GEMM with FP32 accumulation and FP32 output runs on the tensor cores.  The
+ * cached weight is half the bytes of the f32 view, which is the point: the
+ * decode step is bound by weight traffic, not arithmetic. */
+extern "C" int mynah_cuda_matmul_bf16_d2d(void *opaque, const float *d_in,
+                                           float *d_out, size_t rows,
+                                           size_t iw, size_t ow,
+                                           const float *weight,
+                                           const float *bias, char *e,
+                                           size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0u, out_n = 0u, w_n = 0u, total_n = 0u;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    if (in_n > (size_t)INT_MAX || out_n > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA BF16 matmul is too large for one launch");
+        return -1;
+    }
+    uint16_t *dw = nullptr;
+    if (cached_weight_bf16(st, weight, w_n, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    if (ensure_bf16_activation(st, in_n, e, ec) != 0) return -1;
+    k_f32_to_bf16<<<((int)in_n + 255) / 256, 256, 0, st->stream>>>(
+        d_in, st->dev_bf16_activation, (int)in_n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b0 = 0.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &a1, dw, CUDA_R_16BF, (int)iw,
+                         st->dev_bf16_activation, CUDA_R_16BF, (int)iw,
+                         &b0, d_out, CUDA_R_32F, (int)ow,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), e, ec))
+        return -1;
+    if (db) {
+        k_bias_add<<<((int)out_n + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->bf16_matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->bf16_rows.fetch_add((unsigned long long)rows, std::memory_order_relaxed);
+    return 0;
+}
+
 static int cuda_flow_layer_norm(cuda_backend_state *st, const float *in,
                                 float *out, const float *gain,
                                 const float *bias, size_t rows, size_t width,
@@ -3070,6 +3240,10 @@ static int cuda_flow_linear(cuda_backend_state *st, const float *in, float *out,
         return mynah_cuda_matmul_q8_d2d(st, in, out, rows, input_width,
                                         output_width, linear->weight,
                                         linear->bias, e, ec);
+    if (linear->qtype == MYNAH_BACKEND_QTYPE_BF16)
+        return mynah_cuda_matmul_bf16_d2d(st, in, out, rows, input_width,
+                                          output_width, linear->weight,
+                                          linear->bias, e, ec);
     if (linear->qtype != 0) {
         set_error(e, ec, "unsupported CUDA flow projection precision");
         return -1;
@@ -5794,9 +5968,15 @@ extern "C" int mynah_cuda_self_attention_dev(
 #define TILE_GEMM_BM 64
 #define TILE_GEMM_BN 64
 #define TILE_GEMM_BK 16
-__global__ static void k_tile_gemm(const float *A, const float *W,
+/* BF16 == true: W is resident bf16 bits and A is rounded to bf16 on load, so
+ * the tile computes the same bf16 x bf16 -> fp32 representation as the
+ * per-request cuBLAS BF16 path, still with one ordered fp32 accumulator. */
+template <bool BF16>
+__global__ static void k_tile_gemm(const float *A, const void *Wv,
                                    const float *bias, float *C, int M, int N,
                                    int K) {
+    const float *W = static_cast<const float *>(Wv);
+    const uint16_t *W16 = static_cast<const uint16_t *>(Wv);
     __shared__ float As[TILE_GEMM_BK][TILE_GEMM_BM + 4];
     __shared__ float Ws[TILE_GEMM_BK][TILE_GEMM_BN + 4];
     const int tid = (int)threadIdx.x;
@@ -5813,8 +5993,18 @@ __global__ static void k_tile_gemm(const float *A, const float *W,
             const int r = idx / TILE_GEMM_BK;
             const int c = idx % TILE_GEMM_BK;
             const int k = k0 + c;
-            As[c][r] = (m0 + r < M && k < K) ? A[(size_t)(m0 + r) * K + k] : 0.0f;
-            Ws[c][r] = (n0 + r < N && k < K) ? W[(size_t)(n0 + r) * K + k] : 0.0f;
+            if (BF16) {
+                As[c][r] = (m0 + r < M && k < K)
+                               ? cuda_bf16_to_float(cuda_bf16_from_float(
+                                     A[(size_t)(m0 + r) * K + k]))
+                               : 0.0f;
+                Ws[c][r] = (n0 + r < N && k < K)
+                               ? cuda_bf16_to_float(W16[(size_t)(n0 + r) * K + k])
+                               : 0.0f;
+            } else {
+                As[c][r] = (m0 + r < M && k < K) ? A[(size_t)(m0 + r) * K + k] : 0.0f;
+                Ws[c][r] = (n0 + r < N && k < K) ? W[(size_t)(n0 + r) * K + k] : 0.0f;
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -6244,12 +6434,28 @@ static void tile_release(cuda_backend_state *st) {
 
 static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
                      const float *hb, float *C, size_t M, size_t N, size_t K,
-                     char *e, size_t ec) {
-    float *dw = nullptr, *db = nullptr;
-    if (cached_weight(st, hw, N * K * sizeof(float), &dw, e, ec)) return -1;
+                     int bf16, char *e, size_t ec) {
+    float *db = nullptr;
     if (hb != nullptr && cached_weight(st, hb, N * sizeof(float), &db, e, ec))
         return -1;
     cuda_tile_workspace &w = st->tile;
+    const dim3 grid((unsigned)((N + TILE_GEMM_BN - 1) / TILE_GEMM_BN),
+                    (unsigned)((M + TILE_GEMM_BM - 1) / TILE_GEMM_BM));
+    if (bf16) {
+        /* MYNAH_CUDA_QUANT=bf16: the resident BF16 weight copy through the
+         * ordered fp32-accumulating tile kernel, whichever tile mode the f32
+         * path runs.  A cuBLAS BF16 tile was measured on the L4: its
+         * M-dependent rounding put the Mimi solo-vs-gang gap at 1.1e-3,
+         * outside the tensor-core parity band the self-check allows; this
+         * kernel keeps the tile batch-invariant at bf16 weight traffic. */
+        uint16_t *dw16 = nullptr;
+        if (cached_weight_bf16(st, hw, N * K, &dw16, e, ec)) return -1;
+        k_tile_gemm<true><<<grid, 256, 0, st->stream>>>(A, dw16, db, C, (int)M,
+                                                          (int)N, (int)K);
+        return ce(cudaGetLastError(), e, ec);
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, hw, N * K * sizeof(float), &dw, e, ec)) return -1;
     if (st->tile_cublas) {
         /* Tensor-core GEMM through cuBLAS: faster, but cuBLAS picks its
          * algorithm by M, so a row's bits can depend on its batch. */
@@ -6283,10 +6489,8 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
                                                        (int)N, db, C);
         return ce(cudaGetLastError(), e, ec);
     }
-    const dim3 grid((unsigned)((N + TILE_GEMM_BN - 1) / TILE_GEMM_BN),
-                    (unsigned)((M + TILE_GEMM_BM - 1) / TILE_GEMM_BM));
-    k_tile_gemm<<<grid, 256, 0, st->stream>>>(A, dw, db, C, (int)M, (int)N,
-                                                (int)K);
+    k_tile_gemm<false><<<grid, 256, 0, st->stream>>>(A, dw, db, C, (int)M,
+                                                       (int)N, (int)K);
     return ce(cudaGetLastError(), e, ec);
 }
 
@@ -6318,11 +6522,14 @@ static int tile_residual(cuda_backend_state *st, float *x, const float *y,
 }
 
 /* cuBLAS chooses its algorithm (and split-K) by M and the tensor-core
- * modes round inputs, so a row's bits then depend on its batch mates. */
+ * modes round inputs, so a row's bits then depend on its batch mates.  The
+ * same holds for the reduced-precision weight paths (MYNAH_CUDA_QUANT=bf16
+ * runs cuBLAS BF16 GEMMs; int8 dequantizes through its own tensor-core
+ * kernels), whichever tile mode is set. */
 extern "C" int mynah_cuda_batch_invariant(void *opaque) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (st == nullptr) return 1;
-    return !(st->fast_math || st->tf32 || st->tile_cublas);
+    return !(st->fast_math || st->tf32 || st->tile_cublas || st->quant_weights);
 }
 
 extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
@@ -6445,7 +6652,7 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
         if (tile_norm(st, w.x, w.xn, L->norm1_weight, L->norm1_bias, M, d->dim,
                       d->layernorm_eps, e, ec) ||
             tile_gemm(st, w.xn, L->in_proj_weight, L->in_proj_bias, w.qkv, M,
-                      3u * d->dim, d->dim, e, ec))
+                      3u * d->dim, d->dim, d->weight_bf16, e, ec))
             return -1;
         const unsigned blocks = (unsigned)((work + warps_per_block - 1) /
                                            warps_per_block);
@@ -6482,19 +6689,19 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
         }
         if (ce(cudaGetLastError(), e, ec)) return -1;
         if (tile_gemm(st, w.att, L->out_proj_weight, L->out_proj_bias, w.proj, M,
-                      d->dim, d->dim, e, ec) ||
+                      d->dim, d->dim, d->weight_bf16, e, ec) ||
             tile_residual(st, w.x, w.proj, L->layer_scale_1, M, d->dim, e, ec) ||
             tile_norm(st, w.x, w.xn, L->norm2_weight, L->norm2_bias, M, d->dim,
                       d->layernorm_eps, e, ec) ||
             tile_gemm(st, w.xn, L->linear1_weight, L->linear1_bias, w.ffn_buf, M,
-                      d->ffn, d->dim, e, ec))
+                      d->ffn, d->dim, d->weight_bf16, e, ec))
             return -1;
         const int ffn_total = (int)(M * d->ffn);
         k_gelu<<<(ffn_total + 255) / 256, 256, 0, st->stream>>>(w.ffn_buf,
                                                                  ffn_total);
         if (ce(cudaGetLastError(), e, ec) ||
             tile_gemm(st, w.ffn_buf, L->linear2_weight, L->linear2_bias, w.proj,
-                      M, d->dim, d->ffn, e, ec) ||
+                      M, d->dim, d->ffn, d->weight_bf16, e, ec) ||
             tile_residual(st, w.x, w.proj, L->layer_scale_2, M, d->dim, e, ec))
             return -1;
     }

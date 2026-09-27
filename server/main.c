@@ -1483,6 +1483,8 @@ static void handle_health(int fd) {
              "\"matvec_calls\":%llu,\"q8_matmul_calls\":%llu,"
              "\"q8_rows\":%llu,\"q8_weight_uploads\":%llu,"
              "\"q8_weight_bytes\":%llu,\"q8_activation_bytes\":%llu,"
+             "\"bf16_matmul_calls\":%llu,\"bf16_rows\":%llu,"
+             "\"bf16_weight_bytes\":%llu,"
              "\"device_memory_bytes\":%llu,"
              "\"device_memory_free_bytes\":%llu,\"graphs_enabled\":%u,"
              "\"fast_math_enabled\":%u,\"decoder_batch_enabled\":%u,"
@@ -1514,6 +1516,8 @@ static void handle_health(int fd) {
              backend_metrics.q8_matmul_calls, backend_metrics.q8_rows,
              backend_metrics.q8_weight_uploads, backend_metrics.q8_weight_bytes,
              backend_metrics.q8_activation_bytes,
+             backend_metrics.bf16_matmul_calls, backend_metrics.bf16_rows,
+             backend_metrics.bf16_weight_bytes,
              backend_metrics.device_memory_bytes,
              backend_metrics.device_memory_free_bytes,
              backend_metrics.graphs_enabled, backend_metrics.fast_math_enabled,
@@ -1913,6 +1917,14 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_q8_activation_bytes_total counter\n"
            "mynah_backend_q8_activation_bytes_total %llu\n",
            m.q8_activation_bytes);
+    METRIC("# HELP mynah_backend_bf16_matmul_calls_total Resident CUDA BF16-weight matmul calls.\n"
+           "# TYPE mynah_backend_bf16_matmul_calls_total counter\n"
+           "mynah_backend_bf16_matmul_calls_total %llu\n",
+           m.bf16_matmul_calls);
+    METRIC("# HELP mynah_backend_bf16_weight_bytes_total CUDA BF16 cached weight bytes.\n"
+           "# TYPE mynah_backend_bf16_weight_bytes_total counter\n"
+           "mynah_backend_bf16_weight_bytes_total %llu\n",
+           m.bf16_weight_bytes);
     METRIC("# HELP mynah_backend_device_memory_bytes CUDA device memory.\n"
            "# TYPE mynah_backend_device_memory_bytes gauge\n"
            "mynah_backend_device_memory_bytes %llu\n",

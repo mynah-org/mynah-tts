@@ -66,6 +66,11 @@ typedef struct {
      * 1 Mimi decoder transformer, 2 SEANet decoder) and power-of-two bucket
      * (1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+). Added in 1.9.0. */
     unsigned long long batch_width_hist[3][8];
+    /* Resident BF16-weight matmuls (MYNAH_CUDA_QUANT=bf16), appended
+     * after the histograms so the earlier layout is a prefix. */
+    unsigned long long bf16_matmul_calls;
+    unsigned long long bf16_rows;
+    unsigned long long bf16_weight_bytes;
 } mynah_tts_backend_metrics;
 
 typedef struct {
