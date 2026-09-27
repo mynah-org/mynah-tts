@@ -404,6 +404,14 @@ int mynah_tts_model_open_device(const char *model_dir, mynah_tts_device device,
     int qtype_request = -1;
     if (!is_magpie && mynah_qmat_qtype_from_env() < 0) {
         qtype_request = QMAT_QTYPE_F16;
+        /* MYNAH_CUDA_QUANT=int8 on a CUDA backend stands for the old
+         * MYNAH_QUANT=int8 half of the recipe: the int8 groups the engine
+         * selects must find an int8 cache, including its CPU mirror.  Only
+         * when MYNAH_QUANT is unset; a CPU backend never reads it. */
+        enum { QMAT_QTYPE_INT8 = 1 };
+        if (strcmp(mynah_backend_name(model->backend), "cuda") == 0 &&
+            mynah_cuda_quant_from_env() == MYNAH_CUDA_QUANT_INT8)
+            qtype_request = QMAT_QTYPE_INT8;
     }
     model->qcache = mynah_qmat_cache_new(qtype_request);
     if (model->qcache == NULL) {

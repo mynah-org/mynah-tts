@@ -89,6 +89,8 @@ struct mynah_backend {
     int (*matmul_d2d)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*matmul_q8_d2d)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*q8_reserve)(void *, size_t, size_t, size_t, char *, size_t);
+    int (*matmul_bf16_d2d)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+    int (*bf16_reserve)(void *, size_t, char *, size_t);
     int (*im2col)(void *, const float *, float *, int, int, int, int, char *, size_t);
     int (*conv1d)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
     int (*conv1d_dev)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
@@ -191,6 +193,8 @@ extern int mynah_cuda_matmul_to_dev(void *, const float *, float *, size_t, size
 extern int mynah_cuda_matmul_d2d(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 extern int mynah_cuda_matmul_q8_d2d(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 extern int mynah_cuda_q8_reserve(void *, size_t, size_t, size_t, char *, size_t);
+extern int mynah_cuda_matmul_bf16_d2d(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
+extern int mynah_cuda_bf16_reserve(void *, size_t, char *, size_t);
 extern int mynah_cuda_im2col(void *, const float *, float *, int, int, int, int, char *, size_t);
 extern int mynah_cuda_conv1d(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 extern int mynah_cuda_conv1d_dev(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
@@ -703,6 +707,8 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->matmul_d2d = mynah_cuda_matmul_d2d;
         backend->matmul_q8_d2d = mynah_cuda_matmul_q8_d2d;
         backend->q8_reserve = mynah_cuda_q8_reserve;
+        backend->matmul_bf16_d2d = mynah_cuda_matmul_bf16_d2d;
+        backend->bf16_reserve = mynah_cuda_bf16_reserve;
         backend->im2col = mynah_cuda_im2col;
         backend->conv1d = mynah_cuda_conv1d;
         backend->conv1d_dev = mynah_cuda_conv1d_dev;
@@ -1546,6 +1552,44 @@ int mynah_backend_q8_reserve(const mynah_backend *bk, size_t activation_count,
     if (bk != NULL && bk->q8_reserve != NULL)
         return bk->q8_reserve(bk->state, activation_count, rows, output_count,
                               e, ec);
+    return -1;
+}
+
+mynah_cuda_quant_mode mynah_cuda_quant_from_env(void) {
+    const char *value = getenv("MYNAH_CUDA_QUANT");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "f32") == 0 ||
+        strcmp(value, "fp32") == 0 || strcmp(value, "off") == 0)
+        return MYNAH_CUDA_QUANT_F32;
+    if (strcmp(value, "bf16") == 0 || strcmp(value, "bfloat16") == 0)
+        return MYNAH_CUDA_QUANT_BF16;
+    if (strcmp(value, "int8") == 0 || strcmp(value, "q8") == 0)
+        return MYNAH_CUDA_QUANT_INT8;
+    return MYNAH_CUDA_QUANT_INVALID;
+}
+
+const char *mynah_cuda_quant_name(mynah_cuda_quant_mode mode) {
+    switch (mode) {
+    case MYNAH_CUDA_QUANT_F32: return "f32";
+    case MYNAH_CUDA_QUANT_BF16: return "bf16";
+    case MYNAH_CUDA_QUANT_INT8: return "int8";
+    default: return "invalid";
+    }
+}
+
+int mynah_backend_matmul_bf16_d2d(const mynah_backend *bk, const float *din,
+                                  float *dout, size_t rows, size_t iw,
+                                  size_t ow, const float *w, const float *b,
+                                  char *e, size_t ec) {
+    if (bk && bk->matmul_bf16_d2d)
+        return bk->matmul_bf16_d2d(bk->state, din, dout, rows, iw, ow, w, b,
+                                   e, ec);
+    return -1;
+}
+
+int mynah_backend_bf16_reserve(const mynah_backend *bk,
+                               size_t activation_count, char *e, size_t ec) {
+    if (bk != NULL && bk->bf16_reserve != NULL)
+        return bk->bf16_reserve(bk->state, activation_count, e, ec);
     return -1;
 }
 

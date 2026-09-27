@@ -588,6 +588,9 @@ enum {
     "backbone:int8,flow_net:f16,conditioner:f16"
 #define POCKET_DEEP_BACKBONE_LAYERS 24u
 
+/* What MYNAH_CUDA_QUANT=int8 selects when MYNAH_QUANT_GROUPS is unset. */
+#define POCKET_QG_CUDA_INT8_SPEC "backbone:int8,flow_net:int8"
+
 typedef struct {
     const char *name;
     unsigned mask;
@@ -851,6 +854,11 @@ struct mynah_engine_state {
     const mynah_backend *backend;
     unsigned qgroups; /* resolved MYNAH_QUANT_GROUPS, 0 when quant is off */
     int cuda_q8_enabled; /* explicit MYNAH_CUDA_Q8=1 policy for int8 groups */
+    /* MYNAH_CUDA_QUANT as resolved for this CUDA state (f32 on any other
+     * backend), and whether f32 hot-stage projections take resident BF16
+     * weight copies (MYNAH_CUDA_QUANT=bf16). The CPU oracle never sees it. */
+    int cuda_quant;
+    int cuda_bf16_weights;
     signed char qgroup_qtype[POCKET_QG_BITS]; /* per-bit override, -1 = cache */
     signed char cond_in_qtype;
     signed char cond_eos_qtype;
@@ -915,6 +923,12 @@ static int pocket_cuda_groups_are_resident_compatible(
     const mynah_engine_state *state, unsigned selected);
 static int pocket_cuda_resident_requested(const mynah_engine_state *state);
 static int pocket_cuda_q8_requested(void);
+static int pocket_cuda_kv_bf16_requested(const mynah_engine_state *state);
+static int pocket_cuda_flow_requested(const mynah_engine_state *state);
+static int pocket_cuda_codec_requested(const mynah_engine_state *state);
+static int pocket_cuda_mimi_tile_enabled(void);
+static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
+                                              unsigned groups);
 
 /* Defined below, next to the writer; the context only holds a pointer. */
 typedef struct pocket_dump pocket_dump;
@@ -1576,13 +1590,20 @@ static int pocket_cs_qtype(const pocket_proj *p) {
         p->qtype >= 0 ? p->qtype : mynah_qmat_cache_qtype(p->qcache));
 }
 
+/* The resident encoding of a projection the CPU would run in exact f32:
+ * raw f32, or the BF16 device copy under MYNAH_CUDA_QUANT=bf16. */
+static int pocket_cuda_f32_qtype(const mynah_engine_state *state) {
+    return state != NULL && state->cuda_bf16_weights ? MYNAH_BACKEND_QTYPE_BF16
+                                                     : 0;
+}
+
 static int pocket_cuda_tar_qtype(const mynah_engine_state *state,
                                  size_t layer,
                                  mynah_transformer_ar_linear_kind kind) {
     pocket_proj proj;
     if (state == NULL || pocket_tar_proj(&state->backbone_hook, layer, kind,
                                          &proj) != 0 || !proj.quantized)
-        return 0;
+        return pocket_cuda_f32_qtype(state);
     return pocket_cs_qtype(&proj);
 }
 
@@ -1592,7 +1613,7 @@ static int pocket_cuda_codec_qtype(const mynah_engine_state *state,
     pocket_proj proj;
     if (state == NULL || pocket_tar_proj(&state->codec_hook, layer, kind,
                                          &proj) != 0 || !proj.quantized)
-        return 0;
+        return pocket_cuda_f32_qtype(state);
     return pocket_cs_qtype(&proj);
 }
 
@@ -1601,7 +1622,7 @@ static int pocket_cuda_flow_qtype(const mynah_engine_state *state,
     pocket_proj proj;
     if (state == NULL || pocket_flow_proj(&state->flow_hook, index, kind,
                                           &proj) != 0 || !proj.quantized)
-        return 0;
+        return pocket_cuda_f32_qtype(state);
     return pocket_cs_qtype(&proj);
 }
 
@@ -1614,6 +1635,10 @@ static int pocket_cuda_linear_d2d(const mynah_engine_state *state,
     if (state == NULL || state->backend == NULL) return -1;
     if (qtype == 1 && state->cuda_q8_enabled)
         return mynah_backend_matmul_q8_d2d(
+            state->backend, input, output, rows, input_width, output_width,
+            weight, bias, error, error_capacity);
+    if (qtype == MYNAH_BACKEND_QTYPE_BF16 && state->cuda_bf16_weights)
+        return mynah_backend_matmul_bf16_d2d(
             state->backend, input, output, rows, input_width, output_width,
             weight, bias, error, error_capacity);
     if (qtype != 0 && qtype != 1) {
@@ -1785,29 +1810,11 @@ static int pocket_cuda_eos_batch(mynah_engine_ctx *const *ctxs, size_t count,
  * the widest scheduler batch before any CUDA graph can be captured.  The
  * arena is deliberately sized from all Pocket linear shapes, not multiplied
  * by layer count: every projection reuses the same buffers. */
-static int pocket_cuda_q8_reserve_for_batch(mynah_engine_state *state,
-                                            size_t batch, char *error,
-                                            size_t capacity) {
-    if (state == NULL || !state->cuda_q8_enabled ||
-        !pocket_cuda_resident_requested(state) || batch == 0u)
-        return 0;
-    const unsigned selected = state->qgroups;
-    const int cache_qtype = state->qcache == NULL
-                                ? 0
-                                : mynah_qmat_cache_qtype(state->qcache);
-    int q8_used = 0;
-    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
-        const unsigned mask = 1u << bit;
-        if ((selected & mask) == 0u) continue;
-        int qtype = state->qgroup_qtype[bit];
-        if (qtype < 0) qtype = cache_qtype;
-        if (mynah_qmat_qtype_resolved(qtype) == 1) {
-            q8_used = 1;
-            break;
-        }
-    }
-    if (!q8_used) return 0;
-
+static int pocket_cuda_linear_workspace(const mynah_engine_state *state,
+                                        size_t batch,
+                                        size_t *activation_count,
+                                        size_t *output_count, char *error,
+                                        size_t capacity) {
     const pocket_config *cfg = &state->cfg;
     size_t attn_dim = 0u;
     size_t qkv_width = 0u;
@@ -1837,15 +1844,61 @@ static int pocket_cuda_q8_reserve_for_batch(mynah_engine_state *state,
     if (flow_three > output_width) output_width = flow_three;
     if (cfg->hidden_dim > output_width) output_width = cfg->hidden_dim;
     if (cfg->latent_dim > output_width) output_width = cfg->latent_dim;
-    size_t activation_count = 0u;
-    size_t output_count = 0u;
-    if (pocket_mul(batch, input_width, &activation_count) != 0 ||
-        pocket_mul(batch, output_width, &output_count) != 0) {
+    if (pocket_mul(batch, input_width, activation_count) != 0 ||
+        pocket_mul(batch, output_width, output_count) != 0) {
         pocket_error(error, capacity, "pocket: CUDA Q8 reserve count overflow");
         return -1;
     }
+    return 0;
+}
+
+static int pocket_cuda_q8_reserve_for_batch(mynah_engine_state *state,
+                                            size_t batch, char *error,
+                                            size_t capacity) {
+    if (state == NULL || !state->cuda_q8_enabled ||
+        !pocket_cuda_resident_requested(state) || batch == 0u)
+        return 0;
+    const unsigned selected = state->qgroups;
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    int q8_used = 0;
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        if (mynah_qmat_qtype_resolved(qtype) == 1) {
+            q8_used = 1;
+            break;
+        }
+    }
+    if (!q8_used) return 0;
+    size_t activation_count = 0u;
+    size_t output_count = 0u;
+    if (pocket_cuda_linear_workspace(state, batch, &activation_count,
+                                     &output_count, error, capacity) != 0)
+        return -1;
     return mynah_backend_q8_reserve(state->backend, activation_count, batch,
                                     output_count, error, capacity);
+}
+
+/* The BF16 path needs one reusable BF16 activation buffer, sized like the Q8
+ * arena from the widest Pocket linear input and the scheduler's widest
+ * batch, and reserved before any graph capture for the same reason. */
+static int pocket_cuda_bf16_reserve_for_batch(mynah_engine_state *state,
+                                              size_t batch, char *error,
+                                              size_t capacity) {
+    if (state == NULL || !state->cuda_bf16_weights ||
+        !pocket_cuda_resident_requested(state) || batch == 0u)
+        return 0;
+    size_t activation_count = 0u;
+    size_t output_count = 0u;
+    if (pocket_cuda_linear_workspace(state, batch, &activation_count,
+                                     &output_count, error, capacity) != 0)
+        return -1;
+    return mynah_backend_bf16_reserve(state->backend, activation_count, error,
+                                      capacity);
 }
 
 
@@ -3761,17 +3814,45 @@ static int pocket_model_init(const mynah_tts_model *model,
      * `flow_head` compute with no hook at all. */
     state->backend = model->backend;
     state->qcache = model->qcache;
+    const int on_cuda = state->backend != NULL &&
+                        strcmp(mynah_backend_name(state->backend), "cuda") == 0;
+    /* MYNAH_CUDA_QUANT is the operator's one switch; the older variables are
+     * the expert overrides it resolves to, and an explicit one still wins. */
+    state->cuda_quant = MYNAH_CUDA_QUANT_F32;
+    if (on_cuda) {
+        const mynah_cuda_quant_mode mode = mynah_cuda_quant_from_env();
+        if (mode == MYNAH_CUDA_QUANT_INVALID) {
+            pocket_error(error, capacity,
+                         "MYNAH_CUDA_QUANT='%s' is not one of f32, bf16, int8",
+                         getenv("MYNAH_CUDA_QUANT"));
+            pocket_model_free(state);
+            return -1;
+        }
+        state->cuda_quant = (int)mode;
+    }
     state->cuda_q8_enabled =
-        state->backend != NULL &&
-        strcmp(mynah_backend_name(state->backend), "cuda") == 0 &&
-        pocket_cuda_q8_requested();
+        on_cuda && (getenv("MYNAH_CUDA_Q8") != NULL
+                        ? pocket_cuda_q8_requested()
+                        : state->cuda_quant == MYNAH_CUDA_QUANT_INT8);
+    state->cuda_bf16_weights =
+        on_cuda && pocket_cuda_resident_requested(state) &&
+        state->cuda_quant == MYNAH_CUDA_QUANT_BF16;
     for (size_t b = 0; b < POCKET_QG_BITS; ++b) state->qgroup_qtype[b] = -1;
     state->qgroups = 0u;
     const char *qgroups_spec = "none";
     if (mynah_qmat_cache_enabled(state->qcache)) {
         const char *spec = mynah_qmat_groups_spec();
         if (strcmp(spec, "default") == 0 && pocket_cuda_resident_requested(state) &&
-            !state->cuda_q8_enabled) {
+            state->cuda_quant == MYNAH_CUDA_QUANT_INT8 && state->cuda_q8_enabled) {
+            /* The resident int8 recipe: the two stages inside the AR loop
+             * that carry the weight traffic.  The Mimi transformer stays f32
+             * because its hot path is the cross-request tile, which has no
+             * int8 kernel; quantizing only its per-request fallback would
+             * make two requests of one server decode Mimi differently. */
+            spec = POCKET_QG_CUDA_INT8_SPEC;
+        } else if (strcmp(spec, "default") == 0 &&
+                   pocket_cuda_resident_requested(state) &&
+                   !state->cuda_q8_enabled) {
             /* The CPU defaults below select bf16/f16 encodings the resident
              * CUDA kernels do not accept, so inheriting them would quietly run
              * the backbone, flow and Mimi on the CPU oracle of a CUDA build.
@@ -3808,6 +3889,42 @@ static int pocket_model_init(const mynah_tts_model *model,
         const int resident_on = resident == NULL || strcmp(resident, "0") != 0;
         const int decoder_raw = state->codec_conv_qtype != 1 &&
                                 state->codec_convtr_qtype != 1;
+        {
+            /* The one line an operator reads: what each hot stage REALLY
+             * runs, resolved from the same predicates the dispatch uses. */
+            const char *requested =
+                mynah_cuda_quant_name((mynah_cuda_quant_mode)state->cuda_quant);
+            const char *bb = !resident_on ? "cpu"
+                : pocket_cuda_stage_encoding(state,
+                                             POCKET_QG_ATTENTION | POCKET_QG_FFN);
+            const char *flow = !pocket_cuda_flow_requested(state) ? "cpu"
+                : pocket_cuda_stage_encoding(state, POCKET_QG_FLOW_NET);
+            const char *mimi = !pocket_cuda_codec_requested(state) ? "cpu"
+                : pocket_cuda_stage_encoding(state, POCKET_QG_CODEC_TF);
+            /* The cross-request Mimi tile (default on) has f32 and bf16
+             * kernels only; an int8 codec group reaches the per-request
+             * fallback alone, and the line must say so. */
+            if (strcmp(mimi, "int8") == 0 && pocket_cuda_mimi_tile_enabled())
+                mimi = "int8(tile=f32)";
+            const int overridden =
+                (state->cuda_quant == MYNAH_CUDA_QUANT_INT8 &&
+                 (strcmp(bb, "int8") != 0 || strcmp(flow, "int8") != 0)) ||
+                (state->cuda_quant == MYNAH_CUDA_QUANT_BF16 &&
+                 (strcmp(bb, "bf16") != 0 || strcmp(flow, "bf16") != 0 ||
+                  strcmp(mimi, "bf16") != 0)) ||
+                (state->cuda_quant == MYNAH_CUDA_QUANT_F32 &&
+                 (strcmp(bb, "f32") != 0 || strcmp(flow, "f32") != 0 ||
+                  strcmp(mimi, "f32") != 0));
+            fprintf(stderr,
+                    "mynah-tts: CUDA quant=%s backbone=%s flow=%s mimi=%s "
+                    "kv=%s%s\n",
+                    requested, bb, flow, mimi,
+                    pocket_cuda_kv_bf16_requested(state) ? "bf16" : "f32",
+                    overridden ? " (stages differ from MYNAH_CUDA_QUANT: "
+                                 "overridden by MYNAH_QUANT_GROUPS/MYNAH_QUANT/"
+                                 "MYNAH_CUDA_Q8 or a per-stage switch)"
+                               : "");
+        }
         fprintf(stderr,
                 "mynah-tts: pocket backend=cuda resident=%s qgroups=0x%04x "
                 "q8=%s resident{backbone=%s flow=%s codec_transformer=%s} "
@@ -3858,8 +3975,9 @@ static int pocket_model_init(const mynah_tts_model *model,
             fprintf(stderr,
                     "mynah-tts: %s: MYNAH_QUANT_GROUPS='%s' keeps %s on the "
                     "CPU oracle of a CUDA build; the resident kernels accept "
-                    "f32 (MYNAH_QUANT_GROUPS=none) or int8 with "
-                    "MYNAH_CUDA_Q8=1%s\n",
+                    "f32 (MYNAH_QUANT_GROUPS=none) or int8 (MYNAH_CUDA_QUANT="
+                    "int8, or MYNAH_CUDA_Q8=1); use MYNAH_CUDA_QUANT=bf16 for "
+                    "resident bf16 weights%s\n",
                     allowed ? "WARNING" : "error", qgroups_spec, cpu_stages,
                     allowed ? " (allowed by MYNAH_CUDA_ALLOW_CPU_STAGES)"
                             : "; set MYNAH_CUDA_ALLOW_CPU_STAGES=1 to run "
@@ -4123,6 +4241,29 @@ static int pocket_cuda_groups_are_resident_compatible(
         if (qtype != 0 && !(qtype == 1 && state->cuda_q8_enabled)) return 0;
     }
     return 1;
+}
+
+/* The encoding a resident stage's projections actually take: "f32", "bf16"
+ * (MYNAH_CUDA_QUANT=bf16 over exact-f32 groups), "int8", "mixed", or "cpu"
+ * when an encoding has no resident kernel. */
+static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
+                                              unsigned groups) {
+    if (!pocket_cuda_groups_are_resident_compatible(state, groups)) return "cpu";
+    if (pocket_cuda_groups_are_f32(state, groups))
+        return state->cuda_bf16_weights ? "bf16" : "f32";
+    const unsigned selected = state->qgroups & groups;
+    if (selected != groups) return "mixed";
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        if (mynah_qmat_qtype_resolved(qtype) != 1) return "mixed";
+    }
+    return "int8";
 }
 
 static int pocket_cuda_flow_requested(const mynah_engine_state *state) {
@@ -8116,6 +8257,10 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
         .output = output,
         .kv = kv,
         .start = start,
+        /* Same encoding as the per-request path would give these rows. */
+        .weight_bf16 = pocket_cuda_codec_qtype(state, 0u,
+                                               MYNAH_TAR_LINEAR_IN_PROJ) ==
+                       MYNAH_BACKEND_QTYPE_BF16,
     };
     char local[256];
     local[0] = '\0';
@@ -9084,6 +9229,17 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                     "mynah-tts: disabling resident CUDA Q8 workspace: %s\n",
                     q8_error[0] != '\0' ? q8_error : "reserve failed");
             state->cuda_q8_enabled = 0;
+        }
+    }
+    if (state->cuda_bf16_weights) {
+        char bf16_error[256];
+        bf16_error[0] = '\0';
+        if (pocket_cuda_bf16_reserve_for_batch(state, batch, bf16_error,
+                                               sizeof(bf16_error)) != 0) {
+            fprintf(stderr,
+                    "mynah-tts: disabling resident CUDA BF16 weights: %s\n",
+                    bf16_error[0] != '\0' ? bf16_error : "reserve failed");
+            state->cuda_bf16_weights = 0;
         }
     }
 
