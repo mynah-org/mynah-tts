@@ -203,3 +203,26 @@ Open before any production claim: the 30-minute Poisson soak; the BF16 KV
 quality gate; the 24L/6L self-check solo-vs-gang tolerance (1e-4) now fails
 at ~2.5e-4 with TF32 in SEANet; merge and re-measure the two agent branches
 (`pocket-cuda-codec-gang` d18ebbc, `MYNAH_CUDA_QUANT` + BF16 weights 80c9880).
+
+### Quality gate: BF16 KV and TF32 vs the CPU f32 oracle (2026-09-27)
+
+120 utterances per mode (20 sentences x 3 voices x 2 seeds), 24L, ASR =
+faster-whisper small.en (CPU), WER with jiwer after normalisation, speaker
+similarity = resemblyzer cosine. Raw WAVs, CSVs and transcripts on the L4
+under `/root/evidence/quality/`.
+
+| mode | WER | SNR vs CPU (mean) | log-spec dist | speaker cos mean / min | utt. WER > 30% |
+|---|---:|---:|---:|---:|---|
+| A CPU f32 | 3.04% | - | - | - | one (a digit-reading artefact common to all modes) |
+| B CUDA invariant kernels | 3.10% | 63.2 dB | 0.041 | 0.9998 / 0.988 | same one |
+| C CUDA defaults (TF32, cuBLAS tile), f32 KV | 3.04% | 53.7 dB | 0.107 | 0.9997 / 0.988 | same one |
+| D CUDA defaults + BF16 KV (serving config) | 2.51% | 16.5 dB | 0.293 | 0.9958 / 0.951 | none |
+| seed-to-seed baseline (A, seed 1 vs 2) | - | -2.6 dB | 1.82 | 0.940 | - |
+
+TF32 changes rounding but not one sampled trajectory (120/120 same WER as
+CPU). BF16 KV makes the sampler diverge on many utterances (only 46/120 stay
+above 20 dB SNR, 13/120 change duration), yet the diverged renderings are
+different valid samples: WER equal or better and speaker cosine >= 0.965 on
+every one of them, far above the seed-to-seed baseline. Verdict: the serving
+config passes the gate (WER within 1 point, no outliers); do not expect it to
+be sample-identical to the CPU oracle. No listening test yet, English only.
