@@ -382,6 +382,40 @@ typedef struct {
     float *const *kv;
     const size_t *start;
 } mynah_backend_tile_desc;
+/* Quantizer projection + causal depthwise upsample for several independent
+ * requests in one submission.  Row r reads the host vector `host_input[r]`
+ * ([in_dim], copied into backend-owned pinned staging before the call
+ * returns), projects it with `proj_weight` ([channels][in_dim]) and advances
+ * its own device tail `partial[r]` ([channels][kernel-stride], may be NULL
+ * only when kernel == stride), writing row-major [stride][channels] to
+ * `output[r]`.  Every output element uses exactly the reduction order of
+ * mynah_backend_matvec_dev + mynah_backend_conv_transpose_causal_step_dev,
+ * so a row's result does not depend on who else is in the call.  One H2D,
+ * two kernels, no synchronisation.  Returns 1 when the backend has no such
+ * path (nothing was queued), -1 on a queueing failure. */
+typedef struct {
+    size_t rows, in_dim, channels, kernel, stride;
+    const float *const *host_input;
+    float *const *output;
+    float *const *partial;
+    const float *proj_weight, *proj_bias; /* host model-pack views */
+    const float *up_weight, *up_bias;
+} mynah_backend_upsample_batch_desc;
+int mynah_backend_codec_upsample_batch_dev(
+    const mynah_backend *backend, const mynah_backend_upsample_batch_desc *desc,
+    char *error, size_t error_capacity);
+/* Queue one gather of `rows` device vectors of `width` floats into a single
+ * backend-owned pinned host block ([rows][width]) with one D2H.  `*host_out`
+ * is readable only after the next mynah_backend_sync() and stays valid until
+ * the next call.  Returns 1 when unsupported (nothing queued). */
+int mynah_backend_gather_rows_d2h(const mynah_backend *backend,
+                                  const float *const *dev_rows, size_t rows,
+                                  size_t width, const float **host_out,
+                                  char *error, size_t error_capacity);
+/* Record one cross-request codec gang call: stage 0 is the quantizer +
+ * upsample submission, stage 1 the batched PCM collect.  No-op off CUDA. */
+void mynah_backend_note_codec_gang(const mynah_backend *backend, int stage,
+                                   size_t rows);
 int mynah_backend_has_tile_transformer(const mynah_backend *backend);
 int mynah_backend_tile_transformer_dev(const mynah_backend *backend,
                                        const mynah_backend_tile_desc *desc,

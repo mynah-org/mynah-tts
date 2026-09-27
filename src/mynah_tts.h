@@ -16,7 +16,8 @@ typedef enum {
 
 /* Backend counters are process-local diagnostics. The public metrics layout
  * changed in 1.8.0 when resident Pocket CUDA decoder-graph counters were
- * added and in 1.9.0 when batch-width histograms were appended; consumers
+ * added, in 1.9.0 when batch-width histograms were appended, and again when
+ * the codec-gang counters were appended after them; consumers
  * that cache the struct layout must rebuild against this header. Counters are
  * intentionally monotonically increasing and may be sampled while synthesis
  * is running;
@@ -66,6 +67,14 @@ typedef struct {
      * 1 Mimi decoder transformer, 2 SEANet decoder) and power-of-two bucket
      * (1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+). Added in 1.9.0. */
     unsigned long long batch_width_hist[3][8];
+    /* Cross-request Pocket codec gang (MYNAH_CUDA_CODEC_GANG): stage 0 is the
+     * batched quantizer projection + causal upsample, stage 1 the batched
+     * PCM collect. Calls, rows served, and the same width buckets as above.
+     * Appended after the width histograms so older fields keep their
+     * offsets. */
+    unsigned long long codec_gang_calls[2];
+    unsigned long long codec_gang_rows[2];
+    unsigned long long codec_gang_width_hist[2][8];
 } mynah_tts_backend_metrics;
 
 typedef struct {

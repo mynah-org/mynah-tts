@@ -663,18 +663,13 @@ __global__ static void k_scatter_rows_to_channels(
  * input sample per call.  The first `stride` positions are returned in
  * row-major form for the resident codec transformer; the remaining
  * `kernel-stride` positions become the next call's carried tail. */
-__global__ static void k_conv_transpose_causal_depthwise_step(
+/* The per-channel body is shared by the single-request and the
+ * cross-request kernels so both compile to the same arithmetic: a request's
+ * upsample output must not depend on whether it ran alone or in a gang. */
+__device__ __forceinline__ static void causal_depthwise_step_channel(
     const float *input, float *output, float *partial, const float *weight,
-    const float *bias, int channels, int kernel, int stride, int tail) {
-    /* One thread owns one channel and walks the short kernel serially.  The
-     * old implementation assigned one thread to each output position and
-     * read/wrote `partial` in the same launch.  For the normal Mimi shape
-     * tail == stride, position 0 reads partial[0] while position stride writes
-     * partial[0]: that is a real read/write race, not merely an ordering
-     * concern.  Keeping the per-channel loop also handles tail > stride,
-     * where the newly emitted tail overlaps the carried prefix. */
-    const int channel = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-    if (channel >= channels) return;
+    const float *bias, int channels, int kernel, int stride, int tail,
+    int channel) {
     const float channel_bias = bias == nullptr ? 0.0f : bias[channel];
     for (int position = 0; position < kernel; ++position) {
         float value = channel_bias +
@@ -687,6 +682,38 @@ __global__ static void k_conv_transpose_causal_depthwise_step(
             partial[channel * tail + (position - stride)] = value - channel_bias;
         }
     }
+}
+
+__global__ static void k_conv_transpose_causal_depthwise_step(
+    const float *input, float *output, float *partial, const float *weight,
+    const float *bias, int channels, int kernel, int stride, int tail) {
+    /* One thread owns one channel and walks the short kernel serially.  The
+     * old implementation assigned one thread to each output position and
+     * read/wrote `partial` in the same launch.  For the normal Mimi shape
+     * tail == stride, position 0 reads partial[0] while position stride writes
+     * partial[0]: that is a real read/write race, not merely an ordering
+     * concern.  Keeping the per-channel loop also handles tail > stride,
+     * where the newly emitted tail overlaps the carried prefix. */
+    const int channel = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (channel >= channels) return;
+    causal_depthwise_step_channel(input, output, partial, weight, bias,
+                                  channels, kernel, stride, tail, channel);
+}
+
+/* The same step for a gang: thread (row, channel) reads its row of the
+ * stacked projection and writes/advances that row's own output and tail
+ * through device pointer tables.  No state is shared between rows. */
+__global__ static void k_conv_transpose_causal_depthwise_step_rows(
+    const float *inputs, float *const *outputs, float *const *partials,
+    const float *weight, const float *bias, int rows, int channels,
+    int kernel, int stride, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (index >= rows * channels) return;
+    const int row = index / channels;
+    const int channel = index - row * channels;
+    causal_depthwise_step_channel(inputs + (size_t)row * (size_t)channels,
+                                  outputs[row], partials[row], weight, bias,
+                                  channels, kernel, stride, tail, channel);
 }
 
 __global__ static void k_gather_rows_to_batch(
@@ -796,6 +823,7 @@ struct cuda_backend_state;
 static void destroy_graphs(cuda_backend_state *st);
 static void destroy_decoder_batch_graphs(cuda_backend_state *st);
 static void tile_release(cuda_backend_state *st);
+static void codec_gang_release(cuda_backend_state *st);
 
 /* Buffers of the cross-request transformer tile, grown outside any capture. */
 struct cuda_tile_workspace {
@@ -805,6 +833,23 @@ struct cuda_tile_workspace {
     void *meta_dev = nullptr, *meta_host = nullptr;
     size_t meta_cap = 0u;
     cudaEvent_t meta_event = nullptr;
+};
+
+/* Staging of the cross-request Pocket codec gang (quantizer + upsample in,
+ * PCM out).  Grown outside any capture; every pinned block is reused per
+ * call and guarded by an event so the host never overwrites a buffer an
+ * earlier async copy has not consumed yet. */
+struct cuda_codec_gang_workspace {
+    void *up_meta_dev = nullptr, *up_meta_host = nullptr;
+    size_t up_meta_cap = 0u;
+    cudaEvent_t up_meta_event = nullptr;
+    float *up_proj = nullptr;
+    size_t up_proj_cap = 0u; /* floats */
+    void *pcm_meta_dev = nullptr, *pcm_meta_host = nullptr;
+    size_t pcm_meta_cap = 0u;
+    cudaEvent_t pcm_meta_event = nullptr;
+    float *pcm_dev = nullptr, *pcm_host = nullptr;
+    size_t pcm_cap = 0u; /* floats */
 };
 
 struct cuda_backend_state {
@@ -888,6 +933,10 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> width_hist[3][8];
     std::atomic<unsigned long long> tile_rows;
     cuda_tile_workspace tile;
+    cuda_codec_gang_workspace codec_gang;
+    std::atomic<unsigned long long> codec_gang_calls[2];
+    std::atomic<unsigned long long> codec_gang_rows[2];
+    std::atomic<unsigned long long> codec_gang_hist[2][8];
     std::atomic<unsigned long long> q8_rows;
     std::atomic<unsigned long long> q8_weight_uploads;
     std::atomic<unsigned long long> q8_weight_bytes;
@@ -2375,6 +2424,9 @@ static int cuda_q8_self_test(void *opaque, char *e, size_t ec) {
     return result;
 }
 
+static int cuda_codec_gang_self_test(cuda_backend_state *st, char *e,
+                                     size_t ec);
+
 static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float in[6]={1,2,3,-1,0.5f,2};
     const float w[12]={1,0,0,0,1,0,0,0,1,1,1,1};
@@ -2390,6 +2442,9 @@ static int cuda_self_test(void *opaque, char *e, size_t ec) {
     for (int i=0;i<8;i++) if (std::fabs(so[i]-en[i])>1e-4f) {
         std::snprintf(e,ec,"sgemm mismatch %d: %f!=%f",i,so[i],en[i]); return -1; }
     if (cuda_resident_kernel_self_test(opaque, e, ec) != 0) return -1;
+    if (cuda_codec_gang_self_test(static_cast<cuda_backend_state *>(opaque),
+                                  e, ec) != 0)
+        return -1;
     return cuda_q8_self_test(opaque, e, ec);
 }
 
@@ -2403,6 +2458,7 @@ static void cuda_close(void *opaque) {
     destroy_decoder_batch_graphs(st);
     destroy_graphs(st);
     tile_release(st);
+    codec_gang_release(st);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
     for (auto &c : st->weights_int8) {
@@ -2510,6 +2566,12 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     for (auto &stage : st->width_hist)
         for (auto &bucket : stage) bucket.store(0ull, std::memory_order_relaxed);
     st->tile_rows.store(0ull, std::memory_order_relaxed);
+    for (int stage = 0; stage < 2; ++stage) {
+        st->codec_gang_calls[stage].store(0ull, std::memory_order_relaxed);
+        st->codec_gang_rows[stage].store(0ull, std::memory_order_relaxed);
+        for (auto &bucket : st->codec_gang_hist[stage])
+            bucket.store(0ull, std::memory_order_relaxed);
+    }
     st->q8_rows.store(0ull, std::memory_order_relaxed);
     st->q8_weight_uploads.store(0ull, std::memory_order_relaxed);
     st->q8_weight_bytes.store(0ull, std::memory_order_relaxed);
@@ -2584,6 +2646,15 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         for (int bucket = 0; bucket < 8; ++bucket)
             metrics->batch_width_hist[stage][bucket] =
                 st->width_hist[stage][bucket].load(std::memory_order_relaxed);
+    for (int stage = 0; stage < 2; ++stage) {
+        metrics->codec_gang_calls[stage] =
+            st->codec_gang_calls[stage].load(std::memory_order_relaxed);
+        metrics->codec_gang_rows[stage] =
+            st->codec_gang_rows[stage].load(std::memory_order_relaxed);
+        for (int bucket = 0; bucket < 8; ++bucket)
+            metrics->codec_gang_width_hist[stage][bucket] =
+                st->codec_gang_hist[stage][bucket].load(std::memory_order_relaxed);
+    }
     metrics->codec_transformer_batch_items =
         st->codec_transformer_batch_items.load(std::memory_order_relaxed);
     metrics->codec_transformer_batch_max_width =
@@ -2748,6 +2819,15 @@ extern "C" int mynah_cuda_d2h_bf16(void *opaque, const void *dev_ptr,
 /* Custom matvec kernel: out[n] = sum_k(in[k] * W[n*K + k]) + bias[n].
  * One thread per output element.  For 1×768 matvecs this beats cuBLAS
  * by eliminating launch + workspace overhead (~3μs vs ~15μs). */
+__device__ __forceinline__ static float matvec_column(
+    const float *__restrict__ in, const float *__restrict__ weight,
+    const float *__restrict__ bias, int K, int col) {
+    const float *w = weight + (size_t)col * K;
+    float sum = bias ? bias[col] : 0.0f;
+    for (int k = 0; k < K; ++k) sum += in[k] * w[k];
+    return sum;
+}
+
 __global__ static void k_matvec(const float *__restrict__ in,
                                 const float *__restrict__ weight,
                                 const float *__restrict__ bias,
@@ -2755,10 +2835,22 @@ __global__ static void k_matvec(const float *__restrict__ in,
                                 int K, int N) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= N) return;
-    const float *w = weight + (size_t)col * K;
-    float sum = bias ? bias[col] : 0.0f;
-    for (int k = 0; k < K; ++k) sum += in[k] * w[k];
-    out[col] = sum;
+    out[col] = matvec_column(in, weight, bias, K, col);
+}
+
+/* M independent matvecs sharing one weight: [rows][K] -> [rows][N].  This is
+ * deliberately not a cuBLAS GEMM: each output keeps k_matvec's serial
+ * reduction, so a row is bit-identical to the single-request projection
+ * whatever the gang width (the Mimi decoder amplifies ulp differences). */
+__global__ static void k_matvec_rows(const float *__restrict__ in,
+                                     const float *__restrict__ weight,
+                                     const float *__restrict__ bias,
+                                     float *__restrict__ out, int K, int N) {
+    const int col = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int row = (int)blockIdx.y;
+    if (col >= N) return;
+    out[(size_t)row * (size_t)N + (size_t)col] =
+        matvec_column(in + (size_t)row * (size_t)K, weight, bias, K, col);
 }
 
 extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_out,
@@ -3432,6 +3524,336 @@ extern "C" int mynah_cuda_gather_rows_to_batch_dev(
                              st->stream>>>(st->dev_batch_k_cache, rows,
                                            (int)batch, (int)width);
     return ce(cudaGetLastError(), e, ec);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cross-request Pocket codec gang: quantizer + upsample, PCM collect  */
+/* ------------------------------------------------------------------ */
+
+static void codec_gang_release(cuda_backend_state *st) {
+    cuda_codec_gang_workspace &w = st->codec_gang;
+    cudaFree(w.up_meta_dev);
+    if (w.up_meta_host != nullptr) cudaFreeHost(w.up_meta_host);
+    if (w.up_meta_event != nullptr) cudaEventDestroy(w.up_meta_event);
+    cudaFree(w.up_proj);
+    cudaFree(w.pcm_meta_dev);
+    if (w.pcm_meta_host != nullptr) cudaFreeHost(w.pcm_meta_host);
+    if (w.pcm_meta_event != nullptr) cudaEventDestroy(w.pcm_meta_event);
+    cudaFree(w.pcm_dev);
+    if (w.pcm_host != nullptr) cudaFreeHost(w.pcm_host);
+    w = cuda_codec_gang_workspace();
+}
+
+/* Grow one pinned-host + device pair.  Growth drains the stream first: an
+ * earlier async copy may still read the old block, and the old device block
+ * may still be referenced by queued kernels.  It happens a handful of times
+ * per process (the gang only widens), never per frame. */
+static int codec_gang_grow_pair(cuda_backend_state *st, void **dev, void **host,
+                                size_t *cap, size_t bytes, char *e, size_t ec) {
+    if (bytes <= *cap) return 0;
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    cudaFree(*dev);
+    if (*host != nullptr) cudaFreeHost(*host);
+    *dev = nullptr;
+    *host = nullptr;
+    *cap = 0u;
+    if (ce(cudaMalloc(dev, bytes), e, ec)) return -1;
+    if (host != nullptr &&
+        ce(cudaHostAlloc(host, bytes, cudaHostAllocDefault), e, ec)) {
+        cudaFree(*dev);
+        *dev = nullptr;
+        return -1;
+    }
+    *cap = bytes;
+    return 0;
+}
+
+extern "C" int mynah_cuda_codec_upsample_batch_dev(
+    void *opaque, const mynah_backend_upsample_batch_desc *d, char *e,
+    size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || d == nullptr || d->host_input == nullptr ||
+        d->output == nullptr || d->proj_weight == nullptr ||
+        d->up_weight == nullptr || d->rows == 0u || d->rows > 4096u ||
+        d->in_dim == 0u || d->channels == 0u || d->stride == 0u ||
+        d->kernel < d->stride || d->in_dim > 65536u ||
+        d->channels > 65536u || d->kernel > 4096u) {
+        set_error(e, ec, "invalid CUDA codec gang upsample description");
+        return -1;
+    }
+    const size_t tail = d->kernel - d->stride;
+    if (tail > 0u && d->partial == nullptr) {
+        set_error(e, ec, "missing CUDA codec gang upsample tails");
+        return -1;
+    }
+    for (size_t r = 0; r < d->rows; ++r) {
+        if (d->host_input[r] == nullptr || d->output[r] == nullptr ||
+            (tail > 0u && d->partial[r] == nullptr)) {
+            set_error(e, ec, "invalid CUDA codec gang upsample row");
+            return -1;
+        }
+    }
+    size_t input_floats = 0u, input_bytes = 0u, proj_floats = 0u,
+           total = 0u, meta_bytes = 0u;
+    if (!cuda_size_mul(d->rows, d->in_dim, &input_floats) ||
+        !cuda_size_mul(input_floats, sizeof(float), &input_bytes) ||
+        !cuda_size_mul(d->rows, d->channels, &proj_floats) ||
+        proj_floats > (size_t)INT_MAX ||
+        !cuda_size_mul(d->channels, d->kernel, &total) ||
+        total > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA codec gang upsample size overflow");
+        return -1;
+    }
+    total = proj_floats;
+    meta_bytes = 2u * d->rows * sizeof(void *) + input_bytes;
+
+    float *dpw = nullptr, *dpb = nullptr, *duw = nullptr, *dub = nullptr;
+    if (cached_weight(st, d->proj_weight,
+                      d->channels * d->in_dim * sizeof(float), &dpw, e, ec) ||
+        (d->proj_bias != nullptr &&
+         cached_weight(st, d->proj_bias, d->channels * sizeof(float), &dpb, e,
+                       ec)) ||
+        cached_weight(st, d->up_weight, d->channels * d->kernel * sizeof(float),
+                      &duw, e, ec) ||
+        (d->up_bias != nullptr &&
+         cached_weight(st, d->up_bias, d->channels * sizeof(float), &dub, e,
+                       ec)))
+        return -1;
+
+    cuda_codec_gang_workspace &w = st->codec_gang;
+    if (w.up_meta_event == nullptr &&
+        ce(cudaEventCreateWithFlags(&w.up_meta_event, cudaEventDisableTiming),
+           e, ec))
+        return -1;
+    if (codec_gang_grow_pair(st, &w.up_meta_dev, &w.up_meta_host,
+                             &w.up_meta_cap, meta_bytes, e, ec))
+        return -1;
+    if (proj_floats > w.up_proj_cap) {
+        if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+        cudaFree(w.up_proj);
+        w.up_proj = nullptr;
+        w.up_proj_cap = 0u;
+        if (ce(cudaMalloc(&w.up_proj, proj_floats * sizeof(float)), e, ec))
+            return -1;
+        w.up_proj_cap = proj_floats;
+    }
+
+    /* One pinned block, one H2D: [outputs][partials][rows x in_dim]. */
+    if (ce(cudaEventSynchronize(w.up_meta_event), e, ec)) return -1;
+    char *host = static_cast<char *>(w.up_meta_host);
+    float **host_out = reinterpret_cast<float **>(host);
+    float **host_partial =
+        reinterpret_cast<float **>(host + d->rows * sizeof(void *));
+    float *host_input =
+        reinterpret_cast<float *>(host + 2u * d->rows * sizeof(void *));
+    for (size_t r = 0; r < d->rows; ++r) {
+        host_out[r] = d->output[r];
+        host_partial[r] = tail > 0u ? d->partial[r] : nullptr;
+        memcpy(host_input + r * d->in_dim, d->host_input[r],
+               d->in_dim * sizeof(float));
+    }
+    if (ce(cudaMemcpyAsync(w.up_meta_dev, w.up_meta_host, meta_bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec) ||
+        ce(cudaEventRecord(w.up_meta_event, st->stream), e, ec))
+        return -1;
+    st->h2d_bytes.fetch_add((unsigned long long)meta_bytes,
+                            std::memory_order_relaxed);
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
+    char *dev = static_cast<char *>(w.up_meta_dev);
+    float *const *d_out = reinterpret_cast<float *const *>(dev);
+    float *const *d_partial =
+        reinterpret_cast<float *const *>(dev + d->rows * sizeof(void *));
+    const float *d_input =
+        reinterpret_cast<const float *>(dev + 2u * d->rows * sizeof(void *));
+
+    const dim3 grid((unsigned)((d->channels + 255u) / 256u), (unsigned)d->rows);
+    k_matvec_rows<<<grid, 256, 0, st->stream>>>(d_input, dpw, dpb, w.up_proj,
+                                                (int)d->in_dim,
+                                                (int)d->channels);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    k_conv_transpose_causal_depthwise_step_rows<<<
+        (int)((total + 255u) / 256u), 256, 0, st->stream>>>(
+        w.up_proj, d_out, d_partial, duw, dub, (int)d->rows, (int)d->channels,
+        (int)d->kernel, (int)d->stride, (int)tail);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_gather_rows_d2h(void *opaque,
+                                          const float *const *dev_rows,
+                                          size_t rows, size_t width,
+                                          const float **host_out, char *e,
+                                          size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (host_out != nullptr) *host_out = nullptr;
+    size_t total = 0u, bytes = 0u;
+    if (st == nullptr || dev_rows == nullptr || host_out == nullptr ||
+        rows == 0u || rows > 4096u || width == 0u ||
+        !cuda_size_mul(rows, width, &total) || total > (size_t)INT_MAX ||
+        !cuda_size_mul(total, sizeof(float), &bytes)) {
+        set_error(e, ec, "invalid CUDA batched row collect");
+        return -1;
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        if (dev_rows[r] == nullptr) {
+            set_error(e, ec, "invalid CUDA batched row collect source");
+            return -1;
+        }
+    }
+    cuda_codec_gang_workspace &w = st->codec_gang;
+    if (w.pcm_meta_event == nullptr &&
+        ce(cudaEventCreateWithFlags(&w.pcm_meta_event, cudaEventDisableTiming),
+           e, ec))
+        return -1;
+    if (codec_gang_grow_pair(st, &w.pcm_meta_dev, &w.pcm_meta_host,
+                             &w.pcm_meta_cap, rows * sizeof(void *), e, ec))
+        return -1;
+    if (total > w.pcm_cap) {
+        void *dev = w.pcm_dev;
+        void *host = w.pcm_host;
+        size_t cap_bytes = w.pcm_cap * sizeof(float);
+        const int rc = codec_gang_grow_pair(st, &dev, &host, &cap_bytes, bytes,
+                                            e, ec);
+        w.pcm_dev = static_cast<float *>(dev);
+        w.pcm_host = static_cast<float *>(host);
+        w.pcm_cap = cap_bytes / sizeof(float);
+        if (rc) return -1;
+    }
+    if (ce(cudaEventSynchronize(w.pcm_meta_event), e, ec)) return -1;
+    memcpy(w.pcm_meta_host, dev_rows, rows * sizeof(void *));
+    if (ce(cudaMemcpyAsync(w.pcm_meta_dev, w.pcm_meta_host,
+                           rows * sizeof(void *), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaEventRecord(w.pcm_meta_event, st->stream), e, ec))
+        return -1;
+    k_gather_rows_to_batch<<<(int)((total + 255u) / 256u), 256, 0,
+                             st->stream>>>(
+        static_cast<float *const *>(w.pcm_meta_dev), w.pcm_dev, (int)rows,
+        (int)width);
+    if (ce(cudaGetLastError(), e, ec) ||
+        ce(cudaMemcpyAsync(w.pcm_host, w.pcm_dev, bytes, cudaMemcpyDeviceToHost,
+                           st->stream), e, ec))
+        return -1;
+    st->d2h_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
+    *host_out = w.pcm_host;
+    return 0;
+}
+
+/* Model-free parity probe for the codec gang: three requests with distinct
+ * inputs and tails, two consecutive frames, through the gang path and through
+ * the single-request matvec + causal-step path. The outputs and carried tails
+ * must be bit-identical, and the batched collect must return exactly the
+ * device rows. */
+static int cuda_codec_gang_self_test(cuda_backend_state *st, char *e,
+                                     size_t ec) {
+    enum { ROWS = 3, IN = 5, CH = 6, KERNEL = 4, STRIDE = 2, TAIL = 2 };
+    static float proj_w[CH * IN];
+    static float proj_b[CH];
+    static float up_w[CH * KERNEL];
+    static float up_b[CH];
+    for (int i = 0; i < CH * IN; ++i) proj_w[i] = 0.037f * (float)((i * 7) % 11) - 0.19f;
+    for (int i = 0; i < CH; ++i) proj_b[i] = 0.013f * (float)i - 0.021f;
+    for (int i = 0; i < CH * KERNEL; ++i) up_w[i] = 0.29f - 0.041f * (float)((i * 5) % 9);
+    for (int i = 0; i < CH; ++i) up_b[i] = 0.007f * (float)(i + 1);
+    float input[2][ROWS][IN];
+    for (int f = 0; f < 2; ++f)
+        for (int r = 0; r < ROWS; ++r)
+            for (int k = 0; k < IN; ++k)
+                input[f][r][k] = 0.11f * (float)(k + 1) - 0.07f * (float)r +
+                                 0.53f * (float)f - 0.3f;
+    const size_t out_n = (size_t)STRIDE * CH;
+    const size_t tail_n = (size_t)CH * TAIL;
+    /* [gang out x3][gang tail x3][solo out x3][solo tail x3][solo in][solo proj] */
+    const size_t floats = 2u * ROWS * (out_n + tail_n) + IN + CH;
+    float *base = nullptr;
+    if (ce(cudaMalloc(&base, floats * sizeof(float)), e, ec)) return -1;
+    int result = -1;
+    do {
+        float *gang_out[ROWS], *gang_tail[ROWS], *solo_out[ROWS], *solo_tail[ROWS];
+        for (int r = 0; r < ROWS; ++r) {
+            gang_out[r] = base + (size_t)r * out_n;
+            gang_tail[r] = base + ROWS * out_n + (size_t)r * tail_n;
+            solo_out[r] = base + ROWS * (out_n + tail_n) + (size_t)r * out_n;
+            solo_tail[r] = base + ROWS * (2u * out_n + tail_n) + (size_t)r * tail_n;
+        }
+        float *solo_in = base + 2u * ROWS * (out_n + tail_n);
+        float *solo_proj = solo_in + IN;
+        if (ce(cudaMemset(base, 0, floats * sizeof(float)), e, ec)) break;
+        /* Give each request a different carried tail before the first frame. */
+        float seed_tail[ROWS][CH * TAIL];
+        for (int r = 0; r < ROWS; ++r)
+            for (int i = 0; i < CH * TAIL; ++i)
+                seed_tail[r][i] = 0.05f * (float)(r + 1) - 0.01f * (float)i;
+        bool failed = false;
+        for (int r = 0; r < ROWS && !failed; ++r)
+            failed = ce(cudaMemcpy(gang_tail[r], seed_tail[r], sizeof(seed_tail[r]),
+                                   cudaMemcpyHostToDevice), e, ec) ||
+                     ce(cudaMemcpy(solo_tail[r], seed_tail[r], sizeof(seed_tail[r]),
+                                   cudaMemcpyHostToDevice), e, ec);
+        if (failed) break;
+        for (int f = 0; f < 2 && !failed; ++f) {
+            const float *rows_in[ROWS];
+            for (int r = 0; r < ROWS; ++r) rows_in[r] = input[f][r];
+            mynah_backend_upsample_batch_desc desc;
+            memset(&desc, 0, sizeof(desc));
+            desc.rows = ROWS;
+            desc.in_dim = IN;
+            desc.channels = CH;
+            desc.kernel = KERNEL;
+            desc.stride = STRIDE;
+            desc.host_input = rows_in;
+            desc.output = gang_out;
+            desc.partial = gang_tail;
+            desc.proj_weight = proj_w;
+            desc.proj_bias = proj_b;
+            desc.up_weight = up_w;
+            desc.up_bias = up_b;
+            if (mynah_cuda_codec_upsample_batch_dev(st, &desc, e, ec) != 0) {
+                failed = true;
+                break;
+            }
+            for (int r = 0; r < ROWS && !failed; ++r) {
+                failed = ce(cudaMemcpyAsync(solo_in, input[f][r], sizeof(input[f][r]),
+                                            cudaMemcpyHostToDevice, st->stream),
+                            e, ec) ||
+                         mynah_cuda_matvec_dev(st, solo_in, solo_proj, IN, CH,
+                                               proj_w, proj_b, e, ec) != 0 ||
+                         mynah_cuda_conv_transpose_causal_step_dev(
+                             st, solo_proj, solo_out[r], solo_tail[r], CH, KERNEL,
+                             STRIDE, up_w, up_b, e, ec) != 0 ||
+                         ce(cudaStreamSynchronize(st->stream), e, ec);
+            }
+        }
+        if (failed || ce(cudaStreamSynchronize(st->stream), e, ec)) break;
+        float got[ROWS * (STRIDE * CH + CH * TAIL)];
+        float want[ROWS * (STRIDE * CH + CH * TAIL)];
+        if (ce(cudaMemcpy(got, base, sizeof(got), cudaMemcpyDeviceToHost), e, ec) ||
+            ce(cudaMemcpy(want, base + ROWS * (out_n + tail_n), sizeof(want),
+                          cudaMemcpyDeviceToHost), e, ec))
+            break;
+        if (memcmp(got, want, sizeof(got)) != 0) {
+            set_error(e, ec, "CUDA codec gang upsample differs from the single-request path");
+            break;
+        }
+        const float *collected = nullptr;
+        const float *collect_rows[ROWS] = {gang_out[2], gang_out[0], gang_out[1]};
+        if (mynah_cuda_gather_rows_d2h(st, collect_rows, ROWS, out_n, &collected,
+                                       e, ec) != 0 ||
+            ce(cudaStreamSynchronize(st->stream), e, ec))
+            break;
+        static const int order[ROWS] = {2, 0, 1};
+        bool same = true;
+        for (int r = 0; r < ROWS && same; ++r)
+            same = memcmp(collected + (size_t)r * out_n, got + (size_t)order[r] * out_n,
+                          out_n * sizeof(float)) == 0;
+        if (!same) {
+            set_error(e, ec, "CUDA batched row collect self-test mismatch");
+            break;
+        }
+        result = 0;
+    } while (false);
+    cudaFree(base);
+    return result;
 }
 
 extern "C" int mynah_cuda_zero_dev(void *opaque, float *data, size_t n,
@@ -4970,6 +5392,23 @@ extern "C" int mynah_cuda_note_codec_transformer_batch(void *opaque,
                std::memory_order_relaxed)) {
     }
     return 0;
+}
+
+extern "C" void mynah_cuda_note_codec_gang(void *opaque, int stage,
+                                           size_t rows) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || stage < 0 || stage > 1 || rows == 0u) return;
+    int bucket = 0;
+    size_t limit = 1u;
+    while (bucket < 7 && rows > limit) {
+        ++bucket;
+        limit <<= 1u;
+    }
+    backend->codec_gang_hist[stage][bucket].fetch_add(
+        1ull, std::memory_order_relaxed);
+    backend->codec_gang_calls[stage].fetch_add(1ull, std::memory_order_relaxed);
+    backend->codec_gang_rows[stage].fetch_add((unsigned long long)rows,
+                                              std::memory_order_relaxed);
 }
 
 extern "C" void mynah_cuda_note_codec_upsample(void *opaque, int fallback) {
