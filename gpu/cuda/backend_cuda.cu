@@ -1,8 +1,10 @@
 #include "backend.h"
+#include "costmap.h"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <cmath>
 #include <climits>
@@ -2428,6 +2430,9 @@ static void cuda_close(void *opaque) {
     delete st;
 }
 
+static void cuda_nvtx_push(const char *name) { nvtxRangePushA(name); }
+static void cuda_nvtx_pop(void) { nvtxRangePop(); }
+
 extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn *matmul,
                                        mynah_backend_sgemm_fn *sgemm,
                                        mynah_backend_close_fn *close,
@@ -2443,6 +2448,13 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     if (ce(cudaSetDevice(0), e, ec)) return -1;
     auto *st = new (std::nothrow) cuda_backend_state();
     if (!st) { set_error(e,ec,"oom"); return -1; }
+    {
+        /* MYNAH_NVTX=1 with MYNAH_COST_MAP=2 puts every engine region on the
+         * Nsight Systems timeline next to the kernels it launched. */
+        const char *nvtx = getenv("MYNAH_NVTX");
+        if (nvtx != nullptr && strcmp(nvtx, "0") != 0)
+            mynah_costmap_set_range_hooks(cuda_nvtx_push, cuda_nvtx_pop);
+    }
     st->dev_scratch = nullptr; st->dev_scratch_cap = 0;
     st->dev_bf16_convert = nullptr; st->dev_bf16_convert_cap = 0u;
     st->dev_q8_activation = nullptr;
@@ -2568,6 +2580,10 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         st->backbone_batch_max_width.load(std::memory_order_relaxed);
     metrics->codec_transformer_batch_calls =
         st->codec_transformer_batch_calls.load(std::memory_order_relaxed);
+    for (int stage = 0; stage < 3; ++stage)
+        for (int bucket = 0; bucket < 8; ++bucket)
+            metrics->batch_width_hist[stage][bucket] =
+                st->width_hist[stage][bucket].load(std::memory_order_relaxed);
     metrics->codec_transformer_batch_items =
         st->codec_transformer_batch_items.load(std::memory_order_relaxed);
     metrics->codec_transformer_batch_max_width =
@@ -4884,11 +4900,22 @@ extern "C" int mynah_cuda_decoder_note_step(
     return 0;
 }
 
+static void note_width(cuda_backend_state *st, int stage, size_t width) {
+    int bucket = 0;
+    size_t limit = 1u;
+    while (bucket < 7 && width > limit) {
+        ++bucket;
+        limit <<= 1u;
+    }
+    st->width_hist[stage][bucket].fetch_add(1ull, std::memory_order_relaxed);
+}
+
 extern "C" int mynah_cuda_decoder_note_batch(void *opaque, size_t items,
                                                size_t frames) {
     auto *backend = static_cast<cuda_backend_state *>(opaque);
     if (backend == nullptr || items == 0u || frames == 0u) return -1;
     if (!backend->decoder_batch_enabled) return 0;
+    note_width(backend, 2, items);
     backend->decoder_batch_calls.fetch_add(1ull, std::memory_order_relaxed);
     backend->decoder_batch_items.fetch_add((unsigned long long)items,
                                            std::memory_order_relaxed);
@@ -4908,6 +4935,7 @@ extern "C" int mynah_cuda_decoder_note_batch(void *opaque, size_t items,
 extern "C" int mynah_cuda_note_backbone_batch(void *opaque, size_t items) {
     auto *backend = static_cast<cuda_backend_state *>(opaque);
     if (backend == nullptr || items == 0u) return -1;
+    note_width(backend, 0, items);
     backend->backbone_batch_calls.fetch_add(1ull, std::memory_order_relaxed);
     backend->backbone_batch_items.fetch_add((unsigned long long)items,
                                             std::memory_order_relaxed);
@@ -4927,6 +4955,7 @@ extern "C" int mynah_cuda_note_codec_transformer_batch(void *opaque,
                                                          size_t width) {
     auto *backend = static_cast<cuda_backend_state *>(opaque);
     if (backend == nullptr || items == 0u || width == 0u) return -1;
+    note_width(backend, 1, items);
     backend->codec_transformer_batch_calls.fetch_add(
         1ull, std::memory_order_relaxed);
     backend->codec_transformer_batch_items.fetch_add(

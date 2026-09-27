@@ -1694,7 +1694,7 @@ static void handle_metrics(int fd) {
     const unsigned long audio_us = atomic_load(&g_stats.audio_us);
     const double rtf = audio_us > 0ul
         ? (double)service_us / (double)audio_us : 0.0;
-    char body[8192];
+    char body[16384];
     size_t n = 0u;
 #define METRIC(...) do { \
         if (n < sizeof(body)) { \
@@ -1824,6 +1824,19 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_codec_transformer_batch_max_width gauge\n"
            "mynah_backend_codec_transformer_batch_max_width %llu\n",
            m.codec_transformer_batch_max_width);
+    {
+        static const char *const stage_name[3] = {"backbone", "mimi", "decoder"};
+        static const char *const bucket_name[8] = {"1", "2", "4", "8", "16",
+                                                   "32", "64", "inf"};
+        METRIC("# HELP mynah_backend_batch_width_calls_total Batched CUDA calls "
+               "by stage and width bucket (upper bound, not cumulative).\n"
+               "# TYPE mynah_backend_batch_width_calls_total counter\n");
+        for (int stage = 0; stage < 3; ++stage)
+            for (int bucket = 0; bucket < 8; ++bucket)
+                METRIC("mynah_backend_batch_width_calls_total{stage=\"%s\",le=\"%s\"} %llu\n",
+                       stage_name[stage], bucket_name[bucket],
+                       m.batch_width_hist[stage][bucket]);
+    }
     METRIC("# HELP mynah_backend_codec_upsample_steps_total Resident quantizer and causal upsample steps.\n"
            "# TYPE mynah_backend_codec_upsample_steps_total counter\n"
            "mynah_backend_codec_upsample_steps_total %llu\n",

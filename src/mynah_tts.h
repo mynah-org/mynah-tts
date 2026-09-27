@@ -16,7 +16,7 @@ typedef enum {
 
 /* Backend counters are process-local diagnostics. The public metrics layout
  * changed in 1.8.0 when resident Pocket CUDA decoder-graph counters were
- * added; consumers
+ * added and in 1.9.0 when batch-width histograms were appended; consumers
  * that cache the struct layout must rebuild against this header. Counters are
  * intentionally monotonically increasing and may be sampled while synthesis
  * is running;
@@ -62,6 +62,10 @@ typedef struct {
     unsigned fast_math_enabled;
     unsigned decoder_batch_enabled;
     unsigned q8_enabled;
+    /* Effective width of each batched CUDA call, by stage (0 backbone step,
+     * 1 Mimi decoder transformer, 2 SEANet decoder) and power-of-two bucket
+     * (1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+). Added in 1.9.0. */
+    unsigned long long batch_width_hist[3][8];
 } mynah_tts_backend_metrics;
 
 typedef struct {

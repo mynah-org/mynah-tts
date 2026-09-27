@@ -239,6 +239,18 @@ void mynah_region_thread_role(const char *role) {
     if (t != NULL) snprintf(t->role, sizeof t->role, "%s", role);
 }
 
+/* ---- optional profiler ranges ------------------------------------------- */
+
+/* A backend may mirror every region onto its profiler's timeline (NVTX on
+ * CUDA). The hooks only run when a cost map is being recorded at all. */
+static void (*rgn_push_hook)(const char *name);
+static void (*rgn_pop_hook)(void);
+
+void mynah_costmap_set_range_hooks(void (*push)(const char *), void (*pop)(void)) {
+    rgn_push_hook = push;
+    rgn_pop_hook = pop;
+}
+
 /* ---- the markers -------------------------------------------------------- */
 
 void mynah_region_begin_(int id) {
@@ -265,6 +277,7 @@ void mynah_region_begin_(int id) {
     t->stack_id[t->depth] = id;
     t->stack_t0[t->depth] = rgn_now_ns();
     ++t->depth;
+    if (rgn_push_hook != NULL) rgn_push_hook(mynah_region_name(id));
 }
 
 void mynah_region_end_(int id) {
@@ -276,6 +289,7 @@ void mynah_region_end_(int id) {
     t->ns[id] += dt;
     ++t->calls[id];
     if (t->depth > 0) t->child_ns[t->stack_id[t->depth - 1]] += dt;
+    if (rgn_pop_hook != NULL) rgn_pop_hook();
 }
 
 int mynah_region_begin_unique_(int id) {
@@ -302,6 +316,7 @@ void mynah_region_unwind(int depth) {
         ++t->calls[id];
         ++t->leaked;
         if (t->depth > 0) t->child_ns[t->stack_id[t->depth - 1]] += dt;
+        if (rgn_pop_hook != NULL) rgn_pop_hook();
     }
 }
 

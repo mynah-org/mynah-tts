@@ -194,6 +194,8 @@ extern int mynah_costmap_level_v;
 void mynah_costmap_init(void);
 int  mynah_costmap_level(void);
 
+/* Mirror regions onto an external profiler timeline; NULL hooks disable it. */
+void mynah_costmap_set_range_hooks(void (*push)(const char *), void (*pop)(void));
 void mynah_region_begin_(int id);
 void mynah_region_end_(int id);
 
