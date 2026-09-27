@@ -6609,6 +6609,24 @@ static int pocket_text_flush_limited(mynah_engine_ctx *ctx, int final, size_t li
         const size_t stop = ctx->text_prefilled + slice;
         if (stop < want) want = (stop / tile) * tile;
     }
+    /* The cross-request CUDA prefill advances one token per row per unit, so a
+     * row it hands back here can sit between tiles. Its tiles are already not
+     * where a one-shot put them; the CPU tile invariant cannot be restored,
+     * only resumed: finish the partial tile first, then continue aligned. */
+    const size_t misaligned = tile != 0u ? ctx->text_prefilled % tile : 0u;
+    int realign = 0;
+    if (misaligned != 0u && ctx->cuda_backbone_enabled) {
+        const size_t boundary = ctx->text_prefilled + (tile - misaligned);
+        if (boundary <= ctx->text_length) {
+            want = boundary;
+            realign = 1;
+        } else if (final) {
+            want = ctx->text_length;
+            realign = 1;
+        } else {
+            return 0; /* wait for the text that completes this tile */
+        }
+    }
     if (want <= ctx->text_prefilled) return 0;
     const size_t rows = want - ctx->text_prefilled;
     /* The invariant the paragraph above is about, asserted rather than assumed.
@@ -6616,7 +6634,7 @@ static int pocket_text_flush_limited(mynah_engine_ctx *ctx, int final, size_t li
      * postcondition, and it is what makes a future edit to that line fail here
      * -- loudly, on every quantization profile -- instead of failing as a one
      * ULP difference that only the f32 tile path can see. */
-    if (want != ctx->text_length && tile != 0u &&
+    if (!realign && want != ctx->text_length && tile != 0u &&
         ((ctx->text_prefilled % tile) != 0u || (rows % tile) != 0u)) {
         pocket_error(error, capacity,
                      "pocket: a non-final text flush of %zu rows at offset %zu is "
@@ -10928,6 +10946,79 @@ done:
     return rc;
 }
 
+/* Regression for the cross-request CUDA prefill: it advances one token per
+ * row per unit, so when a short row finishes the long one is handed to the
+ * scalar hook between two prefill tiles. That hand-off used to be refused as a
+ * misaligned flush ("not aligned to the 16-row prefill tile") and failed the
+ * request. The check builds exactly that pair and requires both to finish.
+ * Needs the CUDA batch prefill; anywhere else the batch hook declines and the
+ * check has nothing to test. */
+static int pocket_check_prefill_handoff(mynah_engine_state *state,
+                                        const mynah_tts_model *model,
+                                        mynah_engine_scratch *scratch,
+                                        char *error, size_t capacity) {
+    static const char *const texts[2] = {
+        "Short opening line.",
+        "This second request is deliberately much longer than the first one, "
+        "so that it is still being prefilled when its short neighbour has "
+        "already finished, and it continues well past two full prefill tiles "
+        "of text before the end of the sentence arrives."};
+    mynah_engine_ctx *ctx[2] = {NULL, NULL};
+    int rc = -1;
+    for (size_t i = 0; i < 2u; ++i) {
+        int *ids = NULL;
+        size_t n_ids = 0;
+        if (mynah_engine_pocket_tokenize(state, texts[i], strlen(texts[i]), &ids,
+                                         &n_ids, error, capacity) != 0)
+            goto done;
+        mynah_tts_request request;
+        memset(&request, 0, sizeof(request));
+        request.text_ids = ids;
+        request.text_length = n_ids;
+        request.temperature = -1.0f;
+        const int bad = pocket_ctx_new(model, state, &request, 8u, 7u + i, &ctx[i],
+                                       error, capacity) != 0;
+        free(ids);
+        if (bad) goto done;
+    }
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    const size_t budget = 2u * (tile != 0u ? tile : 16u);
+    if (tile == 0u || ctx[0]->text_length >= budget ||
+        ctx[1]->text_length <= 2u * budget) {
+        pocket_error(error, capacity,
+                     "self-check: prefill hand-off texts are %zu and %zu tokens, "
+                     "need < %zu and > %zu",
+                     ctx[0]->text_length, ctx[1]->text_length, budget, 2u * budget);
+        goto done;
+    }
+    int done_flags[2] = {0, 0};
+    const int batch = pocket_prepare_slice_batch(ctx, 2u, budget, done_flags,
+                                                 scratch, error, capacity);
+    if (batch < 0) goto done;
+    if (batch == 1) { rc = 0; goto done; } /* no batch prefill on this backend */
+    for (size_t guard = 0; guard < 64u; ++guard) {
+        int all = 1;
+        for (size_t i = 0; i < 2u; ++i) {
+            if (ctx[i]->prepared) continue;
+            all = 0;
+            int one = 0;
+            if (pocket_prepare_slice(ctx[i], budget, &one, error, capacity) != 0) {
+                char detail[256];
+                snprintf(detail, sizeof(detail), "%s", error);
+                pocket_error(error, capacity,
+                             "self-check: prefill hand-off, request %zu: %s", i,
+                             detail);
+                goto done;
+            }
+        }
+        if (all) { rc = 0; goto done; }
+    }
+    pocket_error(error, capacity, "self-check: prefill hand-off never finished");
+done:
+    for (size_t i = 0; i < 2u; ++i) pocket_ctx_free(ctx[i]);
+    return rc;
+}
+
 int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
                                    size_t capacity) {
     if (model == NULL) {
@@ -10991,6 +11082,9 @@ int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
             bad = pocket_check_gang(state, model, cases, count, 32u, scratch, error,
                                     capacity) != 0;
         }
+        if (!bad && w == 0u)
+            bad = pocket_check_prefill_handoff(state, model, scratch, error,
+                                               capacity) != 0;
         pocket_scratch_free(scratch);
         if (bad) goto done;
     }
