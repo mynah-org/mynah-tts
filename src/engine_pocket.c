@@ -10361,6 +10361,13 @@ typedef struct {
 #define POCKET_CHECK_MAX 16u
 #define POCKET_BATCH_PARITY_ATOL 1.0e-4f
 #define POCKET_BATCH_PARITY_RTOL 1.0e-4f
+/* When the backend's GEMMs are not batch-invariant (cuBLAS algorithm choice,
+ * TF32), solo and gang outputs legitimately differ by rounding that the
+ * autoregressive codec amplifies; measured on the L4 at ~2.5e-4 of a
+ * full-scale waveform. The gate then asks for -60 dB agreement instead of
+ * bit-level identity; a real batching defect is orders of magnitude larger. */
+#define POCKET_BATCH_PARITY_ATOL_TC 1.0e-3f
+#define POCKET_BATCH_PARITY_RTOL_TC 1.0e-3f
 
 /* Two sets of contexts built from the SAME cases.  Everything in this engine is
  * a deterministic function of (weights, text, voice, seed), so set A and set B
@@ -10697,6 +10704,11 @@ static int pocket_check_gang(mynah_engine_state *state,
                              const pocket_check_case *cases, size_t count,
                              size_t max_steps, mynah_engine_scratch *scratch,
                              char *error, size_t capacity) {
+    const int invariant = mynah_backend_batch_invariant(state->backend);
+    const float parity_atol = invariant ? POCKET_BATCH_PARITY_ATOL
+                                        : POCKET_BATCH_PARITY_ATOL_TC;
+    const float parity_rtol = invariant ? POCKET_BATCH_PARITY_RTOL
+                                        : POCKET_BATCH_PARITY_RTOL_TC;
     pocket_check_set a, b;
     if (pocket_check_set_new(state, model, cases, count, max_steps, &a, error,
                              capacity) != 0) {
@@ -10756,8 +10768,7 @@ static int pocket_check_gang(mynah_engine_state *state,
                     if (delta > max_abs) max_abs = delta;
                     const float scale = fmaxf(fabsf(solo[sample]),
                                               fabsf(got[i][sample]));
-                    const float limit = POCKET_BATCH_PARITY_ATOL +
-                                        POCKET_BATCH_PARITY_RTOL * scale;
+                    const float limit = parity_atol + parity_rtol * scale;
                     if (first_diff == SIZE_MAX &&
                         (!isfinite(delta) || delta > limit))
                         first_diff = sample;
@@ -10772,7 +10783,7 @@ static int pocket_check_gang(mynah_engine_state *state,
                                                   b.ctx[i]->codec_out[value]);
                         if (delta > codec_max_abs) codec_max_abs = delta;
                         if (codec_first_diff == SIZE_MAX &&
-                            (!isfinite(delta) || delta > POCKET_BATCH_PARITY_ATOL))
+                            (!isfinite(delta) || delta > parity_atol))
                             codec_first_diff = value;
                     }
                     for (size_t value = 0; value < codec_floats; ++value) {

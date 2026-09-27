@@ -936,6 +936,7 @@ struct cuda_backend_state {
     size_t batch_meta_cap;
     bool fast_math;
     bool tf32; /* MYNAH_CUDA_TF32: FP32 GEMMs on TF32 tensor cores */
+    bool tile_cublas; /* MYNAH_CUDA_TILE_CUBLAS: tile projections via cuBLAS */
     bool graphs_enabled;
     std::vector<cuda_graph_entry> graph_cache;
     std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
@@ -2655,6 +2656,7 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
      * an explicit opt-in experiment; its Tensor-Core error budget is a later
      * stage gate, not the default CUDA result. */
     st->tf32 = !st->fast_math && cuda_env_enabled("MYNAH_CUDA_TF32", true);
+    st->tile_cublas = cuda_env_enabled("MYNAH_CUDA_TILE_CUBLAS", true);
     const cublasMath_t math_mode = st->fast_math
         ? CUBLAS_DEFAULT_MATH
         : (st->tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH);
@@ -6248,8 +6250,7 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
     if (hb != nullptr && cached_weight(st, hb, N * sizeof(float), &db, e, ec))
         return -1;
     cuda_tile_workspace &w = st->tile;
-    static const bool use_cublas = cuda_env_enabled("MYNAH_CUDA_TILE_CUBLAS", true);
-    if (use_cublas) {
+    if (st->tile_cublas) {
         /* Tensor-core GEMM through cuBLAS: faster, but cuBLAS picks its
          * algorithm by M, so a row's bits can depend on its batch. */
         if (cbe(cublasSetStream(st->cublas, st->stream), e, ec)) return -1;
@@ -6314,6 +6315,14 @@ static int tile_residual(cuda_backend_state *st, float *x, const float *y,
             x, y, ds, (int)M, (int)dim);
     }
     return ce(cudaGetLastError(), e, ec);
+}
+
+/* cuBLAS chooses its algorithm (and split-K) by M and the tensor-core
+ * modes round inputs, so a row's bits then depend on its batch mates. */
+extern "C" int mynah_cuda_batch_invariant(void *opaque) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) return 1;
+    return !(st->fast_math || st->tf32 || st->tile_cublas);
 }
 
 extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,

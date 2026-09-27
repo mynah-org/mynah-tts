@@ -389,6 +389,11 @@ typedef struct {
     const size_t *rings;        /* [rows] slots per row; NULL = `ring`    */
     int kv_bf16;                /* the caches hold BF16 instead of f32    */
 } mynah_backend_tile_desc;
+/* 1 when a row's result cannot depend on the other rows of a batched call
+ * (every kernel reduces in a fixed order). 0 when the backend runs cuBLAS
+ * algorithm selection or tensor-core (TF32/FP16) GEMMs, whose rounding and
+ * blocking follow M: then solo and gang outputs agree only to a tolerance. */
+int mynah_backend_batch_invariant(const mynah_backend *backend);
 int mynah_backend_has_tile_transformer(const mynah_backend *backend);
 int mynah_backend_tile_transformer_dev(const mynah_backend *backend,
                                        const mynah_backend_tile_desc *desc,
