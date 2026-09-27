@@ -102,6 +102,7 @@ struct mynah_backend {
     int (*gelu_host_f64)(void *, float *, size_t, char *, size_t);
     int (*matmul_graph)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*self_attention_dev)(void *, const float *, float *, float *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
+    int (*tile_transformer_dev)(void *, const mynah_backend_tile_desc *, char *, size_t);
     int (*self_attention_batch_dev)(void *, const float *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*self_attention_bf16_dev)(void *, const float *, void *, void *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*self_attention_bf16_batch_dev)(void *, const float *, void *const *, void *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
@@ -208,6 +209,7 @@ extern int mynah_cuda_scale_dev(void *, float *, size_t, float, char *, size_t);
 extern int mynah_cuda_clip_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_argmax_dev(void *, const float *, size_t, size_t, size_t, int, unsigned *, char *, size_t);
 extern int mynah_cuda_self_attention_dev(void *, const float *, float *, float *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
+extern int mynah_cuda_tile_transformer_dev(void *, const mynah_backend_tile_desc *, char *, size_t);
 extern int mynah_cuda_self_attention_batch_dev(void *, const float *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_dev(void *, const float *, void *, void *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_batch_dev(void *, const float *, void *const *, void *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
@@ -714,6 +716,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->gelu_host_f64 = mynah_cuda_gelu_host_f64;
         backend->matmul_graph = mynah_cuda_matmul_graph;
         backend->self_attention_dev = mynah_cuda_self_attention_dev;
+        backend->tile_transformer_dev = mynah_cuda_tile_transformer_dev;
         backend->self_attention_batch_dev = mynah_cuda_self_attention_batch_dev;
         backend->self_attention_bf16_dev = mynah_cuda_self_attention_bf16_dev;
         backend->self_attention_bf16_batch_dev = mynah_cuda_self_attention_bf16_batch_dev;
@@ -1153,6 +1156,18 @@ int mynah_backend_snake_dev(const mynah_backend *backend,
     snake_rows_job job = {dev_data, alpha, length, snake_channels};
     mynah_parallel_for((int)channels, snake_row, &job);
     return 0;
+}
+
+int mynah_backend_has_tile_transformer(const mynah_backend *backend) {
+    return backend != NULL && backend->tile_transformer_dev != NULL;
+}
+
+int mynah_backend_tile_transformer_dev(const mynah_backend *backend,
+                                       const mynah_backend_tile_desc *desc,
+                                       char *error, size_t error_capacity) {
+    if (backend == NULL || backend->tile_transformer_dev == NULL) return 1;
+    return backend->tile_transformer_dev(backend->state, desc, error,
+                                         error_capacity);
 }
 
 int mynah_backend_has_attention_dev(const mynah_backend *backend) {

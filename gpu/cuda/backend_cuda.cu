@@ -793,6 +793,17 @@ struct cuda_decoder_batch_graph_entry {
 struct cuda_backend_state;
 static void destroy_graphs(cuda_backend_state *st);
 static void destroy_decoder_batch_graphs(cuda_backend_state *st);
+static void tile_release(cuda_backend_state *st);
+
+/* Buffers of the cross-request transformer tile, grown outside any capture. */
+struct cuda_tile_workspace {
+    float *x = nullptr, *xn = nullptr, *qkv = nullptr, *att = nullptr,
+          *proj = nullptr, *ffn_buf = nullptr;
+    size_t rows_cap = 0u, dim = 0u, ffn = 0u;
+    void *meta_dev = nullptr, *meta_host = nullptr;
+    size_t meta_cap = 0u;
+    cudaEvent_t meta_event = nullptr;
+};
 
 struct cuda_backend_state {
     cublasHandle_t cublas;
@@ -871,6 +882,10 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> matmul_calls;
     std::atomic<unsigned long long> matvec_calls;
     std::atomic<unsigned long long> q8_matmul_calls;
+    std::atomic<unsigned long long> tile_calls;
+    std::atomic<unsigned long long> width_hist[3][8];
+    std::atomic<unsigned long long> tile_rows;
+    cuda_tile_workspace tile;
     std::atomic<unsigned long long> q8_rows;
     std::atomic<unsigned long long> q8_weight_uploads;
     std::atomic<unsigned long long> q8_weight_bytes;
@@ -2385,6 +2400,7 @@ static void cuda_close(void *opaque) {
     (void)cudaStreamSynchronize(st->stream);
     destroy_decoder_batch_graphs(st);
     destroy_graphs(st);
+    tile_release(st);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
     for (auto &c : st->weights_int8) {
@@ -2478,6 +2494,10 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->matmul_calls.store(0ull, std::memory_order_relaxed);
     st->matvec_calls.store(0ull, std::memory_order_relaxed);
     st->q8_matmul_calls.store(0ull, std::memory_order_relaxed);
+    st->tile_calls.store(0ull, std::memory_order_relaxed);
+    for (auto &stage : st->width_hist)
+        for (auto &bucket : stage) bucket.store(0ull, std::memory_order_relaxed);
+    st->tile_rows.store(0ull, std::memory_order_relaxed);
     st->q8_rows.store(0ull, std::memory_order_relaxed);
     st->q8_weight_uploads.store(0ull, std::memory_order_relaxed);
     st->q8_weight_bytes.store(0ull, std::memory_order_relaxed);
@@ -5463,6 +5483,371 @@ extern "C" int mynah_cuda_self_attention_dev(
         qkv, kcache, vcache, position, cache_stride, valid,
         (int)heads, (int)head_width, scale, out);
     return ce(cudaGetLastError(), e, ec);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cross-request causal transformer tile                              */
+/* ------------------------------------------------------------------ */
+
+/* C[m][n] = bias[n] + sum_k A[m][k] * W[n][k], A row-major [M][K], W row-major
+ * [N][K].  Every output element is one fp32 accumulator walked over k in
+ * ascending order, whatever M is and wherever the row sits in the tile, so a
+ * request computes the same bits alone or inside a wide gang.  That is the
+ * property cuBLAS does not promise (it picks algorithms and split-K by M). */
+#define TILE_GEMM_BM 64
+#define TILE_GEMM_BN 64
+#define TILE_GEMM_BK 16
+__global__ static void k_tile_gemm(const float *A, const float *W,
+                                   const float *bias, float *C, int M, int N,
+                                   int K) {
+    __shared__ float As[TILE_GEMM_BK][TILE_GEMM_BM + 4];
+    __shared__ float Ws[TILE_GEMM_BK][TILE_GEMM_BN + 4];
+    const int tid = (int)threadIdx.x;
+    const int tx = tid % 16;
+    const int ty = tid / 16;
+    const int m0 = (int)blockIdx.y * TILE_GEMM_BM;
+    const int n0 = (int)blockIdx.x * TILE_GEMM_BN;
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TILE_GEMM_BK) {
+        for (int i = 0; i < 4; ++i) {
+            const int idx = tid + i * 256;
+            const int r = idx / TILE_GEMM_BK;
+            const int c = idx % TILE_GEMM_BK;
+            const int k = k0 + c;
+            As[c][r] = (m0 + r < M && k < K) ? A[(size_t)(m0 + r) * K + k] : 0.0f;
+            Ws[c][r] = (n0 + r < N && k < K) ? W[(size_t)(n0 + r) * K + k] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < TILE_GEMM_BK; ++kk) {
+            float a[4], w[4];
+            for (int i = 0; i < 4; ++i) a[i] = As[kk][ty * 4 + i];
+            for (int j = 0; j < 4; ++j) w[j] = Ws[kk][tx * 4 + j];
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], w[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + tx * 4 + j;
+            if (n >= N) continue;
+            C[(size_t)m * N + n] = acc[i][j] + (bias != nullptr ? bias[n] : 0.0f);
+        }
+    }
+}
+
+__global__ static void k_tile_gather(const float *const *inputs, float *x,
+                                     int positions, int dim, int total) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    const int per_row = positions * dim;
+    x[i] = inputs[i / per_row][i % per_row];
+}
+
+/* Row-major [row*positions + t][dim] to each request's channel-major
+ * [dim][positions] decoder input. */
+__global__ static void k_tile_scatter(const float *x, float *const *outputs,
+                                      int positions, int dim, int total) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    const int m = i / dim;
+    const int c = i % dim;
+    outputs[m / positions][(size_t)c * positions + (m % positions)] = x[i];
+}
+
+/* RoPE on q and k at each row's absolute position (the formula of k_rope_qk),
+ * then k and v into the request's ring. One block per row. */
+__global__ static void k_tile_rope_store(float *qkv, float *const *kv,
+                                         const long long *start, int layer,
+                                         int layers, int positions, int heads,
+                                         int head_width, int ring,
+                                         float max_period) {
+    const int m = (int)blockIdx.x;
+    const int r = m / positions;
+    const long long absolute = start[r] + (m % positions);
+    const int half = head_width / 2;
+    const int dim = heads * head_width;
+    float *row = qkv + (size_t)m * 3u * (size_t)dim;
+    float *kbase = kv[(size_t)r * layers + layer];
+    float *kslot = kbase + (size_t)(absolute % ring) * dim;
+    float *vslot = kbase + (size_t)ring * dim + (size_t)(absolute % ring) * dim;
+    const float slope = (float)(-log((double)max_period) * 2.0 /
+                                (double)head_width);
+    for (int pair = (int)threadIdx.x; pair < heads * half;
+         pair += (int)blockDim.x) {
+        const int head = pair / half;
+        const int i = pair % half;
+        const size_t qi = (size_t)head * head_width + (size_t)(2 * i);
+        const float frequency = expf((float)i * slope);
+        const float angle = (float)absolute * frequency;
+        float sine = 0.0f, cosine = 0.0f;
+        sincosf(angle, &sine, &cosine);
+        const float q0 = row[qi], q1 = row[qi + 1u];
+        row[qi] = q0 * cosine - q1 * sine;
+        row[qi + 1u] = q0 * sine + q1 * cosine;
+        const float k0 = row[dim + qi], k1 = row[dim + qi + 1u];
+        kslot[qi] = k0 * cosine - k1 * sine;
+        kslot[qi + 1u] = k0 * sine + k1 * cosine;
+        vslot[qi] = row[2 * dim + qi];
+        vslot[qi + 1u] = row[2 * dim + qi + 1u];
+    }
+}
+
+/* One warp per (row, head): scores over the causal window in shared memory,
+ * a two-pass softmax, then each lane owns output dims. Every reduction order
+ * depends only on the window length, never on the batch. */
+__global__ static void k_tile_attention(const float *qkv, float *const *kv,
+                                        const long long *start, int layer,
+                                        int layers, int positions, int heads,
+                                        int head_width, int context, int ring,
+                                        float scale, float *out, int rows_total) {
+    extern __shared__ float tile_scores[];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int work = (int)blockIdx.x * ((int)blockDim.x >> 5) + warp;
+    if (work >= rows_total * heads) return;
+    const int m = work / heads;
+    const int h = work % heads;
+    const int r = m / positions;
+    const long long absolute = start[r] + (m % positions);
+    const long long first = absolute + 1 > context ? absolute + 1 - context : 0;
+    const int n = (int)(absolute - first + 1);
+    const int dim = heads * head_width;
+    float *scores = tile_scores + (size_t)warp * context;
+    const float *q = qkv + (size_t)m * 3u * dim + (size_t)h * head_width;
+    const float *kbase = kv[(size_t)r * layers + layer];
+    const float *vbase = kbase + (size_t)ring * dim;
+    float local_max = -INFINITY;
+    for (int s = lane; s < n; s += 32) {
+        const float *k = kbase + (size_t)((first + s) % ring) * dim +
+                         (size_t)h * head_width;
+        float dot = 0.0f;
+        for (int d = 0; d < head_width; ++d) dot = fmaf(q[d], k[d], dot);
+        const float score = dot * scale;
+        scores[s] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, off));
+    float local_sum = 0.0f;
+    for (int s = lane; s < n; s += 32) {
+        const float p = expf(scores[s] - local_max);
+        scores[s] = p;
+        local_sum += p;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_xor_sync(0xffffffffu, local_sum, off);
+    __syncwarp();
+    const float inv = local_sum > 0.0f ? 1.0f / local_sum : 0.0f;
+    for (int d = lane; d < head_width; d += 32) {
+        float acc = 0.0f;
+        for (int s = 0; s < n; ++s) {
+            const float *v = vbase + (size_t)((first + s) % ring) * dim +
+                             (size_t)h * head_width;
+            acc = fmaf(scores[s], v[d], acc);
+        }
+        out[(size_t)m * dim + (size_t)h * head_width + d] = acc * inv;
+    }
+}
+
+static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
+                        size_t ffn, size_t meta_bytes, char *e, size_t ec) {
+    cuda_tile_workspace &w = st->tile;
+    if (rows > w.rows_cap || dim != w.dim || ffn != w.ffn) {
+        cudaFree(w.x); cudaFree(w.xn); cudaFree(w.qkv);
+        cudaFree(w.att); cudaFree(w.proj); cudaFree(w.ffn_buf);
+        w.x = w.xn = w.qkv = w.att = w.proj = w.ffn_buf = nullptr;
+        w.rows_cap = 0u;
+        size_t md = 0u, mf = 0u;
+        if (!cuda_size_mul(rows, dim, &md) || !cuda_size_mul(rows, ffn, &mf) ||
+            md > (size_t)INT_MAX / 3u || mf > (size_t)INT_MAX) {
+            set_error(e, ec, "CUDA tile workspace size overflow");
+            return -1;
+        }
+        if (ce(cudaMalloc(&w.x, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.xn, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.qkv, 3u * md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.att, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.proj, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.ffn_buf, mf * sizeof(float)), e, ec))
+            return -1;
+        w.rows_cap = rows;
+        w.dim = dim;
+        w.ffn = ffn;
+    }
+    if (meta_bytes > w.meta_cap) {
+        if (w.meta_event != nullptr) (void)cudaEventSynchronize(w.meta_event);
+        cudaFree(w.meta_dev);
+        cudaFreeHost(w.meta_host);
+        w.meta_dev = nullptr;
+        w.meta_host = nullptr;
+        w.meta_cap = 0u;
+        if (ce(cudaMalloc(&w.meta_dev, meta_bytes), e, ec) ||
+            ce(cudaHostAlloc(&w.meta_host, meta_bytes, cudaHostAllocDefault), e, ec))
+            return -1;
+        w.meta_cap = meta_bytes;
+    }
+    if (w.meta_event == nullptr &&
+        ce(cudaEventCreateWithFlags(&w.meta_event, cudaEventDisableTiming), e, ec))
+        return -1;
+    return 0;
+}
+
+static void tile_release(cuda_backend_state *st) {
+    cuda_tile_workspace &w = st->tile;
+    cudaFree(w.x); cudaFree(w.xn); cudaFree(w.qkv);
+    cudaFree(w.att); cudaFree(w.proj); cudaFree(w.ffn_buf);
+    cudaFree(w.meta_dev);
+    if (w.meta_host != nullptr) cudaFreeHost(w.meta_host);
+    if (w.meta_event != nullptr) cudaEventDestroy(w.meta_event);
+    w = cuda_tile_workspace();
+}
+
+static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
+                     const float *hb, float *C, size_t M, size_t N, size_t K,
+                     char *e, size_t ec) {
+    float *dw = nullptr, *db = nullptr;
+    if (cached_weight(st, hw, N * K * sizeof(float), &dw, e, ec)) return -1;
+    if (hb != nullptr && cached_weight(st, hb, N * sizeof(float), &db, e, ec))
+        return -1;
+    const dim3 grid((unsigned)((N + TILE_GEMM_BN - 1) / TILE_GEMM_BN),
+                    (unsigned)((M + TILE_GEMM_BM - 1) / TILE_GEMM_BM));
+    k_tile_gemm<<<grid, 256, 0, st->stream>>>(A, dw, db, C, (int)M, (int)N,
+                                                (int)K);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int tile_norm(cuda_backend_state *st, const float *in, float *out,
+                     const float *gain, const float *bias, size_t M, size_t dim,
+                     float eps, char *e, size_t ec) {
+    float *dg = nullptr, *db = nullptr;
+    if (cached_weight(st, gain, dim * sizeof(float), &dg, e, ec)) return -1;
+    if (bias != nullptr && cached_weight(st, bias, dim * sizeof(float), &db, e, ec))
+        return -1;
+    k_layer_norm<<<(int)M, 256, 0, st->stream>>>(out, in, dg, db, (int)dim, eps,
+                                                (int)M);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int tile_residual(cuda_backend_state *st, float *x, const float *y,
+                         const float *scale, size_t M, size_t dim, char *e,
+                         size_t ec) {
+    const int total = (int)(M * dim);
+    if (scale == nullptr) {
+        k_residual_add<<<(total + 255) / 256, 256, 0, st->stream>>>(x, y, total);
+    } else {
+        float *ds = nullptr;
+        if (cached_weight(st, scale, dim * sizeof(float), &ds, e, ec)) return -1;
+        k_scaled_residual_rows_add<<<(total + 255) / 256, 256, 0, st->stream>>>(
+            x, y, ds, (int)M, (int)dim);
+    }
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
+                                               const mynah_backend_tile_desc *d,
+                                               char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || d == nullptr || d->layer == nullptr ||
+        d->input == nullptr || d->output == nullptr || d->kv == nullptr ||
+        d->start == nullptr || d->rows == 0u || d->positions == 0u ||
+        d->dim == 0u || d->heads == 0u || d->ffn == 0u || d->layers == 0u ||
+        d->context == 0u || d->dim % d->heads != 0u ||
+        (d->dim / d->heads) % 2u != 0u ||
+        d->ring < d->context + d->positions - 1u ||
+        d->context > 3072u || d->rows > 4096u || d->positions > 4096u ||
+        d->layers > 64u || d->dim > 65536u || d->ffn > 65536u) {
+        set_error(e, ec, "invalid CUDA tile transformer description");
+        return -1;
+    }
+    size_t M = 0u;
+    if (!cuda_size_mul(d->rows, d->positions, &M) || M > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA tile row count overflow");
+        return -1;
+    }
+    const size_t kv_count = d->rows * d->layers;
+    const size_t meta_bytes =
+        (2u * d->rows + kv_count) * sizeof(void *) + d->rows * sizeof(long long);
+    if (tile_reserve(st, M, d->dim, d->ffn, meta_bytes, e, ec)) return -1;
+    cuda_tile_workspace &w = st->tile;
+
+    /* The pinned staging is reused per call: wait until the previous call's
+     * copy has consumed it before overwriting. */
+    if (ce(cudaEventSynchronize(w.meta_event), e, ec)) return -1;
+    char *host = static_cast<char *>(w.meta_host);
+    memcpy(host, d->input, d->rows * sizeof(void *));
+    memcpy(host + d->rows * sizeof(void *), d->output, d->rows * sizeof(void *));
+    memcpy(host + 2u * d->rows * sizeof(void *), d->kv, kv_count * sizeof(void *));
+    long long *host_start =
+        reinterpret_cast<long long *>(host + (2u * d->rows + kv_count) * sizeof(void *));
+    for (size_t r = 0; r < d->rows; ++r) host_start[r] = (long long)d->start[r];
+    if (ce(cudaMemcpyAsync(w.meta_dev, w.meta_host, meta_bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec) ||
+        ce(cudaEventRecord(w.meta_event, st->stream), e, ec))
+        return -1;
+    char *dev = static_cast<char *>(w.meta_dev);
+    const float *const *d_in = reinterpret_cast<const float *const *>(dev);
+    float *const *d_out = reinterpret_cast<float *const *>(dev + d->rows * sizeof(void *));
+    float *const *d_kv = reinterpret_cast<float *const *>(dev + 2u * d->rows * sizeof(void *));
+    const long long *d_start = reinterpret_cast<const long long *>(
+        dev + (2u * d->rows + kv_count) * sizeof(void *));
+
+    const int dim = (int)d->dim;
+    const int heads = (int)d->heads;
+    const int head_width = dim / heads;
+    const int total = (int)(M * d->dim);
+    k_tile_gather<<<(total + 255) / 256, 256, 0, st->stream>>>(
+        d_in, w.x, (int)d->positions, dim, total);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    const float scale = 1.0f / sqrtf((float)head_width);
+    const int warps_per_block = 4;
+    const int work = (int)M * heads;
+    const size_t smem = (size_t)warps_per_block * d->context * sizeof(float);
+    for (size_t l = 0; l < d->layers; ++l) {
+        const mynah_transformer_tile_layer *L = &d->layer[l];
+        if (tile_norm(st, w.x, w.xn, L->norm1_weight, L->norm1_bias, M, d->dim,
+                      d->layernorm_eps, e, ec) ||
+            tile_gemm(st, w.xn, L->in_proj_weight, L->in_proj_bias, w.qkv, M,
+                      3u * d->dim, d->dim, e, ec))
+            return -1;
+        k_tile_rope_store<<<(int)M, 256, 0, st->stream>>>(
+            w.qkv, d_kv, d_start, (int)l, (int)d->layers, (int)d->positions,
+            heads, head_width, (int)d->ring, d->max_period);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        k_tile_attention<<<(work + warps_per_block - 1) / warps_per_block,
+                           warps_per_block * 32, smem, st->stream>>>(
+            w.qkv, d_kv, d_start, (int)l, (int)d->layers, (int)d->positions,
+            heads, head_width, (int)d->context, (int)d->ring, scale, w.att,
+            (int)M);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        if (tile_gemm(st, w.att, L->out_proj_weight, L->out_proj_bias, w.proj, M,
+                      d->dim, d->dim, e, ec) ||
+            tile_residual(st, w.x, w.proj, L->layer_scale_1, M, d->dim, e, ec) ||
+            tile_norm(st, w.x, w.xn, L->norm2_weight, L->norm2_bias, M, d->dim,
+                      d->layernorm_eps, e, ec) ||
+            tile_gemm(st, w.xn, L->linear1_weight, L->linear1_bias, w.ffn_buf, M,
+                      d->ffn, d->dim, e, ec))
+            return -1;
+        const int ffn_total = (int)(M * d->ffn);
+        k_gelu<<<(ffn_total + 255) / 256, 256, 0, st->stream>>>(w.ffn_buf,
+                                                                 ffn_total);
+        if (ce(cudaGetLastError(), e, ec) ||
+            tile_gemm(st, w.ffn_buf, L->linear2_weight, L->linear2_bias, w.proj,
+                      M, d->dim, d->ffn, e, ec) ||
+            tile_residual(st, w.x, w.proj, L->layer_scale_2, M, d->dim, e, ec))
+            return -1;
+    }
+    k_tile_scatter<<<(total + 255) / 256, 256, 0, st->stream>>>(
+        w.x, d_out, (int)d->positions, dim, total);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    st->tile_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->tile_rows.fetch_add((unsigned long long)d->rows, std::memory_order_relaxed);
+    return 0;
 }
 
 extern "C" int mynah_cuda_self_attention_bf16_dev(

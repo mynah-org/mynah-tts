@@ -281,6 +281,13 @@ int mynah_transformer_ar_state_load_kv(mynah_transformer_ar_state *state,
 int mynah_transformer_ar_state_set_offset(mynah_transformer_ar_state *state,
                                           size_t positions, char *error,
                                           size_t error_capacity);
+/* The same commit for a caller that keeps its own device copy of a windowed
+ * cache and has already called _prepare_window(end): the offset may run past
+ * `kv_positions` as long as it stays inside [kv_base, kv_base + kv_positions].
+ * `_set_offset` keeps its stricter absolute check for everything else. */
+int mynah_transformer_ar_state_set_window_offset(
+    mynah_transformer_ar_state *state, size_t positions, char *error,
+    size_t error_capacity);
 
 /* Validates that every pointer the configuration requires is present.
  * Returns 0, or -1 with a message in `error`. */

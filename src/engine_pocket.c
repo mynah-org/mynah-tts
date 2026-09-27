@@ -1019,6 +1019,11 @@ struct mynah_engine_ctx {
      * directly into the resident SEANet input.  It suppresses the old
      * codec_back -> decoder_input H2D copy for this frame only. */
     int cuda_codec_device_output_ready;
+    /* Set when this request's Mimi KV lives only in the device ring of the
+     * cross-request tile (MYNAH_CUDA_MIMI_TILE). The host window is then
+     * stale by design, so the frame can never fall back to the CPU oracle or
+     * to the per-request path; a tile failure fails the request. */
+    int cuda_mimi_tile_owned;
 
     /* Optional resident CUDA SEANet decoder. This handle owns the causal
      * convolution rings and transposed-convolution tails on device. */
@@ -4820,7 +4825,7 @@ static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx,
                    host_output + t * host_batch_stride, dim * sizeof(float));
     if (host_mirror && !pocket_all_finite(ctx->codec_out, output_floats))
         goto fail;
-    if (mynah_transformer_ar_state_set_offset(ctx->codec_transformer, end, local,
+    if (mynah_transformer_ar_state_set_window_offset(ctx->codec_transformer, end, local,
                                               sizeof(local)) != 0)
         goto fail;
     ctx->cuda_codec_device_input_ready = 0;
@@ -6744,6 +6749,7 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
     ctx->cuda_codec_needs_host_sync = 0;
     ctx->cuda_codec_pending = 0;
     ctx->cuda_codec_device_output_ready = 0;
+    ctx->cuda_mimi_tile_owned = 0;
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
     ctx->spare = 0.0f;
@@ -7631,7 +7637,8 @@ static int pocket_decode_frame_transform_finish(mynah_engine_ctx *ctx,
      * waste work and make an unrelated uninitialised NaN look like a CUDA
      * transformer failure.  Dumps force the mirror on in the helper above. */
     const int device_only = ctx->cuda_codec_device_output_ready &&
-                            !pocket_cuda_codec_host_mirror_enabled();
+                            (!pocket_cuda_codec_host_mirror_enabled() ||
+                             ctx->cuda_mimi_tile_owned);
     if (!device_only) {
         for (size_t t = 0; t < stride; ++t) {
             for (size_t c = 0; c < dim; ++c)
@@ -7659,6 +7666,10 @@ static int pocket_decode_frame_transform_finish(mynah_engine_ctx *ctx,
  * it queues any D2H or synchronization work. `defer_cuda` is set only by the
  * frame-major gang; the single/offline path runs the same resident transformer
  * immediately. */
+static int pocket_cuda_mimi_tile_enabled(void);
+static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                 int *done, char *error, size_t capacity);
+
 static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
                                        int defer_cuda, char *error,
                                        size_t capacity) {
@@ -7736,6 +7747,18 @@ static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
     if (ctx->cuda_codec_enabled) {
         ctx->cuda_codec_pending = 1;
         if (defer_cuda) return 0;
+        if (pocket_cuda_mimi_tile_enabled()) {
+            int tiled = 0;
+            mynah_engine_ctx *one[1] = {ctx};
+            if (pocket_cuda_mimi_tile(one, 1u, &tiled, error, capacity) == 0 &&
+                tiled)
+                return pocket_decode_frame_transform_finish(ctx, error, capacity);
+            if (ctx->cuda_mimi_tile_owned) {
+                if (error != NULL && capacity > 0u && error[0] == '\0')
+                    pocket_error(error, capacity, "pocket: CUDA Mimi tile failed");
+                return -1;
+            }
+        }
         if (pocket_cuda_codec_transform_one(ctx, NULL, error, capacity) == 0)
             return pocket_decode_frame_transform_finish(ctx, error, capacity);
         /* The resident attempt did not advance the host offset. Disable this
@@ -7975,6 +7998,168 @@ static void pocket_decode_batch_drop(mynah_engine_ctx *ctx, size_t index,
     }
 }
 
+/* On by default for CUDA: measured on the L4 (24L, BF16 KV, C8) it moved the
+ * served aggregate from 2.9 to 10.3 audio-s/s. MYNAH_CUDA_MIMI_TILE=0 restores
+ * the per-request resident schedule. */
+static int pocket_cuda_mimi_tile_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_MIMI_TILE");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+/* Can this request's pending frame run in the cross-request tile? The tile
+ * needs the device upsample output, the device decoder handoff, and a device
+ * KV window wide enough to be used as a ring. A request adopts the ring only
+ * at codec position 0, so its whole Mimi history is ring-resident. */
+static int pocket_cuda_mimi_tile_eligible(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->cuda_codec_enabled || !ctx->cuda_codec_pending ||
+        ctx->state == NULL || ctx->cuda_codec_kv == NULL ||
+        !ctx->cuda_codec_device_input_ready || ctx->cuda_codec_up == NULL ||
+        !ctx->cuda_decoder_enabled || ctx->cuda_decoder_input == NULL)
+        return 0;
+    const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    if (tc == NULL || cfg->codec_dim != cfg->codec_tf_dim ||
+        ctx->cuda_codec_kv_half != ctx->cuda_codec_kv_positions * cfg->codec_tf_dim ||
+        ctx->cuda_codec_kv_positions + 1u < tc->context + cfg->upsample_stride)
+        return 0;
+    return ctx->cuda_mimi_tile_owned ||
+           mynah_transformer_ar_state_offset(ctx->codec_transformer) == 0u;
+}
+
+/* One launch sequence for the Mimi decoder transformer of every eligible
+ * request in the gang: [requests x upsample_stride] rows through each layer,
+ * attention against each request's own ring. On success the request's frame
+ * is in its device decoder input and its host offset has advanced; the host
+ * KV window is not maintained. `done[i]` reports which contexts it served. */
+static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                 int *done, char *error, size_t capacity) {
+    for (size_t i = 0; i < count; ++i) done[i] = 0;
+    if (count == 0u || !pocket_cuda_mimi_tile_enabled()) return 0;
+    const mynah_engine_state *state = NULL;
+    const float *input[POCKET_MAX_BATCH];
+    float *output[POCKET_MAX_BATCH];
+    size_t start[POCKET_MAX_BATCH];
+    size_t index[POCKET_MAX_BATCH];
+    size_t rows = 0u;
+    for (size_t i = 0; i < count && i < POCKET_MAX_BATCH; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (!pocket_cuda_mimi_tile_eligible(ctx)) {
+            if (ctx != NULL && ctx->cuda_mimi_tile_owned && ctx->cuda_codec_pending)
+                pocket_error(error, capacity,
+                             "pocket: CUDA Mimi tile row lost eligibility "
+                             "(enabled=%d input=%d up=%d decoder=%d offset=%zu)",
+                             ctx->cuda_codec_enabled,
+                             ctx->cuda_codec_device_input_ready,
+                             ctx->cuda_codec_up != NULL,
+                             ctx->cuda_decoder_enabled,
+                             mynah_transformer_ar_state_offset(
+                                 ctx->codec_transformer));
+            continue;
+        }
+        if (state == NULL) state = ctx->state;
+        if (ctx->state != state) continue;
+        input[rows] = ctx->cuda_codec_up;
+        output[rows] = ctx->cuda_decoder_input;
+        start[rows] = mynah_transformer_ar_state_offset(ctx->codec_transformer);
+        index[rows++] = i;
+    }
+    if (rows == 0u) return 0;
+    if (!mynah_backend_has_tile_transformer(state->backend)) return 0;
+    const pocket_config *cfg = &state->cfg;
+    const size_t layers = cfg->codec_tf_layers;
+    if (layers == 0u || layers > 8u) return 0;
+    float *kv[POCKET_MAX_BATCH * 8u];
+    mynah_transformer_tile_layer layer[8];
+    size_t ring = SIZE_MAX;
+    for (size_t r = 0; r < rows; ++r) {
+        const mynah_engine_ctx *ctx = ctxs[index[r]];
+        if (ctx->cuda_codec_kv_positions < ring) ring = ctx->cuda_codec_kv_positions;
+        for (size_t l = 0; l < layers; ++l) kv[r * layers + l] = ctx->cuda_codec_kv[l];
+    }
+    for (size_t l = 0; l < layers; ++l) {
+        const mynah_transformer_ar_layer *src = &state->codec_layers[l];
+        layer[l].norm1_weight = src->norm1_weight;
+        layer[l].norm1_bias = src->norm1_bias;
+        layer[l].in_proj_weight = src->in_proj_weight;
+        layer[l].in_proj_bias = src->in_proj_bias;
+        layer[l].out_proj_weight = src->out_proj_weight;
+        layer[l].out_proj_bias = src->out_proj_bias;
+        layer[l].layer_scale_1 = src->layer_scale_1;
+        layer[l].norm2_weight = src->norm2_weight;
+        layer[l].norm2_bias = src->norm2_bias;
+        layer[l].linear1_weight = src->linear1_weight;
+        layer[l].linear1_bias = src->linear1_bias;
+        layer[l].linear2_weight = src->linear2_weight;
+        layer[l].linear2_bias = src->linear2_bias;
+        layer[l].layer_scale_2 = src->layer_scale_2;
+    }
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctxs[index[0]]->codec_transformer);
+    /* A ring shared by every request of the call: all of them were sized from
+     * the same model, and the smallest one bounds the slot arithmetic. */
+    for (size_t r = 0; r < rows; ++r)
+        if (ctxs[index[r]]->cuda_codec_kv_positions != ring) return 0;
+    const mynah_backend_tile_desc desc = {
+        .rows = rows,
+        .positions = cfg->upsample_stride,
+        .dim = cfg->codec_tf_dim,
+        .heads = cfg->codec_tf_heads,
+        .ffn = cfg->codec_tf_ffn,
+        .layers = layers,
+        .context = tc->context,
+        .ring = ring,
+        .max_period = tc->max_period,
+        .layernorm_eps = tc->layernorm_eps,
+        .layer = layer,
+        .input = input,
+        .output = output,
+        .kv = kv,
+        .start = start,
+    };
+    char local[256];
+    local[0] = '\0';
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
+                                                      local, sizeof(local));
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (rc != 0) {
+        /* Nothing was committed on the host. Owned rows cannot recover; the
+         * caller drops them, and fresh rows fall back to the old path. */
+        if (rc < 0) pocket_error(error, capacity, "%s", local);
+        return rc < 0 ? -1 : 0;
+    }
+    (void)mynah_backend_note_codec_transformer_batch(state->backend, rows, rows);
+    for (size_t r = 0; r < rows; ++r) {
+        mynah_engine_ctx *ctx = ctxs[index[r]];
+        const size_t end = start[r] + cfg->upsample_stride;
+        /* Only the host offset matters now; its KV window is intentionally
+         * stale, so the window is compacted without any device traffic. */
+        if (mynah_transformer_ar_state_prepare_window(ctx->codec_transformer,
+                                                       end) != 0 ||
+            mynah_transformer_ar_state_set_window_offset(ctx->codec_transformer, end,
+                                                  local, sizeof(local)) != 0) {
+            ctx->cuda_mimi_tile_owned = 1;
+            pocket_error(error, capacity,
+                         "pocket: CUDA Mimi tile cannot advance the host codec "
+                         "offset to %zu (capacity %zu): %s",
+                         end,
+                         mynah_transformer_ar_state_kv_positions(
+                             ctx->codec_transformer),
+                         local);
+            continue; /* done stays 0: the caller drops an owned row */
+        }
+        ctx->cuda_mimi_tile_owned = 1;
+        ctx->cuda_codec_valid = 0;
+        ctx->cuda_codec_needs_host_sync = 0;
+        ctx->cuda_codec_device_input_ready = 0;
+        ctx->cuda_codec_device_output_ready = 1;
+        ctx->cuda_codec_pending = 0;
+        done[index[r]] = 1;
+    }
+    return 0;
+}
+
 /* Run one frame's consecutive codec positions as a true cross-request batch.
  * The decoder transformer is a prefill tile, not a one-token AR step: each
  * request contributes `upsample_stride` positions, while its KV window and
@@ -7986,6 +8171,20 @@ static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
     if (ctxs == NULL || count == 0u) return 0;
     for (size_t i = 0; i < count; ++i) {
         if (ctxs[i] != NULL) ctxs[i]->cuda_codec_device_output_ready = 0;
+    }
+    if (pocket_cuda_mimi_tile_enabled()) {
+        int tiled[POCKET_MAX_BATCH];
+        if (pocket_cuda_mimi_tile(ctxs, count, tiled, error, capacity) < 0)
+            return 1;
+        int failed = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (tiled[i] || ctxs[i] == NULL || !ctxs[i]->cuda_codec_pending ||
+                ctxs[i]->cuda_mimi_tile_owned) continue;
+            if (pocket_cuda_codec_transform_one(ctxs[i], scratch, error,
+                                                capacity) != 0)
+                failed = 1;
+        }
+        return failed;
     }
     if (count == 1u)
         return pocket_cuda_codec_transform_one(ctxs[0], scratch, error, capacity);
@@ -8256,7 +8455,7 @@ static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
         }
         size_t end = 0u;
         if (pocket_add(starts[i], stride, &end) != 0 ||
-            mynah_transformer_ar_state_set_offset(
+            mynah_transformer_ar_state_set_window_offset(
                 ctxs[i]->codec_transformer, end, local, sizeof(local)) != 0)
             goto fail;
         ctxs[i]->cuda_codec_device_input_ready = 0;
@@ -8432,6 +8631,23 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                     sizeof(codec_error));
                 for (size_t p = 0; p < codec_count; ++p) {
                     mynah_engine_ctx *ctx = codec_pending[p];
+                    if (ctx->cuda_codec_pending && ctx->cuda_mimi_tile_owned) {
+                        /* Its KV exists only in the device ring: there is no
+                         * CPU state to continue from. */
+                        for (size_t i = 0; i < count; ++i) {
+                            if (ctxs[i] != ctx) continue;
+                            pocket_decode_batch_drop(
+                                ctx, i, out_samples, out_count, failed,
+                                &reported,
+                                codec_error[0] != '\0'
+                                    ? codec_error
+                                    : "pocket: CUDA Mimi tile failed",
+                                error, capacity);
+                            break;
+                        }
+                        ctx->cuda_codec_pending = 0;
+                        continue;
+                    }
                     if (ctx->cuda_codec_pending) {
                         int host_sync = 0;
                         if (ctx->cuda_codec_device_input_ready) {

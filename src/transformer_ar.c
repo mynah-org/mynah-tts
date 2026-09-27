@@ -718,6 +718,26 @@ int mynah_transformer_ar_state_set_offset(mynah_transformer_ar_state *state,
     return 0;
 }
 
+int mynah_transformer_ar_state_set_window_offset(
+    mynah_transformer_ar_state *state, size_t positions, char *error,
+    size_t error_capacity) {
+    if (state == NULL) {
+        tar_set_error(error, error_capacity, "transformer_ar: null state");
+        return -1;
+    }
+    if (positions > state->config.max_seq_len || positions < state->kv_base ||
+        positions - state->kv_base > state->kv_positions) {
+        tar_set_error(error, error_capacity,
+                      "transformer_ar: offset %zu is outside the prepared "
+                      "window [%zu, %zu]",
+                      positions, state->kv_base,
+                      state->kv_base + state->kv_positions);
+        return -1;
+    }
+    state->offset = positions;
+    return 0;
+}
+
 int mynah_transformer_ar_check_weights(
     const mynah_transformer_ar_state *state,
     const mynah_transformer_ar_weights *weights, char *error,

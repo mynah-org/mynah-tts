@@ -348,6 +348,44 @@ int mynah_backend_self_attention_dev(const mynah_backend *backend,
                                      size_t head_width, float scale,
                                      float *dev_out,
                                      char *error, size_t error_capacity);
+/* A causal transformer tile over many independent requests in one call.
+ *
+ * Each of `rows` requests contributes `positions` consecutive tokens starting
+ * at its own absolute position `start[r]`; every request keeps a private K/V
+ * ring of `ring` slots per layer (slot = absolute % ring, layout [2][ring][dim])
+ * and attends to at most the last `context` positions.  Inputs are per-request
+ * device rows [positions][dim]; outputs are written channel-major
+ * [dim][positions] into per-request device buffers.  All pointer arrays are
+ * host arrays of device pointers; `kv` has rows * layers entries, request-major.
+ *
+ * The projections use a fixed per-element reduction order, so one request's
+ * result does not depend on how many others share the call. Nothing here
+ * synchronizes. Returns 1 when the backend has no such path. */
+/* Host weight pointers of one pre-norm layer, cached on the device by the
+ * backend on first use. Biases and layer scales may be NULL. */
+typedef struct {
+    const float *norm1_weight, *norm1_bias;
+    const float *in_proj_weight, *in_proj_bias;   /* [3*dim][dim] */
+    const float *out_proj_weight, *out_proj_bias; /* [dim][dim] */
+    const float *layer_scale_1;
+    const float *norm2_weight, *norm2_bias;
+    const float *linear1_weight, *linear1_bias;   /* [ffn][dim] */
+    const float *linear2_weight, *linear2_bias;   /* [dim][ffn] */
+    const float *layer_scale_2;
+} mynah_transformer_tile_layer;
+typedef struct {
+    size_t rows, positions, dim, heads, ffn, layers, context, ring;
+    float max_period, layernorm_eps;
+    const mynah_transformer_tile_layer *layer; /* [layers], host pointers */
+    const float *const *input;
+    float *const *output;
+    float *const *kv;
+    const size_t *start;
+} mynah_backend_tile_desc;
+int mynah_backend_has_tile_transformer(const mynah_backend *backend);
+int mynah_backend_tile_transformer_dev(const mynah_backend *backend,
+                                       const mynah_backend_tile_desc *desc,
+                                       char *error, size_t error_capacity);
 /* Batched self-attention for independent requests.  QKV is contiguous as
  * [batch][3][heads][head_width], while each request supplies its own resident
  * K/V cache and absolute position. */
