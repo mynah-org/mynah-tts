@@ -118,6 +118,13 @@ typedef struct {
     unsigned topk;
     int use_local_transformer;
     uint64_t seed;
+    /* Optional text segmentation (src/text_segment.h). When segment_count > 1,
+     * text_ids is the concatenation of segment_count chunks whose lengths are
+     * listed here and sum to text_length; an engine that supports it generates
+     * each chunk as its own utterance, in order, into one audio stream. 0 or 1
+     * means one segment, i.e. the whole text at once. Borrowed, like text_ids. */
+    const size_t *segment_lengths;
+    size_t segment_count;
 } mynah_tts_request;
 
 typedef int (*mynah_tts_audio_callback)(const float *samples, size_t count,

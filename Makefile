@@ -169,7 +169,7 @@ STAMP_WRITE := $(shell mkdir -p $(BUILD_DIR) && \
 	fi)
 
 
-CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/sgemm_rt.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/sgemm_rt.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/text_segment.c src/dispatch.c src/costmap.c
 CLI_SOURCE := cli/main.c
 # E14-4.  On x86 src/sgemm.c is built TWICE and src/sgemm_rt.c picks between
 # them at runtime; everywhere else it is built once as before.  The reason it
@@ -240,7 +240,7 @@ WINDOW_TEST_OBJECT := $(BUILD_DIR)/tests/test_transformer_ar_window.o
 WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 
 .PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross x86-tier-parity kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test dispatch-gate ternary-test server server-test server-multilang-test \
-	server-concurrency-test server-concurrency-test-all server-refusal-test bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
+	server-concurrency-test server-concurrency-test-all server-refusal-test segment-parity bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
         playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda cuda-server gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot \
@@ -750,6 +750,25 @@ tokenizer-parity: $(SP_TEST)
 	  model=$$(ls -d $$HOME/.cache/huggingface/hub/models--kyutai--pocket-tts/snapshots/*/languages/$$lang/tokenizer.model 2>/dev/null | head -1); \
 	  test -n "$$model" || (echo "no tokenizer.model for $$lang" >&2; exit 2); \
 	  $(SP_TEST) "$$model" "$$f"; \
+	done
+
+# PocketTTS text segmentation against upstream's split_into_best_sentences.
+# Generate the cases first with
+# `uv run --with sentencepiece python tools/oracle_pocket_segments.py`.
+SEG_CASES_DIR ?= build/oracle-segments
+SEG_TEST := $(BUILD_DIR)/tests/test_text_segment
+$(SEG_TEST): tests/test_text_segment.c $(CORE_OBJECTS) | $(INGOT_LIB)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $(BUILD_DIR)/tests/test_text_segment.o
+	$(CC) $(CFLAGS) $(CORE_OBJECTS) $(BUILD_DIR)/tests/test_text_segment.o $(LDFLAGS) $(LDLIBS) -o $@
+
+segment-parity: $(SEG_TEST)
+	@test -d "$(SEG_CASES_DIR)" || (echo "missing $(SEG_CASES_DIR); run: uv run --with sentencepiece python tools/oracle_pocket_segments.py" >&2; exit 2)
+	@set -e; for f in $(SEG_CASES_DIR)/*.jsonl; do \
+	  lang=$$(basename $$f .jsonl); \
+	  model=$$(ls -d $$HOME/.cache/huggingface/hub/models--kyutai--pocket-tts/snapshots/*/languages/$$lang/tokenizer.model 2>/dev/null | head -1); \
+	  test -n "$$model" || (echo "no tokenizer.model for $$lang" >&2; exit 2); \
+	  $(SEG_TEST) "$$model" "$$f"; \
 	done
 
 # Synthetic Magpie-shaped pack and the refactor goldens it exists for.

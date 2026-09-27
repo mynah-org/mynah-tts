@@ -48,7 +48,8 @@ def main():
     prof = load_reference()
     argv = PP.server_args(prof)
     check("server args carry the pinned topology",
-          argv[:6] == ["--prefork", "16", "--prefork-threads", "2", "--max-batch", "8"])
+          argv[:6] == ["--prefork", "16", "--prefork-threads", "2", "--max-batch",
+                       str(prof["server"]["max_batch"])])
     gates = dict(zip(PP.gate_args(prof)[0::2], PP.gate_args(prof)[1::2]))
     check("the TTFA gate comes from the profile", gates["--ttfa-pref-ms"] == "500.0")
     check("the soak length comes from the profile", gates["--soak-seconds"] == "1800")
@@ -137,7 +138,8 @@ def main():
         want = str(PP.load(a.profile)[0]["profile"]["objective"]["preferred_concurrency"])
         check("the level comes from the profile", a.levels == want)
         check("the topology reaches --server-args",
-              a.server_args == "--prefork 16 --prefork-threads 2 --max-batch 8")
+              a.server_args == "--prefork 16 --prefork-threads 2 --max-batch %d"
+              % PP.load(a.profile)[0]["server"]["max_batch"])
         check("the 30-minute soak length is applied", a.soak_seconds == 1800.0)
         check("gate thresholds are floats, not strings",
               isinstance(a.ttfa_pref_ms, float) and a.ttfa_pref_ms == 500.0)

@@ -5,6 +5,7 @@
 #include "qmat.h"
 #include "tokenizer.h"
 #include "tokenizer_sentencepiece.h"
+#include "text_segment.h"
 #include "flow_head.h"
 #include "convq8.h"
 #include "seanet.h"
@@ -266,6 +267,8 @@ static int synthesize(int argc, char **argv) {
     }
     int *tokens = NULL;
     size_t token_count = 0;
+    size_t *segment_lengths = NULL;   /* MYNAH_POCKET_SEGMENT_TOKENS, Pocket only */
+    size_t segment_count = 0;
     if (token_text != NULL && parse_tokens(token_text, &tokens, &token_count) != 0) {
         fprintf(stderr, "invalid token list\n");
         return 2;
@@ -285,6 +288,7 @@ static int synthesize(int argc, char **argv) {
     if (mynah_tts_model_open_device(model_dir, device, &model, error, sizeof(error)) != 0) {
         fprintf(stderr, "model check failed: %s\n", error);
         free(tokens);
+    free(segment_lengths);
         return 1;
     }
     const double load_seconds = now_seconds() - load_start;
@@ -302,8 +306,14 @@ static int synthesize(int argc, char **argv) {
                 mynah_tts_model_close(model);
                 return 2;
             }
-            if (mynah_sp_encode(sp, raw_text, strlen(raw_text), &tokens, &token_count,
-                                tok_err, sizeof(tok_err)) != 0) {
+            const size_t segment_tokens = mynah_text_segment_tokens_from_env();
+            if ((segment_tokens > 0u
+                     ? mynah_text_segment(sp, raw_text, segment_tokens,
+                                          mynah_text_segment_first_tokens_from_env(),
+                                          &tokens, &token_count, &segment_lengths,
+                                          &segment_count, tok_err, sizeof(tok_err))
+                     : mynah_sp_encode(sp, raw_text, strlen(raw_text), &tokens,
+                                       &token_count, tok_err, sizeof(tok_err))) != 0) {
                 fprintf(stderr, "tokenization error: %s\n", tok_err);
                 mynah_sp_close(sp);
                 mynah_tts_model_close(model);
@@ -333,6 +343,7 @@ static int synthesize(int argc, char **argv) {
             fprintf(stderr, "out of memory appending text EOS\n");
             mynah_tts_model_close(model);
             free(tokens);
+    free(segment_lengths);
             return 1;
         }
         tokens = next;
@@ -347,7 +358,15 @@ static int synthesize(int argc, char **argv) {
         .topk = topk,
         .seed = seed,
         .use_local_transformer = use_local,
+        .segment_lengths = segment_lengths,
+        .segment_count = segment_count,
     };
+    if (segment_count > 1u) {
+        fprintf(stderr, "text segments: %zu (", segment_count);
+        for (size_t s = 0; s < segment_count; ++s)
+            fprintf(stderr, "%s%zu", s ? " " : "", segment_lengths[s]);
+        fprintf(stderr, " tokens)\n");
+    }
     if (batch > 1u) {
         /* Throughput mode: `batch` requests stepped together, one per seed so
          * they take different trajectories and retire at different steps, which
@@ -357,6 +376,7 @@ static int synthesize(int argc, char **argv) {
             fprintf(stderr, "--batch is limited to %zu\n", mynah_tts_max_batch());
             mynah_tts_model_close(model);
             free(tokens);
+    free(segment_lengths);
             return 1;
         }
         mynah_tts_request requests[64];
@@ -408,6 +428,7 @@ static int synthesize(int argc, char **argv) {
         for (unsigned b = 0; b < batch; ++b) mynah_tts_free_samples(outs[b]);
         mynah_tts_model_close(model);
         free(tokens);
+    free(segment_lengths);
         return (batch_result == 0 && failures == 0) ? 0 : 1;
     }
     float *samples = NULL;
@@ -465,6 +486,7 @@ static int synthesize(int argc, char **argv) {
     free(timings);
     mynah_tts_model_close(model);
     free(tokens);
+    free(segment_lengths);
     return result == 0 ? 0 : 1;
 }
 
