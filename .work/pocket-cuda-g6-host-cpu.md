@@ -142,6 +142,24 @@ Ranked by expected gain at C64; each item gets a switch and a board row.
    tensor-core batch-invariant tile GEMM for prefill; B>64 once the step is
    lean; codec every 2 frames for streams with a deep buffer.
 
+## VRAM per stream (audit 2026-09-28, matches the measured ~178 MB)
+
+| component | bytes per stream |
+|---|---:|
+| backbone KV, BF16: 24 x 2 x (126 voice + T text + 1501 steps) x 1024 x 2 B | ~165 MB at T=50 |
+| Mimi codec KV window, FP32: 2 x 2 x 500 x 512 x 4 B | 4.1 MB |
+| SEANet per-step temporaries (work_a/b/c, im2col `columns`, conv windows, convtr full) | ~5.2 MB |
+| real causal state, activations, upsample, decoder IO | < 0.3 MB |
+
+The KV is sized for the 1500-frame (120 s) default step budget; a typical
+request writes ~300 of ~1677 positions. Fixed cost ~1.8 GB (weights 1.3 GB and
+shared buffers), so ~115 streams fit on 23 GB, hence the C128 OOM. Levers:
+grow the KV in 256-position chunks (`MYNAH_CUDA_KV_GROW`, in progress):
+~49 MB per stream; share the SEANet temporaries across the gang (-5 MB);
+codec window 266 instead of 500 and BF16 (-3 MB); trim the slot pool above
+the in-flight high-water mark (idle VRAM only). BF16-resident weights save
+only ~0.65 GB once.
+
 ## Board
 
 | candidate | baseline | candidate | delta | decision |
