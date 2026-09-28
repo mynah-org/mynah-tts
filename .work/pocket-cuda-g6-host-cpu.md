@@ -142,3 +142,13 @@ Ranked by expected gain at C64; each item gets a switch and a board row.
 |---|---:|---:|---:|---|
 | `MYNAH_CUDA_SYNC=blocking` (host sleeps in sync) | C64 97.7 aud/s, 117% CPU | 88.9, 43% CPU | -9% | REVERT as default (opt-in only): each wake-up leaves the GPU idle |
 | `MYNAH_CUDA_SYNC=yield` | 97.7, 117% | 96.6, 116% | -1% | REVERT (no CPU saved) |
+| decoder graphs off (`MYNAH_CUDA_DECODER_GRAPHS=0`, diagnostic) | 97.7 | 98.4 | +1% | the re-captured graphs were worth nothing |
+| decoder graph reuse per width (`MYNAH_CUDA_DECODER_GRAPH_REUSE`, 97e1e0c) | C64 96.7, 568 captures / 206 replays | 98.8, 10 captures / 826 replays | +2% | KEEP (default on); WER 3.94% vs 3.49% off, 0/96 utts > 30% |
+| backbone attention rewrite (`MYNAH_CUDA_BACKBONE_ATTN`, 97e1e0c) | C32 76.8, C48 89.9, C64 98.0 (RTF p95 0.489, TTFA p95 98 ms) | 99.9, 110.1, **119.4** (0.431, 87 ms) | **+22-30%** | KEEP (default on); self-check PASS with both kernels; WER 3.76%, 0/96 > 30% |
+| slot pool (`MYNAH_CUDA_SLOT_POOL`, 009fb44) | C64 119.1 unpinned / 116.4 on 4 cores | 123.5 / **121.7** | +3.7% / +4.6% | KEEP (default on); leak test: the same request before and after another one is md5-identical with pool 0, 1 and 1 + ZERO_KV; self-check PASS |
+| true 4-core host (`taskset -c 0-3 -w 4`, affinity logged) | C64 123.5 unpinned | 121.7, server CPU 110% of 400% | -1.5% | a g6.xlarge host does not limit the L4 |
+| max-batch/inflight 96 | C64 at 64/64: 123.5 | C80 119.5 (RTF p95 0.53, TTFA p95 106 ms), C96 117.4 (0.61, 121 ms), 0 stalls | flat aud/s, +50% streams | C96 realtime on one L4; GPU-bound plateau ~120 aud/s |
+| max-batch 128 (4 cores) | | C112 113.7 (RTF p95 0.70); C128 fails (VRAM 22.4 GB, 20 streams failed) | | ceiling ~C112 at the current per-request VRAM (~180 MB/stream) |
+
+Rows above the slot pool ran unpinned with `-w 8` (see the correction above);
+all are C32-C64 x 20 s, 24L, BF16 KV unless stated.
