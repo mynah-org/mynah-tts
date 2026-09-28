@@ -247,6 +247,15 @@ def finish_record(rec, chunks, bytes_per_s, kind):
         gaps = [b[0] - a[0] for a, b in zip(chunks, chunks[1:])]
         rec["max_gap_s"] = max(gaps) if gaps else 0.0
         audio_chunks = [(t, n / bytes_per_s) for t, n in chunks]
+        # The smallest delay after the first audio at which a player can start
+        # and never run dry: chunk i (carrying audio from position cum_i) must
+        # have arrived by start + cum_i.  safe_start = TTFA + that delay.
+        cum, late = 0.0, 0.0
+        for t, a in audio_chunks:
+            late = max(late, (t - chunks[0][0]) - cum)
+            cum += a
+        rec["required_prebuffer_s"] = late
+        rec["safe_start_s"] = rec["ttfa_s"] + late
         for pb in (0.25, 0.5):
             c, d = stalls(audio_chunks, pb)
             rec["stalls_%d" % int(pb * 1000)] = c
@@ -522,6 +531,8 @@ def run_level(a, conc, seed):
         "ttfa": stats("ttfa_s", ok), "ttfb": stats("ttfb_s", ok),
         "rtf_stream": stats("rtf_stream", ok), "rtf_e2e": stats("rtf_e2e", ok),
         "max_gap": stats("max_gap_s", ok),
+        "required_prebuffer": stats("required_prebuffer_s", ok),
+        "safe_start": stats("safe_start_s", ok),
         "stalls_250": sum(r.get("stalls_250", 0) for r in ok),
         "stalls_500": sum(r.get("stalls_500", 0) for r in ok),
         "req_with_stall_250": sum(1 for r in ok if r.get("stalls_250")),
