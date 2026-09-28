@@ -13,7 +13,7 @@ tmux new-session -d -s "srv-$port" "MYNAH_L4_CPUS=$MYNAH_L4_CPUS MYNAH_L4_WORKER
 for i in $(seq 90); do curl -sf "localhost:$port/health" >/dev/null && break; sleep 2; done
 P=$(pgrep -f "mynah-tts-server.*-p $port" | head -1)
 echo "affinity: $(taskset -cp "$P" 2>&1)" >> "$ev/$tag-server.log"
-cd "$root" && flock /root/gpu.lock /venv/main/bin/python tools/pocket_ladder.py --port "$port" \
+cd "$root" && flock "${MYNAH_L4_LOCK:-/root/gpu.lock}" /venv/main/bin/python tools/pocket_ladder.py --port "$port" \
   --levels "$lvls" --warmup "$wu" --duration "$du" --server-pid "$P" --stop-rtf-p95 50 \
   ${MYNAH_L4_LADDER_ARGS} --out "$ev/$tag" --tag "$tag" > "$ev/$tag-ladder.out" 2>&1
 pkill -INT -f "mynah-tts-server.*-p $port"; sleep 4
