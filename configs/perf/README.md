@@ -67,6 +67,7 @@ the provenance of one run — that is what lets it survive a new binary.
 | a GOOD level may not sit in `ceiling` | C96 was GOOD for a day before anyone looked above C90: an unexamined ceiling is capacity thrown away |
 | `preferred_concurrency` must equal the measured level | the number a deployment reads must be the number a soak earned |
 | `prefork_workers x threads_per_worker <= logical_cpus` | oversubscription measured as a scheduling failure, not as a model result |
+| `server.device: cuda` needs `hardware.gpu`, `http_workers`, `max_inflight >= max_batch`, and no prefork | the CUDA server is one process with one scheduler thread; a `max_inflight` below `max_batch` is silently lowered by the server, so the profile would not say what runs |
 
 ## Starting a new box
 
@@ -77,3 +78,36 @@ the soak and write the point it earned.
 Do not inherit the topology. `16x2` is right for PocketTTS (109.5M) and `4x8` is right
 for qwen-tts (1.7B) **on the same 32-core host**: the optimum follows the model's
 `T_frame(B) = a + b*B` ratio, not the machine. Re-screen it.
+
+## GPU boxes
+
+`server.device` is `cpu` when absent, so every profile above is unchanged. A `cuda`
+profile is one process — `http_workers` HTTP threads in front of one scheduler thread
+that owns the GPU — and carries `hardware.gpu`; `hardware.architecture`/`logical_cpus`
+then describe the host. `recommended.json` stays the CPU recommendation.
+
+```
+configs/perf/l4-24g-pocket-en-24l-cuda.json  one NVIDIA L4 (sm_89), Pocket 24L: C160 qualified, 184.5 audio-s/s
+configs/perf/l4-24g-pocket-en-6l-cuda.json   one NVIDIA L4 (sm_89), Pocket 6L:  C256 qualified, 316 audio-s/s
+```
+
+```bash
+tools/l4/provision.sh sm_89       # on the box: builds `make cuda-server cuda`, converts both packs
+tools/perf_profile.py command l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l --port 8080
+tools/perf_profile.py command l4-24g-pocket-en-6l-cuda  --model models/pocket-english-6l  --port 8080
+tools/perf_profile.py soak    l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l
+```
+
+`command` prints the exported variables and `build/cuda/mynah-tts-server --device cuda -w
+... --max-batch ... --max-inflight ...`. `soak` does not start the CPU harness for a cuda
+profile (and `tools/serving_profile.py --profile` refuses one): it prints the
+`tools/l4/qualify.sh` run — two 30-minute soaks on fresh servers, audio captured from
+the live streams, WER, evidence bundle — under `tools/l4/detach.sh`, plus the single
+`tools/l4/soak.sh` screen. The harness starts the server through `tools/l4/serve.sh`,
+and `tests/test_perf_profile.py` checks that its exports are exactly the profile's.
+
+Neither L4 profile is the shipped default: `MYNAH_CUDA_KV_DTYPE=bf16` and
+`MYNAH_THREADS=1` are required. Every `MYNAH_CUDA_*` switch that is on by default is
+declared `null` with its measured win and what `=0` rolls back to, and so are the
+opt-ins that must stay off (`MYNAH_CUDA_PREFILL_FIXED=0` is +4-9% but loses
+piecewise-prefill identity).
