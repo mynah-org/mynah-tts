@@ -4,6 +4,7 @@
  */
 #include "transformer_ar.h"
 
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -12,6 +13,8 @@
 #include <string.h>
 
 #include "kernels.h"
+#include "threads.h"
+
 
 /* ------------------------------------------------------------------ utils */
 
@@ -626,6 +629,26 @@ size_t mynah_transformer_ar_state_kv_half_floats(
     return (state == NULL) ? 0 : state->kv_half;
 }
 
+float *mynah_transformer_ar_state_kv_window(mynah_transformer_ar_state *state,
+                                            size_t layer, int value) {
+    if (state == NULL || layer >= state->config.num_layers ||
+        (value != 0 && value != 1)) {
+        return NULL;
+    }
+    return state->kv + layer * state->kv_layer +
+           (value ? state->kv_half : 0u);
+}
+
+size_t mynah_transformer_ar_state_kv_positions(
+    const mynah_transformer_ar_state *state) {
+    return state == NULL ? 0u : state->kv_positions;
+}
+
+size_t mynah_transformer_ar_state_kv_base(
+    const mynah_transformer_ar_state *state) {
+    return state == NULL ? 0u : state->kv_base;
+}
+
 int mynah_transformer_ar_state_load_kv(mynah_transformer_ar_state *state,
                                        size_t layer, const float *kv,
                                        size_t positions, char *error,
@@ -689,6 +712,26 @@ int mynah_transformer_ar_state_set_offset(mynah_transformer_ar_state *state,
                       "transformer_ar: offset %zu exceeds the cache's %zu "
                       "positions; a windowed cache has no slot for it",
                       positions, state->kv_positions);
+        return -1;
+    }
+    state->offset = positions;
+    return 0;
+}
+
+int mynah_transformer_ar_state_set_window_offset(
+    mynah_transformer_ar_state *state, size_t positions, char *error,
+    size_t error_capacity) {
+    if (state == NULL) {
+        tar_set_error(error, error_capacity, "transformer_ar: null state");
+        return -1;
+    }
+    if (positions > state->config.max_seq_len || positions < state->kv_base ||
+        positions - state->kv_base > state->kv_positions) {
+        tar_set_error(error, error_capacity,
+                      "transformer_ar: offset %zu is outside the prepared "
+                      "window [%zu, %zu]",
+                      positions, state->kv_base,
+                      state->kv_base + state->kv_positions);
         return -1;
     }
     state->offset = positions;
@@ -783,6 +826,19 @@ static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
     return (hi - state->kv_base < state->kv_positions) ? 0 : -1;
 }
 
+int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
+                                               size_t end_position) {
+    if (state == NULL || end_position > state->config.max_seq_len ||
+        end_position < state->offset) {
+        return -1;
+    }
+    if (end_position == state->offset || end_position == 0u) return 0;
+    const size_t hi = end_position - 1u;
+    return tar_kv_reserve(state,
+                          tar_window_start(state->offset, state->config.context),
+                          hi);
+}
+
 /* Every state in `refs` gets room for the whole tile before ANY row writes.
  *
  * The bound that matters is the LOWEST position in the tile, not the highest:
@@ -865,6 +921,111 @@ static int tar_linear_rows(const mynah_transformer_ar_weights *weights,
     return 0;
 }
 
+/* One (row, head) of attention: scores over the row's window, softmax, and the
+ * weighted sum of V. The serial loop and the pooled task both call exactly this,
+ * so the arithmetic of a head does not depend on which thread ran it or on how
+ * many threads there were -- the split below is bit-identical by construction. */
+static int tar_attend_head(const mynah_transformer_ar_config *config,
+                           size_t attn_dim, size_t layer, tar_rows *rows,
+                           const tar_row_ref *ref, size_t b, size_t h,
+                           float scale, float *scores) {
+    const mynah_transformer_ar_state *state = ref->state;
+    const size_t head_dim = config->head_dim;
+    const size_t position = ref->position;
+    const size_t lo = tar_window_start(position, config->context);
+    const size_t span = position - lo + 1u;
+    /* Slot 0 is `kv_base`, not position 0: on an unwindowed cache the base is
+     * always 0 and this is the same arithmetic as before. */
+    const size_t lo_slot = lo - state->kv_base;
+    const float *q = rows->qkv + b * 3u * attn_dim;
+    const float *k_cache = state->kv + layer * state->kv_layer;
+    const float *v_cache = k_cache + state->kv_half;
+    const float *qh = q + h * head_dim;
+    float *oh = rows->attn + b * attn_dim + h * head_dim;
+    for (size_t j = 0; j < span; ++j) {
+        const float *kj = k_cache + (lo_slot + j) * attn_dim + h * head_dim;
+        scores[j] = mynah_dot_f32(qh, kj, head_dim) * scale;
+    }
+    /* Rejects non-finite scores, which is the last line of defence against a
+     * NaN that slipped into the cache. */
+    if (mynah_softmax_f32(scores, scores, span) != 0) return -1;
+    memset(oh, 0, head_dim * sizeof(float));
+    for (size_t j = 0; j < span; ++j) {
+        const float *vj = v_cache + (lo_slot + j) * attn_dim + h * head_dim;
+        mynah_axpy_f32(oh, vj, scores[j], head_dim);
+    }
+    return 0;
+}
+
+/* The attention was the one part of a step that ran on the calling thread
+ * alone: on Axion (2 threads per worker) `mynah_dot_f32` + `mynah_axpy_f32`
+ * were 22% of a B5 synthesis while the second pool thread sat in
+ * pf_wait_for_work. The (row, head) pairs are independent, so they go to the
+ * pool. Each task keeps its scores on the stack; a window wider than that
+ * buffer, or too little work to pay for a dispatch, stays serial. */
+#define TAR_ATTN_STACK_SPAN 4096u
+#define TAR_ATTN_MIN_PARALLEL_MACS 65536u
+
+typedef struct {
+    const mynah_transformer_ar_config *config;
+    size_t attn_dim;
+    size_t layer;
+    tar_rows *rows;
+    const tar_row_ref *refs;
+    size_t heads;
+    float scale;
+    int failed;   /* any task's softmax refusal; read after the join */
+} tar_attn_job;
+
+static void tar_attn_task(void *ctx, int index) {
+    tar_attn_job *j = (tar_attn_job *)ctx;
+    const size_t b = (size_t)index / j->heads;
+    const size_t h = (size_t)index % j->heads;
+    float scores[TAR_ATTN_STACK_SPAN];
+    if (tar_attend_head(j->config, j->attn_dim, j->layer, j->rows, &j->refs[b], b,
+                        h, j->scale, scores) != 0)
+        __atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
+}
+
+/* MYNAH_TAR_ATTN_PARALLEL=0 keeps every head on the calling thread (A/B). */
+static int tar_attn_parallel_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("MYNAH_TAR_ATTN_PARALLEL");
+        cached = !(env != NULL && strcmp(env, "0") == 0);
+    }
+    return cached;
+}
+
+static int tar_attend_rows(const mynah_transformer_ar_config *config,
+                           size_t attn_dim, size_t layer, tar_rows *rows,
+                           const tar_row_ref *refs, size_t count, float scale) {
+    const size_t heads = config->num_heads;
+    size_t macs = 0u, widest = 0u;
+    for (size_t b = 0; b < count; ++b) {
+        const size_t position = refs[b].position;
+        const size_t span = position - tar_window_start(position, config->context) + 1u;
+        if (span > widest) widest = span;
+        macs += span * attn_dim * 2u;
+    }
+    const size_t tasks = count * heads;
+    if (tar_attn_parallel_enabled() && mynah_num_threads() > 1 && tasks > 1u &&
+        tasks <= (size_t)INT_MAX &&
+        widest <= TAR_ATTN_STACK_SPAN && macs >= TAR_ATTN_MIN_PARALLEL_MACS) {
+        tar_attn_job job = {config, attn_dim, layer, rows, refs, heads, scale, 0};
+        mynah_parallel_for((int)tasks, tar_attn_task, &job);
+        return job.failed ? -1 : 0;
+    }
+    for (size_t b = 0; b < count; ++b) {
+        for (size_t h = 0; h < heads; ++h) {
+            if (tar_attend_head(config, attn_dim, layer, rows, &refs[b], b, h, scale,
+                                refs[b].state->scores) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 /*
  * The stack, over `count` rows already loaded into `rows->x`.
  *
@@ -936,35 +1097,8 @@ static int tar_forward_rows(const mynah_transformer_ar_weights *weights,
          * at this point is arithmetic-bound (~13 GFLOP for a 5.2 s utterance
          * against this core's ~100 GFLOP/s f32 roof), not traffic-bound, and
          * reordering traffic cannot move an arithmetic bound. */
-        for (size_t b = 0; b < count; ++b) {
-            mynah_transformer_ar_state *state = refs[b].state;
-            const size_t position = refs[b].position;
-            const size_t lo = tar_window_start(position, config->context);
-            const size_t span = position - lo + 1u;
-            /* Slot 0 is `kv_base`, not position 0: on an unwindowed cache the
-             * base is always 0 and this is the same arithmetic as before. */
-            const size_t lo_slot = lo - state->kv_base;
-            const float *q = rows->qkv + b * 3u * attn_dim;
-            const float *k_cache = state->kv + l * state->kv_layer;
-            const float *v_cache = k_cache + state->kv_half;
-            float *scores = state->scores;
-            for (size_t h = 0; h < heads; ++h) {
-                const float *qh = q + h * head_dim;
-                for (size_t j = 0; j < span; ++j) {
-                    const float *kj = k_cache + (lo_slot + j) * attn_dim + h * head_dim;
-                    scores[j] = mynah_dot_f32(qh, kj, head_dim) * scale;
-                }
-                /* Rejects non-finite scores, which is the last line of defence
-                 * against a NaN that slipped into the cache. */
-                if (mynah_softmax_f32(scores, scores, span) != 0) return -1;
-                float *oh = rows->attn + b * attn_dim + h * head_dim;
-                memset(oh, 0, head_dim * sizeof(float));
-                for (size_t j = 0; j < span; ++j) {
-                    const float *vj = v_cache + (lo_slot + j) * attn_dim + h * head_dim;
-                    mynah_axpy_f32(oh, vj, scores[j], head_dim);
-                }
-            }
-        }
+        if (tar_attend_rows(config, attn_dim, l, rows, refs, count, scale) != 0)
+            return -1;
         if (tar_linear_rows(weights, l, MYNAH_TAR_LINEAR_OUT_PROJ,
                             layer->out_proj_weight, layer->out_proj_bias, rows,
                             rows->attn, rows->upd, count, attn_dim, d_model,

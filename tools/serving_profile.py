@@ -1161,6 +1161,11 @@ def apply_profile(args, ap):
     errs = PP.semantic(prof, path)
     if errs:
         raise PB.Refusal(["%s is not a valid profile:" % path] + ["  " + e for e in errs])
+    if PP.device(prof) != "cpu":
+        raise PB.Refusal(
+            ["%s is a %s profile: this harness starts the prefork CPU server. Qualify it "
+             "with the GPU harness instead:" % (prof["profile"]["id"], PP.device(prof)),
+             "  tools/perf_profile.py soak %s --model <pack>" % prof["profile"]["id"]])
 
     given = set()
     for tok in sys.argv[1:]:

@@ -12,7 +12,8 @@ through a framework that would silently re-quantize them.
 
 Source layout (already downloaded, gated repo, see `--source`):
 
-    <snapshot>/languages/<language>/model.safetensors      214 tensors, BF16
+    <snapshot>/languages/<language>/model.safetensors      schema-derived tensors
+                                                               (BF16, F32, or mixed)
     <snapshot>/languages/<language>/tokenizer.model        SentencePiece Unigram
     <snapshot>/languages/<language>/embeddings/<voice>.safetensors   KV cache, F32
 
@@ -135,7 +136,17 @@ NAN_IS_BOS_SENTINEL = True
 EXPECTED_SAMPLES_PER_FRAME = 1920   # facts §1
 EXPECTED_FRAME_RATE = 12.5          # facts §1
 EXPECTED_SEANET_RATIOS = (6, 5, 4)  # facts §1
-EXPECTED_TENSOR_COUNT = {214, 213}  # facts §2: current gen / the 2026-01 one
+# The exact tensor count is not an architectural input: every backbone block
+# contributes the same eight tensors.  Keep the non-backbone count as a guard so
+# a missing/extra flow or Mimi tensor is still rejected, while a deeper valid
+# backbone is accepted.  166 is the current generation (with
+# bos_before_voice); 165 is the 2026-01 generation.
+EXPECTED_NON_BACKBONE_TENSOR_COUNTS = {165, 166}
+BACKBONE_TENSOR_NAMES = (
+    "self_attn.in_proj.weight", "self_attn.out_proj.weight",
+    "linear1.weight", "linear2.weight",
+    "norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias",
+)
 
 # Per-voice provenance, from `.work/licensing-and-voice-policy.md`, which read it
 # from https://huggingface.co/kyutai/tts-voices. jean (EARS) and cosette
@@ -196,6 +207,9 @@ class TensorRef:
     """One tensor in a source safetensors file, as byte range plus shape."""
 
     name: str
+    # "BF16", "F32", or "mixed" for the source checkpoint.  The 24L
+    # English checkpoint intentionally stores flow/backbone in F32 and Mimi in
+    # BF16; the pack target policy is handled independently by convert().
     dtype: str
     shape: tuple[int, ...]
     start: int
@@ -542,15 +556,11 @@ class Schema:
 def derive_schema(refs: dict[str, TensorRef], voice_refs: dict[str, TensorRef],
                   voice_name: str) -> Schema:
     dtypes = {ref.dtype for ref in refs.values()}
-    if len(dtypes) != 1:
-        fail(f"checkpoint mixes dtypes {sorted(dtypes)}; this converter assumes one")
-    dtype = dtypes.pop()
-    if dtype not in ("BF16", "F32"):
-        fail(f"checkpoint dtype {dtype} is neither BF16 nor F32")
-
-    if len(refs) not in EXPECTED_TENSOR_COUNT:
-        fail(f"checkpoint has {len(refs)} tensors; the known PocketTTS generations "
-             f"have {sorted(EXPECTED_TENSOR_COUNT)}. Refusing to guess the schema.")
+    unsupported = dtypes - {"BF16", "F32"}
+    if unsupported:
+        fail(f"checkpoint uses unsupported dtypes {sorted(unsupported)}; "
+             "PocketTTS expects BF16/F32 weights")
+    dtype = next(iter(dtypes)) if len(dtypes) == 1 else "mixed"
 
     # --- latent and model width -------------------------------------------
     latent_dim = need(refs, "flow_lm.bos_emb").shape[0]
@@ -579,6 +589,20 @@ def derive_schema(refs: dict[str, TensorRef], voice_refs: dict[str, TensorRef],
         for norm in ("norm1", "norm2"):
             expect_shape(refs, f"{prefix}.{norm}.weight", (hidden_dim,))
             expect_shape(refs, f"{prefix}.{norm}.bias", (hidden_dim,))
+        expected = {f"{prefix}.{suffix}" for suffix in BACKBONE_TENSOR_NAMES}
+        actual = {name for name in refs if name.startswith(prefix + ".")}
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            fail(f"backbone layer {layer} tensor set is incompatible; "
+                 f"missing={missing} extra={extra}")
+
+    non_backbone_count = len(refs) - layers * len(BACKBONE_TENSOR_NAMES)
+    if non_backbone_count not in EXPECTED_NON_BACKBONE_TENSOR_COUNTS:
+        fail(f"checkpoint has {len(refs)} tensors for {layers} backbone layers: "
+             f"{non_backbone_count} non-backbone tensors, expected one of "
+             f"{sorted(EXPECTED_NON_BACKBONE_TENSOR_COUNTS)} for the verified "
+             "Pocket graph")
 
     # --- heads: QKV is fused, so the only place the head split is visible is
     #     the voice KV cache, [2, 1, T, heads, head_dim]. facts §4.
@@ -931,7 +955,7 @@ def check_flat_manifest(text: str, manifest: dict[str, Any]) -> None:
 
 
 def build_manifest(language: str, revision: str, schema: Schema, voices: list[Voice],
-                   cloning: bool, dtype: str, voice_dtype: str,
+                   cloning: bool, dtype_label: str, voice_dtype: str,
                    tokenizer_pieces: int) -> dict[str, Any]:
     temperature = ENGLISH_TEMPERATURE if language.startswith("english") else DEFAULT_TEMPERATURE
     manifest: dict[str, Any] = {
@@ -942,7 +966,7 @@ def build_manifest(language: str, revision: str, schema: Schema, voices: list[Vo
         "generation": schema.generation,
         "revision": revision,
         "source": REPO_ID,
-        "dtype": {"BF16": "bfloat16", "F32": "float32"}[dtype],
+        "dtype": dtype_label,
 
         # --- audio ---
         "sample_rate": SAMPLE_RATE,
@@ -1030,7 +1054,7 @@ def build_manifest(language: str, revision: str, schema: Schema, voices: list[Vo
 # --------------------------------------------------------------------------
 
 def write_licenses(output: Path, language: str, revision: str, schema: Schema,
-                   voices: list[Voice], dtype: str, voice_dtype: str,
+                   voices: list[Voice], dtype_label: str, voice_dtype: str,
                    cloning: bool) -> None:
     licenses = output / "LICENSES"
     licenses.mkdir(parents=True, exist_ok=True)
@@ -1043,13 +1067,16 @@ def write_licenses(output: Path, language: str, revision: str, schema: Schema,
         "converted to the mynah model pack format (`model.json`, `speakers.json`, "
         "`source.json`)",
     ]
-    if dtype != schema.dtype:
+    source_dtype_label = {"BF16": "bfloat16", "F32": "float32"}.get(schema.dtype)
+    source_preserved = (schema.dtype == "mixed" and dtype_label == "mixed")
+    if not source_preserved and dtype_label != source_dtype_label:
         modifications.append(
-            f"converted the model weights from {schema.dtype} to {dtype}")
+            f"converted the checkpoint weight policy ({schema.dtype}) into the "
+            f"pack's {dtype_label} representation")
     else:
         modifications.append(
-            f"model weight values are unchanged; they are copied byte for byte in "
-            f"{schema.dtype}")
+            "model weight values are unchanged; they are copied byte for byte "
+            f"with the source dtype policy ({dtype_label})")
     if voice_dtype == "F16":
         modifications.append(
             "quantized the predefined voice states (transformer KV caches) from "
@@ -1172,10 +1199,17 @@ def verify_pack(output: Path) -> list[str]:
     if len(refs) != manifest["tensor_count"]:
         fail(f"model.json says {manifest['tensor_count']} tensors, "
              f"tts.safetensors has {len(refs)}")
-    want_dtype = {"bfloat16": "BF16", "float32": "F32"}[manifest["dtype"]]
-    wrong = sorted(n for n, r in refs.items() if r.dtype != want_dtype)
+    declared_dtype = manifest["dtype"]
+    allowed_dtypes = {
+        "bfloat16": {"BF16"},
+        "float32": {"F32"},
+        "mixed": {"BF16", "F32"},
+    }.get(declared_dtype)
+    if allowed_dtypes is None:
+        fail(f"model.json has unsupported pack dtype {declared_dtype!r}")
+    wrong = sorted(n for n, r in refs.items() if r.dtype not in allowed_dtypes)
     if wrong:
-        fail(f"tts.safetensors has {len(wrong)} tensors that are not {want_dtype}, "
+        fail(f"tts.safetensors has {len(wrong)} tensors outside {sorted(allowed_dtypes)}, "
              f"first is {wrong[0]}")
 
     hidden = manifest["hidden_dim"]
@@ -1381,17 +1415,33 @@ def convert(args: argparse.Namespace) -> int:
     if cloning and not groups["cloning"]:
         fail("the checkpoint has no voice-cloning tensors; pass --no-cloning")
     keep = sorted(groups["core"] + (groups["cloning"] if cloning else []))
-    dropped_bytes = sum(refs[n].nbytes for n in groups["cloning"]) if not cloning else 0
 
-    target_dtype = {"bf16": "BF16", "f32": "F32"}[args.dtype]
-    if target_dtype == "BF16" and schema.dtype == "F32":
-        convert_fn: Callable[[bytes], bytes] | None = f32_to_bf16
-    elif target_dtype == "F32" and schema.dtype == "BF16":
-        convert_fn = bf16_to_f32
-    elif target_dtype == schema.dtype:
-        convert_fn = None
-    else:
-        fail(f"cannot convert {schema.dtype} to {target_dtype}")
+    fixed_target = {"bf16": "BF16", "f32": "F32"}.get(args.dtype)
+    if fixed_target is None and args.dtype != "source":
+        fail(f"unknown dtype policy {args.dtype!r}")
+
+    def output_dtype(ref: TensorRef) -> str:
+        return ref.dtype if fixed_target is None else fixed_target
+
+    def convert_blob(blob: bytes, source_dtype: str, target_dtype: str,
+                     what: str) -> bytes:
+        if source_dtype == target_dtype:
+            return blob
+        if source_dtype == "F32" and target_dtype == "BF16":
+            return f32_to_bf16(blob)
+        if source_dtype == "BF16" and target_dtype == "F32":
+            return bf16_to_f32(blob)
+        fail(f"cannot convert {what} from {source_dtype} to {target_dtype}")
+
+    target_dtypes = {output_dtype(refs[name]) for name in keep}
+    dtype_labels = {"BF16": "bfloat16", "F32": "float32"}
+    dtype_label = (next(iter(dtype_labels[d] for d in target_dtypes))
+                   if len(target_dtypes) == 1 else "mixed")
+    dropped_pack_bytes = (sum(
+        ST_ITEMSIZE[output_dtype(refs[name])] *
+        (math.prod(refs[name].shape) if refs[name].shape else 1)
+        for name in groups["cloning"])
+        if not cloning else 0)
 
     output: Path = args.output
     output.mkdir(parents=True, exist_ok=True)
@@ -1400,17 +1450,18 @@ def convert(args: argparse.Namespace) -> int:
     (output / "voices").mkdir()
 
     # --- tts.safetensors ---------------------------------------------------
-    ratio = ST_ITEMSIZE[target_dtype] / ST_ITEMSIZE[schema.dtype]
     with model_path.open("rb") as source_stream:
         def emitter(ref: TensorRef) -> Callable[[], bytes]:
             def emit() -> bytes:
                 blob = st_raw(source_stream, ref)
-                return blob if convert_fn is None else convert_fn(blob)
+                return convert_blob(blob, ref.dtype, output_dtype(ref), ref.name)
             return emit
 
         out_tensors = [
-            OutTensor(name=name, dtype=target_dtype, shape=refs[name].shape,
-                      nbytes=int(refs[name].nbytes * ratio), emit=emitter(refs[name]))
+            OutTensor(name=name, dtype=output_dtype(refs[name]), shape=refs[name].shape,
+                      nbytes=ST_ITEMSIZE[output_dtype(refs[name])] *
+                      (math.prod(refs[name].shape) if refs[name].shape else 1),
+                      emit=emitter(refs[name]))
             for name in keep
         ]
         tts_bytes = st_write(output / "tts.safetensors", out_tensors)
@@ -1479,7 +1530,7 @@ def convert(args: argparse.Namespace) -> int:
 
     # --- model.json --------------------------------------------------------
     manifest = build_manifest(args.language, revision, schema, selected, cloning,
-                              target_dtype, voice_dtype, tokenizer_pieces)
+                              dtype_label, voice_dtype, tokenizer_pieces)
     manifest["tensor_count"] = len(keep)
     manifest["commercial_only"] = bool(args.commercial_only)
     manifest_text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -1488,7 +1539,7 @@ def convert(args: argparse.Namespace) -> int:
 
     # --- licenses ----------------------------------------------------------
     write_licenses(output, args.language, revision, schema, selected,
-                   target_dtype, voice_dtype, cloning)
+                   dtype_label, voice_dtype, cloning)
 
     # --- source.json (the only file with a timestamp) ----------------------
     source_files = [
@@ -1537,11 +1588,11 @@ def convert(args: argparse.Namespace) -> int:
     print(f"  source     : {REPO_ID} @ {revision}  language={args.language} "
           f"generation={schema.generation}")
     print(f"  tensors    : {len(keep)} of {schema.tensor_count} "
-          f"({'with' if cloning else 'without'} cloning), {target_dtype}")
+          f"({'with' if cloning else 'without'} cloning), {dtype_label}")
     print(f"  tts        : {tts_bytes / 1e6:9.2f} MB")
     if not cloning:
         print(f"  omitted    : {len(groups['cloning'])} cloning tensors, "
-              f"{dropped_bytes * ratio / 1e6:.2f} MB")
+              f"{dropped_pack_bytes / 1e6:.2f} MB")
     print(f"  voices     : {len(selected)}  {voice_source_bytes / 1e6:.2f} MB F32 -> "
           f"{voice_packed_bytes / 1e6:.2f} MB F16 "
           f"(saved {(voice_source_bytes - voice_packed_bytes) / 1e6:.2f} MB, "
@@ -1557,6 +1608,7 @@ def convert(args: argparse.Namespace) -> int:
         print(f"  WARNING    : {len(non_commercial)} voice(s) are not cleared for "
               f"commercial use: {', '.join(non_commercial)}")
         print("               rebuild with --commercial-only to exclude them")
+    print(f"  source dtypes: {schema.dtype}; pack dtype: {dtype_label}")
     print(f"  dims       : latent={schema.latent_dim} d_model={schema.hidden_dim} "
           f"heads={schema.attention_heads}x{schema.head_dim} ffn={schema.ffn_dim} "
           f"layers={schema.transformer_layers} flow={schema.flow_dim}x"
@@ -1590,9 +1642,9 @@ def main() -> int:
     parser.add_argument("--commercial-only", action="store_true",
                         help="keep only voices whose license clears commercial use; "
                              "voices with unverified provenance are excluded too")
-    parser.add_argument("--dtype", choices=("bf16", "f32"), default="bf16",
-                        help="model weight dtype in the pack (default: bf16, the "
-                             "checkpoint's own dtype, copied byte for byte)")
+    parser.add_argument("--dtype", choices=("bf16", "f32", "source"), default="bf16",
+                        help="model weight policy: bf16 (default), f32, or source "
+                             "to preserve each checkpoint tensor dtype")
     return convert(parser.parse_args())
 
 

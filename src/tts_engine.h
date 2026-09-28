@@ -53,6 +53,11 @@ typedef struct {
      * branching on this is the bug this whole seam exists to prevent. */
     unsigned is_discrete_codec;
     unsigned latent_dim;            /* 0 when is_discrete_codec */
+    /* Tokens per resumable prefill slice when MYNAH_PREFILL_SLICE is unset;
+     * 0 = the driver's default. A property of what one prefill token costs
+     * for this model, which is why the engine and not the driver owns it.
+     * Appended; see the vtable note. */
+    unsigned prefill_slice_tokens;
 } mynah_engine_caps;
 
 typedef struct {
@@ -64,6 +69,12 @@ typedef struct {
     unsigned eos_frame;
     unsigned frames_appended;
     int      failed;                /* per request; siblings keep running */
+    /* The request finished a text segment and has another one: it is NOT
+     * finished, but it is not ready for the next step either. The driver moves
+     * it back to preparing and finishes the next segment's prefill through
+     * `prepare_slice`, behind the audio it has already emitted. Only an engine
+     * that has `prepare_slice` may set it. Appended; see the vtable note. */
+    int      reprepare;
 } mynah_engine_step_result;
 
 /* The vtable below is APPENDABLE, and that is a load-bearing property rather
@@ -251,6 +262,33 @@ typedef struct {
      * alignment is asserted inside `pocket_text_flush`, not assumed here. */
     int  (*prepare_slice)(mynah_engine_ctx *ctx, size_t budget, int *done,
                           char *error, size_t error_capacity);
+
+    /* ---- batched resumable prefill (APPENDED) ----------------------------
+     *
+     * OPTIONAL; NULL means that the engine only supports the scalar
+     * `prepare_slice` hook.  The driver passes distinct contexts from one
+     * model/state and a reusable scratch arena.  `done[i]` is written by the
+     * engine for each row; a row that is not done remains resumable and is
+     * passed again on a later service tick.
+     *
+     * Return values have the same opt-in shape as the other optional backend
+     * hooks: 0 means the call ran (including a partial budget), 1 means "not
+     * eligible" and leaves the contexts untouched so the driver may use the
+     * scalar hook, and -1 is a shared failure that the driver attributes to
+     * this prefill gang.  The engine must not return 1 after advancing only a
+     * subset of rows.
+     *
+     * The audio/state result must be the same model computation as scalar
+     * prefill, subject only to the backend's existing CPU/GPU numerical parity
+     * tolerance; it must not depend on gang width or row order.
+     *
+     * This is deliberately after `prepare_slice`.  The public driver can add
+     * a CUDA-only batched implementation without changing engines that do not
+     * know about it or shifting their positional vtables. */
+    int  (*prepare_slice_batch)(mynah_engine_ctx *const *ctxs, size_t count,
+                                size_t budget, int *done,
+                                mynah_engine_scratch *scratch,
+                                char *error, size_t error_capacity);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

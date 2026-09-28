@@ -5,6 +5,7 @@
 #include "qmat.h"
 #include "tokenizer.h"
 #include "tokenizer_sentencepiece.h"
+#include "text_segment.h"
 #include "flow_head.h"
 #include "convq8.h"
 #include "seanet.h"
@@ -31,7 +32,7 @@ static void usage(const char *program) {
     printf("Usage:\n");
     printf("  %s --self-test\n", program);
     printf("  %s --inspect MODEL_DIR\n", program);
-    printf("  %s --pocket-self-check MODEL_DIR\n", program);
+    printf("  %s --pocket-self-check MODEL_DIR [--device cpu|cuda]\n", program);
     printf("  %s --write-test-wav OUTPUT.wav\n", program);
     printf("  %s --synthesize MODEL_DIR --tokens IDS --output OUTPUT.wav [options]\n", program);
     printf("  %s --synthesize MODEL_DIR --text \"hello world\" --lang en --output OUTPUT.wav [options]\n", program);
@@ -40,7 +41,7 @@ static void usage(const char *program) {
     printf("               --batch N (step N requests together, seeds N..N+batch-1)\n");
     printf("  %s --clone-voice MODEL_DIR --reference REF.wav --output VOICE.safetensors --consent \"...\"\n", program);
     printf("  %s --gpu-self-test metal|cuda\n", program);
-    printf("\nNative Magpie inference is CPU-first; Metal/CUDA are explicit build variants.\n");
+    printf("\nMagpie and PocketTTS run on the CPU path; Metal/CUDA are explicit build variants.\n");
 }
 
 static void print_info(const mynah_tts_model_info *info) {
@@ -266,6 +267,8 @@ static int synthesize(int argc, char **argv) {
     }
     int *tokens = NULL;
     size_t token_count = 0;
+    size_t *segment_lengths = NULL;   /* MYNAH_POCKET_SEGMENT_TOKENS, Pocket only */
+    size_t segment_count = 0;
     if (token_text != NULL && parse_tokens(token_text, &tokens, &token_count) != 0) {
         fprintf(stderr, "invalid token list\n");
         return 2;
@@ -285,6 +288,7 @@ static int synthesize(int argc, char **argv) {
     if (mynah_tts_model_open_device(model_dir, device, &model, error, sizeof(error)) != 0) {
         fprintf(stderr, "model check failed: %s\n", error);
         free(tokens);
+    free(segment_lengths);
         return 1;
     }
     const double load_seconds = now_seconds() - load_start;
@@ -302,8 +306,14 @@ static int synthesize(int argc, char **argv) {
                 mynah_tts_model_close(model);
                 return 2;
             }
-            if (mynah_sp_encode(sp, raw_text, strlen(raw_text), &tokens, &token_count,
-                                tok_err, sizeof(tok_err)) != 0) {
+            const size_t segment_tokens = mynah_text_segment_tokens_from_env();
+            if ((segment_tokens > 0u
+                     ? mynah_text_segment(sp, raw_text, segment_tokens,
+                                          mynah_text_segment_first_tokens_from_env(),
+                                          &tokens, &token_count, &segment_lengths,
+                                          &segment_count, tok_err, sizeof(tok_err))
+                     : mynah_sp_encode(sp, raw_text, strlen(raw_text), &tokens,
+                                       &token_count, tok_err, sizeof(tok_err))) != 0) {
                 fprintf(stderr, "tokenization error: %s\n", tok_err);
                 mynah_sp_close(sp);
                 mynah_tts_model_close(model);
@@ -333,6 +343,7 @@ static int synthesize(int argc, char **argv) {
             fprintf(stderr, "out of memory appending text EOS\n");
             mynah_tts_model_close(model);
             free(tokens);
+    free(segment_lengths);
             return 1;
         }
         tokens = next;
@@ -347,7 +358,15 @@ static int synthesize(int argc, char **argv) {
         .topk = topk,
         .seed = seed,
         .use_local_transformer = use_local,
+        .segment_lengths = segment_lengths,
+        .segment_count = segment_count,
     };
+    if (segment_count > 1u) {
+        fprintf(stderr, "text segments: %zu (", segment_count);
+        for (size_t s = 0; s < segment_count; ++s)
+            fprintf(stderr, "%s%zu", s ? " " : "", segment_lengths[s]);
+        fprintf(stderr, " tokens)\n");
+    }
     if (batch > 1u) {
         /* Throughput mode: `batch` requests stepped together, one per seed so
          * they take different trajectories and retire at different steps, which
@@ -357,6 +376,7 @@ static int synthesize(int argc, char **argv) {
             fprintf(stderr, "--batch is limited to %zu\n", mynah_tts_max_batch());
             mynah_tts_model_close(model);
             free(tokens);
+    free(segment_lengths);
             return 1;
         }
         mynah_tts_request requests[64];
@@ -408,6 +428,7 @@ static int synthesize(int argc, char **argv) {
         for (unsigned b = 0; b < batch; ++b) mynah_tts_free_samples(outs[b]);
         mynah_tts_model_close(model);
         free(tokens);
+    free(segment_lengths);
         return (batch_result == 0 && failures == 0) ? 0 : 1;
     }
     float *samples = NULL;
@@ -465,6 +486,7 @@ static int synthesize(int argc, char **argv) {
     free(timings);
     mynah_tts_model_close(model);
     free(tokens);
+    free(segment_lengths);
     return result == 0 ? 0 : 1;
 }
 
@@ -614,13 +636,38 @@ int main(int argc, char **argv) {
      * over the batch and `decode_audio_batch` is bit-identical per context.
      * Separate from `--self-test` because it needs a pack, which `--self-test`
      * deliberately does not. */
-    if (strcmp(argv[1], "--pocket-self-check") == 0 && argc == 3) {
+    if (strcmp(argv[1], "--pocket-self-check") == 0) {
+        if (argc < 3 || argc > 5) {
+            fprintf(stderr, "usage: %s --pocket-self-check MODEL_DIR "
+                    "[--device cpu|cuda]\n", argv[0]);
+            return 2;
+        }
+        mynah_tts_device device = MYNAH_TTS_DEVICE_CPU;
+        for (int i = 3; i < argc; ++i) {
+            if (strcmp(argv[i], "--device") != 0 || i + 1 >= argc ||
+                parse_device(argv[++i], &device) != 0) {
+                fprintf(stderr, "pocket self-check: invalid option %s\n", argv[i]);
+                return 2;
+            }
+        }
         mynah_tts_model *model = NULL;
         char error[512];
-        if (mynah_tts_model_open(argv[2], &model, error, sizeof(error)) != 0) {
+        if (mynah_tts_model_open_device(argv[2], device, &model, error,
+                                        sizeof(error)) != 0) {
             fprintf(stderr, "pocket self-check: %s\n", error);
             return 1;
         }
+        mynah_tts_model_info info;
+        memset(&info, 0, sizeof(info));
+        (void)mynah_tts_model_get_info(model, &info);
+        if (strcmp(info.engine, "pocket") != 0) {
+            fprintf(stderr, "pocket self-check: model engine is '%s', not 'pocket'\n",
+                    info.engine);
+            mynah_tts_model_close(model);
+            return 2;
+        }
+        printf("pocket self-check: device=%s revision=%s\n",
+               mynah_tts_device_name(device), info.revision);
         const int bad =
             mynah_engine_pocket_self_check(model, error, sizeof(error)) != 0;
         mynah_tts_model_close(model);

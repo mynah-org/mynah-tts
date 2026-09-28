@@ -114,7 +114,7 @@ typedef struct {
     size_t d_model;     /* residual width, e.g. 1024                        */
     size_t num_heads;   /* e.g. 16                                          */
     size_t head_dim;    /* e.g. 64; 0 means d_model / num_heads             */
-    size_t num_layers;  /* e.g. 6                                           */
+    size_t num_layers;  /* e.g. 6 or 24; always supplied by the model         */
     size_t ffn_dim;     /* e.g. 4096                                        */
     size_t max_seq_len; /* KV capacity in positions, voice prefix included  */
     size_t context;     /* sliding attention window; 0 = unlimited          */
@@ -249,6 +249,21 @@ float *mynah_transformer_ar_state_kv(mynah_transformer_ar_state *state,
 size_t mynah_transformer_ar_state_kv_half_floats(
     const mynah_transformer_ar_state *state);
 
+/* Windowed-cache accessors for a resident backend. Unlike `state_kv()`, these
+ * are valid for both the unwindowed backbone cache and Mimi's compact sliding
+ * window. `value == 0` selects K and `value == 1` selects V; the returned row
+ * starts at the current absolute `kv_base`. */
+float *mynah_transformer_ar_state_kv_window(mynah_transformer_ar_state *state,
+                                            size_t layer, int value);
+size_t mynah_transformer_ar_state_kv_positions(
+    const mynah_transformer_ar_state *state);
+size_t mynah_transformer_ar_state_kv_base(
+    const mynah_transformer_ar_state *state);
+
+/* Make room for an exclusive end position without advancing the state. */
+int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
+                                               size_t end_position);
+
 /*
  * Copies a voice prefix into layer `layer`.  `kv` is
  * `[2][positions][num_heads][head_dim]` — the voice safetensors layout with
@@ -266,6 +281,13 @@ int mynah_transformer_ar_state_load_kv(mynah_transformer_ar_state *state,
 int mynah_transformer_ar_state_set_offset(mynah_transformer_ar_state *state,
                                           size_t positions, char *error,
                                           size_t error_capacity);
+/* The same commit for a caller that keeps its own device copy of a windowed
+ * cache and has already called _prepare_window(end): the offset may run past
+ * `kv_positions` as long as it stays inside [kv_base, kv_base + kv_positions].
+ * `_set_offset` keeps its stricter absolute check for everything else. */
+int mynah_transformer_ar_state_set_window_offset(
+    mynah_transformer_ar_state *state, size_t positions, char *error,
+    size_t error_capacity);
 
 /* Validates that every pointer the configuration requires is present.
  * Returns 0, or -1 with a message in `error`. */

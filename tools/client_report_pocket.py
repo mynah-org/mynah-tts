@@ -276,8 +276,8 @@ def build(path):
         ["Revision", "492522650173a0653b7575cdc25ae09810e5d741"],
         ["Licence", "CC-BY-4.0 (weights). Per-voice licences vary; see the pack's VOICES.md"],
         ["Language", "English"],
-        ["Architecture", "Continuous-latent autoregressive, ~109.5 M parameters: a 6-layer "
-                         "backbone, a flow-matching head, a Mimi/SEANet causal decoder"],
+        ["Architecture", "Continuous-latent autoregressive PocketTTS: verified 6L and 24L "
+                         "backbones with the same flow-matching head and Mimi/SEANet causal decoder"],
         ["Audio", "24 000 Hz, one 80 ms frame per step (12.5 frames per second)"],
     ], [26*mm, fw-26*mm], header=False))
     A(Spacer(1, 5))

@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "l4-24g-pocket-en-6l-cuda",
+    "description": "One NVIDIA L4 (24 GB, sm_89), PocketTTS English 6L (english_2026-04) streaming on the CUDA server. C256 is the qualified operating point: two independent 30-minute soaks on the v2 corpus, 316-317 audio-s/s, RTF p95 0.792-0.794, TTFA p95 145 ms, 0 stalls, 0 failures, WER 1.06/0.87% on every 4th capture. NOT the shipped default: BF16 KV and one host thread are exported. Host-scoped: another GPU is another profile.",
+    "engine": "pocket",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [
+        1,
+        352
+      ],
+      "preferred_concurrency": 256,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "cpu_family": "AMD EPYC 7702 (host)",
+    "logical_cpus": 128,
+    "ram_gib": 126,
+    "canonical_topology": "one process: 8 HTTP workers in front of one CUDA scheduler thread; no prefork",
+    "notes": "vast.ai instance, load generator on the same host. The host is not the limit: pinned to 4 cores (taskset -c 0-3, a g6.xlarge-class host) the server lost 1.5% at C64 (123.5 -> 121.7 audio-s/s) using 110% of 400% CPU. The server's CPU is ~110-125% of one core, mostly one scheduler thread spinning in cudaStreamSynchronize, so 4 vCPUs are enough for one L4.",
+    "gpu": {
+      "name": "NVIDIA L4",
+      "memory_gib": 22.5,
+      "memory_mib": 23034,
+      "compute_capability": "8.9",
+      "driver": "595.84",
+      "cuda_runtime": "13.2",
+      "count": 1,
+      "provider": "vast.ai"
+    }
+  },
+  "build": {
+    "target": "make cuda-server cuda CUDA_ARCH=sm_89",
+    "blas": "n/a (CUDA build)",
+    "simd": "n/a (CUDA build)",
+    "requirements": {
+      "cuda_arch": "sm_89 explicitly: CUDA_ARCH=native is for local bring-up, never a portable artifact (tools/gpu/provision.sh defaults to native).",
+      "binary": "build/cuda/mynah-tts-server"
+    }
+  },
+  "server": {
+    "device": "cuda",
+    "http_workers": 8,
+    "max_batch": 256,
+    "max_inflight": 256,
+    "why": "One process, --max-batch = --max-inflight = C (the CUDA batch cap is 384 since d716334). Knee ladder RTF p95 0.40/0.50/0.60/0.70/0.79-0.85/0.90/0.99/1.09 at C128/160/192/224/256/288/320/352: C256 is the last level with the margin the 24L keeps at C160. 8 HTTP workers is the harness default (tools/gpu/serve.sh). VRAM 8.0-8.5 GB flat over 30 minutes."
+  },
+  "runtime": {
+    "matches_shipped_default": false,
+    "quant_groups": {
+      "backbone": "f32",
+      "flow_net": "f32",
+      "conditioner": "f32",
+      "codec_transformer": "f32",
+      "codec_conv": "f32",
+      "codec_convtr": "f32"
+    },
+    "environment": {
+      "MYNAH_THREADS": {
+        "value": "1",
+        "why": "Required: NOT the default (the pool otherwise sizes itself to every allowed CPU, 128 on this host). On CUDA the hot stages are resident on the device and the host pool has nothing hot to run; every point below was measured with 1 (tools/gpu/serve.sh)."
+      },
+      "MYNAH_CUDA_KV_DTYPE": {
+        "value": "bf16",
+        "why": "Required: NOT the default. Without it the device backbone KV is FP32 (the parity oracle, pocket_cuda_kv_bf16_requested in src/engine_pocket.c) at twice the VRAM per stream; every point below, and the BF16-KV WER gate of .work/pocket-cuda-c60-l4.md, was measured with bf16."
+      },
+      "MYNAH_QUANT_GROUPS": {
+        "value": "none",
+        "why": "Pinned to what every point was measured with. Since the 2026-09-27 trap fix it is also what a resident CUDA build resolves 'default' to (src/engine_pocket.c: raw f32 weights), so it no longer changes the run; it stays explicit because before that fix an unset variable inherited the CPU bf16/f16 groups and ran backbone, flow and Mimi on the CPU oracle while the server said device=cuda (C1 RTF 8.7). Any other spec now refuses to start unless MYNAH_CUDA_ALLOW_CPU_STAGES=1."
+      },
+      "MYNAH_SERVE_PROFILE": {
+        "value": "1",
+        "why": "Instrumentation only: the scheduler's occupancy/step counters, printed at shutdown (src/inference.c). Exported by tools/gpu/serve.sh for every point below, so it is part of what was measured; it does not change the audio."
+      },
+      "MYNAH_CUDA_ALLOW_CPU_STAGES": {
+        "value": null,
+        "why": "Must be ABSENT: it lets a CUDA server run a hot stage (backbone, flow, Mimi) on the CPU oracle, 20-30x slower, while reporting device=cuda."
+      },
+      "MYNAH_CUDA_MIMI_TILE": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Cross-request Mimi tile: C8 2.9 -> 10.3 audio-s/s, RTF p95 1.76 -> 0.85 (L4, 24L, 2026-09-27). =0 is the rollback to the per-request resident Mimi schedule."
+      },
+      "MYNAH_CUDA_PREFILL_TILE": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Batched prefill tile + device voice cache: C32 8.5 -> 30.5 audio-s/s, prefill slices ~160 ms -> ~1.5 ms. =0 is the rollback to the host-seeded token-by-token prefill; MYNAH_CUDA_KV_GROW also depends on the tile."
+      },
+      "MYNAH_CUDA_TF32": {
+        "value": null,
+        "why": "Must be ABSENT (default on). TF32 tensor cores for the cuBLAS FP32 GEMMs: C32 22.0 -> 27.7 audio-s/s (ABAB), RTF p95 0.95 -> 0.73; WER gate passed against the CPU f32 oracle. =0 is the rollback to strict FP32 cuBLAS."
+      },
+      "MYNAH_CUDA_TILE_SPLITK": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Split-K in the fixed-order tile GEMM: measured neutral (~26 -> ~27 audio-s/s at C32) and kept. =0 is the rollback to the unsplit kernel."
+      },
+      "MYNAH_CUDA_TILE_CUBLAS": {
+        "value": null,
+        "why": "Must be ABSENT (default on). The Mimi tile GEMM through cuBLAS: C48 43.9 -> 58.1 audio-s/s, RTF p95 0.76 -> 0.55. =0 is the rollback to the fixed-order SIMT tile GEMM."
+      },
+      "MYNAH_CUDA_TILE_ATTN_GROUPED": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Grouped shared-memory tile attention. Its only A/B was noisy and read 48.7 -> 43.9 audio-s/s at C48 ('default, re-check' on the 2026-09-27 board); every qualified point ran with it on. =0 is the rollback to the ungrouped kernel; the re-check is still owed."
+      },
+      "MYNAH_CUDA_DECODER_CONVTR_GEMM": {
+        "value": null,
+        "why": "Must be ABSENT (default on). SEANet ConvTranspose as one GEMM: C48 24.5 -> 48.7 audio-s/s, RTF p95 1.06 -> 0.67. =0 is the rollback to the per-tap kernel."
+      },
+      "MYNAH_CUDA_CODEC_GANG": {
+        "value": null,
+        "why": "Must be ABSENT (default on). One quantizer projection + upsample and one PCM D2H for the whole gang: C8 6.46 -> 7.74 audio-s/s, RTF p95 1.09 -> 0.97 (measured on the agent branch, old base). =0 restores the per-request schedule exactly."
+      },
+      "MYNAH_CUDA_BACKBONE_ATTN": {
+        "value": null,
+        "why": "Must be ABSENT (default: the chunked online-softmax decode attention). +22-30%: C64 98.0 -> 119.4 audio-s/s, RTF p95 0.489 -> 0.431, TTFA p95 98 -> 87 ms; self-check PASS with both kernels. =legacy (not =0) is the rollback to the per-position tree-reduction kernel."
+      },
+      "MYNAH_CUDA_DECODER_GRAPH_REUSE": {
+        "value": null,
+        "why": "Must be ABSENT (default on). One SEANet decoder graph per width, re-recorded instead of re-captured: C64 96.7 -> 98.8 audio-s/s (+2%), 568 captures / 206 replays -> 10 / 826. =0 is the rollback to one graph per exact gang."
+      },
+      "MYNAH_CUDA_SLOT_POOL": {
+        "value": null,
+        "why": "Must be ABSENT (default on). max_batch resource sets created at start-up instead of allocating on the scheduler thread: C64 119.1 -> 123.5 audio-s/s unpinned (+3.7%), 116.4 -> 121.7 on 4 cores (+4.6%); md5-identical leak test with the pool off and on. =0 is the rollback to per-request allocation."
+      },
+      "MYNAH_CUDA_KV_GROW": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Device backbone KV grown in 256-position chunks: VRAM C64 13.2 -> 6.8 GB, C96 18.9 -> 9.2 GB, C128 OOM -> 11.5 GB (-48%); md5-identical to full capacity. =0 is the rollback to worst-case allocation, which OOMs at C128 on this GPU, so this profile cannot run without it."
+      },
+      "MYNAH_CUDA_PREFILL_FIXED": {
+        "value": null,
+        "why": "Must be ABSENT (default: fixed-order prefill). =0 routes the prefill tile through cuBLAS TF32: +4-9% (C64 127.3 -> 133.0, C96 130.4 -> 141.8 audio-s/s) but the long-form self-check fails (text pushed in pieces vs whole differs), i.e. it loses piecewise-prefill identity. Opt-in only: determinism vs throughput is a product decision not taken here."
+      },
+      "MYNAH_CUDA_TILE_TC": {
+        "value": null,
+        "why": "Must be ABSENT (default off). WMMA TF32 fixed-order tile GEMM: -25% without split-K (C64 127.6 -> 95.4), +1-2% with it (127.3 -> 128.4 at C64); invariant but far from cuBLAS. Opt-in experiment."
+      },
+      "MYNAH_CUDA_SYNC": {
+        "value": null,
+        "why": "Must be ABSENT (default: the driver's auto schedule, which spins). blocking: C64 97.7 -> 88.9 audio-s/s (-9%) for 117% -> 43% server CPU; yield: -1% with no CPU saved. Each wake-up leaves the GPU idle."
+      },
+      "MYNAH_CUDA_QUANT": {
+        "value": null,
+        "why": "Must be ABSENT (default f32 resident weights). bf16 (deterministic BF16 tile) is 4% slower than f32 on the L4; int8 is diagnostic. Neither has a qualified point."
+      }
+    }
+  },
+  "gates": {
+    "mandatory": {
+      "rtf_p95_below": 1.0,
+      "stall_ms": 500,
+      "completed_equals_launched": true
+    },
+    "preferred": {
+      "ttfa_p95_ms": 500.0,
+      "rtf_p95": 0.9,
+      "stall_ms": 250
+    },
+    "drift": {
+      "rtf_tolerance": 0.05,
+      "min_windows": 3
+    },
+    "soak": {
+      "bank": "tools/corpus/pocket_v2_en.jsonl",
+      "bank_version": "v2 corpus, 300 distinct English utterances (short / conversational / medium / long, drawn .25/.35/.28/.12), deterministic by seed",
+      "voices": [
+        "alba",
+        "marius",
+        "javert",
+        "jean"
+      ],
+      "mode": "closed",
+      "seconds": 1800,
+      "warmup_seconds": 30,
+      "window_seconds": 180
+    }
+  },
+  "qualification": {
+    "status": "qualified",
+    "model": "models/pocket-english-6l (kyutai/pocket-tts english_2026-04, revision 75cfe24e3142233bb81887fed3482e9652bb4a6e, converted by tools/convert_pocket.py with the default --dtype bf16)",
+    "workload": "v2 corpus, four voices drawn per request, streaming route, closed loop saturated at C, load generator (tools/pocket_ladder.py) on the same host, 30 s warm-up, ten 180 s windows. Qualified by tools/gpu/qualify.sh: two independent 30-minute soaks on freshly started servers with different seeds, audio captured from the live streams and transcribed. Every 10th request captured and every 4th capture transcribed (2,245 and 2,249 utterances) with faster-whisper small.en (CPU int8).",
+    "operating_point": {
+      "date": "2026-09-28",
+      "commit": "d716334",
+      "version": "d716334, 384 cap, soak B seed 8765",
+      "concurrency": 256,
+      "verdict": "GOOD",
+      "configuration": "environment-override",
+      "soak_seconds": 1800,
+      "requests": 88218,
+      "ttfa_p95_ms": 145,
+      "rtf_p95": 0.794,
+      "stalls_250ms": 0,
+      "stalls_500ms": 0,
+      "throughput_audio_s_per_s": 316.1,
+      "evidence": "l4:/root/evidence/bundles/pocket-6l-c256-final (private evidence bundle, not published), soak B"
+    },
+    "ceiling": [
+      {
+        "date": "2026-09-28",
+        "version": "384 cap build",
+        "concurrency": 288,
+        "verdict": "MARGINAL",
+        "configuration": "environment-override",
+        "soak_seconds": 25,
+        "rtf_p95": 0.896,
+        "throughput_audio_s_per_s": 252.6,
+        "evidence": ".work/pocket-cuda-g6-host-cpu.md (6L knee ladder, 25 s per level, 384 cap)",
+        "why_not_promoted": "RTF p95 0.896 sits on the 0.90 gate with no margin, from a 25 s screen; C256 keeps the same margin the 24L keeps at C160."
+      },
+      {
+        "date": "2026-09-28",
+        "version": "384 cap build",
+        "concurrency": 320,
+        "verdict": "MARGINAL",
+        "configuration": "environment-override",
+        "soak_seconds": 25,
+        "rtf_p95": 0.986,
+        "throughput_audio_s_per_s": 257.4,
+        "evidence": ".work/pocket-cuda-g6-host-cpu.md (6L knee ladder, 25 s per level, 384 cap)",
+        "why_not_promoted": "RTF p95 0.986: below 1.0 with no margin; the plateau is ~255 audio-s/s in 25 s screens."
+      },
+      {
+        "date": "2026-09-28",
+        "version": "384 cap build",
+        "concurrency": 352,
+        "verdict": "NOT STREAMABLE",
+        "configuration": "environment-override",
+        "soak_seconds": 25,
+        "requests": 607,
+        "rtf_p95": 1.086,
+        "stalls_250ms": 18207,
+        "throughput_audio_s_per_s": 258.5,
+        "evidence": ".work/pocket-cuda-g6-host-cpu.md (6L knee ladder, 25 s per level, 384 cap)",
+        "why_not_promoted": "RTF p95 1.086 and 18,207 stalls@250 in 607 requests: realtime breaks between C320 and C352."
+      }
+    ],
+    "history": [
+      {
+        "date": "2026-09-28",
+        "commit": "d716334",
+        "version": "d716334, 384 cap, soak A seed 4321",
+        "concurrency": 256,
+        "verdict": "GOOD",
+        "configuration": "environment-override",
+        "soak_seconds": 1800,
+        "requests": 88073,
+        "ttfa_p95_ms": 145,
+        "rtf_p95": 0.792,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 317.0,
+        "evidence": "l4:/root/evidence/bundles/pocket-6l-c256-final (private evidence bundle, not published), soak A"
+      },
+      {
+        "date": "2026-09-28",
+        "commit": "d716334",
+        "version": "d716334, 384 cap, soak B seed 8765",
+        "concurrency": 256,
+        "verdict": "GOOD",
+        "configuration": "environment-override",
+        "soak_seconds": 1800,
+        "requests": 88218,
+        "ttfa_p95_ms": 145,
+        "rtf_p95": 0.794,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 316.1,
+        "evidence": "l4:/root/evidence/bundles/pocket-6l-c256-final (private evidence bundle, not published), soak B"
+      }
+    ],
+    "notes": "Same build family, host, corpus and protocol as the 24L (l4-24g-pocket-en-24l-cuda.json). Plateau ~255 audio-s/s in 25 s screens and ~316 in the 30-minute soaks, vs ~138 / ~184.5 for the 24L: the backbone is 4x lighter, the Mimi/SEANet codec costs the same. WER 1.06% (A) / 0.87% (B); alba 0.62/0.44%, javert 0.49/0.34%, jean 0.95/1.12%, marius 2.24/1.58%; short 2.80/2.62%; 0.6% of utterances above 30%. No separate unloaded control: the serving path is the code measured on the 24L, where load did not change the audio. Detail: .work/pocket-cuda-g6-host-cpu.md and docs/performance.md (2026-09-28)."
+  }
+}

@@ -258,7 +258,7 @@ static int res_layer_device(const mynah_weights *file, const mynah_backend *back
                  mynah_backend_snake_dev(backend, activated, alpha.data, channels,
                                          length, channels / 2u, error,
                                          error_capacity) == 0 &&
-                 mynah_backend_conv1d(backend, activated, residual,
+                 mynah_backend_conv1d_dev(backend, activated, residual,
                                       (int)channels, (int)channels, (int)length,
                                       (int)kernels[branch_index],
                                       (int)dilations[dilation_index], weight.data,
@@ -278,7 +278,7 @@ static int res_layer_device(const mynah_weights *file, const mynah_backend *back
                          mynah_backend_snake_dev(backend, residual, alpha.data, channels,
                                                  length, channels / 2u, error,
                                                  error_capacity) == 0 &&
-                         mynah_backend_conv1d(backend, residual, branch,
+                         mynah_backend_conv1d_dev(backend, residual, branch,
                                               (int)channels, (int)channels, (int)length,
                                               (int)kernels[branch_index], 1,
                                               weight.data, bias.data, error,
@@ -307,6 +307,15 @@ static int decode_codec_resident(const mynah_tts_model *model, const unsigned *c
                                 size_t raw_length, float **samples, size_t *sample_count,
                                 char *error, size_t error_capacity) {
     const mynah_backend *backend = model->backend;
+    const int cuda_backend = backend != NULL &&
+                             strcmp(mynah_backend_name(backend), "cuda") == 0;
+    /* NanoCodec's resident graph still has model-specific hard-coded codec
+     * metadata and per-call workspace allocation.  Keep it opt-in on CUDA
+     * until its model-pack contract and pooled lifetime are validated; Pocket's
+     * own SEANet decoder has a separate resident path. */
+    if (cuda_backend &&
+        (getenv("MYNAH_CUDA_CODEC") == NULL ||
+         strcmp(getenv("MYNAH_CUDA_CODEC"), "1") != 0)) return 1;
     if (backend == NULL || !mynah_backend_has_dev_ops(backend) ||
         !mynah_backend_has_attention_dev(backend) ||
         (getenv("MYNAH_METAL_CPU_CODEC") != NULL &&
@@ -345,7 +354,7 @@ static int decode_codec_resident(const mynah_tts_model *model, const unsigned *c
         mynah_tensor_get(model->codec, "audio_decoder.pre_conv.conv.bias", &bias,
                error, error_capacity) != 0 ||
         mynah_backend_batch_begin(backend, error, error_capacity) != 0 ||
-        mynah_backend_conv1d(backend, dev_latent, current, 32, 864, (int)raw_length,
+        mynah_backend_conv1d_dev(backend, dev_latent, current, 32, 864, (int)raw_length,
                              7, 1, weight.data, bias.data, error, error_capacity) != 0 ||
         mynah_backend_sync(backend, error, error_capacity) != 0) goto fail;
     mynah_backend_dev_free(backend, dev_latent);
@@ -408,7 +417,7 @@ static int decode_codec_resident(const mynah_tts_model *model, const unsigned *c
         mynah_tensor_get(model->codec, bias_name, &bias, error, error_capacity) != 0 ||
         mynah_backend_dev_alloc(backend, current_length, &audio_dev,
                                 error, error_capacity) != 0 ||
-        mynah_backend_conv1d(backend, current, audio_dev, (int)current_channels, 1,
+        mynah_backend_conv1d_dev(backend, current, audio_dev, (int)current_channels, 1,
                              (int)current_length, 3, 1, weight.data, bias.data,
                              error, error_capacity) != 0 ||
         mynah_backend_clip_dev(backend, audio_dev, current_length,

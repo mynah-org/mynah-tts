@@ -2,16 +2,16 @@
   "schema_version": 1,
   "profile": {
     "id": "axion-c4a-32c-pocket-en",
-    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English streaming. C110 is the qualified operating point, measured on the shipped default with nothing exported. Host-scoped: not a generic Arm profile and no claim about Magpie.",
+    "description": "GCP Axion c4a, 32 Neoverse-V2 cores, PocketTTS English (6L) streaming. C164 is the qualified operating point (30 min, GOOD, 0/0 stalls), measured on the shipped default with nothing exported (text segmentation on, wide I8MM kernel, pooled attention) and --max-batch 12. Host-scoped: not a generic Arm profile and no claim about Magpie.",
     "engine": "pocket",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
       "concurrency_range": [
         1,
-        130
+        176
       ],
-      "preferred_concurrency": 120,
+      "preferred_concurrency": 164,
       "quality_changes_allowed": false
     }
   },
@@ -44,8 +44,8 @@
   "server": {
     "prefork_workers": 16,
     "threads_per_worker": 2,
-    "max_batch": 8,
-    "why": "16x2 beats 8x4 decisively here: at equal threads and equal slots, RTF p95 0.784 against 1.052, throughput -25%, stall@250 84/17968 against 734/13511. The optimum is a property of the model's T_frame(B) = a + b*B ratio, not of the machine -- qwen-tts at 1.7B prefers 4x8 on this same host. max_batch is capped at 16 by MYNAH_GRAPH_MAX_JOBS and is not binding at C90 (about 6 live slots per worker)."
+    "max_batch": 12,
+    "why": "16x2 beats 8x4 decisively here: at equal threads and equal slots, RTF p95 0.784 against 1.052, throughput -25%, stall@250 84/17968 against 734/13511. The optimum is a property of the model's T_frame(B) = a + b*B ratio, not of the machine -- qwen-tts at 1.7B prefers 4x8 on this same host. max_batch is capped at 16 by MYNAH_GRAPH_MAX_JOBS and is not binding at C90 (about 6 live slots per worker). 2026-09-27: max_batch 8 made 16 x 8 = 128 request places the ceiling (the C130 TTFB jump); 12 gives 192 places and the ceiling becomes the CPU (RTF p95 0.881 at C164, 0.906 at C176)."
   },
   "runtime": {
     "matches_shipped_default": true,
@@ -69,6 +69,14 @@
       "MYNAH_PREFILL_STEP_MS": {
         "value": null,
         "why": "Must be ABSENT. The shipped default is 40 ms of prefill work per AR step, MEASURED at C120 (30 gives TTFA p95 510 and MARGINAL, 40 gives 450 and GOOD, 50 gives 448 and buys nothing). It is not derived from the frame's slack: that rule produced 30 for the f16 kernel and points the wrong way now that bf16 made the step cheaper. 0 removes the cap, which is what makes zero stalls a scheduler bound instead of a lucky distribution."
+      },
+      "MYNAH_POCKET_SEGMENT_TOKENS": {
+        "value": null,
+        "why": "Must be ABSENT. Segmentation is on by default since 2026-09-27 (50 / first 24); at C120 it takes TTFA p95 246 -> 143 ms on this pack. 0 turns it off."
+      },
+      "MYNAH_POCKET_FIRST_SEGMENT_TOKENS": {
+        "value": null,
+        "why": "Must be ABSENT: the default first chunk is 24 tokens."
       }
     }
   },
@@ -108,40 +116,57 @@
     "model": "models/pocket-en",
     "workload": "Mixed v2 bank, streaming route /v1/audio/speech, PCM, one language pack, load generator on the same host.",
     "operating_point": {
-      "date": "2026-09-19",
-      "version": "1.4.0",
+      "date": "2026-09-27",
+      "version": "branch pocket-24l-cpu-segments (defaults commit)",
       "configuration": "shipped-default",
-      "concurrency": 120,
+      "concurrency": 164,
       "verdict": "GOOD",
       "soak_seconds": 1800,
-      "requests": 64205,
-      "ttfb_p95_ms": 75.1,
-      "ttfa_p95_ms": 447.4,
-      "rtf_p95": 0.794,
-      "prebuffer_p95_ms": 2.8,
-      "safe_start_p95_ms": 458.0,
-      "max_gap_p95_ms": 121.0,
+      "requests": 77819,
+      "ttfb_p95_ms": 81.5,
+      "ttfa_p95_ms": 179,
+      "rtf_p95": 0.881,
+      "prebuffer_p95_ms": 13.0,
+      "safe_start_p95_ms": 182,
+      "max_gap_p95_ms": 169,
       "stalls_250ms": 0,
       "stalls_500ms": 0,
-      "throughput_audio_s_per_s": 155.3,
-      "evidence": "reports/20260919-c96-axion/c120-cap40-30min-20260919-1838.log"
+      "throughput_audio_s_per_s": 193.3,
+      "evidence": "reports/20260927-axion/chain4-20260927-1147/s6-soak-c164.log"
     },
     "ceiling": [
       {
-        "date": "2026-09-19",
-        "version": "1.4.0",
+        "date": "2026-09-27",
+        "version": "branch pocket-24l-cpu-segments (defaults commit)",
         "configuration": "shipped-default",
-        "concurrency": 130,
+        "concurrency": 168,
         "verdict": "MARGINAL",
-        "soak_seconds": 600,
-        "requests": 21620,
-        "ttfb_p95_ms": 200.7,
-        "ttfa_p95_ms": 580.9,
-        "rtf_p95": 0.802,
-        "stalls_250ms": 2,
+        "soak_seconds": 1800,
+        "requests": 78235,
+        "ttfb_p95_ms": 82.8,
+        "ttfa_p95_ms": 182,
+        "rtf_p95": 0.891,
+        "stalls_250ms": 1,
         "stalls_500ms": 0,
-        "evidence": "reports/20260919-c96-axion/ceiling-bf16-20260919-1653.log",
-        "why_not_promoted": "TTFB jumps 74.8 -> 200.7 ms, which is not synthesis: 16 workers x 8 slots is 128 places and 130 requests is the first level that fills them, so requests wait for a slot before they begin. This is also where --max-batch stops being the inert knob it was measured to be at C100 and becomes a real lever again. Measured at the OLD 30 ms prefill cap; the cap is now 40, which is what promoted C120, so this level is stale and is the first to re-screen."
+        "throughput_audio_s_per_s": 194.3,
+        "evidence": "reports/20260927-axion/chain2-20260927-0904/s6-soak-c168.log",
+        "why_not_promoted": "One stall@250 in 78235 with RTF p95 0.891 against the 0.90 gate: the CPU edge."
+      },
+      {
+        "date": "2026-09-27",
+        "version": "branch pocket-24l-cpu-segments (defaults commit)",
+        "configuration": "shipped-default",
+        "concurrency": 176,
+        "verdict": "MARGINAL",
+        "soak_seconds": 180,
+        "requests": 7942,
+        "ttfb_p95_ms": 87.1,
+        "ttfa_p95_ms": 194,
+        "rtf_p95": 0.906,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "evidence": "reports/20260927-axion/chain2-20260927-0904/s6-c176.log",
+        "why_not_promoted": "RTF p95 0.906 > 0.90 in a 3-minute screen: the CPU is saturated (~173-176 audio-s/s in screens from C120 up)."
       }
     ],
     "history": [
@@ -232,6 +257,57 @@
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 155.3,
         "evidence": "reports/20260919-c96-axion/c120-cap40-30min-20260919-1838.log"
+      },
+      {
+        "date": "2026-09-27",
+        "version": "branch pocket-24l-cpu-segments (defaults commit)",
+        "configuration": "shipped-default",
+        "concurrency": 152,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 77088,
+        "ttfb_p95_ms": 78.5,
+        "ttfa_p95_ms": 175,
+        "rtf_p95": 0.816,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 191.4,
+        "evidence": "reports/20260927-axion/chain3-20260927-1043/s6-soak-c152.log"
+      },
+      {
+        "date": "2026-09-27",
+        "version": "branch pocket-24l-cpu-segments (defaults commit)",
+        "configuration": "shipped-default",
+        "concurrency": 160,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 77555,
+        "ttfb_p95_ms": 80.0,
+        "ttfa_p95_ms": 178,
+        "rtf_p95": 0.836,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 192.5,
+        "evidence": "reports/20260927-axion/chain4-20260927-1147/s6-soak-c160.log"
+      },
+      {
+        "date": "2026-09-27",
+        "version": "branch pocket-24l-cpu-segments (defaults commit)",
+        "configuration": "shipped-default",
+        "concurrency": 164,
+        "verdict": "GOOD",
+        "soak_seconds": 1800,
+        "requests": 77819,
+        "ttfb_p95_ms": 81.5,
+        "ttfa_p95_ms": 179,
+        "rtf_p95": 0.881,
+        "prebuffer_p95_ms": 13.0,
+        "safe_start_p95_ms": 182,
+        "max_gap_p95_ms": 169,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 193.3,
+        "evidence": "reports/20260927-axion/chain4-20260927-1147/s6-soak-c164.log"
       }
     ],
     "notes": "The operating point moved C96 -> C110 -> C120 across 2026-09-19, on one host and one bank, by three changes made that day: the per-step prefill cap, backbone:bf16 with a tiled BFMMLA kernel, and the cap re-measured after that kernel made the step cheaper. +25% concurrency and TTFA p95 492 -> 447 ms. TWO FINDINGS THAT EXPIRED THE SAME DAY THEY WERE WRITTEN, kept here so nobody quotes them: 'cap = deadline - T_frame' is not a law (at the modal width it now points the wrong way, because a frame that overruns is a debt a slot repays from its lead, not a stall), and '--max-batch is inert' was true at C100 and false at C120, where the width histogram reaches B7 with 92015 frames and B8 with 62154. The next limit is admission: at C130 TTFB triples because 16 workers x 8 slots is 128 places."

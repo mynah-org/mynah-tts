@@ -141,6 +141,27 @@ make metal && build/metal/mynah-tts --gpu-self-test metal   # macOS
 make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
 ```
 
+Pocket-TTS support is currently an experimental engine path: official 6-layer
+and 24-layer packs run on CPU, with the CPU server using model-aware text
+segmentation and the same depth-driven runtime for both packs. The Linux CUDA
+server path has been exercised on Blackwell (`sm_120`) and Ada (`sm_89`). CUDA has resident implementations for
+the backbone, flow head, Mimi decoder-transformer, quantizer/causal upsample and
+causal SEANet decoder, but each stage is capability- and precision-gated. The
+default Pocket CPU quantization profile intentionally keeps several groups
+quantized. Resident CUDA now has an explicit Q8 linear path for batched
+backbone/flow/Mimi and latent/EOS control projections (device activation
+quantization, INT8 GEMM, cached per-row weight scales and f32 epilogue);
+convolution groups still use the CPU oracle until their own CUDA Q8 kernel
+passes parity. The resident SEANet decoder is now cross-request batched in
+raw-F32 mode, with causal tails/workspaces kept per request. A raw-F32 resident bring-up therefore uses
+`MYNAH_QUANT_GROUPS=none`, shown below. The current path still keeps generation
+control (EOS thresholding/sampling/RNG) and the final PCM boundary on the host;
+the EOS projection itself is batched on the resident stream, and its
+decoder counters distinguish true cross-request SEANet arithmetic batches from
+ordinary single-request/fallback steps. CUDA remains opt-in and model-specific;
+it is qualified for streaming on an NVIDIA L4 (C160 large, C256 small), see
+[docs/cuda-serving.md](docs/cuda-serving.md).
+
 A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
 speakers and license metadata. Model files, generated WAVs, build output and the
 local `.venv` are all gitignored.
@@ -173,20 +194,41 @@ curl -X POST http://localhost:8080/v1/tts \
 curl http://localhost:8080/v1/voices          # ids and names
 curl http://localhost:8080/v1/models          # OpenAI-shaped listing
 curl http://localhost:8080/health             # liveness
+curl http://localhost:8080/metrics            # Prometheus counters/gauges
 ```
 
 Requests accept `seed`, `temperature`, `top_k`, `max_steps`, `language` and
 `"stream": true` for chunked PCM as it is generated, sample-identical to the
 batch response.
 
+**PocketTTS on an NVIDIA GPU** is qualified for streaming: one L4 serves 160
+concurrent streams of the 24-layer model and 256 of the 6-layer one (two
+30-minute saturated soaks each, zero stalls, first audio p95 ~150 ms). Build
+with `make cuda-server CUDA_ARCH=sm_89` and start it from the serving profile:
+
+```bash
+python3 tools/perf_profile.py command l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l
+# MYNAH_THREADS=1 MYNAH_CUDA_KV_DTYPE=bf16 MYNAH_QUANT_GROUPS=none \
+#   build/cuda/mynah-tts-server --device cuda -w 8 --max-batch 160 --max-inflight 160 -p 8080 -m models/pocket-english-24l
+```
+
+Every CUDA optimisation is on by default; the environment only needs
+`MYNAH_CUDA_KV_DTYPE=bf16` and `MYNAH_THREADS=1`. The full guide (models,
+streaming requests, sizing another GPU, every `MYNAH_CUDA_*` switch with its
+measured effect, monitoring, troubleshooting and the qualification procedure)
+is **[docs/cuda-serving.md](docs/cuda-serving.md)**.
+
 **Concurrent requests are batched, vLLM-style.** Offline requests are not
 serialized behind a lock: a scheduler admits everything queued into one
 weight-stationary decode — per-request KV, RNG and EOS, one pass over the
-decode weights for all of them (up to 16 in flight). Measured 1.63x aggregate
+decode weights for each bounded engine microbatch (up to 16 by default).
+`--max-inflight` can retain more resident streaming slots without widening that
+microbatch. Measured 1.63x aggregate
 throughput at eight concurrent, and stronger than vLLM on one axis: each
 request's audio is **byte-identical** to the same request run alone, whatever
-it happened to batch with. Streaming requests run one at a time by design —
-their callback interleaves with generation.
+it happened to batch with. Streaming requests join the same bounded scheduler
+and their callbacks interleave with generation; the resident-slot ceiling is
+independent from the arithmetic microbatch width.
 
 The plumbing is what you would expect of a real server: a fixed worker pool
 (`-w`, default 4) drains a bounded connection queue, sheds load with `503` +

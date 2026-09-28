@@ -11,6 +11,7 @@ into an exact argv, an exact environment and an exact set of gates.
     tools/perf_profile.py server-env  recommended
     tools/perf_profile.py forbidden-env recommended
     tools/perf_profile.py soak        recommended --model models/pocket-en   # the soak command
+                                     # (a cuda profile prints the tools/gpu/qualify.sh run)
     tools/perf_profile.py best        recommended
     tools/perf_profile.py new  my-box --like axion-c4a-32c-pocket-en
 
@@ -142,11 +143,25 @@ def semantic(prof, path):
         errs.append("profile.id %r does not match the file name" % p["id"])
 
     srv = prof["server"]
-    used = srv["prefork_workers"] * srv["threads_per_worker"]
-    if hw.get("logical_cpus") and used > hw["logical_cpus"]:
-        errs.append("server asks for %d threads (%dx%d) on a %d-CPU host"
-                    % (used, srv["prefork_workers"], srv["threads_per_worker"],
-                       hw["logical_cpus"]))
+    if device(prof) == "cuda":
+        errs += semantic_cuda(prof)
+    else:
+        missing = [k for k in ("prefork_workers", "threads_per_worker") if k not in srv]
+        if missing:
+            errs.append("a cpu profile needs server.%s" % " and server.".join(missing))
+            return errs
+        for k in ("http_workers", "max_inflight"):
+            if k in srv:
+                errs.append("server.%s is a cuda setting; a cpu profile runs prefork "
+                            "workers" % k)
+        if "gpu" in hw:
+            errs.append("hardware.gpu on a cpu profile: set server.device to the "
+                        "device the operating point was measured on")
+        used = srv["prefork_workers"] * srv["threads_per_worker"]
+        if hw.get("logical_cpus") and used > hw["logical_cpus"]:
+            errs.append("server asks for %d threads (%dx%d) on a %d-CPU host"
+                        % (used, srv["prefork_workers"], srv["threads_per_worker"],
+                           hw["logical_cpus"]))
 
     obj = p.get("objective", {})
     lo, hi = (obj.get("concurrency_range") or [None, None])
@@ -190,6 +205,41 @@ def semantic(prof, path):
     return errs
 
 
+def device(prof):
+    """cpu unless the profile says otherwise: every profile written before the GPU
+    boxes is a cpu profile and stays one without an edit."""
+    return prof.get("server", {}).get("device", "cpu")
+
+
+def semantic_cuda(prof):
+    """A CUDA server is one process: HTTP threads in front of one scheduler thread that
+    owns the GPU. Prefork workers would each open their own device context and split
+    the batch the GPU is there to widen."""
+    errs = []
+    srv, hw = prof["server"], prof["hardware"]
+    for k in ("http_workers", "max_inflight"):
+        if k not in srv:
+            errs.append("a cuda profile needs server.%s" % k)
+    for k in ("prefork_workers", "threads_per_worker"):
+        if srv.get(k, 1) != 1:
+            errs.append("server.%s is %d on a cuda profile; the CUDA server is one "
+                        "process with one scheduler thread (absent or 1)" % (k, srv[k]))
+    if "gpu" not in hw:
+        errs.append("a cuda profile needs hardware.gpu: the operating point is a "
+                    "property of the device, not of the host")
+    if hw.get("logical_cpus") and srv.get("http_workers", 0) > hw["logical_cpus"]:
+        errs.append("server asks for %d HTTP workers on a %d-CPU host"
+                    % (srv["http_workers"], hw["logical_cpus"]))
+    if srv.get("max_inflight") is not None and srv["max_inflight"] < srv["max_batch"]:
+        errs.append("max_inflight %d is below max_batch %d: the server would silently "
+                    "lower the batch, so the profile would not say what runs"
+                    % (srv["max_inflight"], srv["max_batch"]))
+    if "cuda" not in prof["build"].get("target", ""):
+        errs.append("build.target %r does not build the CUDA server"
+                    % prof["build"].get("target", ""))
+    return errs
+
+
 # -- resolution ------------------------------------------------------------------------
 def environ(prof):
     """The variables a run must EXPORT (value not null)."""
@@ -210,9 +260,14 @@ def forbidden_env(prof):
 
 def server_args(prof):
     srv = prof["server"]
-    a = ["--prefork", str(srv["prefork_workers"]),
-         "--prefork-threads", str(srv["threads_per_worker"]),
-         "--max-batch", str(srv["max_batch"])]
+    if device(prof) == "cuda":
+        a = ["--device", "cuda", "-w", str(srv["http_workers"]),
+             "--max-batch", str(srv["max_batch"]),
+             "--max-inflight", str(srv["max_inflight"])]
+    else:
+        a = ["--prefork", str(srv["prefork_workers"]),
+             "--prefork-threads", str(srv["threads_per_worker"]),
+             "--max-batch", str(srv["max_batch"])]
     for key, flag in (("max_pending", "--max-pending"),
                       ("request_timeout_ms", "--request-timeout-ms")):
         if isinstance(srv.get(key), int):
@@ -284,7 +339,12 @@ def cmd_show(a):
 def cmd_command(a):
     prof = load(a.name)[0]
     line = env_line(prof)
-    argv = ["./build/cpu/mynah-tts-server", "-m", a.model, "-p", str(a.port)] + server_args(prof)
+    if device(prof) == "cuda":
+        argv = (["build/cuda/mynah-tts-server"] + server_args(prof)
+                + ["-p", str(a.port), "-m", a.model])
+    else:
+        argv = (["./build/cpu/mynah-tts-server", "-m", a.model, "-p", str(a.port)]
+                + server_args(prof))
     print((line + " " if line else "") + " ".join(argv))
     return 0
 
@@ -300,6 +360,61 @@ def cmd_forbidden_env(a):
     return 0
 
 
+L4_SERVE = os.path.join(ROOT, "tools", "l4", "serve.sh")
+
+
+def l4_serve_env(path=L4_SERVE):
+    """The MYNAH_* variables tools/gpu/serve.sh exports, or None when it is not there.
+
+    The GPU harness starts the server through that script, so its export line IS the
+    environment of every qualifying run on those boxes; a profile that disagrees with it
+    describes a server the harness does not start."""
+    if not os.path.exists(path):
+        return None
+    out = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("export "):
+                for tok in shlex.split(line[len("export "):]):
+                    if "=" in tok and tok.startswith("MYNAH_"):
+                        k, v = tok.split("=", 1)
+                        out[k] = v
+    return out
+
+
+def soak_cuda(prof, model, c):
+    """The GPU boxes qualify with tools/gpu/qualify.sh (two soaks, captured audio, WER,
+    bundle), not with serving_profile.py: print that run instead of starting the CPU
+    harness against a CUDA server."""
+    pid, srv, s = prof["profile"]["id"], prof["server"], prof["gates"]["soak"]
+    serve = l4_serve_env()
+    if serve is not None and serve != environ(prof):
+        print("WARNING: tools/gpu/serve.sh exports %s but the profile pins %s; the run "
+              "would not measure this profile"
+              % (" ".join("%s=%s" % kv for kv in sorted(serve.items())) or "nothing",
+                 env_line(prof) or "nothing"), file=sys.stderr)
+    if c != srv["max_batch"]:
+        print("NOTE: qualify.sh sets --max-batch to the level (C%d), not to the profile's "
+              "max_batch %d" % (c, srv["max_batch"]), file=sys.stderr)
+    knobs = [("MYNAH_GPU_WORKERS", str(srv["http_workers"]))]
+    if srv["max_inflight"] != c:        # ab.sh defaults --max-inflight to the batch
+        knobs.append(("MYNAH_GPU_INFLIGHT", str(max(srv["max_inflight"], c))))
+    knobs.append(("MYNAH_GPU_CORPUS", s["bank"]))
+    if s.get("voices"):
+        knobs.append(("MYNAH_GPU_VOICES", ",".join(s["voices"])))
+    one = " ".join("%s=%s" % (k, shlex.quote(v)) for k, v in knobs)
+    print("# qualification (two %ds soaks, WER on the captures, evidence bundle); run on "
+          "the GPU box from the checkout, detached so it survives the ssh session:"
+          % s["seconds"])
+    print("tools/gpu/detach.sh %s-q env MYNAH_Q_SECONDS=%d %s tools/gpu/qualify.sh %s %s %d"
+          % (pid, s["seconds"], one, pid, shlex.quote(model), c))
+    print("# one soak only (a screen, not a qualification):")
+    print("MYNAH_GPU_MODEL=%s MYNAH_GPU_BATCH=%d %s tools/gpu/soak.sh %s %d %d"
+          % (shlex.quote(model), c, one, pid, c, s["seconds"]))
+    return 0
+
+
 def cmd_soak(a):
     """The exact soak that would qualify this profile, as one copy-pasteable line."""
     prof = load(a.name)[0]
@@ -307,6 +422,8 @@ def cmd_soak(a):
     if c is None:
         print("no --level and no objective.preferred_concurrency", file=sys.stderr)
         return 2
+    if device(prof) == "cuda":
+        return soak_cuda(prof, a.model, c)
     line = env_line(prof)
     argv = ["python3", "tools/serving_profile.py", "--profile", prof["profile"]["id"],
             "--model", a.model, "--levels", str(c)]
@@ -408,7 +525,7 @@ def rank_profiles(facts):
             continue
         prof, path = load(fn[:-5])
         hw = prof.get("hardware", {})
-        if hw.get("architecture") != facts["architecture"]:
+        if hw.get("architecture") != facts["architecture"] or device(prof) != "cpu":
             continue
         diffs = []
         score = 0.0

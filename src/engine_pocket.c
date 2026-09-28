@@ -34,10 +34,18 @@
 #define POCKET_PATH_MAX 4096u
 #define POCKET_MANIFEST_MAX (4u * 1024u * 1024u)
 #define POCKET_QNAME_MAX 48u
-/* How many requests one backbone pass may serve.  The driver clamps this to its
- * own MYNAH_GRAPH_MAX_JOBS; the number here is what the engine can actually do
- * without the batch scratch becoming the dominant per-slot cost. */
-#define POCKET_MAX_BATCH 16u
+/* How many requests one resident backbone pass may serve.  CUDA's pointer
+ * metadata arena is sized for 128 rows; keeping the engine and driver ceilings
+ * equal lets a GPU worker form one real batch at C128 instead of four C32
+ * microbatches.  CPU still remains correct at the wider width, while its
+ * operator can choose a smaller --max-batch at serving time. */
+/* Storage bound of every per-batch array.  The CPU engine advertises 128 (its
+ * qualified ceiling); the CUDA backend advertises the full 384: with the device
+ * KV grown on demand the 6L pack still has realtime margin at 256 on an L4. */
+#define POCKET_MAX_BATCH 384u
+#define POCKET_CPU_MAX_BATCH 128u
+#define POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE ((size_t)0x300000u)
+#define POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE ((size_t)0x400000u)
 
 /* ------------------------------------------------------------------ errors */
 
@@ -366,6 +374,13 @@ typedef struct {
     char *name;
     char *file;    /* relative to the pack directory                          */
     size_t frames; /* positions speakers.json declares; 0 = not declared      */
+    size_t positions; /* validated KV positions; zero until the pack sweep     */
+    /* Model-owned f32 [layers][K/V][positions][heads*head_dim].  This is
+     * populated once per voice (lazily by default) and copied into each
+     * request's transformer state during reset.  Keeping it at model scope
+     * removes the safetensors decode from every request without making a
+     * request share mutable KV state. */
+    float *kv;
 } pocket_voice;
 
 /* ------------------------------------------------------ quantization groups
@@ -558,6 +573,27 @@ enum {
 #define POCKET_QG_DEFAULT_SPEC_PINNED                                          \
     "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"                \
     "backbone:bf16,flow_net:f16,conditioner:f16"
+
+/* The same default for a DEEP backbone: int8 instead of bf16, everything else
+ * identical. Chosen by the pack's own `transformer_layers`, not by a name.
+ *
+ * On the 6L pack bf16 beats int8 in serving (the step is small and bf16 is
+ * native on the production CPU). On the 24L pack it is the other way round:
+ * the backbone is 4x the weight traffic per step, int8 halves it, and the wide
+ * I8MM kernel (src/qmat.c, matvec_q8_i8mm_np) reads it once per eight rows.
+ * Measured on the Axion, 16x2 mb8, 2026-09-25/26: int8 is the configuration
+ * every 24L capacity point was qualified on (C96 GOOD for thirty minutes), and
+ * the ASR gate puts int8 at 0.94% WER against 1.12% for bf16 on the same texts
+ * (reports/20260926-24l-axion). Only 6 and 24 layers exist and were measured;
+ * the threshold sits at the measured deep point rather than being interpolated.
+ * CPU only: the CUDA backend keeps the spec it was measured with. */
+#define POCKET_QG_DEFAULT_SPEC_PINNED_DEEP                                     \
+    "codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"                \
+    "backbone:int8,flow_net:f16,conditioner:f16"
+#define POCKET_DEEP_BACKBONE_LAYERS 24u
+
+/* What MYNAH_CUDA_QUANT=int8 selects when MYNAH_QUANT_GROUPS is unset. */
+#define POCKET_QG_CUDA_INT8_SPEC "backbone:int8,flow_net:int8"
 
 typedef struct {
     const char *name;
@@ -821,6 +857,12 @@ struct mynah_engine_state {
     mynah_qmat_cache *qcache;
     const mynah_backend *backend;
     unsigned qgroups; /* resolved MYNAH_QUANT_GROUPS, 0 when quant is off */
+    int cuda_q8_enabled; /* explicit MYNAH_CUDA_Q8=1 policy for int8 groups */
+    /* MYNAH_CUDA_QUANT as resolved for this CUDA state (f32 on any other
+     * backend), and whether f32 hot-stage projections take resident BF16
+     * weight copies (MYNAH_CUDA_QUANT=bf16). The CPU oracle never sees it. */
+    int cuda_quant;
+    int cuda_bf16_weights;
     signed char qgroup_qtype[POCKET_QG_BITS]; /* per-bit override, -1 = cache */
     signed char cond_in_qtype;
     signed char cond_eos_qtype;
@@ -867,9 +909,50 @@ struct mynah_engine_state {
 
     pocket_voice *voices;
     size_t voice_count;
+    int voice_cache_enabled;
+    pthread_mutex_t voice_cache_mutex;
+    int voice_cache_mutex_ready;
+    /* Device copies of the voice KV prefixes for the CUDA prefill tile, in the
+     * backbone cache's element type, built on first use of each voice. */
+    void **cuda_voice_kv;
+    int cuda_voice_kv_bf16;
+    float *cuda_prefill_in;
+    size_t cuda_prefill_in_floats;
+
+    /* Idle per-request CUDA resource sets (MYNAH_CUDA_SLOT_POOL).  A retired
+     * CUDA context parks its device buffers, resident decoder and pinned host
+     * staging here instead of freeing them, because every cudaFree and
+     * cudaFreeHost synchronises the whole device.  Only ever non-empty when the
+     * CUDA serving path is active; the CPU path never touches it. */
+    pthread_mutex_t cuda_slot_pool_mutex;
+    int cuda_slot_pool_mutex_ready;
+    struct pocket_cuda_slot *cuda_slot_pool;
+    size_t cuda_slot_pool_count;
 
     mynah_sp *tokenizer;
 };
+
+/* Forward declaration: model initialisation reports the resolved CUDA
+ * capability before contexts exist, while the predicate itself lives beside
+ * the resident allocation code.  Keeping the report on the same predicate is
+ * important: a log line must not claim a raw-F32 stage that the allocator will
+ * correctly refuse for a quantized group. */
+static int pocket_cuda_groups_are_f32(const mynah_engine_state *state,
+                                      unsigned selected);
+static int pocket_cuda_groups_are_resident_compatible(
+    const mynah_engine_state *state, unsigned selected);
+static int pocket_cuda_resident_requested(const mynah_engine_state *state);
+static int pocket_cuda_q8_requested(void);
+static int pocket_cuda_kv_bf16_requested(const mynah_engine_state *state);
+static int pocket_cuda_flow_requested(const mynah_engine_state *state);
+static int pocket_cuda_codec_requested(const mynah_engine_state *state);
+static int pocket_cuda_mimi_tile_enabled(void);
+static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
+                                              unsigned groups);
+
+static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                    int final, char *error, size_t capacity);
+static size_t pocket_prepare_target(const mynah_engine_ctx *ctx);
 
 /* Defined below, next to the writer; the context only holds a pointer. */
 typedef struct pocket_dump pocket_dump;
@@ -921,6 +1004,98 @@ struct mynah_engine_ctx {
     float *text_embed; /* [text_capacity][hidden_dim] */
     float *step_input; /* [hidden_dim] */
     float *hidden;     /* [hidden_dim] */
+    int step_input_host_pinned;
+    int hidden_host_pinned;
+
+    /* Optional resident CUDA backbone.  These are deliberately opaque
+     * backend-owned buffers represented as float pointers; the CPU state above
+     * remains the source of truth for admission, rollback and fallback.  KV is
+     * [layers][2][capacity][heads*head_dim], K then V, matching the host state
+     * byte layout. */
+    float *cuda_backbone_kv;
+    float *cuda_x;
+    float *cuda_norm;
+    float *cuda_qkv;
+    float *cuda_attn;
+    float *cuda_proj;
+    float *cuda_ffn;
+    /* Positions per K/V plane of the device cache: its stride.  Equal to the
+     * host state's `max_seq_len` unless MYNAH_CUDA_KV_GROW started it smaller,
+     * in which case `pocket_cuda_backbone_reserve` widens it on demand; never
+     * larger than `max_seq_len`. */
+    size_t cuda_backbone_capacity;
+    size_t cuda_backbone_kv_floats;
+    /* Bytes actually behind `cuda_backbone_kv`.  With the slot pool a reused
+     * cache may be larger than this request needs; the layout still uses
+     * `cuda_backbone_capacity` as its stride, so the tail is simply unused. */
+    size_t cuda_backbone_kv_bytes;
+    int cuda_backbone_kv_bf16;
+    int cuda_backbone_enabled;
+    int cuda_backbone_valid;
+    /* Set when this request's backbone K/V was built on the device by the
+     * prefill tile (MYNAH_CUDA_PREFILL_TILE): the voice prefix copied from the
+     * device voice cache and the text prefilled in one pass. The host cache
+     * then holds nothing valid, so nothing may upload it or step on the CPU. */
+    int cuda_backbone_device_owned;
+    int cuda_voice_pending;
+
+    /* Optional resident CUDA Mimi decoder transformer. The host transformer
+     * remains the correctness/fallback state; the device owns a compact KV
+     * window, while the host mirror is refreshed only at a rebase or retry. */
+    float **cuda_codec_kv; /* [codec_tf_layers], each [K][V] device block */
+    float *cuda_codec_x;
+    float *cuda_codec_norm;
+    float *cuda_codec_qkv;
+    float *cuda_codec_attn;
+    float *cuda_codec_proj;
+    float *cuda_codec_ffn;
+    size_t cuda_codec_kv_positions;
+    size_t cuda_codec_kv_half;
+    size_t cuda_codec_kv_base;
+    int cuda_codec_enabled;
+    int cuda_codec_valid;
+    int cuda_codec_needs_host_sync;
+    int cuda_codec_pending;
+    /* Resident input side of the Mimi decoder.  The quantizer projection is
+     * [latent_dim -> codec_dim]; the depthwise causal upsample emits one
+     * row-major [upsample_stride][codec_dim] frame and carries its tail on
+     * device between requests. */
+    float *cuda_codec_denorm;
+    float *cuda_codec_up_input;
+    float *cuda_codec_up;
+    float *cuda_codec_up_partial;
+    size_t cuda_codec_up_tail;
+    int cuda_codec_upsample_enabled;
+    int cuda_codec_device_input_ready;
+    /* Set by the cross-request codec gang (MYNAH_CUDA_CODEC_GANG) when this
+     * frame's denormalised latent, quantizer projection and causal upsample
+     * were already queued for the whole gang; the per-request prepare then
+     * consumes the device input instead of queueing its own copy. Valid for
+     * exactly one prepare. */
+    int cuda_codec_gang_upsampled;
+    /* Set after the resident codec-transformer has written the current frame
+     * directly into the resident SEANet input.  It suppresses the old
+     * codec_back -> decoder_input H2D copy for this frame only. */
+    int cuda_codec_device_output_ready;
+    /* Set when this request's Mimi KV lives only in the device ring of the
+     * cross-request tile (MYNAH_CUDA_MIMI_TILE). The host window is then
+     * stale by design, so the frame can never fall back to the CPU oracle or
+     * to the per-request path; a tile failure fails the request. */
+    int cuda_mimi_tile_owned;
+
+    /* Optional resident CUDA SEANet decoder. This handle owns the causal
+     * convolution rings and transposed-convolution tails on device. */
+    mynah_backend_decoder *cuda_decoder;
+    float *cuda_decoder_input;
+    float *cuda_decoder_output;
+    /* A pooled resource set taken at admission (MYNAH_CUDA_SLOT_POOL).  The
+     * alloc helpers take their parts from it; whatever this request did not
+     * consume stays here and is parked again, with the rest, at ctx_free. */
+    struct pocket_cuda_slot *cuda_slot;
+    int cuda_decoder_enabled;
+    int cuda_decoder_graph_enabled;
+    int cuda_decoder_started;
+
     float *noise;      /* [latent_dim] */
     float *flow_out;   /* [latent_dim] */
     float *latents;    /* [max_steps][latent_dim] */
@@ -930,7 +1105,12 @@ struct mynah_engine_ctx {
     float *codec_seq;  /* [upsample_stride][codec_tf_dim] */
     float *codec_out;  /* [upsample_stride][codec_tf_dim] */
     float *codec_back; /* [codec_dim][upsample_stride] */
+    int denorm_host_pinned;
+    int codec_seq_host_pinned;
+    int codec_out_host_pinned;
+    int codec_back_host_pinned;
     float *pcm;        /* [samples_per_frame] */
+    int pcm_host_pinned;
 
     size_t frames;
     size_t decoded_frames;
@@ -941,6 +1121,18 @@ struct mynah_engine_ctx {
     /* A resumable prefill is in flight: the prologue has run and the text is
      * partly in the KV cache. Never 1 at the same time as `prepared`. */
     int seeding;
+    /* Text segmentation (mynah_tts_request.segment_lengths). `text_ids` and
+     * `text_length` always describe the CURRENT segment; `seg_all` keeps every
+     * segment's ids so the next one can be copied in. Each segment is its own
+     * utterance from the voice prefix -- upstream's per-chunk generation --
+     * while the frame history and the codec state run straight through, so the
+     * driver sees one monotonic stream. NULL/0 means one segment. */
+    int *seg_all;
+    size_t *seg_lengths;
+    size_t seg_count;
+    size_t seg_index;
+    size_t seg_frame0;     /* first frame of the current segment */
+    int segment_pending;   /* the segment ended; the next one needs its prologue */
     int eos;
     /* The step budget was reached before EOS.  Kept as a flag rather than
      * reported as an error: the driver has no budget check of its own, and a
@@ -975,6 +1167,60 @@ struct mynah_engine_ctx {
 
 struct mynah_engine_scratch {
     size_t batch;
+    const mynah_backend *backend; /* borrowed model backend */
+    /* Shared resident-CUDA transformer workspace for cross-request batching.
+     * The host staging arrays are allocated once with this scratch; each row
+     * still keeps its own persistent KV cache in mynah_engine_ctx. */
+    float *cuda_host_input;
+    float *cuda_host_output;
+    float *cuda_host_kv;
+    float *cuda_kv_shadow;
+    float **cuda_kcache;
+    float **cuda_vcache;
+    size_t *cuda_positions;
+    size_t *cuda_cache_strides;
+    float *cuda_x;
+    float *cuda_norm;
+    float *cuda_qkv;
+    float *cuda_attn;
+    float *cuda_proj;
+    float *cuda_ffn;
+    /* Optional control-seam projections.  The host copies are intentionally
+     * reused from the transformer staging arena; these two device rows are
+     * only the latent->hidden input projection, not another per-layer arena. */
+    float *cuda_condition_input;
+    size_t cuda_batch_capacity;
+    int cuda_batch_enabled;
+    int cuda_graph_enabled;
+    int cuda_graph_ready;
+    int cuda_condition_ready;
+    int cuda_backbone_output_ready;
+    size_t cuda_kv_shadow_floats;
+
+    /* Shared CUDA Mimi decoder-transformer workspace.  Per-request KV remains
+     * in the context; these activation slabs are reused across frame-major
+     * gangs and are never multiplied by the number of layers. */
+    float *cuda_codec_host_input;
+    float *cuda_codec_host_output;
+    float *cuda_codec_x;
+    float *cuda_codec_norm;
+    float *cuda_codec_qkv;
+    float *cuda_codec_attn;
+    float *cuda_codec_proj;
+    float *cuda_codec_ffn;
+    /* Codec metadata is copied asynchronously once per tile/position.  Each
+     * source slice has its own storage so the next position cannot overwrite a
+     * pointer or position table before the CUDA stream has consumed it. */
+    float **cuda_codec_kcache;
+    float **cuda_codec_vcache;
+    float **cuda_codec_input_rows;
+    float **cuda_codec_output_rows;
+    size_t *cuda_codec_abs_positions;
+    size_t *cuda_codec_positions;
+    size_t *cuda_codec_cache_strides;
+    size_t cuda_codec_batch_capacity;
+    int cuda_codec_enabled;
+
     /* The cross-request step: one stacked activation set and one projection
      * scratch for the whole batch, owned by the driver rather than by any
      * request in it. */
@@ -994,6 +1240,41 @@ struct mynah_engine_scratch {
     const float **flow_cond;      /* [batch] */
     const float **flow_noise;     /* [batch] */
     float **flow_out;             /* [batch] */
+
+    /* Optional resident CUDA flow-head workspace.  It is separate from the
+     * CPU flow batch because the CUDA graph captures these exact device and
+     * pinned-host addresses. */
+    float *cuda_flow_host_cond;
+    float *cuda_flow_host_noise;
+    float *cuda_flow_host_time;
+    float *cuda_flow_host_output;
+    float *cuda_flow_cond;
+    float *cuda_flow_noise;
+    float *cuda_flow_time_embed;
+    float *cuda_flow_output;
+    float *cuda_flow_y;
+    float *cuda_flow_silu;
+    float *cuda_flow_x;
+    float *cuda_flow_norm;
+    float *cuda_flow_hidden;
+    float *cuda_flow_scratch;
+    float *cuda_flow_mod;
+    float *cuda_flow_final_mod;
+    float *cuda_flow_time_hidden;
+    float *cuda_flow_time_output;
+    float *cuda_flow_time_sum;
+    mynah_backend_flow_linear *cuda_flow_time_mlp_in;
+    mynah_backend_flow_linear *cuda_flow_time_mlp_out;
+    const float **cuda_flow_time_alpha;
+    mynah_backend_flow_block *cuda_flow_blocks;
+    mynah_backend_flow_linear cuda_flow_cond_embed;
+    mynah_backend_flow_linear cuda_flow_input_proj;
+    mynah_backend_flow_linear cuda_flow_final_adaln;
+    mynah_backend_flow_linear cuda_flow_final_linear;
+    size_t cuda_flow_batch_capacity;
+    int cuda_flow_enabled;
+    int cuda_flow_graph_enabled;
+    int cuda_flow_graph_ready;
 };
 
 /* --------------------------------------------------------------- the dump
@@ -1221,11 +1502,13 @@ static void pocket_dump_flush(const mynah_engine_ctx *ctx) {
             continue;
         }
         for (size_t j = 0; j < len; ++j) {
-            /* U+2581 LOWER ONE EIGHTH BLOCK is SentencePiece's space. */
+            /* U+2581 LOWER ONE EIGHTH BLOCK is SentencePiece's word boundary.
+             * The tokenizer emits it on the first ordinary piece too, but it
+             * is not a leading space in the caller's text. */
             if (j + 2u < len && (unsigned char)piece[j] == 0xE2u &&
                 (unsigned char)piece[j + 1u] == 0x96u &&
                 (unsigned char)piece[j + 2u] == 0x81u) {
-                fputc(' ', f);
+                if (!(i == 0u && j == 0u)) fputc(' ', f);
                 j += 2u;
                 continue;
             }
@@ -1353,6 +1636,317 @@ static int pocket_proj_row(const pocket_proj *p, const float *weight,
 static int pocket_cs_qtype(const pocket_proj *p) {
     return mynah_qmat_qtype_resolved(
         p->qtype >= 0 ? p->qtype : mynah_qmat_cache_qtype(p->qcache));
+}
+
+/* The resident encoding of a projection the CPU would run in exact f32:
+ * raw f32, or the BF16 device copy under MYNAH_CUDA_QUANT=bf16. */
+static int pocket_cuda_f32_qtype(const mynah_engine_state *state) {
+    return state != NULL && state->cuda_bf16_weights ? MYNAH_BACKEND_QTYPE_BF16
+                                                     : 0;
+}
+
+static int pocket_cuda_tar_qtype(const mynah_engine_state *state,
+                                 size_t layer,
+                                 mynah_transformer_ar_linear_kind kind) {
+    pocket_proj proj;
+    if (state == NULL || pocket_tar_proj(&state->backbone_hook, layer, kind,
+                                         &proj) != 0 || !proj.quantized)
+        return pocket_cuda_f32_qtype(state);
+    return pocket_cs_qtype(&proj);
+}
+
+static int pocket_cuda_codec_qtype(const mynah_engine_state *state,
+                                   size_t layer,
+                                   mynah_transformer_ar_linear_kind kind) {
+    pocket_proj proj;
+    if (state == NULL || pocket_tar_proj(&state->codec_hook, layer, kind,
+                                         &proj) != 0 || !proj.quantized)
+        return pocket_cuda_f32_qtype(state);
+    return pocket_cs_qtype(&proj);
+}
+
+static int pocket_cuda_flow_qtype(const mynah_engine_state *state,
+                                  size_t index, mynah_flow_linear_kind kind) {
+    pocket_proj proj;
+    if (state == NULL || pocket_flow_proj(&state->flow_hook, index, kind,
+                                          &proj) != 0 || !proj.quantized)
+        return pocket_cuda_f32_qtype(state);
+    return pocket_cs_qtype(&proj);
+}
+
+static int pocket_cuda_linear_d2d(const mynah_engine_state *state,
+                                  const float *input, float *output,
+                                  size_t rows, size_t input_width,
+                                  size_t output_width, const float *weight,
+                                  const float *bias, int qtype, char *error,
+                                  size_t error_capacity) {
+    if (state == NULL || state->backend == NULL) return -1;
+    if (qtype == 1 && state->cuda_q8_enabled)
+        return mynah_backend_matmul_q8_d2d(
+            state->backend, input, output, rows, input_width, output_width,
+            weight, bias, error, error_capacity);
+    if (qtype == MYNAH_BACKEND_QTYPE_BF16 && state->cuda_bf16_weights)
+        return mynah_backend_matmul_bf16_d2d(
+            state->backend, input, output, rows, input_width, output_width,
+            weight, bias, error, error_capacity);
+    if (qtype != 0 && qtype != 1) {
+        pocket_error(error, error_capacity,
+                     "pocket: CUDA resident projection precision is unsupported");
+        return -1;
+    }
+    return mynah_backend_matmul_d2d(
+        state->backend, input, output, rows, input_width, output_width, weight,
+        bias, error, error_capacity);
+}
+
+static int pocket_all_finite(const float *v, size_t n);
+static int pocket_cuda_groups_are_resident_compatible(
+    const mynah_engine_state *state, unsigned groups);
+
+static int pocket_cuda_control_qtype(const mynah_engine_state *state,
+                                     unsigned group, int requested) {
+    if (state == NULL || (state->qgroups & group) == 0u) return 0;
+    int qtype = requested;
+    if (qtype < 0 && state->qcache != NULL)
+        qtype = mynah_qmat_cache_qtype(state->qcache);
+    return mynah_qmat_qtype_resolved(qtype);
+}
+
+/* The latent->hidden projection is a small but unavoidable host seam in the
+ * original batching path.  On a CPU-poor GPU worker, doing one 32x1024 qmat
+ * per request is needlessly expensive and also means the first stage is not
+ * actually continuous-batched.  Stack the previous latent rows, run the same
+ * resolved f32/Q8 projection on the resident stream, and download only the
+ * resulting hidden rows needed by the CPU fallback/finite gate.  The device
+ * result remains in `cuda_x`, so a successful backbone batch consumes it
+ * without another H2D copy.
+ *
+ * This helper is deliberately optional: a failed transfer/launch is drained
+ * and returns 1 before any request state advances, so the existing CPU
+ * projection remains the correctness fallback. */
+static int pocket_cuda_condition_batch(mynah_engine_ctx *const *ctxs,
+                                        size_t count,
+                                        mynah_engine_scratch *scratch,
+                                        char *error, size_t capacity) {
+    (void)error;
+    (void)capacity;
+    if (ctxs == NULL || scratch == NULL || count < 2u ||
+        scratch->backend == NULL || scratch->cuda_condition_input == NULL ||
+        scratch->cuda_x == NULL || scratch->cuda_host_input == NULL ||
+        scratch->cuda_host_output == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0)
+        return 1;
+    const mynah_engine_state *state = ctxs[0] == NULL ? NULL : ctxs[0]->state;
+    if (state == NULL || state->input_linear == NULL ||
+        !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_IN))
+        return 1;
+    const pocket_config *cfg = &state->cfg;
+    const int qtype = pocket_cuda_control_qtype(
+        state, POCKET_QG_COND_IN, state->cond_in_qtype);
+    size_t input_count = 0u;
+    size_t output_count = 0u;
+    if (pocket_mul(count, cfg->latent_dim, &input_count) != 0 ||
+        pocket_mul(count, cfg->hidden_dim, &output_count) != 0 ||
+        input_count == 0u || output_count == 0u ||
+        cfg->latent_dim > cfg->hidden_dim ||
+        count > (size_t)INT_MAX || cfg->latent_dim > (size_t)INT_MAX ||
+        cfg->hidden_dim > (size_t)INT_MAX)
+        return 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || ctx->step_input == NULL)
+            return 1;
+        const float *previous = ctx->frames > ctx->seg_frame0
+            ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
+            : state->bos_emb;
+        memcpy(scratch->cuda_host_input + i * cfg->latent_dim,
+               previous, cfg->latent_dim * sizeof(float));
+    }
+
+    char local[256];
+    local[0] = '\0';
+    int failed = mynah_backend_batch_begin(scratch->backend, local,
+                                            sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_h2d(scratch->backend, scratch->cuda_host_input,
+                                   scratch->cuda_condition_input, input_count,
+                                   local, sizeof(local)) != 0;
+    if (!failed)
+        failed = pocket_cuda_linear_d2d(
+                     state, scratch->cuda_condition_input, scratch->cuda_x,
+                     count, cfg->latent_dim, cfg->hidden_dim,
+                     state->input_linear, NULL, qtype, local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_d2h(scratch->backend, scratch->cuda_x,
+                                   scratch->cuda_host_output, output_count,
+                                   local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0;
+    if (failed) {
+        char drain[256];
+        drain[0] = '\0';
+        (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+        return 1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        memcpy(ctxs[i]->step_input,
+               scratch->cuda_host_output + i * cfg->hidden_dim,
+               cfg->hidden_dim * sizeof(float));
+        if (!pocket_all_finite(ctxs[i]->step_input, cfg->hidden_dim)) return 1;
+    }
+    scratch->cuda_condition_ready = 1;
+    return 0;
+}
+
+/* EOS is control data, but its one-output projection is still a regular
+ * resident linear.  Keep the scalar EOS decision on the host while moving the
+ * hidden->logit matmul into the same microbatch as the AR step. */
+static int pocket_cuda_eos_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                                 mynah_engine_scratch *scratch, char *error,
+                                 size_t capacity) {
+    (void)error;
+    (void)capacity;
+    if (ctxs == NULL || scratch == NULL || count < 2u ||
+        !scratch->cuda_backbone_output_ready || scratch->backend == NULL ||
+        scratch->cuda_norm == NULL || scratch->cuda_proj == NULL ||
+        scratch->cuda_host_input == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0)
+        return 1;
+    const mynah_engine_state *state = ctxs[0] == NULL ? NULL : ctxs[0]->state;
+    if (state == NULL || state->out_eos_weight == NULL ||
+        !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_EOS))
+        return 1;
+    const pocket_config *cfg = &state->cfg;
+    const int qtype = pocket_cuda_control_qtype(
+        state, POCKET_QG_COND_EOS, state->cond_eos_qtype);
+    if (count > (size_t)INT_MAX || cfg->hidden_dim > (size_t)INT_MAX)
+        return 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i] == NULL || ctxs[i]->state != state ||
+            ctxs[i]->hidden == NULL)
+            return 1;
+    }
+    char local[256];
+    local[0] = '\0';
+    int failed = mynah_backend_batch_begin(scratch->backend, local,
+                                            sizeof(local)) != 0;
+    if (!failed)
+        failed = pocket_cuda_linear_d2d(
+                     state, scratch->cuda_norm, scratch->cuda_proj, count,
+                     cfg->hidden_dim, 1u, state->out_eos_weight,
+                     state->out_eos_bias, qtype, local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_d2h(scratch->backend, scratch->cuda_proj,
+                                   scratch->cuda_host_input, count, local,
+                                   sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0;
+    if (failed) {
+        char drain[256];
+        drain[0] = '\0';
+        (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+        scratch->cuda_backbone_output_ready = 0;
+        return 1;
+    }
+    for (size_t i = 0; i < count; ++i) ctxs[i]->eos_logit = scratch->cuda_host_input[i];
+    scratch->cuda_backbone_output_ready = 0;
+    return 0;
+}
+
+/* Q8 uses one reusable activation/scale/accumulator arena.  Reserve it for
+ * the widest scheduler batch before any CUDA graph can be captured.  The
+ * arena is deliberately sized from all Pocket linear shapes, not multiplied
+ * by layer count: every projection reuses the same buffers. */
+static int pocket_cuda_linear_workspace(const mynah_engine_state *state,
+                                        size_t batch,
+                                        size_t *activation_count,
+                                        size_t *output_count, char *error,
+                                        size_t capacity) {
+    const pocket_config *cfg = &state->cfg;
+    size_t attn_dim = 0u;
+    size_t qkv_width = 0u;
+    size_t codec_qkv_width = 0u;
+    size_t flow_freq_width = 0u;
+    size_t flow_three = 0u;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(attn_dim, 3u, &qkv_width) != 0 ||
+        pocket_mul(cfg->codec_tf_dim, 3u, &codec_qkv_width) != 0 ||
+        pocket_mul(cfg->flow_freqs, 2u, &flow_freq_width) != 0 ||
+        pocket_mul(cfg->flow_dim, 3u, &flow_three) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA Q8 reserve size overflow");
+        return -1;
+    }
+    size_t input_width = cfg->hidden_dim;
+    size_t output_width = qkv_width;
+    if (attn_dim > input_width) input_width = attn_dim;
+    if (cfg->ffn_dim > input_width) input_width = cfg->ffn_dim;
+    if (cfg->codec_tf_dim > input_width) input_width = cfg->codec_tf_dim;
+    if (cfg->codec_tf_ffn > input_width) input_width = cfg->codec_tf_ffn;
+    if (cfg->latent_dim > input_width) input_width = cfg->latent_dim;
+    if (cfg->flow_dim > input_width) input_width = cfg->flow_dim;
+    if (flow_freq_width > input_width) input_width = flow_freq_width;
+    if (codec_qkv_width > output_width) output_width = codec_qkv_width;
+    if (cfg->ffn_dim > output_width) output_width = cfg->ffn_dim;
+    if (cfg->codec_tf_ffn > output_width) output_width = cfg->codec_tf_ffn;
+    if (flow_three > output_width) output_width = flow_three;
+    if (cfg->hidden_dim > output_width) output_width = cfg->hidden_dim;
+    if (cfg->latent_dim > output_width) output_width = cfg->latent_dim;
+    if (pocket_mul(batch, input_width, activation_count) != 0 ||
+        pocket_mul(batch, output_width, output_count) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA Q8 reserve count overflow");
+        return -1;
+    }
+    return 0;
+}
+
+static int pocket_cuda_q8_reserve_for_batch(mynah_engine_state *state,
+                                            size_t batch, char *error,
+                                            size_t capacity) {
+    if (state == NULL || !state->cuda_q8_enabled ||
+        !pocket_cuda_resident_requested(state) || batch == 0u)
+        return 0;
+    const unsigned selected = state->qgroups;
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    int q8_used = 0;
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        if (mynah_qmat_qtype_resolved(qtype) == 1) {
+            q8_used = 1;
+            break;
+        }
+    }
+    if (!q8_used) return 0;
+    size_t activation_count = 0u;
+    size_t output_count = 0u;
+    if (pocket_cuda_linear_workspace(state, batch, &activation_count,
+                                     &output_count, error, capacity) != 0)
+        return -1;
+    return mynah_backend_q8_reserve(state->backend, activation_count, batch,
+                                    output_count, error, capacity);
+}
+
+/* The BF16 path needs one reusable BF16 activation buffer, sized like the Q8
+ * arena from the widest Pocket linear input and the scheduler's widest
+ * batch, and reserved before any graph capture for the same reason. */
+static int pocket_cuda_bf16_reserve_for_batch(mynah_engine_state *state,
+                                              size_t batch, char *error,
+                                              size_t capacity) {
+    if (state == NULL || !state->cuda_bf16_weights ||
+        !pocket_cuda_resident_requested(state) || batch == 0u)
+        return 0;
+    size_t activation_count = 0u;
+    size_t output_count = 0u;
+    if (pocket_cuda_linear_workspace(state, batch, &activation_count,
+                                     &output_count, error, capacity) != 0)
+        return -1;
+    return mynah_backend_bf16_reserve(state->backend, activation_count, error,
+                                      capacity);
 }
 
 
@@ -2183,9 +2777,13 @@ static void pocket_voices_free(pocket_voice *voices, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         free(voices[i].name);
         free(voices[i].file);
+        free(voices[i].kv);
     }
     free(voices);
 }
+
+static int pocket_voice_cache_load(mynah_engine_state *state, size_t index,
+                                   char *error, size_t capacity);
 
 static int pocket_voices_load(mynah_engine_state *state, const char *path,
                               char *error, size_t capacity) {
@@ -2318,6 +2916,7 @@ static int pocket_voices_load(mynah_engine_state *state, const char *path,
                                   error, capacity) != 0;
         ingot_st_close(file);
         if (bad) return -1;
+        voices[i].positions = positions;
         if (voices[i].frames != 0u && positions != voices[i].frames) {
             pocket_error(error, capacity,
                          "voice %s holds %zu positions, %s declares %zu; this file "
@@ -2326,7 +2925,97 @@ static int pocket_voices_load(mynah_engine_state *state, const char *path,
             return -1;
         }
     }
+
+    /* A request never mutates this cache: it only copies one voice's prefix
+     * into its private transformer KV.  Lazy loading is the default so a
+     * large pack does not pay for voices it never serves.  `all`/`startup`
+     * are explicit deployment choices for a server that wants every voice
+     * resident before accepting traffic; `0` retains the old per-context
+     * safetensors path for replacement/debug experiments. */
+    const char *cache_mode = getenv("MYNAH_POCKET_VOICE_CACHE");
+    state->voice_cache_enabled = cache_mode == NULL || strcmp(cache_mode, "0") != 0;
+    if (state->voice_cache_enabled && cache_mode != NULL &&
+        (strcmp(cache_mode, "all") == 0 || strcmp(cache_mode, "startup") == 0)) {
+        for (size_t i = 0; i < count; ++i) {
+            if (pocket_voice_cache_load(state, i, error, capacity) != 0) return -1;
+        }
+    }
     return 0;
+}
+
+/* Decode one voice exactly once into model-owned immutable f32 storage.  The
+ * safetensors file is still opened and schema-validated on this first use,
+ * preserving the pack provenance checks while keeping all later resets on the
+ * resident path.  The mutex covers lazy first use when contexts are admitted
+ * concurrently. */
+static int pocket_voice_cache_load(mynah_engine_state *state, size_t index,
+                                   char *error, size_t capacity) {
+    if (state == NULL || index >= state->voice_count) {
+        pocket_error(error, capacity, "pocket: invalid voice cache index");
+        return -1;
+    }
+    if (state->voice_cache_mutex_ready) pthread_mutex_lock(&state->voice_cache_mutex);
+
+    pocket_voice *voice = &state->voices[index];
+    if (voice->kv != NULL) {
+        if (state->voice_cache_mutex_ready) pthread_mutex_unlock(&state->voice_cache_mutex);
+        return 0;
+    }
+
+    char path[POCKET_PATH_MAX];
+    ingot_st *file = NULL;
+    float *cache = NULL;
+    int result = -1;
+    size_t positions = 0;
+    size_t attn_dim = 0;
+    size_t layer_stride = 0;
+    size_t total = 0;
+    if (pocket_join(path, sizeof(path), state->model_dir, voice->file, error,
+                    capacity) != 0 ||
+        ingot_st_open(&file, path, error, capacity) != 0 ||
+        pocket_voice_validate(file, &state->cfg, voice->name, &positions, error,
+                              capacity) != 0) {
+        goto done;
+    }
+    if (voice->frames != 0u && positions != voice->frames) {
+        pocket_error(error, capacity,
+                     "voice %s holds %zu positions, the pack declares %zu; this "
+                     "file does not belong to this pack",
+                     voice->name, positions, voice->frames);
+        goto done;
+    }
+    if (pocket_mul(state->cfg.heads, state->cfg.head_dim, &attn_dim) != 0 ||
+        pocket_mul(2u, positions, &layer_stride) != 0 ||
+        pocket_mul(layer_stride, attn_dim, &layer_stride) != 0 ||
+        pocket_mul(state->cfg.layers, layer_stride, &total) != 0) {
+        pocket_error(error, capacity, "voice %s KV size overflows size_t",
+                     voice->name);
+        goto done;
+    }
+    cache = mynah_alloc_floats(total, error, capacity);
+    if (cache == NULL) goto done;
+
+    char name[POCKET_NAME_MAX];
+    for (size_t layer = 0; layer < state->cfg.layers; ++layer) {
+        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", layer);
+        const ingot_st_tensor *tensor = ingot_st_find(file, name);
+        if (tensor == NULL ||
+            ingot_st_to_f32(file, tensor, cache + layer * layer_stride) != 0) {
+            pocket_error(error, capacity, "cannot cache %s from voice %s", name,
+                         voice->name);
+            goto done;
+        }
+    }
+    voice->positions = positions;
+    voice->kv = cache;
+    cache = NULL;
+    result = 0;
+
+done:
+    free(cache);
+    ingot_st_close(file);
+    if (state->voice_cache_mutex_ready) pthread_mutex_unlock(&state->voice_cache_mutex);
+    return result;
 }
 
 /* ------------------------------------------------------ weight resolution */
@@ -2783,10 +3472,27 @@ static int pocket_resolve_singles(mynah_engine_state *state, char *error,
 
 /* -------------------------------------------------------------- model_init */
 
+static void pocket_cuda_slot_pool_drain(mynah_engine_state *state);
+
 static void pocket_model_free(mynah_engine_state *state) {
     if (state == NULL) return;
+    pocket_cuda_slot_pool_drain(state);
+    if (state->cuda_slot_pool_mutex_ready) {
+        pthread_mutex_destroy(&state->cuda_slot_pool_mutex);
+        state->cuda_slot_pool_mutex_ready = 0;
+    }
+    if (state->cuda_voice_kv != NULL) {
+        for (size_t v = 0; v < state->voice_count; ++v)
+            mynah_backend_dev_free(state->backend, (float *)state->cuda_voice_kv[v]);
+        free(state->cuda_voice_kv);
+    }
+    mynah_backend_dev_free(state->backend, state->cuda_prefill_in);
     mynah_sp_close(state->tokenizer);
     pocket_voices_free(state->voices, state->voice_count);
+    if (state->voice_cache_mutex_ready) {
+        pthread_mutex_destroy(&state->voice_cache_mutex);
+        state->voice_cache_mutex_ready = 0;
+    }
     free(state->backbone_layers);
     free(state->time_embed);
     free(state->res_blocks);
@@ -3091,6 +3797,15 @@ static int pocket_model_init(const mynah_tts_model *model,
         pocket_error(error, capacity, "out of memory creating the pocket engine");
         return -1;
     }
+    if (pthread_mutex_init(&state->voice_cache_mutex, NULL) != 0) {
+        free(state);
+        pocket_error(error, capacity, "cannot initialise the pocket voice cache");
+        return -1;
+    }
+    state->voice_cache_mutex_ready = 1;
+    /* A failed init only disables the CUDA slot pool; `_enabled` checks it. */
+    if (pthread_mutex_init(&state->cuda_slot_pool_mutex, NULL) == 0)
+        state->cuda_slot_pool_mutex_ready = 1;
     state->model_dir = pocket_strdup(model->model_dir, strlen(model->model_dir));
     if (state->model_dir == NULL) {
         pocket_model_free(state);
@@ -3163,16 +3878,61 @@ static int pocket_model_init(const mynah_tts_model *model,
      * `flow_head` compute with no hook at all. */
     state->backend = model->backend;
     state->qcache = model->qcache;
+    const int on_cuda = state->backend != NULL &&
+                        strcmp(mynah_backend_name(state->backend), "cuda") == 0;
+    /* MYNAH_CUDA_QUANT is the operator's one switch; the older variables are
+     * the expert overrides it resolves to, and an explicit one still wins. */
+    state->cuda_quant = MYNAH_CUDA_QUANT_F32;
+    if (on_cuda) {
+        const mynah_cuda_quant_mode mode = mynah_cuda_quant_from_env();
+        if (mode == MYNAH_CUDA_QUANT_INVALID) {
+            pocket_error(error, capacity,
+                         "MYNAH_CUDA_QUANT='%s' is not one of f32, bf16, int8",
+                         getenv("MYNAH_CUDA_QUANT"));
+            pocket_model_free(state);
+            return -1;
+        }
+        state->cuda_quant = (int)mode;
+    }
+    state->cuda_q8_enabled =
+        on_cuda && (getenv("MYNAH_CUDA_Q8") != NULL
+                        ? pocket_cuda_q8_requested()
+                        : state->cuda_quant == MYNAH_CUDA_QUANT_INT8);
+    state->cuda_bf16_weights =
+        on_cuda && pocket_cuda_resident_requested(state) &&
+        state->cuda_quant == MYNAH_CUDA_QUANT_BF16;
     for (size_t b = 0; b < POCKET_QG_BITS; ++b) state->qgroup_qtype[b] = -1;
     state->qgroups = 0u;
+    const char *qgroups_spec = "none";
     if (mynah_qmat_cache_enabled(state->qcache)) {
         const char *spec = mynah_qmat_groups_spec();
-        if (strcmp(spec, "default") == 0) {
+        if (strcmp(spec, "default") == 0 && pocket_cuda_resident_requested(state) &&
+            state->cuda_quant == MYNAH_CUDA_QUANT_INT8 && state->cuda_q8_enabled) {
+            /* The resident int8 recipe: the two stages inside the AR loop
+             * that carry the weight traffic.  The Mimi transformer stays f32
+             * because its hot path is the cross-request tile, which has no
+             * int8 kernel; quantizing only its per-request fallback would
+             * make two requests of one server decode Mimi differently. */
+            spec = POCKET_QG_CUDA_INT8_SPEC;
+        } else if (strcmp(spec, "default") == 0 &&
+                   pocket_cuda_resident_requested(state) &&
+                   !state->cuda_q8_enabled) {
+            /* The CPU defaults below select bf16/f16 encodings the resident
+             * CUDA kernels do not accept, so inheriting them would quietly run
+             * the backbone, flow and Mimi on the CPU oracle of a CUDA build.
+             * The resident path's measured baseline is raw f32 weights. */
+            spec = "none";
+        } else if (strcmp(spec, "default") == 0) {
             /* With no MYNAH_QUANT to obey, the default names its own encodings
              * rather than inheriting a base that has changed underneath it. */
-            spec = (mynah_qmat_qtype_from_env() < 0) ? POCKET_QG_DEFAULT_SPEC_PINNED
-                                                      : POCKET_QG_DEFAULT_SPEC;
+            spec = (mynah_qmat_qtype_from_env() >= 0) ? POCKET_QG_DEFAULT_SPEC
+                 : (state->cfg.layers >= POCKET_DEEP_BACKBONE_LAYERS &&
+                    (state->backend == NULL ||
+                     strcmp(mynah_backend_name(state->backend), "cuda") != 0))
+                     ? POCKET_QG_DEFAULT_SPEC_PINNED_DEEP
+                     : POCKET_QG_DEFAULT_SPEC_PINNED;
         }
+        qgroups_spec = spec;
         if (pocket_qgroups_parse(spec, &state->qgroups, state->qgroup_qtype, error,
                                  capacity) != 0) {
             pocket_model_free(state);
@@ -3187,6 +3947,115 @@ static int pocket_model_init(const mynah_tts_model *model,
         (signed char)pocket_qtype_for(state->qgroup_qtype, POCKET_QG_CODEC_CONV);
     state->codec_convtr_qtype =
         (signed char)pocket_qtype_for(state->qgroup_qtype, POCKET_QG_CODEC_CONVTR);
+    if (state->backend != NULL &&
+        strcmp(mynah_backend_name(state->backend), "cuda") == 0) {
+        const char *resident = getenv("MYNAH_CUDA_RESIDENT");
+        const int resident_on = resident == NULL || strcmp(resident, "0") != 0;
+        const int decoder_raw = state->codec_conv_qtype != 1 &&
+                                state->codec_convtr_qtype != 1;
+        {
+            /* The one line an operator reads: what each hot stage REALLY
+             * runs, resolved from the same predicates the dispatch uses. */
+            const char *requested =
+                mynah_cuda_quant_name((mynah_cuda_quant_mode)state->cuda_quant);
+            const char *bb = !resident_on ? "cpu"
+                : pocket_cuda_stage_encoding(state,
+                                             POCKET_QG_ATTENTION | POCKET_QG_FFN);
+            const char *flow = !pocket_cuda_flow_requested(state) ? "cpu"
+                : pocket_cuda_stage_encoding(state, POCKET_QG_FLOW_NET);
+            const char *mimi = !pocket_cuda_codec_requested(state) ? "cpu"
+                : pocket_cuda_stage_encoding(state, POCKET_QG_CODEC_TF);
+            /* The cross-request Mimi tile (default on) has f32 and bf16
+             * kernels only; an int8 codec group reaches the per-request
+             * fallback alone, and the line must say so. */
+            if (strcmp(mimi, "int8") == 0 && pocket_cuda_mimi_tile_enabled())
+                mimi = "int8(tile=f32)";
+            const int overridden =
+                (state->cuda_quant == MYNAH_CUDA_QUANT_INT8 &&
+                 (strcmp(bb, "int8") != 0 || strcmp(flow, "int8") != 0)) ||
+                (state->cuda_quant == MYNAH_CUDA_QUANT_BF16 &&
+                 (strcmp(bb, "bf16") != 0 || strcmp(flow, "bf16") != 0 ||
+                  strcmp(mimi, "bf16") != 0)) ||
+                (state->cuda_quant == MYNAH_CUDA_QUANT_F32 &&
+                 (strcmp(bb, "f32") != 0 || strcmp(flow, "f32") != 0 ||
+                  strcmp(mimi, "f32") != 0));
+            fprintf(stderr,
+                    "mynah-tts: CUDA quant=%s backbone=%s flow=%s mimi=%s "
+                    "kv=%s%s\n",
+                    requested, bb, flow, mimi,
+                    pocket_cuda_kv_bf16_requested(state) ? "bf16" : "f32",
+                    overridden ? " (stages differ from MYNAH_CUDA_QUANT: "
+                                 "overridden by MYNAH_QUANT_GROUPS/MYNAH_QUANT/"
+                                 "MYNAH_CUDA_Q8 or a per-stage switch)"
+                               : "");
+        }
+        fprintf(stderr,
+                "mynah-tts: pocket backend=cuda resident=%s qgroups=0x%04x "
+                "q8=%s resident{backbone=%s flow=%s codec_transformer=%s} "
+                "raw_f32{backbone=%s flow=%s codec_transformer=%s "
+                "quantizer_upsample=%s decoder=%s}; "
+                "non-Q8 quantized groups stay on the CPU oracle\n",
+                resident_on ? "on" : "off", state->qgroups,
+                state->cuda_q8_enabled ? "on" : "off",
+                pocket_cuda_groups_are_resident_compatible(
+                    state, POCKET_QG_ATTENTION | POCKET_QG_FFN) ? "on" : "off",
+                pocket_cuda_groups_are_resident_compatible(state,
+                                                            POCKET_QG_FLOW_NET)
+                    ? "on" : "off",
+                pocket_cuda_groups_are_resident_compatible(state,
+                                                            POCKET_QG_CODEC_TF)
+                    ? "on" : "off",
+                pocket_cuda_groups_are_f32(state, POCKET_QG_ATTENTION | POCKET_QG_FFN)
+                    ? "on" : "off",
+                pocket_cuda_groups_are_f32(state, POCKET_QG_FLOW_NET) ? "on" : "off",
+                pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_TF) ? "on" : "off",
+                pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_CONV) ? "on" : "off",
+                decoder_raw ? "on" : "off");
+        /* A CUDA build asked for the resident path must not run a hot stage
+         * on the CPU because of a quantization spec: that is a 20-30x slower
+         * server that still reports device=cuda. The explicit per-stage kill
+         * switches (MYNAH_CUDA_FLOW=0, MYNAH_CUDA_POCKET_CODEC=0) are A/B
+         * choices and are not affected; only an incompatible encoding is. */
+        static const struct {
+            const char *name;
+            unsigned groups;
+        } hot[] = {
+            {"backbone", POCKET_QG_ATTENTION | POCKET_QG_FFN},
+            {"flow_net", POCKET_QG_FLOW_NET},
+            {"codec_transformer", POCKET_QG_CODEC_TF},
+        };
+        char cpu_stages[96] = "";
+        for (size_t i = 0; resident_on && i < sizeof(hot) / sizeof(hot[0]); ++i) {
+            if (pocket_cuda_groups_are_resident_compatible(state, hot[i].groups)) {
+                continue;
+            }
+            const size_t used = strlen(cpu_stages);
+            snprintf(cpu_stages + used, sizeof(cpu_stages) - used, "%s%s",
+                     used ? "," : "", hot[i].name);
+        }
+        if (cpu_stages[0] != '\0') {
+            const char *allow = getenv("MYNAH_CUDA_ALLOW_CPU_STAGES");
+            const int allowed = allow != NULL && strcmp(allow, "0") != 0;
+            fprintf(stderr,
+                    "mynah-tts: %s: MYNAH_QUANT_GROUPS='%s' keeps %s on the "
+                    "CPU oracle of a CUDA build; the resident kernels accept "
+                    "f32 (MYNAH_QUANT_GROUPS=none) or int8 (MYNAH_CUDA_QUANT="
+                    "int8, or MYNAH_CUDA_Q8=1); use MYNAH_CUDA_QUANT=bf16 for "
+                    "resident bf16 weights%s\n",
+                    allowed ? "WARNING" : "error", qgroups_spec, cpu_stages,
+                    allowed ? " (allowed by MYNAH_CUDA_ALLOW_CPU_STAGES)"
+                            : "; set MYNAH_CUDA_ALLOW_CPU_STAGES=1 to run "
+                              "it anyway");
+            if (!allowed) {
+                pocket_error(error, capacity,
+                             "CUDA resident path requested but %s would run on "
+                             "the CPU (MYNAH_QUANT_GROUPS='%s')",
+                             cpu_stages, qgroups_spec);
+                pocket_model_free(state);
+                return -1;
+            }
+        }
+    }
     {
         static const unsigned bb_kinds[4] = {POCKET_QG_BB_QKV, POCKET_QG_BB_OPROJ,
                                              POCKET_QG_BB_FFN1, POCKET_QG_BB_FFN2};
@@ -3249,6 +4118,31 @@ static int pocket_model_init(const mynah_tts_model *model,
  * pack knows (the streaming emit threshold, the latent width) stay zero rather
  * than being guessed.  The driver always passes a real state and checks the
  * fields it needs, so it cannot pick up a half-answer by accident. */
+/* Tokens per prefill slice, sized so one slice costs about what 32 tokens cost
+ * on the 6L pack: 32 * 6 / layers, rounded down to the backbone's prefill tile
+ * and never below one tile (a slice smaller than the tile runs the tile anyway).
+ * 6 layers -> 32, the value C120 was qualified on; 24 layers -> 16, the value
+ * every 24L capacity point was qualified on (slices of 8, 16 and 24 all run 16
+ * tokens there, and 32 puts ~160 ms of prefill in front of a batch step). CPU
+ * only: 0 leaves the CUDA path on the driver's default. */
+static unsigned pocket_prefill_slice_tokens(const mynah_engine_state *state) {
+    if (state->backend != NULL && strcmp(mynah_backend_name(state->backend), "cuda") == 0)
+        return 0u;
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    const size_t layers = state->cfg.layers > 0u ? state->cfg.layers : 1u;
+    size_t tokens = (32u * 6u) / layers;
+    if (tokens > 32u) tokens = 32u;
+    tokens -= tokens % tile;
+    if (tokens < tile) tokens = tile;
+    return (unsigned)tokens;
+}
+
+static size_t pocket_max_batch_for(const mynah_backend *backend) {
+    return backend != NULL && strcmp(mynah_backend_name(backend), "cuda") == 0
+               ? POCKET_MAX_BATCH
+               : POCKET_CPU_MAX_BATCH;
+}
+
 static int pocket_caps(const mynah_tts_model *model,
                        const mynah_engine_state *state, mynah_engine_caps *out) {
     if (out == NULL) return -1;
@@ -3260,7 +4154,7 @@ static int pocket_caps(const mynah_tts_model *model,
         out->frames_per_step = 1u;
         out->min_audio_frames = model->info.min_generated_frames;
         out->default_max_steps = model->info.max_decoder_steps;
-        out->max_batch = POCKET_MAX_BATCH;
+        out->max_batch = (unsigned)pocket_max_batch_for(model->backend);
         out->voice_count = model->info.speaker_count;
         out->is_discrete_codec = 0u;
         return 0;
@@ -3276,15 +4170,2838 @@ static int pocket_caps(const mynah_tts_model *model,
     out->audio_emit_frames = (unsigned)cfg->audio_emit_frames;
     out->min_audio_frames = (unsigned)cfg->min_audio_frames;
     out->default_max_steps = (unsigned)cfg->default_max_steps;
-    out->max_batch = POCKET_MAX_BATCH;
+    out->max_batch = (unsigned)pocket_max_batch_for(state->backend);
     out->voice_count = (unsigned)state->voice_count;
     out->needs_cfg = 0u;
     out->is_discrete_codec = 0u;
     out->latent_dim = (unsigned)cfg->latent_dim;
+    out->prefill_slice_tokens = pocket_prefill_slice_tokens(state);
     return 0;
 }
 
 /* ----------------------------------------------------------------- context */
+
+static int pocket_all_finite(const float *v, size_t n);
+
+static int pocket_cuda_resident_requested(const mynah_engine_state *state) {
+    if (state == NULL || state->backend == NULL ||
+        strcmp(mynah_backend_name(state->backend), "cuda") != 0) {
+        return 0;
+    }
+    const char *setting = getenv("MYNAH_CUDA_RESIDENT");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+static int pocket_cuda_q8_requested(void) {
+    const char *setting = getenv("MYNAH_CUDA_Q8");
+    return setting != NULL && strcmp(setting, "0") != 0;
+}
+
+/* Persistent backbone K/V is FP32 by default because it is the CPU/GPU
+ * parity oracle.  BF16 is an explicit capacity experiment: QKV projections,
+ * attention accumulation, host shadow and all CPU state remain FP32, while
+ * the device cache stores two-byte values.  This is deliberately independent
+ * of model-weight Q8 so either reduction can be measured in isolation. */
+static int pocket_cuda_kv_bf16_requested(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state)) return 0;
+    const char *setting = getenv("MYNAH_CUDA_KV_DTYPE");
+    return setting != NULL &&
+           (strcmp(setting, "bf16") == 0 || strcmp(setting, "bfloat16") == 0);
+}
+
+static void *pocket_cuda_kv_offset(float *base, size_t elements,
+                                   int bf16) {
+    if (base == NULL) return NULL;
+    const size_t width = bf16 ? sizeof(uint16_t) : sizeof(float);
+    return (void *)((unsigned char *)base + elements * width);
+}
+
+/* ------------------------------------------- growable device backbone KV
+ *
+ * MYNAH_CUDA_KV_GROW (default on; `=0` restores the full-capacity
+ * allocation).  The backbone cache is sized at admission for the worst case,
+ * voice + text + max_steps + 1, and with the default 1500-frame budget that is
+ * ~1700 positions of 96 KiB each (24L, BF16) while a typical request touches
+ * ~300 of them.  At C128 on a 23 GB L4 that worst case is what runs out.
+ *
+ * With this on, a context whose backbone is expected to be device-owned (the
+ * prefill tile path, the only one the host cannot shadow) starts from a
+ * conservative estimate and the device cache grows in 256-position chunks
+ * right before a writer would pass its end.  The host transformer state keeps
+ * its full `max_seq_len` untouched: it is the CPU path and its ceiling.  The
+ * device stride is `cuda_backbone_capacity`, which may now be smaller than
+ * `max_seq_len` and never larger. */
+#define POCKET_CUDA_KV_GROW_CHUNK ((size_t)256u)
+
+static int pocket_cuda_prefill_tile_enabled(void);
+
+static int pocket_cuda_kv_grow_enabled(void) {
+    const char *setting = getenv("MYNAH_CUDA_KV_GROW");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+static int pocket_cuda_kv_grow_logged(void) {
+    const char *setting = getenv("MYNAH_CUDA_KV_GROW_LOG");
+    return setting != NULL && strcmp(setting, "0") != 0;
+}
+
+/* Admission-time prediction of `pocket_cuda_prefill_tile_usable`: every clause
+ * that does not depend on the cache this decides the size of.  A wrong "yes"
+ * is still correct -- every writer grows the cache before it passes the end --
+ * it only moves the growth from admission to the first step. */
+static int pocket_cuda_kv_grow_expected(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL || ctx->state == NULL || !ctx->cuda_backbone_enabled ||
+        !pocket_cuda_kv_grow_enabled() || !pocket_cuda_prefill_tile_enabled() ||
+        ctx->state->backend == NULL ||
+        !mynah_backend_has_tile_transformer(ctx->state->backend))
+        return 0;
+    const mynah_engine_state *state = ctx->state;
+    return state->cfg.heads * state->cfg.head_dim == state->cfg.hidden_dim &&
+           ctx->speaker < state->voice_count &&
+           state->voices[ctx->speaker].kv != NULL;
+}
+
+/* The positions a device cache starts with.  Pocket emits about 2-2.6 frames
+ * per text token (measured table in ctx_new: 1.96..2.57), so 3 per token plus
+ * a 64-frame tail covers an ordinary request without growing; a floor of 256
+ * keeps short prompts from growing at all.  Rounded to the growth chunk and
+ * never more than the full worst case `full`. */
+static size_t pocket_cuda_kv_initial_capacity(const mynah_engine_ctx *ctx,
+                                              size_t full) {
+    if (!pocket_cuda_kv_grow_expected(ctx)) return full;
+    size_t steps = 0u, positions = 0u, max_frames = 0u;
+    if (pocket_mul(ctx->text_capacity, 3u, &steps) != 0 ||
+        pocket_add(steps, 64u, &steps) != 0 ||
+        pocket_add(ctx->max_steps, 1u, &max_frames) != 0)
+        return full;
+    if (steps < POCKET_CUDA_KV_GROW_CHUNK) steps = POCKET_CUDA_KV_GROW_CHUNK;
+    if (steps > SIZE_MAX - (POCKET_CUDA_KV_GROW_CHUNK - 1u)) return full;
+    steps = (steps + POCKET_CUDA_KV_GROW_CHUNK - 1u) /
+            POCKET_CUDA_KV_GROW_CHUNK * POCKET_CUDA_KV_GROW_CHUNK;
+    {
+        /* Test hook: a tiny start forces growth in the middle of ordinary
+         * requests, so grown and full-capacity runs can be compared. */
+        const char *forced = getenv("MYNAH_CUDA_KV_GROW_INITIAL_STEPS");
+        if (forced != NULL && forced[0] != '\0') {
+            const long value = strtol(forced, NULL, 10);
+            if (value > 0) steps = (size_t)value;
+        }
+    }
+    if (steps > max_frames) steps = max_frames;
+    if (pocket_add(ctx->voice_positions, ctx->text_capacity, &positions) != 0 ||
+        pocket_add(positions, steps, &positions) != 0 || positions > full)
+        return full;
+    return positions;
+}
+
+/* Pageable CUDA copies are allowed by the API but commonly turn an
+ * ostensibly asynchronous transfer into a host-side staging/synchronisation
+ * point.  These small request buffers sit exactly on the single-request seam
+ * (step input, hidden output and codec frame mirrors), so pin them when the
+ * resident CUDA path is requested.  Allocation failure is recoverable: the
+ * normal malloc buffer preserves CPU correctness and CUDA will simply expose
+ * the extra transfer cost in its counters. */
+static float *pocket_cuda_host_buffer(const mynah_engine_state *state,
+                                      size_t count, int *pinned, char *error,
+                                      size_t capacity) {
+    if (pinned != NULL) *pinned = 0;
+    if (state != NULL && pocket_cuda_resident_requested(state) &&
+        state->backend != NULL) {
+        float *buffer = NULL;
+        char ignored[256];
+        if (mynah_backend_host_alloc(state->backend, count, &buffer, ignored,
+                                     sizeof(ignored)) == 0) {
+            if (pinned != NULL) *pinned = 1;
+            return buffer;
+        }
+    }
+    return mynah_alloc_floats(count, error, capacity);
+}
+
+static void pocket_cuda_host_buffer_free(const mynah_engine_state *state,
+                                          float *buffer, int pinned) {
+    if (buffer == NULL) return;
+    if (pinned && state != NULL && state->backend != NULL)
+        mynah_backend_host_free(state->backend, buffer);
+    else
+        free(buffer);
+}
+
+/* CUDA device pointers and pinned host staging are owned by a request or by
+ * the driver scratch, but the backend stream may still refer to them after a
+ * recoverable error.  Normal synthesis drains before returning; this guard is
+ * for cancellation, admission failure and teardown paths where the caller can
+ * destroy the owner immediately.  It runs before *any* resident buffer is
+ * released, including graph-owned scratch. */
+static void pocket_cuda_drain_before_release(const mynah_backend *backend) {
+    if (backend == NULL || mynah_backend_name(backend) == NULL ||
+        strcmp(mynah_backend_name(backend), "cuda") != 0)
+        return;
+    char ignored[256];
+    (void)mynah_backend_sync(backend, ignored, sizeof(ignored));
+}
+
+/* ------------------------------------------- per-request CUDA resource pool
+ *
+ * MYNAH_CUDA_SLOT_POOL (default on whenever the resident CUDA path is active,
+ * `=0` restores the allocate-per-request behaviour).  Every admission used to
+ * cudaMalloc/cudaHostAlloc a request's device buffers, pinned staging and
+ * resident SEANet decoder, and every retirement freed them again.  cudaFree
+ * and cudaFreeHost synchronise the whole device, so at C64 the scheduler
+ * thread punched a GPU bubble into the pipeline about eleven times a second.
+ *
+ * A retired context now parks its resource set here and the next admission
+ * takes it back.  What a new request must not inherit is reset on take:
+ *   - pinned host staging is zeroed (a fresh allocation was calloc-clean);
+ *   - the Mimi KV window and the decoder input/output are zeroed on the
+ *     stream, the upsample tail is zeroed (and again by the prologue);
+ *   - the SEANet causal rings are cleared with mynah_backend_decoder_reset
+ *     (the prologue clears them again, as it always did);
+ *   - the backbone KV is NOT cleared by default: attention reads only the
+ *     positions this request wrote (voice prefix, text, its own steps), which
+ *     is exactly the property a fresh cudaMalloc -- uninitialised, and often
+ *     the previous owner's memory -- already relied on.
+ *     MYNAH_CUDA_SLOT_POOL_ZERO_KV=1 clears it too, for a leak A/B: the audio
+ *     must be bit-identical either way.
+ * The set is only parked after the existing drain, so nothing queued by the
+ * previous owner still refers to it; everything is on the backend's one
+ * stream, so the new owner's work is ordered after the reset.  Graph caches
+ * keyed by the decoder are forgotten at park exactly as they were at close. */
+#define POCKET_CUDA_SLOT_POOL_CAP POCKET_MAX_BATCH
+
+typedef struct pocket_cuda_slot {
+    struct pocket_cuda_slot *next;
+    /* resident backbone */
+    float *bb_kv;
+    size_t bb_kv_bytes;
+    int bb_kv_bf16;
+    float *bb_x, *bb_norm, *bb_qkv, *bb_attn, *bb_proj, *bb_ffn;
+    /* resident Mimi decoder transformer */
+    float **codec_kv;
+    size_t codec_kv_layers;
+    size_t codec_kv_positions;
+    size_t codec_kv_half;
+    float *codec_x, *codec_norm, *codec_qkv, *codec_attn, *codec_proj,
+        *codec_ffn;
+    /* resident quantizer projection + causal upsample */
+    float *codec_denorm, *codec_up_input, *codec_up, *codec_up_partial;
+    size_t codec_up_tail;
+    int codec_upsample;
+    /* resident SEANet decoder */
+    mynah_backend_decoder *decoder;
+    float *decoder_input, *decoder_output;
+    /* pinned host staging (only ever pinned buffers are parked) */
+    float *step_input, *hidden, *denorm, *codec_seq, *codec_out, *codec_back,
+        *pcm;
+} pocket_cuda_slot;
+
+static int pocket_cuda_slot_pool_enabled(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state) ||
+        !state->cuda_slot_pool_mutex_ready) return 0;
+    const char *setting = getenv("MYNAH_CUDA_SLOT_POOL");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+static int pocket_cuda_slot_zero_kv_requested(void) {
+    const char *setting = getenv("MYNAH_CUDA_SLOT_POOL_ZERO_KV");
+    return setting != NULL && strcmp(setting, "0") != 0;
+}
+
+static void pocket_cuda_slot_free_backbone(const mynah_backend *backend,
+                                           pocket_cuda_slot *slot) {
+    mynah_backend_dev_free(backend, slot->bb_kv);
+    mynah_backend_dev_free(backend, slot->bb_x);
+    mynah_backend_dev_free(backend, slot->bb_norm);
+    mynah_backend_dev_free(backend, slot->bb_qkv);
+    mynah_backend_dev_free(backend, slot->bb_attn);
+    mynah_backend_dev_free(backend, slot->bb_proj);
+    mynah_backend_dev_free(backend, slot->bb_ffn);
+    slot->bb_kv = NULL;
+    slot->bb_kv_bytes = 0u;
+    slot->bb_kv_bf16 = 0;
+    slot->bb_x = slot->bb_norm = slot->bb_qkv = NULL;
+    slot->bb_attn = slot->bb_proj = slot->bb_ffn = NULL;
+}
+
+static void pocket_cuda_slot_free_upsample(const mynah_backend *backend,
+                                           pocket_cuda_slot *slot) {
+    mynah_backend_dev_free(backend, slot->codec_denorm);
+    mynah_backend_dev_free(backend, slot->codec_up_input);
+    mynah_backend_dev_free(backend, slot->codec_up);
+    mynah_backend_dev_free(backend, slot->codec_up_partial);
+    slot->codec_denorm = slot->codec_up_input = NULL;
+    slot->codec_up = slot->codec_up_partial = NULL;
+    slot->codec_up_tail = 0u;
+    slot->codec_upsample = 0;
+}
+
+static void pocket_cuda_slot_free_codec(const mynah_backend *backend,
+                                        pocket_cuda_slot *slot) {
+    if (slot->codec_kv != NULL) {
+        for (size_t l = 0; l < slot->codec_kv_layers; ++l)
+            mynah_backend_dev_free(backend, slot->codec_kv[l]);
+        free(slot->codec_kv);
+    }
+    mynah_backend_dev_free(backend, slot->codec_x);
+    mynah_backend_dev_free(backend, slot->codec_norm);
+    mynah_backend_dev_free(backend, slot->codec_qkv);
+    mynah_backend_dev_free(backend, slot->codec_attn);
+    mynah_backend_dev_free(backend, slot->codec_proj);
+    mynah_backend_dev_free(backend, slot->codec_ffn);
+    slot->codec_kv = NULL;
+    slot->codec_kv_layers = 0u;
+    slot->codec_kv_positions = 0u;
+    slot->codec_kv_half = 0u;
+    slot->codec_x = slot->codec_norm = slot->codec_qkv = NULL;
+    slot->codec_attn = slot->codec_proj = slot->codec_ffn = NULL;
+}
+
+static void pocket_cuda_slot_free_decoder(const mynah_backend *backend,
+                                          pocket_cuda_slot *slot) {
+    mynah_backend_dev_free(backend, slot->decoder_input);
+    mynah_backend_dev_free(backend, slot->decoder_output);
+    if (slot->decoder != NULL) mynah_backend_decoder_close(backend, slot->decoder);
+    slot->decoder = NULL;
+    slot->decoder_input = slot->decoder_output = NULL;
+}
+
+static void pocket_cuda_slot_destroy(const mynah_backend *backend,
+                                     pocket_cuda_slot *slot) {
+    if (slot == NULL) return;
+    pocket_cuda_slot_free_backbone(backend, slot);
+    pocket_cuda_slot_free_codec(backend, slot);
+    pocket_cuda_slot_free_upsample(backend, slot);
+    pocket_cuda_slot_free_decoder(backend, slot);
+    mynah_backend_host_free(backend, slot->step_input);
+    mynah_backend_host_free(backend, slot->hidden);
+    mynah_backend_host_free(backend, slot->denorm);
+    mynah_backend_host_free(backend, slot->codec_seq);
+    mynah_backend_host_free(backend, slot->codec_out);
+    mynah_backend_host_free(backend, slot->codec_back);
+    mynah_backend_host_free(backend, slot->pcm);
+    free(slot);
+}
+
+/* Whether a parked backbone cache of `have` bytes may serve a request that
+ * needs `need`.  With a growable cache (`bounded`) a short request must not sit
+ * on an arbitrarily large parked cache: at most twice what it needs, otherwise
+ * the parked one is freed and a right-sized one allocated. */
+static int pocket_cuda_slot_kv_fits(size_t have, size_t need, int bounded) {
+    if (have < need) return 0;
+    return !bounded || need > SIZE_MAX / 2u || have <= 2u * need;
+}
+
+/* Take the idle set whose backbone cache fits `bb_kv_bytes` most tightly (and
+ * has the requested element type); failing that, the one with the largest
+ * cache, whose KV alone is then re-allocated (with `bounded` that is also the
+ * set whose oversized cache frees the most).  NULL when the pool is empty. */
+static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
+                                                  size_t bb_kv_bytes,
+                                                  int bb_kv_bf16, int bounded) {
+    if (!pocket_cuda_slot_pool_enabled(state)) return NULL;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    pocket_cuda_slot **best = NULL;
+    pocket_cuda_slot **largest = NULL;
+    for (pocket_cuda_slot **link = &state->cuda_slot_pool; *link != NULL;
+         link = &(*link)->next) {
+        const pocket_cuda_slot *slot = *link;
+        if (slot->bb_kv_bf16 == bb_kv_bf16 &&
+            pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, bb_kv_bytes, bounded) &&
+            (best == NULL || slot->bb_kv_bytes < (*best)->bb_kv_bytes))
+            best = link;
+        if (largest == NULL || slot->bb_kv_bytes > (*largest)->bb_kv_bytes)
+            largest = link;
+    }
+    pocket_cuda_slot **pick = best != NULL ? best : largest;
+    pocket_cuda_slot *slot = NULL;
+    if (pick != NULL) {
+        slot = *pick;
+        *pick = slot->next;
+        slot->next = NULL;
+        state->cuda_slot_pool_count--;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    return slot;
+}
+
+/* Hand a pooled pinned buffer to the context, zeroed like the calloc it
+ * replaces, or fall back to the ordinary allocation. */
+static float *pocket_cuda_host_take(const mynah_engine_state *state,
+                                    float **pooled, size_t count, int *pinned,
+                                    char *error, size_t capacity) {
+    if (pooled != NULL && *pooled != NULL) {
+        float *buffer = *pooled;
+        *pooled = NULL;
+        memset(buffer, 0, count * sizeof(float));
+        if (pinned != NULL) *pinned = 1;
+        return buffer;
+    }
+    return pocket_cuda_host_buffer(state, count, pinned, error, capacity);
+}
+
+#define POCKET_SLOT_MOVE(dst, src) \
+    do {                           \
+        (dst) = (src);             \
+        (src) = NULL;              \
+    } while (0)
+
+/* Move this context's CUDA resources into a pooled set.  Runs after the
+ * drain in ctx_free; the ctx pointers it moves are left NULL, so the ordinary
+ * release helpers that follow only reset flags.  A disabled pool, a full pool
+ * or an empty set frees instead. */
+static void pocket_cuda_slot_park(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || ctx->state == NULL) return;
+    mynah_engine_state *state = ctx->state;
+    const mynah_backend *backend = state->backend;
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    ctx->cuda_slot = NULL;
+    if (!pocket_cuda_slot_pool_enabled(state)) {
+        pocket_cuda_slot_destroy(backend, slot);
+        return;
+    }
+    if (slot == NULL) {
+        slot = (pocket_cuda_slot *)calloc(1, sizeof(*slot));
+        if (slot == NULL) return; /* the ordinary release frees everything */
+    }
+    if (ctx->cuda_backbone_kv != NULL && ctx->cuda_x != NULL &&
+        ctx->cuda_norm != NULL && ctx->cuda_qkv != NULL &&
+        ctx->cuda_attn != NULL && ctx->cuda_proj != NULL &&
+        ctx->cuda_ffn != NULL && ctx->cuda_backbone_kv_bytes != 0u) {
+        pocket_cuda_slot_free_backbone(backend, slot);
+        POCKET_SLOT_MOVE(slot->bb_kv, ctx->cuda_backbone_kv);
+        slot->bb_kv_bytes = ctx->cuda_backbone_kv_bytes;
+        slot->bb_kv_bf16 = ctx->cuda_backbone_kv_bf16;
+        POCKET_SLOT_MOVE(slot->bb_x, ctx->cuda_x);
+        POCKET_SLOT_MOVE(slot->bb_norm, ctx->cuda_norm);
+        POCKET_SLOT_MOVE(slot->bb_qkv, ctx->cuda_qkv);
+        POCKET_SLOT_MOVE(slot->bb_attn, ctx->cuda_attn);
+        POCKET_SLOT_MOVE(slot->bb_proj, ctx->cuda_proj);
+        POCKET_SLOT_MOVE(slot->bb_ffn, ctx->cuda_ffn);
+        ctx->cuda_backbone_kv_bytes = 0u;
+    }
+    if (ctx->cuda_codec_kv != NULL && ctx->cuda_codec_x != NULL &&
+        ctx->cuda_codec_norm != NULL && ctx->cuda_codec_qkv != NULL &&
+        ctx->cuda_codec_attn != NULL && ctx->cuda_codec_proj != NULL &&
+        ctx->cuda_codec_ffn != NULL && ctx->cuda_codec_kv_positions != 0u) {
+        pocket_cuda_slot_free_codec(backend, slot);
+        POCKET_SLOT_MOVE(slot->codec_kv, ctx->cuda_codec_kv);
+        slot->codec_kv_layers = state->cfg.codec_tf_layers;
+        slot->codec_kv_positions = ctx->cuda_codec_kv_positions;
+        slot->codec_kv_half = ctx->cuda_codec_kv_half;
+        POCKET_SLOT_MOVE(slot->codec_x, ctx->cuda_codec_x);
+        POCKET_SLOT_MOVE(slot->codec_norm, ctx->cuda_codec_norm);
+        POCKET_SLOT_MOVE(slot->codec_qkv, ctx->cuda_codec_qkv);
+        POCKET_SLOT_MOVE(slot->codec_attn, ctx->cuda_codec_attn);
+        POCKET_SLOT_MOVE(slot->codec_proj, ctx->cuda_codec_proj);
+        POCKET_SLOT_MOVE(slot->codec_ffn, ctx->cuda_codec_ffn);
+    }
+    if (ctx->cuda_codec_upsample_enabled && ctx->cuda_codec_denorm != NULL &&
+        ctx->cuda_codec_up_input != NULL && ctx->cuda_codec_up != NULL &&
+        (ctx->cuda_codec_up_tail == 0u || ctx->cuda_codec_up_partial != NULL)) {
+        pocket_cuda_slot_free_upsample(backend, slot);
+        POCKET_SLOT_MOVE(slot->codec_denorm, ctx->cuda_codec_denorm);
+        POCKET_SLOT_MOVE(slot->codec_up_input, ctx->cuda_codec_up_input);
+        POCKET_SLOT_MOVE(slot->codec_up, ctx->cuda_codec_up);
+        POCKET_SLOT_MOVE(slot->codec_up_partial, ctx->cuda_codec_up_partial);
+        slot->codec_up_tail = ctx->cuda_codec_up_tail;
+        slot->codec_upsample = 1;
+    }
+    if (ctx->cuda_decoder != NULL && ctx->cuda_decoder_input != NULL &&
+        ctx->cuda_decoder_output != NULL) {
+        pocket_cuda_slot_free_decoder(backend, slot);
+        /* The same graph bookkeeping decoder_close did: the per-decoder graph
+         * and any cross-request batch graph naming this decoder go now, so
+         * the bounded graph caches never fill up with retired gangs. */
+        mynah_backend_graph_forget(backend, ctx->cuda_decoder);
+        POCKET_SLOT_MOVE(slot->decoder, ctx->cuda_decoder);
+        POCKET_SLOT_MOVE(slot->decoder_input, ctx->cuda_decoder_input);
+        POCKET_SLOT_MOVE(slot->decoder_output, ctx->cuda_decoder_output);
+    }
+#define POCKET_SLOT_PARK_HOST(field, flag)                   \
+    do {                                                     \
+        if (ctx->field != NULL && ctx->flag) {               \
+            mynah_backend_host_free(backend, slot->field);   \
+            POCKET_SLOT_MOVE(slot->field, ctx->field);       \
+            ctx->flag = 0;                                   \
+        }                                                    \
+    } while (0)
+    POCKET_SLOT_PARK_HOST(step_input, step_input_host_pinned);
+    POCKET_SLOT_PARK_HOST(hidden, hidden_host_pinned);
+    POCKET_SLOT_PARK_HOST(denorm, denorm_host_pinned);
+    POCKET_SLOT_PARK_HOST(codec_seq, codec_seq_host_pinned);
+    POCKET_SLOT_PARK_HOST(codec_out, codec_out_host_pinned);
+    POCKET_SLOT_PARK_HOST(codec_back, codec_back_host_pinned);
+    POCKET_SLOT_PARK_HOST(pcm, pcm_host_pinned);
+#undef POCKET_SLOT_PARK_HOST
+    const int any = slot->bb_kv != NULL || slot->codec_kv != NULL ||
+                    slot->codec_upsample || slot->decoder != NULL ||
+                    slot->step_input != NULL || slot->hidden != NULL ||
+                    slot->denorm != NULL || slot->codec_seq != NULL ||
+                    slot->codec_out != NULL || slot->codec_back != NULL ||
+                    slot->pcm != NULL;
+    if (!any) {
+        pocket_cuda_slot_destroy(backend, slot);
+        return;
+    }
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    if (state->cuda_slot_pool_count < POCKET_CUDA_SLOT_POOL_CAP) {
+        slot->next = state->cuda_slot_pool;
+        state->cuda_slot_pool = slot;
+        state->cuda_slot_pool_count++;
+        slot = NULL;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    pocket_cuda_slot_destroy(backend, slot); /* pool full: free as before */
+}
+
+/* Model teardown: every context is gone, free what the pool still holds. */
+static void pocket_cuda_slot_pool_drain(mynah_engine_state *state) {
+    if (state == NULL || !state->cuda_slot_pool_mutex_ready) return;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    pocket_cuda_slot *slot = state->cuda_slot_pool;
+    state->cuda_slot_pool = NULL;
+    state->cuda_slot_pool_count = 0u;
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    if (slot != NULL) pocket_cuda_drain_before_release(state->backend);
+    while (slot != NULL) {
+        pocket_cuda_slot *next = slot->next;
+        pocket_cuda_slot_destroy(state->backend, slot);
+        slot = next;
+    }
+}
+
+/* The resident CUDA kernels currently consume the original float model views.
+ * They must not silently replace a CPU qmat projection with an f32 GEMM: that
+ * would make the backend-dependent audio differ before the caller ever reaches
+ * a documented precision choice.  Keep this predicate in one place so every
+ * resident stage makes the same decision from the resolved model groups.
+ *
+ * A group not selected by MYNAH_QUANT_GROUPS is exact f32.  A selected group
+ * with an explicit encoding uses that encoding; a bare group inherits the
+ * cache encoding.  qmat's resolver is important here because an unavailable
+ * f16/bf16 kernel legitimately downgrades to exact f32 on that CPU build. */
+static int pocket_cuda_groups_are_f32(const mynah_engine_state *state,
+                                      unsigned groups) {
+    if (state == NULL || groups == 0u) return 0;
+    const unsigned selected = state->qgroups & groups;
+    if (selected == 0u) return 1;
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        if (mynah_qmat_qtype_resolved(qtype) != 0) return 0;
+    }
+    return 1;
+}
+
+/* The resident projection kernels currently accept original f32 and explicit
+ * INT8/Q8. F16/BF16/INT4 continue to use the CPU oracle until their exact
+ * device representations and parity gates exist. */
+static int pocket_cuda_groups_are_resident_compatible(
+    const mynah_engine_state *state, unsigned groups) {
+    if (state == NULL || groups == 0u) return 0;
+    const unsigned selected = state->qgroups & groups;
+    if (selected == 0u) return 1;
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        qtype = mynah_qmat_qtype_resolved(qtype);
+        if (qtype != 0 && !(qtype == 1 && state->cuda_q8_enabled)) return 0;
+    }
+    return 1;
+}
+
+/* The encoding a resident stage's projections actually take: "f32", "bf16"
+ * (MYNAH_CUDA_QUANT=bf16 over exact-f32 groups), "int8", "mixed", or "cpu"
+ * when an encoding has no resident kernel. */
+static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
+                                              unsigned groups) {
+    if (!pocket_cuda_groups_are_resident_compatible(state, groups)) return "cpu";
+    if (pocket_cuda_groups_are_f32(state, groups))
+        return state->cuda_bf16_weights ? "bf16" : "f32";
+    const unsigned selected = state->qgroups & groups;
+    if (selected != groups) return "mixed";
+    const int cache_qtype = state->qcache == NULL
+                                ? 0
+                                : mynah_qmat_cache_qtype(state->qcache);
+    for (size_t bit = 0; bit < POCKET_QG_BITS; ++bit) {
+        const unsigned mask = 1u << bit;
+        if ((selected & mask) == 0u) continue;
+        int qtype = state->qgroup_qtype[bit];
+        if (qtype < 0) qtype = cache_qtype;
+        if (mynah_qmat_qtype_resolved(qtype) != 1) return "mixed";
+    }
+    return "int8";
+}
+
+static int pocket_cuda_flow_requested(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state)) return 0;
+    if (!pocket_cuda_groups_are_resident_compatible(state,
+                                                    POCKET_QG_FLOW_NET)) return 0;
+    const char *setting = getenv("MYNAH_CUDA_FLOW");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+static int pocket_cuda_codec_requested(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state)) return 0;
+    /* MYNAH_CUDA_CODEC predates Pocket and controls the generic NanoCodec
+     * resident experiment. Honor it as a compatibility kill switch, but give
+     * Pocket its own name so enabling/disabling one model family cannot be
+     * confused with the other. */
+    const char *setting = getenv("MYNAH_CUDA_POCKET_CODEC");
+    if (setting == NULL) setting = getenv("MYNAH_CUDA_CODEC");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+/* Keep the resident Mimi decoder independently switchable while bringing up
+ * the codec transformer.  This is also useful for parity diagnosis: the
+ * codec-transformer batch and the causal decoder can then be compared against
+ * the same CPU oracle one stage at a time. */
+static int pocket_cuda_decoder_requested(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state)) return 0;
+    const char *setting = getenv("MYNAH_CUDA_POCKET_DECODER");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+/* The released Pocket configuration pins the LSD time pair at {0, 1}.  Build
+ * the same BF16-rounded sinusoidal features once into persistent staging so a
+ * flow graph replay never depends on a stack buffer or a host allocation. */
+static int pocket_cuda_flow_time_features(const pocket_config *cfg, float *out) {
+    if (cfg == NULL || out == NULL || cfg->flow_time_conds != 2u ||
+        cfg->flow_freqs == 0u) return -1;
+    const double log_period = log(10000.0);
+    const size_t half = cfg->flow_freqs;
+    for (size_t t = 0; t < 2u; ++t) {
+        const float time = t == 0u ? 0.0f : 1.0f;
+        float *row = out + t * 2u * half;
+        for (size_t i = 0; i < half; ++i) {
+            float freq = (float)exp(-log_period * (double)i / (double)half);
+            uint32_t bits = 0u;
+            memcpy(&bits, &freq, sizeof(bits));
+            bits = (bits + UINT32_C(0x7fff) + ((bits >> 16) & 1u)) &
+                   UINT32_C(0xffff0000);
+            memcpy(&freq, &bits, sizeof(freq));
+            const float arg = time * freq;
+            row[i] = cosf(arg);
+            row[half + i] = sinf(arg);
+        }
+    }
+    return 0;
+}
+
+static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    const mynah_backend *backend =
+        (ctx->state == NULL) ? NULL : ctx->state->backend;
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, ctx->cuda_backbone_kv);
+        mynah_backend_dev_free(backend, ctx->cuda_x);
+        mynah_backend_dev_free(backend, ctx->cuda_norm);
+        mynah_backend_dev_free(backend, ctx->cuda_qkv);
+        mynah_backend_dev_free(backend, ctx->cuda_attn);
+        mynah_backend_dev_free(backend, ctx->cuda_proj);
+        mynah_backend_dev_free(backend, ctx->cuda_ffn);
+    }
+    ctx->cuda_backbone_kv = NULL;
+    ctx->cuda_x = NULL;
+    ctx->cuda_norm = NULL;
+    ctx->cuda_qkv = NULL;
+    ctx->cuda_attn = NULL;
+    ctx->cuda_proj = NULL;
+    ctx->cuda_ffn = NULL;
+    ctx->cuda_backbone_capacity = 0u;
+    ctx->cuda_backbone_kv_floats = 0u;
+    ctx->cuda_backbone_kv_bytes = 0u;
+    ctx->cuda_backbone_kv_bf16 = 0;
+    ctx->cuda_backbone_valid = 0;
+}
+
+static void pocket_cuda_codec_release(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    const mynah_backend *backend =
+        ctx->state == NULL ? NULL : ctx->state->backend;
+    if (backend != NULL && ctx->cuda_codec_kv != NULL) {
+        for (size_t l = 0; l < ctx->state->cfg.codec_tf_layers; ++l)
+            mynah_backend_dev_free(backend, ctx->cuda_codec_kv[l]);
+    }
+    free(ctx->cuda_codec_kv);
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, ctx->cuda_codec_x);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_norm);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_qkv);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_attn);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_proj);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_ffn);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_denorm);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_up_input);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_up);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_up_partial);
+    }
+    ctx->cuda_codec_kv = NULL;
+    ctx->cuda_codec_x = NULL;
+    ctx->cuda_codec_norm = NULL;
+    ctx->cuda_codec_qkv = NULL;
+    ctx->cuda_codec_attn = NULL;
+    ctx->cuda_codec_proj = NULL;
+    ctx->cuda_codec_ffn = NULL;
+    ctx->cuda_codec_denorm = NULL;
+    ctx->cuda_codec_up_input = NULL;
+    ctx->cuda_codec_up = NULL;
+    ctx->cuda_codec_up_partial = NULL;
+    ctx->cuda_codec_up_tail = 0u;
+    ctx->cuda_codec_upsample_enabled = 0;
+    ctx->cuda_codec_device_input_ready = 0;
+    ctx->cuda_codec_kv_positions = 0u;
+    ctx->cuda_codec_kv_half = 0u;
+    ctx->cuda_codec_kv_base = 0u;
+    ctx->cuda_codec_enabled = 0;
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 0;
+    ctx->cuda_codec_pending = 0;
+    ctx->cuda_codec_device_output_ready = 0;
+}
+
+/* Allocate one compact device KV window plus reusable single-context
+ * activations. The shared gang scratch below is preferred whenever the server
+ * has more than one pending decoder, but the context-owned buffers keep the
+ * optional CUDA codec path correct for the lane/offline entry point too. */
+static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || ctx->state == NULL ||
+        !pocket_cuda_codec_requested(ctx->state) ||
+        ctx->codec_transformer == NULL) return 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_backend *backend = state->backend;
+    const int codec_tf_resident =
+        pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_CODEC_TF);
+    const int codec_conv_f32 =
+        pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_CONV);
+    if (!codec_tf_resident) return 0;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    if (backend == NULL || tc == NULL || cfg->codec_tf_layers == 0u ||
+        cfg->codec_tf_dim == 0u || cfg->codec_tf_heads == 0u ||
+        cfg->codec_tf_ffn == 0u || cfg->latent_dim == 0u ||
+        cfg->codec_dim == 0u || cfg->upsample_stride == 0u ||
+        tc->context == 0u ||
+        tc->d_model != cfg->codec_tf_dim ||
+        tc->num_heads != cfg->codec_tf_heads ||
+        tc->head_dim != cfg->codec_tf_dim / cfg->codec_tf_heads ||
+        tc->num_layers != cfg->codec_tf_layers ||
+        tc->ffn_dim != cfg->codec_tf_ffn ||
+        tc->context != cfg->codec_tf_context ||
+        fabsf(tc->layernorm_eps - 1.0e-5f) > 1.0e-7f) return 0;
+    const size_t positions =
+        mynah_transformer_ar_state_kv_positions(ctx->codec_transformer);
+    const size_t half =
+        mynah_transformer_ar_state_kv_half_floats(ctx->codec_transformer);
+    size_t kv_floats = 0u;
+    size_t qkv_floats = 0u;
+    if (positions == 0u || half == 0u ||
+        pocket_mul(half, 2u, &kv_floats) != 0 ||
+        pocket_mul(cfg->codec_tf_dim, 3u, &qkv_floats) != 0) return 0;
+
+    char ignored[256];
+    /* A pooled set (MYNAH_CUDA_SLOT_POOL) brings its buffers when the window
+     * geometry matches exactly; its KV window is cleared below, because the
+     * Mimi ring must start as a fresh request's would. */
+    int reused_kv = 0;
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    if (slot != NULL && slot->codec_kv != NULL) {
+        if (slot->codec_kv_layers == cfg->codec_tf_layers &&
+            slot->codec_kv_positions == positions &&
+            slot->codec_kv_half == half) {
+            POCKET_SLOT_MOVE(ctx->cuda_codec_kv, slot->codec_kv);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_x, slot->codec_x);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_norm, slot->codec_norm);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_qkv, slot->codec_qkv);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_attn, slot->codec_attn);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_proj, slot->codec_proj);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_ffn, slot->codec_ffn);
+            reused_kv = 1;
+        }
+        pocket_cuda_slot_free_codec(backend, slot);
+    }
+    if (ctx->cuda_codec_kv == NULL)
+        ctx->cuda_codec_kv = (float **)calloc(cfg->codec_tf_layers,
+                                              sizeof(*ctx->cuda_codec_kv));
+    if (ctx->cuda_codec_kv == NULL) return 0;
+#define POCKET_CODEC_ALLOC(field, count)                                      \
+    do {                                                                       \
+        if ((field) == NULL &&                                                 \
+            mynah_backend_dev_alloc(backend, (count), &(field), ignored,     \
+                                     sizeof(ignored)) != 0)                    \
+            goto fail;                                                         \
+    } while (0)
+    for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+        POCKET_CODEC_ALLOC(ctx->cuda_codec_kv[l], kv_floats);
+        if (reused_kv &&
+            mynah_backend_zero_dev(backend, ctx->cuda_codec_kv[l], kv_floats,
+                                   ignored, sizeof(ignored)) != 0)
+            goto fail;
+    }
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_x, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_norm, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_qkv, qkv_floats);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_attn, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_proj, cfg->codec_tf_dim);
+    POCKET_CODEC_ALLOC(ctx->cuda_codec_ffn, cfg->codec_tf_ffn);
+    if (codec_conv_f32) {
+        size_t up_floats = 0u;
+        size_t up_tail_floats = 0u;
+        const size_t up_tail = mynah_seanet_state_upsample_tail(ctx->codec);
+        if (pocket_mul(cfg->upsample_stride, cfg->codec_dim, &up_floats) != 0 ||
+            pocket_mul(up_tail, cfg->codec_dim, &up_tail_floats) != 0)
+            goto fail;
+        int reused_up = 0;
+        if (slot != NULL && slot->codec_upsample &&
+            slot->codec_up_tail == up_tail) {
+            reused_up = 1;
+            POCKET_SLOT_MOVE(ctx->cuda_codec_denorm, slot->codec_denorm);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_up_input, slot->codec_up_input);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_up, slot->codec_up);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_up_partial, slot->codec_up_partial);
+        }
+        if (slot != NULL) pocket_cuda_slot_free_upsample(backend, slot);
+        POCKET_CODEC_ALLOC(ctx->cuda_codec_denorm, cfg->latent_dim);
+        POCKET_CODEC_ALLOC(ctx->cuda_codec_up_input, cfg->codec_dim);
+        POCKET_CODEC_ALLOC(ctx->cuda_codec_up, up_floats);
+        if (up_tail_floats > 0u) {
+            POCKET_CODEC_ALLOC(ctx->cuda_codec_up_partial, up_tail_floats);
+            /* The carried upsample tail is request state; the prologue clears
+             * it again, this keeps a reused buffer clean before that. */
+            if (reused_up &&
+                mynah_backend_zero_dev(backend, ctx->cuda_codec_up_partial,
+                                       up_tail_floats, ignored,
+                                       sizeof(ignored)) != 0)
+                goto fail;
+        }
+        ctx->cuda_codec_up_tail = up_tail;
+        ctx->cuda_codec_upsample_enabled = 1;
+    }
+#undef POCKET_CODEC_ALLOC
+    ctx->cuda_codec_kv_positions = positions;
+    ctx->cuda_codec_kv_half = half;
+    ctx->cuda_codec_kv_base = 0u;
+    ctx->cuda_codec_enabled = 1;
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 0;
+    ctx->cuda_codec_pending = 0;
+    ctx->cuda_codec_device_input_ready = 0;
+    return 0;
+fail:
+    pocket_cuda_codec_release(ctx);
+    return 0;
+}
+
+/* Drop only the optional device-side quantizer/upsample state.  The resident
+ * decoder-transformer can still consume the CPU-produced codec sequence, so
+ * a transient failure here does not force the whole codec backend off. */
+static void pocket_cuda_codec_upsample_disable(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    const mynah_backend *backend =
+        ctx->state == NULL ? NULL : ctx->state->backend;
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, ctx->cuda_codec_denorm);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_up_input);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_up);
+        mynah_backend_dev_free(backend, ctx->cuda_codec_up_partial);
+    }
+    ctx->cuda_codec_denorm = NULL;
+    ctx->cuda_codec_up_input = NULL;
+    ctx->cuda_codec_up = NULL;
+    ctx->cuda_codec_up_partial = NULL;
+    ctx->cuda_codec_up_tail = 0u;
+    ctx->cuda_codec_upsample_enabled = 0;
+    ctx->cuda_codec_device_input_ready = 0;
+    ctx->cuda_codec_gang_upsampled = 0;
+}
+
+/* The CPU SEANet state is reset at request start. Mirror that reset on the
+ * resident upsample tail before the first latent is queued. */
+static void pocket_cuda_codec_upsample_reset(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    ctx->cuda_codec_device_input_ready = 0;
+    ctx->cuda_codec_gang_upsampled = 0;
+    if (!ctx->cuda_codec_upsample_enabled ||
+        ctx->cuda_codec_up_partial == NULL || ctx->state == NULL) return;
+    size_t count = 0u;
+    if (pocket_mul(ctx->state->cfg.codec_dim, ctx->cuda_codec_up_tail,
+                   &count) != 0 || count == 0u) {
+        pocket_cuda_codec_upsample_disable(ctx);
+        return;
+    }
+    char local[256];
+    if (mynah_backend_zero_dev(ctx->state->backend,
+                               ctx->cuda_codec_up_partial, count, local,
+                               sizeof(local)) != 0) {
+        char drain[256];
+        (void)mynah_backend_sync(ctx->state->backend, drain, sizeof(drain));
+        pocket_cuda_codec_upsample_disable(ctx);
+    }
+}
+
+/* Import only the carried depthwise-upsample tail.  The CPU SEANet state does
+ * not advance while the resident upsample is active, so this is the minimum
+ * state required to resume on CPU after a launch/API failure. */
+static int pocket_cuda_codec_import_upsample_tail(mynah_engine_ctx *ctx,
+                                                  char *error,
+                                                  size_t capacity) {
+    if (ctx == NULL || ctx->state == NULL ||
+        !ctx->cuda_codec_upsample_enabled || ctx->cuda_codec_up_tail == 0u)
+        return 0;
+    if (ctx->cuda_codec_up_partial == NULL || ctx->codec_up == NULL) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA upsample tail storage is unavailable");
+        return -1;
+    }
+    const size_t channels = ctx->state->cfg.codec_dim;
+    size_t count = 0u;
+    if (pocket_mul(channels, ctx->cuda_codec_up_tail, &count) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA upsample tail size overflow");
+        return -1;
+    }
+    char local[256];
+    local[0] = '\0';
+    if (mynah_backend_d2h(ctx->state->backend, ctx->cuda_codec_up_partial,
+                          ctx->codec_up, count, local, sizeof(local)) != 0 ||
+        mynah_backend_sync(ctx->state->backend, local, sizeof(local)) != 0 ||
+        mynah_seanet_state_set_upsample_tail(
+            ctx->codec, ctx->codec_up, channels, ctx->cuda_codec_up_tail) != 0) {
+        pocket_error(error, capacity, "%s", local[0] != '\0'
+                                             ? local
+                                             : "pocket: CUDA upsample tail import failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* Queue the host denormalised latent through the resident quantizer
+ * projection and the stateful depthwise Mimi upsample. The output remains on
+ * device in row-major [stride][codec_dim] form for the decoder-transformer;
+ * only a bounded host fallback import is needed if a later CUDA operation
+ * refuses the frame. */
+static int pocket_cuda_codec_upsample_prepare(mynah_engine_ctx *ctx,
+                                              char *error, size_t capacity) {
+    if (ctx == NULL || ctx->state == NULL ||
+        !ctx->cuda_codec_upsample_enabled ||
+        ctx->cuda_codec_denorm == NULL || ctx->cuda_codec_up_input == NULL ||
+        ctx->cuda_codec_up == NULL ||
+        ctx->codec_transformer == NULL) return 1;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    if (!pocket_cuda_groups_are_f32(state, POCKET_QG_CODEC_CONV)) return 1;
+    const size_t stride = cfg->upsample_stride;
+    const size_t tail = ctx->cuda_codec_up_tail;
+    size_t kernel = 0u;
+    if (stride == 0u || cfg->latent_dim == 0u || cfg->codec_dim == 0u ||
+        pocket_add(stride, tail, &kernel) != 0 || kernel > (size_t)INT_MAX ||
+        stride > (size_t)INT_MAX || cfg->latent_dim > (size_t)INT_MAX ||
+        cfg->codec_dim > (size_t)INT_MAX ||
+        (tail > 0u && ctx->cuda_codec_up_partial == NULL))
+        return 1;
+    char local[256];
+    local[0] = '\0';
+    int failed = mynah_backend_batch_begin(state->backend, local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_h2d(state->backend, ctx->denorm,
+                                    ctx->cuda_codec_denorm, cfg->latent_dim,
+                                    local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_matvec_dev(
+                     state->backend, ctx->cuda_codec_denorm,
+                     ctx->cuda_codec_up_input, cfg->latent_dim, cfg->codec_dim,
+                     state->quantizer_proj, NULL, local, sizeof(local)) != 0;
+    if (!failed)
+        failed = mynah_backend_conv_transpose_causal_step_dev(
+                     state->backend, ctx->cuda_codec_up_input,
+                     ctx->cuda_codec_up, ctx->cuda_codec_up_partial,
+                     (int)cfg->codec_dim, (int)kernel, (int)stride,
+                     state->upsample.weight, state->upsample.bias, local,
+                     sizeof(local)) != 0;
+    if (failed) {
+        char drain[256];
+        drain[0] = '\0';
+        if (mynah_backend_sync(state->backend, drain, sizeof(drain)) != 0 ||
+            pocket_cuda_codec_import_upsample_tail(ctx, error, capacity) != 0) {
+            if (error != NULL && capacity > 0u && error[0] == '\0')
+                pocket_error(error, capacity, "%s", drain[0] != '\0'
+                                                      ? drain
+                                                      : "pocket: CUDA upsample failure lost its causal state");
+            pocket_cuda_codec_upsample_disable(ctx);
+            return -1;
+        }
+        pocket_cuda_codec_upsample_disable(ctx);
+        return 1;
+    }
+    ctx->cuda_codec_device_input_ready = 1;
+    return 0;
+}
+
+/* Import the resident upsample output/tail before switching the request to
+ * the CPU transformer path. This is deliberately synchronous and bounded;
+ * it is a failure path, never the normal CUDA schedule. */
+static int pocket_cuda_codec_sync_host_upsample_input(mynah_engine_ctx *ctx,
+                                                       char *error,
+                                                       size_t capacity) {
+    if (ctx == NULL || ctx->state == NULL) return -1;
+    if (!ctx->cuda_codec_device_input_ready) return 0;
+    const pocket_config *cfg = &ctx->state->cfg;
+    size_t output_floats = 0u;
+    size_t tail_floats = 0u;
+    if (pocket_mul(cfg->upsample_stride, cfg->codec_dim, &output_floats) != 0 ||
+        pocket_mul(ctx->cuda_codec_up_tail, cfg->codec_dim, &tail_floats) != 0 ||
+        ctx->cuda_codec_up == NULL ||
+        (tail_floats > 0u && ctx->cuda_codec_up_partial == NULL) ||
+        mynah_backend_d2h(ctx->state->backend, ctx->cuda_codec_up,
+                          ctx->codec_seq, output_floats, error, capacity) != 0 ||
+        (tail_floats > 0u &&
+         mynah_backend_d2h(ctx->state->backend, ctx->cuda_codec_up_partial,
+                           ctx->codec_up, tail_floats, error, capacity) != 0) ||
+        mynah_backend_sync(ctx->state->backend, error, capacity) != 0) {
+        if (error != NULL && capacity > 0u && error[0] == '\0')
+            pocket_error(error, capacity,
+                         "pocket: CUDA upsample fallback synchronization failed");
+        return -1;
+    }
+    if (tail_floats > 0u &&
+        mynah_seanet_state_set_upsample_tail(
+            ctx->codec, ctx->codec_up, cfg->codec_dim,
+            ctx->cuda_codec_up_tail) != 0) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA upsample tail import failed");
+        return -1;
+    }
+    ctx->cuda_codec_device_input_ready = 0;
+    return 0;
+}
+
+static int pocket_cuda_codec_sync_host_window(mynah_engine_ctx *ctx,
+                                              char *error, size_t capacity);
+
+/* Compact the host Mimi cache before a device frame and upload it only when
+ * the sliding-window base changed. The host state remains authoritative for
+ * fallback; the device cache is a resident mirror of the same [K][V] window. */
+static int pocket_cuda_codec_prepare_window(mynah_engine_ctx *ctx,
+                                            size_t end_position, char *error,
+                                            size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_codec_enabled || ctx->codec_transformer == NULL)
+        return 1;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    if (tc == NULL) return -1;
+    const size_t offset =
+        mynah_transformer_ar_state_offset(ctx->codec_transformer);
+    const size_t expected_base =
+        offset >= tc->context ? offset - tc->context + 1u : 0u;
+    if (ctx->cuda_codec_valid && expected_base != ctx->cuda_codec_kv_base) {
+        /* The host cache is intentionally stale between frames.  Refresh it
+         * before transformer_ar compacts/rebases the host window, otherwise a
+         * later full H2D upload would put old device rows into new slots. */
+        char sync_error[256];
+        if (pocket_cuda_codec_sync_host_window(ctx, sync_error,
+                                               sizeof(sync_error)) != 0) {
+            pocket_error(error, capacity, "%s", sync_error);
+            return -1;
+        }
+    }
+    if (mynah_transformer_ar_state_prepare_window(ctx->codec_transformer,
+                                                   end_position) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA codec window cannot fit frame");
+        return -1;
+    }
+    const size_t base =
+        mynah_transformer_ar_state_kv_base(ctx->codec_transformer);
+    if (ctx->cuda_codec_valid && ctx->cuda_codec_kv_base == base) return 0;
+    const size_t half = ctx->cuda_codec_kv_half;
+    char local[256];
+    for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+        const float *host_k = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 0);
+        const float *host_v = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 1);
+        float *device = ctx->cuda_codec_kv[l];
+        if (host_k == NULL || host_v == NULL || device == NULL ||
+            mynah_backend_h2d(state->backend, host_k, device, half, local,
+                              sizeof(local)) != 0 ||
+            mynah_backend_h2d(state->backend, host_v, device + half, half, local,
+                              sizeof(local)) != 0) {
+            ctx->cuda_codec_valid = 0;
+            ctx->cuda_codec_needs_host_sync = 0;
+            return -1;
+        }
+    }
+    ctx->cuda_codec_kv_base = base;
+    ctx->cuda_codec_valid = 1;
+    ctx->cuda_codec_needs_host_sync = 0;
+    return 0;
+}
+
+/* Refresh the complete bounded KV window only at a rebase or a recoverable
+ * CUDA failure.  Keeping this off the normal frame path removes two D2H calls
+ * per layer per request while preserving the host transformer as a safe retry
+ * oracle. */
+static int pocket_cuda_codec_sync_host_window(mynah_engine_ctx *ctx, char *error,
+                                              size_t capacity) {
+    if (ctx == NULL || ctx->state == NULL || ctx->codec_transformer == NULL)
+        return -1;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    if (mynah_transformer_ar_state_kv_base(ctx->codec_transformer) !=
+        ctx->cuda_codec_kv_base) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA codec and host KV bases disagree");
+        return -1;
+    }
+    char local[256];
+    for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+        float *host_k = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 0);
+        float *host_v = mynah_transformer_ar_state_kv_window(
+            ctx->codec_transformer, l, 1);
+        float *device = ctx->cuda_codec_kv[l];
+        if (host_k == NULL || host_v == NULL || device == NULL ||
+            mynah_backend_d2h(state->backend, device, host_k,
+                              ctx->cuda_codec_kv_half, local, sizeof(local)) != 0 ||
+            mynah_backend_d2h(state->backend, device + ctx->cuda_codec_kv_half,
+                              host_v, ctx->cuda_codec_kv_half, local,
+                              sizeof(local)) != 0)
+            return -1;
+    }
+    const int result = mynah_backend_sync(state->backend, local, sizeof(local));
+    if (result == 0) ctx->cuda_codec_needs_host_sync = 0;
+    return result;
+}
+
+/* The host codec mirror is a correctness/debugging aid, not part of the
+ * resident CUDA graph.  Keep it enabled by default so stage dumps and the CPU
+ * fallback retain the same observability as the original CUDA bring-up.  A
+ * production GPU worker can set this to 0 once CUDA parity is qualified; the
+ * resident Mimi decoder then avoids one D2H transfer per codec frame entirely.
+ * The fallback path still imports the bounded upsample/KV state before it
+ * switches to the CPU transformer, so disabling the mirror does not weaken
+ * recoverability. */
+static int pocket_cuda_codec_host_mirror_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_CODEC_HOST_MIRROR");
+        /* A stage dump explicitly asks for host codec-transformer rows.  Do
+         * not let the performance switch silently make that diagnostic file
+         * contain stale rows. */
+        const int dump_requested = getenv("MYNAH_POCKET_DUMP") != NULL;
+        cached = (dump_requested || value == NULL || strcmp(value, "0") != 0)
+                     ? 1
+                     : 0;
+    }
+    return cached;
+}
+
+/* Keep one bounded host-handoff switch for bring-up and recovery.  The
+ * resident device handoff is the production default; forcing it off makes the
+ * codec transformer still run on CUDA while the decoder consumes the mirrored
+ * row-major output through the existing H2D boundary. */
+static int pocket_cuda_codec_device_handoff_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_CODEC_DEVICE_HANDOFF");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+static int pocket_cuda_codec_upsample_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_CODEC_UPSAMPLE");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+/* Cross-request codec gang on CUDA: one submission for every request's
+ * quantizer projection + causal upsample, and one D2H for every request's
+ * PCM, instead of one set of copies/launches per request.  Each row keeps
+ * the single-request reduction order, so it is on by default;
+ * MYNAH_CUDA_CODEC_GANG=0 restores the per-request schedule exactly. */
+static int pocket_cuda_codec_gang_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_CODEC_GANG");
+        cached = (value == NULL || strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* One complete Mimi decoder-transformer frame on the resident CUDA stream.
+ * It is intentionally the same layer order as transformer_ar.c: the only
+ * host boundary is the 16-row input/output and the bounded K/V shadow needed
+ * for a safe CPU retry. */
+static int pocket_cuda_codec_transform_one(mynah_engine_ctx *ctx,
+                                           mynah_engine_scratch *scratch,
+                                           char *error, size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_codec_enabled || ctx->state == NULL) return 1;
+    ctx->cuda_codec_device_output_ready = 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    const size_t stride = cfg->upsample_stride;
+    const size_t dim = cfg->codec_tf_dim;
+    const int device_input = ctx->cuda_codec_device_input_ready != 0;
+    size_t output_floats = 0u;
+    if (tc == NULL || stride == 0u || dim == 0u ||
+        ctx->cuda_codec_x == NULL || ctx->cuda_codec_norm == NULL ||
+        ctx->cuda_codec_qkv == NULL || ctx->cuda_codec_attn == NULL ||
+        ctx->cuda_codec_proj == NULL || ctx->cuda_codec_ffn == NULL ||
+        pocket_mul(stride, dim, &output_floats) != 0) return 1;
+    /* The official Pocket packs validate codec_tf_dim == codec_dim. Keep the
+     * check local as well: the resident decoder input has the latter layout,
+     * and a future model with an explicit projection must not silently alias
+     * the handoff. */
+    const int device_handoff = pocket_cuda_codec_device_handoff_enabled() &&
+                               cfg->codec_dim == dim &&
+                               ctx->cuda_decoder_enabled &&
+                               ctx->cuda_decoder_input != NULL;
+    const int host_mirror = !device_handoff ||
+                            pocket_cuda_codec_host_mirror_enabled();
+    /* The server's single-request lane still goes through this function when
+     * the scheduler has no neighbour to batch with.  Use the same pinned
+     * staging that the true cross-request tile uses, when the shared scratch
+     * is available, so pageable host memory does not turn an async copy into
+     * an implicit CPU-side staging/synchronisation point.  The standalone
+     * offline API has no driver scratch and keeps its exact compatibility
+     * path. */
+    float *host_input = ctx->codec_seq;
+    float *host_output = ctx->codec_out;
+    size_t host_batch_stride = dim;
+    int staged = 0;
+    if (scratch != NULL && scratch->cuda_codec_enabled &&
+        scratch->cuda_codec_batch_capacity > 0u &&
+        scratch->cuda_codec_host_input != NULL &&
+        scratch->cuda_codec_host_output != NULL) {
+        host_input = scratch->cuda_codec_host_input;
+        host_output = scratch->cuda_codec_host_output;
+        if (pocket_mul(scratch->cuda_codec_batch_capacity, dim,
+                       &host_batch_stride) != 0)
+            return 1;
+        staged = 1;
+    }
+    const size_t start = mynah_transformer_ar_state_offset(ctx->codec_transformer);
+    size_t end = 0u;
+    if (pocket_add(start, stride, &end) != 0 ||
+        pocket_cuda_codec_prepare_window(ctx, end, error, capacity) != 0) return 1;
+    char local[256];
+    char drain[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    for (size_t t = 0; t < stride; ++t) {
+        const size_t absolute = start + t;
+        const size_t relative = absolute - ctx->cuda_codec_kv_base;
+        const size_t window_absolute =
+            absolute >= tc->context ? absolute - tc->context + 1u : 0u;
+        if (window_absolute < ctx->cuda_codec_kv_base ||
+            window_absolute > absolute || relative >= ctx->cuda_codec_kv_positions)
+            goto fail_region;
+        const size_t window_slot = window_absolute - ctx->cuda_codec_kv_base;
+        const size_t attention_position = relative - window_slot;
+        if (device_input) {
+            if (mynah_backend_copy_dev(
+                    state->backend, ctx->cuda_codec_x,
+                    ctx->cuda_codec_up + t * dim, dim, local,
+                    sizeof(local)) != 0)
+                goto fail_region;
+        } else {
+            if (staged)
+                memcpy(host_input + t * host_batch_stride,
+                       ctx->codec_seq + t * dim,
+                       dim * sizeof(float));
+            if (mynah_backend_h2d(state->backend, staged
+                                      ? host_input + t * host_batch_stride
+                                      : ctx->codec_seq + t * dim,
+                                  ctx->cuda_codec_x, dim, local,
+                                  sizeof(local)) != 0)
+                goto fail_region;
+        }
+        for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+            const mynah_transformer_ar_layer *layer = &state->codec_layers[l];
+            float *device = ctx->cuda_codec_kv[l];
+            if (mynah_backend_layer_norm_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_norm,
+                    layer->norm1_weight, layer->norm1_bias, 1u, dim, local,
+                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_norm, ctx->cuda_codec_qkv, 1u, dim,
+                    3u * dim, layer->in_proj_weight, layer->in_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_rope_dev(state->backend, ctx->cuda_codec_qkv,
+                                       absolute, cfg->codec_tf_heads,
+                                       dim / cfg->codec_tf_heads, tc->max_period,
+                                       local, sizeof(local)) != 0 ||
+                mynah_backend_self_attention_dev(
+                    state->backend, ctx->cuda_codec_qkv,
+                    device + window_slot * dim,
+                    device + ctx->cuda_codec_kv_half + window_slot * dim,
+                    attention_position, dim, attention_position + 1u,
+                    cfg->codec_tf_heads,
+                    dim / cfg->codec_tf_heads,
+                    1.0f / sqrtf((float)(dim / cfg->codec_tf_heads)),
+                    ctx->cuda_codec_attn, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_attn, ctx->cuda_codec_proj, 1u,
+                    dim, dim, layer->out_proj_weight, layer->out_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_OUT_PROJ),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_add_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_proj,
+                    layer->layer_scale_1, dim, local, sizeof(local)) != 0 ||
+                mynah_backend_layer_norm_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_norm,
+                    layer->norm2_weight, layer->norm2_bias, 1u, dim, local,
+                    sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_norm, ctx->cuda_codec_ffn, 1u, dim,
+                    cfg->codec_tf_ffn, layer->linear1_weight,
+                    layer->linear1_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN1),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_gelu_dev(state->backend, ctx->cuda_codec_ffn,
+                                       cfg->codec_tf_ffn, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, ctx->cuda_codec_ffn, ctx->cuda_codec_proj, 1u,
+                    cfg->codec_tf_ffn, dim, layer->linear2_weight,
+                    layer->linear2_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN2),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_add_dev(
+                    state->backend, ctx->cuda_codec_x, ctx->cuda_codec_proj,
+                    layer->layer_scale_2, dim, local, sizeof(local)) != 0)
+                goto fail_region;
+        }
+        if (device_handoff &&
+            mynah_backend_scatter_row_to_channels_dev(
+                state->backend, ctx->cuda_codec_x, ctx->cuda_decoder_input,
+                dim, stride, t, local, sizeof(local)) != 0)
+            goto fail_region;
+        if (host_mirror &&
+            mynah_backend_d2h(state->backend, ctx->cuda_codec_x,
+                              host_output + t * host_batch_stride, dim, local,
+                              sizeof(local)) != 0)
+            goto fail_region;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (mynah_backend_sync(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    if (staged && host_mirror)
+        for (size_t t = 0; t < stride; ++t)
+            memcpy(ctx->codec_out + t * dim,
+                   host_output + t * host_batch_stride, dim * sizeof(float));
+    if (host_mirror && !pocket_all_finite(ctx->codec_out, output_floats))
+        goto fail;
+    if (mynah_transformer_ar_state_set_window_offset(ctx->codec_transformer, end, local,
+                                              sizeof(local)) != 0)
+        goto fail;
+    ctx->cuda_codec_device_input_ready = 0;
+    ctx->cuda_codec_device_output_ready = device_handoff;
+    ctx->cuda_codec_pending = 0;
+    return 0;
+
+fail_region:
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+fail:
+    (void)mynah_backend_sync(state->backend, drain, sizeof(drain));
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 1;
+    /* Leave the marker set so a frame-major caller can run the untouched CPU
+     * tile. The direct compatibility wrapper clears it before that fallback. */
+    ctx->cuda_codec_pending = 1;
+    /* Returning 1 asks the caller to run the untouched host transformer. */
+    return 1;
+}
+
+#define POCKET_CUDA_DECODER_GRAPH_KEY ((size_t)0x200000u)
+
+static void pocket_cuda_decoder_release(mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return;
+    const mynah_backend *backend =
+        ctx->state == NULL ? NULL : ctx->state->backend;
+    if (backend != NULL) {
+        if (ctx->cuda_decoder != NULL)
+            mynah_backend_graph_forget(backend, ctx->cuda_decoder);
+        mynah_backend_dev_free(backend, ctx->cuda_decoder_input);
+        mynah_backend_dev_free(backend, ctx->cuda_decoder_output);
+        mynah_backend_decoder_close(backend, ctx->cuda_decoder);
+    }
+    ctx->cuda_decoder = NULL;
+    ctx->cuda_decoder_input = NULL;
+    ctx->cuda_decoder_output = NULL;
+    ctx->cuda_decoder_enabled = 0;
+    ctx->cuda_decoder_graph_enabled = 0;
+    ctx->cuda_decoder_started = 0;
+    ctx->cuda_codec_device_output_ready = 0;
+}
+
+static int pocket_cuda_decoder_alloc(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->cuda_decoder_enabled || ctx->state == NULL ||
+        ctx->state->backend == NULL ||
+        strcmp(mynah_backend_name(ctx->state->backend), "cuda") != 0) return 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    /* The resident decoder is an f32 SEANet graph.  The CPU decoder has a
+     * separate int8 implementation for these two groups; using raw CUDA
+     * weights in that case would make the waveform backend-dependent.  f16 or
+     * int4 group requests currently leave the CPU conv stack exact f32, so they
+     * remain eligible until a future CUDA quantized decoder exists. */
+    if (state->codec_conv_qtype == 1 || state->codec_convtr_qtype == 1) {
+        ctx->cuda_decoder_enabled = 0;
+        return 0;
+    }
+    mynah_backend_decoder_desc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.channels = cfg->audio_channels;
+    desc.dimension = cfg->codec_dim;
+    desc.n_filters = cfg->n_filters;
+    desc.n_residual_layers = cfg->n_residual_layers;
+    desc.ratios = cfg->ratios;
+    desc.n_ratios = cfg->n_ratios;
+    desc.kernel_size = cfg->kernel_size;
+    desc.residual_kernel_size = cfg->residual_kernel_size;
+    desc.last_kernel_size = cfg->last_kernel_size;
+    desc.dilation_base = cfg->dilation_base;
+    desc.compress = cfg->compress;
+    desc.elu_alpha = cfg->elu_alpha;
+    desc.first = state->decoder.first;
+    desc.convtr = state->decoder.convtr;
+    desc.blocks = state->decoder.blocks;
+    desc.last = state->decoder.last;
+
+    char ignored[256];
+    ignored[0] = '\0';
+    size_t input_floats = 0;
+    size_t output_floats = 0;
+    /* A pooled decoder (MYNAH_CUDA_SLOT_POOL) was opened from the same model
+     * description.  Its causal rings are cleared here -- and again by the
+     * prologue, as for any request -- and its handoff buffers zeroed, so a
+     * new request never starts from the previous owner's audio. */
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    if (slot != NULL && slot->decoder != NULL) {
+        POCKET_SLOT_MOVE(ctx->cuda_decoder, slot->decoder);
+        POCKET_SLOT_MOVE(ctx->cuda_decoder_input, slot->decoder_input);
+        POCKET_SLOT_MOVE(ctx->cuda_decoder_output, slot->decoder_output);
+        if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, &input_floats) != 0 ||
+            pocket_mul(cfg->audio_channels, cfg->samples_per_frame,
+                       &output_floats) != 0 ||
+            ctx->cuda_decoder_input == NULL || ctx->cuda_decoder_output == NULL ||
+            mynah_backend_decoder_reset(state->backend, ctx->cuda_decoder,
+                                        ignored, sizeof(ignored)) != 0 ||
+            mynah_backend_zero_dev(state->backend, ctx->cuda_decoder_input,
+                                   input_floats, ignored, sizeof(ignored)) != 0 ||
+            mynah_backend_zero_dev(state->backend, ctx->cuda_decoder_output,
+                                   output_floats, ignored, sizeof(ignored)) != 0) {
+            /* Drop the pooled handle and open a fresh one below. */
+            pocket_cuda_drain_before_release(state->backend);
+            pocket_cuda_decoder_release(ctx);
+            ctx->cuda_decoder_enabled = 1;
+        } else {
+            const char *graphs = getenv("MYNAH_CUDA_GRAPHS");
+            ctx->cuda_decoder_graph_enabled =
+                graphs == NULL || strcmp(graphs, "0") != 0;
+            ctx->cuda_decoder_started = 0;
+            return 0;
+        }
+    }
+    if (mynah_backend_decoder_open(state->backend, &desc, cfg->upsample_stride,
+                                   &ctx->cuda_decoder, ignored,
+                                   sizeof(ignored)) != 0) {
+        ctx->cuda_decoder_enabled = 0;
+        return 0; /* optional backend: CPU remains authoritative */
+    }
+    if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, &input_floats) != 0 ||
+        pocket_mul(cfg->audio_channels, cfg->samples_per_frame, &output_floats) != 0 ||
+        mynah_backend_dev_alloc(state->backend, input_floats,
+                                &ctx->cuda_decoder_input, ignored,
+                                sizeof(ignored)) != 0 ||
+        mynah_backend_dev_alloc(state->backend, output_floats,
+                                &ctx->cuda_decoder_output, ignored,
+                                sizeof(ignored)) != 0) {
+        pocket_cuda_decoder_release(ctx);
+        return 0;
+    }
+    const char *graphs = getenv("MYNAH_CUDA_GRAPHS");
+    ctx->cuda_decoder_graph_enabled = graphs == NULL || strcmp(graphs, "0") != 0;
+    ctx->cuda_decoder_started = 0;
+    return 0;
+}
+
+/* Return the resident decoder's per-step buffer sizes.  Keeping this check in
+ * one place matters because the submit/collect split below is also used by the
+ * frame-major server gang: a failed size calculation must remain a pre-state
+ * optional-backend fallback, never a half-submitted decoder step. */
+static int pocket_cuda_decoder_sizes(const mynah_engine_ctx *ctx,
+                                     size_t *input_floats,
+                                     size_t *output_floats) {
+    if (input_floats != NULL) *input_floats = 0u;
+    if (output_floats != NULL) *output_floats = 0u;
+    if (ctx == NULL || ctx->state == NULL || input_floats == NULL ||
+        output_floats == NULL) return -1;
+    const pocket_config *cfg = &ctx->state->cfg;
+    if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, input_floats) != 0 ||
+        pocket_mul(cfg->audio_channels, cfg->samples_per_frame,
+                   output_floats) != 0) return -1;
+    return 0;
+}
+
+/* Return 0 when the resident decoder has queued this frame, 1 when the
+ * optional path is unavailable before it touched decoder state, and -1 after
+ * a launch/graph error. Once the GPU rings have advanced, silently switching
+ * to the CPU rings would be wrong, so that last case is request-fatal.
+ *
+ * This function intentionally stops before D2H and synchronization. The
+ * frame-major gang uses it for every active context, queues all output copies,
+ * then drains the common CUDA stream once. */
+static int pocket_cuda_decoder_submit(mynah_engine_ctx *ctx, char *error,
+                                      size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL)
+        return 1;
+    const mynah_backend *backend = ctx->state->backend;
+    const pocket_config *cfg = &ctx->state->cfg;
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+    if (pocket_cuda_decoder_sizes(ctx, &input_floats, &output_floats) != 0) {
+        if (ctx->cuda_decoder_started) {
+            pocket_error(error, capacity, "CUDA decoder size overflow after state advance");
+            return -1;
+        }
+        pocket_cuda_decoder_release(ctx);
+        return 1;
+    }
+    (void)output_floats;
+    char local[256];
+    local[0] = '\0';
+    if (!ctx->cuda_codec_device_output_ready) {
+        if (mynah_backend_h2d(backend, ctx->codec_back, ctx->cuda_decoder_input,
+                              input_floats, local, sizeof(local)) != 0) {
+            if (ctx->cuda_decoder_started) {
+                pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                   ? local
+                                                   : "CUDA decoder input copy failed after state advance");
+                return -1;
+            }
+            pocket_cuda_decoder_release(ctx);
+            return 1;
+        }
+    }
+
+    int capturing = 0;
+    int replay = 0;
+    int graph = 1;
+    if (ctx->cuda_decoder_graph_enabled) {
+        const int status = mynah_backend_graph_begin(
+            backend, POCKET_CUDA_DECODER_GRAPH_KEY, ctx->cuda_decoder, &replay,
+            local, sizeof(local));
+        if (status < 0) {
+            if (ctx->cuda_decoder_started) {
+                pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                   ? local
+                                                   : "CUDA decoder graph setup failed after state advance");
+                return -1;
+            }
+            pocket_cuda_decoder_release(ctx);
+            return 1;
+        }
+        if (status == 0) {
+            capturing = replay == 0;
+        } else {
+            graph = 0;
+            ctx->cuda_decoder_graph_enabled = 0;
+        }
+    } else {
+        graph = 0;
+    }
+
+    if (capturing || !graph) {
+        /* The first graph capture does not execute the kernels until replay;
+         * a non-graph call executes them directly. */
+        ctx->cuda_decoder_started = 1;
+        if (mynah_backend_decoder_step(backend, ctx->cuda_decoder,
+                                       ctx->cuda_decoder_input,
+                                       cfg->upsample_stride,
+                                       ctx->cuda_decoder_output, local,
+                                       sizeof(local)) != 0) {
+            if (capturing) mynah_backend_graph_abort(
+                backend, POCKET_CUDA_DECODER_GRAPH_KEY, ctx->cuda_decoder);
+            pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                                  : "CUDA decoder failed");
+            return -1;
+        }
+        if (capturing) {
+            if (mynah_backend_graph_end(backend, POCKET_CUDA_DECODER_GRAPH_KEY,
+                                         ctx->cuda_decoder, local,
+                                         sizeof(local)) == 0) {
+                capturing = 0;
+                if (mynah_backend_graph_launch(backend,
+                                               POCKET_CUDA_DECODER_GRAPH_KEY,
+                                               ctx->cuda_decoder, local,
+                                               sizeof(local)) != 0) {
+                    pocket_error(error, capacity, "%s", local[0] != '\0'
+                                      ? local : "CUDA decoder graph launch failed");
+                    return -1;
+                }
+                (void)mynah_backend_decoder_note_step(backend,
+                                                       ctx->cuda_decoder);
+            } else {
+                /* Capture is an optimization. Its failed capture did not
+                 * execute the recorded commands; run one ordinary step. */
+                ctx->cuda_decoder_graph_enabled = 0;
+                if (mynah_backend_decoder_step(backend, ctx->cuda_decoder,
+                                               ctx->cuda_decoder_input,
+                                               cfg->upsample_stride,
+                                               ctx->cuda_decoder_output, local,
+                                               sizeof(local)) != 0) {
+                    pocket_error(error, capacity, "%s", local[0] != '\0'
+                                  ? local : "CUDA decoder fallback failed");
+                    return -1;
+                }
+            }
+        }
+    } else if (replay) {
+        ctx->cuda_decoder_started = 1;
+        if (mynah_backend_graph_launch(backend, POCKET_CUDA_DECODER_GRAPH_KEY,
+                                       ctx->cuda_decoder, local,
+                                       sizeof(local)) != 0) {
+            pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                                  : "CUDA decoder graph replay failed");
+            return -1;
+        }
+        (void)mynah_backend_decoder_note_step(backend, ctx->cuda_decoder);
+    }
+    /* The handoff is valid for exactly this decoder submission. Keeping it
+     * sticky would let an accidental retry consume the previous frame. */
+    ctx->cuda_codec_device_output_ready = 0;
+    return 0;
+}
+
+/* Queue one true cross-request SEANet step.  The CUDA backend owns the
+ * arithmetic batch; this layer only validates that every request has the
+ * same resident topology, stages the device inputs, and preserves the
+ * pre-state optional fallback contract used by the single-request path.
+ *
+ * The CUDA backend may capture this exact stable decoder gang.  Its graph
+ * owns persistent pointer-table metadata, so the scheduler can change the
+ * input values every frame without retaining stack addresses.  A changing
+ * gang falls back to eager arithmetic; the individual decoder graph remains
+ * available for width-one/fallback work. */
+static int pocket_cuda_decoder_arithmetic_batch_enabled(void);
+
+static int pocket_cuda_decoder_submit_batch(
+    mynah_engine_ctx *const *ctxs, size_t count, char *error, size_t capacity) {
+    if (ctxs == NULL || count < 2u || count > POCKET_MAX_BATCH) return 1;
+    if (!pocket_cuda_decoder_arithmetic_batch_enabled()) return 1;
+
+    const mynah_backend *backend = NULL;
+    mynah_backend_decoder *decoders[POCKET_MAX_BATCH];
+    const float *inputs[POCKET_MAX_BATCH];
+    float *outputs[POCKET_MAX_BATCH];
+    size_t encoder_frames = 0u;
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+
+    /* Validate the complete gang before queuing any H2D copy.  A mixed model
+     * or a request that has already fallen back must not leave a half-staged
+     * batch behind the per-request compatibility loop. */
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state == NULL ||
+            !ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL ||
+            ctx->state->backend == NULL ||
+            strcmp(mynah_backend_name(ctx->state->backend), "cuda") != 0)
+            return 1;
+        if (backend == NULL) backend = ctx->state->backend;
+        if (ctx->state->backend != backend) return 1;
+
+        const size_t this_frames = ctx->state->cfg.upsample_stride;
+        size_t this_input = 0u;
+        size_t this_output = 0u;
+        if (pocket_cuda_decoder_sizes(ctx, &this_input, &this_output) != 0) {
+            if (ctx->cuda_decoder_started) {
+                pocket_error(error, capacity,
+                             "CUDA decoder batch input size overflow after state advance");
+                return -1;
+            }
+            return 1;
+        }
+        if (i == 0u) {
+            encoder_frames = this_frames;
+            input_floats = this_input;
+            output_floats = this_output;
+        } else if (this_frames != encoder_frames ||
+                   this_input != input_floats || this_output != output_floats) {
+            return 1;
+        }
+        decoders[i] = ctx->cuda_decoder;
+        inputs[i] = ctx->cuda_decoder_input;
+        outputs[i] = ctx->cuda_decoder_output;
+        if (inputs[i] == NULL || outputs[i] == NULL) return 1;
+    }
+
+    char local[256];
+    local[0] = '\0';
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx->cuda_codec_device_output_ready) continue;
+        if (mynah_backend_h2d(backend, ctx->codec_back,
+                              ctx->cuda_decoder_input, input_floats, local,
+                              sizeof(local)) != 0) {
+            if (ctx->cuda_decoder_started) {
+                pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                     ? local
+                                                     : "CUDA decoder batch input copy failed after state advance");
+                return -1;
+            }
+            /* This context never reached a decoder step.  It can safely be
+             * released and CPU-finished while the other candidates continue
+             * through the single-request compatibility path. */
+            pocket_cuda_decoder_release(ctx);
+            return 1;
+        }
+    }
+
+    const int result = mynah_backend_decoder_step_batch(
+        backend, decoders, inputs, count, encoder_frames, outputs, local,
+        sizeof(local));
+    if (result > 0) return 1;
+    if (result < 0) {
+        pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                 ? local
+                                                 : "CUDA decoder batch launch failed");
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        ctxs[i]->cuda_decoder_started = 1;
+        ctxs[i]->cuda_codec_device_output_ready = 0;
+    }
+    return 0;
+}
+
+/* Queue the resident decoder output into its host PCM buffer.  No sync is
+ * allowed here; callers must drain the backend once after all contexts in the
+ * gang have submitted their copies. */
+static int pocket_cuda_decoder_collect(mynah_engine_ctx *ctx, char *error,
+                                       size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL)
+        return -1;
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+    if (pocket_cuda_decoder_sizes(ctx, &input_floats, &output_floats) != 0) {
+        pocket_error(error, capacity, "CUDA decoder output size overflow");
+        return -1;
+    }
+    (void)input_floats;
+    char local[256];
+    local[0] = '\0';
+    if (mynah_backend_d2h(ctx->state->backend, ctx->cuda_decoder_output,
+                          ctx->pcm, output_floats, local, sizeof(local)) != 0) {
+        pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                              : "CUDA decoder output copy failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* Single-context compatibility wrapper.  Offline and streaming callers keep
+ * exactly the old semantics; only the gang scheduler uses submit/collect
+ * directly. */
+static int pocket_cuda_decoder_step(mynah_engine_ctx *ctx, char *error,
+                                    size_t capacity) {
+    const int submitted = pocket_cuda_decoder_submit(ctx, error, capacity);
+    if (submitted != 0) return submitted;
+    if (pocket_cuda_decoder_collect(ctx, error, capacity) != 0) return -1;
+    char local[256];
+    local[0] = '\0';
+    if (mynah_backend_sync(ctx->state->backend, local, sizeof(local)) != 0) {
+        pocket_error(error, capacity, "%s", local[0] != '\0' ? local
+                                                              : "CUDA decoder synchronization failed");
+        return -1;
+    }
+    size_t input_floats = 0u;
+    size_t output_floats = 0u;
+    if (pocket_cuda_decoder_sizes(ctx, &input_floats, &output_floats) != 0) {
+        pocket_error(error, capacity, "CUDA decoder output size overflow");
+        return -1;
+    }
+    (void)input_floats;
+    if (!pocket_all_finite(ctx->pcm, output_floats)) {
+        pocket_error(error, capacity, "CUDA decoder produced non-finite PCM");
+        return -1;
+    }
+    return 0;
+}
+
+static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->cuda_backbone_enabled || ctx->backbone == NULL) {
+        return 0;
+    }
+    if (!pocket_cuda_groups_are_resident_compatible(
+            ctx->state, POCKET_QG_ATTENTION | POCKET_QG_FFN)) {
+        /* Keep the CPU qmat graph authoritative for encodings that do not yet
+         * have a matching resident CUDA epilogue. Explicit INT8 is admitted
+         * only through MYNAH_CUDA_Q8. */
+        ctx->cuda_backbone_enabled = 0;
+        return 0;
+    }
+    const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    if (bc == NULL || cfg->heads == 0u || cfg->head_dim == 0u ||
+        cfg->layers == 0u || cfg->hidden_dim == 0u || cfg->ffn_dim == 0u ||
+        fabsf(cfg->layernorm_eps - 1.0e-5f) > 1.0e-7f) {
+        /* The CUDA layer-norm kernel currently implements the transformer
+         * family's fixed 1e-5 epsilon.  Unsupported metadata stays on CPU. */
+        ctx->cuda_backbone_enabled = 0;
+        return 0;
+    }
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        if (ctx->state->backbone_layers[l].layer_scale_1 != NULL ||
+            ctx->state->backbone_layers[l].layer_scale_2 != NULL) {
+            ctx->cuda_backbone_enabled = 0;
+            return 0;
+        }
+    }
+
+    size_t attn_dim = 0;
+    size_t layer_half = 0;
+    size_t layer_span = 0;
+    size_t kv_floats = 0;
+    size_t kv_bytes = 0;
+    size_t qkv = 0;
+    size_t position_bytes = 0;
+    const int kv_bf16 = pocket_cuda_kv_bf16_requested(ctx->state);
+    const size_t kv_element = kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    /* MYNAH_CUDA_KV_GROW: the device cache may start below the host state's
+     * `max_seq_len`; with it off (or a non-tile context) this is exactly the
+     * full capacity and every line below is what it was. */
+    size_t kv_capacity = pocket_cuda_kv_initial_capacity(ctx, bc->max_seq_len);
+    const int kv_growable = kv_capacity < bc->max_seq_len;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(kv_capacity, attn_dim, &layer_half) != 0 ||
+        pocket_mul(layer_half, 2u, &layer_span) != 0 ||
+        pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
+        pocket_mul(attn_dim, 3u, &qkv) != 0 ||
+        pocket_mul(kv_floats, kv_element, &kv_bytes) != 0 ||
+        pocket_mul(cfg->layers, 2u * attn_dim, &position_bytes) != 0 ||
+        pocket_mul(position_bytes, kv_element, &position_bytes) != 0 ||
+        position_bytes == 0u) {
+        ctx->cuda_backbone_enabled = 0;
+        return 0;
+    }
+
+    char ignored[256];
+    /* A pooled set (MYNAH_CUDA_SLOT_POOL) brings its buffers; the cache is
+     * kept when it is at least as large as this request needs, and only the
+     * cache is re-allocated otherwise.  Everything taken is owned by the
+     * context from here on, so the failure paths below free it. */
+    int reused_kv = 0;
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    if (slot != NULL && slot->bb_kv != NULL) {
+        const mynah_backend *backend = ctx->state->backend;
+        if (slot->bb_kv_bf16 == kv_bf16 &&
+            pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, kv_bytes, kv_growable)) {
+            ctx->cuda_backbone_kv = slot->bb_kv;
+            ctx->cuda_backbone_kv_bytes = slot->bb_kv_bytes;
+            reused_kv = 1;
+            if (kv_growable) {
+                /* A larger parked cache is capacity already paid for: lay it
+                 * out over all of its bytes (never past the host ceiling), so
+                 * the request grows later or not at all. */
+                size_t fits = slot->bb_kv_bytes / position_bytes;
+                if (fits > bc->max_seq_len) fits = bc->max_seq_len;
+                if (fits > kv_capacity) {
+                    kv_capacity = fits;
+                    kv_floats = cfg->layers * 2u * kv_capacity * attn_dim;
+                }
+            }
+        } else {
+            mynah_backend_dev_free(backend, slot->bb_kv);
+        }
+        slot->bb_kv = NULL;
+        slot->bb_kv_bytes = 0u;
+        POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
+        POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
+        POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
+        POCKET_SLOT_MOVE(ctx->cuda_attn, slot->bb_attn);
+        POCKET_SLOT_MOVE(ctx->cuda_proj, slot->bb_proj);
+        POCKET_SLOT_MOVE(ctx->cuda_ffn, slot->bb_ffn);
+    }
+#define POCKET_CUDA_ALLOC(field, count)                                      \
+    do {                                                                      \
+        ignored[0] = '\0';                                                    \
+        if ((field) == NULL &&                                                \
+            mynah_backend_dev_alloc(ctx->state->backend, (count), &(field),  \
+                                    ignored, sizeof(ignored)) != 0) {          \
+            pocket_cuda_backbone_release(ctx);                                \
+            ctx->cuda_backbone_enabled = 0;                                   \
+            return 0;                                                         \
+        }                                                                       \
+    } while (0)
+    ignored[0] = '\0';
+    if (ctx->cuda_backbone_kv == NULL) {
+        if (mynah_backend_dev_alloc_bytes(
+                ctx->state->backend, kv_bytes, (void **)&ctx->cuda_backbone_kv,
+                ignored, sizeof(ignored)) != 0) {
+            pocket_cuda_backbone_release(ctx);
+            ctx->cuda_backbone_enabled = 0;
+            return 0;
+        }
+        ctx->cuda_backbone_kv_bytes = kv_bytes;
+    } else if (reused_kv && pocket_cuda_slot_zero_kv_requested() &&
+               mynah_backend_zero_dev(ctx->state->backend,
+                                      ctx->cuda_backbone_kv,
+                                      ctx->cuda_backbone_kv_bytes /
+                                          sizeof(float),
+                                      ignored, sizeof(ignored)) != 0) {
+        pocket_cuda_backbone_release(ctx);
+        ctx->cuda_backbone_enabled = 0;
+        return 0;
+    }
+    POCKET_CUDA_ALLOC(ctx->cuda_x, cfg->hidden_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_norm, cfg->hidden_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_qkv, qkv);
+    POCKET_CUDA_ALLOC(ctx->cuda_attn, attn_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_proj, cfg->hidden_dim);
+    POCKET_CUDA_ALLOC(ctx->cuda_ffn, cfg->ffn_dim);
+#undef POCKET_CUDA_ALLOC
+    ctx->cuda_backbone_capacity = kv_capacity;
+    ctx->cuda_backbone_kv_floats = kv_floats;
+    ctx->cuda_backbone_kv_bf16 = kv_bf16;
+    ctx->cuda_backbone_valid = 0;
+    return 0;
+}
+
+/* Make the device backbone cache hold at least `needed` positions
+ * (MYNAH_CUDA_KV_GROW).  Called by every writer before it could pass the end:
+ * the prefill tile, the upload of a host prefix, the single-row step, the
+ * batched step and the step pre-flight.  Never inside a stream capture: the
+ * callers run it before `batch_begin`/`graph_begin`.
+ *
+ * All-or-nothing: the new cache is allocated and the live prefix of every
+ * layer's K and V planes copied into the wider layout before the old one is
+ * released, so a failure leaves the context on the cache it had.  The copy is
+ * of the host offset's worth of positions -- the only ones any kernel reads;
+ * anything past it is unreachable and overwritten before it becomes readable
+ * (the invariant `_state_reset` relies on).  A sync separates the copy from
+ * the free: the stream is the only one touching this cache, and growth is rare
+ * (a request that outlives its estimate, once per 256 frames).
+ *
+ * Nothing caches the old pointer or capacity past this call: the batched step
+ * rebuilds its per-layer pointer tables from `cuda_backbone_kv` every step
+ * (graph replay reads those host tables), the prefill tile rebuilds its
+ * kv/ring arrays every call, and the single-row step reads the fields
+ * directly. */
+static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
+                                        char *error, size_t capacity) {
+    if (ctx == NULL || ctx->cuda_backbone_kv == NULL ||
+        needed <= ctx->cuda_backbone_capacity)
+        return 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_backend *backend = state->backend;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    if (bc == NULL || needed > bc->max_seq_len ||
+        ctx->cuda_backbone_capacity == 0u) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA backbone KV cannot hold %zu positions", needed);
+        return -1;
+    }
+    const size_t old_capacity = ctx->cuda_backbone_capacity;
+    const size_t chunks = (needed - old_capacity + POCKET_CUDA_KV_GROW_CHUNK - 1u) /
+                          POCKET_CUDA_KV_GROW_CHUNK;
+    size_t new_capacity = bc->max_seq_len;
+    if (chunks <= (bc->max_seq_len - old_capacity) / POCKET_CUDA_KV_GROW_CHUNK)
+        new_capacity = old_capacity + chunks * POCKET_CUDA_KV_GROW_CHUNK;
+    const size_t element = ctx->cuda_backbone_kv_bf16 ? sizeof(uint16_t)
+                                                      : sizeof(float);
+    size_t attn_dim = 0u, old_half = 0u, new_half = 0u, new_floats = 0u;
+    size_t new_bytes = 0u, valid = 0u, valid_bytes = 0u;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(old_capacity, attn_dim, &old_half) != 0 ||
+        pocket_mul(new_capacity, attn_dim, &new_half) != 0 ||
+        pocket_mul(new_half, 2u * cfg->layers, &new_floats) != 0 ||
+        pocket_mul(new_floats, element, &new_bytes) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA KV growth size overflow");
+        return -1;
+    }
+    valid = mynah_transformer_ar_state_offset(ctx->backbone);
+    if (valid > old_capacity) valid = old_capacity;
+    valid_bytes = valid * attn_dim * element;
+
+    char local[256];
+    local[0] = '\0';
+    void *grown = NULL;
+    if (mynah_backend_dev_alloc_bytes(backend, new_bytes, &grown, local,
+                                      sizeof(local)) != 0 || grown == NULL) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA backbone KV growth %zu -> %zu positions: %s",
+                     old_capacity, new_capacity,
+                     local[0] != '\0' ? local : "out of device memory");
+        return -1;
+    }
+    const unsigned char *src = (const unsigned char *)ctx->cuda_backbone_kv;
+    unsigned char *dst = (unsigned char *)grown;
+    int failed = 0;
+    for (size_t l = 0; l < cfg->layers && valid_bytes > 0u && !failed; ++l) {
+        const size_t from_k = l * 2u * old_half * element;
+        const size_t to_k = l * 2u * new_half * element;
+        failed = mynah_backend_copy_dev_bytes(backend, dst + to_k, src + from_k,
+                                              valid_bytes, local,
+                                              sizeof(local)) != 0 ||
+                 mynah_backend_copy_dev_bytes(
+                     backend, dst + to_k + new_half * element,
+                     src + from_k + old_half * element, valid_bytes, local,
+                     sizeof(local)) != 0;
+    }
+    /* The copies must land before the old cache goes, and a failed copy must
+     * surface here rather than as a wrong attention later. */
+    if (!failed) failed = mynah_backend_sync(backend, local, sizeof(local)) != 0;
+    if (failed) {
+        pocket_cuda_drain_before_release(backend);
+        mynah_backend_dev_free(backend, (float *)grown);
+        pocket_error(error, capacity,
+                     "pocket: CUDA backbone KV growth copy: %s",
+                     local[0] != '\0' ? local : "failed");
+        return -1;
+    }
+    mynah_backend_dev_free(backend, ctx->cuda_backbone_kv);
+    ctx->cuda_backbone_kv = (float *)grown;
+    ctx->cuda_backbone_capacity = new_capacity;
+    ctx->cuda_backbone_kv_floats = new_floats;
+    ctx->cuda_backbone_kv_bytes = new_bytes;
+    if (pocket_cuda_kv_grow_logged())
+        fprintf(stderr,
+                "pocket: CUDA backbone KV grew %zu -> %zu positions "
+                "(%zu live, %zu bytes)\n",
+                old_capacity, new_capacity, valid, new_bytes);
+    return 0;
+}
+
+static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
+                                       size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_backbone_enabled ||
+        ctx->cuda_backbone_kv == NULL) {
+        return 1;
+    }
+    if (ctx->cuda_backbone_device_owned) {
+        pocket_error(error, capacity,
+                     "pocket: refusing to upload a stale host cache over a "
+                     "device-owned backbone");
+        return -1;
+    }
+    const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    const size_t half = mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+    size_t attn_dim = 0;
+    size_t device_layer_half = 0;
+    size_t layer_span = 0;
+    size_t kv_floats = 0;
+    size_t valid_floats = 0;
+    const size_t kv_element_bytes = ctx->cuda_backbone_kv_bf16
+                                        ? sizeof(uint16_t)
+                                        : sizeof(float);
+    const size_t position = mynah_transformer_ar_state_offset(ctx->backbone);
+    /* A growable device cache (MYNAH_CUDA_KV_GROW) may be shorter than the
+     * host prefix; widen it first.  The device stride is its own capacity. */
+    if (bc != NULL && position <= bc->max_seq_len &&
+        pocket_cuda_backbone_reserve(ctx, position, error, capacity) != 0) {
+        ctx->cuda_backbone_valid = 0;
+        return -1;
+    }
+    size_t device_floats = 0;
+    if (bc == NULL || position > bc->max_seq_len ||
+        position > ctx->cuda_backbone_capacity ||
+        pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(ctx->cuda_backbone_capacity, attn_dim,
+                   &device_layer_half) != 0 ||
+        pocket_mul(half, 2u, &layer_span) != 0 ||
+        pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
+        pocket_mul(cfg->layers, 2u * device_layer_half, &device_floats) != 0 ||
+        device_floats > ctx->cuda_backbone_kv_floats ||
+        pocket_mul(position, attn_dim, &valid_floats) != 0 ||
+        valid_floats > half) {
+        pocket_error(error, capacity, "pocket: CUDA KV upload size overflow");
+        return -1;
+    }
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        unsigned char *layer_base =
+            (unsigned char *)ctx->cuda_backbone_kv +
+            l * (device_layer_half * 2u) * kv_element_bytes;
+        void *destination = layer_base;
+        void *destination_v = layer_base + device_layer_half * kv_element_bytes;
+        const float *source = mynah_transformer_ar_state_kv(ctx->backbone, l);
+        if (source == NULL) {
+            ctx->cuda_backbone_valid = 0;
+            return -1;
+        }
+        /* The host cache is [K capacity][V capacity], but only the prefix up
+         * to the current offset can ever be read by attention.  Uploading the
+         * zero/unwritten tail made every new request pay for the full KV
+         * capacity (and, on 24L, dominated H2D traffic).  Keep the device
+         * layout unchanged and copy just the two live contiguous prefixes.
+         * A fully populated cache remains one copy, preserving the fast path
+         * for a future caller that legitimately fills the whole capacity.
+         * Validate the host shadow before the first H2D so an injected or
+         * corrupted value cannot leave a partially updated device cache. */
+        if (position == ctx->cuda_backbone_capacity &&
+            half == device_layer_half) {
+            if (!pocket_all_finite(source, layer_span)) {
+                ctx->cuda_backbone_valid = 0;
+                pocket_error(error, capacity,
+                             "pocket: CUDA KV upload has non-finite host data");
+                return -1;
+            }
+            const int failed = ctx->cuda_backbone_kv_bf16
+                ? mynah_backend_h2d_bf16(ctx->state->backend, source,
+                                         destination, layer_span, error,
+                                         capacity)
+                : mynah_backend_h2d(ctx->state->backend, source,
+                                    (float *)destination, layer_span, error,
+                                    capacity);
+            if (failed != 0) {
+                ctx->cuda_backbone_valid = 0;
+                return -1;
+            }
+        } else if (valid_floats > 0u) {
+            if (!pocket_all_finite(source, valid_floats) ||
+                !pocket_all_finite(source + half, valid_floats)) {
+                ctx->cuda_backbone_valid = 0;
+                pocket_error(error, capacity,
+                             "pocket: CUDA KV upload has non-finite host data");
+                return -1;
+            }
+            const int failed = ctx->cuda_backbone_kv_bf16
+                ? mynah_backend_h2d_bf16(ctx->state->backend, source,
+                                         destination, valid_floats, error,
+                                         capacity)
+                : mynah_backend_h2d(ctx->state->backend, source,
+                                    (float *)destination, valid_floats, error,
+                                    capacity);
+            if (failed != 0) {
+                ctx->cuda_backbone_valid = 0;
+                return -1;
+            }
+            const int failed_v = ctx->cuda_backbone_kv_bf16
+                ? mynah_backend_h2d_bf16(ctx->state->backend, source + half,
+                                         destination_v, valid_floats, error,
+                                         capacity)
+                : mynah_backend_h2d(ctx->state->backend, source + half,
+                                    (float *)destination_v, valid_floats, error,
+                                    capacity);
+            if (failed_v != 0) {
+                ctx->cuda_backbone_valid = 0;
+                return -1;
+            }
+        }
+    }
+    ctx->cuda_backbone_valid = 1;
+    return 0;
+}
+
+/* One resident Pocket autoregressive step.  The host state is deliberately
+ * committed only after the device output has been downloaded and validated;
+ * this lets the caller retry the same position on CPU after a recoverable CUDA
+ * failure without consuming a different KV position. */
+static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
+                                     size_t capacity) {
+    if (ctx == NULL || !ctx->cuda_backbone_enabled ||
+        ctx->cuda_backbone_kv == NULL) {
+        return 1; /* unavailable: use the normal CPU path */
+    }
+    const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_backend *backend = ctx->state->backend;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    if (bc == NULL || ctx->cuda_backbone_capacity == 0u ||
+        ctx->cuda_backbone_capacity > bc->max_seq_len ||
+        ctx->cuda_x == NULL || ctx->cuda_norm == NULL || ctx->cuda_qkv == NULL ||
+        ctx->cuda_attn == NULL || ctx->cuda_proj == NULL || ctx->cuda_ffn == NULL) {
+        return 1;
+    }
+    const size_t position = mynah_transformer_ar_state_offset(ctx->backbone);
+    if (position >= bc->max_seq_len) {
+        pocket_error(error, capacity, "pocket: CUDA backbone KV capacity exhausted");
+        return -1;
+    }
+    /* MYNAH_CUDA_KV_GROW: widen the device cache before this step writes past
+     * it.  Nothing is queued yet, so a failure leaves the row untouched: a
+     * host-shadowed row continues on CPU, a device-owned one fails. */
+    if (pocket_cuda_backbone_reserve(ctx, position + 1u, error, capacity) != 0) {
+        if (!ctx->cuda_backbone_device_owned) {
+            ctx->cuda_backbone_enabled = 0;
+            ctx->cuda_backbone_valid = 0;
+        }
+        return -1;
+    }
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
+    char local[256];
+    char drain_error[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(backend, local, sizeof(local)) != 0) goto fail;
+    if (!ctx->cuda_backbone_valid &&
+        pocket_cuda_backbone_upload(ctx, local, sizeof(local)) != 0) goto fail;
+    if (mynah_backend_h2d(backend, ctx->step_input, ctx->cuda_x,
+                          cfg->hidden_dim, local, sizeof(local)) != 0) goto fail;
+
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        const mynah_transformer_ar_layer *layer = &ctx->state->backbone_layers[l];
+        if (mynah_backend_layer_norm_dev(backend, ctx->cuda_x, ctx->cuda_norm,
+                                         layer->norm1_weight, layer->norm1_bias,
+                                         1u, cfg->hidden_dim, local,
+                                         sizeof(local)) != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_norm, ctx->cuda_qkv, 1u,
+                cfg->hidden_dim, 3u * attn_dim, layer->in_proj_weight,
+                layer->in_proj_bias,
+                pocket_cuda_tar_qtype(ctx->state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                local, sizeof(local)) != 0 ||
+            mynah_backend_rope_dev(backend, ctx->cuda_qkv, position, cfg->heads,
+                                   cfg->head_dim, bc->max_period, local,
+                                   sizeof(local)) != 0) goto fail;
+        void *layer_kv = pocket_cuda_kv_offset(
+            ctx->cuda_backbone_kv, l * (2u * layer_half),
+            ctx->cuda_backbone_kv_bf16);
+        void *layer_v = pocket_cuda_kv_offset(
+            ctx->cuda_backbone_kv, l * (2u * layer_half) + layer_half,
+            ctx->cuda_backbone_kv_bf16);
+        const int attention_failed = ctx->cuda_backbone_kv_bf16
+            ? mynah_backend_self_attention_bf16_dev(
+                  backend, ctx->cuda_qkv, layer_kv, layer_v, position,
+                  attn_dim, position + 1u, cfg->heads, cfg->head_dim,
+                  1.0f / sqrtf((float)cfg->head_dim), ctx->cuda_attn, local,
+                  sizeof(local))
+            : mynah_backend_self_attention_dev(
+                  backend, ctx->cuda_qkv, (float *)layer_kv, (float *)layer_v,
+                  position, attn_dim, position + 1u, cfg->heads, cfg->head_dim,
+                  1.0f / sqrtf((float)cfg->head_dim), ctx->cuda_attn, local,
+                  sizeof(local));
+        if (attention_failed != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_attn, ctx->cuda_proj, 1u, attn_dim,
+                cfg->hidden_dim, layer->out_proj_weight, layer->out_proj_bias,
+                pocket_cuda_tar_qtype(ctx->state, l,
+                                      MYNAH_TAR_LINEAR_OUT_PROJ),
+                local, sizeof(local)) != 0 ||
+            mynah_backend_residual_add_dev(backend, ctx->cuda_x, ctx->cuda_proj,
+                                           cfg->hidden_dim, local,
+                                           sizeof(local)) != 0 ||
+            mynah_backend_layer_norm_dev(backend, ctx->cuda_x, ctx->cuda_norm,
+                                         layer->norm2_weight, layer->norm2_bias,
+                                         1u, cfg->hidden_dim, local,
+                                         sizeof(local)) != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_norm, ctx->cuda_ffn, 1u,
+                cfg->hidden_dim, cfg->ffn_dim, layer->linear1_weight,
+                layer->linear1_bias,
+                pocket_cuda_tar_qtype(ctx->state, l, MYNAH_TAR_LINEAR_FFN1),
+                local, sizeof(local)) != 0 ||
+            mynah_backend_gelu_dev(backend, ctx->cuda_ffn, cfg->ffn_dim, local,
+                                   sizeof(local)) != 0 ||
+            pocket_cuda_linear_d2d(
+                ctx->state, ctx->cuda_ffn, ctx->cuda_proj, 1u,
+                cfg->ffn_dim, cfg->hidden_dim, layer->linear2_weight,
+                layer->linear2_bias,
+                pocket_cuda_tar_qtype(ctx->state, l, MYNAH_TAR_LINEAR_FFN2),
+                local, sizeof(local)) != 0 ||
+            mynah_backend_residual_add_dev(backend, ctx->cuda_x, ctx->cuda_proj,
+                                           cfg->hidden_dim, local,
+                                           sizeof(local)) != 0) goto fail;
+    }
+    if (mynah_backend_layer_norm_dev(
+            backend, ctx->cuda_x, ctx->cuda_norm, ctx->state->backbone.out_norm_weight,
+            ctx->state->backbone.out_norm_bias, 1u, cfg->hidden_dim, local,
+            sizeof(local)) != 0 ||
+        mynah_backend_d2h(backend, ctx->cuda_norm, ctx->hidden,
+                          cfg->hidden_dim, local, sizeof(local)) != 0) goto fail;
+    /* Keep only the newly appended K/V slot shadowed in the host cache.  The
+     * whole prefix stays resident, but this bounded copy is what makes a
+     * later recoverable CUDA failure safe to retry on CPU without replaying
+     * the request from the beginning. */
+    const size_t host_half =
+        mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+    const size_t host_slot = position * attn_dim;
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
+        void *device_k = pocket_cuda_kv_offset(
+            ctx->cuda_backbone_kv, l * (2u * layer_half) + host_slot,
+            ctx->cuda_backbone_kv_bf16);
+        void *device_v = pocket_cuda_kv_offset(
+            ctx->cuda_backbone_kv, l * (2u * layer_half) + layer_half + host_slot,
+            ctx->cuda_backbone_kv_bf16);
+        if (host_kv == NULL ||
+            (ctx->cuda_backbone_kv_bf16
+                 ? mynah_backend_d2h_bf16(backend, device_k,
+                                           host_kv + host_slot, attn_dim, local,
+                                           sizeof(local))
+                 : mynah_backend_d2h(backend, (float *)device_k,
+                                      host_kv + host_slot, attn_dim, local,
+                                      sizeof(local))) != 0 ||
+            (ctx->cuda_backbone_kv_bf16
+                 ? mynah_backend_d2h_bf16(backend, device_v,
+                                           host_kv + host_half + host_slot,
+                                           attn_dim, local, sizeof(local))
+                 : mynah_backend_d2h(backend, (float *)device_v,
+                                      host_kv + host_half + host_slot, attn_dim,
+                                      local, sizeof(local))) != 0) goto fail;
+    }
+    if (mynah_backend_sync(backend, local, sizeof(local)) != 0 ||
+        !pocket_all_finite(ctx->hidden, cfg->hidden_dim)) goto fail;
+    if (mynah_transformer_ar_state_set_offset(ctx->backbone, position + 1u,
+                                              local, sizeof(local)) != 0) goto fail;
+    if (error != NULL && capacity > 0u) error[0] = '\0';
+    return 0;
+
+fail:
+    /* A failed CUDA launch can leave the stream in an error state.  Do not
+     * pay the same failure on every following frame: the host cache is still
+     * authoritative, so this request can continue on CPU until its context is
+     * destroyed. */
+    (void)mynah_backend_sync(backend, drain_error, sizeof(drain_error));
+    ctx->cuda_backbone_enabled = 0;
+    ctx->cuda_backbone_valid = 0;
+    pocket_error(error, capacity, "%s",
+                 local[0] != '\0' ? local : "CUDA resident backbone failed");
+    return -1;
+}
+
+/* Cross-request CUDA batch: projections and residual/FFN work are stacked,
+ * while every row keeps its own KV pointer and absolute position.  A return of
+ * 1 means "not eligible" and leaves all host state untouched; -1 means a CUDA
+ * failure after submission and invalidates the resident caches so the caller
+ * can retry the same rows through the CPU implementation. */
+static int pocket_cuda_backbone_step_batch(
+    mynah_engine_ctx *const *ctxs, size_t count, mynah_engine_scratch *scratch,
+    const float *const *input_rows, float *const *output_rows, int mirror_host,
+    char *error, size_t capacity) {
+    if (ctxs == NULL || scratch == NULL || count < 2u ||
+        !scratch->cuda_batch_enabled || scratch->backend == NULL ||
+        count > scratch->cuda_batch_capacity || count > POCKET_MAX_BATCH) {
+        return 1;
+    }
+    const int prefill = input_rows != NULL;
+    if (prefill) scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = 0;
+    mynah_engine_ctx *first = ctxs[0];
+    if (first == NULL || first->state == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0) return 1;
+    const mynah_engine_state *state = first->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *first_config =
+        mynah_transformer_ar_state_config(first->backbone);
+    if (first_config == NULL) return 1;
+    const int kv_bf16 = first->cuda_backbone_kv_bf16;
+
+    if (scratch->cuda_kcache == NULL || scratch->cuda_vcache == NULL ||
+        scratch->cuda_positions == NULL || scratch->cuda_cache_strides == NULL ||
+        scratch->cuda_host_kv == NULL || scratch->cuda_kv_shadow == NULL) {
+        return 1;
+    }
+    size_t attn_dim = 0u;
+    size_t shadow_row = 0u;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(2u, attn_dim, &shadow_row) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA attention size overflow");
+        return 1;
+    }
+    size_t shadow_floats = 0u;
+    if (pocket_mul(cfg->layers, count, &shadow_floats) != 0 ||
+        pocket_mul(shadow_floats, shadow_row, &shadow_floats) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA KV shadow size overflow");
+        return 1;
+    }
+    int all_kv_valid = 1;
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || !ctx->cuda_backbone_enabled ||
+            ctx->cuda_backbone_kv == NULL || ctx->cuda_x == NULL ||
+            ctx->cuda_backbone_capacity == 0u ||
+            ctx->cuda_backbone_kv_bf16 != kv_bf16) return 1;
+        const mynah_transformer_ar_config *config =
+            mynah_transformer_ar_state_config(ctx->backbone);
+        if (config == NULL || config->d_model != first_config->d_model ||
+            config->num_heads != first_config->num_heads ||
+            config->head_dim != first_config->head_dim ||
+            config->num_layers != first_config->num_layers ||
+            config->ffn_dim != first_config->ffn_dim ||
+            config->max_period != first_config->max_period ||
+            config->layernorm_eps != first_config->layernorm_eps) return 1;
+        if (config->max_seq_len == 0u ||
+            ctx->cuda_backbone_capacity > config->max_seq_len) return 1;
+        scratch->cuda_positions[i] =
+            mynah_transformer_ar_state_offset(ctx->backbone);
+        if (scratch->cuda_positions[i] >= config->max_seq_len) return -1;
+        /* MYNAH_CUDA_KV_GROW: widen a short device cache here, before
+         * `batch_begin` and any graph capture.  The step pre-flight has
+         * normally done it already; a failure leaves every row untouched and
+         * reports "not eligible", so the per-row path decides the row. */
+        if (pocket_cuda_backbone_reserve(ctx, scratch->cuda_positions[i] + 1u,
+                                         NULL, 0u) != 0) return 1;
+        /* The resident KV allocation is [K/V][position][head].  max_seq_len
+         * is the extent of one cache plane, not the stride between positions.
+         * The old batch path multiplied by max_seq_len here, so the first
+         * multi-request step wrote past every per-request cache while the
+         * single-request path (which already uses attn_dim) stayed correct. */
+        scratch->cuda_cache_strides[i] = attn_dim;
+        if (!ctx->cuda_backbone_valid) all_kv_valid = 0;
+        const float *input = input_rows != NULL ? input_rows[i] : ctx->step_input;
+        if (input == NULL) return 1;
+        memcpy(scratch->cuda_host_input + i * cfg->hidden_dim, input,
+               cfg->hidden_dim * sizeof(float));
+    }
+    /* Graph replay reads one persistent host pointer table per transformer
+     * layer.  The table cannot be a stack array and it cannot be shared by all
+     * layers: each layer owns a different KV allocation, while the captured
+     * memcpy nodes are replayed later with new requests. */
+    for (size_t l = 0; l < cfg->layers; ++l) {
+        for (size_t i = 0; i < count; ++i) {
+            const mynah_transformer_ar_config *config =
+                mynah_transformer_ar_state_config(ctxs[i]->backbone);
+            size_t layer_half = 0u;
+            size_t layer_span = 0u;
+            size_t layer_offset = 0u;
+            if (config == NULL ||
+                pocket_mul(ctxs[i]->cuda_backbone_capacity, attn_dim,
+                           &layer_half) != 0 ||
+                pocket_mul(layer_half, 2u, &layer_span) != 0 ||
+                pocket_mul(l, layer_span, &layer_offset) != 0) return -1;
+            const size_t metadata_offset = l * scratch->cuda_batch_capacity + i;
+            scratch->cuda_kcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
+                ctxs[i]->cuda_backbone_kv, layer_offset, kv_bf16);
+            scratch->cuda_vcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
+                ctxs[i]->cuda_backbone_kv, layer_offset + layer_half, kv_bf16);
+        }
+    }
+
+    char local[256];
+    char drain_error[256];
+    int graph_replay = 0;
+    int graph_capture = 0;
+    const size_t graph_key = prefill
+        ? POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE + count
+        : (scratch->cuda_condition_ready
+               ? POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE + count
+               : count);
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0)
+        goto fail;
+    if (scratch->cuda_graph_enabled && scratch->cuda_graph_ready && all_kv_valid) {
+        const int graph_rc = mynah_backend_graph_begin(
+            scratch->backend, graph_key, scratch, &graph_replay, local,
+            sizeof(local));
+        if (graph_rc < 0) goto fail;
+        if (graph_rc == 0) graph_capture = !graph_replay;
+    }
+
+    if (graph_replay) {
+        if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch, local,
+                                       sizeof(local)) != 0) goto fail;
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            mynah_engine_ctx *ctx = ctxs[i];
+            if (!ctx->cuda_backbone_valid &&
+                pocket_cuda_backbone_upload(ctx, local, sizeof(local)) != 0)
+                goto fail;
+        }
+        if (!scratch->cuda_condition_ready &&
+            mynah_backend_h2d(scratch->backend, scratch->cuda_host_input,
+                              scratch->cuda_x, count * cfg->hidden_dim, local,
+                              sizeof(local)) != 0) goto fail;
+
+        for (size_t l = 0; l < cfg->layers; ++l) {
+            const mynah_transformer_ar_layer *layer = &state->backbone_layers[l];
+            if (mynah_backend_layer_norm_dev(
+                    scratch->backend, scratch->cuda_x, scratch->cuda_norm,
+                    layer->norm1_weight, layer->norm1_bias, count,
+                    cfg->hidden_dim, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_norm, scratch->cuda_qkv, count,
+                    cfg->hidden_dim, 3u * attn_dim, layer->in_proj_weight,
+                    layer->in_proj_bias,
+                    pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                    local, sizeof(local)) != 0) goto fail;
+            if (mynah_backend_rope_batch_dev(
+                    scratch->backend, scratch->cuda_qkv,
+                    scratch->cuda_positions, count, cfg->heads, cfg->head_dim,
+                    first_config->max_period, local, sizeof(local)) != 0)
+                goto fail;
+            const int attention_failed = kv_bf16
+                ? mynah_backend_self_attention_bf16_batch_dev(
+                      scratch->backend, scratch->cuda_qkv,
+                      (void *const *)(scratch->cuda_kcache +
+                                      l * scratch->cuda_batch_capacity),
+                      (void *const *)(scratch->cuda_vcache +
+                                      l * scratch->cuda_batch_capacity),
+                      scratch->cuda_positions, scratch->cuda_cache_strides,
+                      count, cfg->heads, cfg->head_dim,
+                      1.0f / sqrtf((float)cfg->head_dim), scratch->cuda_attn,
+                      local, sizeof(local))
+                : mynah_backend_self_attention_batch_dev(
+                      scratch->backend, scratch->cuda_qkv,
+                      scratch->cuda_kcache + l * scratch->cuda_batch_capacity,
+                      scratch->cuda_vcache + l * scratch->cuda_batch_capacity,
+                      scratch->cuda_positions, scratch->cuda_cache_strides,
+                      count, cfg->heads, cfg->head_dim,
+                      1.0f / sqrtf((float)cfg->head_dim), scratch->cuda_attn,
+                      local, sizeof(local));
+            if (attention_failed != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_attn, scratch->cuda_proj, count,
+                    attn_dim, cfg->hidden_dim, layer->out_proj_weight,
+                    layer->out_proj_bias,
+                    pocket_cuda_tar_qtype(state, l,
+                                          MYNAH_TAR_LINEAR_OUT_PROJ),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_residual_add_dev(
+                    scratch->backend, scratch->cuda_x, scratch->cuda_proj,
+                    count * cfg->hidden_dim, local, sizeof(local)) != 0 ||
+                mynah_backend_layer_norm_dev(
+                    scratch->backend, scratch->cuda_x, scratch->cuda_norm,
+                    layer->norm2_weight, layer->norm2_bias, count,
+                    cfg->hidden_dim, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_norm, scratch->cuda_ffn, count,
+                    cfg->hidden_dim, cfg->ffn_dim, layer->linear1_weight,
+                    layer->linear1_bias,
+                    pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_FFN1),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_gelu_dev(scratch->backend, scratch->cuda_ffn,
+                                       count * cfg->ffn_dim, local,
+                                       sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_ffn, scratch->cuda_proj, count,
+                    cfg->ffn_dim, cfg->hidden_dim, layer->linear2_weight,
+                    layer->linear2_bias,
+                    pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_FFN2),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_residual_add_dev(
+                    scratch->backend, scratch->cuda_x, scratch->cuda_proj,
+                    count * cfg->hidden_dim, local, sizeof(local)) != 0 ||
+                (mirror_host &&
+                 (kv_bf16
+                      ? mynah_backend_gather_kv_bf16_batch(
+                            scratch->backend,
+                            (void *const *)(scratch->cuda_kcache +
+                                            l * scratch->cuda_batch_capacity),
+                            (void *const *)(scratch->cuda_vcache +
+                                            l * scratch->cuda_batch_capacity),
+                            scratch->cuda_positions,
+                            scratch->cuda_cache_strides, count, cfg->heads,
+                            cfg->head_dim,
+                            scratch->cuda_kv_shadow + l * count * shadow_row,
+                            local, sizeof(local))
+                      : mynah_backend_gather_kv_batch(
+                            scratch->backend,
+                            scratch->cuda_kcache + l * scratch->cuda_batch_capacity,
+                            scratch->cuda_vcache + l * scratch->cuda_batch_capacity,
+                            scratch->cuda_positions,
+                            scratch->cuda_cache_strides, count, cfg->heads,
+                            cfg->head_dim,
+                            scratch->cuda_kv_shadow + l * count * shadow_row,
+                            local, sizeof(local))) != 0)) goto fail;
+        }
+        if (mynah_backend_layer_norm_dev(
+                scratch->backend, scratch->cuda_x, scratch->cuda_norm,
+                state->backbone.out_norm_weight,
+                state->backbone.out_norm_bias, count, cfg->hidden_dim, local,
+                sizeof(local)) != 0 ||
+            ( (!prefill || output_rows != NULL) &&
+              mynah_backend_d2h(scratch->backend, scratch->cuda_norm,
+                                scratch->cuda_host_output,
+                                count * cfg->hidden_dim, local,
+                                sizeof(local)) != 0) ||
+            (mirror_host &&
+             mynah_backend_d2h(scratch->backend, scratch->cuda_kv_shadow,
+                               scratch->cuda_host_kv, shadow_floats, local,
+                               sizeof(local)) != 0)) goto fail;
+
+        if (graph_capture) {
+            if (mynah_backend_graph_end(scratch->backend, graph_key, scratch,
+                                         local, sizeof(local)) != 0) {
+                scratch->cuda_graph_ready = 0;
+                mynah_backend_graph_abort(scratch->backend, graph_key, scratch);
+                return 1;
+            }
+            graph_capture = 0;
+            if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
+                                            local, sizeof(local)) != 0) goto fail;
+        }
+    }
+    if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) goto fail;
+    if (!prefill || output_rows != NULL) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!pocket_all_finite(
+                    scratch->cuda_host_output + i * cfg->hidden_dim,
+                    cfg->hidden_dim)) goto fail;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            float *output = output_rows != NULL ? output_rows[i] : ctxs[i]->hidden;
+            if (output == NULL) goto fail;
+            memcpy(output, scratch->cuda_host_output + i * cfg->hidden_dim,
+                   cfg->hidden_dim * sizeof(float));
+        }
+    }
+    /* The graph and the ordinary path both gather only the newly appended
+     * slot.  Commit it to the host shadow after the one stream sync; the large
+     * prefix remains device-resident. */
+    if (mirror_host) {
+        for (size_t l = 0; l < cfg->layers; ++l) {
+            for (size_t i = 0; i < count; ++i) {
+                mynah_engine_ctx *ctx = ctxs[i];
+                float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
+                const size_t host_half =
+                    mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+                const size_t host_slot = scratch->cuda_positions[i] * attn_dim;
+                const float *shadow = scratch->cuda_host_kv +
+                    l * count * shadow_row + i * shadow_row;
+                if (host_kv == NULL) goto fail;
+                memcpy(host_kv + host_slot, shadow, attn_dim * sizeof(float));
+                memcpy(host_kv + host_half + host_slot, shadow + attn_dim,
+                       attn_dim * sizeof(float));
+            }
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (mynah_transformer_ar_state_set_offset(
+                ctxs[i]->backbone, scratch->cuda_positions[i] + 1u, local,
+                sizeof(local)) != 0) {
+            for (size_t j = 0; j < i; ++j) {
+                (void)mynah_transformer_ar_state_set_offset(
+                    ctxs[j]->backbone, scratch->cuda_positions[j], NULL, 0u);
+            }
+            goto fail;
+        }
+    }
+    /* The upload above establishes the device prefix for every row.  Mark it
+     * valid only after the complete step, so the next batch neither reuploads
+     * the whole voice/text prefix nor suppresses graph capture forever. */
+    for (size_t i = 0; i < count; ++i) ctxs[i]->cuda_backbone_valid = 1;
+    scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = (!prefill || output_rows != NULL) ? 1 : 0;
+    if (scratch->cuda_graph_enabled) scratch->cuda_graph_ready = 1;
+    if (error != NULL && capacity > 0u) error[0] = '\0';
+    return 0;
+
+fail:
+    scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = 0;
+    if (graph_capture) {
+        mynah_backend_graph_abort(scratch->backend, graph_key, scratch);
+    }
+    if (scratch->cuda_graph_enabled) {
+        scratch->cuda_graph_ready = 0;
+        mynah_backend_graph_forget(scratch->backend, scratch);
+    }
+    (void)mynah_backend_sync(scratch->backend, drain_error, sizeof(drain_error));
+    for (size_t i = 0; i < count; ++i) {
+        ctxs[i]->cuda_backbone_enabled = 0;
+        ctxs[i]->cuda_backbone_valid = 0;
+    }
+    pocket_error(error, capacity, "%s",
+                 local[0] != '\0' ? local : "CUDA resident backbone batch failed");
+    return -1;
+}
+
+#define POCKET_CUDA_FLOW_GRAPH_BASE ((size_t)0x100000u)
+
+/* Resident Pocket flow head for the subset of rows that actually emitted a
+ * latent. The first call warms all weight caches on the ordinary stream; the
+ * next call captures/replays one graph per gathered width. A failure only
+ * disables this optional stage and leaves the CPU flow implementation to
+ * produce the row, so no request state is consumed by a failed launch. */
+static int pocket_cuda_flow_step_batch(const mynah_engine_state *state,
+                                       size_t count,
+                                       mynah_engine_scratch *scratch,
+                                       char *error, size_t capacity) {
+    if (state == NULL || scratch == NULL || count == 0u ||
+        !scratch->cuda_flow_enabled || scratch->backend == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0 ||
+        count > scratch->cuda_flow_batch_capacity ||
+        scratch->flow_cond == NULL || scratch->flow_noise == NULL ||
+        scratch->flow_out == NULL || scratch->cuda_flow_host_cond == NULL ||
+        scratch->cuda_flow_host_noise == NULL ||
+        scratch->cuda_flow_host_time == NULL ||
+        scratch->cuda_flow_host_output == NULL ||
+        scratch->cuda_flow_cond == NULL || scratch->cuda_flow_noise == NULL ||
+        scratch->cuda_flow_time_embed == NULL ||
+        scratch->cuda_flow_output == NULL || scratch->cuda_flow_y == NULL ||
+        scratch->cuda_flow_silu == NULL || scratch->cuda_flow_x == NULL ||
+        scratch->cuda_flow_norm == NULL || scratch->cuda_flow_hidden == NULL ||
+        scratch->cuda_flow_scratch == NULL || scratch->cuda_flow_mod == NULL ||
+        scratch->cuda_flow_final_mod == NULL ||
+        scratch->cuda_flow_time_hidden == NULL ||
+        scratch->cuda_flow_time_output == NULL ||
+        scratch->cuda_flow_time_sum == NULL ||
+        scratch->cuda_flow_time_mlp_in == NULL ||
+        scratch->cuda_flow_time_mlp_out == NULL ||
+        scratch->cuda_flow_time_alpha == NULL || scratch->cuda_flow_blocks == NULL) {
+        return 1;
+    }
+    const pocket_config *cfg = &state->cfg;
+    size_t flow_freq_width = 0u;
+    size_t rows_hidden = 0u;
+    size_t rows_latent = 0u;
+    size_t time_rows = 0u;
+    if (pocket_mul(cfg->flow_freqs, 2u, &flow_freq_width) != 0 ||
+        pocket_mul(count, cfg->hidden_dim, &rows_hidden) != 0 ||
+        pocket_mul(count, cfg->latent_dim, &rows_latent) != 0 ||
+        pocket_mul(cfg->flow_time_conds, flow_freq_width, &time_rows) != 0 ||
+        flow_freq_width == 0u || cfg->flow_time_conds == 0u) return 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (scratch->flow_cond[i] == NULL || scratch->flow_noise[i] == NULL ||
+            scratch->flow_out[i] == NULL) return 1;
+        memcpy(scratch->cuda_flow_host_cond + i * cfg->hidden_dim,
+               scratch->flow_cond[i], cfg->hidden_dim * sizeof(float));
+        memcpy(scratch->cuda_flow_host_noise + i * cfg->latent_dim,
+               scratch->flow_noise[i], cfg->latent_dim * sizeof(float));
+    }
+
+    char local[256];
+    char drain_error[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0)
+        return 1;
+
+    int replay = 0;
+    int capturing = 0;
+    const size_t graph_key = POCKET_CUDA_FLOW_GRAPH_BASE + count;
+    if (scratch->cuda_flow_graph_enabled && scratch->cuda_flow_graph_ready) {
+        const int graph_rc = mynah_backend_graph_begin(
+            scratch->backend, graph_key, scratch, &replay, local, sizeof(local));
+        if (graph_rc < 0) {
+            pocket_error(error, capacity, "%s", local[0] != '\0'
+                                                 ? local
+                                                 : "CUDA flow graph setup failed");
+            scratch->cuda_flow_enabled = 0;
+            scratch->cuda_flow_graph_ready = 0;
+            return 1;
+        }
+        if (graph_rc == 0) capturing = !replay;
+    }
+
+    if (!replay) {
+        if (mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_cond,
+                              scratch->cuda_flow_cond, rows_hidden, local,
+                              sizeof(local)) != 0 ||
+            mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_noise,
+                              scratch->cuda_flow_noise, rows_latent, local,
+                              sizeof(local)) != 0 ||
+            mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_time,
+                              scratch->cuda_flow_time_embed, time_rows,
+                              local, sizeof(local)) != 0) {
+            if (capturing) mynah_backend_graph_abort(
+                scratch->backend, graph_key, scratch);
+            return 1;
+        }
+        mynah_backend_flow_batch flow;
+        memset(&flow, 0, sizeof(flow));
+        flow.batch = count;
+        flow.latent_dim = cfg->latent_dim;
+        flow.cond_dim = cfg->hidden_dim;
+        flow.hidden_dim = cfg->flow_dim;
+        flow.depth = cfg->flow_depth;
+        flow.num_time_conds = cfg->flow_time_conds;
+        flow.freq_embed_dim = flow_freq_width;
+        flow.layernorm_eps = cfg->flow_layernorm_eps;
+        flow.rmsnorm_eps = 1.0e-5f;
+        flow.dev_cond = scratch->cuda_flow_cond;
+        flow.dev_noise = scratch->cuda_flow_noise;
+        flow.dev_time_embed = scratch->cuda_flow_time_embed;
+        flow.dev_y = scratch->cuda_flow_y;
+        flow.dev_silu = scratch->cuda_flow_silu;
+        flow.dev_x = scratch->cuda_flow_x;
+        flow.dev_norm = scratch->cuda_flow_norm;
+        flow.dev_hidden = scratch->cuda_flow_hidden;
+        flow.dev_scratch = scratch->cuda_flow_scratch;
+        flow.dev_mod = scratch->cuda_flow_mod;
+        flow.dev_final_mod = scratch->cuda_flow_final_mod;
+        flow.dev_time_hidden = scratch->cuda_flow_time_hidden;
+        flow.dev_time_output = scratch->cuda_flow_time_output;
+        flow.dev_time_sum = scratch->cuda_flow_time_sum;
+        flow.dev_out = scratch->cuda_flow_output;
+        flow.time_mlp_in = scratch->cuda_flow_time_mlp_in;
+        flow.time_mlp_out = scratch->cuda_flow_time_mlp_out;
+        flow.time_alpha = scratch->cuda_flow_time_alpha;
+        flow.cond_embed = &scratch->cuda_flow_cond_embed;
+        flow.input_proj = &scratch->cuda_flow_input_proj;
+        flow.blocks = scratch->cuda_flow_blocks;
+        flow.final_adaln = &scratch->cuda_flow_final_adaln;
+        flow.final_linear = &scratch->cuda_flow_final_linear;
+        if (mynah_backend_flow_batch_dev(scratch->backend, &flow, local,
+                                          sizeof(local)) != 0) {
+            if (capturing) mynah_backend_graph_abort(
+                scratch->backend, graph_key, scratch);
+            return 1;
+        }
+        if (capturing) {
+            if (mynah_backend_graph_end(scratch->backend, graph_key, scratch,
+                                         local, sizeof(local)) != 0) {
+                scratch->cuda_flow_graph_ready = 0;
+                return 1;
+            }
+            capturing = 0;
+            if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
+                                            local, sizeof(local)) != 0) {
+                mynah_backend_graph_forget(scratch->backend, scratch);
+                scratch->cuda_flow_enabled = 0;
+                return 1;
+            }
+        } else if (scratch->cuda_flow_graph_enabled) {
+            /* This is the warm-up submission. */
+            scratch->cuda_flow_graph_ready = 1;
+        }
+    } else if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
+                                           local, sizeof(local)) != 0) {
+        mynah_backend_graph_forget(scratch->backend, scratch);
+        scratch->cuda_flow_enabled = 0;
+        scratch->cuda_flow_graph_ready = 0;
+        return 1;
+    }
+
+    if (mynah_backend_d2h(scratch->backend, scratch->cuda_flow_output,
+                          scratch->cuda_flow_host_output, rows_latent, local,
+                          sizeof(local)) != 0 ||
+        mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) {
+        if (capturing) mynah_backend_graph_abort(
+            scratch->backend, graph_key, scratch);
+        snprintf(drain_error, sizeof(drain_error), "%s", local);
+        (void)mynah_backend_sync(scratch->backend, drain_error,
+                                 sizeof(drain_error));
+        mynah_backend_graph_forget(scratch->backend, scratch);
+        scratch->cuda_flow_enabled = 0;
+        scratch->cuda_flow_graph_ready = 0;
+        return 1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        float *out = scratch->flow_out[i];
+        const float *src = scratch->cuda_flow_host_output + i * cfg->latent_dim;
+        if (!pocket_all_finite(src, cfg->latent_dim)) {
+            mynah_backend_graph_forget(scratch->backend, scratch);
+            scratch->cuda_flow_enabled = 0;
+            scratch->cuda_flow_graph_ready = 0;
+            return 1;
+        }
+        memcpy(out, src, cfg->latent_dim * sizeof(float));
+    }
+    if (error != NULL && capacity > 0u) error[0] = '\0';
+    return 0;
+}
 
 static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     if (ctx == NULL) return;
@@ -3295,6 +7012,15 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     }
     pocket_dump_flush(ctx);
     pocket_dump_free(ctx->dump);
+    pocket_cuda_drain_before_release(ctx->state == NULL ? NULL
+                                                           : ctx->state->backend);
+    /* With MYNAH_CUDA_SLOT_POOL the device buffers, decoder and pinned
+     * staging move to the pool here; the releases below then free nothing
+     * and only reset flags.  Without it this frees a taken-but-unused set. */
+    pocket_cuda_slot_park(ctx);
+    pocket_cuda_backbone_release(ctx);
+    pocket_cuda_codec_release(ctx);
+    pocket_cuda_decoder_release(ctx);
     pocket_call_release(&ctx->backbone_call.call);
     pocket_call_release(&ctx->codec_call.call);
     pocket_call_release(&ctx->flow_call.call);
@@ -3305,28 +7031,49 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     ingot_st_close(ctx->voice_file);
     free(ctx->voice_kv);
     free(ctx->text_ids);
+    free(ctx->seg_all);
+    free(ctx->seg_lengths);
     free(ctx->text_embed);
-    free(ctx->step_input);
-    free(ctx->hidden);
+    pocket_cuda_host_buffer_free(ctx->state, ctx->step_input,
+                                 ctx->step_input_host_pinned);
+    pocket_cuda_host_buffer_free(ctx->state, ctx->hidden,
+                                 ctx->hidden_host_pinned);
     free(ctx->noise);
     free(ctx->flow_out);
     free(ctx->latents);
-    free(ctx->denorm);
+    pocket_cuda_host_buffer_free(ctx->state, ctx->denorm,
+                                 ctx->denorm_host_pinned);
     free(ctx->codec_in);
     free(ctx->codec_up);
-    free(ctx->codec_seq);
-    free(ctx->codec_out);
-    free(ctx->codec_back);
-    free(ctx->pcm);
+    pocket_cuda_host_buffer_free(ctx->state, ctx->codec_seq,
+                                 ctx->codec_seq_host_pinned);
+    pocket_cuda_host_buffer_free(ctx->state, ctx->codec_out,
+                                 ctx->codec_out_host_pinned);
+    pocket_cuda_host_buffer_free(ctx->state, ctx->codec_back,
+                                 ctx->codec_back_host_pinned);
+    if (ctx->pcm_host_pinned && ctx->state != NULL && ctx->state->backend != NULL)
+        mynah_backend_host_free(ctx->state->backend, ctx->pcm);
+    else
+        free(ctx->pcm);
     free(ctx);
 }
 
-/* Opens the voice and reads its length, without loading anything yet: the KV
- * itself is copied in `prepare`, so a reset costs no allocation. */
+/* Opens the voice and resolves its model-owned KV prefix.  With the default
+ * cache mode the first context decodes the prefix once; subsequent contexts
+ * only copy from immutable model storage into their private transformer state.
+ * `MYNAH_POCKET_VOICE_CACHE=0` keeps the previous per-context file path. */
 static int pocket_voice_open(mynah_engine_ctx *ctx, char *error, size_t capacity) {
-    const mynah_engine_state *state = ctx->state;
+    mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
-    const pocket_voice *voice = &state->voices[ctx->speaker];
+    pocket_voice *voice = &state->voices[ctx->speaker];
+
+    if (state->voice_cache_enabled) {
+        if (pocket_voice_cache_load(state, ctx->speaker, error, capacity) != 0)
+            return -1;
+        ctx->voice_positions = voice->positions;
+        return 0;
+    }
+
     char path[POCKET_PATH_MAX];
     if (pocket_join(path, sizeof(path), state->model_dir, voice->file, error,
                     capacity) != 0) {
@@ -3406,6 +7153,8 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
     ctx->state = state;
+    ctx->cuda_backbone_enabled = pocket_cuda_resident_requested(state);
+    ctx->cuda_decoder_enabled = pocket_cuda_decoder_requested(state);
     ctx->speaker = request->speaker;
     ctx->max_steps = max_steps;
     ctx->text_length = request->text_length;
@@ -3438,6 +7187,39 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
             return -1;
         }
         ctx->text_ids[i] = id;
+    }
+
+    /* Segments, when the caller split the text (src/text_segment.h). The whole
+     * text stays the allocation ceiling (`text_capacity`), and `text_length`
+     * becomes the first segment's: every later path already reads the current
+     * text through those two fields. */
+    if (request->segment_count > 1u) {
+        size_t sum = 0u;
+        int bad = request->segment_lengths == NULL;
+        for (size_t s = 0; !bad && s < request->segment_count; ++s) {
+            const size_t len = request->segment_lengths[s];
+            if (len == 0u || pocket_add(sum, len, &sum) != 0) bad = 1;
+        }
+        if (bad || sum != ctx->text_length) {
+            pocket_ctx_free(ctx);
+            pocket_error(error, capacity,
+                         "pocket: %zu text segments do not add up to the %zu text "
+                         "tokens", request->segment_count, ctx->text_length);
+            return -1;
+        }
+        ctx->seg_all = (int *)malloc(ctx->text_length * sizeof(*ctx->seg_all));
+        ctx->seg_lengths =
+            (size_t *)malloc(request->segment_count * sizeof(*ctx->seg_lengths));
+        if (ctx->seg_all == NULL || ctx->seg_lengths == NULL) {
+            pocket_ctx_free(ctx);
+            pocket_error(error, capacity, "out of memory copying the text segments");
+            return -1;
+        }
+        memcpy(ctx->seg_all, ctx->text_ids, ctx->text_length * sizeof(*ctx->seg_all));
+        memcpy(ctx->seg_lengths, request->segment_lengths,
+               request->segment_count * sizeof(*ctx->seg_lengths));
+        ctx->seg_count = request->segment_count;
+        ctx->text_length = ctx->seg_lengths[0];
     }
 
     /* ---- the text-chunk seam, E2-5 -------------------------------------
@@ -3530,21 +7312,82 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
 
-    ctx->voice_kv = mynah_alloc_floats(voice_floats, error, capacity);
+    /* MYNAH_CUDA_SLOT_POOL: take an idle CUDA resource set before any of it
+     * would be allocated.  NULL on the CPU path, with the pool off, or when
+     * the pool is empty -- every helper below then allocates as before.  From
+     * here on the set belongs to the context, so every failure path returns it
+     * to the pool through ctx_free. */
+    if (pocket_cuda_slot_pool_enabled(state)) {
+        const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
+        /* What `pocket_cuda_backbone_alloc` will ask for: the full worst case,
+         * or the growable cache's starting size (MYNAH_CUDA_KV_GROW). */
+        const size_t bb_positions =
+            pocket_cuda_kv_initial_capacity(ctx, backbone_capacity);
+        size_t bb_kv_bytes = 0u;
+        if (pocket_mul(bb_positions, attn_dim, &bb_kv_bytes) != 0 ||
+            pocket_mul(bb_kv_bytes, 2u * cfg->layers, &bb_kv_bytes) != 0 ||
+            pocket_mul(bb_kv_bytes, kv_bf16 ? sizeof(uint16_t) : sizeof(float),
+                       &bb_kv_bytes) != 0)
+            bb_kv_bytes = SIZE_MAX;
+        ctx->cuda_slot = pocket_cuda_slot_acquire(
+            state, bb_kv_bytes, kv_bf16, bb_positions < backbone_capacity);
+    }
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+
+    /* The default model-owned voice cache is immutable and is copied directly
+     * into the request transformer state during seeding.  Do not retain a
+     * second decoded voice prefix per request; the legacy file-backed mode
+     * still allocates its private decode buffer below. */
+    if (!state->voice_cache_enabled)
+        ctx->voice_kv = mynah_alloc_floats(voice_floats, error, capacity);
     ctx->text_embed = mynah_alloc_floats(text_floats, error, capacity);
-    ctx->step_input = mynah_alloc_floats(cfg->hidden_dim, error, capacity);
-    ctx->hidden = mynah_alloc_floats(cfg->hidden_dim, error, capacity);
+    ctx->step_input = pocket_cuda_host_take(state,
+                                            slot ? &slot->step_input : NULL,
+                                            cfg->hidden_dim,
+                                            &ctx->step_input_host_pinned,
+                                            error, capacity);
+    ctx->hidden = pocket_cuda_host_take(state, slot ? &slot->hidden : NULL,
+                                        cfg->hidden_dim,
+                                        &ctx->hidden_host_pinned, error,
+                                        capacity);
     ctx->noise = mynah_alloc_floats(cfg->latent_dim, error, capacity);
     ctx->flow_out = mynah_alloc_floats(cfg->latent_dim, error, capacity);
     ctx->latents = mynah_alloc_floats(latent_floats, error, capacity);
-    ctx->denorm = mynah_alloc_floats(cfg->latent_dim, error, capacity);
+    ctx->denorm = pocket_cuda_host_take(state, slot ? &slot->denorm : NULL,
+                                        cfg->latent_dim,
+                                        &ctx->denorm_host_pinned, error,
+                                        capacity);
     ctx->codec_in = mynah_alloc_floats(cfg->codec_dim, error, capacity);
     ctx->codec_up = mynah_alloc_floats(up_floats, error, capacity);
-    ctx->codec_seq = mynah_alloc_floats(up_floats, error, capacity);
-    ctx->codec_out = mynah_alloc_floats(up_floats, error, capacity);
-    ctx->codec_back = mynah_alloc_floats(up_floats, error, capacity);
-    ctx->pcm = mynah_alloc_floats(pcm_floats, error, capacity);
-    if (ctx->voice_kv == NULL || ctx->text_embed == NULL || ctx->step_input == NULL ||
+    ctx->codec_seq = pocket_cuda_host_take(state,
+                                           slot ? &slot->codec_seq : NULL,
+                                           up_floats,
+                                           &ctx->codec_seq_host_pinned,
+                                           error, capacity);
+    ctx->codec_out = pocket_cuda_host_take(state,
+                                           slot ? &slot->codec_out : NULL,
+                                           up_floats,
+                                           &ctx->codec_out_host_pinned,
+                                           error, capacity);
+    ctx->codec_back = pocket_cuda_host_take(state,
+                                            slot ? &slot->codec_back : NULL,
+                                            up_floats,
+                                            &ctx->codec_back_host_pinned,
+                                            error, capacity);
+    if (slot != NULL && slot->pcm != NULL) {
+        POCKET_SLOT_MOVE(ctx->pcm, slot->pcm);
+        memset(ctx->pcm, 0, pcm_floats * sizeof(float));
+        ctx->pcm_host_pinned = 1;
+    } else if (pocket_cuda_resident_requested(state)) {
+        char ignored[256];
+        if (mynah_backend_host_alloc(state->backend, pcm_floats, &ctx->pcm,
+                                     ignored, sizeof(ignored)) == 0)
+            ctx->pcm_host_pinned = 1;
+    }
+    if (ctx->pcm == NULL)
+        ctx->pcm = mynah_alloc_floats(pcm_floats, error, capacity);
+    if ((!state->voice_cache_enabled && ctx->voice_kv == NULL) ||
+        ctx->text_embed == NULL || ctx->step_input == NULL ||
         ctx->hidden == NULL || ctx->noise == NULL || ctx->flow_out == NULL ||
         ctx->latents == NULL || ctx->denorm == NULL || ctx->codec_in == NULL ||
         ctx->codec_up == NULL || ctx->codec_seq == NULL || ctx->codec_out == NULL ||
@@ -3666,6 +7509,13 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
 
+    /* CUDA allocations happen before the request can be prepared.  If the
+     * optional resident path cannot reserve them, the context remains a valid
+     * CPU context and the backend contract's safe fallback is preserved. */
+    (void)pocket_cuda_backbone_alloc(ctx);
+    (void)pocket_cuda_codec_alloc(ctx);
+    (void)pocket_cuda_decoder_alloc(ctx);
+
     /* Set last, so the failure paths above (which call `_ctx_free`) cannot
      * submit a span or count a request that never ran. */
     ctx->t_created_ns = mynah_costmap_level() ? mynah_costmap_now_ns() : 0u;
@@ -3705,6 +7555,13 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
  * caller's `final`, which is what it always meant. */
 static int pocket_text_flush_limited(mynah_engine_ctx *ctx, int final, size_t limit,
                                      char *error, size_t capacity) {
+    if (ctx->cuda_backbone_device_owned) {
+        /* No host prefill for a device-owned cache; the tile takes whatever
+         * text is available, regardless of the slice budget. */
+        (void)limit;
+        mynah_engine_ctx *one[1] = {ctx};
+        return pocket_cuda_prefill_tile(one, 1u, final, error, capacity);
+    }
     const pocket_config *cfg = &ctx->state->cfg;
     const size_t tile = mynah_transformer_ar_prefill_tile();
     size_t want = (final || tile == 0u)
@@ -3716,6 +7573,24 @@ static int pocket_text_flush_limited(mynah_engine_ctx *ctx, int final, size_t li
         const size_t stop = ctx->text_prefilled + slice;
         if (stop < want) want = (stop / tile) * tile;
     }
+    /* The cross-request CUDA prefill advances one token per row per unit, so a
+     * row it hands back here can sit between tiles. Its tiles are already not
+     * where a one-shot put them; the CPU tile invariant cannot be restored,
+     * only resumed: finish the partial tile first, then continue aligned. */
+    const size_t misaligned = tile != 0u ? ctx->text_prefilled % tile : 0u;
+    int realign = 0;
+    if (misaligned != 0u && ctx->cuda_backbone_enabled) {
+        const size_t boundary = ctx->text_prefilled + (tile - misaligned);
+        if (boundary <= ctx->text_length) {
+            want = boundary;
+            realign = 1;
+        } else if (final) {
+            want = ctx->text_length;
+            realign = 1;
+        } else {
+            return 0; /* wait for the text that completes this tile */
+        }
+    }
     if (want <= ctx->text_prefilled) return 0;
     const size_t rows = want - ctx->text_prefilled;
     /* The invariant the paragraph above is about, asserted rather than assumed.
@@ -3723,7 +7598,7 @@ static int pocket_text_flush_limited(mynah_engine_ctx *ctx, int final, size_t li
      * postcondition, and it is what makes a future edit to that line fail here
      * -- loudly, on every quantization profile -- instead of failing as a one
      * ULP difference that only the f32 tile path can see. */
-    if (want != ctx->text_length && tile != 0u &&
+    if (!realign && want != ctx->text_length && tile != 0u &&
         ((ctx->text_prefilled % tile) != 0u || (rows % tile) != 0u)) {
         pocket_error(error, capacity,
                      "pocket: a non-final text flush of %zu rows at offset %zu is "
@@ -3763,13 +7638,333 @@ static int pocket_text_flush(mynah_engine_ctx *ctx, int final, char *error,
  * The split is where it is because of the measurement: this part is ~15 ms and
  * flat in text length, the part after it is 190 ms for a long text and linear
  * in it. Only the linear part is worth interrupting. */
-static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capacity) {
+/* On by default for CUDA: on the L4 (24L, BF16 KV) it took C32 from 8.5 to
+ * 30.5 audio-s/s with prefill slices from ~160 ms to ~1.5 ms.
+ * MYNAH_CUDA_PREFILL_TILE=0 restores the host-seeded token-by-token prefill. */
+static int pocket_cuda_prefill_tile_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_PREFILL_TILE");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+/* The prefill tile needs a resident backbone whose cache is laid out
+ * [layer][K capacity][V capacity], a host voice KV to seed the device voice
+ * cache from, and an attention width equal to the model width. */
+static int pocket_cuda_prefill_tile_usable(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !pocket_cuda_prefill_tile_enabled() ||
+        !ctx->cuda_backbone_enabled || ctx->cuda_backbone_kv == NULL ||
+        ctx->state == NULL || ctx->state->backend == NULL ||
+        !mynah_backend_has_tile_transformer(ctx->state->backend))
+        return 0;
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
+    if (cfg->heads * cfg->head_dim != cfg->hidden_dim ||
+        ctx->speaker >= state->voice_count ||
+        state->voices[ctx->speaker].kv == NULL ||
+        ctx->voice_positions > ctx->cuda_backbone_capacity)
+        return 0;
+    return 1;
+}
+
+/* The device voice cache entry for `speaker`, uploaded on first use in the
+ * backbone cache's element type. NULL on failure. */
+static void *pocket_cuda_voice_kv(mynah_engine_state *state, size_t speaker,
+                                  size_t positions, int bf16, char *error,
+                                  size_t capacity) {
+    if (state->cuda_voice_kv == NULL) {
+        state->cuda_voice_kv =
+            (void **)calloc(state->voice_count, sizeof(*state->cuda_voice_kv));
+        if (state->cuda_voice_kv == NULL) return NULL;
+        state->cuda_voice_kv_bf16 = bf16;
+    }
+    if (state->cuda_voice_kv_bf16 != bf16) {
+        pocket_error(error, capacity, "pocket: mixed CUDA KV element types");
+        return NULL;
+    }
+    if (state->cuda_voice_kv[speaker] != NULL) return state->cuda_voice_kv[speaker];
+    const pocket_config *cfg = &state->cfg;
+    size_t floats = 0u, bytes = 0u;
+    if (pocket_mul(cfg->layers, 2u * positions * cfg->heads * cfg->head_dim,
+                   &floats) != 0 ||
+        pocket_mul(floats, bf16 ? sizeof(uint16_t) : sizeof(float), &bytes) != 0)
+        return NULL;
+    const float *host = state->voices[speaker].kv;
+    void *device = NULL;
+    if (host == NULL ||
+        mynah_backend_dev_alloc_bytes(state->backend, bytes, &device, error,
+                                      capacity) != 0)
+        return NULL;
+    const int failed = bf16
+        ? mynah_backend_h2d_bf16(state->backend, host, device, floats, error,
+                                 capacity)
+        : mynah_backend_h2d(state->backend, host, (float *)device, floats, error,
+                            capacity);
+    if (failed != 0) {
+        mynah_backend_dev_free(state->backend, (float *)device);
+        return NULL;
+    }
+    state->cuda_voice_kv[speaker] = device;
+    return device;
+}
+
+/* Prefill every pending text token of `ctxs` in one pass of the backbone
+ * tile, after copying each fresh request's voice prefix device-to-device.
+ * Rows are packed, each attends to its own prefix. On success every context
+ * has its whole available text in the device cache and is marked valid; on
+ * failure nothing on the host moved and the requests must fail. */
+static int pocket_cuda_prefill_fixed_order(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("MYNAH_CUDA_PREFILL_FIXED");
+        cached = s != NULL && strcmp(s, "0") == 0 ? 0 : 1;
+    }
+    return cached;
+}
+
+static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                    int final, char *error, size_t capacity) {
+    if (count == 0u) return 0;
+    mynah_engine_state *state = ctxs[0]->state;
+    const pocket_config *cfg = &state->cfg;
+    const size_t layers = cfg->layers;
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    if (count > POCKET_MAX_BATCH || layers > 64u) {
+        pocket_error(error, capacity, "pocket: CUDA prefill tile too wide");
+        return -1;
+    }
+    size_t take[POCKET_MAX_BATCH];
+    size_t start[POCKET_MAX_BATCH];
+    size_t total = 0u, widest = 0u;
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx->state != state || !ctx->cuda_backbone_device_owned) {
+            pocket_error(error, capacity, "pocket: CUDA prefill tile row mismatch");
+            return -1;
+        }
+        /* `final` is the seal: it arrives while the text still reads as open,
+         * and must take the tail that an open text would hold back. */
+        const size_t target = final ? ctx->text_length : pocket_prepare_target(ctx);
+        take[i] = target > ctx->text_prefilled ? target - ctx->text_prefilled : 0u;
+        start[i] = ctx->voice_positions + ctx->text_prefilled;
+        /* MYNAH_CUDA_KV_GROW: the tile writes [start, start + take) and the
+         * voice copy [0, voice); both land in the cache as it is after this.
+         * Admission sizes the cache for voice + the whole text ceiling, so
+         * this is a guard, not the normal path. */
+        if (pocket_cuda_backbone_reserve(ctx, start[i] + take[i], error,
+                                         capacity) != 0)
+            return -1;
+        total += take[i];
+        if (take[i] > widest) widest = take[i];
+    }
+    const size_t kv_elem = ctxs[0]->cuda_backbone_kv_bf16 ? sizeof(uint16_t)
+                                                          : sizeof(float);
+    char local[256];
+    local[0] = '\0';
+    /* Voice prefixes first: one D2D per layer and plane per fresh request. */
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (!ctx->cuda_voice_pending) continue;
+        if (ctx->cuda_backbone_kv_bf16 != ctxs[0]->cuda_backbone_kv_bf16) {
+            pocket_error(error, capacity, "pocket: CUDA prefill tile layout mismatch");
+            return -1;
+        }
+        const size_t span = ctx->voice_positions * attn_dim;
+        const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
+        const unsigned char *voice = (const unsigned char *)pocket_cuda_voice_kv(
+            state, ctx->speaker, ctx->voice_positions, ctx->cuda_backbone_kv_bf16,
+            local, sizeof(local));
+        if (voice == NULL) {
+            pocket_error(error, capacity, "pocket: CUDA voice cache: %s", local);
+            return -1;
+        }
+        unsigned char *base = (unsigned char *)ctx->cuda_backbone_kv;
+        for (size_t l = 0; l < layers && span > 0u; ++l) {
+            const unsigned char *src = voice + l * 2u * span * kv_elem;
+            unsigned char *dst = base + l * 2u * layer_half * kv_elem;
+            if (mynah_backend_copy_dev_bytes(state->backend, dst, src,
+                                             span * kv_elem, local,
+                                             sizeof(local)) != 0 ||
+                mynah_backend_copy_dev_bytes(state->backend,
+                                             dst + layer_half * kv_elem,
+                                             src + span * kv_elem,
+                                             span * kv_elem, local,
+                                             sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA voice copy: %s", local);
+                return -1;
+            }
+        }
+    }
+    if (total > 0u) {
+        /* Text embeddings: one packed device buffer, owned by the model and
+         * grown outside any graph. */
+        size_t floats = 0u;
+        if (pocket_mul(total, cfg->hidden_dim, &floats) != 0) return -1;
+        if (floats > state->cuda_prefill_in_floats) {
+            mynah_backend_dev_free(state->backend, state->cuda_prefill_in);
+            state->cuda_prefill_in = NULL;
+            state->cuda_prefill_in_floats = 0u;
+            if (mynah_backend_dev_alloc(state->backend, floats,
+                                        &state->cuda_prefill_in, local,
+                                        sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA prefill input: %s", local);
+                return -1;
+            }
+            state->cuda_prefill_in_floats = floats;
+        }
+        const float *input[POCKET_MAX_BATCH];
+        void *kv[POCKET_MAX_BATCH * 64u];
+        size_t rows = 0u, offset = 0u;
+        size_t row_take[POCKET_MAX_BATCH], row_start[POCKET_MAX_BATCH];
+        size_t row_ring[POCKET_MAX_BATCH];
+        for (size_t i = 0; i < count; ++i) {
+            mynah_engine_ctx *ctx = ctxs[i];
+            if (take[i] == 0u) continue;
+            float *dst = state->cuda_prefill_in + offset * cfg->hidden_dim;
+            if (mynah_backend_h2d(state->backend,
+                                  ctx->text_embed +
+                                      ctx->text_prefilled * cfg->hidden_dim,
+                                  dst, take[i] * cfg->hidden_dim, local,
+                                  sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA prefill H2D: %s", local);
+                return -1;
+            }
+            input[rows] = dst;
+            row_take[rows] = take[i];
+            row_start[rows] = start[i];
+            row_ring[rows] = ctx->cuda_backbone_capacity;
+            const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
+            for (size_t l = 0; l < layers; ++l)
+                kv[rows * layers + l] = (unsigned char *)ctx->cuda_backbone_kv +
+                                        l * 2u * layer_half * kv_elem;
+            offset += take[i];
+            ++rows;
+        }
+        mynah_transformer_tile_layer layer[64];
+        for (size_t l = 0; l < layers; ++l) {
+            const mynah_transformer_ar_layer *src = &state->backbone_layers[l];
+            layer[l].norm1_weight = src->norm1_weight;
+            layer[l].norm1_bias = src->norm1_bias;
+            layer[l].in_proj_weight = src->in_proj_weight;
+            layer[l].in_proj_bias = src->in_proj_bias;
+            layer[l].out_proj_weight = src->out_proj_weight;
+            layer[l].out_proj_bias = src->out_proj_bias;
+            layer[l].layer_scale_1 = src->layer_scale_1;
+            layer[l].norm2_weight = src->norm2_weight;
+            layer[l].norm2_bias = src->norm2_bias;
+            layer[l].linear1_weight = src->linear1_weight;
+            layer[l].linear1_bias = src->linear1_bias;
+            layer[l].linear2_weight = src->linear2_weight;
+            layer[l].linear2_bias = src->linear2_bias;
+            layer[l].layer_scale_2 = src->layer_scale_2;
+        }
+        const mynah_transformer_ar_config *bc =
+            mynah_transformer_ar_state_config(ctxs[0]->backbone);
+        const mynah_backend_tile_desc desc = {
+            .rows = rows,
+            .positions = widest,
+            .dim = cfg->hidden_dim,
+            .heads = cfg->heads,
+            .ffn = cfg->ffn_dim,
+            .layers = layers,
+            .context = 0u,
+            .ring = ctxs[0]->cuda_backbone_capacity,
+            .rings = row_ring,
+            .max_period = bc->max_period,
+            .layernorm_eps = cfg->layernorm_eps,
+            .layer = layer,
+            .input = input,
+            .output = NULL,
+            .kv = kv,
+            .start = row_start,
+            .count = row_take,
+            .kv_bf16 = ctxs[0]->cuda_backbone_kv_bf16,
+            /* Same encoding as the per-request backbone step gives its rows. */
+            .weight_bf16 = pocket_cuda_tar_qtype(state, 0u,
+                                                 MYNAH_TAR_LINEAR_IN_PROJ) ==
+                           MYNAH_BACKEND_QTYPE_BF16,
+            /* Text arrives in pieces (segments, appends); every piece must
+             * land in the cache exactly as a one-shot prefill would put it.
+             * MYNAH_CUDA_PREFILL_FIXED=0 trades that for cuBLAS speed. */
+            .fixed_order = pocket_cuda_prefill_fixed_order(),
+        };
+        mynah_region_begin(MYNAH_RGN_PREFILL);
+        const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
+                                                          local, sizeof(local));
+        mynah_region_end(MYNAH_RGN_PREFILL);
+        if (rc != 0) {
+            pocket_error(error, capacity, "pocket: CUDA prefill tile: %s",
+                         local[0] != '\0' ? local : "unavailable");
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (mynah_transformer_ar_state_set_offset(
+                ctx->backbone, start[i] + take[i], local, sizeof(local)) != 0) {
+            pocket_error(error, capacity, "pocket: CUDA prefill offset: %s", local);
+            return -1;
+        }
+        ctx->text_prefilled += take[i];
+        ctx->cuda_voice_pending = 0;
+        ctx->cuda_backbone_valid = 1;
+    }
+    return 0;
+}
+
+static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capacity);
+
+/* Point `text_ids`/`text_length` at segment `index`. */
+static void pocket_segment_select(mynah_engine_ctx *ctx, size_t index) {
+    size_t start = 0u;
+    for (size_t s = 0; s < index; ++s) start += ctx->seg_lengths[s];
+    memcpy(ctx->text_ids, ctx->seg_all + start,
+           ctx->seg_lengths[index] * sizeof(*ctx->text_ids));
+    ctx->text_length = ctx->seg_lengths[index];
+    ctx->seg_index = index;
+}
+
+/* The prologue of segment 2..N. Upstream generates each chunk from a fresh
+ * copy of the voice state, so the backbone, its KV, the flow head and the EOS
+ * bookkeeping restart exactly as for a new request. What does NOT restart is
+ * everything the driver sees -- the frame count, the step count and budget,
+ * the RNG and the codec. The codec is a deliberate divergence: upstream opens a
+ * new Mimi state per chunk and concatenates the audio; here the causal decoder
+ * runs straight through the boundary, which avoids a decoder warm-up transient
+ * inside one response. The first latent of the segment is conditioned on BOS
+ * (`seg_frame0`), not on the previous segment's last latent. */
+static int pocket_segment_prologue(mynah_engine_ctx *ctx, char *error,
+                                   size_t capacity) {
+    pocket_segment_select(ctx, ctx->seg_index + 1u);
+    ctx->seg_frame0 = ctx->frames;
+    ctx->segment_pending = 0;
+    mynah_transformer_ar_state_reset(ctx->backbone);
+    mynah_flow_head_reset(ctx->flow);
+    ctx->eos_step = SIZE_MAX;
+    ctx->eos_logit = 0.0f;
+    ctx->cuda_backbone_valid = 0;
+    ctx->cuda_backbone_device_owned = 0;
+    ctx->cuda_voice_pending = 0;
+    return pocket_seed_backbone(ctx, error, capacity);
+}
+
+static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capacity) {
+    const mynah_engine_state *state = ctx->state;
+    if (ctx->seg_count > 1u) pocket_segment_select(ctx, 0u);
+    ctx->seg_frame0 = 0u;
+    ctx->segment_pending = 0;
 
     mynah_transformer_ar_state_reset(ctx->backbone);
     mynah_transformer_ar_state_reset(ctx->codec_transformer);
     mynah_seanet_state_reset(ctx->codec);
+    pocket_cuda_codec_upsample_reset(ctx);
+    if (ctx->cuda_decoder_enabled && ctx->cuda_decoder != NULL) {
+        char decoder_error[256];
+        if (mynah_backend_decoder_reset(state->backend, ctx->cuda_decoder,
+                                        decoder_error, sizeof(decoder_error)) != 0) {
+            /* No GPU decoder frame has been emitted in this generation yet;
+             * dropping the optional device state is therefore safe. */
+            pocket_cuda_decoder_release(ctx);
+        }
+    }
     mynah_flow_head_reset(ctx->flow);
     ctx->frames = 0;
     ctx->decoded_frames = 0;
@@ -3779,6 +7974,17 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
     ctx->broken = 0;
     ctx->budget_exhausted = 0;
     ctx->eos_logit = 0.0f;
+    /* The host reset below is authoritative.  The resident cache is
+     * re-uploaded lazily before the next CUDA step, after voice/text prefill
+     * has rebuilt every valid host position. */
+    ctx->cuda_backbone_valid = 0;
+    ctx->cuda_codec_valid = 0;
+    ctx->cuda_codec_needs_host_sync = 0;
+    ctx->cuda_codec_pending = 0;
+    ctx->cuda_codec_device_output_ready = 0;
+    ctx->cuda_mimi_tile_owned = 0;
+    ctx->cuda_backbone_device_owned = 0;
+    ctx->cuda_voice_pending = 0;
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
     ctx->spare = 0.0f;
@@ -3787,18 +7993,60 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
         ctx->dump->frames = 0;
         ctx->dump->decoded = 0;
     }
+    return pocket_seed_backbone(ctx, error, capacity);
+}
 
+/* The voice KV prefix and the conditioner lookup of the current text: the part
+ * of a prologue that every utterance -- a request or one of its segments --
+ * starts from. It ends with the text prefill at zero. */
+static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capacity) {
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const pocket_voice *voice = &state->voices[ctx->speaker];
+    size_t attn_dim = 0;
+    size_t layer_stride = 0;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(2u, ctx->voice_positions, &layer_stride) != 0 ||
+        pocket_mul(layer_stride, attn_dim, &layer_stride) != 0) {
+        pocket_error(error, capacity, "pocket: voice KV size overflows size_t");
+        return -1;
+    }
+    if (pocket_cuda_prefill_tile_usable(ctx)) {
+        /* The voice prefix goes device-to-device and the text through the
+         * prefill tile; the host cache only tracks the offset. */
+        if (mynah_transformer_ar_state_set_offset(ctx->backbone,
+                                                  ctx->voice_positions, error,
+                                                  capacity) != 0)
+            return -1;
+        ctx->cuda_backbone_device_owned = 1;
+        ctx->cuda_voice_pending = 1;
+        ctx->cuda_backbone_valid = 0;
+        for (size_t i = 0; i < ctx->text_length; ++i) {
+            const size_t id = (size_t)ctx->text_ids[i];
+            memcpy(ctx->text_embed + i * cfg->hidden_dim,
+                   state->embed_table + id * cfg->hidden_dim,
+                   cfg->hidden_dim * sizeof(float));
+        }
+        ctx->text_prefilled = 0;
+        return 0;
+    }
     char name[POCKET_NAME_MAX];
     for (size_t l = 0; l < cfg->layers; ++l) {
-        snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", l);
-        const ingot_st_tensor *tensor = ingot_st_find(ctx->voice_file, name);
-        if (tensor == NULL ||
-            ingot_st_to_f32(ctx->voice_file, tensor, ctx->voice_kv) != 0) {
-            pocket_error(error, capacity, "cannot read %s from voice %s", name,
-                         state->voices[ctx->speaker].name);
-            return -1;
+        const float *layer_kv = NULL;
+        if (voice->kv != NULL) {
+            layer_kv = voice->kv + l * layer_stride;
+        } else {
+            snprintf(name, sizeof(name), "transformer.layers.%zu.self_attn/cache", l);
+            const ingot_st_tensor *tensor = ingot_st_find(ctx->voice_file, name);
+            if (tensor == NULL ||
+                ingot_st_to_f32(ctx->voice_file, tensor, ctx->voice_kv) != 0) {
+                pocket_error(error, capacity, "cannot read %s from voice %s", name,
+                             state->voices[ctx->speaker].name);
+                return -1;
+            }
+            layer_kv = ctx->voice_kv;
         }
-        if (mynah_transformer_ar_state_load_kv(ctx->backbone, l, ctx->voice_kv,
+        if (mynah_transformer_ar_state_load_kv(ctx->backbone, l, layer_kv,
                                                ctx->voice_positions, error,
                                                capacity) != 0) {
             return -1;
@@ -3869,7 +8117,8 @@ static int pocket_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
     const int depth = mynah_region_depth();
     int rc = 0;
     if (!ctx->seeding) {
-        rc = pocket_seed_prologue(ctx, error, capacity);
+        rc = ctx->segment_pending ? pocket_segment_prologue(ctx, error, capacity)
+                                  : pocket_seed_prologue(ctx, error, capacity);
         if (rc == 0) ctx->seeding = 1;
     } else {
         rc = pocket_text_flush_limited(ctx, !ctx->text_open, budget, error, capacity);
@@ -3890,6 +8139,191 @@ static int pocket_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
     mynah_region_unwind(depth);
     mynah_region_end(MYNAH_RGN_PREPARE);
     return rc;
+}
+
+static size_t pocket_prepare_target(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL) return 0u;
+    if (!ctx->text_open) return ctx->text_length;
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    if (tile == 0u) return ctx->text_length;
+    return (ctx->text_length / tile) * tile;
+}
+
+static int pocket_cuda_prefill_batch_enabled(void) {
+    const char *env = getenv("MYNAH_CUDA_PREFILL_BATCH");
+    return env == NULL || strcmp(env, "0") != 0;
+}
+
+/* Cross-request CUDA text prefill.  Each iteration advances one token in every
+ * active row, which keeps absolute RoPE/KV positions ragged-safe while allowing
+ * the resident transformer graph to amortise launches across requests.  The
+ * host K/V shadow is intentionally kept current in this first implementation:
+ * a later CUDA failure can therefore still fall back to the CPU oracle without
+ * replaying the voice or text prefix. */
+static int pocket_prepare_slice_batch(
+    mynah_engine_ctx *const *ctxs, size_t count, size_t budget, int *done,
+    mynah_engine_scratch *scratch, char *error, size_t capacity) {
+    if (ctxs == NULL || done == NULL || scratch == NULL || count < 2u ||
+        count > POCKET_MAX_BATCH || count > scratch->cuda_batch_capacity) return 1;
+    if (!pocket_cuda_prefill_batch_enabled()) return 1;
+    for (size_t i = 0; i < count; ++i) done[i] = 0;
+
+    mynah_engine_ctx *first = ctxs[0];
+    if (first == NULL || first->state == NULL || first->state->backend == NULL ||
+        strcmp(mynah_backend_name(first->state->backend), "cuda") != 0 ||
+        !first->cuda_backbone_enabled) return 1;
+    mynah_engine_state *state = first->state;
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || ctx->prepared || ctx->broken ||
+            !ctx->cuda_backbone_enabled || ctx->text_embed == NULL) return 1;
+    }
+
+    mynah_region_begin(MYNAH_RGN_PREPARE);
+    const int depth = mynah_region_depth();
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i]->seeding) continue;
+        if ((ctxs[i]->segment_pending
+                 ? pocket_segment_prologue(ctxs[i], error, capacity)
+                 : pocket_seed_prologue(ctxs[i], error, capacity)) != 0) {
+            mynah_region_unwind(depth);
+            mynah_region_end(MYNAH_RGN_PREPARE);
+            return -1;
+        }
+        ctxs[i]->seeding = 1;
+    }
+
+    {
+        /* Device-owned rows: one prefill tile for all of them. */
+        mynah_engine_ctx *owned[POCKET_MAX_BATCH];
+        size_t owned_count = 0u, others = 0u;
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i]->cuda_backbone_device_owned) owned[owned_count++] = ctxs[i];
+            else ++others;
+        }
+        if (owned_count > 0u) {
+            if (pocket_cuda_prefill_tile(owned, owned_count, 0, error, capacity) != 0) {
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return -1;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                if (!ctxs[i]->cuda_backbone_device_owned ||
+                    ctxs[i]->text_prefilled < pocket_prepare_target(ctxs[i]))
+                    continue;
+                ctxs[i]->prepared = 1;
+                ctxs[i]->seeding = 0;
+                done[i] = 1;
+            }
+            if (others == 0u) {
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return 0;
+            }
+        }
+    }
+
+    mynah_engine_ctx *work[POCKET_MAX_BATCH];
+    const float *inputs[POCKET_MAX_BATCH];
+    size_t work_index[POCKET_MAX_BATCH];
+    size_t units = 0u;
+    const size_t unit_limit = budget == 0u ? SIZE_MAX : budget;
+    int rc = 0;
+    int no_batch_work = 0;
+    while (units < unit_limit) {
+        size_t work_count = 0u;
+        for (size_t i = 0; i < count; ++i) {
+            mynah_engine_ctx *ctx = ctxs[i];
+            if (ctx->cuda_backbone_device_owned) continue;
+            if (ctx->text_prefilled >= pocket_prepare_target(ctx)) continue;
+            work[work_count] = ctx;
+            work_index[work_count] = i;
+            inputs[work_count] =
+                ctx->text_embed + ctx->text_prefilled * state->cfg.hidden_dim;
+            ++work_count;
+        }
+        if (work_count < 2u) {
+            /* If no row could be advanced, let the scalar hook take the
+             * single-row/zero-target edge case on the next branch.  After at
+             * least one batched unit, keep the remaining singleton resumable;
+             * completed peers are committed below and the driver will call the
+             * scalar hook for that one on the next tick. */
+            if (units == 0u && work_count != 0u) no_batch_work = 1;
+            break;
+        }
+
+        char cuda_error[256];
+        cuda_error[0] = '\0';
+        rc = pocket_cuda_backbone_step_batch(
+            work, work_count, scratch, inputs, NULL, 1, cuda_error,
+            sizeof(cuda_error));
+        if (rc == 1) {
+            /* A failed first graph capture did not execute its commands.  The
+             * batch helper disables only graph replay for the next attempt, so
+             * retry once eagerly before considering the scalar CPU fallback. */
+            rc = pocket_cuda_backbone_step_batch(
+                work, work_count, scratch, inputs, NULL, 1, cuda_error,
+                sizeof(cuda_error));
+        }
+        if (rc != 0) {
+            if (rc < 0) {
+                /* The batch helper commits neither host KV nor host offsets
+                 * until its complete stream has drained.  On a launch/sync
+                 * failure it also disables the resident path for these rows,
+                 * so the scalar oracle can safely finish the same tile from
+                 * the authoritative host state below. */
+                rc = 1;
+            }
+            break;
+        }
+        (void)mynah_backend_note_backbone_batch(state->backend, work_count);
+        for (size_t j = 0; j < work_count; ++j)
+            ++ctxs[work_index[j]]->text_prefilled;
+        ++units;
+    }
+
+    if (rc == 0 && no_batch_work) rc = 1;
+    if (rc == 1) {
+        /* A graph/capability miss or a resident launch failure lands here.
+         * The scalar path is safe at a tile boundary; if a prior GPU unit
+         * left an open request between boundaries, refuse rather than
+         * silently changing its state machine. */
+        const size_t tile = mynah_transformer_ar_prefill_tile();
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i]->text_open && tile != 0u &&
+                (ctxs[i]->text_prefilled % tile) != 0u) {
+                pocket_error(error, capacity,
+                             "pocket: CUDA prefill became unavailable between text tiles");
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return -1;
+            }
+            const size_t before = ctxs[i]->text_prefilled;
+            if (pocket_text_flush_limited(ctxs[i], !ctxs[i]->text_open,
+                                          budget, error, capacity) != 0) {
+                mynah_region_unwind(depth);
+                mynah_region_end(MYNAH_RGN_PREPARE);
+                return -1;
+            }
+            if (ctxs[i]->text_prefilled != before)
+                ctxs[i]->cuda_backbone_valid = 0;
+        }
+        rc = 0;
+    } else if (rc < 0) {
+        mynah_region_unwind(depth);
+        mynah_region_end(MYNAH_RGN_PREPARE);
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i]->text_prefilled < pocket_prepare_target(ctxs[i])) continue;
+        ctxs[i]->prepared = 1;
+        ctxs[i]->seeding = 0;
+        done[i] = 1;
+    }
+    mynah_region_unwind(depth);
+    mynah_region_end(MYNAH_RGN_PREPARE);
+    return 0;
 }
 
 static int pocket_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
@@ -3945,8 +8379,8 @@ static int pocket_all_finite(const float *v, size_t n) {
  * batch one context at a time to find whose data was refused, and that re-step
  * is only legal if the refused call moved nobody.  An engine that advances
  * 0..i-1 and then refuses i gets its survivors double-stepped, and no driver
- * can see that from the outside.  At the `max_batch` of 16 this engine
- * declares, that is one bad request corrupting fifteen strangers.
+ * can see that from the outside.  At the `max_batch` of 64 this engine
+ * declares, that is one bad request corrupting sixty-three strangers.
  *
  * It is enforced in three layers, in this order:
  *
@@ -4057,6 +8491,29 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                              i, offset_before[i]);
                 return -1;
             }
+            /* MYNAH_CUDA_KV_GROW: a growable device cache is widened here,
+             * before anything is queued or captured, so every backbone path
+             * below finds room for this step.  Growth moves no observable
+             * state (the live prefix is copied), so a refusal after it is
+             * still a refusal of an untouched batch.  A device-owned row that
+             * cannot grow fails the batch, and the driver's isolation retires
+             * only that row; a host-shadowed row just continues on CPU. */
+            if (ctx->cuda_backbone_enabled && ctx->cuda_backbone_kv != NULL &&
+                offset_before[i] >= ctx->cuda_backbone_capacity) {
+                char grow_error[256];
+                grow_error[0] = '\0';
+                if (pocket_cuda_backbone_reserve(ctx, offset_before[i] + 1u,
+                                                 grow_error,
+                                                 sizeof(grow_error)) != 0) {
+                    if (ctx->cuda_backbone_device_owned) {
+                        pocket_error(error, capacity, "pocket: request %zu: %s",
+                                     i, grow_error);
+                        return -1;
+                    }
+                    ctx->cuda_backbone_enabled = 0;
+                    ctx->cuda_backbone_valid = 0;
+                }
+            }
         }
     }
 
@@ -4067,23 +8524,32 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                           : mynah_transformer_ar_batch_capacity(scratch->backbone_batch);
     const int can_gather = scratch != NULL && scratch->backbone_batch != NULL &&
                            scratch->states != NULL && count <= batch_capacity;
+    if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
 
     /* ---- 2. the fallible mutation, before anything advances --------------- */
     mynah_region_begin(MYNAH_RGN_STEP);
     mynah_region_begin2(MYNAH_RGN_STEP_EMBED);
+    int cuda_condition_used = 0;
+    int all_will_step = can_gather && count > 1u;
+    for (size_t i = 0; i < count; ++i)
+        if (!will_step[i]) all_will_step = 0;
+    if (all_will_step && scratch != NULL &&
+        pocket_cuda_condition_batch(ctxs, count, scratch, NULL, 0u) == 0)
+        cuda_condition_used = 1;
     size_t live = 0;
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         if (!will_step[i]) continue;
         /* BOS is a tracked fact, not a NaN: no latent yet means bos_emb. */
         const float *previous =
-            (ctx->frames > 0)
+            (ctx->frames > ctx->seg_frame0)
                 ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
                 : state->bos_emb;
         /* The previous latent's embedding is [1024][32], 128 KB: small enough
          * that stacking it would cost more bookkeeping than it saves traffic,
          * so it stays per request -- and it is its own quantization group. */
-        if (pocket_single_linear(state, POCKET_QG_COND_IN, state->cond_in_key,
+        if (!cuda_condition_used &&
+            pocket_single_linear(state, POCKET_QG_COND_IN, state->cond_in_key,
                                  state->cond_in_qtype, state->input_linear, NULL,
                                  previous, ctx->step_input, cfg->latent_dim,
                                  cfg->hidden_dim) != 0) {
@@ -4117,13 +8583,92 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
     int failed = 0;
     size_t failed_at = 0;
-    if (live > 1u && can_gather) {
+    int cuda_used = 0;
+    int any_owned = 0, all_owned = 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!will_step[i]) continue;
+        if (ctxs[i]->cuda_backbone_device_owned) any_owned = 1;
+        else all_owned = 0;
+    }
+    if (live > 1u && (live == count || any_owned)) {
+        char cuda_error[256];
+        cuda_error[0] = '\0';
+        mynah_engine_ctx *subset[POCKET_MAX_BATCH];
+        mynah_engine_ctx *const *rows = ctxs;
+        if (live != count) {
+            /* A retired row leaves the device input projection misaligned;
+             * the host step inputs are current, so use those. */
+            size_t n = 0u;
+            for (size_t i = 0; i < count; ++i)
+                if (will_step[i]) subset[n++] = ctxs[i];
+            rows = subset;
+            if (scratch != NULL) scratch->cuda_condition_ready = 0;
+        }
+        /* The host K/V mirror only feeds a CPU retry, which a device-owned
+         * row can never take. */
+        const int cuda_rc = pocket_cuda_backbone_step_batch(
+            rows, live, scratch, NULL, NULL, all_owned ? 0 : 1, cuda_error,
+            sizeof(cuda_error));
+        if (cuda_rc == 0) {
+            cuda_used = 1;
+            (void)mynah_backend_note_backbone_batch(scratch->backend, live);
+        } else if (scratch != NULL) {
+            scratch->cuda_condition_ready = 0;
+        }
+    }
+    if (live == 1u) {
+        /* A single request is the latency-critical server path.  CUDA keeps
+         * the whole transformer step resident; if a launch/sync fails, the
+         * host KV offset is still unchanged and the ordinary CPU step below
+         * can safely retry it. */
+        mynah_engine_ctx *single = NULL;
+        for (size_t i = 0; i < count; ++i) {
+            if (will_step[i]) {
+                single = ctxs[i];
+                break;
+            }
+        }
+        char cuda_error[256];
+        cuda_error[0] = '\0';
+        const int cuda_rc = pocket_cuda_backbone_step(
+            single, cuda_error, sizeof(cuda_error));
+        if (cuda_rc == 0) cuda_used = 1;
+    }
+    if (!cuda_used && any_owned && live > 1u) {
+        /* No batch scratch: the same device step one row at a time. A row that
+         * fails leaves its offset where the rollback below puts it back. */
+        cuda_used = 1;
+        for (size_t i = 0; i < count && !failed; ++i) {
+            if (!will_step[i]) continue;
+            char cuda_error[256];
+            cuda_error[0] = '\0';
+            const int rc = !ctxs[i]->cuda_backbone_device_owned
+                ? 1
+                : pocket_cuda_backbone_step(ctxs[i], cuda_error,
+                                            sizeof(cuda_error));
+            if (rc != 0) {
+                failed = 1;
+                failed_at = i;
+                fprintf(stderr, "pocket: device-owned row %zu step rc=%d: %s\n",
+                        i, rc, cuda_error);
+            }
+        }
+    }
+    if (!cuda_used && any_owned) {
+        mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
+        mynah_region_end(MYNAH_RGN_STEP);
+        pocket_error(error, capacity,
+                     "pocket: the CUDA backbone step failed for a device-owned "
+                     "request; there is no host cache to retry it on");
+        return -1;
+    }
+    if (!cuda_used && live > 1u && can_gather) {
         failed = mynah_transformer_ar_step_batch(scratch->states, live,
                                                  &scratch->backbone_w,
                                                  scratch->backbone_batch,
                                                  scratch->inputs,
                                                  scratch->outputs) != 0;
-    } else {
+    } else if (!cuda_used) {
         /* No batch scratch (or a single live request): the same graph, one row
          * at a time.  Not a second implementation -- `_step_batch` of one row
          * is `_step` -- just the path with nothing to share.  It is also the
@@ -4204,6 +8749,19 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     size_t gathered = 0;
     const size_t flow_capacity =
         (scratch == NULL) ? 0u : mynah_flow_head_batch_capacity(scratch->flow_batch);
+    int cuda_eos_used = 0;
+    if (scratch != NULL && scratch->cuda_backbone_output_ready && count > 1u) {
+        int eligible = 1;
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i] == NULL || ctxs[i]->budget_exhausted) {
+                eligible = 0;
+                break;
+            }
+        }
+        if (eligible && pocket_cuda_eos_batch(ctxs, count, scratch, NULL, 0u) == 0)
+            cuda_eos_used = 1;
+    }
+    if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
 
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
@@ -4228,10 +8786,11 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
 
         mynah_region_begin(MYNAH_RGN_EMIT);
         mynah_region_begin(MYNAH_RGN_STEP_HEAD);
-        if (pocket_single_linear(state, POCKET_QG_COND_EOS, state->cond_eos_key,
-                                 state->cond_eos_qtype, state->out_eos_weight, state->out_eos_bias,
-                                 ctx->hidden, &ctx->eos_logit, cfg->hidden_dim,
-                                 1u) != 0) {
+        if (!cuda_eos_used &&
+            pocket_single_linear(state, POCKET_QG_COND_EOS, state->cond_eos_key,
+                                 state->cond_eos_qtype, state->out_eos_weight,
+                                 state->out_eos_bias, ctx->hidden,
+                                 &ctx->eos_logit, cfg->hidden_dim, 1u) != 0) {
             mynah_region_end(MYNAH_RGN_STEP_HEAD);
             mynah_region_end(MYNAH_RGN_EMIT);
             pocket_error(error, capacity,
@@ -4244,7 +8803,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             ++ctx->dump->steps;
         }
         if (ctx->eos_step == SIZE_MAX && ctx->eos_logit > cfg->eos_threshold &&
-            ctx->frames >= cfg->min_audio_frames) {
+            ctx->frames - ctx->seg_frame0 >= cfg->min_audio_frames) {
             ctx->eos_step = ctx->step;
         }
         /* The crossing itself does not end the request: upstream emits its
@@ -4253,8 +8812,21 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
          * single frame is invalid, hence eos_frame 0 and nothing appended. */
         if (ctx->eos_step != SIZE_MAX &&
             ctx->step >= ctx->eos_step + ctx->frames_after_eos) {
-            ctx->eos = 1;
             ++ctx->step;
+            if (ctx->seg_index + 1u < ctx->seg_count) {
+                /* End of a segment, not of the request: the next segment's
+                 * prologue and prefill run through `prepare_slice`, and until
+                 * they finish the context must not look ready to anyone. */
+                ctx->prepared = 0;
+                ctx->seeding = 0;
+                ctx->segment_pending = 1;
+                results[i].reprepare = 1;
+                results[i].eos_frame = 0u;
+                results[i].frames_appended = 0u;
+                mynah_region_end(MYNAH_RGN_EMIT);
+                continue;
+            }
+            ctx->eos = 1;
             results[i].eos = 1;
             results[i].eos_frame = 0u;
             results[i].frames_appended = 0u;
@@ -4294,14 +8866,22 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
      * the pocket profile read as if it had Magpie's depth head. */
     mynah_region_begin(MYNAH_RGN_FLOW);
     int flow_failed = 0;
+    int cuda_flow_used = 0;
     if (gathered > 0) {
-        if (gathered <= flow_capacity && scratch != NULL &&
+        if (scratch != NULL && scratch->cuda_flow_enabled) {
+            char cuda_error[256];
+            cuda_error[0] = '\0';
+            if (pocket_cuda_flow_step_batch(ctxs[0]->state, gathered, scratch,
+                                            cuda_error, sizeof(cuda_error)) == 0)
+                cuda_flow_used = 1;
+        }
+        if (!cuda_flow_used && gathered <= flow_capacity && scratch != NULL &&
             scratch->flow_heads != NULL) {
             flow_failed = mynah_flow_head_forward_batch(
                               scratch->flow_heads, gathered, &scratch->flow_w,
                               scratch->flow_cond, times, scratch->flow_noise,
                               scratch->flow_out, scratch->flow_batch) != 0;
-        } else {
+        } else if (!cuda_flow_used) {
             for (size_t i = 0; i < count && !flow_failed; ++i) {
                 mynah_engine_ctx *ctx = ctxs[i];
                 if (results[i].frames_appended == 0u) continue;
@@ -4314,6 +8894,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     }
     mynah_region_end(MYNAH_RGN_FLOW);
     mynah_region_end(MYNAH_RGN_EMIT);
+    if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
 
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
@@ -4379,42 +8960,257 @@ static void pocket_truncate(mynah_engine_ctx *ctx, size_t frame_count) {
  * ring buffers, the decoder transformer's KV, the position counter -- so the
  * order in which contexts are visited cannot reach any of the numbers.
  */
-static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
-                               size_t capacity) {
+static int pocket_decode_frame_transform_cpu(mynah_engine_ctx *ctx, char *error,
+                                             size_t capacity) {
+    const int depth = mynah_region_depth();
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (mynah_transformer_ar_prefill(ctx->codec_transformer, &ctx->codec_w,
+                                     ctx->codec_seq,
+                                     ctx->state->cfg.upsample_stride,
+                                     ctx->codec_out) != 0) {
+        mynah_region_unwind(depth);
+        pocket_error(error, capacity, "pocket: the decoder transformer failed");
+        return -1;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    return 0;
+}
+
+static int pocket_decode_frame_transform_finish(mynah_engine_ctx *ctx,
+                                                char *error, size_t capacity) {
+    const pocket_config *cfg = &ctx->state->cfg;
+    const size_t stride = cfg->upsample_stride;
+    const size_t dim = cfg->codec_dim;
+    size_t output_floats = 0u;
+    if (pocket_mul(stride, dim, &output_floats) != 0) {
+        pocket_error(error, capacity, "pocket: decoder transformer output size overflow");
+        return -1;
+    }
+    /* With the direct resident handoff and MYNAH_CUDA_CODEC_HOST_MIRROR=0,
+     * codec_out was intentionally never copied back.  The decoder consumes
+     * cuda_decoder_input, so transposing stale host memory here would both
+     * waste work and make an unrelated uninitialised NaN look like a CUDA
+     * transformer failure.  Dumps force the mirror on in the helper above. */
+    const int device_only = ctx->cuda_codec_device_output_ready &&
+                            (!pocket_cuda_codec_host_mirror_enabled() ||
+                             ctx->cuda_mimi_tile_owned);
+    if (!device_only) {
+        for (size_t t = 0; t < stride; ++t) {
+            for (size_t c = 0; c < dim; ++c)
+                ctx->codec_back[c * stride + t] = ctx->codec_out[t * dim + c];
+        }
+        if (!pocket_all_finite(ctx->codec_out, output_floats)) {
+            pocket_error(error, capacity,
+                         "pocket: decoder transformer produced non-finite values");
+            return -1;
+        }
+        if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
+            const size_t slot = ctx->dump->decoded;
+            memcpy(ctx->dump->denorm + slot * cfg->latent_dim, ctx->denorm,
+                   cfg->latent_dim * sizeof(float));
+            memcpy(ctx->dump->codec_tf + slot * ctx->dump->codec_row,
+                   ctx->codec_out, ctx->dump->codec_row * sizeof(float));
+        }
+    }
+    ctx->cuda_codec_device_input_ready = 0;
+    return 0;
+}
+
+/* The one place a latent frame is denormalised, shared by the per-request
+ * prepare and the CUDA codec gang so both hand the device the same bits. */
+static void pocket_denorm_latent(mynah_engine_ctx *ctx, size_t frame) {
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const float *latent = ctx->latents + frame * cfg->latent_dim;
+    for (size_t d = 0; d < cfg->latent_dim; ++d) {
+        ctx->denorm[d] = latent[d] * state->emb_std[d] + state->emb_mean[d];
+    }
+}
+
+/* Queue the quantizer projection + causal upsample of one frame for every
+ * eligible request of a gang in one backend submission (CUDA only).
+ * `frames[i]` is the frame to prepare for ctxs[i], SIZE_MAX to skip it.
+ *
+ * Eligibility is exactly the per-request resident upsample's; a request that
+ * is not eligible, or a backend without the path, is left untouched and goes
+ * through pocket_decode_frame_prepare's own schedule.  Each row advances only
+ * its own device tail, with the single-request reduction order.  On a
+ * queueing failure every row is restored the way the per-request path
+ * restores itself (drain, import the carried tail, drop the device upsample);
+ * a row whose tail cannot be recovered is reported in `row_failed`. */
+static void pocket_cuda_codec_gang_upsample(mynah_engine_ctx *const *ctxs,
+                                            size_t count, const size_t *frames,
+                                            int *row_failed, char *error,
+                                            size_t capacity) {
+    if (!pocket_cuda_codec_gang_enabled() ||
+        !pocket_cuda_codec_upsample_enabled())
+        return;
+    const mynah_engine_state *state = NULL;
+    const float *host_input[POCKET_MAX_BATCH];
+    float *output[POCKET_MAX_BATCH];
+    float *partial[POCKET_MAX_BATCH];
+    size_t index[POCKET_MAX_BATCH];
+    size_t rows = 0u;
+    size_t tail = 0u;
+    for (size_t i = 0; i < count && i < POCKET_MAX_BATCH; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (frames[i] == SIZE_MAX || ctx == NULL || ctx->state == NULL) continue;
+        ctx->cuda_codec_gang_upsampled = 0;
+        const pocket_config *cfg = &ctx->state->cfg;
+        if (!ctx->cuda_codec_enabled || !ctx->cuda_codec_upsample_enabled ||
+            cfg->codec_tf_dim != cfg->codec_dim || ctx->cuda_codec_up == NULL ||
+            ctx->codec_transformer == NULL || ctx->state->backend == NULL ||
+            (ctx->cuda_codec_up_tail > 0u && ctx->cuda_codec_up_partial == NULL))
+            continue;
+        if (state == NULL) {
+            if (strcmp(mynah_backend_name(ctx->state->backend), "cuda") != 0 ||
+                !pocket_cuda_groups_are_f32(ctx->state, POCKET_QG_CODEC_CONV))
+                continue;
+            state = ctx->state;
+            tail = ctx->cuda_codec_up_tail;
+        }
+        /* One model per call: the weights are shared by every row. */
+        if (ctx->state != state || ctx->cuda_codec_up_tail != tail) continue;
+        pocket_denorm_latent(ctx, frames[i]);
+        host_input[rows] = ctx->denorm;
+        output[rows] = ctx->cuda_codec_up;
+        partial[rows] = ctx->cuda_codec_up_partial;
+        index[rows++] = i;
+    }
+    if (rows == 0u) return;
+    const pocket_config *cfg = &state->cfg;
+    size_t kernel = 0u;
+    if (pocket_add(cfg->upsample_stride, tail, &kernel) != 0) return;
+    const mynah_backend_upsample_batch_desc desc = {
+        .rows = rows,
+        .in_dim = cfg->latent_dim,
+        .channels = cfg->codec_dim,
+        .kernel = kernel,
+        .stride = cfg->upsample_stride,
+        .host_input = host_input,
+        .output = output,
+        .partial = partial,
+        .proj_weight = state->quantizer_proj,
+        .proj_bias = NULL,
+        .up_weight = state->upsample.weight,
+        .up_bias = state->upsample.bias,
+    };
+    char local[256];
+    local[0] = '\0';
+    mynah_region_begin2(MYNAH_RGN_CODEC_EMBED);
+    const int rc = mynah_backend_codec_upsample_batch_dev(state->backend, &desc,
+                                                          local, sizeof(local));
+    mynah_region_end2(MYNAH_RGN_CODEC_EMBED);
+    if (rc > 0) return;
+    if (rc == 0) {
+        for (size_t r = 0; r < rows; ++r) {
+            mynah_engine_ctx *ctx = ctxs[index[r]];
+            ctx->cuda_codec_device_input_ready = 1;
+            ctx->cuda_codec_gang_upsampled = 1;
+        }
+        mynah_backend_note_codec_gang(state->backend, 0, rows);
+        return;
+    }
+    char drain[256];
+    drain[0] = '\0';
+    const int drained =
+        mynah_backend_sync(state->backend, drain, sizeof(drain)) == 0;
+    for (size_t r = 0; r < rows; ++r) {
+        mynah_engine_ctx *ctx = ctxs[index[r]];
+        char one[256];
+        one[0] = '\0';
+        if (!drained ||
+            pocket_cuda_codec_import_upsample_tail(ctx, one, sizeof(one)) != 0) {
+            row_failed[index[r]] = 1;
+            pocket_error(error, capacity, "%s",
+                         one[0] != '\0' ? one
+                                        : (drain[0] != '\0'
+                                               ? drain
+                                               : (local[0] != '\0'
+                                                      ? local
+                                                      : "pocket: CUDA codec gang upsample lost its causal state")));
+        }
+        mynah_backend_note_codec_upsample(state->backend, 1);
+        pocket_cuda_codec_upsample_disable(ctx);
+    }
+}
+
+/* Prepare the host-owned portion of one codec frame. Decoder submission is
+ * deliberately outside this helper so a gang can prepare every context before
+ * it queues any D2H or synchronization work. `defer_cuda` is set only by the
+ * frame-major gang; the single/offline path runs the same resident transformer
+ * immediately. */
+static int pocket_cuda_mimi_tile_enabled(void);
+static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                 int *done, char *error, size_t capacity);
+
+static int pocket_decode_frame_prepare(mynah_engine_ctx *ctx, size_t frame,
+                                       int defer_cuda, char *error,
+                                       size_t capacity) {
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
     const size_t stride = cfg->upsample_stride;
     const size_t dim = cfg->codec_dim;
     const int depth = mynah_region_depth();
+    int device_input = 0;
 
-    const float *latent = ctx->latents + frame * cfg->latent_dim;
     mynah_region_begin2(MYNAH_RGN_CODEC_EMBED);
-    for (size_t d = 0; d < cfg->latent_dim; ++d) {
-        ctx->denorm[d] = latent[d] * state->emb_std[d] + state->emb_mean[d];
+    /* quantizer.output_proj is Conv1d(32, codec_dim, 1): one matvec per
+     * frame. When the resident codec transformer is active and its model
+     * width matches the upsample width, keep both operations on device. The
+     * CPU sequence below remains the exact fallback and oracle. */
+    const int gang_input = ctx->cuda_codec_gang_upsampled != 0;
+    if (gang_input) {
+        /* The gang already denormalised this frame into ctx->denorm and
+         * queued its projection/upsample (pocket_cuda_codec_gang_upsample). */
+        ctx->cuda_codec_gang_upsampled = 0;
+        mynah_backend_note_codec_upsample(state->backend, 0);
+        device_input = 1;
+    } else {
+        pocket_denorm_latent(ctx, frame);
     }
-    /* quantizer.output_proj is Conv1d(32, 512, 1): one matvec per frame. */
-    if (pocket_single_linear(state, POCKET_QG_CODEC_CONV, state->codec_conv_key,
-                             state->codec_conv_qtype, state->quantizer_proj, NULL,
-                             ctx->denorm, ctx->codec_in, cfg->latent_dim, dim) != 0) {
-        mynah_region_unwind(depth);
-        pocket_error(error, capacity, "pocket: the quantizer projection failed");
-        return -1;
+    if (!gang_input &&
+        pocket_cuda_codec_upsample_enabled() && ctx->cuda_codec_enabled &&
+        ctx->cuda_codec_upsample_enabled &&
+        cfg->codec_tf_dim == cfg->codec_dim) {
+        char upsample_error[256];
+        upsample_error[0] = '\0';
+        const int upsample_rc = pocket_cuda_codec_upsample_prepare(
+            ctx, upsample_error, sizeof(upsample_error));
+        if (upsample_rc == 0) {
+            mynah_backend_note_codec_upsample(state->backend, 0);
+            device_input = 1;
+        } else if (upsample_rc < 0) {
+            mynah_region_unwind(depth);
+            pocket_error(error, capacity, "%s", upsample_error[0] != '\0'
+                                                     ? upsample_error
+                                                     : "pocket: CUDA upsample failed while preserving state");
+            return -1;
+        } else {
+            mynah_backend_note_codec_upsample(state->backend, 1);
+        }
     }
-    if (mynah_seanet_upsample(ctx->codec, &state->upsample, ctx->codec_in, 1u,
-                              ctx->codec_up) != 0) {
+    if (!device_input &&
+        (pocket_single_linear(
+             state, POCKET_QG_CODEC_CONV, state->codec_conv_key,
+             state->codec_conv_qtype, state->quantizer_proj, NULL,
+             ctx->denorm, ctx->codec_in, cfg->latent_dim, dim) != 0 ||
+               mynah_seanet_upsample(ctx->codec, &state->upsample, ctx->codec_in,
+                                     1u, ctx->codec_up) != 0)) {
         mynah_region_unwind(depth);
-        pocket_error(error, capacity, "pocket: the codec upsample failed");
+        pocket_error(error, capacity, "pocket: the quantizer/upsample failed");
         return -1;
     }
     mynah_region_end2(MYNAH_RGN_CODEC_EMBED);
 
-    /* The decoder transformer runs at the encoder frame rate and its inner
-     * layers see [positions, channels]; the transpose belongs here, at the
-     * same place the reference puts it. */
-    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
-    for (size_t c = 0; c < dim; ++c) {
-        for (size_t t = 0; t < stride; ++t) {
-            ctx->codec_seq[t * dim + c] = ctx->codec_up[c * stride + t];
+    if (!device_input) {
+        /* The decoder transformer runs at the encoder frame rate and its
+         * inner layers see [positions, channels]; the transpose belongs here,
+         * at the same place the reference puts it. */
+        for (size_t c = 0; c < dim; ++c) {
+            for (size_t t = 0; t < stride; ++t) {
+                ctx->codec_seq[t * dim + c] = ctx->codec_up[c * stride + t];
+            }
         }
     }
     /* Two counters, both mandatory (E2-3): the ring buffers inside the SEANet
@@ -4429,27 +9225,54 @@ static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
                      mynah_transformer_ar_state_offset(ctx->codec_transformer));
         return -1;
     }
-    if (mynah_transformer_ar_prefill(ctx->codec_transformer, &ctx->codec_w,
-                                     ctx->codec_seq, stride, ctx->codec_out) != 0) {
-        mynah_region_unwind(depth);
-        pocket_error(error, capacity, "pocket: the decoder transformer failed");
+    if (ctx->cuda_codec_enabled) {
+        ctx->cuda_codec_pending = 1;
+        if (defer_cuda) return 0;
+        if (pocket_cuda_mimi_tile_enabled()) {
+            int tiled = 0;
+            mynah_engine_ctx *one[1] = {ctx};
+            if (pocket_cuda_mimi_tile(one, 1u, &tiled, error, capacity) == 0 &&
+                tiled)
+                return pocket_decode_frame_transform_finish(ctx, error, capacity);
+            if (ctx->cuda_mimi_tile_owned) {
+                if (error != NULL && capacity > 0u && error[0] == '\0')
+                    pocket_error(error, capacity, "pocket: CUDA Mimi tile failed");
+                return -1;
+            }
+        }
+        if (pocket_cuda_codec_transform_one(ctx, NULL, error, capacity) == 0)
+            return pocket_decode_frame_transform_finish(ctx, error, capacity);
+        /* The resident attempt did not advance the host offset. Disable this
+         * context's device mirror after restoring its bounded KV mirror, then
+         * run the exact CPU oracle below. */
+        if (ctx->cuda_codec_device_input_ready &&
+            pocket_cuda_codec_sync_host_upsample_input(ctx, error, capacity) != 0)
+            return -1;
+        if (ctx->cuda_codec_needs_host_sync &&
+            pocket_cuda_codec_sync_host_window(ctx, error, capacity) != 0)
+            return -1;
+        ctx->cuda_codec_enabled = 0;
+    }
+    ctx->cuda_codec_pending = 0;
+    if (pocket_decode_frame_transform_cpu(ctx, error, capacity) != 0) return -1;
+    return pocket_decode_frame_transform_finish(ctx, error, capacity);
+}
+
+/* Finish the common host-side state transition after either a CPU decoder or
+ * a resident CUDA decoder has produced ctx->pcm. */
+static int pocket_decode_frame_finish(mynah_engine_ctx *ctx, int cuda_decode,
+                                      char *error, size_t capacity) {
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const size_t stride = cfg->upsample_stride;
+    const int depth = mynah_region_depth();
+    if (cuda_decode < 0 || cuda_decode > 1) {
+        pocket_error(error, capacity, "pocket: invalid decoder completion state");
         return -1;
     }
-    for (size_t t = 0; t < stride; ++t) {
-        for (size_t c = 0; c < dim; ++c) {
-            ctx->codec_back[c * stride + t] = ctx->codec_out[t * dim + c];
-        }
-    }
-    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
-    if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
-        const size_t slot = ctx->dump->decoded;
-        memcpy(ctx->dump->denorm + slot * cfg->latent_dim, ctx->denorm,
-               cfg->latent_dim * sizeof(float));
-        memcpy(ctx->dump->codec_tf + slot * ctx->dump->codec_row, ctx->codec_out,
-               ctx->dump->codec_row * sizeof(float));
-    }
     mynah_region_begin2(MYNAH_RGN_CODEC_CONV);
-    if (mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
+    if (cuda_decode > 0 &&
+        mynah_seanet_decode(ctx->codec, &state->decoder, ctx->codec_back, stride,
                             ctx->pcm) != 0) {
         mynah_region_unwind(depth);
         pocket_error(error, capacity, "pocket: the SEANet decoder failed");
@@ -4457,12 +9280,31 @@ static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
     }
     mynah_region_end2(MYNAH_RGN_CODEC_CONV);
     mynah_seanet_state_advance(ctx->codec, 1u);
+    ctx->cuda_codec_device_output_ready = 0;
     if (ctx->dump != NULL && ctx->dump->decoded < ctx->dump->capacity) {
         memcpy(ctx->dump->pcm + ctx->dump->decoded * ctx->dump->frame_samples,
                ctx->pcm, ctx->dump->frame_samples * sizeof(float));
         ++ctx->dump->decoded;
     }
     return 0;
+}
+
+/* One context's compatibility schedule: prepare, submit/collect/sync, then
+ * finish.  The gang schedule below calls the same prepare/finish helpers but
+ * drains one shared backend stream for all resident decoder submissions. */
+static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
+                               size_t capacity) {
+    const int depth = mynah_region_depth();
+    if (pocket_decode_frame_prepare(ctx, frame, 0, error, capacity) != 0) {
+        mynah_region_unwind(depth);
+        return -1;
+    }
+    const int cuda_decode = pocket_cuda_decoder_step(ctx, error, capacity);
+    if (cuda_decode < 0) {
+        mynah_region_unwind(depth);
+        return -1;
+    }
+    return pocket_decode_frame_finish(ctx, cuda_decode, error, capacity);
 }
 
 /*
@@ -4564,36 +9406,33 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
  * The contract is in `tts_engine.h`; what follows is how this engine meets it
  * and, just as importantly, what it does NOT yet do.
  *
- * ## Bit-identity, and why it is not a tolerance here
+ * ## Numerical parity
  *
  * Whoever shares a call, how many there are and in what order they appear are a
  * scheduling decision the driver remakes every step on timing, so anything that
  * crossed between rows would make a request's audio depend on server load. The
  * guarantee here is structural rather than tested-and-hoped: every frame goes
- * through `pocket_decode_frame` above, which touches this context's buffers and
- * no others, so the loop below is free to visit contexts in any order it likes
- * and there is no arithmetic anywhere that can see the row count. Nothing was
- * relaxed to make batching possible, which is the reason it is safe.
+ * through the prepare/finish helpers above, which touch this context's buffers
+ * and no others. The CUDA schedule may submit one resident arithmetic batch
+ * before a stream drain, but it never aliases their causal state. Batched
+ * cuBLAS is allowed to reassociate a reduction differently from the single
+ * GEMM, so the real-weight gate below checks a tight finite-value tolerance
+ * rather than requiring byte identity between those two valid CUDA schedules.
  *
  * ## Frame-major, and what that is and is not worth
  *
  * The gang is walked frame index by frame index, all contexts at each index,
- * rather than context by context. That is NOT a performance claim: the codec
- * transformer and the SEANet stack are still one pass over their own weights
- * per context per frame, exactly as before, and nothing here was benchmarked
- * (this machine compiles for correctness only). Frame-major is chosen because
- * it is the schedule a shared pass would need, and adopting it now means the
- * step that actually shares work is local to this function instead of a
- * restructuring of it.
- *
- * What blocks that step is named rather than implied: the 41.8% item is the
- * decoder transformer, and sharing it across contexts needs a cross-request
- * PREFILL in `transformer_ar` -- `_step_batch` takes one position per state,
- * while a codec frame is `upsample_stride` consecutive positions of one state.
- * That module belongs to another lane. Until it exists the only cross-context
- * arithmetic available here is `quantizer.output_proj`, 32x512 against the
- * transformer's millions, and batching it would trade a measurable risk to
- * bit-identity for an unmeasurable gain. It was deliberately left alone.
+ * rather than context by context. The raw-F32 SEANet decoder uses true
+ * cross-request CUDA arithmetic batches: each request keeps independent causal
+ * state while elementwise/Conv1d/ConvTranspose work is launched for the whole
+ * gang. The codec-transformer batch is retained as an explicit experimental
+ * opt-in (`MYNAH_CUDA_CODEC_BATCH=1`); the production default keeps its
+ * resident per-request schedule because the real Mimi decoder amplifies the
+ * few-ulp reduction difference of a multi-row cuBLAS GEMM into an audible
+ * waveform delta. The quantizer/upsample boundary still has a small host
+ * control seam when its resident path is unavailable, and final PCM must be
+ * copied to the stream sink, so this is not a claim that a complete request
+ * is one fused kernel.
  *
  * ## Blast radius
  *
@@ -4602,16 +9441,538 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
  * passes and every other context finishes its own range. The return value is
  * non-zero only for something that belongs to no single context.
  */
+static int pocket_cuda_decoder_batch_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_DECODER_BATCH");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+static int pocket_cuda_decoder_arithmetic_batch_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_DECODER_ARITHMETIC_BATCH");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+static int pocket_cuda_codec_batch_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_CODEC_BATCH");
+    /* The opt-in is deliberate: the real-weight parity gate currently finds
+     * a large Mimi waveform delta after multi-row cuBLAS reassociation.  The
+     * safe default still keeps every codec projection resident on CUDA. */
+    return value != NULL && strcmp(value, "0") != 0;
+}
+
+static void pocket_decode_batch_drop(mynah_engine_ctx *ctx, size_t index,
+                                     float **out_samples, size_t *out_count,
+                                     int *failed, int *reported,
+                                     const char *detail, char *error,
+                                     size_t capacity) {
+    if (ctx != NULL) ctx->broken = 1;
+    if (out_samples != NULL && out_samples[index] != NULL) {
+        free(out_samples[index]);
+        out_samples[index] = NULL;
+    }
+    if (out_count != NULL) out_count[index] = 0u;
+    if (failed != NULL) failed[index] = 1;
+    if (reported != NULL && !*reported) {
+        pocket_error(error, capacity, "%s", detail != NULL && detail[0] != '\0'
+                                             ? detail
+                                             : "pocket: decoding audio failed");
+        *reported = 1;
+    }
+}
+
+/* On by default for CUDA: measured on the L4 (24L, BF16 KV, C8) it moved the
+ * served aggregate from 2.9 to 10.3 audio-s/s. MYNAH_CUDA_MIMI_TILE=0 restores
+ * the per-request resident schedule. */
+static int pocket_cuda_mimi_tile_enabled(void) {
+    const char *value = getenv("MYNAH_CUDA_MIMI_TILE");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
+/* Can this request's pending frame run in the cross-request tile? The tile
+ * needs the device upsample output, the device decoder handoff, and a device
+ * KV window wide enough to be used as a ring. A request adopts the ring only
+ * at codec position 0, so its whole Mimi history is ring-resident. */
+static int pocket_cuda_mimi_tile_eligible(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->cuda_codec_enabled || !ctx->cuda_codec_pending ||
+        ctx->state == NULL || ctx->cuda_codec_kv == NULL ||
+        !ctx->cuda_codec_device_input_ready || ctx->cuda_codec_up == NULL ||
+        !ctx->cuda_decoder_enabled || ctx->cuda_decoder_input == NULL)
+        return 0;
+    const pocket_config *cfg = &ctx->state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctx->codec_transformer);
+    if (tc == NULL || cfg->codec_dim != cfg->codec_tf_dim ||
+        ctx->cuda_codec_kv_half != ctx->cuda_codec_kv_positions * cfg->codec_tf_dim ||
+        ctx->cuda_codec_kv_positions + 1u < tc->context + cfg->upsample_stride)
+        return 0;
+    return ctx->cuda_mimi_tile_owned ||
+           mynah_transformer_ar_state_offset(ctx->codec_transformer) == 0u;
+}
+
+/* One launch sequence for the Mimi decoder transformer of every eligible
+ * request in the gang: [requests x upsample_stride] rows through each layer,
+ * attention against each request's own ring. On success the request's frame
+ * is in its device decoder input and its host offset has advanced; the host
+ * KV window is not maintained. `done[i]` reports which contexts it served. */
+static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
+                                 int *done, char *error, size_t capacity) {
+    for (size_t i = 0; i < count; ++i) done[i] = 0;
+    if (count == 0u || !pocket_cuda_mimi_tile_enabled()) return 0;
+    const mynah_engine_state *state = NULL;
+    const float *input[POCKET_MAX_BATCH];
+    float *output[POCKET_MAX_BATCH];
+    size_t start[POCKET_MAX_BATCH];
+    size_t index[POCKET_MAX_BATCH];
+    size_t rows = 0u;
+    for (size_t i = 0; i < count && i < POCKET_MAX_BATCH; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (!pocket_cuda_mimi_tile_eligible(ctx)) {
+            if (ctx != NULL && ctx->cuda_mimi_tile_owned && ctx->cuda_codec_pending)
+                pocket_error(error, capacity,
+                             "pocket: CUDA Mimi tile row lost eligibility "
+                             "(enabled=%d input=%d up=%d decoder=%d offset=%zu)",
+                             ctx->cuda_codec_enabled,
+                             ctx->cuda_codec_device_input_ready,
+                             ctx->cuda_codec_up != NULL,
+                             ctx->cuda_decoder_enabled,
+                             mynah_transformer_ar_state_offset(
+                                 ctx->codec_transformer));
+            continue;
+        }
+        if (state == NULL) state = ctx->state;
+        if (ctx->state != state) continue;
+        input[rows] = ctx->cuda_codec_up;
+        output[rows] = ctx->cuda_decoder_input;
+        start[rows] = mynah_transformer_ar_state_offset(ctx->codec_transformer);
+        index[rows++] = i;
+    }
+    if (rows == 0u) return 0;
+    if (!mynah_backend_has_tile_transformer(state->backend)) return 0;
+    const pocket_config *cfg = &state->cfg;
+    const size_t layers = cfg->codec_tf_layers;
+    if (layers == 0u || layers > 8u) return 0;
+    void *kv[POCKET_MAX_BATCH * 8u];
+    mynah_transformer_tile_layer layer[8];
+    size_t ring = SIZE_MAX;
+    for (size_t r = 0; r < rows; ++r) {
+        const mynah_engine_ctx *ctx = ctxs[index[r]];
+        if (ctx->cuda_codec_kv_positions < ring) ring = ctx->cuda_codec_kv_positions;
+        for (size_t l = 0; l < layers; ++l) kv[r * layers + l] = ctx->cuda_codec_kv[l];
+    }
+    for (size_t l = 0; l < layers; ++l) {
+        const mynah_transformer_ar_layer *src = &state->codec_layers[l];
+        layer[l].norm1_weight = src->norm1_weight;
+        layer[l].norm1_bias = src->norm1_bias;
+        layer[l].in_proj_weight = src->in_proj_weight;
+        layer[l].in_proj_bias = src->in_proj_bias;
+        layer[l].out_proj_weight = src->out_proj_weight;
+        layer[l].out_proj_bias = src->out_proj_bias;
+        layer[l].layer_scale_1 = src->layer_scale_1;
+        layer[l].norm2_weight = src->norm2_weight;
+        layer[l].norm2_bias = src->norm2_bias;
+        layer[l].linear1_weight = src->linear1_weight;
+        layer[l].linear1_bias = src->linear1_bias;
+        layer[l].linear2_weight = src->linear2_weight;
+        layer[l].linear2_bias = src->linear2_bias;
+        layer[l].layer_scale_2 = src->layer_scale_2;
+    }
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctxs[index[0]]->codec_transformer);
+    /* A ring shared by every request of the call: all of them were sized from
+     * the same model, and the smallest one bounds the slot arithmetic. */
+    for (size_t r = 0; r < rows; ++r)
+        if (ctxs[index[r]]->cuda_codec_kv_positions != ring) return 0;
+    const mynah_backend_tile_desc desc = {
+        .rows = rows,
+        .positions = cfg->upsample_stride,
+        .dim = cfg->codec_tf_dim,
+        .heads = cfg->codec_tf_heads,
+        .ffn = cfg->codec_tf_ffn,
+        .layers = layers,
+        .context = tc->context,
+        .ring = ring,
+        .max_period = tc->max_period,
+        .layernorm_eps = tc->layernorm_eps,
+        .layer = layer,
+        .input = input,
+        .output = output,
+        .kv = kv,
+        .start = start,
+        /* Same encoding as the per-request path would give these rows. */
+        .weight_bf16 = pocket_cuda_codec_qtype(state, 0u,
+                                               MYNAH_TAR_LINEAR_IN_PROJ) ==
+                       MYNAH_BACKEND_QTYPE_BF16,
+    };
+    char local[256];
+    local[0] = '\0';
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
+                                                      local, sizeof(local));
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (rc != 0) {
+        /* Nothing was committed on the host. Owned rows cannot recover; the
+         * caller drops them, and fresh rows fall back to the old path. */
+        if (rc < 0) pocket_error(error, capacity, "%s", local);
+        return rc < 0 ? -1 : 0;
+    }
+    (void)mynah_backend_note_codec_transformer_batch(state->backend, rows, rows);
+    for (size_t r = 0; r < rows; ++r) {
+        mynah_engine_ctx *ctx = ctxs[index[r]];
+        const size_t end = start[r] + cfg->upsample_stride;
+        /* Only the host offset matters now; its KV window is intentionally
+         * stale, so the window is compacted without any device traffic. */
+        if (mynah_transformer_ar_state_prepare_window(ctx->codec_transformer,
+                                                       end) != 0 ||
+            mynah_transformer_ar_state_set_window_offset(ctx->codec_transformer, end,
+                                                  local, sizeof(local)) != 0) {
+            ctx->cuda_mimi_tile_owned = 1;
+            pocket_error(error, capacity,
+                         "pocket: CUDA Mimi tile cannot advance the host codec "
+                         "offset to %zu (capacity %zu): %s",
+                         end,
+                         mynah_transformer_ar_state_kv_positions(
+                             ctx->codec_transformer),
+                         local);
+            continue; /* done stays 0: the caller drops an owned row */
+        }
+        ctx->cuda_mimi_tile_owned = 1;
+        ctx->cuda_codec_valid = 0;
+        ctx->cuda_codec_needs_host_sync = 0;
+        ctx->cuda_codec_device_input_ready = 0;
+        ctx->cuda_codec_device_output_ready = 1;
+        ctx->cuda_codec_pending = 0;
+        done[index[r]] = 1;
+    }
+    return 0;
+}
+
+/* Run one frame's consecutive codec positions as a true cross-request batch.
+ * The decoder transformer is a prefill tile, not a one-token AR step: each
+ * request contributes `upsample_stride` positions, while its KV window and
+ * absolute RoPE positions remain independent. */
+static int pocket_cuda_codec_transform_batch(mynah_engine_ctx *const *ctxs,
+                                              size_t count,
+                                              mynah_engine_scratch *scratch,
+                                              char *error, size_t capacity) {
+    if (ctxs == NULL || count == 0u) return 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i] != NULL) ctxs[i]->cuda_codec_device_output_ready = 0;
+    }
+    if (pocket_cuda_mimi_tile_enabled()) {
+        int tiled[POCKET_MAX_BATCH];
+        if (pocket_cuda_mimi_tile(ctxs, count, tiled, error, capacity) < 0)
+            return 1;
+        int failed = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (tiled[i] || ctxs[i] == NULL || !ctxs[i]->cuda_codec_pending ||
+                ctxs[i]->cuda_mimi_tile_owned) continue;
+            if (pocket_cuda_codec_transform_one(ctxs[i], scratch, error,
+                                                capacity) != 0)
+                failed = 1;
+        }
+        return failed;
+    }
+    if (count == 1u)
+        return pocket_cuda_codec_transform_one(ctxs[0], scratch, error, capacity);
+    if (!pocket_cuda_codec_batch_enabled()) {
+        int failed = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i] == NULL || !ctxs[i]->cuda_codec_pending) continue;
+            if (pocket_cuda_codec_transform_one(ctxs[i], NULL, error, capacity) != 0)
+                failed = 1;
+        }
+        return failed;
+    }
+    if (scratch == NULL || !scratch->cuda_codec_enabled ||
+        scratch->cuda_codec_x == NULL || scratch->cuda_codec_norm == NULL ||
+        scratch->cuda_codec_qkv == NULL || scratch->cuda_codec_attn == NULL ||
+        scratch->cuda_codec_proj == NULL || scratch->cuda_codec_ffn == NULL ||
+        scratch->cuda_codec_host_input == NULL ||
+        scratch->cuda_codec_host_output == NULL ||
+        scratch->cuda_codec_abs_positions == NULL ||
+        scratch->cuda_codec_positions == NULL ||
+        scratch->cuda_codec_cache_strides == NULL ||
+        scratch->cuda_codec_kcache == NULL ||
+        scratch->cuda_codec_vcache == NULL ||
+        scratch->cuda_codec_input_rows == NULL ||
+        scratch->cuda_codec_output_rows == NULL || scratch->cuda_kcache == NULL ||
+        scratch->cuda_vcache == NULL || count > scratch->cuda_batch_capacity) {
+        int failed = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (ctxs[i] == NULL || !ctxs[i]->cuda_codec_pending) continue;
+            if (pocket_cuda_codec_transform_one(ctxs[i], scratch, error,
+                                                capacity) != 0)
+                failed = 1;
+        }
+        return failed;
+    }
+    const mynah_engine_state *state = ctxs[0]->state;
+    if (state == NULL || state->backend == NULL ||
+        strcmp(mynah_backend_name(state->backend), "cuda") != 0) return 1;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *tc =
+        mynah_transformer_ar_state_config(ctxs[0]->codec_transformer);
+    const size_t stride = cfg->upsample_stride;
+    const size_t dim = cfg->codec_tf_dim;
+    int device_handoff = pocket_cuda_codec_device_handoff_enabled() &&
+                         cfg->codec_dim == dim;
+    if (tc == NULL || stride == 0u || dim == 0u || count > POCKET_MAX_BATCH)
+        return 1;
+
+    size_t rows = 0u;
+    if (pocket_mul(count, dim, &rows) != 0) return 1;
+    size_t ffn_rows = 0u;
+    if (pocket_mul(count, cfg->codec_tf_ffn, &ffn_rows) != 0) return 1;
+    size_t output_floats = 0u;
+    if (pocket_mul(stride, dim, &output_floats) != 0) return 1;
+    size_t starts[POCKET_MAX_BATCH];
+    size_t bases[POCKET_MAX_BATCH];
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || ctx->state != state || !ctx->cuda_codec_pending ||
+            !ctx->cuda_codec_enabled || ctx->cuda_codec_kv == NULL ||
+            ctx->cuda_codec_kv_positions == 0u ||
+            ctx->cuda_codec_kv_half == 0u) return 1;
+        if (ctx->cuda_codec_device_input_ready &&
+            (ctx->cuda_codec_up == NULL || cfg->codec_dim != dim)) return 1;
+        const mynah_transformer_ar_config *other =
+            mynah_transformer_ar_state_config(ctx->codec_transformer);
+        if (other == NULL || other->d_model != tc->d_model ||
+            other->num_heads != tc->num_heads ||
+            other->head_dim != tc->head_dim ||
+            other->num_layers != tc->num_layers ||
+            other->ffn_dim != tc->ffn_dim || other->context != tc->context ||
+            other->max_period != tc->max_period ||
+            other->layernorm_eps != tc->layernorm_eps) return 1;
+        if (!ctx->cuda_decoder_enabled || ctx->cuda_decoder_input == NULL)
+            device_handoff = 0;
+        starts[i] = mynah_transformer_ar_state_offset(ctx->codec_transformer);
+        size_t end = 0u;
+        if (pocket_add(starts[i], stride, &end) != 0 ||
+            pocket_cuda_codec_prepare_window(ctx, end, error, capacity) != 0)
+            return 1;
+        bases[i] = ctx->cuda_codec_kv_base;
+    }
+    const int host_mirror = !device_handoff ||
+                            pocket_cuda_codec_host_mirror_enabled();
+
+    char local[256];
+    char drain[256];
+    local[0] = '\0';
+    if (mynah_backend_batch_begin(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    for (size_t t = 0; t < stride; ++t) {
+        int any_device_input = 0;
+        float **input_rows = scratch->cuda_codec_input_rows +
+                             t * scratch->cuda_codec_batch_capacity;
+        size_t *absolute_positions = scratch->cuda_codec_abs_positions +
+                                     t * scratch->cuda_codec_batch_capacity;
+        size_t *positions = scratch->cuda_codec_positions +
+                            t * scratch->cuda_codec_batch_capacity;
+        size_t *cache_strides = scratch->cuda_codec_cache_strides +
+                                t * scratch->cuda_codec_batch_capacity;
+        for (size_t i = 0; i < count; ++i) {
+            const size_t absolute = starts[i] + t;
+            const size_t window_absolute =
+                absolute >= tc->context ? absolute - tc->context + 1u : 0u;
+            if (absolute < bases[i] || window_absolute < bases[i] ||
+                window_absolute > absolute ||
+                absolute - bases[i] >= ctxs[i]->cuda_codec_kv_positions)
+                goto fail_region;
+            const size_t window_slot = window_absolute - bases[i];
+            if (ctxs[i]->cuda_codec_device_input_ready) {
+                input_rows[i] = ctxs[i]->cuda_codec_up + t * dim;
+                any_device_input = 1;
+            } else {
+                input_rows[i] = NULL;
+                memcpy(scratch->cuda_codec_host_input +
+                           t * scratch->cuda_batch_capacity * dim + i * dim,
+                       ctxs[i]->codec_seq + t * dim,
+                       dim * sizeof(float));
+            }
+            absolute_positions[i] = absolute;
+            positions[i] = absolute - bases[i] - window_slot;
+            cache_strides[i] = dim;
+        }
+        if (any_device_input) {
+            if (mynah_backend_gather_rows_to_batch_dev(
+                    state->backend, input_rows,
+                    scratch->cuda_codec_x, count, dim, local,
+                    sizeof(local)) != 0)
+                goto fail_region;
+            for (size_t i = 0; i < count; ++i) {
+                if (input_rows[i] != NULL) continue;
+                if (mynah_backend_h2d(
+                        state->backend,
+                        scratch->cuda_codec_host_input +
+                            t * scratch->cuda_batch_capacity * dim + i * dim,
+                        scratch->cuda_codec_x + i * dim, dim, local,
+                        sizeof(local)) != 0)
+                    goto fail_region;
+            }
+        } else if (mynah_backend_h2d(
+                       state->backend,
+                       scratch->cuda_codec_host_input +
+                           t * scratch->cuda_batch_capacity * dim,
+                       scratch->cuda_codec_x, rows, local, sizeof(local)) != 0)
+            goto fail_region;
+        for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
+            const mynah_transformer_ar_layer *layer = &state->codec_layers[l];
+            for (size_t i = 0; i < count; ++i) {
+                float *device = ctxs[i]->cuda_codec_kv[l];
+                const size_t absolute = starts[i] + t;
+                const size_t window_absolute =
+                    absolute >= tc->context ? absolute - tc->context + 1u : 0u;
+                const size_t window_slot = window_absolute - bases[i];
+                scratch->cuda_codec_kcache[
+                    t * cfg->codec_tf_layers * scratch->cuda_codec_batch_capacity +
+                    l * scratch->cuda_codec_batch_capacity + i] =
+                    device + window_slot * dim;
+                scratch->cuda_codec_vcache[
+                    t * cfg->codec_tf_layers * scratch->cuda_codec_batch_capacity +
+                    l * scratch->cuda_codec_batch_capacity + i] =
+                    device + ctxs[i]->cuda_codec_kv_half + window_slot * dim;
+            }
+            if (mynah_backend_layer_norm_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_norm, layer->norm1_weight,
+                    layer->norm1_bias, count, dim, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_norm, scratch->cuda_codec_qkv,
+                    count, dim, 3u * dim, layer->in_proj_weight,
+                    layer->in_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_IN_PROJ),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_rope_batch_dev(
+                    state->backend, scratch->cuda_codec_qkv,
+                    absolute_positions, count,
+                    cfg->codec_tf_heads, dim / cfg->codec_tf_heads,
+                    tc->max_period, local, sizeof(local)) != 0 ||
+                mynah_backend_self_attention_batch_dev(
+                    state->backend, scratch->cuda_codec_qkv,
+                    scratch->cuda_codec_kcache +
+                        (t * cfg->codec_tf_layers + l) *
+                            scratch->cuda_codec_batch_capacity,
+                    scratch->cuda_codec_vcache +
+                        (t * cfg->codec_tf_layers + l) *
+                            scratch->cuda_codec_batch_capacity,
+                    positions, cache_strides,
+                    count, cfg->codec_tf_heads, dim / cfg->codec_tf_heads,
+                    1.0f / sqrtf((float)(dim / cfg->codec_tf_heads)),
+                    scratch->cuda_codec_attn, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_attn, scratch->cuda_codec_proj,
+                    count, dim, dim, layer->out_proj_weight,
+                    layer->out_proj_bias,
+                    pocket_cuda_codec_qtype(
+                        state, l, MYNAH_TAR_LINEAR_OUT_PROJ),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_rows_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_proj, layer->layer_scale_1, rows,
+                    dim, local, sizeof(local)) != 0 ||
+                mynah_backend_layer_norm_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_norm, layer->norm2_weight,
+                    layer->norm2_bias, count, dim, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_norm, scratch->cuda_codec_ffn,
+                    count, dim, cfg->codec_tf_ffn, layer->linear1_weight,
+                    layer->linear1_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN1),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_gelu_dev(state->backend, scratch->cuda_codec_ffn,
+                                       ffn_rows, local, sizeof(local)) != 0 ||
+                pocket_cuda_linear_d2d(
+                    state, scratch->cuda_codec_ffn, scratch->cuda_codec_proj,
+                    count, cfg->codec_tf_ffn, dim, layer->linear2_weight,
+                    layer->linear2_bias,
+                    pocket_cuda_codec_qtype(state, l, MYNAH_TAR_LINEAR_FFN2),
+                    local, sizeof(local)) != 0 ||
+                mynah_backend_scaled_residual_rows_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_proj, layer->layer_scale_2, rows,
+                    dim, local, sizeof(local)) != 0)
+                goto fail_region;
+        }
+        if (device_handoff) {
+            /* Keep this table separate from the per-layer attention tables.
+             * Their host-to-device metadata copies are asynchronous, so
+             * reusing layer zero here would race the final layer when the
+             * codec has one transformer block. */
+            for (size_t i = 0; i < count; ++i)
+                scratch->cuda_codec_output_rows[
+                    t * scratch->cuda_codec_batch_capacity + i] =
+                    ctxs[i]->cuda_decoder_input;
+            if (mynah_backend_scatter_rows_to_channels_dev(
+                    state->backend, scratch->cuda_codec_x,
+                    scratch->cuda_codec_output_rows +
+                        t * scratch->cuda_codec_batch_capacity,
+                    count, dim, stride, t, local,
+                    sizeof(local)) != 0)
+                goto fail_region;
+        }
+        if (host_mirror &&
+            mynah_backend_d2h(state->backend, scratch->cuda_codec_x,
+                              scratch->cuda_codec_host_output +
+                                  t * scratch->cuda_batch_capacity * dim,
+                              rows,
+                              local,
+                              sizeof(local)) != 0)
+            goto fail_region;
+    }
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+    if (mynah_backend_sync(state->backend, local, sizeof(local)) != 0)
+        goto fail;
+    for (size_t i = 0; i < count; ++i) {
+        if (host_mirror) {
+            /* The staged D2H for the last tile is complete only after the
+             * stream drain above; copying it earlier would race pageable host
+             * state. */
+            for (size_t t = 0; t < stride; ++t)
+                memcpy(ctxs[i]->codec_out + t * dim,
+                       scratch->cuda_codec_host_output +
+                           t * scratch->cuda_batch_capacity * dim + i * dim,
+                       dim * sizeof(float));
+            if (!pocket_all_finite(ctxs[i]->codec_out, output_floats))
+                goto fail;
+        }
+        size_t end = 0u;
+        if (pocket_add(starts[i], stride, &end) != 0 ||
+            mynah_transformer_ar_state_set_window_offset(
+                ctxs[i]->codec_transformer, end, local, sizeof(local)) != 0)
+            goto fail;
+        ctxs[i]->cuda_codec_device_input_ready = 0;
+        ctxs[i]->cuda_codec_device_output_ready = device_handoff;
+        ctxs[i]->cuda_codec_pending = 0;
+    }
+    (void)mynah_backend_note_codec_transformer_batch(
+        state->backend, count, stride);
+    return 0;
+
+fail_region:
+    mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
+fail:
+    (void)mynah_backend_sync(state->backend, drain, sizeof(drain));
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i] != NULL) {
+            ctxs[i]->cuda_codec_valid = 0;
+            ctxs[i]->cuda_codec_needs_host_sync = 1;
+            ctxs[i]->cuda_codec_device_output_ready = 0;
+        }
+    }
+    return 1;
+}
+
 static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
                                      const size_t *first_frame,
                                      const size_t *frame_count, float **out_samples,
                                      size_t *out_count, int *failed,
                                      mynah_engine_scratch *scratch, char *error,
                                      size_t capacity) {
-    /* The driver owns the arrays and pre-clears them; nothing in `scratch` is
-     * needed while the codec is per context, and nothing here keeps a pointer
-     * into any of them. */
-    (void)scratch;
+    /* The driver owns the arrays and pre-clears them; scratch is shared only
+     * for the resident CUDA codec gang and never retains request ownership. */
     if (ctxs == NULL || first_frame == NULL || frame_count == NULL ||
         out_samples == NULL || out_count == NULL || failed == NULL) {
         pocket_error(error, capacity, "pocket: null argument decoding a gang");
@@ -4671,34 +10032,342 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
     }
 
     if (longest == 0u) return 0;
-    mynah_region_begin(MYNAH_RGN_CODEC);
-    for (size_t f = 0; f < longest; ++f) {
+    const mynah_backend *batch_backend = NULL;
+    int use_async_decoder = pocket_cuda_decoder_batch_enabled();
+    if (use_async_decoder) {
         for (size_t i = 0; i < count; ++i) {
-            if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
-            mynah_engine_ctx *ctx = ctxs[i];
-            const size_t frame_samples = ctx->state->cfg.samples_per_frame;
-            one_error[0] = '\0';
-            if (pocket_decode_frame(ctx, first_frame[i] + f, one_error,
-                                    sizeof(one_error)) != 0) {
-                /* This context's codec advanced through frames nobody will hear
-                 * and cannot be rewound -- same reasoning as the single-range
-                 * path. Its neighbours are untouched and keep decoding. */
-                ctx->broken = 1;
-                free(out_samples[i]);
-                out_samples[i] = NULL;
-                out_count[i] = 0u;
-                failed[i] = 1;
-                if (!reported) {
-                    pocket_error(error, capacity, "%s",
-                                 one_error[0] != '\0'
-                                     ? one_error
-                                     : "pocket: decoding audio failed");
-                    reported = 1;
-                }
-                continue;
+            if (failed[i] || out_samples[i] == NULL) continue;
+            const mynah_backend *backend = ctxs[i]->state->backend;
+            if (backend == NULL ||
+                (batch_backend != NULL && backend != batch_backend)) {
+                use_async_decoder = 0;
+                break;
             }
-            memcpy(out_samples[i] + f * frame_samples, ctx->pcm,
-                   frame_samples * sizeof(float));
+            if (batch_backend == NULL) batch_backend = backend;
+        }
+        if (batch_backend == NULL ||
+            strcmp(mynah_backend_name(batch_backend), "cuda") != 0)
+            use_async_decoder = 0;
+    }
+
+    mynah_region_begin(MYNAH_RGN_CODEC);
+    if (!use_async_decoder) {
+        /* This is the unchanged CPU/compatibility schedule. */
+        for (size_t f = 0; f < longest; ++f) {
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                mynah_engine_ctx *ctx = ctxs[i];
+                const size_t frame_samples = ctx->state->cfg.samples_per_frame;
+                one_error[0] = '\0';
+                if (pocket_decode_frame(ctx, first_frame[i] + f, one_error,
+                                        sizeof(one_error)) != 0) {
+                    /* This context's codec advanced through frames nobody will
+                     * hear and cannot be rewound; its neighbours are untouched. */
+                    pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                             failed, &reported, one_error,
+                                             error, capacity);
+                    continue;
+                }
+                memcpy(out_samples[i] + f * frame_samples, ctx->pcm,
+                       frame_samples * sizeof(float));
+            }
+        }
+    } else {
+        /* Prepare all host state first, then queue every resident decoder.  A
+         * CUDA graph identity is per decoder, so graphs remain independent even
+         * though their launches share this backend stream. */
+        int prepared[POCKET_MAX_BATCH];
+        int submitted[POCKET_MAX_BATCH];
+        for (size_t f = 0; f < longest; ++f) {
+            memset(prepared, 0, sizeof(prepared));
+            memset(submitted, 0, sizeof(submitted));
+            size_t submitted_count = 0u;
+            int decoder_batch_used = 0;
+
+            /* Queue every request's quantizer + upsample for this frame in
+             * one submission before the per-request host preparation. */
+            {
+                size_t gang_frames[POCKET_MAX_BATCH];
+                int gang_failed[POCKET_MAX_BATCH];
+                for (size_t i = 0; i < count; ++i) {
+                    gang_failed[i] = 0;
+                    gang_frames[i] = (failed[i] || out_samples[i] == NULL ||
+                                      f >= frame_count[i])
+                                         ? SIZE_MAX
+                                         : first_frame[i] + f;
+                }
+                one_error[0] = '\0';
+                pocket_cuda_codec_gang_upsample(ctxs, count, gang_frames,
+                                                gang_failed, one_error,
+                                                sizeof(one_error));
+                for (size_t i = 0; i < count; ++i) {
+                    if (gang_failed[i])
+                        pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                 out_count, failed, &reported,
+                                                 one_error, error, capacity);
+                }
+            }
+
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                one_error[0] = '\0';
+                if (pocket_decode_frame_prepare(ctxs[i], first_frame[i] + f, 1,
+                                                one_error, sizeof(one_error)) != 0) {
+                    pocket_decode_batch_drop(ctxs[i], i, out_samples, out_count,
+                                             failed, &reported, one_error,
+                                             error, capacity);
+                    continue;
+                }
+                prepared[i] = 1;
+            }
+
+            /* All host-side frame preparation is complete. Run the pending
+             * codec-transformer tiles together; contexts that cannot use the
+             * optional resident path fall back to the same CPU tile before
+             * any decoder submission observes codec_back. */
+            mynah_engine_ctx *codec_pending[POCKET_MAX_BATCH];
+            size_t codec_count = 0u;
+            for (size_t i = 0; i < count; ++i) {
+                if (prepared[i] && !failed[i] &&
+                    ctxs[i]->cuda_codec_pending)
+                    codec_pending[codec_count++] = ctxs[i];
+            }
+            if (codec_count > 0u) {
+                char codec_error[256];
+                codec_error[0] = '\0';
+                (void)pocket_cuda_codec_transform_batch(
+                    codec_pending, codec_count, scratch, codec_error,
+                    sizeof(codec_error));
+                for (size_t p = 0; p < codec_count; ++p) {
+                    mynah_engine_ctx *ctx = codec_pending[p];
+                    if (ctx->cuda_codec_pending && ctx->cuda_mimi_tile_owned) {
+                        /* Its KV exists only in the device ring: there is no
+                         * CPU state to continue from. */
+                        for (size_t i = 0; i < count; ++i) {
+                            if (ctxs[i] != ctx) continue;
+                            pocket_decode_batch_drop(
+                                ctx, i, out_samples, out_count, failed,
+                                &reported,
+                                codec_error[0] != '\0'
+                                    ? codec_error
+                                    : "pocket: CUDA Mimi tile failed",
+                                error, capacity);
+                            break;
+                        }
+                        ctx->cuda_codec_pending = 0;
+                        continue;
+                    }
+                    if (ctx->cuda_codec_pending) {
+                        int host_sync = 0;
+                        if (ctx->cuda_codec_device_input_ready) {
+                            host_sync =
+                                pocket_cuda_codec_sync_host_upsample_input(
+                                    ctx, codec_error, sizeof(codec_error));
+                        }
+                        if (ctx->cuda_codec_needs_host_sync) {
+                            if (host_sync == 0)
+                                host_sync = pocket_cuda_codec_sync_host_window(
+                                    ctx, codec_error, sizeof(codec_error));
+                        }
+                        ctx->cuda_codec_pending = 0;
+                        ctx->cuda_codec_enabled = 0;
+                        if (host_sync != 0 ||
+                            pocket_decode_frame_transform_cpu(
+                                ctx, codec_error, sizeof(codec_error)) != 0 ||
+                            pocket_decode_frame_transform_finish(
+                                ctx, codec_error, sizeof(codec_error)) != 0) {
+                            size_t failed_index = 0u;
+                            for (size_t i = 0; i < count; ++i) {
+                                if (ctxs[i] == ctx) {
+                                    failed_index = i;
+                                    break;
+                                }
+                            }
+                            pocket_decode_batch_drop(
+                                ctx, failed_index, out_samples, out_count, failed,
+                                &reported, codec_error, error, capacity);
+                        }
+                    } else if (pocket_decode_frame_transform_finish(
+                                   ctx, codec_error, sizeof(codec_error)) != 0) {
+                        for (size_t i = 0; i < count; ++i) {
+                            if (ctxs[i] != ctx) continue;
+                            pocket_decode_batch_drop(
+                                ctx, i, out_samples, out_count, failed,
+                                &reported, codec_error, error, capacity);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            mynah_engine_ctx *decoder_candidates[POCKET_MAX_BATCH];
+            size_t decoder_candidate_indices[POCKET_MAX_BATCH];
+            size_t decoder_candidate_count = 0u;
+            for (size_t i = 0; i < count; ++i) {
+                if (!prepared[i] || failed[i]) continue;
+                mynah_engine_ctx *ctx = ctxs[i];
+                one_error[0] = '\0';
+                if (!ctx->cuda_decoder_enabled || ctx->cuda_decoder == NULL) {
+                    if (pocket_decode_frame_finish(ctx, 1, one_error,
+                                                   sizeof(one_error)) != 0)
+                        pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                                 failed, &reported, one_error,
+                                                 error, capacity);
+                } else if (decoder_candidate_count < POCKET_MAX_BATCH) {
+                    decoder_candidates[decoder_candidate_count] = ctx;
+                    decoder_candidate_indices[decoder_candidate_count++] = i;
+                }
+            }
+
+            /* The scheduler's normal width is now a real SEANet arithmetic
+             * batch.  If topology/state validation says the optional path is
+             * unavailable, the exact old per-request queue remains the
+             * fallback for every candidate. */
+            if (decoder_candidate_count > 1u) {
+                one_error[0] = '\0';
+                const int batch_status = pocket_cuda_decoder_submit_batch(
+                    decoder_candidates, decoder_candidate_count, one_error,
+                    sizeof(one_error));
+                if (batch_status == 0) {
+                    decoder_batch_used = 1;
+                    for (size_t p = 0; p < decoder_candidate_count; ++p) {
+                        const size_t i = decoder_candidate_indices[p];
+                        submitted[i] = 1;
+                        ++submitted_count;
+                    }
+                } else if (batch_status < 0) {
+                    for (size_t p = 0; p < decoder_candidate_count; ++p) {
+                        const size_t i = decoder_candidate_indices[p];
+                        pocket_decode_batch_drop(
+                            decoder_candidates[p], i, out_samples, out_count,
+                            failed, &reported, one_error, error, capacity);
+                    }
+                }
+            }
+
+            for (size_t p = 0; p < decoder_candidate_count; ++p) {
+                const size_t i = decoder_candidate_indices[p];
+                if (submitted[i] || failed[i]) continue;
+                mynah_engine_ctx *ctx = decoder_candidates[p];
+                one_error[0] = '\0';
+                const int status = pocket_cuda_decoder_submit(
+                    ctx, one_error, sizeof(one_error));
+                if (status == 0) {
+                    submitted[i] = 1;
+                    ++submitted_count;
+                } else if (status > 0) {
+                    /* The device path was unavailable before state advance;
+                     * CPU remains an allowed per-request fallback. */
+                    if (pocket_decode_frame_finish(ctx, 1, one_error,
+                                                   sizeof(one_error)) != 0)
+                        pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                                 failed, &reported, one_error,
+                                                 error, capacity);
+                } else {
+                    pocket_decode_batch_drop(ctx, i, out_samples, out_count,
+                                             failed, &reported, one_error,
+                                             error, capacity);
+                }
+            }
+
+            if (submitted_count > 0u) {
+                if (decoder_batch_used)
+                    (void)mynah_backend_decoder_note_batch(
+                        batch_backend, decoder_candidate_count, 1u);
+                /* One gather + one D2H for the whole gang's PCM.  Any
+                 * refusal leaves nothing queued and falls back to the
+                 * per-request copies below. */
+                const float *gang_pcm = NULL;
+                size_t gang_pcm_rows = 0u;
+                size_t gang_pcm_floats = 0u;
+                size_t gang_pcm_index[POCKET_MAX_BATCH];
+                if (pocket_cuda_codec_gang_enabled() && submitted_count > 1u) {
+                    const float *sources[POCKET_MAX_BATCH];
+                    int uniform = 1;
+                    for (size_t i = 0; i < count && uniform; ++i) {
+                        if (!submitted[i] || failed[i]) continue;
+                        size_t input_floats = 0u;
+                        size_t output_floats = 0u;
+                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
+                                                      &output_floats) != 0 ||
+                            ctxs[i]->cuda_decoder_output == NULL ||
+                            (gang_pcm_rows > 0u &&
+                             output_floats != gang_pcm_floats)) {
+                            uniform = 0;
+                            break;
+                        }
+                        gang_pcm_floats = output_floats;
+                        sources[gang_pcm_rows] = ctxs[i]->cuda_decoder_output;
+                        gang_pcm_index[gang_pcm_rows++] = i;
+                    }
+                    one_error[0] = '\0';
+                    if (!uniform || gang_pcm_rows < 2u ||
+                        mynah_backend_gather_rows_d2h(
+                            batch_backend, sources, gang_pcm_rows,
+                            gang_pcm_floats, &gang_pcm, one_error,
+                            sizeof(one_error)) != 0)
+                        gang_pcm = NULL;
+                }
+                for (size_t i = 0; i < count && gang_pcm == NULL; ++i) {
+                    if (!submitted[i] || failed[i]) continue;
+                    one_error[0] = '\0';
+                    if (pocket_cuda_decoder_collect(ctxs[i], one_error,
+                                                    sizeof(one_error)) != 0)
+                        pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                 out_count, failed, &reported,
+                                                 one_error, error, capacity);
+                }
+
+                char sync_error[256];
+                sync_error[0] = '\0';
+                const int sync_failed = mynah_backend_sync(
+                    batch_backend, sync_error, sizeof(sync_error)) != 0;
+                if (sync_failed) {
+                    for (size_t i = 0; i < count; ++i) {
+                        if (submitted[i] && !failed[i])
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, &reported,
+                                                     sync_error, error, capacity);
+                    }
+                } else {
+                    if (gang_pcm != NULL) {
+                        for (size_t r = 0; r < gang_pcm_rows; ++r)
+                            memcpy(ctxs[gang_pcm_index[r]]->pcm,
+                                   gang_pcm + r * gang_pcm_floats,
+                                   gang_pcm_floats * sizeof(float));
+                        mynah_backend_note_codec_gang(batch_backend, 1,
+                                                      gang_pcm_rows);
+                    }
+                    for (size_t i = 0; i < count; ++i) {
+                        if (!submitted[i] || failed[i]) continue;
+                        size_t input_floats = 0u;
+                        size_t output_floats = 0u;
+                        one_error[0] = '\0';
+                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
+                                                      &output_floats) != 0 ||
+                            !pocket_all_finite(ctxs[i]->pcm, output_floats)) {
+                            snprintf(one_error, sizeof(one_error),
+                                     "CUDA decoder produced non-finite PCM");
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, &reported,
+                                                     one_error, error, capacity);
+                            continue;
+                        }
+                        if (pocket_decode_frame_finish(ctxs[i], 0, one_error,
+                                                       sizeof(one_error)) != 0)
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, &reported,
+                                                     one_error, error, capacity);
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                const size_t frame_samples = ctxs[i]->state->cfg.samples_per_frame;
+                memcpy(out_samples[i] + f * frame_samples, ctxs[i]->pcm,
+                       frame_samples * sizeof(float));
+            }
         }
     }
     mynah_region_end(MYNAH_RGN_CODEC);
@@ -4712,8 +10381,184 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
 
 /* ---------------------------------------------------------------- scratch */
 
+/* The CUDA attention metadata is tiny, but it is copied by async graph nodes.
+ * Keep it pinned just like the activation staging so a graph replay never
+ * falls back to an implicit pageable-host staging allocation.  The backend's
+ * host allocator is expressed in floats for the activation API; round byte
+ * metadata up to that allocator's unit and retain the original pointer. */
+static int pocket_host_alloc_bytes(const mynah_backend *backend, size_t bytes,
+                                   void **out, char *error, size_t capacity) {
+    if (out == NULL || backend == NULL || bytes == 0u ||
+        bytes > SIZE_MAX - (sizeof(float) - 1u)) return -1;
+    *out = NULL;
+    size_t floats = (bytes + sizeof(float) - 1u) / sizeof(float);
+    float *raw = NULL;
+    if (mynah_backend_host_alloc(backend, floats, &raw, error, capacity) != 0)
+        return -1;
+    *out = raw;
+    return 0;
+}
+
+static void pocket_host_free_bytes(const mynah_backend *backend, void *ptr) {
+    if (backend != NULL && ptr != NULL)
+        mynah_backend_host_free(backend, (float *)ptr);
+}
+
+static void pocket_cuda_codec_scratch_release(mynah_engine_scratch *scratch) {
+    if (scratch == NULL) return;
+    const mynah_backend *backend = scratch->backend;
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, scratch->cuda_codec_x);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_norm);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_qkv);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_attn);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_proj);
+        mynah_backend_dev_free(backend, scratch->cuda_codec_ffn);
+        mynah_backend_host_free(backend, scratch->cuda_codec_host_input);
+        mynah_backend_host_free(backend, scratch->cuda_codec_host_output);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_kcache);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_vcache);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_abs_positions);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_positions);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_cache_strides);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_input_rows);
+        pocket_host_free_bytes(backend, scratch->cuda_codec_output_rows);
+    } else {
+        free(scratch->cuda_codec_host_input);
+        free(scratch->cuda_codec_host_output);
+        free(scratch->cuda_codec_kcache);
+        free(scratch->cuda_codec_vcache);
+        free(scratch->cuda_codec_abs_positions);
+        free(scratch->cuda_codec_positions);
+        free(scratch->cuda_codec_cache_strides);
+        free(scratch->cuda_codec_input_rows);
+        free(scratch->cuda_codec_output_rows);
+    }
+    scratch->cuda_codec_host_input = NULL;
+    scratch->cuda_codec_host_output = NULL;
+    scratch->cuda_codec_x = NULL;
+    scratch->cuda_codec_norm = NULL;
+    scratch->cuda_codec_qkv = NULL;
+    scratch->cuda_codec_attn = NULL;
+    scratch->cuda_codec_proj = NULL;
+    scratch->cuda_codec_ffn = NULL;
+    scratch->cuda_codec_kcache = NULL;
+    scratch->cuda_codec_vcache = NULL;
+    scratch->cuda_codec_input_rows = NULL;
+    scratch->cuda_codec_output_rows = NULL;
+    scratch->cuda_codec_abs_positions = NULL;
+    scratch->cuda_codec_positions = NULL;
+    scratch->cuda_codec_cache_strides = NULL;
+    scratch->cuda_codec_batch_capacity = 0u;
+    scratch->cuda_codec_enabled = 0;
+}
+
+static void pocket_cuda_flow_release(mynah_engine_scratch *scratch) {
+    if (scratch == NULL) return;
+    const mynah_backend *backend = scratch->backend;
+    if (backend != NULL) {
+        mynah_backend_dev_free(backend, scratch->cuda_flow_cond);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_noise);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_embed);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_output);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_y);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_silu);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_x);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_norm);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_hidden);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_scratch);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_mod);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_final_mod);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_hidden);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_output);
+        mynah_backend_dev_free(backend, scratch->cuda_flow_time_sum);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_cond);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_noise);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_time);
+        mynah_backend_host_free(backend, scratch->cuda_flow_host_output);
+    } else {
+        free(scratch->cuda_flow_host_cond);
+        free(scratch->cuda_flow_host_noise);
+        free(scratch->cuda_flow_host_time);
+        free(scratch->cuda_flow_host_output);
+    }
+    scratch->cuda_flow_host_cond = NULL;
+    scratch->cuda_flow_host_noise = NULL;
+    scratch->cuda_flow_host_time = NULL;
+    scratch->cuda_flow_host_output = NULL;
+    scratch->cuda_flow_cond = NULL;
+    scratch->cuda_flow_noise = NULL;
+    scratch->cuda_flow_time_embed = NULL;
+    scratch->cuda_flow_output = NULL;
+    scratch->cuda_flow_y = NULL;
+    scratch->cuda_flow_silu = NULL;
+    scratch->cuda_flow_x = NULL;
+    scratch->cuda_flow_norm = NULL;
+    scratch->cuda_flow_hidden = NULL;
+    scratch->cuda_flow_scratch = NULL;
+    scratch->cuda_flow_mod = NULL;
+    scratch->cuda_flow_final_mod = NULL;
+    scratch->cuda_flow_time_hidden = NULL;
+    scratch->cuda_flow_time_output = NULL;
+    scratch->cuda_flow_time_sum = NULL;
+    free(scratch->cuda_flow_time_mlp_in);
+    free(scratch->cuda_flow_time_mlp_out);
+    free((void *)scratch->cuda_flow_time_alpha);
+    free(scratch->cuda_flow_blocks);
+    scratch->cuda_flow_time_mlp_in = NULL;
+    scratch->cuda_flow_time_mlp_out = NULL;
+    scratch->cuda_flow_time_alpha = NULL;
+    scratch->cuda_flow_blocks = NULL;
+    memset(&scratch->cuda_flow_cond_embed, 0,
+           sizeof(scratch->cuda_flow_cond_embed));
+    memset(&scratch->cuda_flow_input_proj, 0,
+           sizeof(scratch->cuda_flow_input_proj));
+    memset(&scratch->cuda_flow_final_adaln, 0,
+           sizeof(scratch->cuda_flow_final_adaln));
+    memset(&scratch->cuda_flow_final_linear, 0,
+           sizeof(scratch->cuda_flow_final_linear));
+    scratch->cuda_flow_batch_capacity = 0u;
+    scratch->cuda_flow_enabled = 0;
+    scratch->cuda_flow_graph_ready = 0;
+}
+
 static void pocket_scratch_free(mynah_engine_scratch *scratch) {
     if (scratch == NULL) return;
+    pocket_cuda_drain_before_release(scratch->backend);
+    pocket_cuda_codec_scratch_release(scratch);
+    if (scratch->backend != NULL) {
+        mynah_backend_graph_forget(scratch->backend, scratch);
+        pocket_cuda_flow_release(scratch);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_x);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_norm);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_qkv);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_attn);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_proj);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_ffn);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_condition_input);
+        mynah_backend_dev_free(scratch->backend, scratch->cuda_kv_shadow);
+        mynah_backend_host_free(scratch->backend, scratch->cuda_host_input);
+        mynah_backend_host_free(scratch->backend, scratch->cuda_host_output);
+        mynah_backend_host_free(scratch->backend, scratch->cuda_host_kv);
+    } else {
+        pocket_cuda_flow_release(scratch);
+        free(scratch->cuda_host_input);
+        free(scratch->cuda_host_output);
+        free(scratch->cuda_host_kv);
+        free(scratch->cuda_condition_input);
+        free(scratch->cuda_kv_shadow);
+    }
+    if (scratch->backend != NULL) {
+        pocket_host_free_bytes(scratch->backend, scratch->cuda_kcache);
+        pocket_host_free_bytes(scratch->backend, scratch->cuda_vcache);
+        pocket_host_free_bytes(scratch->backend, scratch->cuda_positions);
+        pocket_host_free_bytes(scratch->backend, scratch->cuda_cache_strides);
+    } else {
+        free(scratch->cuda_kcache);
+        free(scratch->cuda_vcache);
+        free(scratch->cuda_positions);
+        free(scratch->cuda_cache_strides);
+    }
     mynah_transformer_ar_batch_free(scratch->backbone_batch);
     mynah_flow_head_batch_free(scratch->flow_batch);
     pocket_call_release(&scratch->backbone_call.call);
@@ -4753,14 +10598,484 @@ static int pocket_scratch_new(const mynah_tts_model *model,
         return -1;
     }
     scratch->batch = batch;
-    if (batch == 1u) {
+    scratch->backend = state->backend;
+    if (batch == 1u && !pocket_cuda_resident_requested(state)) {
         /* Nothing to share: a one-slot driver keeps the single-step path. */
         *out = scratch;
         return 0;
     }
 
     const pocket_config *cfg = &state->cfg;
-    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    size_t attn_dim = 0u;
+    size_t qkv_width = 0u;
+    size_t kv_metadata = 0u;
+    size_t kv_shadow_floats = 0u;
+    size_t metadata_layers = cfg->layers;
+    if (cfg->codec_tf_layers > metadata_layers) metadata_layers = cfg->codec_tf_layers;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(attn_dim, 3u, &qkv_width) != 0 ||
+        pocket_mul(batch, metadata_layers, &kv_metadata) != 0 ||
+        pocket_mul(batch, cfg->layers, &kv_shadow_floats) != 0 ||
+        pocket_mul(kv_shadow_floats, 2u, &kv_shadow_floats) != 0 ||
+        pocket_mul(kv_shadow_floats, attn_dim, &kv_shadow_floats) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA scratch size overflow");
+        free(scratch);
+        return -1;
+    }
+
+    /* Q8 workspace growth is forbidden during CUDA graph capture. Reserve
+     * every linear shape once for the scheduler's maximum microbatch; the
+     * per-layer path then reuses it without a sync, malloc or graph teardown. */
+    if (state->cuda_q8_enabled) {
+        char q8_error[256];
+        q8_error[0] = '\0';
+        if (pocket_cuda_q8_reserve_for_batch(state, batch, q8_error,
+                                             sizeof(q8_error)) != 0) {
+            fprintf(stderr,
+                    "mynah-tts: disabling resident CUDA Q8 workspace: %s\n",
+                    q8_error[0] != '\0' ? q8_error : "reserve failed");
+            state->cuda_q8_enabled = 0;
+        }
+    }
+    if (state->cuda_bf16_weights) {
+        char bf16_error[256];
+        bf16_error[0] = '\0';
+        if (pocket_cuda_bf16_reserve_for_batch(state, batch, bf16_error,
+                                               sizeof(bf16_error)) != 0) {
+            fprintf(stderr,
+                    "mynah-tts: disabling resident CUDA BF16 weights: %s\n",
+                    bf16_error[0] != '\0' ? bf16_error : "reserve failed");
+            state->cuda_bf16_weights = 0;
+        }
+    }
+
+    /* Reserve the cross-request resident workspace up front.  If the optional
+     * CUDA buffers cannot be created, the already-correct CPU batch remains
+     * available; no decode call allocates a smaller emergency workspace. */
+    if (pocket_cuda_resident_requested(state)) {
+        size_t rows_hidden = 0, rows_qkv = 0, rows_attn = 0, rows_ffn = 0;
+        size_t condition_inputs = 0;
+        if (pocket_mul(batch, cfg->hidden_dim, &rows_hidden) == 0 &&
+            pocket_mul(batch, qkv_width, &rows_qkv) == 0 &&
+            pocket_mul(batch, attn_dim, &rows_attn) == 0 &&
+            pocket_mul(batch, cfg->ffn_dim, &rows_ffn) == 0 &&
+            pocket_mul(batch, cfg->latent_dim, &condition_inputs) == 0) {
+            scratch->cuda_host_input = NULL;
+            scratch->cuda_host_output = NULL;
+            scratch->cuda_host_kv = NULL;
+            scratch->cuda_kv_shadow = NULL;
+            char ignored[256];
+            int device_failed =
+                mynah_backend_host_alloc(state->backend, rows_hidden,
+                                         &scratch->cuda_host_input, ignored,
+                                         sizeof(ignored)) != 0;
+            if (!device_failed) {
+                device_failed =
+                    mynah_backend_host_alloc(state->backend, rows_hidden,
+                                             &scratch->cuda_host_output, ignored,
+                                             sizeof(ignored)) != 0;
+            }
+            if (!device_failed) {
+                device_failed =
+                    mynah_backend_host_alloc(state->backend, kv_shadow_floats,
+                                             &scratch->cuda_host_kv, ignored,
+                                             sizeof(ignored)) != 0;
+            }
+#define POCKET_CUDA_SCRATCH_ALLOC(field, count)                                \
+            do {                                                                \
+                if (!device_failed &&                                          \
+                    mynah_backend_dev_alloc(state->backend, (count),           \
+                                            &(field), ignored, sizeof(ignored)) != 0) \
+                    device_failed = 1;                                          \
+            } while (0)
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_x, rows_hidden);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_norm, rows_hidden);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_qkv, rows_qkv);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_attn, rows_attn);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_proj, rows_hidden);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_ffn, rows_ffn);
+            POCKET_CUDA_SCRATCH_ALLOC(scratch->cuda_kv_shadow, kv_shadow_floats);
+#undef POCKET_CUDA_SCRATCH_ALLOC
+            /* The control projection is optional.  A model whose latent width
+             * does not fit the generic resident arena simply keeps this small
+             * seam on the CPU; the main CUDA batch remains available. */
+            if (!device_failed && condition_inputs > 0u &&
+                mynah_backend_dev_alloc(state->backend, condition_inputs,
+                                        &scratch->cuda_condition_input, ignored,
+                                        sizeof(ignored)) != 0) {
+                scratch->cuda_condition_input = NULL;
+            }
+            if (!device_failed &&
+                kv_metadata > SIZE_MAX / sizeof(*scratch->cuda_kcache)) {
+                device_failed = 1;
+            }
+            if (!device_failed) {
+                device_failed =
+                    pocket_host_alloc_bytes(
+                        state->backend,
+                        kv_metadata * sizeof(*scratch->cuda_kcache),
+                        (void **)&scratch->cuda_kcache, ignored,
+                        sizeof(ignored)) != 0 ||
+                    pocket_host_alloc_bytes(
+                        state->backend,
+                        kv_metadata * sizeof(*scratch->cuda_vcache),
+                        (void **)&scratch->cuda_vcache, ignored,
+                        sizeof(ignored)) != 0 ||
+                    pocket_host_alloc_bytes(
+                        state->backend,
+                        batch * sizeof(*scratch->cuda_positions),
+                        (void **)&scratch->cuda_positions, ignored,
+                        sizeof(ignored)) != 0 ||
+                    pocket_host_alloc_bytes(
+                        state->backend,
+                        batch * sizeof(*scratch->cuda_cache_strides),
+                        (void **)&scratch->cuda_cache_strides, ignored,
+                        sizeof(ignored)) != 0;
+            }
+            if (!device_failed && pocket_cuda_codec_requested(state)) {
+                int codec_failed = 0;
+                size_t codec_rows = 0u;
+                size_t codec_metadata = 0u;
+                size_t codec_metadata_bytes = 0u;
+                size_t codec_pointer_bytes = 0u;
+                size_t codec_kv_metadata = 0u;
+                size_t codec_kv_pointer_bytes = 0u;
+                size_t codec_output = 0u;
+                size_t codec_qkv = 0u;
+                size_t codec_ffn = 0u;
+                if (pocket_mul(batch, cfg->codec_tf_dim, &codec_rows) != 0 ||
+                    pocket_mul(batch, cfg->upsample_stride, &codec_metadata) != 0 ||
+                    pocket_mul(codec_metadata, cfg->codec_tf_dim,
+                               &codec_output) != 0 ||
+                    pocket_mul(codec_metadata, sizeof(size_t),
+                               &codec_metadata_bytes) != 0 ||
+                    pocket_mul(codec_metadata, sizeof(*scratch->cuda_codec_input_rows),
+                               &codec_pointer_bytes) != 0 ||
+                    pocket_mul(codec_metadata, cfg->codec_tf_layers,
+                               &codec_kv_metadata) != 0 ||
+                    pocket_mul(codec_kv_metadata,
+                               sizeof(*scratch->cuda_codec_kcache),
+                               &codec_kv_pointer_bytes) != 0 ||
+                    pocket_mul(codec_rows, 3u, &codec_qkv) != 0 ||
+                    pocket_mul(batch, cfg->codec_tf_ffn, &codec_ffn) != 0) {
+                    codec_failed = 1;
+                }
+                if (!codec_failed &&
+                    mynah_backend_host_alloc(state->backend, codec_output,
+                                             &scratch->cuda_codec_host_input,
+                                             ignored, sizeof(ignored)) != 0)
+                    codec_failed = 1;
+                if (!codec_failed &&
+                    mynah_backend_host_alloc(state->backend, codec_output,
+                                             &scratch->cuda_codec_host_output,
+                                             ignored, sizeof(ignored)) != 0)
+                    codec_failed = 1;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, codec_kv_pointer_bytes,
+                            (void **)&scratch->cuda_codec_kcache,
+                            ignored, sizeof(ignored)) != 0;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, codec_kv_pointer_bytes,
+                            (void **)&scratch->cuda_codec_vcache,
+                            ignored, sizeof(ignored)) != 0;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, codec_metadata_bytes,
+                            (void **)&scratch->cuda_codec_abs_positions,
+                            ignored, sizeof(ignored)) != 0;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, codec_metadata_bytes,
+                            (void **)&scratch->cuda_codec_positions,
+                            ignored, sizeof(ignored)) != 0;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, codec_metadata_bytes,
+                            (void **)&scratch->cuda_codec_cache_strides,
+                            ignored, sizeof(ignored)) != 0;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, codec_pointer_bytes,
+                            (void **)&scratch->cuda_codec_input_rows,
+                            ignored, sizeof(ignored)) != 0;
+                if (!codec_failed)
+                    codec_failed =
+                        pocket_host_alloc_bytes(
+                            state->backend, codec_pointer_bytes,
+                            (void **)&scratch->cuda_codec_output_rows,
+                            ignored, sizeof(ignored)) != 0;
+#define POCKET_CUDA_CODEC_ALLOC(field, count)                                 \
+                do {                                                           \
+                    if (!codec_failed &&                                     \
+                        mynah_backend_dev_alloc(state->backend, (count),      \
+                                                &(field), ignored,              \
+                                                sizeof(ignored)) != 0)          \
+                        codec_failed = 1;                                     \
+                } while (0)
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_x,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_norm,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_qkv, codec_qkv);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_attn,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_proj,
+                                        codec_rows);
+                POCKET_CUDA_CODEC_ALLOC(scratch->cuda_codec_ffn, codec_ffn);
+#undef POCKET_CUDA_CODEC_ALLOC
+                if (codec_failed) {
+                    pocket_cuda_codec_scratch_release(scratch);
+                } else {
+                    scratch->cuda_codec_batch_capacity = batch;
+                    scratch->cuda_codec_enabled = 1;
+                }
+            }
+            int flow_failed = 0;
+            size_t flow_freq_width = 0u;
+            size_t flow_rows = 0u;
+            size_t flow_rows_latent = 0u;
+            size_t flow_three_hidden = 0u;
+            size_t flow_two_hidden = 0u;
+            size_t flow_mod_rows = 0u;
+            size_t flow_final_mod_rows = 0u;
+            size_t flow_time_rows = 0u;
+            size_t flow_time_hidden = 0u;
+            if (!device_failed && pocket_cuda_flow_requested(state)) {
+                if (pocket_mul(cfg->flow_freqs, 2u, &flow_freq_width) != 0 ||
+                    pocket_mul(batch, cfg->flow_dim, &flow_rows) != 0 ||
+                    pocket_mul(batch, cfg->latent_dim, &flow_rows_latent) != 0 ||
+                    pocket_mul(cfg->flow_dim, 3u, &flow_three_hidden) != 0 ||
+                    pocket_mul(cfg->flow_dim, 2u, &flow_two_hidden) != 0 ||
+                    pocket_mul(batch, flow_three_hidden, &flow_mod_rows) != 0 ||
+                    pocket_mul(batch, flow_two_hidden, &flow_final_mod_rows) != 0 ||
+                    pocket_mul(cfg->flow_time_conds, flow_freq_width,
+                               &flow_time_rows) != 0 ||
+                    pocket_mul(cfg->flow_time_conds, cfg->flow_dim,
+                               &flow_time_hidden) != 0 ||
+                    cfg->flow_time_conds == 0u || cfg->flow_dim < 2u ||
+                    pocket_mul(flow_rows, sizeof(float), &flow_rows) != 0 ||
+                    pocket_mul(flow_rows_latent, sizeof(float), &flow_rows_latent) != 0 ||
+                    pocket_mul(flow_mod_rows, sizeof(float), &flow_mod_rows) != 0 ||
+                    pocket_mul(flow_final_mod_rows, sizeof(float),
+                               &flow_final_mod_rows) != 0 ||
+                    pocket_mul(flow_time_rows, sizeof(float), &flow_time_rows) != 0 ||
+                    pocket_mul(flow_time_hidden, sizeof(float),
+                               &flow_time_hidden) != 0) {
+                    flow_failed = 1;
+                }
+                /* `flow_rows` etc. are byte counts after the checked
+                 * multiplications above; keep the element counts separate for
+                 * the device allocator. */
+                size_t flow_rows_floats = 0u;
+                size_t flow_rows_latent_floats = 0u;
+                size_t flow_mod_rows_floats = 0u;
+                size_t flow_final_mod_rows_floats = 0u;
+                size_t flow_time_rows_floats = 0u;
+                size_t flow_time_hidden_floats = 0u;
+                if (!flow_failed) {
+                    flow_rows_floats = flow_rows / sizeof(float);
+                    flow_rows_latent_floats = flow_rows_latent / sizeof(float);
+                    flow_mod_rows_floats = flow_mod_rows / sizeof(float);
+                    flow_final_mod_rows_floats = flow_final_mod_rows / sizeof(float);
+                    flow_time_rows_floats = flow_time_rows / sizeof(float);
+                    flow_time_hidden_floats = flow_time_hidden / sizeof(float);
+                    if (mynah_backend_host_alloc(state->backend, rows_hidden,
+                                                 &scratch->cuda_flow_host_cond,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        mynah_backend_host_alloc(state->backend,
+                                                 flow_rows_latent_floats,
+                                                 &scratch->cuda_flow_host_noise,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        mynah_backend_host_alloc(state->backend, flow_time_rows_floats,
+                                                 &scratch->cuda_flow_host_time,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        mynah_backend_host_alloc(state->backend,
+                                                 flow_rows_latent_floats,
+                                                 &scratch->cuda_flow_host_output,
+                                                 ignored, sizeof(ignored)) != 0 ||
+                        pocket_cuda_flow_time_features(
+                            cfg, scratch->cuda_flow_host_time) != 0) {
+                        flow_failed = 1;
+                    }
+                }
+#define POCKET_CUDA_FLOW_ALLOC(field, count)                                  \
+                do {                                                           \
+                    if (!flow_failed &&                                       \
+                        mynah_backend_dev_alloc(state->backend, (count),      \
+                                                &(field), ignored,              \
+                                                sizeof(ignored)) != 0)          \
+                        flow_failed = 1;                                       \
+                } while (0)
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_cond, rows_hidden);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_noise,
+                                       flow_rows_latent_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_embed,
+                                       flow_time_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_output,
+                                       flow_rows_latent_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_y, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_silu, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_x, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_norm, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_hidden, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_scratch, flow_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_mod, flow_mod_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_final_mod,
+                                       flow_final_mod_rows_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_hidden,
+                                       flow_time_hidden_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_output,
+                                       flow_time_hidden_floats);
+                POCKET_CUDA_FLOW_ALLOC(scratch->cuda_flow_time_sum,
+                                       cfg->flow_dim);
+#undef POCKET_CUDA_FLOW_ALLOC
+                if (flow_failed) pocket_cuda_flow_release(scratch);
+                else {
+                    scratch->cuda_flow_batch_capacity = batch;
+                    scratch->cuda_flow_enabled = 1;
+                    scratch->cuda_flow_graph_enabled =
+                        getenv("MYNAH_CUDA_GRAPHS") == NULL ||
+                        strcmp(getenv("MYNAH_CUDA_GRAPHS"), "0") != 0;
+                    scratch->cuda_flow_graph_ready = 0;
+                    scratch->cuda_flow_time_mlp_in =
+                        (mynah_backend_flow_linear *)calloc(
+                            cfg->flow_time_conds,
+                            sizeof(*scratch->cuda_flow_time_mlp_in));
+                    scratch->cuda_flow_time_mlp_out =
+                        (mynah_backend_flow_linear *)calloc(
+                            cfg->flow_time_conds,
+                            sizeof(*scratch->cuda_flow_time_mlp_out));
+                    scratch->cuda_flow_time_alpha =
+                        (const float **)calloc(cfg->flow_time_conds,
+                                               sizeof(*scratch->cuda_flow_time_alpha));
+                    scratch->cuda_flow_blocks =
+                        (mynah_backend_flow_block *)calloc(
+                            cfg->flow_depth, sizeof(*scratch->cuda_flow_blocks));
+                    if (scratch->cuda_flow_time_mlp_in == NULL ||
+                        scratch->cuda_flow_time_mlp_out == NULL ||
+                        scratch->cuda_flow_time_alpha == NULL ||
+                        scratch->cuda_flow_blocks == NULL) {
+                        pocket_cuda_flow_release(scratch);
+                    } else {
+                        for (size_t t = 0; t < cfg->flow_time_conds; ++t) {
+                            const mynah_flow_time_embed_weights *src =
+                                &state->time_embed[t];
+                            scratch->cuda_flow_time_mlp_in[t].weight =
+                                src->mlp_in.weight;
+                            scratch->cuda_flow_time_mlp_in[t].bias =
+                                src->mlp_in.bias;
+                            scratch->cuda_flow_time_mlp_in[t].qtype =
+                                pocket_cuda_flow_qtype(
+                                    state, t, MYNAH_FLOW_LINEAR_TIME_MLP_IN);
+                            scratch->cuda_flow_time_mlp_out[t].weight =
+                                src->mlp_out.weight;
+                            scratch->cuda_flow_time_mlp_out[t].bias =
+                                src->mlp_out.bias;
+                            scratch->cuda_flow_time_mlp_out[t].qtype =
+                                pocket_cuda_flow_qtype(
+                                    state, t, MYNAH_FLOW_LINEAR_TIME_MLP_OUT);
+                            scratch->cuda_flow_time_alpha[t] = src->alpha;
+                        }
+                        for (size_t b = 0; b < cfg->flow_depth; ++b) {
+                            const mynah_flow_res_block_weights *src =
+                                &state->res_blocks[b];
+                            mynah_backend_flow_block *dst =
+                                &scratch->cuda_flow_blocks[b];
+                            dst->in_ln_weight = src->in_ln_weight;
+                            dst->in_ln_bias = src->in_ln_bias;
+                            dst->adaln.weight = src->adaln.weight;
+                            dst->adaln.bias = src->adaln.bias;
+                            dst->adaln.qtype = pocket_cuda_flow_qtype(
+                                state, b, MYNAH_FLOW_LINEAR_BLOCK_ADALN);
+                            dst->mlp_in.weight = src->mlp_in.weight;
+                            dst->mlp_in.bias = src->mlp_in.bias;
+                            dst->mlp_in.qtype = pocket_cuda_flow_qtype(
+                                state, b, MYNAH_FLOW_LINEAR_BLOCK_MLP_IN);
+                            dst->mlp_out.weight = src->mlp_out.weight;
+                            dst->mlp_out.bias = src->mlp_out.bias;
+                            dst->mlp_out.qtype = pocket_cuda_flow_qtype(
+                                state, b, MYNAH_FLOW_LINEAR_BLOCK_MLP_OUT);
+                        }
+                        scratch->cuda_flow_cond_embed.weight =
+                            state->flow.cond_embed.weight;
+                        scratch->cuda_flow_cond_embed.bias =
+                            state->flow.cond_embed.bias;
+                        scratch->cuda_flow_cond_embed.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_COND_EMBED);
+                        scratch->cuda_flow_input_proj.weight =
+                            state->flow.input_proj.weight;
+                        scratch->cuda_flow_input_proj.bias =
+                            state->flow.input_proj.bias;
+                        scratch->cuda_flow_input_proj.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_INPUT_PROJ);
+                        scratch->cuda_flow_final_adaln.weight =
+                            state->flow.final_adaln.weight;
+                        scratch->cuda_flow_final_adaln.bias =
+                            state->flow.final_adaln.bias;
+                        scratch->cuda_flow_final_adaln.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_FINAL_ADALN);
+                        scratch->cuda_flow_final_linear.weight =
+                            state->flow.final_linear.weight;
+                        scratch->cuda_flow_final_linear.bias =
+                            state->flow.final_linear.bias;
+                        scratch->cuda_flow_final_linear.qtype =
+                            pocket_cuda_flow_qtype(
+                                state, 0u, MYNAH_FLOW_LINEAR_FINAL_LINEAR);
+                    }
+                }
+            }
+            if (device_failed) {
+                mynah_backend_dev_free(state->backend, scratch->cuda_x);
+                mynah_backend_dev_free(state->backend, scratch->cuda_norm);
+                mynah_backend_dev_free(state->backend, scratch->cuda_qkv);
+                mynah_backend_dev_free(state->backend, scratch->cuda_attn);
+                mynah_backend_dev_free(state->backend, scratch->cuda_proj);
+                mynah_backend_dev_free(state->backend, scratch->cuda_ffn);
+                mynah_backend_dev_free(state->backend, scratch->cuda_kv_shadow);
+                scratch->cuda_x = NULL;
+                scratch->cuda_norm = NULL;
+                scratch->cuda_qkv = NULL;
+                scratch->cuda_attn = NULL;
+                scratch->cuda_proj = NULL;
+                scratch->cuda_ffn = NULL;
+                scratch->cuda_kv_shadow = NULL;
+                mynah_backend_host_free(state->backend, scratch->cuda_host_input);
+                mynah_backend_host_free(state->backend, scratch->cuda_host_output);
+                mynah_backend_host_free(state->backend, scratch->cuda_host_kv);
+                scratch->cuda_host_input = NULL;
+                scratch->cuda_host_output = NULL;
+                scratch->cuda_host_kv = NULL;
+                pocket_host_free_bytes(state->backend, scratch->cuda_kcache);
+                pocket_host_free_bytes(state->backend, scratch->cuda_vcache);
+                pocket_host_free_bytes(state->backend, scratch->cuda_positions);
+                pocket_host_free_bytes(state->backend, scratch->cuda_cache_strides);
+                scratch->cuda_kcache = NULL;
+                scratch->cuda_vcache = NULL;
+                scratch->cuda_positions = NULL;
+                scratch->cuda_cache_strides = NULL;
+            } else {
+                scratch->cuda_batch_capacity = batch;
+                scratch->cuda_batch_enabled = 1;
+                scratch->cuda_graph_enabled =
+                    getenv("MYNAH_CUDA_GRAPHS") == NULL ||
+                    strcmp(getenv("MYNAH_CUDA_GRAPHS"), "0") != 0;
+                scratch->cuda_graph_ready = 0;
+                scratch->cuda_kv_shadow_floats = kv_shadow_floats;
+            }
+        }
+    }
+
     size_t backbone_k = cfg->hidden_dim;
     if (attn_dim > backbone_k) backbone_k = attn_dim;
     if (cfg->ffn_dim > backbone_k) backbone_k = cfg->ffn_dim;
@@ -4864,6 +11179,7 @@ static const mynah_tts_engine pocket_engine = {
     NULL,                      /* debug_dump: the dump is written in ctx_free */
     pocket_decode_audio_batch, /* APPENDED, never inserted (tts_engine.h) */
     pocket_prepare_slice,      /* APPENDED */
+    pocket_prepare_slice_batch,/* APPENDED */
 };
 
 const mynah_tts_engine *mynah_engine_pocket(void) { return &pocket_engine; }
@@ -5008,9 +11324,11 @@ int mynah_engine_pocket_reserve_text(mynah_engine_ctx *ctx, size_t total_tokens,
     ctx->text_ids = ids;
     free(ctx->text_embed);
     ctx->text_embed = embed;
+    pocket_cuda_backbone_release(ctx);
     mynah_transformer_ar_state_free(ctx->backbone);
     ctx->backbone = grown;
     ctx->text_capacity = total_tokens;
+    (void)pocket_cuda_backbone_alloc(ctx);
     return 0;
 }
 
@@ -5201,7 +11519,7 @@ const float *mynah_engine_pocket_latent(const mynah_engine_ctx *ctx, size_t inde
  *
  * Two properties of `tts_engine.h` that only real weights can test, and that
  * until now nothing did: `step_batch` is atomic over the batch (E8-6), and
- * `decode_audio_batch` is bit-identical per context whoever shared the call
+ * `decode_audio_batch` is numerically equivalent per context whoever shared the call
  * (E8-4).  Both had been checked only against the synthetic engine in
  * `tests/test_driver.c`, which is exactly the wrong place to check them: the
  * synthetic engine's step cannot fail halfway through a real graph and its
@@ -5219,6 +11537,15 @@ typedef struct {
 } pocket_check_case;
 
 #define POCKET_CHECK_MAX 16u
+#define POCKET_BATCH_PARITY_ATOL 1.0e-4f
+#define POCKET_BATCH_PARITY_RTOL 1.0e-4f
+/* When the backend's GEMMs are not batch-invariant (cuBLAS algorithm choice,
+ * TF32), solo and gang outputs legitimately differ by rounding that the
+ * autoregressive codec amplifies; measured on the L4 at ~2.5e-4 of a
+ * full-scale waveform. The gate then asks for -60 dB agreement instead of
+ * bit-level identity; a real batching defect is orders of magnitude larger. */
+#define POCKET_BATCH_PARITY_ATOL_TC 1.0e-3f
+#define POCKET_BATCH_PARITY_RTOL_TC 1.0e-3f
 
 /* Two sets of contexts built from the SAME cases.  Everything in this engine is
  * a deterministic function of (weights, text, voice, seed), so set A and set B
@@ -5253,7 +11580,13 @@ static int pocket_check_set_new(mynah_engine_state *state,
         memset(&request, 0, sizeof(request));
         request.text_ids = ids;
         request.text_length = n_ids;
-        request.speaker = cases[i].speaker;
+        /* The atomicity/gang checks need a fixed row count even when a
+         * checkpoint was converted with one voice only (for example the
+         * official 24L verification pack).  Reuse available voices rather
+         * than silently shrinking the batch to voice_count rows. */
+        request.speaker = state->voice_count != 0u
+                              ? cases[i].speaker % state->voice_count
+                              : 0u;
         request.temperature = -1.0f;
         mynah_engine_ctx *ctx = NULL;
         const int bad = pocket_ctx_new(model, state, &request, max_steps,
@@ -5265,6 +11598,19 @@ static int pocket_check_set_new(mynah_engine_state *state,
         }
         set->ctx[set->count++] = ctx;
         if (pocket_prepare(ctx, error, capacity) != 0) {
+            pocket_check_set_free(set);
+            return -1;
+        }
+        /* Keep the rows available while the self-check deliberately exercises
+         * a refusal in the middle of a batch.  EOS timing is model-dependent:
+         * the 6L and 24L checkpoints can retire almost every row during the
+         * three warm-up steps, which would make the atomicity test fail before
+         * it had a victim and a predecessor to inspect.  This only extends the
+         * normal post-EOS tail of these private test contexts; it does not
+         * change inference or any production request setting. */
+        if (mynah_engine_pocket_set_frames_after_eos(ctx, max_steps) != 0) {
+            pocket_error(error, capacity,
+                         "self-check: unable to keep request %zu live", i);
             pocket_check_set_free(set);
             return -1;
         }
@@ -5428,6 +11774,17 @@ static int pocket_check_atomic(mynah_engine_state *state,
         const float saved = *poison;
         const uint32_t nan_bits = UINT32_C(0x7fc00000);
         memcpy(poison, &nan_bits, sizeof(nan_bits));
+        /* A resident CUDA backbone has an authoritative device KV copy after
+         * the first step.  The fault injection above deliberately edits the
+         * public host shadow; invalidate only the victim's device mirror so
+         * the next CUDA step uploads that poisoned slot and exercises the same
+         * rollback path as the CPU oracle instead of silently reading stale
+         * device state. */
+        if (mode == POCKET_INJECT_KV_NAN && bad->cuda_backbone_enabled &&
+            bad->state != NULL && bad->state->backend != NULL &&
+            strcmp(mynah_backend_name(bad->state->backend), "cuda") == 0) {
+            bad->cuda_backbone_valid = 0;
+        }
 
         size_t before[POCKET_CHECK_MAX];
         int budget_before[POCKET_CHECK_MAX];
@@ -5441,6 +11798,23 @@ static int pocket_check_atomic(mynah_engine_state *state,
             pocket_error(error, capacity,
                          "%s: a step with a non-finite input was accepted", what);
             goto done;
+        }
+        /* A resident CUDA fault deliberately disables the affected backbone
+         * mirror before retrying on the CPU oracle.  The control case `a` did
+         * not see the injected fault, so keep its corresponding contexts on
+         * that same fallback lane before the post-refusal bit-identity check;
+         * comparing one GPU continuation with one CPU continuation would test
+         * floating-point backend ordering, not step atomicity. */
+        if (mode == POCKET_INJECT_KV_NAN) {
+            for (size_t i = 0; i < count; ++i) {
+                if (a.ctx[i]->cuda_backbone_enabled !=
+                    b.ctx[i]->cuda_backbone_enabled) {
+                    a.ctx[i]->cuda_backbone_enabled =
+                        b.ctx[i]->cuda_backbone_enabled;
+                    a.ctx[i]->cuda_backbone_valid =
+                        b.ctx[i]->cuda_backbone_valid;
+                }
+            }
         }
         for (size_t i = 0; i < live; ++i) {
             const size_t now = mynah_transformer_ar_state_offset(live_ctx[i]->backbone);
@@ -5508,6 +11882,11 @@ static int pocket_check_gang(mynah_engine_state *state,
                              const pocket_check_case *cases, size_t count,
                              size_t max_steps, mynah_engine_scratch *scratch,
                              char *error, size_t capacity) {
+    const int invariant = mynah_backend_batch_invariant(state->backend);
+    const float parity_atol = invariant ? POCKET_BATCH_PARITY_ATOL
+                                        : POCKET_BATCH_PARITY_ATOL_TC;
+    const float parity_rtol = invariant ? POCKET_BATCH_PARITY_RTOL
+                                        : POCKET_BATCH_PARITY_RTOL_TC;
     pocket_check_set a, b;
     if (pocket_check_set_new(state, model, cases, count, max_steps, &a, error,
                              capacity) != 0) {
@@ -5556,13 +11935,56 @@ static int pocket_check_gang(mynah_engine_state *state,
             const int bad = failed[i] ||
                             pocket_decode_audio(a.ctx[i], first[i], want[i], &solo,
                                                 &solo_n, error, capacity) != 0;
-            if (bad || solo_n != got_n[i] ||
-                (solo_n != 0 &&
-                 memcmp(solo, got[i], solo_n * sizeof(float)) != 0)) {
+            size_t first_diff = SIZE_MAX;
+            float max_abs = 0.0f;
+            size_t codec_first_diff = SIZE_MAX;
+            float codec_max_abs = 0.0f;
+            float codec_back_max_abs = 0.0f;
+            if (!bad && solo_n == got_n[i] && solo_n != 0u) {
+                for (size_t sample = 0; sample < solo_n; ++sample) {
+                    const float delta = fabsf(solo[sample] - got[i][sample]);
+                    if (delta > max_abs) max_abs = delta;
+                    const float scale = fmaxf(fabsf(solo[sample]),
+                                              fabsf(got[i][sample]));
+                    const float limit = parity_atol + parity_rtol * scale;
+                    if (first_diff == SIZE_MAX &&
+                        (!isfinite(delta) || delta > limit))
+                        first_diff = sample;
+                }
+                size_t codec_floats = 0u;
+                if (pocket_mul(a.ctx[i]->state->cfg.upsample_stride,
+                               a.ctx[i]->state->cfg.codec_dim,
+                               &codec_floats) == 0 &&
+                    a.ctx[i]->codec_out != NULL && b.ctx[i]->codec_out != NULL) {
+                    for (size_t value = 0; value < codec_floats; ++value) {
+                        const float delta = fabsf(a.ctx[i]->codec_out[value] -
+                                                  b.ctx[i]->codec_out[value]);
+                        if (delta > codec_max_abs) codec_max_abs = delta;
+                        if (codec_first_diff == SIZE_MAX &&
+                            (!isfinite(delta) || delta > parity_atol))
+                            codec_first_diff = value;
+                    }
+                    for (size_t value = 0; value < codec_floats; ++value) {
+                        const float delta = fabsf(a.ctx[i]->codec_back[value] -
+                                                  b.ctx[i]->codec_back[value]);
+                        if (delta > codec_back_max_abs)
+                            codec_back_max_abs = delta;
+                    }
+                }
+            }
+            if (bad || solo_n != got_n[i] || first_diff != SIZE_MAX) {
                 pocket_error(error, capacity,
                              "decode gang: request %zu of %zu differs from its own "
-                             "solo decode of frames [%zu, %zu)",
-                             i, count, first[i], first[i] + want[i]);
+                             "solo decode of frames [%zu, %zu) at sample %zu "
+                             "(max_abs=%g, codec_max_abs=%g at %zu, "
+                             "codec_back_max_abs=%g, solo0=%g batch0=%g)",
+                             i, count, first[i], first[i] + want[i],
+                             first_diff == SIZE_MAX ? 0u : first_diff,
+                             (double)max_abs, (double)codec_max_abs,
+                             codec_first_diff == SIZE_MAX ? 0u : codec_first_diff,
+                             (double)codec_back_max_abs,
+                             solo_n != 0u && solo != NULL ? (double)solo[0] : 0.0,
+                             got_n[i] != 0u && got[i] != NULL ? (double)got[i][0] : 0.0);
                 free(solo);
                 /* Only what this loop has not handed back yet: got[0..i-1] were
                  * already freed at the bottom of their own iteration. */
@@ -5768,8 +12190,15 @@ static int pocket_lf_synth(mynah_engine_state *state, const mynah_tts_model *mod
     return bad ? -1 : 0;
 }
 
-static int pocket_lf_same(const char *what, const float *a, size_t an,
-                          const float *b, size_t bn, char *error, size_t capacity) {
+static int pocket_lf_same(const mynah_engine_state *state, const char *what,
+                          const float *a, size_t an, const float *b, size_t bn,
+                          char *error, size_t capacity) {
+    /* Bit identity is the contract on a batch-invariant backend. With cuBLAS
+     * or tensor-core GEMMs the prefill of "the text in pieces" runs at a
+     * different M from "the text whole", so only the tolerance gate applies. */
+    const float tol = mynah_backend_batch_invariant(state->backend)
+                          ? 0.0f
+                          : POCKET_BATCH_PARITY_ATOL_TC;
     if (an != bn) {
         pocket_error(error, capacity,
                      "long-form (%s): %zu samples against %zu -- the split "
@@ -5777,7 +12206,11 @@ static int pocket_lf_same(const char *what, const float *a, size_t an,
         return -1;
     }
     for (size_t i = 0; i < an; ++i) {
-        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+        const int differs = tol > 0.0f
+            ? (!isfinite(a[i]) || !isfinite(b[i]) ||
+               fabsf(a[i] - b[i]) > tol + tol * fmaxf(fabsf(a[i]), fabsf(b[i])))
+            : memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        if (differs) {
             pocket_error(error, capacity,
                          "long-form (%s): sample %zu of %zu differs, %.9g against "
                          "%.9g -- pushing the text in pieces is not identical to "
@@ -5957,7 +12390,7 @@ static int pocket_check_lf_refusals(mynah_engine_state *state,
                             capacity) != 0) {
         goto done;
     }
-    if (pocket_lf_same("three refusals, then the accepted text", ref, ref_n, got,
+    if (pocket_lf_same(state, "three refusals, then the accepted text", ref, ref_n, got,
                        got_n, error, capacity) != 0) {
         goto done;
     }
@@ -6086,7 +12519,7 @@ static int pocket_lf_compare(mynah_engine_state *state,
     char control_what[160];
     snprintf(control_what, sizeof(control_what),
              "%s, a ceiling four times the text, still one push", profile);
-    if (pocket_lf_same(control_what, base, base_n, control, control_n, error,
+    if (pocket_lf_same(state, control_what, base, base_n, control, control_n, error,
                        capacity) != 0) {
         goto done;
     }
@@ -6131,7 +12564,7 @@ static int pocket_lf_compare(mynah_engine_state *state,
         }
         char what[160];
         snprintf(what, sizeof(what), "%s, %s", profile, patterns[p].name);
-        if (pocket_lf_same(what, base, base_n, got, got_n, error, capacity) != 0) {
+        if (pocket_lf_same(state, what, base, base_n, got, got_n, error, capacity) != 0) {
             goto done;
         }
         free(got);
@@ -6313,6 +12746,79 @@ done:
     return rc;
 }
 
+/* Regression for the cross-request CUDA prefill: it advances one token per
+ * row per unit, so when a short row finishes the long one is handed to the
+ * scalar hook between two prefill tiles. That hand-off used to be refused as a
+ * misaligned flush ("not aligned to the 16-row prefill tile") and failed the
+ * request. The check builds exactly that pair and requires both to finish.
+ * Needs the CUDA batch prefill; anywhere else the batch hook declines and the
+ * check has nothing to test. */
+static int pocket_check_prefill_handoff(mynah_engine_state *state,
+                                        const mynah_tts_model *model,
+                                        mynah_engine_scratch *scratch,
+                                        char *error, size_t capacity) {
+    static const char *const texts[2] = {
+        "Short opening line.",
+        "This second request is deliberately much longer than the first one, "
+        "so that it is still being prefilled when its short neighbour has "
+        "already finished, and it continues well past two full prefill tiles "
+        "of text before the end of the sentence arrives."};
+    mynah_engine_ctx *ctx[2] = {NULL, NULL};
+    int rc = -1;
+    for (size_t i = 0; i < 2u; ++i) {
+        int *ids = NULL;
+        size_t n_ids = 0;
+        if (mynah_engine_pocket_tokenize(state, texts[i], strlen(texts[i]), &ids,
+                                         &n_ids, error, capacity) != 0)
+            goto done;
+        mynah_tts_request request;
+        memset(&request, 0, sizeof(request));
+        request.text_ids = ids;
+        request.text_length = n_ids;
+        request.temperature = -1.0f;
+        const int bad = pocket_ctx_new(model, state, &request, 8u, 7u + i, &ctx[i],
+                                       error, capacity) != 0;
+        free(ids);
+        if (bad) goto done;
+    }
+    const size_t tile = mynah_transformer_ar_prefill_tile();
+    const size_t budget = 2u * (tile != 0u ? tile : 16u);
+    if (tile == 0u || ctx[0]->text_length >= budget ||
+        ctx[1]->text_length <= 2u * budget) {
+        pocket_error(error, capacity,
+                     "self-check: prefill hand-off texts are %zu and %zu tokens, "
+                     "need < %zu and > %zu",
+                     ctx[0]->text_length, ctx[1]->text_length, budget, 2u * budget);
+        goto done;
+    }
+    int done_flags[2] = {0, 0};
+    const int batch = pocket_prepare_slice_batch(ctx, 2u, budget, done_flags,
+                                                 scratch, error, capacity);
+    if (batch < 0) goto done;
+    if (batch == 1) { rc = 0; goto done; } /* no batch prefill on this backend */
+    for (size_t guard = 0; guard < 64u; ++guard) {
+        int all = 1;
+        for (size_t i = 0; i < 2u; ++i) {
+            if (ctx[i]->prepared) continue;
+            all = 0;
+            int one = 0;
+            if (pocket_prepare_slice(ctx[i], budget, &one, error, capacity) != 0) {
+                char detail[256];
+                snprintf(detail, sizeof(detail), "%s", error);
+                pocket_error(error, capacity,
+                             "self-check: prefill hand-off, request %zu: %s", i,
+                             detail);
+                goto done;
+            }
+        }
+        if (all) { rc = 0; goto done; }
+    }
+    pocket_error(error, capacity, "self-check: prefill hand-off never finished");
+done:
+    for (size_t i = 0; i < 2u; ++i) pocket_ctx_free(ctx[i]);
+    return rc;
+}
+
 int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
                                    size_t capacity) {
     if (model == NULL) {
@@ -6347,7 +12853,6 @@ int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
     static const size_t widths[4] = {2u, 4u, 8u, 16u};
     for (size_t w = 0; w < 4u; ++w) {
         size_t count = widths[w];
-        if (count > state->voice_count) count = state->voice_count;
         if (count > POCKET_CHECK_MAX) count = POCKET_CHECK_MAX;
         mynah_engine_scratch *scratch = NULL;
         if (pocket_scratch_new(model, state, count, &scratch, error, capacity) != 0) {
@@ -6363,6 +12868,12 @@ int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
         char what[96];
         int bad = 0;
         for (size_t m = 0; m < 2u && !bad; ++m) {
+            /* The cached-NaN fault is written into the host K/V and reaches the
+             * backbone through a re-upload. A device-owned cache (the CUDA
+             * prefill tile) is never uploaded from the host -- the upload is
+             * refused by design -- so that fault has nothing to exercise. */
+            if (modes[m] == POCKET_INJECT_KV_NAN && pocket_cuda_prefill_tile_enabled())
+                continue;
             snprintf(what, sizeof(what), "step atomicity at width %zu (batched, %s)",
                      count, mode_name[m]);
             bad = pocket_check_atomic(state, model, cases, count, 12u, scratch,
@@ -6377,6 +12888,9 @@ int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
             bad = pocket_check_gang(state, model, cases, count, 32u, scratch, error,
                                     capacity) != 0;
         }
+        if (!bad && w == 0u)
+            bad = pocket_check_prefill_handoff(state, model, scratch, error,
+                                               capacity) != 0;
         pocket_scratch_free(scratch);
         if (bad) goto done;
     }

@@ -58,7 +58,23 @@
         "isa_features_used": { "type": "array", "items": { "type": "string" } },
         "smt_policy": { "type": "string" },
         "canonical_topology": { "type": "string" },
-        "notes": { "type": "string" }
+        "notes": { "type": "string" },
+        "gpu": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "memory_gib", "compute_capability", "driver", "cuda_runtime", "count"],
+          "description": "The accelerator a server.device other than cpu runs on. Required when server.device is cuda; architecture and logical_cpus above then describe the HOST, which still runs the HTTP layer and the scheduler thread.",
+          "properties": {
+            "name": { "type": "string" },
+            "memory_gib": { "type": "number", "minimum": 1 },
+            "memory_mib": { "type": "integer", "minimum": 1 },
+            "compute_capability": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+            "driver": { "type": "string" },
+            "cuda_runtime": { "type": "string" },
+            "count": { "type": "integer", "minimum": 1 },
+            "provider": { "type": "string" }
+          }
+        }
       }
     },
 
@@ -69,8 +85,8 @@
       "properties": {
         "target": { "type": "string" },
         "blas": {
-          "enum": ["none", "openblas", "scalar", "accelerate"],
-          "description": "Linux production is BLAS=none unless a profile says otherwise; a codec number taken under Accelerate is not comparable with one taken here."
+          "enum": ["none", "openblas", "scalar", "accelerate", "n/a (CUDA build)"],
+          "description": "Linux production is BLAS=none unless a profile says otherwise; a codec number taken under Accelerate is not comparable with one taken here. A CUDA profile says 'n/a (CUDA build)': its hot stages are resident on the device."
         },
         "simd": { "type": "string" },
         "compiler": { "type": "string" },
@@ -81,11 +97,21 @@
     "server": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["prefork_workers", "threads_per_worker", "max_batch"],
+      "required": ["max_batch"],
+      "description": "device cpu (the default when absent) needs prefork_workers and threads_per_worker. device cuda is ONE process: http_workers, max_batch and max_inflight are required, and prefork_workers/threads_per_worker must be absent or 1. tools/perf_profile.py enforces both, since this schema subset has no conditionals.",
       "properties": {
+        "device": { "enum": ["cpu", "cuda"] },
         "prefork_workers": { "type": "integer", "minimum": 1 },
         "threads_per_worker": { "type": "integer", "minimum": 1 },
+        "http_workers": {
+          "type": "integer", "minimum": 1,
+          "description": "cuda: the server's -w, the HTTP threads in front of the one scheduler thread that owns the GPU."
+        },
         "max_batch": { "type": "integer", "minimum": 1 },
+        "max_inflight": {
+          "type": "integer", "minimum": 1,
+          "description": "cuda: --max-inflight, the requests admitted at once. Below max_batch the server silently lowers max_batch, so the validator refuses it."
+        },
         "max_pending": { "type": "integer", "minimum": 0 },
         "request_timeout_ms": { "type": "integer", "minimum": 0 },
         "extra_arguments": { "type": "array", "items": { "type": "string" } },
@@ -168,6 +194,11 @@
           "properties": {
             "bank": { "type": "string" },
             "bank_version": { "type": "string" },
+            "voices": {
+              "type": "array", "items": { "type": "string" }, "minItems": 1,
+              "description": "Voices drawn per request, when the bank does not fix them (the L4 harness's MYNAH_GPU_VOICES)."
+            },
+            "mode": { "enum": ["closed", "poisson"] },
             "seconds": {
               "type": "integer", "minimum": 600,
               "description": "A ten-minute soak screens; it does not promote. The 2026-09-18 lesson: a required_prebuffer MAX moved 495 -> 535 ms between ten minutes and thirty while its p95 did not move at all."
@@ -239,7 +270,7 @@
         "stalls_250ms": { "type": "integer", "minimum": 0 },
         "stalls_500ms": { "type": "integer", "minimum": 0 },
         "throughput_audio_s_per_s": { "type": "number" },
-        "evidence": { "type": "string", "description": "Path to the full report, relative to the repo root." },
+        "evidence": { "type": "string", "description": "Path to the full report, relative to the repo root; evidence that stays on the measured host (the GPU boxes) is named as <host>:<absolute path>." },
         "why_not_promoted": { "type": "string" }
       }
     }

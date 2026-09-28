@@ -1,14 +1,19 @@
 #include "backend.h"
+#include "costmap.h"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <new>
 #include <vector>
 
@@ -30,43 +35,111 @@
 /*  CUDA kernels                                                       */
 /* ------------------------------------------------------------------ */
 
+/* The first CUDA slice used one thread per norm row and accidentally ignored
+ * the optional bias.  One block per row keeps the operation resident while
+ * reducing the work in parallel.  The reduction order is fixed (warp tree),
+ * so CPU/GPU parity only needs the documented floating-point tolerance. */
 __global__ static void k_layer_norm(float *out, const float *in,
-                                    const float *gain,
+                                    const float *gain, const float *bias,
                                     int width, float eps, int nrows) {
-    /* One thread per row: sequential accumulation matches CPU bit-order. */
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = (int)blockIdx.x;
     if (row >= nrows) return;
-    const float *x = in + (size_t)row * width;
-    float *y = out + (size_t)row * width;
-    float mean = 0.0f;
-    for (int d = 0; d < width; ++d) mean += x[d];
-    mean /= (float)width;
-    float var = 0.0f;
-    for (int d = 0; d < width; ++d) { float dd = x[d] - mean; var += dd * dd; }
-    float inv = 1.0f / sqrtf(var / (float)width + eps);
-    for (int d = 0; d < width; ++d)
-        y[d] = (x[d] - mean) * inv * gain[d];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float warp_sum[8];
+    __shared__ float warp_sq[8];
+    __shared__ float mean_shared;
+    __shared__ float inv_shared;
+    const float *x = in + (size_t)row * (size_t)width;
+    float *y = out + (size_t)row * (size_t)width;
+    float sum = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) sum += x[d];
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) warp_sum[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) total += warp_sum[w];
+        mean_shared = total / (float)width;
+    }
+    __syncthreads();
+    const float mean = mean_shared;
+    float sq = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float delta = x[d] - mean;
+        sq += delta * delta;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffffu, sq, off);
+    if (lane == 0) warp_sq[warp] = sq;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) total += warp_sq[w];
+        inv_shared = rsqrtf(total / (float)width + eps);
+    }
+    __syncthreads();
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float b = bias == nullptr ? 0.0f : bias[d];
+        const float g = gain == nullptr ? 1.0f : gain[d];
+        y[d] = (x[d] - mean) * inv_shared * g + b;
+    }
+}
+
+__device__ static float warp_max(float value) {
+    for (int off = 16; off > 0; off >>= 1)
+        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, off));
+    return value;
+}
+
+__device__ static float warp_sum(float value) {
+    for (int off = 16; off > 0; off >>= 1)
+        value += __shfl_down_sync(0xffffffffu, value, off);
+    return value;
 }
 
 __global__ static void k_softmax_causal(float *data, int cols, int valid) {
-    int row = blockIdx.x;
-    float *r = data + (size_t)row * cols;
-    int v = valid < cols ? valid : cols;
-    float mx = -1e30f;
-    for (int i = threadIdx.x; i < v; i += blockDim.x) mx = fmaxf(mx, r[i]);
-    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, off));
-    __shared__ float s_mx, s_sum;
-    if (threadIdx.x == 0) s_mx = mx;
+    const int row = (int)blockIdx.x;
+    float *r = data + (size_t)row * (size_t)cols;
+    const int v = valid < cols ? valid : cols;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float partial[8];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    float local_max = -1.0e30f;
+    for (int i = tid; i < v; i += (int)blockDim.x) local_max = fmaxf(local_max, r[i]);
+    local_max = warp_max(local_max);
+    if (lane == 0) partial[warp] = local_max;
     __syncthreads();
-    mx = s_mx;
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < v; i += blockDim.x) { r[i] = expf(r[i] - mx); sum += r[i]; }
-    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
-    if (threadIdx.x == 0) s_sum = sum;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) maximum = fmaxf(maximum, partial[w]);
+    }
     __syncthreads();
-    float inv = 1.0f / s_sum;
-    for (int i = threadIdx.x; i < v; i += blockDim.x) r[i] *= inv;
-    for (int i = threadIdx.x + v; i < cols; i += blockDim.x) r[i] = 0.0f;
+    float local_sum = 0.0f;
+    for (int i = tid; i < v; i += (int)blockDim.x) {
+        r[i] = expf(r[i] - maximum);
+        local_sum += r[i];
+    }
+    local_sum = warp_sum(local_sum);
+    if (lane == 0) partial[warp] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        denominator = 0.0f;
+        const int warps = ((int)blockDim.x + 31) / 32;
+        for (int w = 0; w < warps; ++w) denominator += partial[w];
+    }
+    __syncthreads();
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int i = tid; i < v; i += (int)blockDim.x) r[i] *= inv;
+    for (int i = tid + v; i < cols; i += (int)blockDim.x) r[i] = 0.0f;
 }
 
 __global__ static void k_gelu(float *data, int n) {
@@ -76,6 +149,87 @@ __global__ static void k_gelu(float *data, int n) {
         float c = 0.7978845608f * (x + 0.044715f * x * x * x);
         data[i] = 0.5f * x * (1.0f + tanhf(c));
     }
+}
+
+__global__ static void k_silu(float *data, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float x = data[i];
+        data[i] = x / (1.0f + expf(-x));
+    }
+}
+
+/* Flow-head variance RMSNorm: the variance is mean-subtracted and unbiased,
+ * matching torch.var() in Pocket's timestep embedder. */
+__global__ static void k_flow_var_rms_norm(const float *in, const float *alpha,
+                                           float *out, int rows, int width,
+                                           float epsilon) {
+    const int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float partial_sum[8];
+    __shared__ float partial_sq[8];
+    __shared__ float mean_shared;
+    __shared__ float inv_shared;
+    const float *x = in + (size_t)row * (size_t)width;
+    float *y = out + (size_t)row * (size_t)width;
+    float sum = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) sum += x[d];
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) partial_sum[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        const int warps = ((int)blockDim.x + 31) / 32;
+        float total = 0.0f;
+        for (int w = 0; w < warps; ++w) total += partial_sum[w];
+        mean_shared = total / (float)width;
+    }
+    __syncthreads();
+    float sq = 0.0f;
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float delta = x[d] - mean_shared;
+        sq += delta * delta;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffffu, sq, off);
+    if (lane == 0) partial_sq[warp] = sq;
+    __syncthreads();
+    if (tid == 0) {
+        const int warps = ((int)blockDim.x + 31) / 32;
+        float total = 0.0f;
+        for (int w = 0; w < warps; ++w) total += partial_sq[w];
+        inv_shared = rsqrtf(total / (float)(width - 1) + epsilon);
+    }
+    __syncthreads();
+    for (int d = tid; d < width; d += (int)blockDim.x) {
+        const float gain = alpha == nullptr ? 1.0f : alpha[d];
+        y[d] = x[d] * gain * inv_shared;
+    }
+}
+
+__global__ static void k_flow_modulate(float *data, const float *mod,
+                                       int rows, int width, int mod_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * width;
+    if (i >= total) return;
+    const int row = i / width;
+    const int col = i - row * width;
+    const float *m = mod + (size_t)row * (size_t)mod_stride;
+    data[i] = data[i] * (1.0f + m[col + width]) + m[col];
+}
+
+__global__ static void k_flow_gate_add(float *out, const float *gate,
+                                       const float *update, int rows, int width,
+                                       int gate_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * width;
+    if (i >= total) return;
+    const int row = i / width;
+    const int col = i - row * width;
+    out[i] += gate[(size_t)row * (size_t)gate_stride + col] * update[i];
 }
 
 __global__ static void k_snake(float *data, const float *alpha,
@@ -102,6 +256,22 @@ __global__ static void k_residual_add(float *out, const float *in, int n) {
     if (i < n) out[i] += in[i];
 }
 
+__global__ static void k_scaled_residual_add(float *out, const float *in,
+                                             const float *scale, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += scale[i] * in[i];
+}
+
+__global__ static void k_scaled_residual_rows_add(float *out, const float *in,
+                                                  const float *scale, int rows,
+                                                  int width) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * width;
+    if (index < total) {
+        out[index] += scale[index % width] * in[index];
+    }
+}
+
 __global__ static void k_bias_add(float *out, const float *bias, int rows, int cols) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < rows * cols) out[i] += bias[i % cols];
@@ -117,6 +287,80 @@ __global__ static void k_f16_to_f32(const half *in, float *out, int n) {
     if (i < n) out[i] = __half2float(in[i]);
 }
 
+/* BF16 is used only for persistent attention K/V.  Keep conversion explicit
+ * instead of relying on a device-specific intrinsic: this compiles for the
+ * target range from older CUDA toolkits through Ada/Blackwell and preserves
+ * the same round-to-nearest-even rule on every GPU. */
+__device__ static uint16_t cuda_bf16_from_float(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t rounded = bits + UINT32_C(0x7fff) + ((bits >> 16) & 1u);
+    return (uint16_t)(rounded >> 16);
+}
+
+__device__ static float cuda_bf16_to_float(uint16_t value) {
+    return __uint_as_float((uint32_t)value << 16);
+}
+
+__global__ static void k_f32_to_bf16(const float *in, uint16_t *out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = cuda_bf16_from_float(in[i]);
+}
+
+__global__ static void k_bf16_to_f32(const uint16_t *in, float *out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = cuda_bf16_to_float(in[i]);
+}
+
+/* Q8 activation packing used by the resident Pocket linear path.  The CPU
+ * qmat reference uses symmetric per-row absmax, ties-away-from-zero rounding
+ * and the signed range [-127, 127].  Keep those choices explicit here: CUDA's
+ * default round-to-nearest-even would otherwise make the AR trajectory depend
+ * on the backend at exact half-integers. */
+__global__ static void k_q8_quantize_rows(const float *in, int8_t *out,
+                                          float *scales, int rows, int cols) {
+    const int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    const int tid = (int)threadIdx.x;
+    __shared__ float maxima[256];
+    const float *src = in + (size_t)row * (size_t)cols;
+    float amax = 0.0f;
+    for (int col = tid; col < cols; col += (int)blockDim.x) {
+        const float value = fabsf(src[col]);
+        if (value > amax) amax = value;
+    }
+    maxima[tid] = amax;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && maxima[tid + stride] > maxima[tid])
+            maxima[tid] = maxima[tid + stride];
+        __syncthreads();
+    }
+    const float scale = maxima[0] == 0.0f ? 0.0f : maxima[0] / 127.0f;
+    if (tid == 0) scales[row] = scale;
+    const float inv = scale == 0.0f ? 0.0f : 127.0f / scale;
+    for (int col = tid; col < cols; col += (int)blockDim.x) {
+        const float value = src[col] * inv;
+        /* Truncation toward zero after adding/subtracting 0.5 is ties-away. */
+        int q = __float2int_rz(value >= 0.0f ? value + 0.5f : value - 0.5f);
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        out[(size_t)row * (size_t)cols + (size_t)col] = (int8_t)q;
+    }
+}
+
+__global__ static void k_q8_epilogue(const int32_t *accum, const float *act_scale,
+                                     const float *weight_scale, const float *bias,
+                                     float *out, int rows, int cols) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = rows * cols;
+    if (index >= total) return;
+    const int row = index / cols;
+    const int col = index - row * cols;
+    const float row_scale = act_scale[row] * weight_scale[col];
+    out[index] = fmaf((float)accum[index], row_scale,
+                      bias == nullptr ? 0.0f : bias[col]);
+}
+
 __global__ static void k_copy_strided(float *dst, const float *src,
                                       int dst_stride, int src_stride,
                                       int width, int rows) {
@@ -124,6 +368,465 @@ __global__ static void k_copy_strided(float *dst, const float *src,
     if (r >= rows) return;
     for (int c = threadIdx.x; c < width; c += blockDim.x)
         dst[(size_t)r * dst_stride + c] = src[(size_t)r * src_stride + c];
+}
+
+__global__ static void k_copy(float *dst, const float *src, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+__global__ static void k_scale(float *data, float scale, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) data[i] *= scale;
+}
+
+__global__ static void k_clip(float *data, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    const float value = data[i];
+    data[i] = isfinite(value) ? fminf(1.0f, fmaxf(-1.0f, value)) : 0.0f;
+}
+
+__global__ static void k_decoder_elu(const float *input, float *output,
+                                     float alpha, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    const float x = input[i];
+    output[i] = x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+}
+
+/* Build the causal window used by one resident decoder convolution. The CPU
+ * reference carries the last `tail` values of each input channel; the first
+ * call sees zero padding for every Pocket decoder convolution. */
+__global__ static void k_decoder_causal_window(const float *previous,
+                                               const float *input, float *window,
+                                               int channels, int length, int tail) {
+    const int window_len = tail + length;
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * window_len;
+    if (index >= total) return;
+    const int channel = index / window_len;
+    const int pos = index - channel * window_len;
+    if (pos < tail) {
+        window[index] = previous[(size_t)channel * (size_t)tail + (size_t)pos];
+    } else {
+        window[index] = input[(size_t)channel * (size_t)length +
+                              (size_t)(pos - tail)];
+    }
+}
+
+__global__ static void k_decoder_causal_columns(const float *window,
+                                                float *columns, int channels,
+                                                int length, int kernel,
+                                                int dilation, int stride,
+                                                int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * kernel * length;
+    if (index >= total) return;
+    const int out_pos = index % length;
+    const int tap_channel = index / length;
+    const int tap = tap_channel % kernel;
+    const int channel = tap_channel / kernel;
+    const int window_len = tail + length;
+    /* `window` already starts with the carried left context.  The CPU
+     * reference indexes that combined buffer at `out_pos * stride`, so adding
+     * `tail` here would skip the causal padding and shift every convolution
+     * into the future. */
+    const int source = out_pos * stride + tap * dilation;
+    columns[index] = source >= 0 && source < window_len
+        ? window[(size_t)channel * (size_t)window_len + (size_t)source]
+        : 0.0f;
+}
+
+__global__ static void k_decoder_copy_tail(const float *window, float *previous,
+                                           int channels, int length, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * tail;
+    if (index >= total) return;
+    const int channel = index / tail;
+    const int pos = index - channel * tail;
+    const int window_len = tail + length;
+    previous[index] = window[(size_t)channel * (size_t)window_len +
+                             (size_t)(window_len - tail + pos)];
+}
+
+__global__ static void k_decoder_convtr_fold_save(float *full, float *partial,
+                                                  const float *bias,
+                                                  int channels, int full_len,
+                                                  int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * tail;
+    if (index >= total) return;
+    const int channel = index / tail;
+    const int pos = index - channel * tail;
+    float *row = full + (size_t)channel * (size_t)full_len;
+    row[pos] += partial[index];
+    partial[index] = row[full_len - tail + pos] -
+                     (bias == nullptr ? 0.0f : bias[channel]);
+}
+
+__global__ static void k_decoder_copy_prefix(const float *full, float *output,
+                                             int channels, int full_len,
+                                             int output_len) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = channels * output_len;
+    if (index >= total) return;
+    const int channel = index / output_len;
+    const int pos = index - channel * output_len;
+    output[index] = full[(size_t)channel * (size_t)full_len + (size_t)pos];
+}
+
+/* The per-request decoder state is independent, but its elementwise and
+ * causal convolution work has the same topology for every request in a
+ * scheduler gang. These kernels keep the request pointer tables on device
+ * and give one launch to the whole gang. They deliberately preserve the
+ * scalar decoder's channel-major layout and accumulation order. */
+__global__ static void k_decoder_elu_batch(float *const *inputs,
+                                           float *const *outputs,
+                                           int batch, int n, float alpha) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * n;
+    if (index >= total) return;
+    const int request = index / n;
+    const int offset = index - request * n;
+    const float x = inputs[request][offset];
+    outputs[request][offset] = x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+}
+
+__global__ static void k_decoder_residual_batch(float *const *base,
+                                                float *const *add, int batch,
+                                                int n) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * n;
+    if (index >= total) return;
+    const int request = index / n;
+    const int offset = index - request * n;
+    base[request][offset] += add[request][offset];
+}
+
+__global__ static void k_decoder_bias_batch(float *const *outputs,
+                                            const float *bias, int batch,
+                                            int channels, int length) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int offset = index - request * per_request;
+    outputs[request][offset] = bias == nullptr ? 0.0f : bias[offset / length];
+}
+
+__global__ static void k_decoder_causal_window_batch(
+    float *const *previous, float *const *inputs, float *const *windows,
+    int batch, int channels, int length, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int window_len = tail + length;
+    const int per_request = channels * window_len;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / window_len;
+    const int pos = local - channel * window_len;
+    windows[request][local] = pos < tail
+        ? previous[request][(size_t)channel * (size_t)tail + (size_t)pos]
+        : inputs[request][(size_t)channel * (size_t)length +
+                          (size_t)(pos - tail)];
+}
+
+__global__ static void k_decoder_causal_columns_batch(
+    float *const *windows, float *const *columns, int batch, int channels,
+    int length, int kernel, int dilation, int stride, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * kernel * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int out_pos = local % length;
+    const int tap_channel = local / length;
+    const int tap = tap_channel % kernel;
+    const int channel = tap_channel / kernel;
+    const int window_len = tail + length;
+    const int source = out_pos * stride + tap * dilation;
+    columns[request][local] = source >= 0 && source < window_len
+        ? windows[request][(size_t)channel * (size_t)window_len +
+                           (size_t)source]
+        : 0.0f;
+}
+
+/* One-GEMM variant: every request's im2col columns side by side in one
+ * [inner][batch * length] buffer, so a single GEMM reads the weights once for
+ * the whole gang instead of once per request. */
+__global__ static void k_decoder_causal_columns_shared(
+    float *const *windows, float *columns, int batch, int channels,
+    int length, int kernel, int dilation, int stride, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * kernel * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int out_pos = local % length;
+    const int tap_channel = local / length;
+    const int tap = tap_channel % kernel;
+    const int channel = tap_channel / kernel;
+    const int window_len = tail + length;
+    const int source = out_pos * stride + tap * dilation;
+    columns[(size_t)tap_channel * (size_t)batch * length +
+            (size_t)request * length + out_pos] =
+        source >= 0 && source < window_len
+            ? windows[request][(size_t)channel * (size_t)window_len +
+                               (size_t)source]
+            : 0.0f;
+}
+
+/* [channels][batch * length] back to each request's [channels][length],
+ * adding the bias. */
+__global__ static void k_decoder_scatter_bias(const float *shared,
+                                              float *const *outputs,
+                                              const float *bias, int batch,
+                                              int channels, int length) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int offset = index - request * per_request;
+    const int channel = offset / length;
+    const int t = offset - channel * length;
+    outputs[request][offset] =
+        shared[(size_t)channel * (size_t)batch * length +
+               (size_t)request * length + t] +
+        (bias == nullptr ? 0.0f : bias[channel]);
+}
+
+__global__ static void k_decoder_copy_tail_batch(float *const *windows,
+                                                 float *const *previous,
+                                                 int batch, int channels,
+                                                 int length, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * tail;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / tail;
+    const int pos = local - channel * tail;
+    const int window_len = tail + length;
+    previous[request][local] = windows[request][
+        (size_t)channel * (size_t)window_len + (size_t)(window_len - tail + pos)];
+}
+
+__global__ static void k_decoder_convtr_batch(
+    float *const *inputs, float *const *full, const float *weight,
+    const float *bias, int batch, int in_channels, int out_channels,
+    int length, int full_len, int kernel, int stride, int groups) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = out_channels * full_len;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int t = local % full_len;
+    const int output_channel = local / full_len;
+    const int in_per_group = in_channels / groups;
+    const int out_per_group = out_channels / groups;
+    const int group = output_channel / out_per_group;
+    const int out_local = output_channel % out_per_group;
+    float value = bias == nullptr ? 0.0f : bias[output_channel];
+    for (int k = 0; k < kernel; ++k) {
+        if (t < k || ((t - k) % stride) != 0) continue;
+        const int input_t = (t - k) / stride;
+        if (input_t >= length) continue;
+        for (int input_local = 0; input_local < in_per_group; ++input_local) {
+            const int input_channel = group * in_per_group + input_local;
+            const size_t weight_index =
+                ((size_t)input_channel * (size_t)out_per_group +
+                 (size_t)out_local) * (size_t)kernel + (size_t)k;
+            value += inputs[request][(size_t)input_channel * (size_t)length +
+                                    (size_t)input_t] * weight[weight_index];
+        }
+    }
+    full[request][local] = value;
+}
+
+/* GEMM form of the batched transposed convolution (groups == 1): gather
+ * every request's input into one [in][batch * length] matrix, one GEMM makes
+ * Y[(out, tap)][batch * length], and this fold adds the taps back onto time. */
+__global__ static void k_decoder_convtr_gather(float *const *inputs, float *x,
+                                               int batch, int channels,
+                                               int length) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int n = batch * length;
+    if (index >= channels * n) return;
+    const int channel = index / n;
+    const int j = index - channel * n;
+    const int request = j / length;
+    const int t = j - request * length;
+    x[index] = inputs[request][(size_t)channel * length + t];
+}
+
+__global__ static void k_decoder_convtr_overlap(const float *y, float *const *full,
+                                                const float *bias, int batch,
+                                                int out_channels, int length,
+                                                int full_len, int kernel,
+                                                int stride) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = out_channels * full_len;
+    if (index >= batch * per_request) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int oc = local / full_len;
+    const int t = local - oc * full_len;
+    const size_t m = (size_t)out_channels * kernel;
+    float value = bias == nullptr ? 0.0f : bias[oc];
+    for (int k = t % stride; k < kernel && k <= t; k += stride) {
+        const int i = (t - k) / stride;
+        if (i >= length) continue;
+        value += y[(size_t)oc * kernel + k + (size_t)(request * length + i) * m];
+    }
+    full[request][local] = value;
+}
+
+__global__ static void k_decoder_convtr_fold_batch(
+    float *const *full, float *const *partial, const float *bias, int batch,
+    int channels, int full_len, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * tail;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / tail;
+    const int pos = local - channel * tail;
+    float *row = full[request] + (size_t)channel * (size_t)full_len;
+    row[pos] += partial[request][local];
+    partial[request][local] = row[full_len - tail + pos] -
+        (bias == nullptr ? 0.0f : bias[channel]);
+}
+
+__global__ static void k_decoder_copy_prefix_batch(
+    float *const *full, float *const *outputs, int batch, int channels,
+    int full_len, int output_len) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * output_len;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / output_len;
+    const int pos = local - channel * output_len;
+    outputs[request][local] = full[request][
+        (size_t)channel * (size_t)full_len + (size_t)pos];
+}
+
+/* The Mimi decoder-transformer produces one row-major [width] activation,
+ * while SEANet consumes a channel-major [width][length] frame.  Keep this
+ * layout conversion on the device so the next decoder step does not need an
+ * avoidable host transpose plus H2D upload. */
+__global__ static void k_scatter_row_to_channels(
+    const float *row, float *output, int width, int length, int position) {
+    const int channel = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (channel >= width) return;
+    output[(size_t)channel * (size_t)length + (size_t)position] = row[channel];
+}
+
+__global__ static void k_scatter_rows_to_channels(
+    const float *rows, float *const *outputs, int batch, int width, int length,
+    int position) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * width;
+    if (index >= total) return;
+    const int request = index / width;
+    const int channel = index - request * width;
+    outputs[request][(size_t)channel * (size_t)length + (size_t)position] =
+        rows[index];
+}
+
+/* Mimi's quantizer upsample is a depthwise causal ConvTranspose1d with one
+ * input sample per call.  The first `stride` positions are returned in
+ * row-major form for the resident codec transformer; the remaining
+ * `kernel-stride` positions become the next call's carried tail. */
+/* The per-channel body is shared by the single-request and the
+ * cross-request kernels so both compile to the same arithmetic: a request's
+ * upsample output must not depend on whether it ran alone or in a gang. */
+__device__ __forceinline__ static void causal_depthwise_step_channel(
+    const float *input, float *output, float *partial, const float *weight,
+    const float *bias, int channels, int kernel, int stride, int tail,
+    int channel) {
+    const float channel_bias = bias == nullptr ? 0.0f : bias[channel];
+    for (int position = 0; position < kernel; ++position) {
+        float value = channel_bias +
+            input[channel] * weight[channel * kernel + position];
+        if (position < tail)
+            value += partial[channel * tail + position];
+        if (position < stride) {
+            output[position * channels + channel] = value;
+        } else if (tail > 0) {
+            partial[channel * tail + (position - stride)] = value - channel_bias;
+        }
+    }
+}
+
+__global__ static void k_conv_transpose_causal_depthwise_step(
+    const float *input, float *output, float *partial, const float *weight,
+    const float *bias, int channels, int kernel, int stride, int tail) {
+    /* One thread owns one channel and walks the short kernel serially.  The
+     * old implementation assigned one thread to each output position and
+     * read/wrote `partial` in the same launch.  For the normal Mimi shape
+     * tail == stride, position 0 reads partial[0] while position stride writes
+     * partial[0]: that is a real read/write race, not merely an ordering
+     * concern.  Keeping the per-channel loop also handles tail > stride,
+     * where the newly emitted tail overlaps the carried prefix. */
+    const int channel = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (channel >= channels) return;
+    causal_depthwise_step_channel(input, output, partial, weight, bias,
+                                  channels, kernel, stride, tail, channel);
+}
+
+/* The same step for a gang: thread (row, channel) reads its row of the
+ * stacked projection and writes/advances that row's own output and tail
+ * through device pointer tables.  No state is shared between rows. */
+__global__ static void k_conv_transpose_causal_depthwise_step_rows(
+    const float *inputs, float *const *outputs, float *const *partials,
+    const float *weight, const float *bias, int rows, int channels,
+    int kernel, int stride, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (index >= rows * channels) return;
+    const int row = index / channels;
+    const int channel = index - row * channels;
+    causal_depthwise_step_channel(inputs + (size_t)row * (size_t)channels,
+                                  outputs[row], partials[row], weight, bias,
+                                  channels, kernel, stride, tail, channel);
+}
+
+__global__ static void k_gather_rows_to_batch(
+    float *const *inputs, float *rows, int batch, int width) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = batch * width;
+    if (index >= total) return;
+    const int request = index / width;
+    const int column = index - request * width;
+    const float *input = inputs[request];
+    if (input != nullptr) rows[index] = input[column];
+}
+
+__global__ static void k_argmax(const float *logits, unsigned *result,
+                                int vocab, int codebook_size, unsigned eos_id,
+                                int allow_eos) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    float best = -1.0e30f;
+    unsigned index = 0u;
+    for (int i = 0; i < vocab; ++i) {
+        const bool allowed = i < codebook_size ||
+                             (allow_eos != 0 && (unsigned)i == eos_id);
+        if (allowed && logits[i] > best) {
+            best = logits[i];
+            index = (unsigned)i;
+        }
+    }
+    result[0] = index;
 }
 
 /* ------------------------------------------------------------------ */
@@ -142,23 +845,300 @@ struct cuda_cached_fp16 {
     half *device_ptr;
 };
 
+/* Resident BF16 copy of an f32 projection weight (MYNAH_CUDA_QUANT=bf16).
+ * Stored as raw bf16 bit patterns; cuBLAS reads them as CUDA_R_16BF. */
+struct cuda_cached_bf16 {
+    const void *host_pointer;
+    size_t n;          /* element count */
+    uint16_t *device_ptr;
+};
+
+struct cuda_cached_int8 {
+    const void *host_pointer;
+    size_t rows;
+    size_t cols;
+    int8_t *device_q;
+    float *device_scale;
+};
+
+struct cuda_graph_entry {
+    size_t rows;
+    size_t iw;
+    size_t ow;
+    const void *weight_pointer;
+    const void *bias_pointer;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    bool valid;
+};
+
+/* A resident engine graph is different from the small host matmul graph
+ * above: its activations belong to one scratch arena, while request KV
+ * pointers and positions are supplied through persistent metadata buffers at
+ * launch time.  Keeping the identity explicit prevents a graph from outliving
+ * the arena whose addresses it captured. */
+struct cuda_pipeline_graph_entry {
+    size_t key;
+    const void *identity;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    bool valid;
+    bool capturing;
+};
+
+/* A batched decoder graph owns its pointer metadata.  The eager decoder batch
+ * path reuses four backend-wide device tables and fills them from small stack
+ * arrays.  That is correct for eager execution, but a graph would retain
+ * those host source pointers after the call returned and later uploads would
+ * overwrite the same device table before its captured kernel used it.
+ *
+ * A graph is therefore keyed by the exact stable decoder gang.  Each captured
+ * pointer-table upload gets its own pinned host table and device table.  The
+ * request data itself still changes every frame through the already-resident
+ * input/output/state buffers; only the addresses are immutable.  This is a
+ * bounded bridge until the scheduler has a physical row arena and can use one
+ * graph per width bucket rather than one graph per changing gang. */
+struct cuda_decoder_batch_graph_entry {
+    size_t batch;
+    size_t encoder_frames;
+    std::vector<mynah_backend_decoder *> decoders;
+    std::vector<const float *> inputs;
+    std::vector<float *> outputs;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    float **device_tables;
+    float **host_tables;
+    size_t upload_slots;
+    size_t used_slots;
+    /* Topology signature for reuse across gangs: every per-row pointer the
+     * graph touches lives in host_tables, so a graph captured for one gang
+     * serves any gang of the same width once the tables are rewritten. */
+    size_t sig_ops;
+    const float *sig_weight;
+    cudaEvent_t done;
+    bool valid;
+};
+
+struct cuda_backend_state;
+static void destroy_graphs(cuda_backend_state *st);
+static void destroy_decoder_batch_graphs(cuda_backend_state *st);
+static void tile_release(cuda_backend_state *st);
+static void codec_gang_release(cuda_backend_state *st);
+
+/* Buffers of the cross-request transformer tile, grown outside any capture. */
+struct cuda_tile_workspace {
+    float *x = nullptr, *xn = nullptr, *qkv = nullptr, *att = nullptr,
+          *proj = nullptr, *ffn_buf = nullptr;
+    /* Capacities in floats: the backbone prefill (dim 1024) and the Mimi
+     * tile (dim 512) share this workspace, so it is sized to the largest
+     * request seen and never shrinks when the two alternate. */
+    size_t md_cap = 0u, mf_cap = 0u;
+    void *meta_dev = nullptr, *meta_host = nullptr;
+    size_t meta_cap = 0u;
+    cudaEvent_t meta_event = nullptr;
+    float *splitk = nullptr;
+    size_t splitk_cap = 0u; /* floats */
+    int sms = 0;
+    bool fixed_order = false; /* the current call asked for invariant GEMMs */
+};
+
+/* Staging of the cross-request Pocket codec gang (quantizer + upsample in,
+ * PCM out).  Grown outside any capture; every pinned block is reused per
+ * call and guarded by an event so the host never overwrites a buffer an
+ * earlier async copy has not consumed yet. */
+struct cuda_codec_gang_workspace {
+    void *up_meta_dev = nullptr, *up_meta_host = nullptr;
+    size_t up_meta_cap = 0u;
+    cudaEvent_t up_meta_event = nullptr;
+    float *up_proj = nullptr;
+    size_t up_proj_cap = 0u; /* floats */
+    void *pcm_meta_dev = nullptr, *pcm_meta_host = nullptr;
+    size_t pcm_meta_cap = 0u;
+    cudaEvent_t pcm_meta_event = nullptr;
+    float *pcm_dev = nullptr, *pcm_host = nullptr;
+    size_t pcm_cap = 0u; /* floats */
+};
+
 struct cuda_backend_state {
     cublasHandle_t cublas;
     cudaStream_t stream;
     std::vector<cuda_cached_buffer> weights;
     std::vector<cuda_cached_fp16> weights_fp16;
+    std::vector<cuda_cached_int8> weights_int8;
+    std::vector<cuda_cached_bf16> weights_bf16;
+    /* BF16 activation rows for the resident BF16-weight GEMM; reserved
+     * before graph capture like the Q8 workspace. */
+    uint16_t *dev_bf16_activation;
+    size_t dev_bf16_activation_cap; /* elements */
     /* Device scratch for activations (grows on demand). */
     float *dev_scratch;
     size_t dev_scratch_cap;   /* bytes */
+    /* Reusable FP32 staging for host<->BF16 KV conversion.  It is grown only
+     * before a new resident prefix is submitted and never inside a graph. */
+    float *dev_bf16_convert;
+    size_t dev_bf16_convert_cap; /* floats */
+    int8_t *dev_q8_activation;
+    float *dev_q8_activation_scale;
+    int32_t *dev_q8_accum;
+    size_t dev_q8_activation_cap;
+    size_t dev_q8_rows_cap;
+    size_t dev_q8_accum_cap;
     /* Pinned host buffer for H2D/D2H. */
     float *host_buf;
     float *dev_buf;           /* mapped device pointer for host_buf */
     size_t host_buf_cap;
+    unsigned *dev_argmax;
+    void *cublas_workspace;
+    size_t cublas_workspace_cap;
+    /* Metadata for independent-request attention batches.  The arrays are
+     * allocated with the backend, never from the autoregressive hot loop. */
+    float **dev_batch_k_cache;
+    float **dev_batch_v_cache;
+    size_t *dev_batch_positions;
+    size_t *dev_batch_cache_strides;
+    /* Pointer tables for the cross-request causal decoder.  Each table is
+     * reused for one topology operation at a time; decoder state itself stays
+     * in the per-request objects. */
+    float **dev_decoder_ptr0;
+    float **dev_decoder_ptr1;
+    float **dev_decoder_ptr2;
+    float **dev_decoder_ptr3;
+    size_t batch_meta_cap;
+    bool fast_math;
+    bool tf32; /* MYNAH_CUDA_TF32: FP32 GEMMs on TF32 tensor cores */
+    bool tile_cublas; /* MYNAH_CUDA_TILE_CUBLAS: tile projections via cuBLAS */
+    /* MYNAH_CUDA_QUANT=bf16|int8 (or MYNAH_CUDA_Q8=1): the engine may hand
+     * the GEMMs reduced-precision weights, whose tensor-core paths are not
+     * batch-invariant. */
+    bool quant_weights;
+    bool graphs_enabled;
+    std::vector<cuda_graph_entry> graph_cache;
+    std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
+    std::vector<cuda_decoder_batch_graph_entry *> decoder_batch_graphs;
+    cuda_decoder_batch_graph_entry *active_decoder_batch_graph;
+    size_t active_decoder_upload_slot;
+    float **active_decoder_tables[4];
+    std::atomic<unsigned long long> h2d_bytes;
+    std::atomic<unsigned long long> d2h_bytes;
+    std::atomic<unsigned long long> h2d_calls;
+    std::atomic<unsigned long long> d2h_calls;
+    std::atomic<unsigned long long> sync_calls;
+    std::atomic<unsigned long long> graph_captures;
+    std::atomic<unsigned long long> graph_replays;
+    std::atomic<unsigned long long> graph_fallbacks;
+    std::atomic<unsigned long long> backbone_batch_calls;
+    std::atomic<unsigned long long> backbone_batch_items;
+    std::atomic<unsigned long long> backbone_batch_max_width;
+    std::atomic<unsigned long long> codec_transformer_batch_calls;
+    std::atomic<unsigned long long> codec_transformer_batch_items;
+    std::atomic<unsigned long long> codec_transformer_batch_max_width;
+    std::atomic<unsigned long long> codec_upsample_steps;
+    std::atomic<unsigned long long> codec_upsample_fallbacks;
+    std::atomic<unsigned long long> decoder_steps;
+    std::atomic<unsigned long long> decoder_batch_calls;
+    std::atomic<unsigned long long> decoder_batch_items;
+    std::atomic<unsigned long long> decoder_batch_max_width;
+    std::atomic<unsigned long long> decoder_batch_frames;
+    std::atomic<unsigned long long> decoder_graph_captures;
+    std::atomic<unsigned long long> decoder_graph_replays;
+    std::atomic<unsigned long long> decoder_graph_fallbacks;
+    std::atomic<unsigned long long> decoder_failures;
+    std::atomic<unsigned long long> resident_fallbacks;
+    std::atomic<unsigned long long> matmul_calls;
+    std::atomic<unsigned long long> matvec_calls;
+    std::atomic<unsigned long long> q8_matmul_calls;
+    std::atomic<unsigned long long> tile_calls;
+    std::atomic<unsigned long long> width_hist[3][8];
+    std::atomic<unsigned long long> tile_rows;
+    cuda_tile_workspace tile;
+    float *dec_cols = nullptr;   /* one-GEMM decoder: [inner][batch*len] */
+    float *dec_out = nullptr;    /* one-GEMM decoder: [out][batch*len]   */
+    size_t dec_cols_cap = 0u, dec_out_cap = 0u; /* floats */
+    float *dec_tr_x = nullptr, *dec_tr_y = nullptr; /* convtr GEMM buffers */
+    size_t dec_tr_x_cap = 0u, dec_tr_y_cap = 0u;
+    cuda_codec_gang_workspace codec_gang;
+    std::atomic<unsigned long long> codec_gang_calls[2];
+    std::atomic<unsigned long long> codec_gang_rows[2];
+    std::atomic<unsigned long long> codec_gang_hist[2][8];
+    std::atomic<unsigned long long> q8_rows;
+    std::atomic<unsigned long long> q8_weight_uploads;
+    std::atomic<unsigned long long> q8_weight_bytes;
+    std::atomic<unsigned long long> q8_activation_bytes;
+    std::atomic<unsigned long long> bf16_matmul_calls;
+    std::atomic<unsigned long long> bf16_rows;
+    std::atomic<unsigned long long> bf16_weight_bytes;
+    bool q8_enabled;
+    bool decoder_batch_enabled;
 };
+
+enum cuda_decoder_op_kind {
+    CUDA_DECODER_CONV = 0,
+    CUDA_DECODER_CONVTR = 1,
+    CUDA_DECODER_RESBLOCK = 2
+};
+
+struct cuda_decoder_op {
+    cuda_decoder_op_kind kind;
+    int pre_elu;
+    int in_channels;
+    int out_channels;
+    int kernel;
+    int stride;
+    int dilation;
+    int groups;
+    size_t max_in_len;
+    size_t tail;
+    size_t max_full_len;
+    float *weight;
+    float *bias;
+    float *previous;
+    float *window;
+    float *partial;
+    float *full;
+};
+
+struct mynah_backend_decoder {
+    cuda_backend_state *backend;
+    size_t channels;
+    size_t dimension;
+    size_t n_filters;
+    size_t max_encoder_frames;
+    float elu_alpha;
+    size_t work_floats;
+    size_t columns_floats;
+    float *work_a;
+    float *work_b;
+    float *work_c;
+    float *columns;
+    std::vector<cuda_decoder_op> ops;
+};
+
+static constexpr size_t CUDA_BATCH_META_CAP = 384u;
+static constexpr size_t CUDA_DECODER_GRAPH_CAP = 384u;
+/* A server can retain one decoder graph per live context in addition to the
+ * width-bucketed backbone/flow graphs.  The condition-projection input graph
+ * is a separate bucket because its input is already resident in `cuda_x` and
+ * must not accidentally replay an H2D node from the ordinary bucket.  Keep
+ * enough finite room for 128 request decoders plus the three 128-width bucket
+ * families. */
+static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 384u;
 
 static void set_error(char *e, size_t c, const char *m) {
     if (e && c > 0) std::snprintf(e, c, "%s", m);
 }
+
+static bool cuda_size_mul(size_t a, size_t b, size_t *out) {
+    if (a != 0u && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool cuda_size_add(size_t a, size_t b, size_t *out) {
+    if (b > SIZE_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
 static int ce(cudaError_t r, char *e, size_t c) {
     if (r == cudaSuccess) return 0;
     std::snprintf(e, c, "CUDA: %s", cudaGetErrorString(r)); return -1;
@@ -168,10 +1148,61 @@ static int cbe(cublasStatus_t s, char *e, size_t c) {
     std::snprintf(e, c, "cuBLAS: %d", (int)s); return -1;
 }
 
+static bool cuda_fast_math_enabled(void) {
+    const char *value = std::getenv("MYNAH_CUDA_FAST_MATH");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+/* Mirrors the engine's resolution of MYNAH_CUDA_QUANT (f32|bf16|int8) and
+ * the explicit MYNAH_CUDA_Q8 override, without linking the C helper. */
+static bool cuda_env_enabled(const char *name, bool fallback);
+static bool cuda_quant_weights_requested(void) {
+    if (getenv("MYNAH_CUDA_Q8") != nullptr &&
+        cuda_env_enabled("MYNAH_CUDA_Q8", false))
+        return true;
+    const char *v = getenv("MYNAH_CUDA_QUANT");
+    if (v == nullptr || v[0] == '\0') return false;
+    return strcmp(v, "bf16") == 0 || strcmp(v, "bfloat16") == 0 ||
+           strcmp(v, "int8") == 0 || strcmp(v, "q8") == 0;
+}
+
+static bool cuda_env_enabled(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    return value == nullptr ? fallback : std::strcmp(value, "0") != 0;
+}
+
+static bool cuda_decoder_batch_enabled(void) {
+    return cuda_env_enabled("MYNAH_CUDA_DECODER_BATCH", true);
+}
+
+static bool cuda_graphs_enabled(void) {
+    const char *value = std::getenv("MYNAH_CUDA_GRAPHS");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+static cublasComputeType_t cuda_compute_type(const cuda_backend_state *st) {
+    if (st->fast_math) return CUBLAS_COMPUTE_32F_FAST_16F;
+    return st->tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+}
+
+static cublasGemmAlgo_t cuda_gemm_algo(const cuda_backend_state *st) {
+    return st->fast_math || st->tf32 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP
+                                     : CUBLAS_GEMM_DEFAULT;
+}
+
 static int ensure_scratch(cuda_backend_state *st, size_t bytes, char *e, size_t ec) {
     if (st->dev_scratch_cap >= bytes) return 0;
+    size_t rounded = 0;
+    if (!cuda_size_add(bytes, (32u << 20) - 1u, &rounded)) {
+        set_error(e, ec, "CUDA scratch size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    destroy_graphs(st);
     if (st->dev_scratch) cudaFree(st->dev_scratch);
-    size_t cap = (bytes + (32u<<20) - 1u) & ~((32u<<20) - 1u);
+    st->dev_scratch = nullptr;
+    st->dev_scratch_cap = 0;
+    size_t cap = rounded & ~((32u << 20) - 1u);
     if (ce(cudaMalloc(&st->dev_scratch, cap), e, ec)) { st->dev_scratch = nullptr; st->dev_scratch_cap = 0; return -1; }
     st->dev_scratch_cap = cap;
     return 0;
@@ -179,9 +1210,16 @@ static int ensure_scratch(cuda_backend_state *st, size_t bytes, char *e, size_t 
 
 static int ensure_host(cuda_backend_state *st, size_t bytes, char *e, size_t ec) {
     if (st->host_buf_cap >= bytes) return 0;
+    size_t rounded = 0;
+    if (!cuda_size_add(bytes, (16u << 20) - 1u, &rounded)) {
+        set_error(e, ec, "CUDA host staging size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    destroy_graphs(st);
     if (st->host_buf) cudaFreeHost(st->host_buf);
     st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
-    size_t cap = (bytes + (16u<<20) - 1u) & ~((16u<<20) - 1u);
+    size_t cap = rounded & ~((16u << 20) - 1u);
     if (ce(cudaHostAlloc(&st->host_buf, cap, cudaHostAllocMapped), e, ec)) return -1;
     if (ce(cudaHostGetDevicePointer(&st->dev_buf, st->host_buf, 0), e, ec)) {
         cudaFreeHost(st->host_buf); st->host_buf = nullptr; return -1;
@@ -190,8 +1228,30 @@ static int ensure_host(cuda_backend_state *st, size_t bytes, char *e, size_t ec)
     return 0;
 }
 
+static int ensure_bf16_convert(cuda_backend_state *st, size_t elements,
+                               char *e, size_t ec) {
+    if (st->dev_bf16_convert_cap >= elements) return 0;
+    if (elements == 0u || elements > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "CUDA BF16 conversion size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    destroy_graphs(st);
+    if (st->dev_bf16_convert) cudaFree(st->dev_bf16_convert);
+    st->dev_bf16_convert = nullptr;
+    st->dev_bf16_convert_cap = 0u;
+    if (ce(cudaMalloc(&st->dev_bf16_convert, elements * sizeof(float)), e, ec))
+        return -1;
+    st->dev_bf16_convert_cap = elements;
+    return 0;
+}
+
 static int cached_weight(cuda_backend_state *st, const float *hp, size_t bytes,
                          float **dp, char *e, size_t ec) {
+    if (st == nullptr || hp == nullptr || dp == nullptr || bytes == 0u) {
+        set_error(e, ec, "invalid CUDA weight cache request");
+        return -1;
+    }
     for (auto &c : st->weights)
         if (c.host_pointer == hp && c.bytes == bytes) { *dp = c.device_pointer; return 0; }
     float *d = nullptr;
@@ -204,17 +1264,314 @@ static int cached_weight(cuda_backend_state *st, const float *hp, size_t bytes,
 
 static int cached_weight_fp16(cuda_backend_state *st, const float *hp, size_t n,
                               half **dp, char *e, size_t ec) {
+    size_t bytes = 0;
+    if (st == nullptr || hp == nullptr || dp == nullptr || n == 0u ||
+        n > (size_t)INT_MAX || !cuda_size_mul(n, sizeof(float), &bytes)) {
+        set_error(e, ec, "invalid CUDA FP16 weight cache request");
+        return -1;
+    }
     for (auto &c : st->weights_fp16)
         if (c.host_pointer == hp && c.n == n) { *dp = c.device_ptr; return 0; }
     float *tmp = nullptr;
     half *d16 = nullptr;
-    if (ce(cudaMalloc(&tmp, n * sizeof(float)), e, ec)) return -1;
-    if (ce(cudaMalloc(&d16, n * sizeof(half)), e, ec)) { cudaFree(tmp); return -1; }
-    cudaMemcpy(tmp, hp, n * sizeof(float), cudaMemcpyHostToDevice);
-    k_f32_to_f16<<<((int)n+255)/256, 256>>>(tmp, d16, (int)n);
-    cudaFree(tmp);
+    size_t half_bytes = 0;
+    if (!cuda_size_mul(n, sizeof(half), &half_bytes)) {
+        set_error(e, ec, "CUDA FP16 weight size overflow");
+        return -1;
+    }
+    if (ce(cudaMalloc(&tmp, bytes), e, ec)) return -1;
+    if (ce(cudaMalloc(&d16, half_bytes), e, ec)) { cudaFree(tmp); return -1; }
+    if (ce(cudaMemcpyAsync(tmp, hp, bytes, cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    k_f32_to_f16<<<((int)n+255)/256, 256, 0, st->stream>>>(tmp, d16, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    /* The temporary is not part of the captured graph and can be reclaimed
+     * after the stream reaches the conversion.  cudaFree provides the needed
+     * ordering on supported CUDA runtimes. */
+    if (ce(cudaFree(tmp), e, ec)) {
+        cudaFree(d16);
+        return -1;
+    }
     st->weights_fp16.push_back({hp, n, d16});
     *dp = d16;
+    return 0;
+}
+
+/* Same shape as cached_weight_fp16: one H2D of the f32 tensor into a
+ * temporary, one device RNE conversion, then the f32 temporary is released.
+ * The first (uncaptured) call of every resident stage warms this cache; a
+ * graph capture then only records the GEMM reading the cached pointer. */
+static int cached_weight_bf16(cuda_backend_state *st, const float *hp,
+                              size_t n, uint16_t **dp, char *e, size_t ec) {
+    size_t bytes = 0u;
+    size_t bf16_bytes = 0u;
+    if (st == nullptr || hp == nullptr || dp == nullptr || n == 0u ||
+        n > (size_t)INT_MAX || !cuda_size_mul(n, sizeof(float), &bytes) ||
+        !cuda_size_mul(n, sizeof(uint16_t), &bf16_bytes)) {
+        set_error(e, ec, "invalid CUDA BF16 weight cache request");
+        return -1;
+    }
+    for (auto &c : st->weights_bf16)
+        if (c.host_pointer == hp && c.n == n) { *dp = c.device_ptr; return 0; }
+    float *tmp = nullptr;
+    uint16_t *d16 = nullptr;
+    if (ce(cudaMalloc(&tmp, bytes), e, ec)) return -1;
+    if (ce(cudaMalloc((void **)&d16, bf16_bytes), e, ec)) {
+        cudaFree(tmp);
+        return -1;
+    }
+    if (ce(cudaMemcpyAsync(tmp, hp, bytes, cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    k_f32_to_bf16<<<((int)n + 255) / 256, 256, 0, st->stream>>>(tmp, d16,
+                                                                 (int)n);
+    if (ce(cudaGetLastError(), e, ec) ||
+        ce(cudaStreamSynchronize(st->stream), e, ec)) {
+        cudaFree(tmp);
+        cudaFree(d16);
+        return -1;
+    }
+    cudaFree(tmp);
+    try {
+        st->weights_bf16.push_back({hp, n, d16});
+    } catch (const std::bad_alloc &) {
+        cudaFree(d16);
+        set_error(e, ec, "out of host memory indexing CUDA BF16 weight");
+        return -1;
+    }
+    st->bf16_weight_bytes.fetch_add((unsigned long long)bf16_bytes,
+                                    std::memory_order_relaxed);
+    *dp = d16;
+    return 0;
+}
+
+static int ensure_bf16_activation(cuda_backend_state *st, size_t elements,
+                                  char *e, size_t ec) {
+    if (st == nullptr || elements == 0u || elements > SIZE_MAX / 2u) {
+        set_error(e, ec, "invalid CUDA BF16 activation workspace size");
+        return -1;
+    }
+    if (st->dev_bf16_activation_cap >= elements) return 0;
+    if (ce(cudaStreamSynchronize(st->stream), e, ec) != 0) return -1;
+    destroy_graphs(st);
+    if (st->dev_bf16_activation != nullptr) cudaFree(st->dev_bf16_activation);
+    st->dev_bf16_activation = nullptr;
+    st->dev_bf16_activation_cap = 0u;
+    if (ce(cudaMalloc((void **)&st->dev_bf16_activation,
+                      elements * sizeof(uint16_t)), e, ec) != 0)
+        return -1;
+    st->dev_bf16_activation_cap = elements;
+    return 0;
+}
+
+extern "C" int mynah_cuda_bf16_reserve(void *opaque, size_t activation_count,
+                                        char *e, size_t ec) {
+    return ensure_bf16_activation(static_cast<cuda_backend_state *>(opaque),
+                                  activation_count, e, ec);
+}
+
+static int cuda_q8_round(float value) {
+    int q = (int)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+    return q;
+}
+
+/* Host-side packing is intentionally the same small scalar formula as
+ * src/qmat.c. It runs once per immutable weight tensor, not in the decode
+ * loop; using it here also makes the device cache's bytes reproducible across
+ * CUDA versions. */
+static int cuda_pack_weight_q8(const float *host, size_t rows, size_t cols,
+                              std::vector<int8_t> *q,
+                              std::vector<float> *scales,
+                              char *e, size_t ec) {
+    if (host == nullptr || q == nullptr || scales == nullptr || rows == 0u ||
+        cols == 0u || rows > (size_t)INT_MAX || cols > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA Q8 weight dimensions");
+        return -1;
+    }
+    size_t elements = 0u;
+    if (!cuda_size_mul(rows, cols, &elements)) {
+        set_error(e, ec, "CUDA Q8 weight size overflow");
+        return -1;
+    }
+    try {
+        q->assign(elements, (int8_t)0);
+        scales->assign(rows, 1.0f);
+    } catch (const std::bad_alloc &) {
+        set_error(e, ec, "out of host memory packing CUDA Q8 weight");
+        return -1;
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        const float *src = host + row * cols;
+        float amax = 0.0f;
+        for (size_t col = 0; col < cols; ++col) {
+            const float value = std::fabs(src[col]);
+            if (value > amax) amax = value;
+        }
+        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+        (*scales)[row] = scale;
+        const float inv = 1.0f / scale;
+        int8_t *dst = q->data() + row * cols;
+        for (size_t col = 0; col < cols; ++col)
+            dst[col] = (int8_t)cuda_q8_round(src[col] * inv);
+    }
+    return 0;
+}
+
+static int cached_weight_q8(cuda_backend_state *st, const float *host,
+                            size_t rows, size_t cols, int8_t **device_q,
+                            float **device_scale, char *e, size_t ec) {
+    if (st == nullptr || host == nullptr || device_q == nullptr ||
+        device_scale == nullptr || rows == 0u || cols == 0u) {
+        set_error(e, ec, "invalid CUDA Q8 weight cache request");
+        return -1;
+    }
+    for (auto &entry : st->weights_int8) {
+        if (entry.host_pointer == host && entry.rows == rows &&
+            entry.cols == cols) {
+            *device_q = entry.device_q;
+            *device_scale = entry.device_scale;
+            return 0;
+        }
+    }
+    std::vector<int8_t> host_q;
+    std::vector<float> host_scale;
+    if (cuda_pack_weight_q8(host, rows, cols, &host_q, &host_scale, e, ec) != 0)
+        return -1;
+    size_t q_bytes = 0u;
+    size_t scale_bytes = 0u;
+    if (!cuda_size_mul(host_q.size(), sizeof(int8_t), &q_bytes) ||
+        !cuda_size_mul(host_scale.size(), sizeof(float), &scale_bytes)) {
+        set_error(e, ec, "CUDA Q8 weight byte size overflow");
+        return -1;
+    }
+    int8_t *q = nullptr;
+    float *scale = nullptr;
+    if (ce(cudaMalloc((void **)&q, q_bytes), e, ec) != 0 ||
+        ce(cudaMalloc((void **)&scale, scale_bytes), e, ec) != 0) {
+        if (q != nullptr) cudaFree(q);
+        if (scale != nullptr) cudaFree(scale);
+        return -1;
+    }
+    if (ce(cudaMemcpy(q, host_q.data(), q_bytes, cudaMemcpyHostToDevice), e,
+           ec) != 0 ||
+        ce(cudaMemcpy(scale, host_scale.data(), scale_bytes,
+                      cudaMemcpyHostToDevice), e, ec) != 0) {
+        cudaFree(q);
+        cudaFree(scale);
+        return -1;
+    }
+    try {
+        st->weights_int8.push_back({host, rows, cols, q, scale});
+    } catch (const std::bad_alloc &) {
+        cudaFree(q);
+        cudaFree(scale);
+        set_error(e, ec, "out of host memory indexing CUDA Q8 weight");
+        return -1;
+    }
+    st->q8_weight_uploads.fetch_add(1ull, std::memory_order_relaxed);
+    st->q8_weight_bytes.fetch_add((unsigned long long)(q_bytes + scale_bytes),
+                                  std::memory_order_relaxed);
+    *device_q = q;
+    *device_scale = scale;
+    return 0;
+}
+
+static int ensure_q8_workspace(cuda_backend_state *st, size_t activation_count,
+                               size_t rows, size_t output_count, char *e,
+                               size_t ec) {
+    if (st == nullptr || activation_count == 0u || rows == 0u ||
+        output_count == 0u) {
+        set_error(e, ec, "invalid CUDA Q8 workspace dimensions");
+        return -1;
+    }
+    if (st->dev_q8_activation_cap >= activation_count &&
+        st->dev_q8_rows_cap >= rows && st->dev_q8_accum_cap >= output_count)
+        return 0;
+    size_t activation_bytes = 0u;
+    size_t row_bytes = 0u;
+    size_t output_bytes = 0u;
+    if (!cuda_size_mul(activation_count, sizeof(int8_t), &activation_bytes) ||
+        !cuda_size_mul(rows, sizeof(float), &row_bytes) ||
+        !cuda_size_mul(output_count, sizeof(int32_t), &output_bytes)) {
+        set_error(e, ec, "CUDA Q8 workspace size overflow");
+        return -1;
+    }
+    if (ce(cudaStreamSynchronize(st->stream), e, ec) != 0) return -1;
+    destroy_graphs(st);
+    if (st->dev_q8_activation_cap < activation_count) {
+        if (st->dev_q8_activation != nullptr) cudaFree(st->dev_q8_activation);
+        st->dev_q8_activation = nullptr;
+        st->dev_q8_activation_cap = 0u;
+        if (ce(cudaMalloc((void **)&st->dev_q8_activation,
+                          activation_bytes), e, ec) != 0)
+            return -1;
+        st->dev_q8_activation_cap = activation_count;
+    }
+    if (st->dev_q8_rows_cap < rows) {
+        if (st->dev_q8_activation_scale != nullptr)
+            cudaFree(st->dev_q8_activation_scale);
+        st->dev_q8_activation_scale = nullptr;
+        st->dev_q8_rows_cap = 0u;
+        if (ce(cudaMalloc((void **)&st->dev_q8_activation_scale,
+                          row_bytes), e, ec) != 0)
+            return -1;
+        st->dev_q8_rows_cap = rows;
+    }
+    if (st->dev_q8_accum_cap < output_count) {
+        if (st->dev_q8_accum != nullptr) cudaFree(st->dev_q8_accum);
+        st->dev_q8_accum = nullptr;
+        st->dev_q8_accum_cap = 0u;
+        if (ce(cudaMalloc((void **)&st->dev_q8_accum,
+                          output_bytes), e, ec) != 0)
+            return -1;
+        st->dev_q8_accum_cap = output_count;
+    }
+    return 0;
+}
+
+/* Graph callers reserve this before capture.  A resize synchronizes and
+ * invalidates graphs, so allowing the first larger batch to discover the
+ * allocation from inside a captured projection would make capture fail. */
+extern "C" int mynah_cuda_q8_reserve(void *opaque, size_t activation_count,
+                                      size_t rows, size_t output_count,
+                                      char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return ensure_q8_workspace(st, activation_count, rows, output_count, e, ec);
+}
+
+static int validate_cuda_matmul(const void *input, const void *output,
+                                const float *weight, size_t rows, size_t iw,
+                                size_t ow, size_t *in_n, size_t *out_n,
+                                size_t *weight_n, size_t *total_n,
+                                char *e, size_t ec) {
+    size_t input_bytes = 0, output_bytes = 0, weight_bytes = 0, total_bytes = 0;
+    if (input == nullptr || output == nullptr || weight == nullptr || rows == 0u ||
+        iw == 0u || ow == 0u || rows > (size_t)INT_MAX ||
+        iw > (size_t)INT_MAX || ow > (size_t)INT_MAX ||
+        !cuda_size_mul(rows, iw, in_n) ||
+        !cuda_size_mul(rows, ow, out_n) ||
+        !cuda_size_mul(iw, ow, weight_n) ||
+        !cuda_size_add(*in_n, *out_n, total_n) ||
+        !cuda_size_mul(*in_n, sizeof(float), &input_bytes) ||
+        !cuda_size_mul(*out_n, sizeof(float), &output_bytes) ||
+        !cuda_size_mul(*weight_n, sizeof(float), &weight_bytes) ||
+        !cuda_size_mul(*total_n, sizeof(float), &total_bytes)) {
+        set_error(e, ec, "invalid CUDA matmul dimensions");
+        return -1;
+    }
     return 0;
 }
 
@@ -226,9 +1583,34 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                        size_t iw, size_t ow, const float *weight, const float *bias,
                        char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    const size_t in_n = rows * iw;
-    const size_t out_n = rows * ow;
-    const size_t w_n = iw * ow;
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(input, output, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    if (!st->fast_math) {
+        float *dw = nullptr;
+        if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
+        float *db = nullptr;
+        if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+        if (ensure_host(st, total_n * sizeof(float), e, ec)) return -1;
+        std::memcpy(st->host_buf, input, in_n * sizeof(float));
+        cublasSetStream(st->cublas, st->stream);
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             (int)ow, (int)rows, (int)iw,
+                             &alpha, dw, CUDA_R_32F, (int)iw,
+                             st->dev_buf, CUDA_R_32F, (int)iw,
+                             &beta, st->dev_buf + in_n, CUDA_R_32F, (int)ow,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), e, ec)) return -1;
+        if (db) {
+            k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+                st->dev_buf + in_n, db, (int)rows, (int)ow);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+        }
+        if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+        std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
+        return 0;
+    }
     half *dw16 = nullptr;
     if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
@@ -248,8 +1630,7 @@ static int cuda_matmul(void *opaque, const float *input, float *output, size_t r
                          &a1, dw16, CUDA_R_16F, (int)iw,
                          di16, CUDA_R_16F, (int)iw,
                          &b0, d_out_mapped, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
         k_bias_add<<<((int)(rows*ow)+255)/256, 256, 0, st->stream>>>(
             d_out_mapped, db, (int)rows, (int)ow);
@@ -266,9 +1647,34 @@ static int cuda_matmul_to_dev(void *opaque, const float *input, float *d_out,
                               const float *weight, const float *bias,
                               char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    const size_t in_n = rows * iw;
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(input, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    if (!st->fast_math) {
+        float *dw = nullptr;
+        if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
+        float *db = nullptr;
+        if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+        if (ensure_host(st, in_n * sizeof(float), e, ec)) return -1;
+        std::memcpy(st->host_buf, input, in_n * sizeof(float));
+        cublasSetStream(st->cublas, st->stream);
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                             (int)ow, (int)rows, (int)iw,
+                             &alpha, dw, CUDA_R_32F, (int)iw,
+                             st->dev_buf, CUDA_R_32F, (int)iw,
+                             &beta, d_out, CUDA_R_32F, (int)ow,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), e, ec)) return -1;
+        if (db) {
+            k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+                d_out, db, (int)rows, (int)ow);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+        }
+        return 0;
+    }
     half *dw16 = nullptr;
-    if (cached_weight_fp16(st, weight, iw * ow, &dw16, e, ec)) return -1;
+    if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
     if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
@@ -283,15 +1689,11 @@ static int cuda_matmul_to_dev(void *opaque, const float *input, float *d_out,
                          &a1, dw16, CUDA_R_16F, (int)iw,
                          di16, CUDA_R_16F, (int)iw,
                          &b0, d_out, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
-        const float one = 1.0f;
-        static float *d_ones2 = nullptr; static size_t oc2 = 0;
-        if (oc2 < rows) { if (d_ones2) cudaFree(d_ones2); size_t c2 = (rows+255)&~255;
-            ce(cudaMalloc(&d_ones2, c2*4), e, ec); std::vector<float> h(c2,1.0f);
-            cudaMemcpy(d_ones2,h.data(),c2*4,cudaMemcpyHostToDevice); oc2=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones2,1,d_out,(int)ow);
+        k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     return 0; /* no sync */
 }
@@ -328,8 +1730,7 @@ static int cuda_sgemm(void *opaque, int ta, int tb, size_t m, size_t n, size_t k
     if (cbe(cublasGemmEx(st->cublas,oa,ob,(int)n,(int)m,(int)k,&alpha,
                         db2,CUDA_R_32F,(int)bc,da,CUDA_R_32F,(int)ac,
                         &beta,dc,CUDA_R_32F,(int)n,
-                        CUBLAS_COMPUTE_32F_FAST_16F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),e,ec)) return -1;
+                        cuda_compute_type(st), cuda_gemm_algo(st)),e,ec)) return -1;
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
     if (ldc == n) std::memcpy(c, hc, cp*4);
     else for (size_t r=0;r<m;r++) std::memcpy(c+r*ldc, hc+r*n, n*4);
@@ -347,10 +1748,15 @@ static int cuda_matmul_dev(void *opaque, const float *d_in, float *d_out,
                            const float *weight, const float *bias,
                            char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
     float *dw = nullptr;
-    if (cached_weight(st, weight, iw * ow * sizeof(float), &dw, e, ec)) return -1;
+    if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
     if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -358,15 +1764,11 @@ static int cuda_matmul_dev(void *opaque, const float *d_in, float *d_out,
                          &a1, dw, CUDA_R_32F, (int)iw,
                          d_in, CUDA_R_32F, (int)iw,
                          &b0, d_out, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F_FAST_16F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
-        const float one = 1.0f;
-        static float *d_ones = nullptr; static size_t oc = 0;
-        if (oc < rows) { if (d_ones) cudaFree(d_ones); size_t c2 = (rows+255)&~255;
-            ce(cudaMalloc(&d_ones, c2*4), e, ec); std::vector<float> h(c2,1.0f);
-            cudaMemcpy(d_ones,h.data(),c2*4,cudaMemcpyHostToDevice); oc=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones,1,d_out,(int)ow);
+        k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     return 0; /* no sync */
 }
@@ -381,19 +1783,33 @@ static int cuda_sgemm_dev(void *opaque, int ta, int tb,
                           float *d_c, size_t ldc,
                           char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || d_a == nullptr || d_b == nullptr || d_c == nullptr ||
+        (ta != 0 && ta != 1) || (tb != 0 && tb != 1) ||
+        m == 0u || n == 0u || k == 0u) {
+        set_error(e, ec, "invalid CUDA device sgemm dimensions");
+        return -1;
+    }
     cublasSetStream(st->cublas, st->stream);
     cublasOperation_t oa = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t ob = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
-    /* Packed leading dimensions: caller provides actual data cols. */
-    size_t ac = ta ? m : k;
-    size_t bc = tb ? k : n;
+    /* The row-major API is represented as C^T = B^T A^T in cuBLAS.  The
+     * leading dimensions are therefore the caller's actual row strides, not
+     * the packed shape columns.  Ignoring them silently corrupts padded and
+     * strided batched projections. */
+    const size_t a_cols = ta ? m : k;
+    const size_t b_cols = tb ? k : n;
+    if (lda < a_cols || ldb < b_cols || ldc < n ||
+        m > (size_t)INT_MAX || n > (size_t)INT_MAX || k > (size_t)INT_MAX ||
+        lda > (size_t)INT_MAX || ldb > (size_t)INT_MAX || ldc > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA strided sgemm dimensions");
+        return -1;
+    }
     return cbe(cublasGemmEx(st->cublas, oa, ob,
                            (int)n, (int)m, (int)k, &alpha,
-                           d_b, CUDA_R_32F, (int)bc,
-                           d_a, CUDA_R_32F, (int)ac,
-                           &beta, d_c, CUDA_R_32F, (int)n,
-                           CUBLAS_COMPUTE_32F_FAST_16F,
-                           CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec) ? -1 : 0;
+                           d_b, CUDA_R_32F, (int)ldb,
+                           d_a, CUDA_R_32F, (int)lda,
+                           &beta, d_c, CUDA_R_32F, (int)ldc,
+                           cuda_compute_type(st), cuda_gemm_algo(st)), e, ec) ? -1 : 0;
 }
 
 extern "C" int mynah_cuda_matmul_dev(void *s, const float *di, float *dout,
@@ -422,94 +1838,822 @@ extern "C" int mynah_cuda_upload(void *opaque, const float *host, size_t n,
     size_t bytes = n * sizeof(float);
     if (ensure_scratch(st, bytes, e, ec)) return -1;
     *dev_ptr = st->dev_scratch;
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->h2d_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(*dev_ptr, host, bytes, cudaMemcpyHostToDevice, st->stream), e, ec);
 }
 
 extern "C" int mynah_cuda_download(void *opaque, const float *dev_ptr, float *host,
                          size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->d2h_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(host, dev_ptr, n * sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
 
 extern "C" int mynah_cuda_sync(void *opaque, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    st->sync_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaStreamSynchronize(st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_batch_begin(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    return cbe(cublasSetStream(st->cublas, st->stream), e, ec);
 }
 
 extern "C" int mynah_cuda_snake_dev(void *opaque, float *dev_data, const float *alpha,
                           size_t channels, size_t length, size_t snake_ch,
                           char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    /* Upload alpha to device (small, use host_buf). */
-    if (ensure_host(st, channels * sizeof(float), e, ec)) return -1;
-    std::memcpy(st->host_buf, alpha, channels * sizeof(float));
-    int threads = 256;
-    k_snake<<<(int)channels, threads, 0, st->stream>>>(
-        dev_data, st->dev_buf, (int)channels, (int)length, (int)snake_ch);
+    if (channels == 0 || length == 0 || snake_ch > channels ||
+        channels > (size_t)INT_MAX || length > (size_t)INT_MAX ||
+        snake_ch > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA Snake dimensions");
+        return -1;
+    }
+    float *d_alpha = nullptr;
+    if (snake_ch > 0u &&
+        cached_weight(st, alpha, snake_ch * sizeof(float), &d_alpha, e, ec)) return -1;
+    k_snake<<<(int)channels, 256, 0, st->stream>>>(
+        dev_data, d_alpha, (int)channels, (int)length, (int)snake_ch);
     return ce(cudaGetLastError(), e, ec);
 }
 
 extern "C" int mynah_cuda_gelu_dev(void *opaque, float *data, size_t n,
                          char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    size_t bytes = n * sizeof(float);
-    if (ensure_scratch(st, bytes, e, ec)) return -1;
-    float *d = st->dev_scratch;
-    if (ce(cudaMemcpyAsync(d, data, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    int threads = 256;
-    int blocks = ((int)n + threads - 1) / threads;
-    k_gelu<<<blocks, threads, 0, st->stream>>>(d, (int)n);
+    if (data == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA GELU dimensions");
+        return -1;
+    }
+    k_gelu<<<((int)n + 255) / 256, 256, 0, st->stream>>>(data, (int)n);
     if (ce(cudaGetLastError(), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(data, d, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
-    return ce(cudaStreamSynchronize(st->stream), e, ec);
+    return 0;
 }
 
 extern "C" int mynah_cuda_layer_norm_dev(void *opaque, const float *in, float *out,
                                const float *gain, const float *bias,
                                size_t rows, size_t width,
                                char *e, size_t ec) {
-    (void)bias; /* Magpie layer_norm has no bias */
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    size_t data_bytes = rows * width * sizeof(float);
-    size_t gb = width * sizeof(float);
-    if (ensure_scratch(st, data_bytes * 2, e, ec)) return -1;
-    if (ensure_host(st, gb, e, ec)) return -1;
-    float *d_in = st->dev_scratch;
-    float *d_out = st->dev_scratch + rows * width;
-    std::memcpy(st->host_buf, gain, gb);
-    float *d_gain = st->dev_buf;
-    if (ce(cudaMemcpyAsync(d_in, in, data_bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    /* 1 thread per row, sequential accumulation for CPU bit-parity. */
-    int threads = rows <= 256 ? (int)rows : 256;
-    int blocks = ((int)rows + threads - 1) / threads;
-    k_layer_norm<<<blocks, threads, 0, st->stream>>>(
-        d_out, d_in, d_gain, (int)width, 1e-5f, (int)rows);
+    if (in == nullptr || out == nullptr || gain == nullptr || rows == 0 || width == 0 ||
+        rows > (size_t)INT_MAX || width > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA layer-norm dimensions");
+        return -1;
+    }
+    float *d_gain = nullptr;
+    float *d_bias = nullptr;
+    if (cached_weight(st, gain, width * sizeof(float), &d_gain, e, ec)) return -1;
+    if (bias != nullptr && cached_weight(st, bias, width * sizeof(float), &d_bias, e, ec)) return -1;
+    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
+        out, in, d_gain, d_bias, (int)width, 1e-5f, (int)rows);
     if (ce(cudaGetLastError(), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(out, d_out, data_bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
-    return ce(cudaStreamSynchronize(st->stream), e, ec);
+    return 0;
 }
 
 extern "C" int mynah_cuda_residual_add_dev(void *opaque, float *out, const float *in,
                                  size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    size_t bytes = n * sizeof(float);
-    if (ensure_scratch(st, bytes * 2, e, ec)) return -1;
-    float *d_out = st->dev_scratch;
-    float *d_in = st->dev_scratch + n;
-    if (ce(cudaMemcpyAsync(d_out, out, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(d_in, in, bytes, cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
-    int threads = 256;
-    int blocks = ((int)n + threads - 1) / threads;
-    k_residual_add<<<blocks, threads, 0, st->stream>>>(d_out, d_in, (int)n);
+    if (out == nullptr || in == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA residual dimensions");
+        return -1;
+    }
+    k_residual_add<<<((int)n + 255) / 256, 256, 0, st->stream>>>(out, in, (int)n);
     if (ce(cudaGetLastError(), e, ec)) return -1;
-    if (ce(cudaMemcpyAsync(out, d_out, bytes, cudaMemcpyDeviceToHost, st->stream), e, ec)) return -1;
-    return ce(cudaStreamSynchronize(st->stream), e, ec);
+    return 0;
+}
+
+extern "C" int mynah_cuda_scaled_residual_add_dev(
+    void *opaque, float *out, const float *in, const float *scale,
+    size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || out == nullptr || in == nullptr || scale == nullptr ||
+        n == 0u || n > (size_t)INT_MAX || n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA scaled residual dimensions");
+        return -1;
+    }
+    float *d_scale = nullptr;
+    if (cached_weight(st, scale, n * sizeof(float), &d_scale, e, ec)) return -1;
+    k_scaled_residual_add<<<((int)n + 255) / 256, 256, 0, st->stream>>>(
+        out, in, d_scale, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    return 0;
+}
+
+extern "C" int mynah_cuda_scaled_residual_rows_dev(
+    void *opaque, float *out, const float *in, const float *scale,
+    size_t rows, size_t width, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    if (st == nullptr || out == nullptr || in == nullptr || scale == nullptr ||
+        rows == 0u || width == 0u || rows > (size_t)INT_MAX ||
+        width > (size_t)INT_MAX || !cuda_size_mul(rows, width, &total) ||
+        total > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA row-wise scaled residual dimensions");
+        return -1;
+    }
+    float *d_scale = nullptr;
+    if (cached_weight(st, scale, width * sizeof(float), &d_scale, e, ec)) return -1;
+    k_scaled_residual_rows_add<<<((int)total + 255) / 256, 256, 0, st->stream>>>(
+        out, in, d_scale, (int)rows, (int)width);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    return 0;
+}
+
+extern "C" int mynah_cuda_copy_dev(void *opaque, float *dst, const float *src,
+                                    size_t n, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (dst == nullptr || src == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA copy dimensions");
+        return -1;
+    }
+    k_copy<<<((int)n + 255) / 256, 256, 0, st->stream>>>(dst, src, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_copy_dev_bytes(void *opaque, void *dst,
+                                         const void *src, size_t bytes,
+                                         char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dst == nullptr || src == nullptr) {
+        set_error(e, ec, "invalid CUDA byte copy");
+        return -1;
+    }
+    if (bytes == 0u) return 0;
+    return ce(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
+                              st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_scale_dev(void *opaque, float *data, size_t n,
+                                     float scale, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (data == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA scale dimensions");
+        return -1;
+    }
+    k_scale<<<((int)n + 255) / 256, 256, 0, st->stream>>>(data, scale, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_clip_dev(void *opaque, float *data, size_t n,
+                                    char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (data == nullptr || n == 0 || n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA clip dimensions");
+        return -1;
+    }
+    k_clip<<<((int)n + 255) / 256, 256, 0, st->stream>>>(data, (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_argmax_dev(void *opaque, const float *logits,
+                                      size_t vocab, size_t codebook_size,
+                                      size_t eos_id, int allow_eos,
+                                      unsigned *argmax, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (logits == nullptr || argmax == nullptr || vocab == 0 ||
+        codebook_size > vocab || vocab > (size_t)INT_MAX ||
+        codebook_size > (size_t)INT_MAX || eos_id > (size_t)UINT_MAX) {
+        set_error(e, ec, "invalid CUDA argmax dimensions");
+        return -1;
+    }
+    if (st->dev_argmax == nullptr &&
+        ce(cudaMalloc(&st->dev_argmax, sizeof(unsigned)), e, ec)) return -1;
+    k_argmax<<<1, 1, 0, st->stream>>>(logits, st->dev_argmax,
+                                       (int)vocab, (int)codebook_size,
+                                       (unsigned)eos_id, allow_eos != 0);
+    if (ce(cudaGetLastError(), e, ec) ||
+        ce(cudaMemcpyAsync(argmax, st->dev_argmax, sizeof(unsigned),
+                           cudaMemcpyDeviceToHost, st->stream), e, ec) ||
+        ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    return 0;
+}
+
+extern "C" int mynah_cuda_softmax_dev(void *opaque, float *data,
+                                       size_t rows, size_t cols, size_t valid,
+                                       char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (data == nullptr || rows == 0 || cols == 0 || rows > (size_t)INT_MAX ||
+        cols > (size_t)INT_MAX || valid > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA softmax dimensions");
+        return -1;
+    }
+    const int v = valid > (size_t)INT_MAX ? INT_MAX : (int)valid;
+    k_softmax_causal<<<(int)rows, 256, 0, st->stream>>>(
+        data, (int)cols, v);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+/* Forward declarations for the attention/RoPE entry points below the
+ * model-free self-test. */
+extern "C" int mynah_cuda_self_attention_dev(
+    void *, const float *, float *, float *, size_t, size_t, size_t, size_t,
+    size_t, float, float *, char *, size_t);
+extern "C" int mynah_cuda_self_attention_batch_dev(
+    void *, const float *, float *const *, float *const *, const size_t *,
+    const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+extern "C" int mynah_cuda_gather_kv_batch(
+    void *, float *const *, float *const *, const size_t *, const size_t *,
+    size_t, size_t, size_t, float *, char *, size_t);
+extern "C" int mynah_cuda_rope_dev(void *, float *, size_t, size_t, size_t,
+                                    float, char *, size_t);
+extern "C" int mynah_cuda_rope_batch_dev(
+    void *, float *, const size_t *, size_t, size_t, size_t, float, char *,
+    size_t);
+extern "C" int mynah_cuda_conv1d_dev(void *, const float *, float *, int, int,
+                                      int, int, int, const float *, const float *,
+                                      char *, size_t);
+extern "C" int mynah_cuda_conv_transpose_dev(void *, const float *, float *, int,
+                                              int, int, int, int, int, int,
+                                              const float *, const float *, char *,
+                                              size_t);
+extern "C" int mynah_cuda_conv_transpose_causal_step_dev(
+    void *, const float *, float *, float *, int, int, int, const float *,
+    const float *, char *, size_t);
+extern "C" int mynah_cuda_scatter_row_to_channels_dev(
+    void *, const float *, float *, size_t, size_t, size_t, char *, size_t);
+extern "C" int mynah_cuda_scatter_rows_to_channels_dev(
+    void *, const float *, float *const *, size_t, size_t, size_t, size_t,
+    char *, size_t);
+extern "C" int mynah_cuda_gather_rows_to_batch_dev(
+    void *, float *const *, float *, size_t, size_t, char *, size_t);
+extern "C" int mynah_cuda_zero_dev(void *, float *, size_t, char *, size_t);
+static int cuda_decoder_self_test(void *opaque, char *e, size_t ec);
+extern "C" int mynah_cuda_decoder_open(
+    void *, const mynah_backend_decoder_desc *, size_t,
+    mynah_backend_decoder **, char *, size_t);
+extern "C" void mynah_cuda_decoder_close(void *, mynah_backend_decoder *);
+extern "C" int mynah_cuda_decoder_reset(void *, mynah_backend_decoder *,
+                                          char *, size_t);
+extern "C" int mynah_cuda_decoder_step(void *, mynah_backend_decoder *,
+                                         const float *, size_t, float *, char *,
+                                         size_t);
+extern "C" int mynah_cuda_decoder_step_batch(
+    void *, mynah_backend_decoder *const *, const float *const *, size_t,
+    size_t, float *const *, char *, size_t);
+
+static int cuda_resident_kernel_self_test(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    float *d_in = nullptr;
+    float *d_out = nullptr;
+    float *d_k0 = nullptr;
+    float *d_v0 = nullptr;
+    float *d_k1 = nullptr;
+    float *d_v1 = nullptr;
+    const float norm_in[8] = {1.0f, 2.0f, 3.0f, 4.0f,
+                              -1.0f, 0.0f, 1.0f, 2.0f};
+    const float gain[4] = {1.0f, 2.0f, 1.0f, 0.5f};
+    const float bias[4] = {0.1f, -0.2f, 0.3f, -0.4f};
+    float norm_out[8] = {0.0f};
+    const float scaled_rows_in[8] = {1.0f, -2.0f, 3.0f, -4.0f,
+                                     5.0f, -6.0f, 7.0f, -8.0f};
+    const float scaled_rows_scale[4] = {0.5f, -1.0f, 2.0f, 0.25f};
+    float scaled_rows_out[8] = {0.0f};
+    const float softmax_in[8] = {1.0f, 2.0f, 3.0f, 4.0f,
+                                 0.0f, -1.0f, 2.0f, 9.0f};
+    float softmax_out[8] = {0.0f};
+    float qkv[24] = {0.0f};
+    float attention_out[8] = {0.0f};
+    float gathered_kv[16] = {0.0f};
+    const float conv_input[3] = {1.0f, 2.0f, 3.0f};
+    const float conv_weight[2] = {2.0f, -1.0f};
+    const float conv_bias[1] = {0.5f};
+    const float conv_expected[3] = {-0.5f, 0.5f, 1.5f};
+    float conv_output[4] = {0.0f};
+    const float convt_input[2] = {1.0f, 2.0f};
+    const float convt_weight[2] = {2.0f, 3.0f};
+    const float convt_expected[4] = {2.5f, 3.5f, 4.5f, 6.5f};
+    float convt_output[4] = {0.0f};
+    const float causal_step_weight[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float causal_step_input[1] = {2.0f};
+    const float causal_step_input_next[1] = {3.0f};
+    const float causal_step_expected[2] = {2.5f, 4.5f};
+    const float causal_step_expected_next[2] = {9.5f, 14.5f};
+    float causal_step_output[2] = {0.0f};
+    float causal_step_partial[2] = {0.0f};
+    /* Also cover tail < stride.  The production Mimi shape is kernel ==
+     * 2*stride, but the backend primitive is intentionally generic and used
+     * to index a negative partial slot for this valid causal shape. */
+    const float causal_short_weight[3] = {1.0f, 2.0f, 3.0f};
+    const float causal_short_expected[2] = {2.5f, 4.5f};
+    const float causal_short_expected_next[2] = {9.5f, 6.5f};
+    float causal_short_output[2] = {0.0f};
+    float causal_short_partial[1] = {0.0f};
+    /* Cover tail > stride as well.  This shape makes the carried prefix
+     * overlap the newly produced tail, which is exactly where an in-place
+     * parallel update can otherwise observe the wrong generation of state. */
+    const float causal_long_weight[5] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+    const float causal_long_expected[2] = {2.5f, 4.5f};
+    const float causal_long_expected_next[2] = {9.5f, 14.5f};
+    float causal_long_output[2] = {0.0f};
+    float causal_long_partial[3] = {0.0f};
+    const float scatter_rows[8] = {1.0f, 2.0f, 3.0f, 4.0f,
+                                   5.0f, 6.0f, 7.0f, 8.0f};
+    float scatter_output[16] = {0.0f};
+    float *scatter_dest[2] = {nullptr, nullptr};
+    const float gather_input_a[4] = {9.0f, 8.0f, 7.0f, 6.0f};
+    const float gather_input_b[4] = {5.0f, 4.0f, 3.0f, 2.0f};
+    float gather_output[8] = {0.0f};
+    float *gather_inputs[2] = {nullptr, nullptr};
+    float *kcache[2] = {nullptr, nullptr};
+    float *vcache[2] = {nullptr, nullptr};
+    size_t positions[2] = {0u, 0u};
+    size_t strides[2] = {4u, 4u};
+    size_t rope_positions[2] = {7u, 9u};
+    const float one_qkv[12] = {1.0f, 0.0f, 0.0f, 1.0f,
+                               1.0f, 0.0f, 0.0f, 1.0f,
+                               1.0f, 2.0f, 3.0f, 4.0f};
+    const float batch_qkv[24] = {
+        1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f,
+        1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    const float rope_slope = (float)(-std::log(10000.0) * 2.0 / 4.0);
+
+    if (ce(cudaMalloc(&d_in, 24u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_out, 24u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_k0, 4u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_v0, 4u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_k1, 4u * sizeof(float)), e, ec) ||
+        ce(cudaMalloc(&d_v1, 4u * sizeof(float)), e, ec)) goto fail;
+
+    if (ce(cudaMemcpy(d_in, norm_in, sizeof(norm_in), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_layer_norm_dev(st, d_in, d_out, gain, bias, 2u, 4u, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(norm_out, d_out, sizeof(norm_out), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t r = 0; r < 2u; ++r) {
+        float mean = 0.0f;
+        for (size_t d = 0; d < 4u; ++d) mean += norm_in[r * 4u + d];
+        mean /= 4.0f;
+        float variance = 0.0f;
+        for (size_t d = 0; d < 4u; ++d) {
+            const float delta = norm_in[r * 4u + d] - mean;
+            variance += delta * delta;
+        }
+        const float inv = 1.0f / sqrtf(variance / 4.0f + 1.0e-5f);
+        for (size_t d = 0; d < 4u; ++d) {
+            const float expected = (norm_in[r * 4u + d] - mean) * inv * gain[d] + bias[d];
+            if (fabsf(norm_out[r * 4u + d] - expected) > 2.0e-3f) {
+                std::snprintf(e, ec, "CUDA layer-norm self-test mismatch at %zu", r * 4u + d);
+                goto fail;
+            }
+        }
+    }
+
+    if (ce(cudaMemcpy(d_in, scaled_rows_in, sizeof(scaled_rows_in),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemcpy(d_out, scaled_rows_in, sizeof(scaled_rows_in),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_scaled_residual_rows_dev(st, d_out, d_in,
+                                             scaled_rows_scale, 2u, 4u,
+                                             e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(scaled_rows_out, d_out, sizeof(scaled_rows_out),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 8u; ++i) {
+        const float expected = scaled_rows_in[i] +
+                               scaled_rows_scale[i % 4u] * scaled_rows_in[i];
+        if (fabsf(scaled_rows_out[i] - expected) > 2.0e-4f) {
+            std::snprintf(e, ec,
+                          "CUDA row-wise LayerScale self-test mismatch at %zu", i);
+            goto fail;
+        }
+    }
+
+    if (ce(cudaMemcpy(d_in, softmax_in, sizeof(softmax_in), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_softmax_dev(st, d_in, 2u, 4u, 3u, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(softmax_out, d_in, sizeof(softmax_out), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t r = 0; r < 2u; ++r) {
+        float sum = 0.0f;
+        for (size_t d = 0; d < 3u; ++d) sum += softmax_out[r * 4u + d];
+        if (fabsf(sum - 1.0f) > 2.0e-4f || softmax_out[r * 4u + 3u] != 0.0f) {
+            std::snprintf(e, ec, "CUDA softmax self-test mismatch at row %zu", r);
+            goto fail;
+        }
+    }
+
+    if (ce(cudaMemcpy(d_in, conv_input, sizeof(conv_input), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv1d_dev(st, d_in, d_out, 1, 1, 3, 2, 1, conv_weight,
+                              conv_bias, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(conv_output, d_out, sizeof(conv_output), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 3u; ++i) {
+        if (fabsf(conv_output[i] - conv_expected[i]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA causal-conv self-test mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (ce(cudaMemcpy(d_in, convt_input, sizeof(convt_input), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_dev(st, d_in, d_out, 1, 1, 2, 4, 2, 2, 1,
+                                      convt_weight, conv_bias, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(convt_output, d_out, sizeof(convt_output), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 4u; ++i) {
+        if (fabsf(convt_output[i] - convt_expected[i]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA transpose-conv self-test mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_zero_dev(st, d_k0, 2u, e, ec) != 0 ||
+        ce(cudaMemcpy(d_in, causal_step_input, sizeof(causal_step_input),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k0, 1, 4, 2, causal_step_weight, conv_bias, e,
+            ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_step_output, d_out, sizeof(causal_step_output),
+                      cudaMemcpyDeviceToHost), e, ec) ||
+        ce(cudaMemcpy(causal_step_partial, d_k0, sizeof(causal_step_partial),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_step_output[i] - causal_step_expected[i]) > 2.0e-4f ||
+            fabsf(causal_step_partial[i] - (i == 0u ? 6.0f : 8.0f)) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA causal transpose first-step mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (ce(cudaMemcpy(d_in, causal_step_input_next, sizeof(causal_step_input_next),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k0, 1, 4, 2, causal_step_weight, conv_bias, e,
+            ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_step_output, d_out, sizeof(causal_step_output),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_step_output[i] - causal_step_expected_next[i]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA causal transpose second-step mismatch at %zu", i);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_zero_dev(st, d_k1, 1u, e, ec) != 0 ||
+        ce(cudaMemcpy(d_in, causal_step_input, sizeof(causal_step_input),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 3, 2, causal_short_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_short_output, d_out,
+                      sizeof(causal_short_output), cudaMemcpyDeviceToHost),
+           e, ec) ||
+        ce(cudaMemcpy(causal_short_partial, d_k1,
+                      sizeof(causal_short_partial), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_short_output[i] - causal_short_expected[i]) > 2.0e-4f ||
+            (i == 0u && fabsf(causal_short_partial[0] - 6.0f) > 2.0e-4f)) {
+            std::snprintf(e, ec,
+                          "CUDA short-tail causal transpose first-step mismatch at %zu",
+                          i);
+            goto fail;
+        }
+    }
+    if (ce(cudaMemcpy(d_in, causal_step_input_next, sizeof(causal_step_input_next),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 3, 2, causal_short_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_short_output, d_out,
+                      sizeof(causal_short_output), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_short_output[i] - causal_short_expected_next[i]) >
+            2.0e-4f) {
+            std::snprintf(e, ec,
+                          "CUDA short-tail causal transpose second-step mismatch at %zu",
+                          i);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_zero_dev(st, d_k1, 3u, e, ec) != 0 ||
+        ce(cudaMemcpy(d_in, causal_step_input, sizeof(causal_step_input),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 5, 2, causal_long_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_long_output, d_out,
+                      sizeof(causal_long_output), cudaMemcpyDeviceToHost),
+           e, ec) ||
+        ce(cudaMemcpy(causal_long_partial, d_k1,
+                      sizeof(causal_long_partial), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t i = 0; i < 2u; ++i) {
+        if (fabsf(causal_long_output[i] - causal_long_expected[i]) >
+                2.0e-4f ||
+            fabsf(causal_long_partial[i] -
+                  (i == 0u ? 6.0f : i == 1u ? 8.0f : 10.0f)) > 2.0e-4f) {
+            std::snprintf(e, ec,
+                          "CUDA long-tail causal transpose first-step mismatch at %zu",
+                          i);
+            goto fail;
+        }
+    }
+    if (fabsf(causal_long_partial[2] - 10.0f) > 2.0e-4f) {
+        std::snprintf(e, ec,
+                      "CUDA long-tail causal transpose first tail mismatch");
+        goto fail;
+    }
+    if (ce(cudaMemcpy(d_in, causal_step_input_next, sizeof(causal_step_input_next),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_conv_transpose_causal_step_dev(
+            st, d_in, d_out, d_k1, 1, 5, 2, causal_long_weight, conv_bias,
+            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(causal_long_output, d_out,
+                      sizeof(causal_long_output), cudaMemcpyDeviceToHost),
+           e, ec) ||
+        ce(cudaMemcpy(causal_long_partial, d_k1,
+                      sizeof(causal_long_partial), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    if (fabsf(causal_long_output[0] - causal_long_expected_next[0]) >
+            2.0e-4f ||
+        fabsf(causal_long_output[1] - causal_long_expected_next[1]) >
+            2.0e-4f ||
+        fabsf(causal_long_partial[0] - 19.0f) > 2.0e-4f ||
+        fabsf(causal_long_partial[1] - 12.0f) > 2.0e-4f ||
+        fabsf(causal_long_partial[2] - 15.0f) > 2.0e-4f) {
+        std::snprintf(e, ec,
+                      "CUDA long-tail causal transpose second-step mismatch");
+        goto fail;
+    }
+    if (ce(cudaMemcpy(d_in, scatter_rows, sizeof(scatter_rows),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemset(d_out, 0, 16u * sizeof(float)), e, ec) ||
+        mynah_cuda_scatter_row_to_channels_dev(st, d_in, d_out, 4u, 2u, 1u,
+                                               e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(scatter_output, d_out, 8u * sizeof(float),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t c = 0; c < 4u; ++c) {
+        if (scatter_output[c * 2u] != 0.0f ||
+            fabsf(scatter_output[c * 2u + 1u] - scatter_rows[c]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA row scatter self-test mismatch at %zu", c);
+            goto fail;
+        }
+    }
+    scatter_dest[0] = d_out;
+    scatter_dest[1] = d_out + 8u;
+    if (ce(cudaMemset(d_out, 0, 16u * sizeof(float)), e, ec) ||
+        mynah_cuda_scatter_rows_to_channels_dev(st, d_in, scatter_dest, 2u,
+                                                4u, 2u, 1u, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(scatter_output, d_out, 16u * sizeof(float),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t request = 0; request < 2u; ++request) {
+        for (size_t c = 0; c < 4u; ++c) {
+            const size_t at = request * 8u + c * 2u;
+            if (scatter_output[at] != 0.0f ||
+                fabsf(scatter_output[at + 1u] -
+                      scatter_rows[request * 4u + c]) > 2.0e-4f) {
+                std::snprintf(e, ec,
+                              "CUDA batched row scatter self-test mismatch at %zu",
+                              request * 4u + c);
+                goto fail;
+            }
+        }
+    }
+    gather_inputs[0] = d_k0;
+    gather_inputs[1] = d_k1;
+    if (ce(cudaMemcpy(d_k0, gather_input_a, sizeof(gather_input_a),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemcpy(d_k1, gather_input_b, sizeof(gather_input_b),
+                      cudaMemcpyHostToDevice), e, ec) ||
+        ce(cudaMemset(d_out, 0, sizeof(gather_output)), e, ec) ||
+        mynah_cuda_gather_rows_to_batch_dev(st, gather_inputs, d_out, 2u, 4u,
+                                            e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(gather_output, d_out, sizeof(gather_output),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t i = 0; i < 4u; ++i) {
+        if (gather_output[i] != gather_input_a[i] ||
+            gather_output[4u + i] != gather_input_b[i]) {
+            std::snprintf(e, ec, "CUDA row gather self-test mismatch at %zu", i);
+            goto fail;
+        }
+    }
+
+    /* RoPE at a non-zero position preserves each complex pair's norm. */
+    for (size_t i = 0; i < 24u; ++i) qkv[i] = (float)(i + 1u) * 0.125f;
+    if (ce(cudaMemcpy(d_in, qkv, 12u * sizeof(float), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_rope_dev(st, d_in, 7u, 1u, 4u, 10000.0f, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(qkv, d_in, 12u * sizeof(float), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t base = 0; base < 4u; base += 2u) {
+        const size_t pair = base / 2u;
+        const float q0 = (float)(base + 1u) * 0.125f;
+        const float q1 = (float)(base + 2u) * 0.125f;
+        const float k0 = (float)(4u + base + 1u) * 0.125f;
+        const float k1 = (float)(4u + base + 2u) * 0.125f;
+        const float frequency = expf((float)pair * rope_slope);
+        const float angle = 7.0f * frequency;
+        const float sine = sinf(angle);
+        const float cosine = cosf(angle);
+        const float expected0 = q0 * cosine - q1 * sine;
+        const float expected1 = q0 * sine + q1 * cosine;
+        const float expected_k0 = k0 * cosine - k1 * sine;
+        const float expected_k1 = k0 * sine + k1 * cosine;
+        const float before = q0 * q0 + q1 * q1;
+        const float before_k = k0 * k0 + k1 * k1;
+        const float after = qkv[base] * qkv[base] + qkv[base + 1u] * qkv[base + 1u];
+        const float after_k = qkv[4u + base] * qkv[4u + base] +
+                              qkv[4u + base + 1u] * qkv[4u + base + 1u];
+        if (fabsf(qkv[base] - expected0) > 3.0e-3f ||
+            fabsf(qkv[base + 1u] - expected1) > 3.0e-3f ||
+            fabsf(qkv[4u + base] - expected_k0) > 3.0e-3f ||
+            fabsf(qkv[4u + base + 1u] - expected_k1) > 3.0e-3f ||
+            fabsf(before - after) > 2.0e-3f ||
+            fabsf(before_k - after_k) > 2.0e-3f) {
+            std::snprintf(e, ec, "CUDA RoPE self-test mismatch at pair %zu", base / 2u);
+            goto fail;
+        }
+    }
+
+    for (size_t i = 0; i < 24u; ++i) qkv[i] = (float)(i + 1u) * 0.125f;
+    if (ce(cudaMemcpy(d_in, qkv, 24u * sizeof(float), cudaMemcpyHostToDevice),
+           e, ec) ||
+        mynah_cuda_rope_batch_dev(st, d_in, rope_positions, 2u, 1u, 4u,
+                                  10000.0f, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(qkv, d_in, 24u * sizeof(float), cudaMemcpyDeviceToHost),
+           e, ec)) goto fail;
+    for (size_t request = 0; request < 2u; ++request) {
+        const size_t row = request * 12u;
+        for (size_t base = 0; base < 8u; base += 2u) {
+            const float q0 = (float)(row + base + 1u) * 0.125f;
+            const float q1 = (float)(row + base + 2u) * 0.125f;
+            const float before_q = q0 * q0 + q1 * q1;
+            const float after_q = qkv[row + base] * qkv[row + base] +
+                                  qkv[row + base + 1u] * qkv[row + base + 1u];
+            const float k0 = (float)(row + base + 5u) * 0.125f;
+            const float k1 = (float)(row + base + 6u) * 0.125f;
+            const float before_k = k0 * k0 + k1 * k1;
+            const float after_k = qkv[row + 4u + base] * qkv[row + 4u + base] +
+                                  qkv[row + 4u + base + 1u] *
+                                  qkv[row + 4u + base + 1u];
+            if (fabsf(before_q - after_q) > 2.0e-3f ||
+                fabsf(before_k - after_k) > 2.0e-3f) {
+                std::snprintf(e, ec,
+                              "CUDA batched RoPE self-test mismatch at request %zu",
+                              request);
+                goto fail;
+            }
+        }
+    }
+
+    /* Single and independent-request batched attention both reduce to the
+     * only valid value at position zero. */
+    if (ce(cudaMemcpy(d_in, one_qkv, sizeof(one_qkv), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_self_attention_dev(st, d_in, d_k0, d_v0, 0u, 4u, 1u, 1u, 4u,
+                                       0.5f, d_out, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(attention_out, d_out, 4u * sizeof(float), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t d = 0; d < 4u; ++d) {
+        if (fabsf(attention_out[d] - one_qkv[8u + d]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA attention self-test mismatch at %zu", d);
+            goto fail;
+        }
+    }
+    kcache[0] = d_k0; kcache[1] = d_k1;
+    vcache[0] = d_v0; vcache[1] = d_v1;
+    if (ce(cudaMemcpy(d_in, batch_qkv, sizeof(batch_qkv), cudaMemcpyHostToDevice), e, ec) ||
+        mynah_cuda_self_attention_batch_dev(st, d_in, kcache, vcache, positions,
+                                             strides, 2u, 1u, 4u, 0.5f, d_out,
+                                             e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(attention_out, d_out, 8u * sizeof(float), cudaMemcpyDeviceToHost), e, ec))
+        goto fail;
+    for (size_t d = 0; d < 4u; ++d) {
+        if (fabsf(attention_out[d] - batch_qkv[8u + d]) > 2.0e-4f ||
+            fabsf(attention_out[4u + d] - batch_qkv[20u + d]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA batched attention self-test mismatch at %zu", d);
+            goto fail;
+        }
+    }
+    if (mynah_cuda_gather_kv_batch(st, kcache, vcache, positions, strides,
+                                   2u, 1u, 4u, d_out, e, ec) != 0 ||
+        mynah_cuda_sync(st, e, ec) != 0 ||
+        ce(cudaMemcpy(gathered_kv, d_out, sizeof(gathered_kv),
+                      cudaMemcpyDeviceToHost), e, ec)) goto fail;
+    for (size_t d = 0; d < 4u; ++d) {
+        if (fabsf(gathered_kv[d] - batch_qkv[4u + d]) > 2.0e-4f ||
+            fabsf(gathered_kv[4u + d] - batch_qkv[8u + d]) > 2.0e-4f ||
+            fabsf(gathered_kv[8u + d] - batch_qkv[16u + d]) > 2.0e-4f ||
+            fabsf(gathered_kv[12u + d] - batch_qkv[20u + d]) > 2.0e-4f) {
+            std::snprintf(e, ec, "CUDA K/V gather self-test mismatch at %zu", d);
+            goto fail;
+        }
+    }
+    if (cuda_decoder_self_test(st, e, ec) != 0) goto fail;
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_k0); cudaFree(d_v0);
+    cudaFree(d_k1); cudaFree(d_v1);
+    return 0;
+
+fail:
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_k0); cudaFree(d_v0);
+    cudaFree(d_k1); cudaFree(d_v1);
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Self-test                                                          */
 /* ------------------------------------------------------------------ */
+
+/* Defined with the resident matmul entry points below. */
+extern "C" int mynah_cuda_matmul_q8_d2d(void *, const float *, float *, size_t,
+                                         size_t, size_t, const float *,
+                                         const float *, char *, size_t);
+
+static int cuda_q8_self_test(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) return -1;
+    /* The INT8 tensor-core GEMM requires aligned m/n/k dimensions on the
+     * supported CUDA path.  Keep this model-free probe on a 4x4x4 shape;
+     * production Pocket projections are all much larger and aligned. */
+    const float input[16] = {1.0f, 2.0f, 3.0f, -1.0f,
+                             -1.0f, 0.5f, 2.0f, 4.0f,
+                             3.0f, -2.0f, 1.0f, 0.25f,
+                             0.5f, 1.5f, -3.0f, 2.0f};
+    const float weight[16] = {1.0f, 0.0f, 0.0f, 0.0f,
+                              0.0f, 1.0f, 0.0f, 0.0f,
+                              0.0f, 0.0f, 1.0f, 0.0f,
+                              0.0f, 0.0f, 0.0f, 1.0f};
+    const float bias[4] = {0.5f, -0.5f, 1.0f, 2.0f};
+    std::vector<int8_t> qweight;
+    std::vector<float> wscale;
+    if (cuda_pack_weight_q8(weight, 4u, 4u, &qweight, &wscale, e, ec) != 0)
+        return -1;
+    int8_t qinput[16] = {0};
+    float xscale[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (size_t row = 0; row < 4u; ++row) {
+        float amax = 0.0f;
+        for (size_t col = 0; col < 4u; ++col)
+            amax = std::fmax(amax, std::fabs(input[row * 4u + col]));
+        xscale[row] = amax == 0.0f ? 0.0f : amax / 127.0f;
+        const float inv = xscale[row] == 0.0f ? 0.0f : 127.0f / xscale[row];
+        for (size_t col = 0; col < 4u; ++col)
+            qinput[row * 4u + col] = (int8_t)cuda_q8_round(
+                input[row * 4u + col] * inv);
+    }
+    float *d_input = nullptr;
+    float *d_output = nullptr;
+    if (ce(cudaMalloc((void **)&d_input, sizeof(input)), e, ec) != 0 ||
+        ce(cudaMalloc((void **)&d_output, 16u * sizeof(float)), e, ec) != 0) {
+        if (d_input != nullptr) cudaFree(d_input);
+        if (d_output != nullptr) cudaFree(d_output);
+        return -1;
+    }
+    int result = 0;
+    do {
+        if (ce(cudaMemcpy(d_input, input, sizeof(input), cudaMemcpyHostToDevice),
+               e, ec) != 0 ||
+            mynah_cuda_matmul_q8_d2d(st, d_input, d_output, 4u, 4u, 4u,
+                                     weight, bias, e, ec) != 0 ||
+            ce(cudaStreamSynchronize(st->stream), e, ec) != 0) {
+            result = -1;
+            break;
+        }
+        float output[16] = {0.0f};
+        if (ce(cudaMemcpy(output, d_output, sizeof(output),
+                          cudaMemcpyDeviceToHost), e, ec) != 0) {
+            result = -1;
+            break;
+        }
+        for (size_t row = 0; row < 4u && result == 0; ++row) {
+            for (size_t col = 0; col < 4u; ++col) {
+                int32_t dot = 0;
+                for (size_t k = 0; k < 4u; ++k)
+                    dot += (int32_t)qinput[row * 4u + k] *
+                           (int32_t)qweight[col * 4u + k];
+                const float row_scale = xscale[row] * wscale[col];
+                const float expected = std::fmaf((float)dot, row_scale,
+                                                 bias[col]);
+                if (std::fabs(output[row * 4u + col] - expected) > 2.0e-5f) {
+                    std::snprintf(e, ec, "Q8 matmul mismatch %zu: %f != %f",
+                                  row * 4u + col, output[row * 4u + col],
+                                  expected);
+                    result = -1;
+                    break;
+                }
+            }
+        }
+    } while (false);
+    cudaFree(d_input);
+    cudaFree(d_output);
+    return result;
+}
+
+static int cuda_codec_gang_self_test(cuda_backend_state *st, char *e,
+                                     size_t ec);
 
 static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float in[6]={1,2,3,-1,0.5f,2};
@@ -525,39 +2669,203 @@ static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float en[8]={1,2,3,6,-1,0.5f,2,1.5f};
     for (int i=0;i<8;i++) if (std::fabs(so[i]-en[i])>1e-4f) {
         std::snprintf(e,ec,"sgemm mismatch %d: %f!=%f",i,so[i],en[i]); return -1; }
-    return 0;
+    if (cuda_resident_kernel_self_test(opaque, e, ec) != 0) return -1;
+    if (cuda_codec_gang_self_test(static_cast<cuda_backend_state *>(opaque),
+                                  e, ec) != 0)
+        return -1;
+    return cuda_q8_self_test(opaque, e, ec);
 }
 
 static void cuda_close(void *opaque) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (!st) return;
+    /* Decoder graph entries own device pointer tables used by the stream.  A
+     * model close normally arrives after request teardown, but make the
+     * backend lifetime ordering explicit for direct library users too. */
+    (void)cudaStreamSynchronize(st->stream);
+    destroy_decoder_batch_graphs(st);
+    destroy_graphs(st);
+    tile_release(st);
+    cudaFree(st->dec_cols);
+    cudaFree(st->dec_out);
+    cudaFree(st->dec_tr_x);
+    cudaFree(st->dec_tr_y);
+    codec_gang_release(st);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
+    for (auto &c : st->weights_int8) {
+        cudaFree(c.device_q);
+        cudaFree(c.device_scale);
+    }
+    for (auto &c : st->weights_bf16) cudaFree(c.device_ptr);
+    if (st->dev_bf16_activation) cudaFree(st->dev_bf16_activation);
     if (st->dev_scratch) cudaFree(st->dev_scratch);
+    if (st->dev_bf16_convert) cudaFree(st->dev_bf16_convert);
+    if (st->dev_q8_activation) cudaFree(st->dev_q8_activation);
+    if (st->dev_q8_activation_scale) cudaFree(st->dev_q8_activation_scale);
+    if (st->dev_q8_accum) cudaFree(st->dev_q8_accum);
     if (st->host_buf) cudaFreeHost(st->host_buf);
+    if (st->dev_argmax) cudaFree(st->dev_argmax);
+    if (st->cublas_workspace) cudaFree(st->cublas_workspace);
+    if (st->dev_batch_k_cache) cudaFree(st->dev_batch_k_cache);
+    if (st->dev_batch_v_cache) cudaFree(st->dev_batch_v_cache);
+    if (st->dev_batch_positions) cudaFree(st->dev_batch_positions);
+    if (st->dev_batch_cache_strides) cudaFree(st->dev_batch_cache_strides);
+    if (st->dev_decoder_ptr0) cudaFree(st->dev_decoder_ptr0);
+    if (st->dev_decoder_ptr1) cudaFree(st->dev_decoder_ptr1);
+    if (st->dev_decoder_ptr2) cudaFree(st->dev_decoder_ptr2);
+    if (st->dev_decoder_ptr3) cudaFree(st->dev_decoder_ptr3);
     cublasDestroy(st->cublas);
     cudaStreamDestroy(st->stream);
     delete st;
 }
+
+static void cuda_nvtx_push(const char *name) { nvtxRangePushA(name); }
+static void cuda_nvtx_pop(void) { nvtxRangePop(); }
 
 extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn *matmul,
                                        mynah_backend_sgemm_fn *sgemm,
                                        mynah_backend_close_fn *close,
                                        mynah_backend_self_test_fn *self_test,
                                        char *e, size_t ec) {
+    /* Mapped host staging is part of the FP32 bring-up path.  Device flags
+     * must be set before any runtime call that can initialise the primary
+     * context; otherwise cudaHostGetDevicePointer may be unavailable. */
+    unsigned int sched = cudaDeviceScheduleAuto;
+    {
+        /* MYNAH_CUDA_SYNC picks how the host waits on the device: the
+         * default lets the driver spin, which burns a whole core per
+         * waiting thread; "blocking" sleeps on an OS primitive instead. */
+        const char *s = getenv("MYNAH_CUDA_SYNC");
+        if (s != nullptr && strcmp(s, "blocking") == 0) sched = cudaDeviceScheduleBlockingSync;
+        else if (s != nullptr && strcmp(s, "yield") == 0) sched = cudaDeviceScheduleYield;
+        else if (s != nullptr && strcmp(s, "spin") == 0) sched = cudaDeviceScheduleSpin;
+    }
+    if (ce(cudaSetDeviceFlags(cudaDeviceMapHost | sched), e, ec)) return -1;
     int dc = 0;
     if (ce(cudaGetDeviceCount(&dc), e, ec) || dc == 0) {
         if (dc == 0) set_error(e, ec, "no CUDA device"); return -1; }
-    ce(cudaSetDevice(0), e, ec);
-    cudaSetDeviceFlags(cudaDeviceMapHost);
+    if (ce(cudaSetDevice(0), e, ec)) return -1;
     auto *st = new (std::nothrow) cuda_backend_state();
     if (!st) { set_error(e,ec,"oom"); return -1; }
+    {
+        /* MYNAH_NVTX=1 with MYNAH_COST_MAP=2 puts every engine region on the
+         * Nsight Systems timeline next to the kernels it launched. */
+        const char *nvtx = getenv("MYNAH_NVTX");
+        if (nvtx != nullptr && strcmp(nvtx, "0") != 0)
+            mynah_costmap_set_range_hooks(cuda_nvtx_push, cuda_nvtx_pop);
+    }
     st->dev_scratch = nullptr; st->dev_scratch_cap = 0;
+    st->dev_bf16_convert = nullptr; st->dev_bf16_convert_cap = 0u;
+    st->dev_q8_activation = nullptr;
+    st->dev_q8_activation_scale = nullptr;
+    st->dev_q8_accum = nullptr;
+    st->dev_q8_activation_cap = 0u;
+    st->dev_q8_rows_cap = 0u;
+    st->dev_q8_accum_cap = 0u;
+    st->dev_bf16_activation = nullptr;
+    st->dev_bf16_activation_cap = 0u;
     st->host_buf = nullptr; st->dev_buf = nullptr; st->host_buf_cap = 0;
+    st->dev_argmax = nullptr;
+    st->cublas_workspace = nullptr; st->cublas_workspace_cap = 0;
+    st->dev_batch_k_cache = nullptr;
+    st->dev_batch_v_cache = nullptr;
+    st->dev_batch_positions = nullptr;
+    st->dev_batch_cache_strides = nullptr;
+    st->dev_decoder_ptr0 = nullptr;
+    st->dev_decoder_ptr1 = nullptr;
+    st->dev_decoder_ptr2 = nullptr;
+    st->dev_decoder_ptr3 = nullptr;
+    st->active_decoder_batch_graph = nullptr;
+    st->active_decoder_upload_slot = 0u;
+    for (size_t i = 0; i < 4u; ++i) st->active_decoder_tables[i] = nullptr;
+    st->h2d_bytes.store(0ull, std::memory_order_relaxed);
+    st->d2h_bytes.store(0ull, std::memory_order_relaxed);
+    st->h2d_calls.store(0ull, std::memory_order_relaxed);
+    st->d2h_calls.store(0ull, std::memory_order_relaxed);
+    st->sync_calls.store(0ull, std::memory_order_relaxed);
+    st->graph_captures.store(0ull, std::memory_order_relaxed);
+    st->graph_replays.store(0ull, std::memory_order_relaxed);
+    st->graph_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->backbone_batch_calls.store(0ull, std::memory_order_relaxed);
+    st->backbone_batch_items.store(0ull, std::memory_order_relaxed);
+    st->backbone_batch_max_width.store(0ull, std::memory_order_relaxed);
+    st->codec_transformer_batch_calls.store(0ull, std::memory_order_relaxed);
+    st->codec_transformer_batch_items.store(0ull, std::memory_order_relaxed);
+    st->codec_transformer_batch_max_width.store(0ull, std::memory_order_relaxed);
+    st->codec_upsample_steps.store(0ull, std::memory_order_relaxed);
+    st->codec_upsample_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->decoder_steps.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_calls.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_items.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_max_width.store(0ull, std::memory_order_relaxed);
+    st->decoder_batch_frames.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_captures.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_replays.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->decoder_failures.store(0ull, std::memory_order_relaxed);
+    st->resident_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->matmul_calls.store(0ull, std::memory_order_relaxed);
+    st->matvec_calls.store(0ull, std::memory_order_relaxed);
+    st->q8_matmul_calls.store(0ull, std::memory_order_relaxed);
+    st->tile_calls.store(0ull, std::memory_order_relaxed);
+    for (auto &stage : st->width_hist)
+        for (auto &bucket : stage) bucket.store(0ull, std::memory_order_relaxed);
+    st->tile_rows.store(0ull, std::memory_order_relaxed);
+    for (int stage = 0; stage < 2; ++stage) {
+        st->codec_gang_calls[stage].store(0ull, std::memory_order_relaxed);
+        st->codec_gang_rows[stage].store(0ull, std::memory_order_relaxed);
+        for (auto &bucket : st->codec_gang_hist[stage])
+            bucket.store(0ull, std::memory_order_relaxed);
+    }
+    st->q8_rows.store(0ull, std::memory_order_relaxed);
+    st->q8_weight_uploads.store(0ull, std::memory_order_relaxed);
+    st->q8_weight_bytes.store(0ull, std::memory_order_relaxed);
+    st->q8_activation_bytes.store(0ull, std::memory_order_relaxed);
+    st->bf16_matmul_calls.store(0ull, std::memory_order_relaxed);
+    st->bf16_rows.store(0ull, std::memory_order_relaxed);
+    st->bf16_weight_bytes.store(0ull, std::memory_order_relaxed);
+    st->batch_meta_cap = CUDA_BATCH_META_CAP;
+    st->fast_math = cuda_fast_math_enabled();
+    st->graphs_enabled = cuda_graphs_enabled();
+    st->q8_enabled = true;
+    st->decoder_batch_enabled = cuda_decoder_batch_enabled();
     if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
     if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
         set_error(e,ec,"cuBLAS init"); cudaStreamDestroy(st->stream); delete st; return -1; }
-    cublasSetMathMode(st->cublas, CUBLAS_DEFAULT_MATH);
+    if (ce(cudaMalloc(&st->dev_batch_k_cache,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_k_cache)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_v_cache,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_v_cache)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_positions,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_positions)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_cache_strides,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_cache_strides)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr0,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr0)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr1,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr1)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr2,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr2)), e, ec) ||
+        ce(cudaMalloc(&st->dev_decoder_ptr3,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr3)), e, ec)) {
+        cuda_close(st);
+        return -1;
+    }
+    /* The parity path must not silently use TF32 on Ampere/Ada.  Fast math is
+     * an explicit opt-in experiment; its Tensor-Core error budget is a later
+     * stage gate, not the default CUDA result. */
+    st->tf32 = !st->fast_math && cuda_env_enabled("MYNAH_CUDA_TF32", true);
+    st->tile_cublas = cuda_env_enabled("MYNAH_CUDA_TILE_CUBLAS", true);
+    st->quant_weights = cuda_quant_weights_requested();
+    const cublasMath_t math_mode = st->fast_math
+        ? CUBLAS_DEFAULT_MATH
+        : (st->tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH);
+    if (cublasSetMathMode(st->cublas, math_mode) != CUBLAS_STATUS_SUCCESS) {
+        set_error(e, ec, "cuBLAS math mode setup failed");
+        cuda_close(st);
+        return -1;
+    }
     *state_out = st;
     *matmul = cuda_matmul;
     *sgemm = cuda_sgemm;
@@ -567,10 +2875,112 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     return 0;
 }
 
+extern "C" int mynah_cuda_metrics_get(void *opaque,
+                                       mynah_tts_backend_metrics *metrics) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || metrics == nullptr) return -1;
+    metrics->h2d_bytes = st->h2d_bytes.load(std::memory_order_relaxed);
+    metrics->d2h_bytes = st->d2h_bytes.load(std::memory_order_relaxed);
+    metrics->h2d_calls = st->h2d_calls.load(std::memory_order_relaxed);
+    metrics->d2h_calls = st->d2h_calls.load(std::memory_order_relaxed);
+    metrics->sync_calls = st->sync_calls.load(std::memory_order_relaxed);
+    metrics->graph_captures = st->graph_captures.load(std::memory_order_relaxed);
+    metrics->graph_replays = st->graph_replays.load(std::memory_order_relaxed);
+    metrics->graph_fallbacks = st->graph_fallbacks.load(std::memory_order_relaxed);
+    metrics->backbone_batch_calls =
+        st->backbone_batch_calls.load(std::memory_order_relaxed);
+    metrics->backbone_batch_items =
+        st->backbone_batch_items.load(std::memory_order_relaxed);
+    metrics->backbone_batch_max_width =
+        st->backbone_batch_max_width.load(std::memory_order_relaxed);
+    metrics->codec_transformer_batch_calls =
+        st->codec_transformer_batch_calls.load(std::memory_order_relaxed);
+    for (int stage = 0; stage < 3; ++stage)
+        for (int bucket = 0; bucket < 8; ++bucket)
+            metrics->batch_width_hist[stage][bucket] =
+                st->width_hist[stage][bucket].load(std::memory_order_relaxed);
+    for (int stage = 0; stage < 2; ++stage) {
+        metrics->codec_gang_calls[stage] =
+            st->codec_gang_calls[stage].load(std::memory_order_relaxed);
+        metrics->codec_gang_rows[stage] =
+            st->codec_gang_rows[stage].load(std::memory_order_relaxed);
+        for (int bucket = 0; bucket < 8; ++bucket)
+            metrics->codec_gang_width_hist[stage][bucket] =
+                st->codec_gang_hist[stage][bucket].load(std::memory_order_relaxed);
+    }
+    metrics->codec_transformer_batch_items =
+        st->codec_transformer_batch_items.load(std::memory_order_relaxed);
+    metrics->codec_transformer_batch_max_width =
+        st->codec_transformer_batch_max_width.load(std::memory_order_relaxed);
+    metrics->codec_upsample_steps =
+        st->codec_upsample_steps.load(std::memory_order_relaxed);
+    metrics->codec_upsample_fallbacks =
+        st->codec_upsample_fallbacks.load(std::memory_order_relaxed);
+    metrics->decoder_steps = st->decoder_steps.load(std::memory_order_relaxed);
+    metrics->decoder_batch_calls =
+        st->decoder_batch_calls.load(std::memory_order_relaxed);
+    metrics->decoder_batch_items =
+        st->decoder_batch_items.load(std::memory_order_relaxed);
+    metrics->decoder_batch_max_width =
+        st->decoder_batch_max_width.load(std::memory_order_relaxed);
+    metrics->decoder_batch_frames =
+        st->decoder_batch_frames.load(std::memory_order_relaxed);
+    metrics->decoder_graph_captures =
+        st->decoder_graph_captures.load(std::memory_order_relaxed);
+    metrics->decoder_graph_replays =
+        st->decoder_graph_replays.load(std::memory_order_relaxed);
+    metrics->decoder_graph_fallbacks =
+        st->decoder_graph_fallbacks.load(std::memory_order_relaxed);
+    metrics->decoder_failures = st->decoder_failures.load(std::memory_order_relaxed);
+    metrics->resident_fallbacks = st->resident_fallbacks.load(std::memory_order_relaxed);
+    metrics->matmul_calls = st->matmul_calls.load(std::memory_order_relaxed);
+    metrics->matvec_calls = st->matvec_calls.load(std::memory_order_relaxed);
+    metrics->q8_matmul_calls =
+        st->q8_matmul_calls.load(std::memory_order_relaxed);
+    metrics->q8_rows = st->q8_rows.load(std::memory_order_relaxed);
+    metrics->q8_weight_uploads =
+        st->q8_weight_uploads.load(std::memory_order_relaxed);
+    metrics->q8_weight_bytes =
+        st->q8_weight_bytes.load(std::memory_order_relaxed);
+    metrics->q8_activation_bytes =
+        st->q8_activation_bytes.load(std::memory_order_relaxed);
+    metrics->bf16_matmul_calls =
+        st->bf16_matmul_calls.load(std::memory_order_relaxed);
+    metrics->bf16_rows = st->bf16_rows.load(std::memory_order_relaxed);
+    metrics->bf16_weight_bytes =
+        st->bf16_weight_bytes.load(std::memory_order_relaxed);
+    size_t free_bytes = 0u;
+    size_t total_bytes = 0u;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+        metrics->device_memory_bytes = (unsigned long long)total_bytes;
+        metrics->device_memory_free_bytes = (unsigned long long)free_bytes;
+    }
+    metrics->graphs_enabled = st->graphs_enabled ? 1u : 0u;
+    metrics->fast_math_enabled = st->fast_math ? 1u : 0u;
+    metrics->decoder_batch_enabled = st->decoder_batch_enabled ? 1u : 0u;
+    metrics->q8_enabled = st->q8_enabled ? 1u : 0u;
+    return 0;
+}
+
 extern "C" int mynah_cuda_dev_alloc(void *opaque, size_t n, float **dev_ptr,
                           char *e, size_t ec) {
     (void)opaque;
+    if (dev_ptr == nullptr || n == 0u || n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA device allocation size");
+        return -1;
+    }
     return ce(cudaMalloc(dev_ptr, n * sizeof(float)), e, ec);
+}
+
+extern "C" int mynah_cuda_dev_alloc_bytes(void *opaque, size_t bytes,
+                                            void **dev_ptr, char *e,
+                                            size_t ec) {
+    (void)opaque;
+    if (dev_ptr == nullptr || bytes == 0u) {
+        set_error(e, ec, "invalid CUDA byte device allocation size");
+        return -1;
+    }
+    return ce(cudaMalloc(dev_ptr, bytes), e, ec);
 }
 
 extern "C" void mynah_cuda_dev_free(void *opaque, float *dev_ptr) {
@@ -578,9 +2988,33 @@ extern "C" void mynah_cuda_dev_free(void *opaque, float *dev_ptr) {
     if (dev_ptr) cudaFree(dev_ptr);
 }
 
+extern "C" int mynah_cuda_host_alloc(void *opaque, size_t n, float **host_ptr,
+                                      char *e, size_t ec) {
+    (void)opaque;
+    if (host_ptr == nullptr || n == 0u || n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA host allocation size");
+        return -1;
+    }
+    return ce(cudaHostAlloc((void **)host_ptr, n * sizeof(float),
+                            cudaHostAllocPortable), e, ec);
+}
+
+extern "C" void mynah_cuda_host_free(void *opaque, float *host_ptr) {
+    (void)opaque;
+    if (host_ptr != nullptr) cudaFreeHost(host_ptr);
+}
+
 extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
                     size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || host == nullptr || dev_ptr == nullptr || n == 0u ||
+        n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA host-to-device copy");
+        return -1;
+    }
+    st->h2d_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(dev_ptr, host, n*sizeof(float),
                               cudaMemcpyHostToDevice, st->stream), e, ec);
 }
@@ -588,13 +3022,70 @@ extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
 extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,
                     size_t n, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dev_ptr == nullptr || host == nullptr || n == 0u ||
+        n > SIZE_MAX / sizeof(float)) {
+        set_error(e, ec, "invalid CUDA device-to-host copy");
+        return -1;
+    }
+    st->d2h_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(host, dev_ptr, n*sizeof(float),
+                              cudaMemcpyDeviceToHost, st->stream), e, ec);
+}
+
+extern "C" int mynah_cuda_h2d_bf16(void *opaque, const float *host,
+                                     void *dev_ptr, size_t n, char *e,
+                                     size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || host == nullptr || dev_ptr == nullptr || n == 0u ||
+        n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA BF16 host-to-device copy");
+        return -1;
+    }
+    if (ensure_bf16_convert(st, n, e, ec)) return -1;
+    const size_t bytes = n * sizeof(float);
+    st->h2d_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
+    if (ce(cudaMemcpyAsync(st->dev_bf16_convert, host, bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec)) return -1;
+    k_f32_to_bf16<<<((int)n + 255) / 256, 256, 0, st->stream>>>(
+        st->dev_bf16_convert, static_cast<uint16_t *>(dev_ptr), (int)n);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_d2h_bf16(void *opaque, const void *dev_ptr,
+                                     float *host, size_t n, char *e,
+                                     size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dev_ptr == nullptr || host == nullptr || n == 0u ||
+        n > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA BF16 device-to-host copy");
+        return -1;
+    }
+    if (ensure_bf16_convert(st, n, e, ec)) return -1;
+    k_bf16_to_f32<<<((int)n + 255) / 256, 256, 0, st->stream>>>(
+        static_cast<const uint16_t *>(dev_ptr), st->dev_bf16_convert, (int)n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    st->d2h_bytes.fetch_add((unsigned long long)(n * sizeof(float)),
+                            std::memory_order_relaxed);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
+    return ce(cudaMemcpyAsync(host, st->dev_bf16_convert, n * sizeof(float),
                               cudaMemcpyDeviceToHost, st->stream), e, ec);
 }
 
 /* Custom matvec kernel: out[n] = sum_k(in[k] * W[n*K + k]) + bias[n].
  * One thread per output element.  For 1×768 matvecs this beats cuBLAS
  * by eliminating launch + workspace overhead (~3μs vs ~15μs). */
+__device__ __forceinline__ static float matvec_column(
+    const float *__restrict__ in, const float *__restrict__ weight,
+    const float *__restrict__ bias, int K, int col) {
+    const float *w = weight + (size_t)col * K;
+    float sum = bias ? bias[col] : 0.0f;
+    for (int k = 0; k < K; ++k) sum += in[k] * w[k];
+    return sum;
+}
+
 __global__ static void k_matvec(const float *__restrict__ in,
                                 const float *__restrict__ weight,
                                 const float *__restrict__ bias,
@@ -602,10 +3093,22 @@ __global__ static void k_matvec(const float *__restrict__ in,
                                 int K, int N) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= N) return;
-    const float *w = weight + (size_t)col * K;
-    float sum = bias ? bias[col] : 0.0f;
-    for (int k = 0; k < K; ++k) sum += in[k] * w[k];
-    out[col] = sum;
+    out[col] = matvec_column(in, weight, bias, K, col);
+}
+
+/* M independent matvecs sharing one weight: [rows][K] -> [rows][N].  This is
+ * deliberately not a cuBLAS GEMM: each output keeps k_matvec's serial
+ * reduction, so a row is bit-identical to the single-request projection
+ * whatever the gang width (the Mimi decoder amplifies ulp differences). */
+__global__ static void k_matvec_rows(const float *__restrict__ in,
+                                     const float *__restrict__ weight,
+                                     const float *__restrict__ bias,
+                                     float *__restrict__ out, int K, int N) {
+    const int col = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int row = (int)blockIdx.y;
+    if (col >= N) return;
+    out[(size_t)row * (size_t)N + (size_t)col] =
+        matvec_column(in + (size_t)row * (size_t)K, weight, bias, K, col);
 }
 
 extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_out,
@@ -613,29 +3116,24 @@ extern "C" int mynah_cuda_matvec_dev(void *opaque, const float *d_in, float *d_o
                            const float *weight, const float *bias,
                            char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    half *dw16 = nullptr;
-    if (cached_weight_fp16(st, weight, K * N, &dw16, e, ec)) return -1;
-    float *db = nullptr;
-    if (bias && cached_weight(st, bias, N * sizeof(float), &db, e, ec)) return -1;
-    /* Convert FP32 input to FP16 in scratch. */
-    if (ensure_scratch(st, K * sizeof(half), e, ec)) return -1;
-    half *di16 = (half *)st->dev_scratch;
-    k_f32_to_f16<<<((int)K+255)/256, 256, 0, st->stream>>>(d_in, di16, (int)K);
-    cublasSetStream(st->cublas, st->stream);
-    const float a1 = 1.0f, b0 = 0.0f;
-    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                         (int)N, 1, (int)K,
-                         &a1, dw16, CUDA_R_16F, (int)K,
-                         di16, CUDA_R_16F, (int)K,
-                         &b0, d_out, CUDA_R_32F, (int)N,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
-    if (db) {
-        const float one = 1.0f;
-        static float *d_one = nullptr;
-        if (!d_one) { ce(cudaMalloc(&d_one, 4), e, ec); cudaMemcpy(d_one, &one, 4, cudaMemcpyHostToDevice); }
-        cublasSaxpy(st->cublas, (int)N, &one, db, 1, d_out, 1);
+    size_t weight_n = 0;
+    if (st == nullptr || d_in == nullptr || d_out == nullptr || weight == nullptr ||
+        K == 0 || N == 0 || K > (size_t)INT_MAX || N > (size_t)INT_MAX ||
+        !cuda_size_mul(K, N, &weight_n) ||
+        !cuda_size_mul(weight_n, sizeof(float), &weight_n)) {
+        set_error(e, ec, "invalid CUDA matvec dimensions");
+        return -1;
     }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_n, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    size_t bias_bytes = 0;
+    if (bias && (!cuda_size_mul(N, sizeof(float), &bias_bytes) ||
+                 cached_weight(st, bias, bias_bytes, &db, e, ec))) return -1;
+    st->matvec_calls.fetch_add(1ull, std::memory_order_relaxed);
+    k_matvec<<<((int)N + 255) / 256, 256, 0, st->stream>>>(
+        d_in, dw, db, d_out, (int)K, (int)N);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
     return 0; /* no sync */
 }
 
@@ -661,48 +3159,342 @@ extern "C" int mynah_cuda_layer_norm_inplace(void *opaque, const float *dev_in,
                                    size_t rows, size_t width,
                                    char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (dev_in == nullptr || dev_out == nullptr || gain == nullptr ||
+        rows == 0 || width == 0 || rows > (size_t)INT_MAX ||
+        width > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA inplace layer-norm dimensions");
+        return -1;
+    }
     /* Cache gain on device (same pointer = same layer, reused across steps). */
     float *d_gain = nullptr;
     if (cached_weight(st, gain, width * sizeof(float), &d_gain, e, ec)) return -1;
-    k_layer_norm<<<(int)rows, 1, 0, st->stream>>>(
-        dev_out, dev_in, d_gain, (int)width, 1e-5f, (int)rows);
+    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
+        dev_out, dev_in, d_gain, nullptr, (int)width, 1e-5f, (int)rows);
     return ce(cudaGetLastError(), e, ec);
 }
 
-/* matmul device-to-device: input already on GPU, no host round-trip.
- * Converts FP32 device input → FP16, runs cuBLAS, output stays on device.
- * Does NOT sync. Caller syncs when needed. */
+/* Matmul device-to-device: input already on GPU, no host round-trip.  The
+ * default is FP32 accumulation/input for parity; MYNAH_CUDA_FAST_MATH=1 opts
+ * into the tensor-core compute mode after the parity gate has been measured. */
 extern "C" int mynah_cuda_matmul_d2d(void *opaque, const float *d_in, float *d_out,
                            size_t rows, size_t iw, size_t ow,
                            const float *weight, const float *bias,
                            char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
-    const size_t in_n = rows * iw;
-    half *dw16 = nullptr;
-    if (cached_weight_fp16(st, weight, iw * ow, &dw16, e, ec)) return -1;
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    float *dw = nullptr;
+    if (cached_weight(st, weight, w_n * sizeof(float), &dw, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
-    if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
-    half *di16 = (half *)st->dev_scratch;
-    k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(d_in, di16, (int)in_n);
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
     if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                          (int)ow, (int)rows, (int)iw,
-                         &a1, dw16, CUDA_R_16F, (int)iw,
-                         di16, CUDA_R_16F, (int)iw,
+                         &a1, dw, CUDA_R_32F, (int)iw,
+                         d_in, CUDA_R_32F, (int)iw,
                          &b0, d_out, CUDA_R_32F, (int)ow,
-                         CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
     if (db) {
-        const float one = 1.0f;
-        static float *d_ones3 = nullptr; static size_t oc3 = 0;
-        if (oc3 < rows) { if (d_ones3) cudaFree(d_ones3); size_t c2 = (rows+255)&~255;
-            ce(cudaMalloc(&d_ones3, c2*4), e, ec); std::vector<float> h(c2,1.0f);
-            cudaMemcpy(d_ones3,h.data(),c2*4,cudaMemcpyHostToDevice); oc3=c2; }
-        cublasSger(st->cublas,(int)ow,(int)rows,&one,db,1,d_ones3,1,d_out,(int)ow);
+        k_bias_add<<<((int)(rows * ow) + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     return 0; /* no sync */
+}
+
+/* Resident Q8 matmul. The activation is quantized on device per row, then a
+ * signed INT8 x INT8 -> INT32 cuBLAS GEMM reads each cached weight row once for
+ * the whole request batch. The small f32 epilogue restores the CPU qmat
+ * representation (activation scale x weight-row scale + bias) into the normal
+ * resident f32 activation buffer. No host copy or stream sync is performed. */
+extern "C" int mynah_cuda_matmul_q8_d2d(void *opaque, const float *d_in,
+                                         float *d_out, size_t rows, size_t iw,
+                                         size_t ow, const float *weight,
+                                         const float *bias, char *e,
+                                         size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0u;
+    size_t out_n = 0u;
+    size_t weight_n = 0u;
+    size_t total_n = 0u;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &weight_n,
+                                               &total_n, e, ec) != 0 ||
+        out_n > (size_t)INT_MAX) {
+        if (st != nullptr && out_n > (size_t)INT_MAX)
+            set_error(e, ec, "CUDA Q8 output is too large for one launch");
+        return -1;
+    }
+    int8_t *device_weight = nullptr;
+    float *device_weight_scale = nullptr;
+    if (cached_weight_q8(st, weight, ow, iw, &device_weight,
+                         &device_weight_scale, e, ec) != 0)
+        return -1;
+    float *device_bias = nullptr;
+    if (bias != nullptr &&
+        cached_weight(st, bias, ow * sizeof(float), &device_bias, e, ec) != 0)
+        return -1;
+    if (ensure_q8_workspace(st, in_n, rows, out_n, e, ec) != 0) return -1;
+    if (rows > (size_t)INT_MAX || iw > (size_t)INT_MAX || ow > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA Q8 GEMM dimensions exceed cuBLAS limits");
+        return -1;
+    }
+    size_t quantize_blocks = 0u;
+    size_t epilogue_blocks = 0u;
+    if (!cuda_size_add(out_n, 255u, &epilogue_blocks) ||
+        !cuda_size_add(rows, 255u, &quantize_blocks) ||
+        (epilogue_blocks /= 256u) > (size_t)INT_MAX ||
+        (quantize_blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA Q8 launch size overflow");
+        return -1;
+    }
+    k_q8_quantize_rows<<<(int)rows, 256, 0, st->stream>>>(
+        d_in, st->dev_q8_activation, st->dev_q8_activation_scale,
+        (int)rows, (int)iw);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    cublasSetStream(st->cublas, st->stream);
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &alpha, device_weight, CUDA_R_8I, (int)iw,
+                         st->dev_q8_activation, CUDA_R_8I, (int)iw,
+                         &beta, st->dev_q8_accum, CUDA_R_32I, (int)ow,
+                         CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), e, ec) != 0)
+        return -1;
+    k_q8_epilogue<<<(int)epilogue_blocks, 256, 0, st->stream>>>(
+        st->dev_q8_accum, st->dev_q8_activation_scale,
+        device_weight_scale, device_bias, d_out, (int)rows, (int)ow);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->q8_matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->q8_rows.fetch_add((unsigned long long)rows, std::memory_order_relaxed);
+    st->q8_activation_bytes.fetch_add((unsigned long long)in_n,
+                                      std::memory_order_relaxed);
+    return 0;
+}
+
+/* Resident BF16-weight matmul.  Activations are rounded to BF16 on device
+ * (RNE, the same helper as the BF16 KV cache), then one cuBLAS BF16 x BF16
+ * GEMM with FP32 accumulation and FP32 output runs on the tensor cores.  The
+ * cached weight is half the bytes of the f32 view, which is the point: the
+ * decode step is bound by weight traffic, not arithmetic. */
+extern "C" int mynah_cuda_matmul_bf16_d2d(void *opaque, const float *d_in,
+                                           float *d_out, size_t rows,
+                                           size_t iw, size_t ow,
+                                           const float *weight,
+                                           const float *bias, char *e,
+                                           size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0u, out_n = 0u, w_n = 0u, total_n = 0u;
+    if (st == nullptr || validate_cuda_matmul(d_in, d_out, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    if (in_n > (size_t)INT_MAX || out_n > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA BF16 matmul is too large for one launch");
+        return -1;
+    }
+    uint16_t *dw = nullptr;
+    if (cached_weight_bf16(st, weight, w_n, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
+    if (ensure_bf16_activation(st, in_n, e, ec) != 0) return -1;
+    k_f32_to_bf16<<<((int)in_n + 255) / 256, 256, 0, st->stream>>>(
+        d_in, st->dev_bf16_activation, (int)in_n);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    cublasSetStream(st->cublas, st->stream);
+    const float a1 = 1.0f, b0 = 0.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         (int)ow, (int)rows, (int)iw,
+                         &a1, dw, CUDA_R_16BF, (int)iw,
+                         st->dev_bf16_activation, CUDA_R_16BF, (int)iw,
+                         &b0, d_out, CUDA_R_32F, (int)ow,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), e, ec))
+        return -1;
+    if (db) {
+        k_bias_add<<<((int)out_n + 255) / 256, 256, 0, st->stream>>>(
+            d_out, db, (int)rows, (int)ow);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    st->matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->bf16_matmul_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->bf16_rows.fetch_add((unsigned long long)rows, std::memory_order_relaxed);
+    return 0;
+}
+
+static int cuda_flow_layer_norm(cuda_backend_state *st, const float *in,
+                                float *out, const float *gain,
+                                const float *bias, size_t rows, size_t width,
+                                float epsilon, char *e, size_t ec) {
+    float *d_gain = nullptr;
+    float *d_bias = nullptr;
+    if (gain != nullptr && cached_weight(st, gain, width * sizeof(float),
+                                          &d_gain, e, ec)) return -1;
+    if (bias != nullptr && cached_weight(st, bias, width * sizeof(float),
+                                          &d_bias, e, ec)) return -1;
+    k_layer_norm<<<(int)rows, 256, 0, st->stream>>>(
+        out, in, d_gain, d_bias, (int)width, epsilon, (int)rows);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int cuda_flow_linear(cuda_backend_state *st, const float *in, float *out,
+                            size_t rows, size_t input_width,
+                            size_t output_width,
+                            const mynah_backend_flow_linear *linear,
+                            char *e, size_t ec) {
+    if (linear == nullptr || linear->weight == nullptr) {
+        set_error(e, ec, "missing CUDA flow projection");
+        return -1;
+    }
+    if (linear->qtype == 1)
+        return mynah_cuda_matmul_q8_d2d(st, in, out, rows, input_width,
+                                        output_width, linear->weight,
+                                        linear->bias, e, ec);
+    if (linear->qtype == MYNAH_BACKEND_QTYPE_BF16)
+        return mynah_cuda_matmul_bf16_d2d(st, in, out, rows, input_width,
+                                          output_width, linear->weight,
+                                          linear->bias, e, ec);
+    if (linear->qtype != 0) {
+        set_error(e, ec, "unsupported CUDA flow projection precision");
+        return -1;
+    }
+    return mynah_cuda_matmul_d2d(st, in, out, rows, input_width, output_width,
+                                 linear->weight, linear->bias, e, ec);
+}
+
+extern "C" int mynah_cuda_flow_batch_dev(
+    void *opaque, const mynah_backend_flow_batch *flow, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || flow == nullptr || flow->batch == 0u ||
+        flow->latent_dim == 0u || flow->cond_dim == 0u ||
+        flow->hidden_dim < 2u || flow->depth == 0u ||
+        flow->num_time_conds == 0u || flow->freq_embed_dim < 2u ||
+        flow->dev_cond == nullptr || flow->dev_noise == nullptr ||
+        flow->dev_time_embed == nullptr || flow->dev_y == nullptr ||
+        flow->dev_silu == nullptr || flow->dev_x == nullptr ||
+        flow->dev_norm == nullptr || flow->dev_hidden == nullptr ||
+        flow->dev_scratch == nullptr || flow->dev_mod == nullptr ||
+        flow->dev_final_mod == nullptr || flow->dev_time_hidden == nullptr ||
+        flow->dev_time_output == nullptr || flow->dev_time_sum == nullptr ||
+        flow->dev_out == nullptr || flow->time_mlp_in == nullptr ||
+        flow->time_mlp_out == nullptr || flow->time_alpha == nullptr ||
+        flow->cond_embed == nullptr || flow->input_proj == nullptr ||
+        flow->blocks == nullptr || flow->final_adaln == nullptr ||
+        flow->final_linear == nullptr) {
+        set_error(e, ec, "invalid CUDA flow batch descriptor");
+        return -1;
+    }
+    const size_t h = flow->hidden_dim;
+    size_t three_h = 0u;
+    size_t two_h = 0u;
+    size_t batch_hidden = 0u;
+    size_t time_hidden = 0u;
+    if (!cuda_size_mul(h, 3u, &three_h) || !cuda_size_mul(h, 2u, &two_h) ||
+        !cuda_size_mul(flow->batch, h, &batch_hidden) ||
+        !cuda_size_mul(flow->num_time_conds, h, &time_hidden) ||
+        flow->batch > (size_t)INT_MAX || h > (size_t)INT_MAX ||
+        three_h > (size_t)INT_MAX || two_h > (size_t)INT_MAX ||
+        flow->latent_dim > (size_t)INT_MAX || flow->cond_dim > (size_t)INT_MAX ||
+        flow->freq_embed_dim > (size_t)INT_MAX ||
+        flow->num_time_conds > (size_t)INT_MAX ||
+        batch_hidden > (size_t)INT_MAX || time_hidden > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA flow batch dimensions overflow");
+        return -1;
+    }
+
+    /* y = cond_embed(cond) + mean(time_embed(t)).  Time features are supplied
+     * by the engine in persistent pinned staging, while all learned time MLPs
+     * stay on the device after their first cache lookup. */
+    if (cuda_flow_linear(st, flow->dev_cond, flow->dev_y, flow->batch,
+                         flow->cond_dim, h, flow->cond_embed, e, ec) != 0)
+        return -1;
+    for (size_t t = 0; t < flow->num_time_conds; ++t) {
+        if (cuda_flow_linear(st, flow->dev_time_embed +
+                                 t * flow->freq_embed_dim,
+                             flow->dev_time_hidden + t * h, 1u,
+                             flow->freq_embed_dim, h, &flow->time_mlp_in[t], e,
+                             ec) != 0) return -1;
+        k_silu<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_time_hidden + t * h, (int)h);
+        if (ce(cudaGetLastError(), e, ec) ||
+            cuda_flow_linear(st, flow->dev_time_hidden + t * h,
+                             flow->dev_time_output + t * h, 1u, h, h,
+                             &flow->time_mlp_out[t], e, ec) != 0) return -1;
+        const float *alpha = flow->time_alpha[t];
+        float *d_alpha = nullptr;
+        if (alpha == nullptr || cached_weight(st, alpha, h * sizeof(float),
+                                              &d_alpha, e, ec)) return -1;
+        k_flow_var_rms_norm<<<1, 256, 0, st->stream>>>(
+            flow->dev_time_output + t * h, d_alpha,
+            flow->dev_time_output + t * h, 1, (int)h, flow->rmsnorm_eps);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        if (t == 0u) {
+            k_copy<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+                flow->dev_time_sum, flow->dev_time_output, (int)h);
+        } else {
+            k_residual_add<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+                flow->dev_time_sum, flow->dev_time_output + t * h, (int)h);
+        }
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    k_scale<<<((int)h + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_time_sum, 1.0f / (float)flow->num_time_conds, (int)h);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    k_bias_add<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_y, flow->dev_time_sum, (int)flow->batch, (int)h);
+    if (ce(cudaGetLastError(), e, ec) ||
+        cuda_flow_linear(st, flow->dev_noise, flow->dev_x, flow->batch,
+                         flow->latent_dim, h, flow->input_proj, e, ec) != 0)
+        return -1;
+    k_copy<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_silu, flow->dev_y, (int)batch_hidden);
+    k_silu<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_silu, (int)batch_hidden);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+
+    for (size_t b = 0; b < flow->depth; ++b) {
+        const mynah_backend_flow_block *block = &flow->blocks[b];
+        if (cuda_flow_linear(st, flow->dev_silu, flow->dev_mod, flow->batch,
+                             h, three_h, &block->adaln, e, ec) != 0 ||
+            cuda_flow_layer_norm(st, flow->dev_x, flow->dev_norm,
+                                 block->in_ln_weight, block->in_ln_bias,
+                                 flow->batch, h, flow->layernorm_eps, e, ec) != 0)
+            return -1;
+        k_flow_modulate<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_norm, flow->dev_mod, (int)flow->batch, (int)h,
+            (int)three_h);
+        if (ce(cudaGetLastError(), e, ec) ||
+            cuda_flow_linear(st, flow->dev_norm, flow->dev_hidden, flow->batch,
+                             h, h, &block->mlp_in, e, ec) != 0) return -1;
+        k_silu<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_hidden, (int)batch_hidden);
+        if (ce(cudaGetLastError(), e, ec) ||
+            cuda_flow_linear(st, flow->dev_hidden, flow->dev_scratch,
+                             flow->batch, h, h, &block->mlp_out, e, ec) != 0)
+            return -1;
+        k_flow_gate_add<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+            flow->dev_x, flow->dev_mod + 2u * h, flow->dev_scratch,
+            (int)flow->batch, (int)h, (int)three_h);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+
+    if (cuda_flow_linear(st, flow->dev_silu, flow->dev_final_mod,
+                         flow->batch, h, two_h, flow->final_adaln, e, ec) != 0 ||
+        cuda_flow_layer_norm(st, flow->dev_x, flow->dev_norm, nullptr, nullptr,
+                             flow->batch, h, flow->layernorm_eps, e, ec) != 0)
+        return -1;
+    k_flow_modulate<<<((int)batch_hidden + 255) / 256, 256, 0, st->stream>>>(
+        flow->dev_norm, flow->dev_final_mod, (int)flow->batch, (int)h,
+        (int)two_h);
+    if (ce(cudaGetLastError(), e, ec) ||
+        cuda_flow_linear(st, flow->dev_norm, flow->dev_out, flow->batch, h,
+                         flow->latent_dim, flow->final_linear, e, ec) != 0)
+        return -1;
+    return 0;
 }
 
 /* im2col kernel for causal conv1d: builds the columns matrix on GPU.
@@ -726,6 +3518,13 @@ extern "C" int mynah_cuda_im2col(void *opaque, const float *input, float *column
                        int in_ch, int length, int kernel, int dilation,
                        char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (input == nullptr || columns == nullptr || in_ch <= 0 || length <= 0 ||
+        kernel <= 0 || dilation <= 0 ||
+        (size_t)in_ch > (size_t)INT_MAX / (size_t)kernel ||
+        (size_t)in_ch * (size_t)kernel > (size_t)INT_MAX / (size_t)length) {
+        set_error(e, ec, "invalid CUDA im2col dimensions");
+        return -1;
+    }
     int total = in_ch * kernel * length;
     k_im2col_causal<<<(total+255)/256, 256, 0, st->stream>>>(
         input, columns, in_ch, length, kernel, dilation);
@@ -796,8 +3595,7 @@ extern "C" int mynah_cuda_conv1d(void *opaque,
                          dw, CUDA_R_32F, (int)inner,
                          &b1,
                          d_out, CUDA_R_32F, length,
-                         CUBLAS_COMPUTE_32F_FAST_16F,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP), e, ec)) return -1;
+                         cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
 
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
 
@@ -807,6 +3605,4413 @@ extern "C" int mynah_cuda_conv1d(void *opaque,
     cudaMemcpy(st->host_buf, d_out, out_count * sizeof(float), cudaMemcpyDeviceToHost);
     std::memcpy(output, st->host_buf, out_count * sizeof(float));
     return 0;
+}
+
+/* Resident causal conv1d.  Unlike mynah_cuda_conv1d(), this function never
+ * interprets its activation pointers as host memory, never uses mapped host
+ * staging, and never synchronizes.  It is the unit used by the resident
+ * NanoCodec graph. */
+extern "C" int mynah_cuda_conv1d_dev(void *opaque,
+                                     const float *input, float *output,
+                                     int in_ch, int out_ch, int length,
+                                     int kernel, int dilation,
+                                     const float *weight, const float *bias,
+                                     char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (input == nullptr || output == nullptr || weight == nullptr ||
+        in_ch <= 0 || out_ch <= 0 || length <= 0 || kernel <= 0 || dilation <= 0 ||
+        (size_t)in_ch > (size_t)INT_MAX / (size_t)kernel ||
+        (size_t)in_ch * (size_t)kernel > (size_t)INT_MAX / (size_t)length ||
+        (size_t)out_ch > (size_t)INT_MAX / (size_t)length) {
+        set_error(e, ec, "invalid CUDA resident conv1d dimensions");
+        return -1;
+    }
+    const size_t inner = (size_t)in_ch * (size_t)kernel;
+    const size_t columns_count = inner * (size_t)length;
+    const size_t output_count = (size_t)out_ch * (size_t)length;
+    size_t weight_count = 0;
+    size_t weight_bytes = 0;
+    if (columns_count > SIZE_MAX - output_count ||
+        columns_count + output_count > SIZE_MAX / sizeof(float) ||
+        !cuda_size_mul(inner, (size_t)out_ch, &weight_count) ||
+        !cuda_size_mul(weight_count, sizeof(float), &weight_bytes)) {
+        set_error(e, ec, "CUDA resident conv1d workspace overflow");
+        return -1;
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_bytes, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias != nullptr && cached_weight(st, bias, (size_t)out_ch * sizeof(float),
+                                         &db, e, ec)) return -1;
+    if (ensure_scratch(st, columns_count * sizeof(float), e, ec)) return -1;
+    float *columns = st->dev_scratch;
+    const int total = in_ch * kernel * length;
+    k_im2col_causal<<<(total + 255) / 256, 256, 0, st->stream>>>(
+        input, columns, in_ch, length, kernel, dilation);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (db != nullptr) {
+        k_broadcast_bias<<<((int)output_count + 255) / 256, 256, 0, st->stream>>>(
+            output, db, out_ch, length);
+    } else {
+        if (ce(cudaMemsetAsync(output, 0, output_count * sizeof(float), st->stream), e, ec)) return -1;
+    }
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (cbe(cublasSetStream(st->cublas, st->stream), e, ec)) return -1;
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        length, out_ch, (int)inner,
+                        &alpha, columns, CUDA_R_32F, length,
+                        dw, CUDA_R_32F, (int)inner,
+                        &beta, output, CUDA_R_32F, length,
+                        cuda_compute_type(st), cuda_gemm_algo(st)), e, ec)) return -1;
+    return 0;
+}
+
+__global__ static void k_conv_transpose(const float *input, const float *weight,
+                                        const float *bias, float *output,
+                                        int in_ch, int out_ch, int length,
+                                        int output_length, int kernel, int stride,
+                                        int groups) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int total = out_ch * output_length;
+    if (index >= total) return;
+    const int t = index % output_length;
+    const int o = index / output_length;
+    const int in_per_group = in_ch / groups;
+    const int out_per_group = out_ch / groups;
+    const int group = o / out_per_group;
+    const int out_local = o % out_per_group;
+    float value = bias == nullptr ? 0.0f : bias[o];
+    for (int k = 0; k < kernel; ++k) {
+        if (t < k || ((t - k) % stride) != 0) continue;
+        const int input_t = (t - k) / stride;
+        if (input_t >= length) continue;
+        for (int input_local = 0; input_local < in_per_group; ++input_local) {
+            const int input_channel = group * in_per_group + input_local;
+            const size_t weight_index =
+                ((size_t)input_channel * (size_t)out_per_group + (size_t)out_local) *
+                (size_t)kernel + (size_t)k;
+            value += input[(size_t)input_channel * (size_t)length + (size_t)input_t] *
+                     weight[weight_index];
+        }
+    }
+    output[index] = value;
+}
+
+extern "C" int mynah_cuda_conv_transpose_dev(
+    void *opaque, const float *input, float *output,
+    int in_ch, int out_ch, int length, int output_length,
+    int kernel, int stride, int groups,
+    const float *weight, const float *bias, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (input == nullptr || output == nullptr || weight == nullptr ||
+        in_ch <= 0 || out_ch <= 0 || length <= 0 || output_length <= 0 ||
+        kernel <= 0 || stride <= 0 || groups <= 0 || in_ch % groups != 0 ||
+        out_ch % groups != 0 || (size_t)out_ch > (size_t)INT_MAX / (size_t)output_length) {
+        set_error(e, ec, "invalid CUDA conv-transpose dimensions");
+        return -1;
+    }
+    const size_t out_per_group = (size_t)out_ch / (size_t)groups;
+    size_t weight_count = 0;
+    size_t weight_bytes = 0;
+    if (!cuda_size_mul((size_t)in_ch, out_per_group, &weight_count) ||
+        !cuda_size_mul(weight_count, (size_t)kernel, &weight_count) ||
+        !cuda_size_mul(weight_count, sizeof(float), &weight_bytes)) {
+        set_error(e, ec, "CUDA conv-transpose weight size overflow");
+        return -1;
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_bytes, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias != nullptr && cached_weight(st, bias, (size_t)out_ch * sizeof(float),
+                                         &db, e, ec)) return -1;
+    const int total = out_ch * output_length;
+    k_conv_transpose<<<(total + 255) / 256, 256, 0, st->stream>>>(
+        input, dw, db, output, in_ch, out_ch, length, output_length,
+        kernel, stride, groups);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_conv_transpose_causal_step_dev(
+    void *opaque, const float *input, float *output, float *partial,
+    int channels, int kernel, int stride, const float *weight,
+    const float *bias, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    size_t weight_count = 0u;
+    size_t weight_bytes = 0u;
+    size_t bias_bytes = 0u;
+    if (st == nullptr || input == nullptr || output == nullptr ||
+        weight == nullptr || channels <= 0 ||
+        kernel <= 0 || stride <= 0 || kernel < stride ||
+        (size_t)channels > (size_t)INT_MAX / (size_t)kernel ||
+        !cuda_size_mul((size_t)channels, (size_t)kernel, &total) ||
+        total > (size_t)INT_MAX ||
+        !cuda_size_mul((size_t)channels, (size_t)kernel, &weight_count) ||
+        !cuda_size_mul(weight_count, sizeof(float), &weight_bytes) ||
+        !cuda_size_mul((size_t)channels, sizeof(float), &bias_bytes)) {
+        set_error(e, ec, "invalid CUDA causal transpose dimensions");
+        return -1;
+    }
+    if (kernel > stride && partial == nullptr) {
+        set_error(e, ec, "missing CUDA causal transpose tail");
+        return -1;
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, weight, weight_bytes, &dw, e, ec)) return -1;
+    float *db = nullptr;
+    if (bias != nullptr && cached_weight(st, bias, bias_bytes, &db, e, ec))
+        return -1;
+    k_conv_transpose_causal_depthwise_step<<<
+        (int)((total + 255u) / 256u), 256, 0, st->stream>>>(
+        input, output, partial, dw, db, channels, kernel, stride,
+        kernel - stride);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_scatter_row_to_channels_dev(
+    void *opaque, const float *row, float *output, size_t width,
+    size_t length, size_t position, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || row == nullptr || output == nullptr || width == 0u ||
+        length == 0u || position >= length || width > (size_t)INT_MAX ||
+        length > (size_t)INT_MAX || position > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA row-to-channel scatter dimensions");
+        return -1;
+    }
+    k_scatter_row_to_channels<<<((int)width + 255) / 256, 256, 0, st->stream>>>(
+        row, output, (int)width, (int)length, (int)position);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_scatter_rows_to_channels_dev(
+    void *opaque, const float *rows, float *const *outputs, size_t batch,
+    size_t width, size_t length, size_t position, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    if (st == nullptr || rows == nullptr || outputs == nullptr || batch == 0u ||
+        batch > st->batch_meta_cap || width == 0u || length == 0u ||
+        position >= length || batch > (size_t)INT_MAX || width > (size_t)INT_MAX ||
+        length > (size_t)INT_MAX || position > (size_t)INT_MAX ||
+        !cuda_size_mul(batch, width, &total) || total > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid CUDA batched row-to-channel scatter dimensions");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (outputs[i] == nullptr) {
+            set_error(e, ec, "invalid CUDA batched scatter output");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, outputs,
+                           batch * sizeof(*outputs), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    k_scatter_rows_to_channels<<<((int)total + 255) / 256, 256, 0, st->stream>>>(
+        rows, st->dev_batch_k_cache, (int)batch, (int)width, (int)length,
+        (int)position);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_gather_rows_to_batch_dev(
+    void *opaque, float *const *inputs, float *rows, size_t batch,
+    size_t width, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t total = 0u;
+    size_t pointer_bytes = 0u;
+    if (st == nullptr || inputs == nullptr || rows == nullptr || batch == 0u ||
+        batch > st->batch_meta_cap || width == 0u ||
+        batch > (size_t)INT_MAX || width > (size_t)INT_MAX ||
+        !cuda_size_mul(batch, width, &total) || total > (size_t)INT_MAX ||
+        !cuda_size_mul(batch, sizeof(*inputs), &pointer_bytes)) {
+        set_error(e, ec, "invalid CUDA batched row-gather dimensions");
+        return -1;
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, inputs, pointer_bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec))
+        return -1;
+    k_gather_rows_to_batch<<<(int)((total + 255u) / 256u), 256, 0,
+                             st->stream>>>(st->dev_batch_k_cache, rows,
+                                           (int)batch, (int)width);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cross-request Pocket codec gang: quantizer + upsample, PCM collect  */
+/* ------------------------------------------------------------------ */
+
+static void codec_gang_release(cuda_backend_state *st) {
+    cuda_codec_gang_workspace &w = st->codec_gang;
+    cudaFree(w.up_meta_dev);
+    if (w.up_meta_host != nullptr) cudaFreeHost(w.up_meta_host);
+    if (w.up_meta_event != nullptr) cudaEventDestroy(w.up_meta_event);
+    cudaFree(w.up_proj);
+    cudaFree(w.pcm_meta_dev);
+    if (w.pcm_meta_host != nullptr) cudaFreeHost(w.pcm_meta_host);
+    if (w.pcm_meta_event != nullptr) cudaEventDestroy(w.pcm_meta_event);
+    cudaFree(w.pcm_dev);
+    if (w.pcm_host != nullptr) cudaFreeHost(w.pcm_host);
+    w = cuda_codec_gang_workspace();
+}
+
+/* Grow one pinned-host + device pair.  Growth drains the stream first: an
+ * earlier async copy may still read the old block, and the old device block
+ * may still be referenced by queued kernels.  It happens a handful of times
+ * per process (the gang only widens), never per frame. */
+static int codec_gang_grow_pair(cuda_backend_state *st, void **dev, void **host,
+                                size_t *cap, size_t bytes, char *e, size_t ec) {
+    if (bytes <= *cap) return 0;
+    if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+    cudaFree(*dev);
+    if (*host != nullptr) cudaFreeHost(*host);
+    *dev = nullptr;
+    *host = nullptr;
+    *cap = 0u;
+    if (ce(cudaMalloc(dev, bytes), e, ec)) return -1;
+    if (host != nullptr &&
+        ce(cudaHostAlloc(host, bytes, cudaHostAllocDefault), e, ec)) {
+        cudaFree(*dev);
+        *dev = nullptr;
+        return -1;
+    }
+    *cap = bytes;
+    return 0;
+}
+
+extern "C" int mynah_cuda_codec_upsample_batch_dev(
+    void *opaque, const mynah_backend_upsample_batch_desc *d, char *e,
+    size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || d == nullptr || d->host_input == nullptr ||
+        d->output == nullptr || d->proj_weight == nullptr ||
+        d->up_weight == nullptr || d->rows == 0u || d->rows > 4096u ||
+        d->in_dim == 0u || d->channels == 0u || d->stride == 0u ||
+        d->kernel < d->stride || d->in_dim > 65536u ||
+        d->channels > 65536u || d->kernel > 4096u) {
+        set_error(e, ec, "invalid CUDA codec gang upsample description");
+        return -1;
+    }
+    const size_t tail = d->kernel - d->stride;
+    if (tail > 0u && d->partial == nullptr) {
+        set_error(e, ec, "missing CUDA codec gang upsample tails");
+        return -1;
+    }
+    for (size_t r = 0; r < d->rows; ++r) {
+        if (d->host_input[r] == nullptr || d->output[r] == nullptr ||
+            (tail > 0u && d->partial[r] == nullptr)) {
+            set_error(e, ec, "invalid CUDA codec gang upsample row");
+            return -1;
+        }
+    }
+    size_t input_floats = 0u, input_bytes = 0u, proj_floats = 0u,
+           total = 0u, meta_bytes = 0u;
+    if (!cuda_size_mul(d->rows, d->in_dim, &input_floats) ||
+        !cuda_size_mul(input_floats, sizeof(float), &input_bytes) ||
+        !cuda_size_mul(d->rows, d->channels, &proj_floats) ||
+        proj_floats > (size_t)INT_MAX ||
+        !cuda_size_mul(d->channels, d->kernel, &total) ||
+        total > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA codec gang upsample size overflow");
+        return -1;
+    }
+    total = proj_floats;
+    meta_bytes = 2u * d->rows * sizeof(void *) + input_bytes;
+
+    float *dpw = nullptr, *dpb = nullptr, *duw = nullptr, *dub = nullptr;
+    if (cached_weight(st, d->proj_weight,
+                      d->channels * d->in_dim * sizeof(float), &dpw, e, ec) ||
+        (d->proj_bias != nullptr &&
+         cached_weight(st, d->proj_bias, d->channels * sizeof(float), &dpb, e,
+                       ec)) ||
+        cached_weight(st, d->up_weight, d->channels * d->kernel * sizeof(float),
+                      &duw, e, ec) ||
+        (d->up_bias != nullptr &&
+         cached_weight(st, d->up_bias, d->channels * sizeof(float), &dub, e,
+                       ec)))
+        return -1;
+
+    cuda_codec_gang_workspace &w = st->codec_gang;
+    if (w.up_meta_event == nullptr &&
+        ce(cudaEventCreateWithFlags(&w.up_meta_event, cudaEventDisableTiming),
+           e, ec))
+        return -1;
+    if (codec_gang_grow_pair(st, &w.up_meta_dev, &w.up_meta_host,
+                             &w.up_meta_cap, meta_bytes, e, ec))
+        return -1;
+    if (proj_floats > w.up_proj_cap) {
+        if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
+        cudaFree(w.up_proj);
+        w.up_proj = nullptr;
+        w.up_proj_cap = 0u;
+        if (ce(cudaMalloc(&w.up_proj, proj_floats * sizeof(float)), e, ec))
+            return -1;
+        w.up_proj_cap = proj_floats;
+    }
+
+    /* One pinned block, one H2D: [outputs][partials][rows x in_dim]. */
+    if (ce(cudaEventSynchronize(w.up_meta_event), e, ec)) return -1;
+    char *host = static_cast<char *>(w.up_meta_host);
+    float **host_out = reinterpret_cast<float **>(host);
+    float **host_partial =
+        reinterpret_cast<float **>(host + d->rows * sizeof(void *));
+    float *host_input =
+        reinterpret_cast<float *>(host + 2u * d->rows * sizeof(void *));
+    for (size_t r = 0; r < d->rows; ++r) {
+        host_out[r] = d->output[r];
+        host_partial[r] = tail > 0u ? d->partial[r] : nullptr;
+        memcpy(host_input + r * d->in_dim, d->host_input[r],
+               d->in_dim * sizeof(float));
+    }
+    if (ce(cudaMemcpyAsync(w.up_meta_dev, w.up_meta_host, meta_bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec) ||
+        ce(cudaEventRecord(w.up_meta_event, st->stream), e, ec))
+        return -1;
+    st->h2d_bytes.fetch_add((unsigned long long)meta_bytes,
+                            std::memory_order_relaxed);
+    st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
+    char *dev = static_cast<char *>(w.up_meta_dev);
+    float *const *d_out = reinterpret_cast<float *const *>(dev);
+    float *const *d_partial =
+        reinterpret_cast<float *const *>(dev + d->rows * sizeof(void *));
+    const float *d_input =
+        reinterpret_cast<const float *>(dev + 2u * d->rows * sizeof(void *));
+
+    const dim3 grid((unsigned)((d->channels + 255u) / 256u), (unsigned)d->rows);
+    k_matvec_rows<<<grid, 256, 0, st->stream>>>(d_input, dpw, dpb, w.up_proj,
+                                                (int)d->in_dim,
+                                                (int)d->channels);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    k_conv_transpose_causal_depthwise_step_rows<<<
+        (int)((total + 255u) / 256u), 256, 0, st->stream>>>(
+        w.up_proj, d_out, d_partial, duw, dub, (int)d->rows, (int)d->channels,
+        (int)d->kernel, (int)d->stride, (int)tail);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_gather_rows_d2h(void *opaque,
+                                          const float *const *dev_rows,
+                                          size_t rows, size_t width,
+                                          const float **host_out, char *e,
+                                          size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (host_out != nullptr) *host_out = nullptr;
+    size_t total = 0u, bytes = 0u;
+    if (st == nullptr || dev_rows == nullptr || host_out == nullptr ||
+        rows == 0u || rows > 4096u || width == 0u ||
+        !cuda_size_mul(rows, width, &total) || total > (size_t)INT_MAX ||
+        !cuda_size_mul(total, sizeof(float), &bytes)) {
+        set_error(e, ec, "invalid CUDA batched row collect");
+        return -1;
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        if (dev_rows[r] == nullptr) {
+            set_error(e, ec, "invalid CUDA batched row collect source");
+            return -1;
+        }
+    }
+    cuda_codec_gang_workspace &w = st->codec_gang;
+    if (w.pcm_meta_event == nullptr &&
+        ce(cudaEventCreateWithFlags(&w.pcm_meta_event, cudaEventDisableTiming),
+           e, ec))
+        return -1;
+    if (codec_gang_grow_pair(st, &w.pcm_meta_dev, &w.pcm_meta_host,
+                             &w.pcm_meta_cap, rows * sizeof(void *), e, ec))
+        return -1;
+    if (total > w.pcm_cap) {
+        void *dev = w.pcm_dev;
+        void *host = w.pcm_host;
+        size_t cap_bytes = w.pcm_cap * sizeof(float);
+        const int rc = codec_gang_grow_pair(st, &dev, &host, &cap_bytes, bytes,
+                                            e, ec);
+        w.pcm_dev = static_cast<float *>(dev);
+        w.pcm_host = static_cast<float *>(host);
+        w.pcm_cap = cap_bytes / sizeof(float);
+        if (rc) return -1;
+    }
+    if (ce(cudaEventSynchronize(w.pcm_meta_event), e, ec)) return -1;
+    memcpy(w.pcm_meta_host, dev_rows, rows * sizeof(void *));
+    if (ce(cudaMemcpyAsync(w.pcm_meta_dev, w.pcm_meta_host,
+                           rows * sizeof(void *), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaEventRecord(w.pcm_meta_event, st->stream), e, ec))
+        return -1;
+    k_gather_rows_to_batch<<<(int)((total + 255u) / 256u), 256, 0,
+                             st->stream>>>(
+        static_cast<float *const *>(w.pcm_meta_dev), w.pcm_dev, (int)rows,
+        (int)width);
+    if (ce(cudaGetLastError(), e, ec) ||
+        ce(cudaMemcpyAsync(w.pcm_host, w.pcm_dev, bytes, cudaMemcpyDeviceToHost,
+                           st->stream), e, ec))
+        return -1;
+    st->d2h_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
+    st->d2h_calls.fetch_add(1ull, std::memory_order_relaxed);
+    *host_out = w.pcm_host;
+    return 0;
+}
+
+/* Model-free parity probe for the codec gang: three requests with distinct
+ * inputs and tails, two consecutive frames, through the gang path and through
+ * the single-request matvec + causal-step path. The outputs and carried tails
+ * must be bit-identical, and the batched collect must return exactly the
+ * device rows. */
+static int cuda_codec_gang_self_test(cuda_backend_state *st, char *e,
+                                     size_t ec) {
+    enum { ROWS = 3, IN = 5, CH = 6, KERNEL = 4, STRIDE = 2, TAIL = 2 };
+    static float proj_w[CH * IN];
+    static float proj_b[CH];
+    static float up_w[CH * KERNEL];
+    static float up_b[CH];
+    for (int i = 0; i < CH * IN; ++i) proj_w[i] = 0.037f * (float)((i * 7) % 11) - 0.19f;
+    for (int i = 0; i < CH; ++i) proj_b[i] = 0.013f * (float)i - 0.021f;
+    for (int i = 0; i < CH * KERNEL; ++i) up_w[i] = 0.29f - 0.041f * (float)((i * 5) % 9);
+    for (int i = 0; i < CH; ++i) up_b[i] = 0.007f * (float)(i + 1);
+    float input[2][ROWS][IN];
+    for (int f = 0; f < 2; ++f)
+        for (int r = 0; r < ROWS; ++r)
+            for (int k = 0; k < IN; ++k)
+                input[f][r][k] = 0.11f * (float)(k + 1) - 0.07f * (float)r +
+                                 0.53f * (float)f - 0.3f;
+    const size_t out_n = (size_t)STRIDE * CH;
+    const size_t tail_n = (size_t)CH * TAIL;
+    /* [gang out x3][gang tail x3][solo out x3][solo tail x3][solo in][solo proj] */
+    const size_t floats = 2u * ROWS * (out_n + tail_n) + IN + CH;
+    float *base = nullptr;
+    if (ce(cudaMalloc(&base, floats * sizeof(float)), e, ec)) return -1;
+    int result = -1;
+    do {
+        float *gang_out[ROWS], *gang_tail[ROWS], *solo_out[ROWS], *solo_tail[ROWS];
+        for (int r = 0; r < ROWS; ++r) {
+            gang_out[r] = base + (size_t)r * out_n;
+            gang_tail[r] = base + ROWS * out_n + (size_t)r * tail_n;
+            solo_out[r] = base + ROWS * (out_n + tail_n) + (size_t)r * out_n;
+            solo_tail[r] = base + ROWS * (2u * out_n + tail_n) + (size_t)r * tail_n;
+        }
+        float *solo_in = base + 2u * ROWS * (out_n + tail_n);
+        float *solo_proj = solo_in + IN;
+        if (ce(cudaMemset(base, 0, floats * sizeof(float)), e, ec)) break;
+        /* Give each request a different carried tail before the first frame. */
+        float seed_tail[ROWS][CH * TAIL];
+        for (int r = 0; r < ROWS; ++r)
+            for (int i = 0; i < CH * TAIL; ++i)
+                seed_tail[r][i] = 0.05f * (float)(r + 1) - 0.01f * (float)i;
+        bool failed = false;
+        for (int r = 0; r < ROWS && !failed; ++r)
+            failed = ce(cudaMemcpy(gang_tail[r], seed_tail[r], sizeof(seed_tail[r]),
+                                   cudaMemcpyHostToDevice), e, ec) ||
+                     ce(cudaMemcpy(solo_tail[r], seed_tail[r], sizeof(seed_tail[r]),
+                                   cudaMemcpyHostToDevice), e, ec);
+        if (failed) break;
+        for (int f = 0; f < 2 && !failed; ++f) {
+            const float *rows_in[ROWS];
+            for (int r = 0; r < ROWS; ++r) rows_in[r] = input[f][r];
+            mynah_backend_upsample_batch_desc desc;
+            memset(&desc, 0, sizeof(desc));
+            desc.rows = ROWS;
+            desc.in_dim = IN;
+            desc.channels = CH;
+            desc.kernel = KERNEL;
+            desc.stride = STRIDE;
+            desc.host_input = rows_in;
+            desc.output = gang_out;
+            desc.partial = gang_tail;
+            desc.proj_weight = proj_w;
+            desc.proj_bias = proj_b;
+            desc.up_weight = up_w;
+            desc.up_bias = up_b;
+            if (mynah_cuda_codec_upsample_batch_dev(st, &desc, e, ec) != 0) {
+                failed = true;
+                break;
+            }
+            for (int r = 0; r < ROWS && !failed; ++r) {
+                failed = ce(cudaMemcpyAsync(solo_in, input[f][r], sizeof(input[f][r]),
+                                            cudaMemcpyHostToDevice, st->stream),
+                            e, ec) ||
+                         mynah_cuda_matvec_dev(st, solo_in, solo_proj, IN, CH,
+                                               proj_w, proj_b, e, ec) != 0 ||
+                         mynah_cuda_conv_transpose_causal_step_dev(
+                             st, solo_proj, solo_out[r], solo_tail[r], CH, KERNEL,
+                             STRIDE, up_w, up_b, e, ec) != 0 ||
+                         ce(cudaStreamSynchronize(st->stream), e, ec);
+            }
+        }
+        if (failed || ce(cudaStreamSynchronize(st->stream), e, ec)) break;
+        float got[ROWS * (STRIDE * CH + CH * TAIL)];
+        float want[ROWS * (STRIDE * CH + CH * TAIL)];
+        if (ce(cudaMemcpy(got, base, sizeof(got), cudaMemcpyDeviceToHost), e, ec) ||
+            ce(cudaMemcpy(want, base + ROWS * (out_n + tail_n), sizeof(want),
+                          cudaMemcpyDeviceToHost), e, ec))
+            break;
+        if (memcmp(got, want, sizeof(got)) != 0) {
+            set_error(e, ec, "CUDA codec gang upsample differs from the single-request path");
+            break;
+        }
+        const float *collected = nullptr;
+        const float *collect_rows[ROWS] = {gang_out[2], gang_out[0], gang_out[1]};
+        if (mynah_cuda_gather_rows_d2h(st, collect_rows, ROWS, out_n, &collected,
+                                       e, ec) != 0 ||
+            ce(cudaStreamSynchronize(st->stream), e, ec))
+            break;
+        static const int order[ROWS] = {2, 0, 1};
+        bool same = true;
+        for (int r = 0; r < ROWS && same; ++r)
+            same = memcmp(collected + (size_t)r * out_n, got + (size_t)order[r] * out_n,
+                          out_n * sizeof(float)) == 0;
+        if (!same) {
+            set_error(e, ec, "CUDA batched row collect self-test mismatch");
+            break;
+        }
+        result = 0;
+    } while (false);
+    cudaFree(base);
+    return result;
+}
+
+extern "C" int mynah_cuda_zero_dev(void *opaque, float *data, size_t n,
+                                    char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t bytes = 0u;
+    if (st == nullptr || data == nullptr || n == 0u ||
+        !cuda_size_mul(n, sizeof(float), &bytes)) {
+        set_error(e, ec, "invalid CUDA device-zero request");
+        return -1;
+    }
+    return ce(cudaMemsetAsync(data, 0, bytes, st->stream), e, ec);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Resident Pocket SEANet decoder                                    */
+/* ------------------------------------------------------------------ */
+
+static bool decoder_mul(size_t a, size_t b, size_t *out) {
+    if (a != 0u && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool decoder_add(size_t a, size_t b, size_t *out) {
+    if (b > SIZE_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool decoder_int(size_t value, int *out) {
+    if (value > (size_t)INT_MAX) return false;
+    *out = (int)value;
+    return true;
+}
+
+static void decoder_free_op(cuda_decoder_op *op) {
+    if (op == nullptr) return;
+    if (op->previous != nullptr) cudaFree(op->previous);
+    if (op->window != nullptr) cudaFree(op->window);
+    if (op->partial != nullptr) cudaFree(op->partial);
+    if (op->full != nullptr) cudaFree(op->full);
+    op->previous = nullptr;
+    op->window = nullptr;
+    op->partial = nullptr;
+    op->full = nullptr;
+}
+
+static void decoder_destroy(mynah_backend_decoder *decoder) {
+    if (decoder == nullptr) return;
+    for (auto &op : decoder->ops) decoder_free_op(&op);
+    if (decoder->work_a != nullptr) cudaFree(decoder->work_a);
+    if (decoder->work_b != nullptr) cudaFree(decoder->work_b);
+    if (decoder->work_c != nullptr) cudaFree(decoder->work_c);
+    if (decoder->columns != nullptr) cudaFree(decoder->columns);
+    decoder->work_a = nullptr;
+    decoder->work_b = nullptr;
+    decoder->work_c = nullptr;
+    decoder->columns = nullptr;
+    delete decoder;
+}
+
+static bool decoder_add_op(mynah_backend_decoder *decoder,
+                           cuda_decoder_op_kind kind, int pre_elu,
+                           size_t in_channels, size_t out_channels,
+                           size_t kernel, size_t stride, size_t dilation,
+                           size_t groups, size_t max_in_len,
+                           const mynah_backend_decoder_weight *weights,
+                           size_t *max_work, size_t *max_columns,
+                           char *e, size_t ec) {
+    cuda_decoder_op op{};
+    int launch_range = 0;
+    op.kind = kind;
+    op.pre_elu = pre_elu;
+    op.max_in_len = max_in_len;
+    if (!decoder_int(in_channels, &op.in_channels) ||
+        !decoder_int(out_channels, &op.out_channels) ||
+        !decoder_int(kernel, &op.kernel) || !decoder_int(stride, &op.stride) ||
+        !decoder_int(dilation, &op.dilation) || !decoder_int(groups, &op.groups) ||
+        weights == nullptr || weights->weight == nullptr || in_channels == 0u ||
+        out_channels == 0u || kernel == 0u || stride == 0u || groups == 0u ||
+        in_channels % groups != 0u || out_channels % groups != 0u ||
+        max_in_len == 0u || max_in_len > (size_t)INT_MAX) {
+        set_error(e, ec, "invalid resident decoder operation descriptor");
+        return false;
+    }
+    size_t span = 0u;
+    if (!decoder_mul(kernel - 1u, dilation, &span) ||
+        !decoder_add(span, 1u, &span) || span < stride) {
+        set_error(e, ec, "resident decoder causal span is invalid");
+        return false;
+    }
+    op.tail = span - stride;
+    if (!decoder_int(op.tail, &launch_range) ||
+        !decoder_int(max_in_len, &launch_range)) {
+        /* The operation fields are already validated above; this pair is only
+         * a compact launch-range check for the causal state length. */
+        set_error(e, ec, "resident decoder state length exceeds CUDA range");
+        return false;
+    }
+    if (kind == CUDA_DECODER_CONVTR) {
+        if (kernel < stride || !decoder_mul(max_in_len, stride, &op.max_full_len) ||
+            !decoder_add(op.max_full_len, kernel - stride, &op.max_full_len)) {
+            set_error(e, ec, "resident decoder transpose shape overflow");
+            return false;
+        }
+        size_t full_elems = 0u;
+        if (!decoder_mul(out_channels, op.max_full_len, &full_elems) ||
+            full_elems > (size_t)INT_MAX ||
+            !decoder_int(op.max_full_len, &launch_range)) {
+            set_error(e, ec, "resident decoder transpose launch range overflow");
+            return false;
+        }
+    }
+
+    size_t work = 0u;
+    const size_t work_len = kind == CUDA_DECODER_CONVTR
+        ? op.max_full_len - op.tail : max_in_len;
+    if (!decoder_mul(out_channels, work_len, &work)) {
+        set_error(e, ec, "resident decoder work shape overflow");
+        return false;
+    }
+    if (work > (size_t)INT_MAX) {
+        set_error(e, ec, "resident decoder work launch range overflow");
+        return false;
+    }
+    if (work > *max_work) *max_work = work;
+    if (kind != CUDA_DECODER_CONVTR) {
+        if (stride != 1u) {
+            set_error(e, ec, "resident decoder only supports stride-one conv1d");
+            return false;
+        }
+        size_t kernel_width = 0u;
+        size_t inner = 0u;
+        if (!decoder_mul(in_channels, kernel, &kernel_width) ||
+            !decoder_int(kernel_width, &launch_range) ||
+            !decoder_mul(kernel_width, max_in_len, &inner)) {
+            set_error(e, ec, "resident decoder column shape overflow");
+            return false;
+        }
+        if (inner > (size_t)INT_MAX) {
+            set_error(e, ec, "resident decoder column launch range overflow");
+            return false;
+        }
+        if (inner > *max_columns) *max_columns = inner;
+    }
+
+    size_t weight_count = 0u;
+    if (kind == CUDA_DECODER_CONVTR) {
+        size_t out_per_group = out_channels / groups;
+        if (!decoder_mul(in_channels, out_per_group, &weight_count) ||
+            !decoder_mul(weight_count, kernel, &weight_count)) {
+            set_error(e, ec, "resident decoder transpose weight overflow");
+            return false;
+        }
+    } else if (!decoder_mul(out_channels, in_channels, &weight_count) ||
+               !decoder_mul(weight_count, kernel, &weight_count)) {
+        set_error(e, ec, "resident decoder weight overflow");
+        return false;
+    }
+    size_t weight_bytes = 0u;
+    if (!decoder_mul(weight_count, sizeof(float), &weight_bytes) ||
+        cached_weight(decoder->backend, weights->weight, weight_bytes,
+                      &op.weight, e, ec)) return false;
+    size_t bias_bytes = 0u;
+    if (weights->bias != nullptr &&
+        (!decoder_mul(out_channels, sizeof(float), &bias_bytes) ||
+         cached_weight(decoder->backend, weights->bias, bias_bytes, &op.bias,
+                       e, ec))) return false;
+
+    size_t n = 0u;
+    size_t bytes = 0u;
+    if (kind == CUDA_DECODER_CONVTR) {
+        if (op.tail > 0u) {
+            if (!decoder_mul(out_channels, op.tail, &n) ||
+                !decoder_mul(n, sizeof(float), &bytes) ||
+                ce(cudaMalloc(&op.partial, bytes), e, ec) ||
+                ce(cudaMemset(op.partial, 0, bytes), e, ec)) {
+                decoder_free_op(&op);
+                return false;
+            }
+        }
+        if (!decoder_mul(out_channels, op.max_full_len, &n) ||
+            !decoder_mul(n, sizeof(float), &bytes) ||
+            ce(cudaMalloc(&op.full, bytes), e, ec) ||
+            ce(cudaMemset(op.full, 0, bytes), e, ec)) {
+            decoder_free_op(&op);
+            return false;
+        }
+    } else if (op.tail > 0u) {
+        size_t window_len = 0u;
+        if (!decoder_mul(in_channels, op.tail, &n) ||
+            !decoder_mul(n, sizeof(float), &bytes) ||
+            ce(cudaMalloc(&op.previous, bytes), e, ec) ||
+            ce(cudaMemset(op.previous, 0, bytes), e, ec) ||
+            !decoder_add(op.tail, max_in_len, &window_len) ||
+            !decoder_mul(in_channels, window_len, &n) ||
+            !decoder_mul(n, sizeof(float), &bytes) ||
+            ce(cudaMalloc(&op.window, bytes), e, ec) ||
+            ce(cudaMemset(op.window, 0, bytes), e, ec)) {
+            decoder_free_op(&op);
+            return false;
+        }
+    }
+    try {
+        decoder->ops.push_back(op);
+    } catch (const std::bad_alloc &) {
+        decoder_free_op(&op);
+        throw;
+    }
+    return true;
+}
+
+static int decoder_build(mynah_backend_decoder *decoder,
+                         const mynah_backend_decoder_desc *desc,
+                         char *e, size_t ec) {
+    if (desc->channels == 0u || desc->dimension == 0u ||
+        desc->n_filters == 0u || desc->n_ratios == 0u || desc->ratios == nullptr ||
+        desc->kernel_size == 0u || desc->last_kernel_size == 0u ||
+        desc->compress == 0u || desc->first.weight == nullptr ||
+        desc->last.weight == nullptr || desc->convtr == nullptr ||
+        (desc->n_residual_layers > 0u && desc->blocks == nullptr)) {
+        set_error(e, ec, "incomplete resident decoder descriptor");
+        return -1;
+    }
+    size_t stage_ops = 0u;
+    size_t block_ops = 0u;
+    size_t op_capacity = 0u;
+    if (!decoder_mul(desc->n_residual_layers, 3u, &block_ops) ||
+        !decoder_add(block_ops, 1u, &stage_ops) ||
+        !decoder_mul(desc->n_ratios, stage_ops, &op_capacity) ||
+        !decoder_add(op_capacity, 2u, &op_capacity)) {
+        set_error(e, ec, "resident decoder topology size overflow");
+        return -1;
+    }
+    try {
+        decoder->ops.reserve(op_capacity);
+    } catch (const std::bad_alloc &) {
+        set_error(e, ec, "out of memory reserving resident decoder topology");
+        return -1;
+    }
+    size_t mult = 1u;
+    for (size_t i = 0; i < desc->n_ratios; ++i) {
+        if (desc->ratios[i] == 0u || !decoder_mul(mult, 2u, &mult)) {
+            set_error(e, ec, "invalid resident decoder ratio");
+            return -1;
+        }
+    }
+    size_t channels_here = 0u;
+    if (!decoder_mul(mult, desc->n_filters, &channels_here)) {
+        set_error(e, ec, "resident decoder channel overflow");
+        return -1;
+    }
+    size_t length = decoder->max_encoder_frames;
+    size_t max_work = 0u;
+    size_t max_columns = 0u;
+    if (!decoder_add_op(decoder, CUDA_DECODER_CONV, 0, desc->dimension,
+                        channels_here, desc->kernel_size, 1u, 1u, 1u, length,
+                        &desc->first, &max_work, &max_columns, e, ec)) return -1;
+    for (size_t stage = 0; stage < desc->n_ratios; ++stage) {
+        const size_t ratio = desc->ratios[stage];
+        if (channels_here < 2u || channels_here % 2u != 0u) {
+            set_error(e, ec, "resident decoder stage channel count is invalid");
+            return -1;
+        }
+        const size_t out_channels = channels_here / 2u;
+        size_t convtr_kernel = 0u;
+        if (!decoder_mul(ratio, 2u, &convtr_kernel)) {
+            set_error(e, ec, "resident decoder kernel shape overflow");
+            return -1;
+        }
+        if (!decoder_add_op(decoder, CUDA_DECODER_CONVTR, 1,
+                            channels_here, out_channels, convtr_kernel, ratio,
+                            1u, 1u, length, &desc->convtr[stage], &max_work,
+                            &max_columns, e, ec)) return -1;
+        if (!decoder_mul(length, ratio, &length)) {
+            set_error(e, ec, "resident decoder length overflow");
+            return -1;
+        }
+        for (size_t layer = 0; layer < desc->n_residual_layers; ++layer) {
+            if (out_channels % desc->compress != 0u) {
+                set_error(e, ec, "resident decoder compress does not divide channels");
+                return -1;
+            }
+            const size_t hidden = out_channels / desc->compress;
+            size_t dilation = 1u;
+            for (size_t d = 0; d < layer; ++d) {
+                if (!decoder_mul(dilation, desc->dilation_base, &dilation)) {
+                    set_error(e, ec, "resident decoder dilation overflow");
+                    return -1;
+                }
+            }
+            const size_t block = stage * desc->n_residual_layers + layer;
+            if (!decoder_add_op(decoder, CUDA_DECODER_CONV, 0,
+                                out_channels, hidden, desc->residual_kernel_size,
+                                1u, dilation, 1u, length,
+                                &desc->blocks[block].conv1, &max_work,
+                                &max_columns, e, ec) ||
+                !decoder_add_op(decoder, CUDA_DECODER_CONV, 0,
+                                hidden, out_channels, 1u, 1u, 1u, 1u, length,
+                                &desc->blocks[block].conv2, &max_work,
+                                &max_columns, e, ec)) return -1;
+            /* Replace the two conv ops with one explicit residual op marker.
+             * The two stateful conv objects remain the final two entries; the
+             * execution loop consumes this topology through the marker below. */
+            cuda_decoder_op rb1 = decoder->ops[decoder->ops.size() - 2u];
+            cuda_decoder_op rb2 = decoder->ops[decoder->ops.size() - 1u];
+            decoder->ops.resize(decoder->ops.size() - 2u);
+            cuda_decoder_op marker{};
+            marker.kind = CUDA_DECODER_RESBLOCK;
+            marker.pre_elu = 0;
+            marker.in_channels = rb1.in_channels;
+            marker.out_channels = rb1.out_channels;
+            marker.kernel = rb1.kernel;
+            marker.stride = rb1.stride;
+            marker.dilation = rb1.dilation;
+            marker.groups = 1;
+            marker.max_in_len = length;
+            /* The marker owns rb1/rb2 by storing them in adjacent vector
+             * entries immediately after it. This keeps the execution order
+             * explicit without allocating a second topology structure. */
+            decoder->ops.push_back(marker);
+            decoder->ops.push_back(rb1);
+            decoder->ops.push_back(rb2);
+        }
+        channels_here = out_channels;
+    }
+    if (channels_here != desc->n_filters) {
+        set_error(e, ec, "resident decoder final channel count mismatch");
+        return -1;
+    }
+    if (!decoder_add_op(decoder, CUDA_DECODER_CONV, 1, desc->n_filters,
+                        desc->channels, desc->last_kernel_size, 1u, 1u, 1u,
+                        length, &desc->last, &max_work, &max_columns, e, ec))
+        return -1;
+    decoder->work_floats = max_work;
+    decoder->columns_floats = max_columns;
+    return 0;
+}
+
+static int decoder_alloc_workspace(mynah_backend_decoder *decoder,
+                                   char *e, size_t ec) {
+    if (decoder->work_floats == 0u || decoder->columns_floats == 0u) {
+        set_error(e, ec, "resident decoder workspace is empty");
+        return -1;
+    }
+    size_t work_bytes = 0u;
+    size_t columns_bytes = 0u;
+    if (!decoder_mul(decoder->work_floats, sizeof(float), &work_bytes) ||
+        !decoder_mul(decoder->columns_floats, sizeof(float), &columns_bytes)) {
+        set_error(e, ec, "resident decoder workspace size overflow");
+        return -1;
+    }
+    if (ce(cudaMalloc(&decoder->work_a, work_bytes), e, ec) ||
+        ce(cudaMalloc(&decoder->work_b, work_bytes), e, ec) ||
+        ce(cudaMalloc(&decoder->work_c, work_bytes), e, ec) ||
+        ce(cudaMalloc(&decoder->columns, columns_bytes), e, ec)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* The one-GEMM decoder shares two backend buffers sized for the widest gang
+ * the batch metadata allows. They are reserved when a decoder opens, because
+ * a batched call may be captured into a graph, where nothing can allocate. */
+static bool decoder_convtr_gemm_enabled(void) {
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_CONVTR_GEMM", true);
+    return on;
+}
+
+static int decoder_reserve_one_gemm(cuda_backend_state *st,
+                                    const mynah_backend_decoder *decoder,
+                                    char *e, size_t ec) {
+    if (decoder_convtr_gemm_enabled()) {
+        size_t x_need = 0u, y_need = 0u;
+        for (const auto &op : decoder->ops) {
+            if (op.kind != CUDA_DECODER_CONVTR || op.groups != 1) continue;
+            const size_t n = st->batch_meta_cap * op.max_in_len;
+            const size_t x = (size_t)op.in_channels * n;
+            const size_t y = (size_t)op.out_channels * (size_t)op.kernel * n;
+            if (x > x_need) x_need = x;
+            if (y > y_need) y_need = y;
+        }
+        if (x_need > st->dec_tr_x_cap) {
+            cudaFree(st->dec_tr_x);
+            st->dec_tr_x = nullptr;
+            st->dec_tr_x_cap = 0u;
+            if (ce(cudaMalloc(&st->dec_tr_x, x_need * sizeof(float)), e, ec)) return -1;
+            st->dec_tr_x_cap = x_need;
+        }
+        if (y_need > st->dec_tr_y_cap) {
+            cudaFree(st->dec_tr_y);
+            st->dec_tr_y = nullptr;
+            st->dec_tr_y_cap = 0u;
+            if (ce(cudaMalloc(&st->dec_tr_y, y_need * sizeof(float)), e, ec)) return -1;
+            st->dec_tr_y_cap = y_need;
+        }
+    }
+    if (!cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false)) return 0;
+    size_t cols = 0u, out = 0u;
+    if (!decoder_mul(decoder->columns_floats, st->batch_meta_cap, &cols) ||
+        !decoder_mul(decoder->work_floats, st->batch_meta_cap, &out)) {
+        set_error(e, ec, "decoder one-GEMM reservation overflow");
+        return -1;
+    }
+    if (cols > st->dec_cols_cap) {
+        cudaFree(st->dec_cols);
+        st->dec_cols = nullptr;
+        st->dec_cols_cap = 0u;
+        if (ce(cudaMalloc(&st->dec_cols, cols * sizeof(float)), e, ec)) return -1;
+        st->dec_cols_cap = cols;
+    }
+    if (out > st->dec_out_cap) {
+        cudaFree(st->dec_out);
+        st->dec_out = nullptr;
+        st->dec_out_cap = 0u;
+        if (ce(cudaMalloc(&st->dec_out, out * sizeof(float)), e, ec)) return -1;
+        st->dec_out_cap = out;
+    }
+    return 0;
+}
+
+static int decoder_conv1d(mynah_backend_decoder *decoder, cuda_decoder_op *op,
+                          const float *input, float *output, size_t length,
+                          char *e, size_t ec) {
+    if (length == 0u || length > op->max_in_len || op->stride != 1 ||
+        length % (size_t)op->stride != 0u)
+        return -1;
+    const size_t out_len = length / (size_t)op->stride;
+    const size_t window_len = op->tail + length;
+    const float *source = input;
+    if (op->tail > 0u) {
+        const size_t total = (size_t)op->in_channels * window_len;
+        k_decoder_causal_window<<<((int)total + 255) / 256, 256,
+                                  0, decoder->backend->stream>>>(
+            op->previous, input, op->window, op->in_channels, (int)length,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        source = op->window;
+    }
+    const size_t inner = (size_t)op->in_channels * (size_t)op->kernel;
+    const size_t columns = inner * out_len;
+    k_decoder_causal_columns<<<((int)columns + 255) / 256, 256,
+                               0, decoder->backend->stream>>>(
+        source, decoder->columns, op->in_channels, (int)out_len, op->kernel,
+        op->dilation, op->stride, (int)op->tail);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (op->bias != nullptr) {
+        k_broadcast_bias<<<((int)((size_t)op->out_channels * out_len) + 255) / 256,
+                           256, 0, decoder->backend->stream>>>(
+            output, op->bias, op->out_channels, (int)out_len);
+    } else if (ce(cudaMemsetAsync(output, 0,
+                                  (size_t)op->out_channels * out_len * sizeof(float),
+                                  decoder->backend->stream), e, ec)) return -1;
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    if (cbe(cublasGemmEx(decoder->backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                         (int)out_len, op->out_channels, (int)inner,
+                         &alpha, decoder->columns, CUDA_R_32F, (int)out_len,
+                         op->weight, CUDA_R_32F, (int)inner, &beta, output,
+                         CUDA_R_32F, (int)out_len,
+                         cuda_compute_type(decoder->backend),
+                         cuda_gemm_algo(decoder->backend)), e, ec)) return -1;
+    if (op->tail > 0u) {
+        const size_t total = (size_t)op->in_channels * op->tail;
+        k_decoder_copy_tail<<<((int)total + 255) / 256, 256,
+                              0, decoder->backend->stream>>>(
+            op->window, op->previous, op->in_channels, (int)length,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    return 0;
+}
+
+static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
+                          const float *input, float *output, size_t length,
+                          char *e, size_t ec) {
+    if (length == 0u || length > op->max_in_len) return -1;
+    const size_t output_len = length * (size_t)op->stride;
+    const size_t full_len = output_len + op->tail;
+    const size_t total = (size_t)op->out_channels * full_len;
+    k_conv_transpose<<<((int)total + 255) / 256, 256, 0, decoder->backend->stream>>>(
+        input, op->weight, op->bias, op->full, op->in_channels,
+        op->out_channels, (int)length, (int)full_len, op->kernel, op->stride,
+        op->groups);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (op->tail > 0u) {
+        const size_t state = (size_t)op->out_channels * op->tail;
+        k_decoder_convtr_fold_save<<<((int)state + 255) / 256, 256,
+                                     0, decoder->backend->stream>>>(
+            op->full, op->partial, op->bias, op->out_channels, (int)full_len,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    k_decoder_copy_prefix<<<((int)((size_t)op->out_channels * output_len) + 255) / 256,
+                            256, 0, decoder->backend->stream>>>(
+        op->full, output, op->out_channels, (int)full_len, (int)output_len);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+/* These helpers are defined with the graph-cache utilities below, but the
+ * pointer-table upload path is the first place that needs them.  Keep the
+ * declarations here so the CUDA translation unit remains valid with both the
+ * older and newer toolkit front ends. */
+static float **decoder_graph_table(cuda_decoder_batch_graph_entry *entry,
+                                   size_t slot, size_t channel);
+static float **decoder_graph_host_table(cuda_decoder_batch_graph_entry *entry,
+                                        size_t slot, size_t channel);
+static size_t decoder_table_channel(const cuda_backend_state *backend,
+                                    float **device);
+
+static int decoder_upload_ptrs(cuda_backend_state *backend, float **device,
+                               float *const *host, size_t batch, char *e,
+                               size_t ec) {
+    if (backend == nullptr || device == nullptr || host == nullptr ||
+        batch == 0u || batch > backend->batch_meta_cap) {
+        set_error(e, ec, "invalid resident decoder pointer table");
+        return -1;
+    }
+    cuda_decoder_batch_graph_entry *graph =
+        backend->active_decoder_batch_graph;
+    if (graph != nullptr) {
+        const size_t channel = decoder_table_channel(backend, device);
+        if (channel >= 4u || batch != graph->batch ||
+            backend->active_decoder_upload_slot >= graph->upload_slots) {
+            set_error(e, ec, "resident decoder graph pointer-table overflow");
+            return -1;
+        }
+        const size_t slot = backend->active_decoder_upload_slot++;
+        float **host_table = decoder_graph_host_table(graph, slot, channel);
+        std::memcpy(host_table, host, batch * sizeof(*host));
+        float **device_table = decoder_graph_table(graph, slot, channel);
+        backend->active_decoder_tables[channel] = device_table;
+        return ce(cudaMemcpyAsync(device_table, host_table,
+                                  batch * sizeof(*host),
+                                  cudaMemcpyHostToDevice, backend->stream),
+                  e, ec);
+    }
+    return ce(cudaMemcpyAsync(device, host, batch * sizeof(*host),
+                              cudaMemcpyHostToDevice, backend->stream),
+              e, ec);
+}
+
+static bool decoder_batch_launch_range(size_t elements, int *blocks) {
+    if (elements == 0u || elements > (size_t)INT_MAX) return false;
+    size_t rounded = 0u;
+    if (!decoder_add(elements, 255u, &rounded)) return false;
+    const size_t count = rounded / 256u;
+    if (count == 0u || count > (size_t)INT_MAX) return false;
+    *blocks = (int)count;
+    return true;
+}
+
+static bool decoder_ops_compatible(const cuda_decoder_op *a,
+                                   const cuda_decoder_op *b) {
+    return a != nullptr && b != nullptr && a->kind == b->kind &&
+           a->pre_elu == b->pre_elu && a->in_channels == b->in_channels &&
+           a->out_channels == b->out_channels && a->kernel == b->kernel &&
+           a->stride == b->stride && a->dilation == b->dilation &&
+           a->groups == b->groups && a->max_in_len == b->max_in_len &&
+           a->tail == b->tail && a->max_full_len == b->max_full_len &&
+           a->weight == b->weight && a->bias == b->bias;
+}
+
+static bool cuda_decoder_graphs_enabled(void) {
+    return cuda_env_enabled("MYNAH_CUDA_DECODER_GRAPHS", true);
+}
+
+static bool cuda_decoder_graph_reuse_enabled(void) {
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_GRAPH_REUSE", true);
+    return on;
+}
+
+static size_t decoder_conv1d_upload_count(const cuda_decoder_op *op) {
+    /* causal-window pointers, columns pointers, output/weight pointers and
+     * the tail copy pointers; the tail-free case has no window or tail copy. */
+    return op != nullptr && op->tail > 0u ? 9u : 4u;
+}
+
+static size_t decoder_convtr_upload_count(const cuda_decoder_op *op) {
+    /* full-input/output, optional partial-tail fold, final prefix output. */
+    return op != nullptr ? 4u + (op->tail > 0u ? 2u : 0u) : 0u;
+}
+
+/* Count the pointer-table uploads made by decoder_step_batch_impl.  The count
+ * is used before capture to reserve stable metadata storage; allocating during
+ * CUDA stream capture is illegal. */
+static bool decoder_batch_upload_bound(const mynah_backend_decoder *decoder,
+                                       size_t *out) {
+    if (decoder == nullptr || out == nullptr || decoder->ops.empty()) return false;
+    size_t count = 0u;
+    for (size_t index = 0u; index < decoder->ops.size();) {
+        const cuda_decoder_op *op = &decoder->ops[index++];
+        size_t add = 0u;
+        if (op->kind == CUDA_DECODER_RESBLOCK) {
+            if (index + 1u >= decoder->ops.size()) return false;
+            const cuda_decoder_op *rb1 = &decoder->ops[index++];
+            const cuda_decoder_op *rb2 = &decoder->ops[index++];
+            add = 2u + decoder_conv1d_upload_count(rb1) + 2u +
+                  decoder_conv1d_upload_count(rb2) + 2u;
+        } else {
+            add = (op->pre_elu != 0 ? 2u : 0u) +
+                  (op->kind == CUDA_DECODER_CONV
+                       ? decoder_conv1d_upload_count(op)
+                       : op->kind == CUDA_DECODER_CONVTR
+                             ? decoder_convtr_upload_count(op)
+                             : 0u);
+        }
+        if (!decoder_add(count, add, &count)) return false;
+    }
+    *out = count;
+    return count != 0u;
+}
+
+static void decoder_batch_graph_free(cuda_decoder_batch_graph_entry *entry) {
+    if (entry == nullptr) return;
+    if (entry->exec != nullptr) cudaGraphExecDestroy(entry->exec);
+    if (entry->graph != nullptr) cudaGraphDestroy(entry->graph);
+    if (entry->device_tables != nullptr) cudaFree(entry->device_tables);
+    if (entry->host_tables != nullptr) cudaFreeHost(entry->host_tables);
+    if (entry->done != nullptr) cudaEventDestroy(entry->done);
+    entry->done = nullptr;
+    entry->exec = nullptr;
+    entry->graph = nullptr;
+    entry->device_tables = nullptr;
+    entry->host_tables = nullptr;
+    delete entry;
+}
+
+static void decoder_batch_graph_remove(cuda_backend_state *backend,
+                                       cuda_decoder_batch_graph_entry *entry) {
+    if (backend == nullptr || entry == nullptr) return;
+    for (size_t i = 0u; i < backend->decoder_batch_graphs.size(); ++i) {
+        if (backend->decoder_batch_graphs[i] != entry) continue;
+        backend->decoder_batch_graphs.erase(
+            backend->decoder_batch_graphs.begin() + i);
+        decoder_batch_graph_free(entry);
+        return;
+    }
+}
+
+static void destroy_decoder_batch_graphs(cuda_backend_state *backend) {
+    if (backend == nullptr) return;
+    for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs)
+        decoder_batch_graph_free(entry);
+    backend->decoder_batch_graphs.clear();
+    backend->active_decoder_batch_graph = nullptr;
+    backend->active_decoder_upload_slot = 0u;
+    for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
+}
+
+static void destroy_decoder_batch_graphs_for(
+    cuda_backend_state *backend, const mynah_backend_decoder *decoder) {
+    if (backend == nullptr || decoder == nullptr) return;
+    for (size_t i = 0u; i < backend->decoder_batch_graphs.size();) {
+        cuda_decoder_batch_graph_entry *entry =
+            backend->decoder_batch_graphs[i];
+        bool hit = false;
+        for (mynah_backend_decoder *row : entry->decoders) {
+            if (row == decoder) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            ++i;
+            continue;
+        }
+        if (cuda_decoder_graph_reuse_enabled() && entry->valid &&
+            entry->done != nullptr) {
+            /* Keep the executable graph; only its rows go stale.  The next
+             * gang of this width rewrites the tables before any launch. */
+            entry->decoders.clear();
+            entry->inputs.clear();
+            entry->outputs.clear();
+            ++i;
+            continue;
+        }
+        backend->decoder_batch_graphs.erase(
+            backend->decoder_batch_graphs.begin() + i);
+        decoder_batch_graph_free(entry);
+    }
+}
+
+static cuda_decoder_batch_graph_entry *find_decoder_batch_graph(
+    cuda_backend_state *backend, mynah_backend_decoder *const *decoders,
+    const float *const *inputs, float *const *outputs, size_t batch,
+    size_t encoder_frames) {
+    if (backend == nullptr || decoders == nullptr || inputs == nullptr ||
+        outputs == nullptr) return nullptr;
+    for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs) {
+        if (!entry->valid || entry->batch != batch ||
+            entry->encoder_frames != encoder_frames ||
+            entry->decoders.size() != batch)
+            continue;
+        bool same = true;
+        for (size_t i = 0u; i < batch; ++i) {
+            if (entry->decoders[i] != decoders[i] ||
+                entry->inputs[i] != inputs[i] ||
+                entry->outputs[i] != outputs[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return entry;
+    }
+    return nullptr;
+}
+
+static cuda_decoder_batch_graph_entry *find_decoder_batch_graph_shape(
+    cuda_backend_state *backend, const mynah_backend_decoder *first,
+    size_t batch, size_t encoder_frames) {
+    if (backend == nullptr || first == nullptr || first->ops.empty())
+        return nullptr;
+    for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs) {
+        if (entry->valid && entry->done != nullptr && entry->batch == batch &&
+            entry->encoder_frames == encoder_frames &&
+            entry->sig_ops == first->ops.size() &&
+            entry->sig_weight == first->ops[0].weight)
+            return entry;
+    }
+    return nullptr;
+}
+
+static cuda_decoder_batch_graph_entry *decoder_batch_graph_create(
+    cuda_backend_state *backend, mynah_backend_decoder *const *decoders,
+    const float *const *inputs, float *const *outputs, size_t batch,
+    size_t encoder_frames, char *e, size_t ec) {
+    if (backend == nullptr || decoders == nullptr || inputs == nullptr ||
+        outputs == nullptr || batch < 2u || batch > backend->batch_meta_cap ||
+        backend->decoder_batch_graphs.size() >= CUDA_DECODER_GRAPH_CAP)
+        return nullptr;
+    size_t upload_slots = 0u;
+    if (!decoder_batch_upload_bound(decoders[0], &upload_slots) ||
+        upload_slots > 4096u) return nullptr;
+    size_t table_count = 0u;
+    size_t table_bytes = 0u;
+    if (!decoder_mul(upload_slots, 4u, &table_count) ||
+        !decoder_mul(table_count, batch, &table_count) ||
+        !decoder_mul(table_count, sizeof(float *), &table_bytes)) {
+        set_error(e, ec, "resident decoder graph metadata size overflow");
+        return nullptr;
+    }
+    auto *entry = new (std::nothrow) cuda_decoder_batch_graph_entry();
+    if (entry == nullptr) {
+        set_error(e, ec, "out of memory creating resident decoder graph");
+        return nullptr;
+    }
+    entry->batch = batch;
+    entry->encoder_frames = encoder_frames;
+    entry->graph = nullptr;
+    entry->exec = nullptr;
+    entry->device_tables = nullptr;
+    entry->host_tables = nullptr;
+    entry->upload_slots = upload_slots;
+    entry->used_slots = 0u;
+    entry->sig_ops = decoders[0]->ops.size();
+    entry->sig_weight = decoders[0]->ops[0].weight;
+    entry->done = nullptr;
+    entry->valid = false;
+    try {
+        entry->decoders.assign(decoders, decoders + batch);
+        entry->inputs.assign(inputs, inputs + batch);
+        entry->outputs.assign(outputs, outputs + batch);
+    } catch (const std::bad_alloc &) {
+        decoder_batch_graph_free(entry);
+        set_error(e, ec, "out of memory storing resident decoder graph rows");
+        return nullptr;
+    }
+    if (ce(cudaMalloc((void **)&entry->device_tables, table_bytes), e, ec) != 0 ||
+        ce(cudaHostAlloc((void **)&entry->host_tables, table_bytes,
+                         cudaHostAllocPortable), e, ec) != 0) {
+        decoder_batch_graph_free(entry);
+        return nullptr;
+    }
+    std::memset(entry->host_tables, 0, table_bytes);
+    try {
+        backend->decoder_batch_graphs.push_back(entry);
+    } catch (const std::bad_alloc &) {
+        decoder_batch_graph_free(entry);
+        set_error(e, ec, "out of memory indexing resident decoder graphs");
+        return nullptr;
+    }
+    return entry;
+}
+
+static float **decoder_graph_table(cuda_decoder_batch_graph_entry *entry,
+                                   size_t slot, size_t channel) {
+    return entry->device_tables +
+           (slot * 4u + channel) * entry->batch;
+}
+
+static float **decoder_graph_host_table(cuda_decoder_batch_graph_entry *entry,
+                                        size_t slot, size_t channel) {
+    return entry->host_tables +
+           (slot * 4u + channel) * entry->batch;
+}
+
+static size_t decoder_table_channel(const cuda_backend_state *backend,
+                                    float **device) {
+    if (backend == nullptr || device == nullptr) return SIZE_MAX;
+    if (device == backend->dev_decoder_ptr0) return 0u;
+    if (device == backend->dev_decoder_ptr1) return 1u;
+    if (device == backend->dev_decoder_ptr2) return 2u;
+    if (device == backend->dev_decoder_ptr3) return 3u;
+    return SIZE_MAX;
+}
+
+static float **decoder_current_table(const cuda_backend_state *backend,
+                                     float **ordinary) {
+    const size_t channel = decoder_table_channel(backend, ordinary);
+    if (backend != nullptr && channel < 4u &&
+        backend->active_decoder_batch_graph != nullptr &&
+        backend->active_decoder_tables[channel] != nullptr)
+        return backend->active_decoder_tables[channel];
+    return ordinary;
+}
+
+static int decoder_elu_batch(cuda_backend_state *backend,
+                             float *const *inputs, float *const *outputs,
+                             size_t batch, size_t elements, float alpha,
+                             char *e, size_t ec) {
+    size_t total = 0u;
+    int blocks = 0;
+    if (!decoder_mul(batch, elements, &total) ||
+        !decoder_batch_launch_range(total, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, inputs, batch,
+                            e, ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, outputs, batch,
+                            e, ec) != 0)
+        return -1;
+    k_decoder_elu_batch<<<blocks, 256, 0, backend->stream>>>(
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
+        (int)elements, alpha);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int decoder_residual_batch(cuda_backend_state *backend,
+                                  float *const *base, float *const *add,
+                                  size_t batch, size_t elements, char *e,
+                                  size_t ec) {
+    size_t total = 0u;
+    int blocks = 0;
+    if (!decoder_mul(batch, elements, &total) ||
+        !decoder_batch_launch_range(total, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, base, batch,
+                            e, ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, add, batch,
+                            e, ec) != 0)
+        return -1;
+    k_decoder_residual_batch<<<blocks, 256, 0, backend->stream>>>(
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
+        (int)elements);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int decoder_conv1d_batch(cuda_backend_state *backend,
+                                mynah_backend_decoder *const *decoders,
+                                cuda_decoder_op *const *ops,
+                                float *const *inputs, float *const *outputs,
+                                size_t batch, size_t length, char *e,
+                                size_t ec) {
+    if (backend == nullptr || decoders == nullptr || ops == nullptr ||
+        inputs == nullptr ||
+        outputs == nullptr || batch == 0u || batch > backend->batch_meta_cap ||
+        decoders[0] == nullptr || ops[0] == nullptr || length == 0u ||
+        length > ops[0]->max_in_len || ops[0]->stride != 1 ||
+        length % (size_t)ops[0]->stride != 0u)
+        return -1;
+    cuda_decoder_op *op = ops[0];
+    const size_t out_len = length / (size_t)op->stride;
+    size_t window_len = 0u;
+    size_t window_elements = 0u;
+    size_t inner = 0u;
+    size_t columns = 0u;
+    size_t output_elements = 0u;
+    if (!decoder_add(op->tail, length, &window_len) ||
+        !decoder_mul((size_t)op->in_channels, (size_t)op->kernel, &inner) ||
+        !decoder_mul(inner, out_len, &columns) ||
+        !decoder_mul((size_t)op->out_channels, out_len, &output_elements) ||
+        !decoder_mul(window_len, (size_t)op->in_channels, &window_elements) ||
+        !decoder_mul(batch, window_elements, &window_elements) ||
+        !decoder_mul(batch, columns, &columns) ||
+        !decoder_mul(batch, output_elements, &output_elements)) {
+        set_error(e, ec, "resident decoder batched conv shape overflow");
+        return -1;
+    }
+    if (window_elements > (size_t)INT_MAX || columns > (size_t)INT_MAX ||
+        output_elements > (size_t)INT_MAX)
+        return -1;
+
+    float *p0[CUDA_BATCH_META_CAP];
+    float *p1[CUDA_BATCH_META_CAP];
+    float *p2[CUDA_BATCH_META_CAP];
+    float *p3[CUDA_BATCH_META_CAP];
+    if (op->tail > 0u) {
+        for (size_t i = 0; i < batch; ++i) {
+            if (ops[i] == nullptr || ops[i]->window == nullptr ||
+                ops[i]->previous == nullptr)
+                return -1;
+            p0[i] = ops[i]->previous;
+            p1[i] = inputs[i];
+            p2[i] = ops[i]->window;
+        }
+        int blocks = 0;
+        if (!decoder_batch_launch_range(window_elements, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch,
+                                e, ec) != 0)
+            return -1;
+        k_decoder_causal_window_batch<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            decoder_current_table(backend, backend->dev_decoder_ptr1),
+            decoder_current_table(backend, backend->dev_decoder_ptr2),
+            (int)batch, op->in_channels, (int)length,
+            (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+        for (size_t i = 0; i < batch; ++i) p0[i] = ops[i]->window;
+    } else {
+        for (size_t i = 0; i < batch; ++i) p0[i] = inputs[i];
+    }
+    static const bool one_gemm = cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false);
+    if (one_gemm && batch > 1u) {
+        size_t cols_need = 0u, out_need = 0u;
+        if (!decoder_mul(inner, batch * out_len, &cols_need) ||
+            !decoder_mul((size_t)op->out_channels, batch * out_len, &out_need))
+            return -1;
+        if (cols_need > backend->dec_cols_cap || out_need > backend->dec_out_cap) {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(backend->stream, &capture) != cudaSuccess ||
+                capture != cudaStreamCaptureStatusNone) {
+                set_error(e, ec, "decoder one-GEMM buffers cannot grow in a capture");
+                return -1;
+            }
+            if (cols_need > backend->dec_cols_cap) {
+                cudaFree(backend->dec_cols);
+                backend->dec_cols = nullptr;
+                backend->dec_cols_cap = 0u;
+                if (ce(cudaMalloc(&backend->dec_cols, cols_need * sizeof(float)), e, ec))
+                    return -1;
+                backend->dec_cols_cap = cols_need;
+            }
+            if (out_need > backend->dec_out_cap) {
+                cudaFree(backend->dec_out);
+                backend->dec_out = nullptr;
+                backend->dec_out_cap = 0u;
+                if (ce(cudaMalloc(&backend->dec_out, out_need * sizeof(float)), e, ec))
+                    return -1;
+                backend->dec_out_cap = out_need;
+            }
+        }
+        for (size_t i = 0; i < batch; ++i) p2[i] = outputs[i];
+        int blocks = 0;
+        if (!decoder_batch_launch_range(columns, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                                ec) != 0)
+            return -1;
+        k_decoder_causal_columns_shared<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            backend->dec_cols, (int)batch, op->in_channels, (int)out_len,
+            op->kernel, op->dilation, op->stride, (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0 ||
+            cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+            return -1;
+        const float alpha = 1.0f, beta = 0.0f;
+        const int m = (int)(batch * out_len);
+        if (cbe(cublasSgemm(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m,
+                            op->out_channels, (int)inner, &alpha,
+                            backend->dec_cols, m, op->weight, (int)inner, &beta,
+                            backend->dec_out, m),
+                e, ec) != 0)
+            return -1;
+        if (!decoder_batch_launch_range(output_elements, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch, e,
+                                ec) != 0)
+            return -1;
+        k_decoder_scatter_bias<<<blocks, 256, 0, backend->stream>>>(
+            backend->dec_out,
+            decoder_current_table(backend, backend->dev_decoder_ptr2), op->bias,
+            (int)batch, op->out_channels, (int)out_len);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    } else {
+    for (size_t i = 0; i < batch; ++i) {
+        if (decoders[i] == nullptr || decoders[i]->columns == nullptr ||
+            ops[i] == nullptr)
+            return -1;
+        p1[i] = decoders[i]->columns;
+        p2[i] = outputs[i];
+        p3[i] = op->weight;
+    }
+    int blocks = 0;
+    if (!decoder_batch_launch_range(columns, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                            ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
+                            ec) != 0)
+        return -1;
+    k_decoder_causal_columns_batch<<<blocks, 256, 0, backend->stream>>>(
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
+        op->in_channels, (int)out_len, op->kernel, op->dilation, op->stride,
+        (int)op->tail);
+    if (ce(cudaGetLastError(), e, ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch, e,
+                            ec) != 0)
+        return -1;
+    if (!decoder_batch_launch_range(output_elements, &blocks)) return -1;
+    k_decoder_bias_batch<<<blocks, 256, 0, backend->stream>>>(
+        decoder_current_table(backend, backend->dev_decoder_ptr2), op->bias,
+        (int)batch, op->out_channels,
+        (int)out_len);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr3, p3, batch, e,
+                            ec) != 0 ||
+        cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+        return -1;
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    if (cbe(cublasSgemmBatched(
+                backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                (int)out_len, op->out_channels, (int)inner, &alpha,
+                (const float *const *)decoder_current_table(
+                    backend, backend->dev_decoder_ptr1), (int)out_len,
+                (const float *const *)decoder_current_table(
+                    backend, backend->dev_decoder_ptr3), (int)inner,
+                &beta, decoder_current_table(backend, backend->dev_decoder_ptr2),
+                (int)out_len,
+                (int)batch),
+            e, ec) != 0)
+        return -1;
+    }
+    if (op->tail > 0u) {
+        int blocks = 0;
+        for (size_t i = 0; i < batch; ++i) {
+            p0[i] = ops[i]->window;
+            p1[i] = ops[i]->previous;
+        }
+        if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch,
+                                e, ec) != 0)
+            return -1;
+        size_t tail_elements = 0u;
+        if (!decoder_mul(batch, (size_t)op->in_channels, &tail_elements) ||
+            !decoder_mul(tail_elements, op->tail, &tail_elements))
+            return -1;
+        if (!decoder_batch_launch_range(tail_elements, &blocks)) return -1;
+        k_decoder_copy_tail_batch<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            decoder_current_table(backend, backend->dev_decoder_ptr1),
+            (int)batch,
+            op->in_channels, (int)length, (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    }
+    return 0;
+}
+
+static int decoder_convtr_batch(cuda_backend_state *backend,
+                                cuda_decoder_op *const *ops,
+                                float *const *inputs, float *const *outputs,
+                                size_t batch, size_t length, char *e,
+                                size_t ec) {
+    if (backend == nullptr || ops == nullptr || inputs == nullptr ||
+        outputs == nullptr || batch == 0u || batch > backend->batch_meta_cap ||
+        ops[0] == nullptr || length == 0u || length > ops[0]->max_in_len)
+        return -1;
+    cuda_decoder_op *op = ops[0];
+    size_t output_len = 0u;
+    size_t full_len = 0u;
+    if (!decoder_mul(length, (size_t)op->stride, &output_len) ||
+        !decoder_add(output_len, op->tail, &full_len)) {
+        set_error(e, ec, "resident decoder batched transpose shape overflow");
+        return -1;
+    }
+    size_t full_elements = 0u;
+    if (!decoder_mul((size_t)op->out_channels, full_len, &full_elements) ||
+        !decoder_mul(batch, full_elements, &full_elements) ||
+        full_elements > (size_t)INT_MAX)
+        return -1;
+    float *p0[CUDA_BATCH_META_CAP];
+    float *p1[CUDA_BATCH_META_CAP];
+    for (size_t i = 0; i < batch; ++i) {
+        if (ops[i] == nullptr || ops[i]->full == nullptr) return -1;
+        p0[i] = inputs[i];
+        p1[i] = ops[i]->full;
+    }
+    int blocks = 0;
+    if (!decoder_batch_launch_range(full_elements, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                            ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
+                            ec) != 0)
+        return -1;
+    const size_t gemm_n = batch * length;
+    if (decoder_convtr_gemm_enabled() && op->groups == 1 &&
+        (size_t)op->in_channels * gemm_n <= backend->dec_tr_x_cap &&
+        (size_t)op->out_channels * (size_t)op->kernel * gemm_n <=
+            backend->dec_tr_y_cap) {
+        const int m = op->out_channels * op->kernel;
+        const int n = (int)gemm_n;
+        const int x_total = op->in_channels * n;
+        k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            backend->dec_tr_x, (int)batch, op->in_channels, (int)length);
+        if (ce(cudaGetLastError(), e, ec) != 0 ||
+            cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+            return -1;
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m, n,
+                             op->in_channels, &alpha, op->weight, CUDA_R_32F, m,
+                             backend->dec_tr_x, CUDA_R_32F, n, &beta,
+                             backend->dec_tr_y, CUDA_R_32F, m,
+                             cuda_compute_type(backend), cuda_gemm_algo(backend)),
+                e, ec) != 0)
+            return -1;
+        k_decoder_convtr_overlap<<<blocks, 256, 0, backend->stream>>>(
+            backend->dec_tr_y,
+            decoder_current_table(backend, backend->dev_decoder_ptr1), op->bias,
+            (int)batch, op->out_channels, (int)length, (int)full_len, op->kernel,
+            op->stride);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    } else {
+    k_decoder_convtr_batch<<<blocks, 256, 0, backend->stream>>>(
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1), op->weight,
+        op->bias, (int)batch, op->in_channels, op->out_channels, (int)length,
+        (int)full_len, op->kernel, op->stride, op->groups);
+    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    }
+    if (op->tail > 0u) {
+        for (size_t i = 0; i < batch; ++i) {
+            p0[i] = ops[i]->full;
+            p1[i] = ops[i]->partial;
+        }
+        size_t tail_elements = 0u;
+        if (!decoder_mul(batch, (size_t)op->out_channels, &tail_elements) ||
+            !decoder_mul(tail_elements, op->tail, &tail_elements) ||
+            !decoder_batch_launch_range(tail_elements, &blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch,
+                                e, ec) != 0 ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch,
+                                e, ec) != 0)
+            return -1;
+        k_decoder_convtr_fold_batch<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            decoder_current_table(backend, backend->dev_decoder_ptr1), op->bias,
+            (int)batch, op->out_channels, (int)full_len, (int)op->tail);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        p0[i] = ops[i]->full;
+        p1[i] = outputs[i];
+    }
+    size_t output_elements = 0u;
+    if (!decoder_mul(batch, (size_t)op->out_channels, &output_elements) ||
+        !decoder_mul(output_elements, output_len, &output_elements) ||
+        !decoder_batch_launch_range(output_elements, &blocks) ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                            ec) != 0 ||
+        decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
+                            ec) != 0)
+        return -1;
+    k_decoder_copy_prefix_batch<<<blocks, 256, 0, backend->stream>>>(
+        decoder_current_table(backend, backend->dev_decoder_ptr0),
+        decoder_current_table(backend, backend->dev_decoder_ptr1),
+        (int)batch,
+        op->out_channels, (int)full_len, (int)output_len);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int decoder_step_impl(mynah_backend_decoder *decoder,
+                             const float *input, size_t encoder_frames,
+                             float *output, char *e, size_t ec) {
+    if (decoder == nullptr || input == nullptr || output == nullptr ||
+        encoder_frames == 0u || encoder_frames > decoder->max_encoder_frames) {
+        set_error(e, ec, "invalid resident decoder step");
+        return -1;
+    }
+    if (cbe(cublasSetStream(decoder->backend->cublas, decoder->backend->stream),
+            e, ec)) return -1;
+    const float *current = input;
+    size_t length = encoder_frames;
+    size_t channels = decoder->dimension;
+    for (size_t index = 0; index < decoder->ops.size();) {
+        cuda_decoder_op *op = &decoder->ops[index++];
+        if (op->kind == CUDA_DECODER_RESBLOCK) {
+            if (index + 1u >= decoder->ops.size()) {
+                set_error(e, ec, "resident decoder residual topology is truncated");
+                return -1;
+            }
+            cuda_decoder_op *rb1 = &decoder->ops[index++];
+            cuda_decoder_op *rb2 = &decoder->ops[index++];
+            const size_t n = channels * length;
+            float *other = current == decoder->work_a ? decoder->work_b
+                         : current == decoder->work_b ? decoder->work_a
+                         : decoder->work_a;
+            k_decoder_elu<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                current, decoder->work_c, decoder->elu_alpha, (int)n);
+            if (ce(cudaGetLastError(), e, ec) ||
+                decoder_conv1d(decoder, rb1, decoder->work_c, other, length, e, ec) != 0)
+                return -1;
+            k_decoder_elu<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                other, other, decoder->elu_alpha, (int)(rb1->out_channels * length));
+            if (ce(cudaGetLastError(), e, ec) ||
+                decoder_conv1d(decoder, rb2, other, decoder->work_c, length, e, ec) != 0)
+                return -1;
+            k_residual_add<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                const_cast<float *>(current), decoder->work_c, (int)n);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+            continue;
+        }
+        const bool last = index == decoder->ops.size();
+        float *destination = last ? output
+                                  : (current == decoder->work_a
+                                         ? decoder->work_b : decoder->work_a);
+        if (op->pre_elu) {
+            const size_t n = channels * length;
+            k_decoder_elu<<<((int)n + 255) / 256, 256, 0, decoder->backend->stream>>>(
+                current, const_cast<float *>(current), decoder->elu_alpha, (int)n);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+        }
+        if (op->kind == CUDA_DECODER_CONV) {
+            if (decoder_conv1d(decoder, op, current, destination, length, e, ec) != 0)
+                return -1;
+            current = destination;
+            channels = (size_t)op->out_channels;
+        } else if (op->kind == CUDA_DECODER_CONVTR) {
+            if (decoder_convtr(decoder, op, current, destination, length, e, ec) != 0)
+                return -1;
+            current = destination;
+            channels = (size_t)op->out_channels;
+            length *= (size_t)op->stride;
+        } else {
+            set_error(e, ec, "resident decoder operation kind is invalid");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* One causal decoder topology, many independent request states.  The
+ * per-request work/tail buffers remain owned by each decoder object, while
+ * elementwise kernels and the conv1d GEMM use one launch/batched cuBLAS call
+ * for the whole gang. */
+static int decoder_step_batch_impl(
+    cuda_backend_state *backend, mynah_backend_decoder *const *decoders,
+    const float *const *inputs, size_t batch, size_t encoder_frames,
+    float *const *outputs, char *e, size_t ec) {
+    if (backend == nullptr || decoders == nullptr || inputs == nullptr ||
+        outputs == nullptr || batch < 2u || batch > backend->batch_meta_cap ||
+        encoder_frames == 0u || decoders[0] == nullptr ||
+        decoders[0]->backend != backend ||
+        encoder_frames > decoders[0]->max_encoder_frames)
+        return 1;
+    if (!backend->decoder_batch_enabled) return 1;
+    mynah_backend_decoder *first = decoders[0];
+    const size_t op_count = first->ops.size();
+    if (op_count == 0u) return -1;
+    for (size_t i = 0; i < batch; ++i) {
+        mynah_backend_decoder *decoder = decoders[i];
+        if (decoder == nullptr || decoder->backend != backend ||
+            decoder->channels != first->channels ||
+            decoder->dimension != first->dimension ||
+            decoder->n_filters != first->n_filters ||
+            decoder->elu_alpha != first->elu_alpha ||
+            decoder->max_encoder_frames != first->max_encoder_frames ||
+            decoder->ops.size() != op_count || inputs[i] == nullptr ||
+            outputs[i] == nullptr)
+            return 1;
+        for (size_t op = 0; op < op_count; ++op) {
+            if (!decoder_ops_compatible(&first->ops[op], &decoder->ops[op]))
+                return 1;
+        }
+    }
+    if (cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+        return -1;
+
+    float *current[CUDA_BATCH_META_CAP];
+    float *other[CUDA_BATCH_META_CAP];
+    float *scratch[CUDA_BATCH_META_CAP];
+    float *destination[CUDA_BATCH_META_CAP];
+    cuda_decoder_op *op_rows[CUDA_BATCH_META_CAP];
+    for (size_t i = 0; i < batch; ++i)
+        current[i] = const_cast<float *>(inputs[i]);
+
+    size_t length = encoder_frames;
+    size_t channels = first->dimension;
+    for (size_t index = 0; index < op_count;) {
+        cuda_decoder_op *op = &first->ops[index++];
+        if (op->kind == CUDA_DECODER_RESBLOCK) {
+            if (index + 1u >= op_count) {
+                set_error(e, ec, "resident decoder residual topology is truncated");
+                return -1;
+            }
+            index += 2u;
+            const cuda_decoder_op *rb1 = &first->ops[index - 2u];
+            for (size_t i = 0; i < batch; ++i) {
+                op_rows[i] = &decoders[i]->ops[index - 2u];
+                if (current[i] == decoders[i]->work_a)
+                    other[i] = decoders[i]->work_b;
+                else if (current[i] == decoders[i]->work_b)
+                    other[i] = decoders[i]->work_a;
+                else
+                    other[i] = decoders[i]->work_a;
+                scratch[i] = decoders[i]->work_c;
+            }
+            size_t elements = 0u;
+            size_t hidden_elements = 0u;
+            if (!decoder_mul(channels, length, &elements) ||
+                !decoder_mul((size_t)rb1->out_channels, length,
+                             &hidden_elements) ||
+                elements > (size_t)INT_MAX ||
+                hidden_elements > (size_t)INT_MAX ||
+                decoder_elu_batch(backend, current, scratch, batch, elements,
+                                  first->elu_alpha, e, ec) != 0 ||
+                decoder_conv1d_batch(backend, decoders, op_rows, scratch, other,
+                                     batch, length, e, ec) != 0)
+                return -1;
+            for (size_t i = 0; i < batch; ++i) {
+                op_rows[i] = &decoders[i]->ops[index - 1u];
+                scratch[i] = other[i];
+            }
+            if (decoder_elu_batch(backend, other, other, batch,
+                                  hidden_elements,
+                                  first->elu_alpha, e, ec) != 0 ||
+                decoder_conv1d_batch(backend, decoders, op_rows, other, scratch,
+                                     batch, length, e, ec) != 0 ||
+                decoder_residual_batch(backend, current, scratch, batch,
+                                       elements, e, ec) != 0)
+                return -1;
+            continue;
+        }
+
+        for (size_t i = 0; i < batch; ++i) {
+            op_rows[i] = &decoders[i]->ops[index - 1u];
+        }
+        if (op->pre_elu) {
+            size_t elements = 0u;
+            if (!decoder_mul(channels, length, &elements) ||
+                elements > (size_t)INT_MAX ||
+                decoder_elu_batch(backend, current, current, batch, elements,
+                                  first->elu_alpha, e, ec) != 0)
+                return -1;
+        }
+        const bool last = index == op_count;
+        for (size_t i = 0; i < batch; ++i) {
+            if (last)
+                destination[i] = outputs[i];
+            else if (current[i] == decoders[i]->work_a)
+                destination[i] = decoders[i]->work_b;
+            else
+                destination[i] = decoders[i]->work_a;
+        }
+        if (op->kind == CUDA_DECODER_CONV) {
+            if (decoder_conv1d_batch(backend, decoders, op_rows, current,
+                                     destination, batch, length, e, ec) != 0)
+                return -1;
+            channels = (size_t)op->out_channels;
+        } else if (op->kind == CUDA_DECODER_CONVTR) {
+            if (decoder_convtr_batch(backend, op_rows, current, destination,
+                                     batch, length, e, ec) != 0)
+                return -1;
+            channels = (size_t)op->out_channels;
+            if (!decoder_mul(length, (size_t)op->stride, &length))
+                return -1;
+        } else {
+            set_error(e, ec, "resident decoder operation kind is invalid");
+            return -1;
+        }
+        for (size_t i = 0; i < batch; ++i) current[i] = destination[i];
+    }
+    return 0;
+}
+
+extern "C" int mynah_cuda_decoder_open(
+    void *opaque, const mynah_backend_decoder_desc *desc,
+    size_t max_encoder_frames, mynah_backend_decoder **out,
+    char *e, size_t ec) {
+    if (out != nullptr) *out = nullptr;
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || desc == nullptr || out == nullptr ||
+        max_encoder_frames == 0u) {
+        set_error(e, ec, "invalid resident decoder open");
+        return -1;
+    }
+    auto *decoder = new (std::nothrow) mynah_backend_decoder();
+    if (decoder == nullptr) {
+        set_error(e, ec, "out of memory creating resident decoder");
+        return -1;
+    }
+    decoder->backend = backend;
+    decoder->channels = desc->channels;
+    decoder->dimension = desc->dimension;
+    decoder->n_filters = desc->n_filters;
+    decoder->max_encoder_frames = max_encoder_frames;
+    decoder->elu_alpha = desc->elu_alpha;
+    try {
+        if (decoder_build(decoder, desc, e, ec) != 0 ||
+            decoder_alloc_workspace(decoder, e, ec) != 0 ||
+            decoder_reserve_one_gemm(backend, decoder, e, ec) != 0) {
+            decoder_destroy(decoder);
+            return -1;
+        }
+    } catch (const std::bad_alloc &) {
+        decoder_destroy(decoder);
+        set_error(e, ec, "out of memory building resident decoder topology");
+        return -1;
+    }
+    *out = decoder;
+    return 0;
+}
+
+extern "C" void mynah_cuda_decoder_close(void *opaque,
+                                           mynah_backend_decoder *decoder) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend != nullptr) {
+        (void)cudaStreamSynchronize(backend->stream);
+        destroy_decoder_batch_graphs_for(backend, decoder);
+    }
+    decoder_destroy(decoder);
+}
+
+extern "C" int mynah_cuda_decoder_reset(void *opaque,
+                                          mynah_backend_decoder *decoder,
+                                          char *e, size_t ec) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoder == nullptr || decoder->backend != backend) {
+        set_error(e, ec, "invalid resident decoder reset");
+        return -1;
+    }
+    for (auto &op : decoder->ops) {
+        if (op.previous != nullptr &&
+            ce(cudaMemsetAsync(op.previous, 0,
+                               (size_t)op.in_channels * op.tail * sizeof(float),
+                               backend->stream), e, ec)) return -1;
+        if (op.partial != nullptr &&
+            ce(cudaMemsetAsync(op.partial, 0,
+                               (size_t)op.out_channels * op.tail * sizeof(float),
+                               backend->stream), e, ec)) return -1;
+    }
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_decoder_step(void *opaque,
+                                         mynah_backend_decoder *decoder,
+                                         const float *dev_input,
+                                         size_t encoder_frames,
+                                         float *dev_output,
+                                         char *e, size_t ec) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoder == nullptr || decoder->backend != backend) {
+        set_error(e, ec, "invalid resident decoder step");
+        if (backend != nullptr)
+            backend->decoder_failures.fetch_add(1ull, std::memory_order_relaxed);
+        return -1;
+    }
+    /* During graph capture this call only records work; the graph launch is
+     * the logical decoder step. Direct execution counts here, while the
+     * engine calls decoder_note_step after a successful capture/replay. */
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool capturing =
+        cudaStreamIsCapturing(backend->stream, &capture_status) == cudaSuccess &&
+        capture_status != cudaStreamCaptureStatusNone;
+    if (!capturing)
+        backend->decoder_steps.fetch_add(1ull, std::memory_order_relaxed);
+    const int result = decoder_step_impl(decoder, dev_input, encoder_frames,
+                                         dev_output, e, ec);
+    if (result != 0) {
+        backend->decoder_failures.fetch_add(1ull, std::memory_order_relaxed);
+        backend->resident_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    return result;
+}
+
+extern "C" int mynah_cuda_decoder_step_batch(
+    void *opaque, mynah_backend_decoder *const *decoders,
+    const float *const *dev_inputs, size_t batch, size_t encoder_frames,
+    float *const *dev_outputs, char *e, size_t ec) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoders == nullptr || dev_inputs == nullptr ||
+        dev_outputs == nullptr || batch < 2u ||
+        batch > backend->batch_meta_cap || encoder_frames == 0u)
+        return 1;
+    auto eager = [&]() -> int {
+        const int result = decoder_step_batch_impl(
+            backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs,
+            e, ec);
+        if (result == 0) {
+            backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                             std::memory_order_relaxed);
+        } else if (result < 0) {
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+        }
+        return result;
+    };
+
+    /* The graph is an optimization of the already-correct arithmetic batch.
+     * It is deliberately separate from the single-request graph: a changing
+     * scheduler gang must never replay a graph containing another request's
+     * causal rings. */
+    if (!backend->graphs_enabled || !cuda_decoder_graphs_enabled()) {
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        return eager();
+    }
+
+    cuda_decoder_batch_graph_entry *entry = find_decoder_batch_graph(
+        backend, decoders, dev_inputs, dev_outputs, batch, encoder_frames);
+    if (entry != nullptr) {
+        if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(
+                1ull, std::memory_order_relaxed);
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+            return -1;
+        }
+        if (entry->done != nullptr)
+            (void)cudaEventRecord(entry->done, backend->stream);
+        backend->decoder_graph_replays.fetch_add(1ull,
+                                                 std::memory_order_relaxed);
+        backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                         std::memory_order_relaxed);
+        return 0;
+    }
+
+    entry = cuda_decoder_graph_reuse_enabled()
+                ? find_decoder_batch_graph_shape(backend, decoders[0], batch,
+                                                 encoder_frames)
+                : nullptr;
+    if (entry != nullptr) {
+        /* Same width, different gang: re-record only to rewrite the pinned
+         * pointer tables that the instantiated graph's memcpy nodes read at
+         * launch, then drop the recording.  No instantiate on this path. */
+        if (ce(cudaEventSynchronize(entry->done), e, ec) != 0) return -1;
+        cudaError_t begin = cudaStreamBeginCapture(backend->stream,
+                                                    cudaStreamCaptureModeRelaxed);
+        if (begin != cudaSuccess) {
+            ce(begin, e, ec);
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                       std::memory_order_relaxed);
+            return eager();
+        }
+        backend->active_decoder_batch_graph = entry;
+        backend->active_decoder_upload_slot = 0u;
+        const int build = decoder_step_batch_impl(
+            backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs,
+            e, ec);
+        const size_t used = backend->active_decoder_upload_slot;
+        backend->active_decoder_batch_graph = nullptr;
+        for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
+        cudaGraph_t scratch = nullptr;
+        const cudaError_t end = cudaStreamEndCapture(backend->stream, &scratch);
+        if (scratch != nullptr) cudaGraphDestroy(scratch);
+        if (build != 0 || end != cudaSuccess || used != entry->used_slots) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                       std::memory_order_relaxed);
+            if (build < 0) {
+                backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                    std::memory_order_relaxed);
+                backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                       std::memory_order_relaxed);
+                return -1;
+            }
+            if (end != cudaSuccess) ce(end, e, ec);
+            return eager();
+        }
+        try {
+            entry->decoders.assign(decoders, decoders + batch);
+            entry->inputs.assign(dev_inputs, dev_inputs + batch);
+            entry->outputs.assign(dev_outputs, dev_outputs + batch);
+        } catch (const std::bad_alloc &) {
+            entry->decoders.clear();
+            entry->inputs.clear();
+            entry->outputs.clear();
+        }
+        if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(
+                1ull, std::memory_order_relaxed);
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+            return -1;
+        }
+        (void)cudaEventRecord(entry->done, backend->stream);
+        backend->decoder_graph_replays.fetch_add(1ull,
+                                                 std::memory_order_relaxed);
+        backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                         std::memory_order_relaxed);
+        return 0;
+    }
+
+    entry = decoder_batch_graph_create(backend, decoders, dev_inputs,
+                                       dev_outputs, batch, encoder_frames, e,
+                                       ec);
+    if (entry == nullptr) {
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        return eager();
+    }
+
+    /* cuBLAS may request its workspace on the first batched convolution GEMM.
+     * Reserve/configure it before capture so a lazy allocator cannot turn a
+     * valid decoder graph into a capture-time failure.  The same workspace is
+     * shared with the other resident graph families on this backend. */
+    if (backend->cublas_workspace == nullptr) {
+        backend->cublas_workspace_cap = 8u * 1024u * 1024u;
+        if (ce(cudaMalloc(&backend->cublas_workspace,
+                          backend->cublas_workspace_cap), e, ec) != 0) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(
+                1ull, std::memory_order_relaxed);
+            return eager();
+        }
+    }
+    if (cbe(cublasSetWorkspace(backend->cublas, backend->cublas_workspace,
+                               backend->cublas_workspace_cap), e, ec) != 0 ||
+        cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0) {
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(
+            1ull, std::memory_order_relaxed);
+        return eager();
+    }
+
+    cudaError_t begin = cudaStreamBeginCapture(backend->stream,
+                                                cudaStreamCaptureModeRelaxed);
+    if (begin != cudaSuccess) {
+        ce(begin, e, ec);
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        return eager();
+    }
+    backend->active_decoder_batch_graph = entry;
+    backend->active_decoder_upload_slot = 0u;
+    for (size_t i = 0u; i < 4u; ++i)
+        backend->active_decoder_tables[i] =
+            i == 0u ? backend->dev_decoder_ptr0
+            : i == 1u ? backend->dev_decoder_ptr1
+            : i == 2u ? backend->dev_decoder_ptr2
+                      : backend->dev_decoder_ptr3;
+    const int build = decoder_step_batch_impl(
+        backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs, e,
+        ec);
+    entry->used_slots = backend->active_decoder_upload_slot;
+    backend->active_decoder_batch_graph = nullptr;
+    for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t end = cudaStreamEndCapture(backend->stream, &graph);
+    if (build != 0 || end != cudaSuccess || graph == nullptr) {
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        /* A validation failure is the normal optional-path result.  A launch
+         * failure must stay fatal to the CUDA batch; the caller's state was
+         * not allowed to advance through an unlaunched graph. */
+        if (build < 0) {
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+            return -1;
+        }
+        if (end != cudaSuccess) ce(end, e, ec);
+        return 1;
+    }
+
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t instantiate = cudaGraphInstantiate(&exec, graph, 0);
+    if (instantiate != cudaSuccess || exec == nullptr) {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        entry->graph = nullptr;
+        entry->exec = nullptr;
+        decoder_batch_graph_remove(backend, entry);
+        if (instantiate != cudaSuccess) ce(instantiate, e, ec);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        /* Capture does not execute the recorded decoder.  Instantiation is
+         * therefore safe to fall back from to one ordinary arithmetic batch. */
+        return eager();
+    }
+    entry->graph = graph;
+    entry->exec = exec;
+    entry->valid = true;
+    if (cuda_decoder_graph_reuse_enabled() &&
+        cudaEventCreateWithFlags(&entry->done, cudaEventDisableTiming) != cudaSuccess)
+        entry->done = nullptr;
+    backend->decoder_graph_captures.fetch_add(1ull,
+                                             std::memory_order_relaxed);
+    if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
+        decoder_batch_graph_remove(backend, entry);
+        backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
+        backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                            std::memory_order_relaxed);
+        backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                               std::memory_order_relaxed);
+        return -1;
+    }
+    if (entry->done != nullptr) (void)cudaEventRecord(entry->done, backend->stream);
+    backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                     std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" int mynah_cuda_decoder_note_step(
+    void *opaque, mynah_backend_decoder *decoder) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || decoder == nullptr || decoder->backend != backend)
+        return -1;
+    backend->decoder_steps.fetch_add(1ull, std::memory_order_relaxed);
+    return 0;
+}
+
+static void note_width(cuda_backend_state *st, int stage, size_t width) {
+    int bucket = 0;
+    size_t limit = 1u;
+    while (bucket < 7 && width > limit) {
+        ++bucket;
+        limit <<= 1u;
+    }
+    st->width_hist[stage][bucket].fetch_add(1ull, std::memory_order_relaxed);
+}
+
+extern "C" int mynah_cuda_decoder_note_batch(void *opaque, size_t items,
+                                               size_t frames) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || items == 0u || frames == 0u) return -1;
+    if (!backend->decoder_batch_enabled) return 0;
+    note_width(backend, 2, items);
+    backend->decoder_batch_calls.fetch_add(1ull, std::memory_order_relaxed);
+    backend->decoder_batch_items.fetch_add((unsigned long long)items,
+                                           std::memory_order_relaxed);
+    unsigned long long observed =
+        backend->decoder_batch_max_width.load(std::memory_order_relaxed);
+    const unsigned long long width = (unsigned long long)items;
+    while (observed < width &&
+           !backend->decoder_batch_max_width.compare_exchange_weak(
+               observed, width, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    backend->decoder_batch_frames.fetch_add((unsigned long long)frames,
+                                            std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" int mynah_cuda_note_backbone_batch(void *opaque, size_t items) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || items == 0u) return -1;
+    note_width(backend, 0, items);
+    backend->backbone_batch_calls.fetch_add(1ull, std::memory_order_relaxed);
+    backend->backbone_batch_items.fetch_add((unsigned long long)items,
+                                            std::memory_order_relaxed);
+    unsigned long long observed =
+        backend->backbone_batch_max_width.load(std::memory_order_relaxed);
+    const unsigned long long width = (unsigned long long)items;
+    while (observed < width &&
+           !backend->backbone_batch_max_width.compare_exchange_weak(
+               observed, width, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    return 0;
+}
+
+extern "C" int mynah_cuda_note_codec_transformer_batch(void *opaque,
+                                                         size_t items,
+                                                         size_t width) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || items == 0u || width == 0u) return -1;
+    note_width(backend, 1, items);
+    backend->codec_transformer_batch_calls.fetch_add(
+        1ull, std::memory_order_relaxed);
+    backend->codec_transformer_batch_items.fetch_add(
+        (unsigned long long)items, std::memory_order_relaxed);
+    unsigned long long observed =
+        backend->codec_transformer_batch_max_width.load(
+            std::memory_order_relaxed);
+    const unsigned long long batch_width = (unsigned long long)items;
+    while (observed < batch_width &&
+           !backend->codec_transformer_batch_max_width.compare_exchange_weak(
+               observed, batch_width, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    return 0;
+}
+
+extern "C" void mynah_cuda_note_codec_gang(void *opaque, int stage,
+                                           size_t rows) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr || stage < 0 || stage > 1 || rows == 0u) return;
+    int bucket = 0;
+    size_t limit = 1u;
+    while (bucket < 7 && rows > limit) {
+        ++bucket;
+        limit <<= 1u;
+    }
+    backend->codec_gang_hist[stage][bucket].fetch_add(
+        1ull, std::memory_order_relaxed);
+    backend->codec_gang_calls[stage].fetch_add(1ull, std::memory_order_relaxed);
+    backend->codec_gang_rows[stage].fetch_add((unsigned long long)rows,
+                                              std::memory_order_relaxed);
+}
+
+extern "C" void mynah_cuda_note_codec_upsample(void *opaque, int fallback) {
+    auto *backend = static_cast<cuda_backend_state *>(opaque);
+    if (backend == nullptr) return;
+    if (fallback != 0) {
+        backend->codec_upsample_fallbacks.fetch_add(
+            1ull, std::memory_order_relaxed);
+    } else {
+        backend->codec_upsample_steps.fetch_add(
+            1ull, std::memory_order_relaxed);
+    }
+}
+
+/* Model-free end-to-end check for the resident causal decoder.  The generic
+ * conv tests above cannot catch a stale causal ring or a transposed-conv tail
+ * folded into the wrong frame, so this deliberately runs two one-frame calls
+ * against the scalar SEANet state with the same tiny topology and weights. */
+static int cuda_decoder_self_test(void *opaque, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) {
+        set_error(e, ec, "CUDA decoder self-test has no backend");
+        return -1;
+    }
+    const size_t ratios[1] = {2u};
+    float first_weight[24];
+    float first_bias[4];
+    float convtr_weight[32];
+    float convtr_bias[2];
+    float rb1_weight[6];
+    float rb1_bias[1];
+    float rb2_weight[2];
+    float rb2_bias[2];
+    float last_weight[6];
+    float last_bias[1];
+    for (size_t i = 0; i < 24u; ++i)
+        first_weight[i] = ((int)(i % 9u) - 4) * 0.03125f;
+    for (size_t i = 0; i < 4u; ++i) first_bias[i] = ((int)i - 1) * 0.05f;
+    for (size_t i = 0; i < 32u; ++i)
+        convtr_weight[i] = ((int)(i % 11u) - 5) * 0.021f;
+    convtr_bias[0] = 0.07f; convtr_bias[1] = -0.04f;
+    for (size_t i = 0; i < 6u; ++i)
+        rb1_weight[i] = ((int)(i % 5u) - 2) * 0.027f;
+    rb1_bias[0] = 0.03f;
+    rb2_weight[0] = 0.11f; rb2_weight[1] = -0.08f;
+    rb2_bias[0] = 0.02f; rb2_bias[1] = -0.01f;
+    for (size_t i = 0; i < 6u; ++i)
+        last_weight[i] = ((int)(i % 7u) - 3) * 0.019f;
+    last_bias[0] = -0.02f;
+
+    mynah_conv_weights first = {first_weight, first_bias};
+    mynah_conv_weights convtr = {convtr_weight, convtr_bias};
+    mynah_seanet_resblock_weights block;
+    block.conv1.weight = rb1_weight;
+    block.conv1.bias = rb1_bias;
+    block.conv2.weight = rb2_weight;
+    block.conv2.bias = rb2_bias;
+    mynah_conv_weights last = {last_weight, last_bias};
+    mynah_seanet_decoder_weights cpu_weights;
+    cpu_weights.first = first;
+    cpu_weights.convtr = &convtr;
+    cpu_weights.blocks = &block;
+    cpu_weights.last = last;
+
+    mynah_backend_decoder_desc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.channels = 1u;
+    desc.dimension = 2u;
+    desc.n_filters = 2u;
+    desc.n_residual_layers = 1u;
+    desc.ratios = ratios;
+    desc.n_ratios = 1u;
+    desc.kernel_size = 3u;
+    desc.residual_kernel_size = 3u;
+    desc.last_kernel_size = 3u;
+    desc.dilation_base = 2u;
+    desc.compress = 2u;
+    desc.elu_alpha = 1.0f;
+    desc.first = first;
+    desc.convtr = &convtr;
+    desc.blocks = &block;
+    desc.last = last;
+
+    mynah_seanet_config cpu_config;
+    std::memset(&cpu_config, 0, sizeof(cpu_config));
+    cpu_config.channels = 1u;
+    cpu_config.dimension = 2u;
+    cpu_config.n_filters = 2u;
+    cpu_config.n_residual_layers = 1u;
+    cpu_config.ratios = ratios;
+    cpu_config.n_ratios = 1u;
+    cpu_config.kernel_size = 3u;
+    cpu_config.residual_kernel_size = 3u;
+    cpu_config.last_kernel_size = 3u;
+    cpu_config.dilation_base = 2u;
+    cpu_config.compress = 2u;
+    cpu_config.elu_alpha = 1.0f;
+
+    const float inputs[2][2] = {{0.20f, -0.15f}, {-0.31f, 0.27f}};
+    float cpu_output[2];
+    float gpu_output[2];
+    char local[256];
+    local[0] = '\0';
+    mynah_backend_decoder *decoder = nullptr;
+    mynah_seanet_state *cpu_state = nullptr;
+    float *dev_input = nullptr;
+    float *dev_output = nullptr;
+    int result = -1;
+
+    do {
+        cpu_state = mynah_seanet_state_create(&cpu_config, nullptr, 2u, local,
+                                              sizeof(local));
+        if (cpu_state == nullptr) break;
+        if (mynah_cuda_decoder_open(st, &desc, 1u, &decoder, local,
+                                     sizeof(local)) != 0 || decoder == nullptr)
+            break;
+        if (mynah_cuda_decoder_reset(st, decoder, local, sizeof(local)) != 0 ||
+            ce(cudaMalloc(&dev_input, 2u * sizeof(float)), local, sizeof(local)) ||
+            ce(cudaMalloc(&dev_output, 2u * sizeof(float)), local, sizeof(local)))
+            break;
+        for (size_t step = 0; step < 2u; ++step) {
+            if (ce(cudaMemcpyAsync(dev_input, inputs[step], 2u * sizeof(float),
+                                   cudaMemcpyHostToDevice, st->stream),
+                   local, sizeof(local)) != 0 ||
+                mynah_cuda_decoder_step(st, decoder, dev_input, 1u, dev_output,
+                                        local, sizeof(local)) != 0 ||
+                mynah_cuda_sync(st, local, sizeof(local)) != 0 ||
+                ce(cudaMemcpy(gpu_output, dev_output, 2u * sizeof(float),
+                              cudaMemcpyDeviceToHost), local, sizeof(local)) != 0 ||
+                mynah_seanet_decode(cpu_state, &cpu_weights, inputs[step], 1u,
+                                    cpu_output) != 0) {
+                break;
+            }
+            int mismatch = 0;
+            for (size_t i = 0; i < 2u; ++i) {
+                if (fabsf(cpu_output[i] - gpu_output[i]) > 3.0e-3f) {
+                    mismatch = 1;
+                    break;
+                }
+            }
+            if (mismatch) {
+                std::snprintf(local, sizeof(local),
+                              "CUDA resident decoder mismatch at step %zu",
+                              step);
+                break;
+            }
+            if (step == 1u) result = 0;
+        }
+    } while (false);
+
+    if (result != 0 && e != nullptr && ec > 0u)
+        std::snprintf(e, ec, "%s", local[0] != '\0'
+                          ? local : "CUDA resident decoder self-test failed");
+    if (dev_input != nullptr) cudaFree(dev_input);
+    if (dev_output != nullptr) cudaFree(dev_output);
+    if (decoder != nullptr) mynah_cuda_decoder_close(st, decoder);
+    if (cpu_state != nullptr) mynah_seanet_state_destroy(cpu_state);
+
+    /* Exercise the same topology with two independent causal states.  This
+     * is deliberately separate from the single-request check above: a batch
+     * kernel can be correct for request zero while indexing request one with
+     * the wrong window/tail stride.  The environment switch is a runtime
+     * feature gate, so a deliberately disabled decoder batch remains a valid
+     * self-test configuration. */
+    if (result == 0 && st->decoder_batch_enabled) {
+        mynah_backend_decoder *batch_decoders[2] = {nullptr, nullptr};
+        mynah_seanet_state *batch_cpu[2] = {nullptr, nullptr};
+        float *batch_inputs_dev[2] = {nullptr, nullptr};
+        float *batch_outputs_dev[2] = {nullptr, nullptr};
+        const float batch_inputs[2][2][2] = {
+            {{0.17f, -0.22f}, {-0.28f, 0.31f}},
+            {{-0.09f, 0.14f}, {0.36f, -0.19f}}
+        };
+        float batch_cpu_output[2][2];
+        float batch_gpu_output[2][2];
+        local[0] = '\0';
+        int batch_ok = 1;
+        for (size_t i = 0; i < 2u && batch_ok; ++i) {
+            batch_cpu[i] = mynah_seanet_state_create(
+                &cpu_config, nullptr, 2u, local, sizeof(local));
+            batch_ok = batch_cpu[i] != nullptr &&
+                       mynah_cuda_decoder_open(
+                           st, &desc, 1u, &batch_decoders[i], local,
+                           sizeof(local)) == 0 && batch_decoders[i] != nullptr;
+            if (batch_ok)
+                batch_ok = mynah_cuda_decoder_reset(
+                               st, batch_decoders[i], local, sizeof(local)) == 0 &&
+                           ce(cudaMalloc((void **)&batch_inputs_dev[i],
+                                         2u * sizeof(float)),
+                              local, sizeof(local)) == 0 &&
+                           ce(cudaMalloc((void **)&batch_outputs_dev[i],
+                                         2u * sizeof(float)),
+                              local, sizeof(local)) == 0;
+        }
+        mynah_backend_decoder *decoder_rows[2] = {
+            batch_decoders[0], batch_decoders[1]};
+        const float *input_rows[2] = {
+            batch_inputs_dev[0], batch_inputs_dev[1]};
+        float *output_rows[2] = {
+            batch_outputs_dev[0], batch_outputs_dev[1]};
+        for (size_t step = 0; step < 2u && batch_ok; ++step) {
+            for (size_t request = 0; request < 2u; ++request) {
+                if (ce(cudaMemcpyAsync(
+                           batch_inputs_dev[request],
+                           batch_inputs[request][step], 2u * sizeof(float),
+                           cudaMemcpyHostToDevice, st->stream),
+                       local, sizeof(local)) != 0) {
+                    batch_ok = 0;
+                    break;
+                }
+            }
+            if (!batch_ok ||
+                mynah_cuda_decoder_step_batch(
+                    st, decoder_rows, input_rows, 2u, 1u, output_rows, local,
+                    sizeof(local)) != 0 ||
+                mynah_cuda_sync(st, local, sizeof(local)) != 0) {
+                batch_ok = 0;
+                break;
+            }
+            for (size_t request = 0; request < 2u; ++request) {
+                if (ce(cudaMemcpy(batch_gpu_output[request],
+                                  batch_outputs_dev[request],
+                                  2u * sizeof(float), cudaMemcpyDeviceToHost),
+                       local, sizeof(local)) != 0 ||
+                    mynah_seanet_decode(batch_cpu[request], &cpu_weights,
+                                        batch_inputs[request][step], 1u,
+                                        batch_cpu_output[request]) != 0) {
+                    batch_ok = 0;
+                    break;
+                }
+                for (size_t d = 0; d < 2u; ++d) {
+                    if (fabsf(batch_cpu_output[request][d] -
+                              batch_gpu_output[request][d]) > 3.0e-3f) {
+                        std::snprintf(
+                            local, sizeof(local),
+                            "CUDA batched resident decoder mismatch at step %zu request %zu",
+                            step, request);
+                        batch_ok = 0;
+                        break;
+                    }
+                }
+                if (!batch_ok) break;
+            }
+        }
+        if (!batch_ok) {
+            result = -1;
+            if (e != nullptr && ec > 0u)
+                std::snprintf(e, ec, "%s", local[0] != '\0'
+                                  ? local
+                                  : "CUDA batched resident decoder self-test failed");
+        }
+        for (size_t i = 0; i < 2u; ++i) {
+            if (batch_inputs_dev[i] != nullptr) cudaFree(batch_inputs_dev[i]);
+            if (batch_outputs_dev[i] != nullptr) cudaFree(batch_outputs_dev[i]);
+            if (batch_decoders[i] != nullptr)
+                mynah_cuda_decoder_close(st, batch_decoders[i]);
+            if (batch_cpu[i] != nullptr)
+                mynah_seanet_state_destroy(batch_cpu[i]);
+        }
+    }
+    return result;
+}
+
+/* One block owns one attention head.  The score reduction is shared by all
+ * value lanes; the output accumulator stays in the destination buffer, so a
+ * head_width larger than the block size is still supported without a dynamic
+ * per-thread array.  This is the same online-softmax recurrence used by the
+ * Metal backend and avoids materialising a [heads, valid] score matrix. */
+__global__ static void k_self_attention(const float *qkv, float *kcache,
+                                        float *vcache, size_t position,
+                                        size_t cache_stride, size_t valid,
+                                        int heads, int head_width, float scale,
+                                        float *out) {
+    const int head = (int)blockIdx.x;
+    if (head >= heads) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t cache_base = position * cache_stride + hbase;
+    const float *q = qkv + hbase;
+    const float *k = qkv + width + hbase;
+    const float *v = qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        kcache[cache_base + (size_t)d] = k[d];
+        vcache[cache_base + (size_t)d] = v[d];
+        out[hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s < valid; ++s) {
+        const float *ks = kcache + s * cache_stride + hbase;
+        const float *vs = vcache + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * ks[d];
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = hbase + (size_t)d;
+            out[index] = out[index] * correction + probability * vs[d];
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] *= inv;
+}
+
+__global__ static void k_cross_attention(const float *q, const float *kcache,
+                                         const float *vcache, size_t valid,
+                                         size_t cache_stride, int heads,
+                                         int head_width, float scale,
+                                         float *out) {
+    const int head = (int)blockIdx.x;
+    if (head >= heads) return;
+    const int tid = (int)threadIdx.x;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] = 0.0f;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s < valid; ++s) {
+        const float *ks = kcache + s * cache_stride + hbase;
+        const float *vs = vcache + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[hbase + (size_t)d] * ks[d];
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = hbase + (size_t)d;
+            out[index] = out[index] * correction + probability * vs[d];
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] *= inv;
+}
+
+__global__ static void k_self_attention_bf16(
+    const float *qkv, uint16_t *kcache, uint16_t *vcache, size_t position,
+    size_t cache_stride, size_t valid, int heads, int head_width, float scale,
+    float *out) {
+    const int head = (int)blockIdx.x;
+    if (head >= heads) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t cache_base = position * cache_stride + hbase;
+    const float *q = qkv + hbase;
+    const float *k = qkv + width + hbase;
+    const float *v = qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        kcache[cache_base + (size_t)d] = cuda_bf16_from_float(k[d]);
+        vcache[cache_base + (size_t)d] = cuda_bf16_from_float(v[d]);
+        out[hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s <= position; ++s) {
+        const uint16_t *ks = kcache + s * cache_stride + hbase;
+        const uint16_t *vs = vcache + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * cuda_bf16_to_float(ks[d]);
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = hbase + (size_t)d;
+            out[index] = out[index] * correction + probability *
+                         cuda_bf16_to_float(vs[d]);
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[hbase + (size_t)d] *= inv;
+}
+
+/* Interleaved RoPE for the fused QKV row.  PocketTTS uses the same absolute
+ * position and frequency construction as transformer_ar.c; keeping the
+ * rotation on the device avoids a host round-trip between QKV projection and
+ * resident attention. */
+__global__ static void k_rope_qk(float *qkv, size_t position, int heads,
+                                 int head_width, float max_period) {
+    const int pair = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int half = head_width / 2;
+    const int total = heads * half;
+    if (pair >= total) return;
+    const int head = pair / half;
+    const int i = pair % half;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t qbase = (size_t)head * (size_t)head_width + (size_t)(2 * i);
+    const size_t kbase = width + qbase;
+    /* Match transformer_ar.c: the slope is formed from a double-precision
+     * logarithm and rounded once before the float32 exp/angle operations. */
+    const float slope = (float)(-log((double)max_period) * 2.0 /
+                                (double)head_width);
+    const float frequency = expf((float)i * slope);
+    const float angle = (float)position * frequency;
+    float sine = 0.0f;
+    float cosine = 0.0f;
+    sincosf(angle, &sine, &cosine);
+    const float q0 = qkv[qbase];
+    const float q1 = qkv[qbase + 1u];
+    qkv[qbase] = q0 * cosine - q1 * sine;
+    qkv[qbase + 1u] = q0 * sine + q1 * cosine;
+    const float k0 = qkv[kbase];
+    const float k1 = qkv[kbase + 1u];
+    qkv[kbase] = k0 * cosine - k1 * sine;
+    qkv[kbase + 1u] = k0 * sine + k1 * cosine;
+}
+
+__global__ static void k_rope_qk_batch(float *qkv, const size_t *positions,
+                                       int batch, int heads, int head_width,
+                                       float max_period) {
+    const int half = head_width / 2;
+    const size_t per_request = (size_t)heads * (size_t)half;
+    const size_t pair = (size_t)blockIdx.x * (size_t)blockDim.x +
+                        (size_t)threadIdx.x;
+    const size_t total = (size_t)batch * per_request;
+    if (pair >= total) return;
+    const size_t request = pair / per_request;
+    const size_t local = pair % per_request;
+    const int head = (int)(local / (size_t)half);
+    const int i = (int)(local % (size_t)half);
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t row = request * width * 3u;
+    const size_t qbase = row + (size_t)head * (size_t)head_width +
+                         (size_t)(2 * i);
+    const size_t kbase = qbase + width;
+    const float slope = (float)(-log((double)max_period) * 2.0 /
+                                (double)head_width);
+    const float frequency = expf((float)i * slope);
+    const float angle = (float)positions[request] * frequency;
+    float sine = 0.0f;
+    float cosine = 0.0f;
+    sincosf(angle, &sine, &cosine);
+    const float q0 = qkv[qbase];
+    const float q1 = qkv[qbase + 1u];
+    qkv[qbase] = q0 * cosine - q1 * sine;
+    qkv[qbase + 1u] = q0 * sine + q1 * cosine;
+    const float k0 = qkv[kbase];
+    const float k1 = qkv[kbase + 1u];
+    qkv[kbase] = k0 * cosine - k1 * sine;
+    qkv[kbase + 1u] = k0 * sine + k1 * cosine;
+}
+
+static int attention_threads(size_t head_width) {
+    int threads = 32;
+    while ((size_t)threads < head_width && threads < 256) threads <<= 1;
+    return threads;
+}
+
+extern "C" int mynah_cuda_self_attention_dev(
+    void *opaque, const float *qkv, float *kcache, float *vcache,
+    size_t position, size_t cache_stride, size_t valid, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
+        heads == 0 || head_width == 0 || valid == 0 || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || cache_stride == 0 || position >= valid ||
+        heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    if (cache_stride < width ||
+        (valid - 1u) > (SIZE_MAX - (width - 1u)) / cache_stride) {
+        set_error(e, ec, "CUDA self-attention cache stride overflow");
+        return -1;
+    }
+    k_self_attention<<<(int)heads, attention_threads(head_width), 0, st->stream>>>(
+        qkv, kcache, vcache, position, cache_stride, valid,
+        (int)heads, (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cross-request causal transformer tile                              */
+/* ------------------------------------------------------------------ */
+
+/* C[m][n] = bias[n] + sum_k A[m][k] * W[n][k], A row-major [M][K], W row-major
+ * [N][K].  Every output element is one fp32 accumulator walked over k in
+ * ascending order, whatever M is and wherever the row sits in the tile, so a
+ * request computes the same bits alone or inside a wide gang.  That is the
+ * property cuBLAS does not promise (it picks algorithms and split-K by M). */
+#define TILE_GEMM_BM 64
+#define TILE_GEMM_BN 64
+#define TILE_GEMM_BK 16
+/* BF16 == true: W is resident bf16 bits and A is rounded to bf16 on load, so
+ * the tile computes the same bf16 x bf16 -> fp32 representation as the
+ * per-request cuBLAS BF16 path, still with one ordered fp32 accumulator. */
+template <bool BF16>
+__global__ static void k_tile_gemm(const float *A, const void *Wv,
+                                   const float *bias, float *C, int M, int N,
+                                   int K) {
+    const float *W = static_cast<const float *>(Wv);
+    const uint16_t *W16 = static_cast<const uint16_t *>(Wv);
+    __shared__ float As[TILE_GEMM_BK][TILE_GEMM_BM + 4];
+    __shared__ float Ws[TILE_GEMM_BK][TILE_GEMM_BN + 4];
+    const int tid = (int)threadIdx.x;
+    const int tx = tid % 16;
+    const int ty = tid / 16;
+    const int m0 = (int)blockIdx.y * TILE_GEMM_BM;
+    const int n0 = (int)blockIdx.x * TILE_GEMM_BN;
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TILE_GEMM_BK) {
+        for (int i = 0; i < 4; ++i) {
+            const int idx = tid + i * 256;
+            const int r = idx / TILE_GEMM_BK;
+            const int c = idx % TILE_GEMM_BK;
+            const int k = k0 + c;
+            if (BF16) {
+                As[c][r] = (m0 + r < M && k < K)
+                               ? cuda_bf16_to_float(cuda_bf16_from_float(
+                                     A[(size_t)(m0 + r) * K + k]))
+                               : 0.0f;
+                Ws[c][r] = (n0 + r < N && k < K)
+                               ? cuda_bf16_to_float(W16[(size_t)(n0 + r) * K + k])
+                               : 0.0f;
+            } else {
+                As[c][r] = (m0 + r < M && k < K) ? A[(size_t)(m0 + r) * K + k] : 0.0f;
+                Ws[c][r] = (n0 + r < N && k < K) ? W[(size_t)(n0 + r) * K + k] : 0.0f;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < TILE_GEMM_BK; ++kk) {
+            float a[4], w[4];
+            for (int i = 0; i < 4; ++i) a[i] = As[kk][ty * 4 + i];
+            for (int j = 0; j < 4; ++j) w[j] = Ws[kk][tx * 4 + j];
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], w[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + tx * 4 + j;
+            if (n >= N) continue;
+            C[(size_t)m * N + n] = acc[i][j] + (bias != nullptr ? bias[n] : 0.0f);
+        }
+    }
+}
+
+/* Split-K variant of k_tile_gemm. The number of splits S depends on the
+ * weight's shape (N, K) and the SM count only, never on M; split s is one
+ * ascending fma chain over its own k range, and the partials are added in the
+ * fixed order ((P0 + P1) + P2) + ... . A row's bits therefore still do not
+ * depend on how many other rows share the call, while small-M tiles get
+ * enough independent blocks to fill the card. (Same scheme as the mynah-asr
+ * cohort GEMM.) */
+__global__ static void k_tile_gemm_part(const float *A, const float *W, float *P,
+                                        int M, int N, int K, int KC) {
+    __shared__ float As[TILE_GEMM_BK][TILE_GEMM_BM + 4];
+    __shared__ float Ws[TILE_GEMM_BK][TILE_GEMM_BN + 4];
+    const int tid = (int)threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int m0 = (int)blockIdx.y * TILE_GEMM_BM;
+    const int n0 = (int)blockIdx.x * TILE_GEMM_BN;
+    const int kb = (int)blockIdx.z * KC;
+    const int ke = min(K, kb + KC);
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    const int lrow = tid >> 2, lk = (tid & 3) * 4;
+    for (int k0 = kb; k0 < ke; k0 += TILE_GEMM_BK) {
+        {
+            const int m = m0 + lrow;
+            const float *src = A + (size_t)m * K + k0 + lk;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int k = k0 + lk + u;
+                As[lk + u][lrow] = (m < M && k < ke) ? src[u] : 0.0f;
+            }
+        }
+        {
+            const int n = n0 + lrow;
+            const float *src = W + (size_t)n * K + k0 + lk;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int k = k0 + lk + u;
+                Ws[lk + u][lrow] = (n < N && k < ke) ? src[u] : 0.0f;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < TILE_GEMM_BK; ++k) {
+            float a[4], w[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = As[k][ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) w[j] = Ws[k][tx * 4 + j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], w[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float *Ps = P + (size_t)blockIdx.z * (size_t)M * (size_t)N;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + tx * 4 + j;
+            if (n < N) Ps[(size_t)m * N + n] = acc[i][j];
+        }
+    }
+}
+
+__global__ static void k_tile_gemm_reduce(const float *P, int S, int M, int N,
+                                          const float *bias, float *C) {
+    const int n = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int m = (int)blockIdx.y;
+    if (n >= N || m >= M) return;
+    const size_t mn = (size_t)M * (size_t)N, o = (size_t)m * N + n;
+    float v = P[o];
+    for (int sp = 1; sp < S; ++sp) v += P[(size_t)sp * mn + o];
+    C[o] = v + (bias != nullptr ? bias[n] : 0.0f);
+}
+
+static int tile_gemm_splits(int sms, int N, int K) {
+    const int ntiles = (N + TILE_GEMM_BN - 1) / TILE_GEMM_BN;
+    int S = (2 * sms + ntiles - 1) / ntiles;
+    const int smax = K / 256;
+    if (S > smax) S = smax;
+    return S < 1 ? 1 : S;
+}
+
+__global__ static void k_bias_rows(float *C, const float *bias, int M, int N) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < M * N) C[i] += bias[i % N];
+}
+
+/* The tile's rows are packed: row m is token `rowmap[m].y` of request
+ * `rowmap[m].x`, so requests may contribute different token counts. */
+__global__ static void k_tile_gather(const float *const *inputs,
+                                     const int2 *rowmap, float *x, int dim,
+                                     int total) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    const int2 rt = rowmap[i / dim];
+    x[i] = inputs[rt.x][(size_t)rt.y * dim + (i % dim)];
+}
+
+/* Row-major [m][dim] to each request's channel-major [dim][positions]. */
+__global__ static void k_tile_scatter(const float *x, float *const *outputs,
+                                      const int2 *rowmap, int positions,
+                                      int dim, int total) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    const int2 rt = rowmap[i / dim];
+    outputs[rt.x][(size_t)(i % dim) * positions + rt.y] = x[i];
+}
+
+__device__ static inline float tile_kv_load(const float *p) { return *p; }
+__device__ static inline float tile_kv_load(const uint16_t *p) {
+    return cuda_bf16_to_float(*p);
+}
+__device__ static inline void tile_kv_store(float *p, float v) { *p = v; }
+__device__ static inline void tile_kv_store(uint16_t *p, float v) {
+    *p = cuda_bf16_from_float(v);
+}
+
+/* RoPE on q and k at each row's absolute position (the formula of k_rope_qk),
+ * then k and v into the request's cache at slot (absolute % ring), layout
+ * [K ring][V ring] per layer. One block per row. */
+template <typename KV>
+__global__ static void k_tile_rope_store(float *qkv, void *const *kv,
+                                         const long long *start,
+                                         const int2 *rowmap, int layer,
+                                         int layers, int heads, int head_width,
+                                         const long long *rings, float max_period) {
+    const int m = (int)blockIdx.x;
+    const int2 rt = rowmap[m];
+    const long long ring = rings[rt.x];
+    const long long absolute = start[rt.x] + rt.y;
+    const int half = head_width / 2;
+    const int dim = heads * head_width;
+    float *row = qkv + (size_t)m * 3u * (size_t)dim;
+    KV *kbase = static_cast<KV *>(kv[(size_t)rt.x * layers + layer]);
+    KV *kslot = kbase + (size_t)(absolute % ring) * dim;
+    KV *vslot = kbase + (size_t)ring * dim + (size_t)(absolute % ring) * dim;
+    const float slope = (float)(-log((double)max_period) * 2.0 /
+                                (double)head_width);
+    for (int pair = (int)threadIdx.x; pair < heads * half;
+         pair += (int)blockDim.x) {
+        const int head = pair / half;
+        const int i = pair % half;
+        const size_t qi = (size_t)head * head_width + (size_t)(2 * i);
+        const float frequency = expf((float)i * slope);
+        const float angle = (float)absolute * frequency;
+        float sine = 0.0f, cosine = 0.0f;
+        sincosf(angle, &sine, &cosine);
+        const float q0 = row[qi], q1 = row[qi + 1u];
+        row[qi] = q0 * cosine - q1 * sine;
+        row[qi + 1u] = q0 * sine + q1 * cosine;
+        const float k0 = row[dim + qi], k1 = row[dim + qi + 1u];
+        tile_kv_store(kslot + qi, k0 * cosine - k1 * sine);
+        tile_kv_store(kslot + qi + 1u, k0 * sine + k1 * cosine);
+        tile_kv_store(vslot + qi, row[2 * dim + qi]);
+        tile_kv_store(vslot + qi + 1u, row[2 * dim + qi + 1u]);
+    }
+}
+
+/* One warp per (row, head): scores over the causal window in shared memory,
+ * a two-pass softmax, then each lane owns output dims. Every reduction order
+ * depends only on the window length, never on the batch. `context` 0 means
+ * the whole prefix; `window_cap` bounds the per-warp score buffer. */
+template <typename KV>
+__global__ static void k_tile_attention(const float *qkv, void *const *kv,
+                                        const long long *start,
+                                        const int2 *rowmap, int layer,
+                                        int layers, int heads, int head_width,
+                                        long long context, const long long *rings,
+                                        int window_cap, float scale, float *out,
+                                        int rows_total) {
+    extern __shared__ float tile_scores[];
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int work = (int)blockIdx.x * ((int)blockDim.x >> 5) + warp;
+    if (work >= rows_total * heads) return;
+    const int m = work / heads;
+    const int h = work % heads;
+    const int2 rt = rowmap[m];
+    const long long ring = rings[rt.x];
+    const long long absolute = start[rt.x] + rt.y;
+    const long long first =
+        (context > 0 && absolute + 1 > context) ? absolute + 1 - context : 0;
+    const int n = (int)(absolute - first + 1);
+    if (n > window_cap) return; /* refused on the host; never reached */
+    const int dim = heads * head_width;
+    float *scores = tile_scores + (size_t)warp * window_cap;
+    const float *q = qkv + (size_t)m * 3u * dim + (size_t)h * head_width;
+    const KV *kbase = static_cast<const KV *>(kv[(size_t)rt.x * layers + layer]);
+    const KV *vbase = kbase + (size_t)ring * dim;
+    float local_max = -INFINITY;
+    for (int s = lane; s < n; s += 32) {
+        const KV *k = kbase + (size_t)((first + s) % ring) * dim +
+                      (size_t)h * head_width;
+        float dot = 0.0f;
+        for (int d = 0; d < head_width; ++d)
+            dot = fmaf(q[d], tile_kv_load(k + d), dot);
+        const float score = dot * scale;
+        scores[s] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, off));
+    float local_sum = 0.0f;
+    for (int s = lane; s < n; s += 32) {
+        const float p = expf(scores[s] - local_max);
+        scores[s] = p;
+        local_sum += p;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_xor_sync(0xffffffffu, local_sum, off);
+    __syncwarp();
+    const float inv = local_sum > 0.0f ? 1.0f / local_sum : 0.0f;
+    for (int d = lane; d < head_width; d += 32) {
+        float acc = 0.0f;
+        for (int s = 0; s < n; ++s) {
+            const KV *v = vbase + (size_t)((first + s) % ring) * dim +
+                          (size_t)h * head_width;
+            acc = fmaf(scores[s], tile_kv_load(v + d), acc);
+        }
+        out[(size_t)m * dim + (size_t)h * head_width + d] = acc * inv;
+    }
+}
+
+/* Grouped variant: one block per (group of up to TILE_ATTN_Q consecutive
+ * tokens of one request, head). The K/V window is streamed through shared
+ * memory in TILE_ATTN_CH-position chunks that every query of the group
+ * reuses, instead of each (token, head) warp reading the whole window from
+ * global memory. One warp per query, online softmax over the chunks. The
+ * result depends only on the request's own tokens and cache. */
+#define TILE_ATTN_Q 16
+#define TILE_ATTN_CH 32
+#define TILE_ATTN_HW 128
+template <typename KV>
+__global__ static void k_tile_attention_grouped(
+    const float *qkv, void *const *kv, const long long *start,
+    const int2 *rowmap, const int2 *groups, int layer, int layers, int heads,
+    int head_width, long long context, const long long *rings, float scale,
+    float *out) {
+    __shared__ float ks[TILE_ATTN_CH][TILE_ATTN_HW + 1];
+    __shared__ float vs[TILE_ATTN_CH][TILE_ATTN_HW];
+    __shared__ float qs[TILE_ATTN_Q][TILE_ATTN_HW];
+    const int2 group = groups[blockIdx.x];   /* x = first packed row, y = rows */
+    const int h = (int)blockIdx.y;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int dim = heads * head_width;
+    const int2 rt0 = rowmap[group.x];
+    const int r = rt0.x;
+    const long long ring = rings[r];
+    const long long abs0 = start[r] + rt0.y;
+    const long long abs_last = abs0 + group.y - 1;
+    const long long lo = (context > 0 && abs0 + 1 > context) ? abs0 + 1 - context : 0;
+    const KV *kbase = static_cast<const KV *>(kv[(size_t)r * layers + layer]);
+    const KV *vbase = kbase + (size_t)ring * dim;
+    for (int i = (int)threadIdx.x; i < group.y * head_width; i += (int)blockDim.x) {
+        const int q = i / head_width, d = i % head_width;
+        qs[q][d] = qkv[(size_t)(group.x + q) * 3u * dim + (size_t)h * head_width + d];
+    }
+    const bool active = warp < group.y;
+    const long long my_abs = abs0 + warp;
+    const long long my_first =
+        (context > 0 && my_abs + 1 > context) ? my_abs + 1 - context : 0;
+    float running_max = -INFINITY, running_sum = 0.0f;
+    float acc[TILE_ATTN_HW / 32];
+    for (int k = 0; k < TILE_ATTN_HW / 32; ++k) acc[k] = 0.0f;
+    for (long long c0 = lo; c0 <= abs_last; c0 += TILE_ATTN_CH) {
+        __syncthreads();
+        for (int i = (int)threadIdx.x; i < TILE_ATTN_CH * head_width;
+             i += (int)blockDim.x) {
+            const int j = i / head_width, d = i % head_width;
+            const long long p = c0 + j;
+            float kval = 0.0f, vval = 0.0f;
+            if (p <= abs_last) {
+                const size_t slot = (size_t)(p % ring) * dim + (size_t)h * head_width + d;
+                kval = tile_kv_load(kbase + slot);
+                vval = tile_kv_load(vbase + slot);
+            }
+            ks[j][d] = kval;
+            vs[j][d] = vval;
+        }
+        __syncthreads();
+        if (!active) continue;
+        const long long p = c0 + lane;
+        float score = -INFINITY;
+        if (p >= my_first && p <= my_abs) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_width; ++d) dot = fmaf(qs[warp][d], ks[lane][d], dot);
+            score = dot * scale;
+        }
+        float chunk_max = score;
+        for (int off = 16; off > 0; off >>= 1)
+            chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, off));
+        if (chunk_max == -INFINITY) continue;
+        const float next_max = fmaxf(running_max, chunk_max);
+        const float correction = running_max == -INFINITY ? 0.0f : expf(running_max - next_max);
+        const float prob = score == -INFINITY ? 0.0f : expf(score - next_max);
+        float chunk_sum = prob;
+        for (int off = 16; off > 0; off >>= 1)
+            chunk_sum += __shfl_xor_sync(0xffffffffu, chunk_sum, off);
+        running_sum = running_sum * correction + chunk_sum;
+        running_max = next_max;
+        for (int k = 0; k < TILE_ATTN_HW / 32; ++k) acc[k] *= correction;
+        for (int j = 0; j < TILE_ATTN_CH; ++j) {
+            const float pj = __shfl_sync(0xffffffffu, prob, j);
+            if (pj == 0.0f) continue;
+            for (int k = 0; k < TILE_ATTN_HW / 32; ++k) {
+                const int d = lane + 32 * k;
+                if (d < head_width) acc[k] = fmaf(pj, vs[j][d], acc[k]);
+            }
+        }
+    }
+    if (!active) return;
+    const float inv = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    float *o = out + (size_t)(group.x + warp) * dim + (size_t)h * head_width;
+    for (int k = 0; k < TILE_ATTN_HW / 32; ++k) {
+        const int d = lane + 32 * k;
+        if (d < head_width) o[d] = acc[k] * inv;
+    }
+}
+
+static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
+                        size_t ffn, size_t meta_bytes, char *e, size_t ec) {
+    cuda_tile_workspace &w = st->tile;
+    size_t md = 0u, mf = 0u;
+    if (!cuda_size_mul(rows, dim, &md) || !cuda_size_mul(rows, ffn, &mf) ||
+        md > (size_t)INT_MAX / 3u || mf > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA tile workspace size overflow");
+        return -1;
+    }
+    if (md > w.md_cap || mf > w.mf_cap) {
+        cudaFree(w.x); cudaFree(w.xn); cudaFree(w.qkv);
+        cudaFree(w.att); cudaFree(w.proj); cudaFree(w.ffn_buf);
+        w.x = w.xn = w.qkv = w.att = w.proj = w.ffn_buf = nullptr;
+        if (md < w.md_cap) md = w.md_cap;
+        if (mf < w.mf_cap) mf = w.mf_cap;
+        w.md_cap = w.mf_cap = 0u;
+        if (ce(cudaMalloc(&w.x, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.xn, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.qkv, 3u * md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.att, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.proj, md * sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&w.ffn_buf, mf * sizeof(float)), e, ec))
+            return -1;
+        w.md_cap = md;
+        w.mf_cap = mf;
+    }
+    if (meta_bytes > w.meta_cap) {
+        if (w.meta_event != nullptr) (void)cudaEventSynchronize(w.meta_event);
+        cudaFree(w.meta_dev);
+        cudaFreeHost(w.meta_host);
+        w.meta_dev = nullptr;
+        w.meta_host = nullptr;
+        w.meta_cap = 0u;
+        if (ce(cudaMalloc(&w.meta_dev, meta_bytes), e, ec) ||
+            ce(cudaHostAlloc(&w.meta_host, meta_bytes, cudaHostAllocDefault), e, ec))
+            return -1;
+        w.meta_cap = meta_bytes;
+    }
+    if (w.meta_event == nullptr &&
+        ce(cudaEventCreateWithFlags(&w.meta_event, cudaEventDisableTiming), e, ec))
+        return -1;
+    if (w.sms == 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&w.sms, cudaDevAttrMultiProcessorCount, dev) !=
+                cudaSuccess || w.sms <= 0)
+            w.sms = 40;
+    }
+    /* The widest split-K partial buffer any projection of this tile needs. */
+    const size_t shapes[4][2] = {{3u * dim, dim}, {dim, dim}, {ffn, dim}, {dim, ffn}};
+    size_t need = 0u;
+    for (const auto &shape : shapes) {
+        const int S = tile_gemm_splits(w.sms, (int)shape[0], (int)shape[1]);
+        if (S <= 1) continue;
+        const size_t floats = (size_t)S * rows * shape[0];
+        if (floats > need) need = floats;
+    }
+    if (need > w.splitk_cap) {
+        cudaFree(w.splitk);
+        w.splitk = nullptr;
+        w.splitk_cap = 0u;
+        if (ce(cudaMalloc(&w.splitk, need * sizeof(float)), e, ec)) return -1;
+        w.splitk_cap = need;
+    }
+    return 0;
+}
+
+static void tile_release(cuda_backend_state *st) {
+    cuda_tile_workspace &w = st->tile;
+    cudaFree(w.x); cudaFree(w.xn); cudaFree(w.qkv);
+    cudaFree(w.att); cudaFree(w.proj); cudaFree(w.ffn_buf);
+    cudaFree(w.meta_dev);
+    cudaFree(w.splitk);
+    if (w.meta_host != nullptr) cudaFreeHost(w.meta_host);
+    if (w.meta_event != nullptr) cudaEventDestroy(w.meta_event);
+    w = cuda_tile_workspace();
+}
+
+/* Fixed-order tile GEMM on TF32 tensor cores: C[M,N] = A[M,K] W[N,K]^T + b.
+ * Each output accumulates over K in the same order (32-wide slabs, then
+ * 8-wide MMA steps) whatever M is and whichever block computes it, so a row's
+ * bits do not depend on the other rows of the call; it keeps the prefill
+ * invariance of the SIMT kernel at tensor-core speed.  Needs sm_80+. */
+static constexpr int TILE_TC_BM = 64, TILE_TC_BN = 64, TILE_TC_BK = 32;
+static constexpr int TILE_TC_LD = TILE_TC_BK + 4;
+static_assert(2 * TILE_TC_BM * TILE_TC_LD >= TILE_TC_BM * (TILE_TC_BN + 4),
+              "the epilogue reuses the operand staging buffer");
+
+__global__ static void __launch_bounds__(128)
+k_tile_gemm_tc(const float *A, const float *W, const float *bias, float *C,
+               int M, int N, int K, int KC, float *P) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    __shared__ __align__(32) float sm[2 * TILE_TC_BM * TILE_TC_LD];
+    float *As = sm;
+    float *Ws = sm + TILE_TC_BM * TILE_TC_LD;
+    const int m0 = (int)blockIdx.y * TILE_TC_BM;
+    const int n0 = (int)blockIdx.x * TILE_TC_BN;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int wm = warp >> 1, wn = warp & 1;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+    /* Split-K: block z owns K range [z*KC, min(K, (z+1)*KC)); the split
+     * count depends on N and K only, and k_tile_gemm_reduce adds the
+     * partials in split order, so the result stays independent of M. */
+    const int kbeg = (int)blockIdx.z * KC;
+    const int kend = kbeg + KC < K ? kbeg + KC : K;
+    for (int k0 = kbeg; k0 < kend; k0 += TILE_TC_BK) {
+        for (int i = 0; i < (TILE_TC_BM * TILE_TC_BK) / 128; ++i) {
+            const int idx = tid + 128 * i;
+            const int r = idx / TILE_TC_BK, c = idx % TILE_TC_BK;
+            const int gk = k0 + c;
+            const int gm = m0 + r, gn = n0 + r;
+            As[r * TILE_TC_LD + c] = gm < M && gk < kend
+                ? wmma::__float_to_tf32(A[(size_t)gm * (size_t)K + (size_t)gk]) : 0.0f;
+            Ws[r * TILE_TC_LD + c] = gn < N && gk < kend
+                ? wmma::__float_to_tf32(W[(size_t)gn * (size_t)K + (size_t)gk]) : 0.0f;
+        }
+        __syncthreads();
+        for (int kk = 0; kk < TILE_TC_BK; kk += 8) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32,
+                           wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32,
+                           wmma::col_major> b[2];
+            for (int i = 0; i < 2; ++i)
+                wmma::load_matrix_sync(a[i], As + (wm * 32 + i * 16) * TILE_TC_LD + kk,
+                                       TILE_TC_LD);
+            for (int j = 0; j < 2; ++j)
+                wmma::load_matrix_sync(b[j], Ws + (wn * 32 + j * 16) * TILE_TC_LD + kk,
+                                       TILE_TC_LD);
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j)
+                    wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    constexpr int CLD = TILE_TC_BN + 4;
+    float *Cs = sm;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+            wmma::store_matrix_sync(Cs + (wm * 32 + i * 16) * CLD + wn * 32 + j * 16,
+                                    acc[i][j], CLD, wmma::mem_row_major);
+    __syncthreads();
+    for (int idx = tid; idx < TILE_TC_BM * TILE_TC_BN; idx += 128) {
+        const int r = idx / TILE_TC_BN, c = idx % TILE_TC_BN;
+        const int gm = m0 + r, gn = n0 + c;
+        if (gm >= M || gn >= N) continue;
+        const size_t o = (size_t)gm * (size_t)N + (size_t)gn;
+        if (P != nullptr)
+            P[(size_t)blockIdx.z * (size_t)M * (size_t)N + o] = Cs[r * CLD + c];
+        else
+            C[o] = Cs[r * CLD + c] + (bias != nullptr ? bias[gn] : 0.0f);
+    }
+#endif
+}
+
+static bool cuda_tile_tc_usable(void) {
+    static const bool on = [] {
+        if (!cuda_env_enabled("MYNAH_CUDA_TILE_TC", false)) return false;
+        int dev = 0, major = 0;
+        return cudaGetDevice(&dev) == cudaSuccess &&
+               cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                      dev) == cudaSuccess && major >= 8;
+    }();
+    return on;
+}
+
+static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
+                     const float *hb, float *C, size_t M, size_t N, size_t K,
+                     int bf16, char *e, size_t ec) {
+    float *db = nullptr;
+    if (hb != nullptr && cached_weight(st, hb, N * sizeof(float), &db, e, ec))
+        return -1;
+    cuda_tile_workspace &w = st->tile;
+    const dim3 grid((unsigned)((N + TILE_GEMM_BN - 1) / TILE_GEMM_BN),
+                    (unsigned)((M + TILE_GEMM_BM - 1) / TILE_GEMM_BM));
+    if (bf16) {
+        /* MYNAH_CUDA_QUANT=bf16: the resident BF16 weight copy through the
+         * ordered fp32-accumulating tile kernel, whichever tile mode the f32
+         * path runs.  A cuBLAS BF16 tile was measured on the L4: its
+         * M-dependent rounding put the Mimi solo-vs-gang gap at 1.1e-3,
+         * outside the tensor-core parity band the self-check allows; this
+         * kernel keeps the tile batch-invariant at bf16 weight traffic. */
+        uint16_t *dw16 = nullptr;
+        if (cached_weight_bf16(st, hw, N * K, &dw16, e, ec)) return -1;
+        k_tile_gemm<true><<<grid, 256, 0, st->stream>>>(A, dw16, db, C, (int)M,
+                                                          (int)N, (int)K);
+        return ce(cudaGetLastError(), e, ec);
+    }
+    float *dw = nullptr;
+    if (cached_weight(st, hw, N * K * sizeof(float), &dw, e, ec)) return -1;
+    if (w.fixed_order && cuda_tile_tc_usable()) {
+        int S = tile_gemm_splits(w.sms > 0 ? w.sms : 40, (int)N, (int)K);
+        if (w.splitk == nullptr || (size_t)S * M * N > w.splitk_cap) S = 1;
+        int KC = (int)((K + (size_t)S - 1u) / (size_t)S);
+        KC = (KC + TILE_TC_BK - 1) / TILE_TC_BK * TILE_TC_BK;
+        const dim3 tgrid((unsigned)((N + TILE_TC_BN - 1) / TILE_TC_BN),
+                         (unsigned)((M + TILE_TC_BM - 1) / TILE_TC_BM),
+                         (unsigned)S);
+        k_tile_gemm_tc<<<tgrid, 128, 0, st->stream>>>(
+            A, dw, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        if (S == 1) return 0;
+        const dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
+        k_tile_gemm_reduce<<<g2, 256, 0, st->stream>>>(w.splitk, S, (int)M,
+                                                       (int)N, db, C);
+        return ce(cudaGetLastError(), e, ec);
+    }
+    if (st->tile_cublas && !w.fixed_order) {
+        /* Tensor-core GEMM through cuBLAS: faster, but cuBLAS picks its
+         * algorithm by M, so a row's bits can depend on its batch. */
+        if (cbe(cublasSetStream(st->cublas, st->stream), e, ec)) return -1;
+        const float alpha = 1.0f, beta = 0.0f;
+        if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)N,
+                             (int)M, (int)K, &alpha, dw, CUDA_R_32F, (int)K, A,
+                             CUDA_R_32F, (int)K, &beta, C, CUDA_R_32F, (int)N,
+                             cuda_compute_type(st), cuda_gemm_algo(st)),
+                e, ec))
+            return -1;
+        if (db == nullptr) return 0;
+        const int total = (int)(M * N);
+        k_bias_rows<<<(total + 255) / 256, 256, 0, st->stream>>>(C, db, (int)M,
+                                                                 (int)N);
+        return ce(cudaGetLastError(), e, ec);
+    }
+    static const bool splitk_on = cuda_env_enabled("MYNAH_CUDA_TILE_SPLITK", true);
+    const int S = tile_gemm_splits(w.sms > 0 ? w.sms : 40, (int)N, (int)K);
+    if (splitk_on && S > 1 && w.splitk != nullptr && (size_t)S * M * N <= w.splitk_cap) {
+        int KC = (int)((K + (size_t)S - 1u) / (size_t)S);
+        KC = (KC + TILE_GEMM_BK - 1) / TILE_GEMM_BK * TILE_GEMM_BK;
+        const dim3 grid((unsigned)((N + TILE_GEMM_BN - 1) / TILE_GEMM_BN),
+                        (unsigned)((M + TILE_GEMM_BM - 1) / TILE_GEMM_BM),
+                        (unsigned)S);
+        k_tile_gemm_part<<<grid, 256, 0, st->stream>>>(A, dw, w.splitk, (int)M,
+                                                       (int)N, (int)K, KC);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        const dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
+        k_tile_gemm_reduce<<<g2, 256, 0, st->stream>>>(w.splitk, S, (int)M,
+                                                       (int)N, db, C);
+        return ce(cudaGetLastError(), e, ec);
+    }
+    k_tile_gemm<false><<<grid, 256, 0, st->stream>>>(A, dw, db, C, (int)M,
+                                                       (int)N, (int)K);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int tile_norm(cuda_backend_state *st, const float *in, float *out,
+                     const float *gain, const float *bias, size_t M, size_t dim,
+                     float eps, char *e, size_t ec) {
+    float *dg = nullptr, *db = nullptr;
+    if (cached_weight(st, gain, dim * sizeof(float), &dg, e, ec)) return -1;
+    if (bias != nullptr && cached_weight(st, bias, dim * sizeof(float), &db, e, ec))
+        return -1;
+    k_layer_norm<<<(int)M, 256, 0, st->stream>>>(out, in, dg, db, (int)dim, eps,
+                                                (int)M);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+static int tile_residual(cuda_backend_state *st, float *x, const float *y,
+                         const float *scale, size_t M, size_t dim, char *e,
+                         size_t ec) {
+    const int total = (int)(M * dim);
+    if (scale == nullptr) {
+        k_residual_add<<<(total + 255) / 256, 256, 0, st->stream>>>(x, y, total);
+    } else {
+        float *ds = nullptr;
+        if (cached_weight(st, scale, dim * sizeof(float), &ds, e, ec)) return -1;
+        k_scaled_residual_rows_add<<<(total + 255) / 256, 256, 0, st->stream>>>(
+            x, y, ds, (int)M, (int)dim);
+    }
+    return ce(cudaGetLastError(), e, ec);
+}
+
+/* cuBLAS chooses its algorithm (and split-K) by M and the tensor-core
+ * modes round inputs, so a row's bits then depend on its batch mates.  The
+ * same holds for the reduced-precision weight paths (MYNAH_CUDA_QUANT=bf16
+ * runs cuBLAS BF16 GEMMs; int8 dequantizes through its own tensor-core
+ * kernels), whichever tile mode is set. */
+extern "C" int mynah_cuda_batch_invariant(void *opaque) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) return 1;
+    return !(st->fast_math || st->tf32 || st->tile_cublas || st->quant_weights);
+}
+
+extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
+                                               const mynah_backend_tile_desc *d,
+                                               char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || d == nullptr || d->layer == nullptr ||
+        d->input == nullptr || d->kv == nullptr || d->start == nullptr ||
+        d->rows == 0u || d->positions == 0u || d->dim == 0u || d->heads == 0u ||
+        d->ffn == 0u || d->layers == 0u || d->dim % d->heads != 0u ||
+        (d->dim / d->heads) % 2u != 0u ||
+        d->rows > 4096u || d->positions > 4096u || d->layers > 64u ||
+        d->dim > 65536u || d->ffn > 65536u) {
+        set_error(e, ec, "invalid CUDA tile transformer description");
+        return -1;
+    }
+    /* Pack the rows and bound every attention window before touching the GPU. */
+    size_t M = 0u;
+    size_t window = 0u;
+    for (size_t r = 0; r < d->rows; ++r) {
+        const size_t n = d->count != nullptr ? d->count[r] : d->positions;
+        if (n > d->positions) {
+            set_error(e, ec, "CUDA tile row count exceeds its positions");
+            return -1;
+        }
+        const size_t end = d->start[r] + n;
+        const size_t ring = d->rings != nullptr ? d->rings[r] : d->ring;
+        if (ring == 0u ||
+            (d->context != 0u && ring < d->context + d->positions - 1u)) {
+            set_error(e, ec, "CUDA tile ring cannot hold the attention window");
+            return -1;
+        }
+        if (d->context == 0u && end > ring) {
+            set_error(e, ec, "CUDA tile position exceeds the cache");
+            return -1;
+        }
+        const size_t w = d->context != 0u && end > d->context ? d->context : end;
+        if (w > window) window = w;
+        M += n;
+    }
+    if (M == 0u) return 0;
+    if (M > (size_t)INT_MAX / d->ffn || window > 12288u) {
+        set_error(e, ec, "CUDA tile is too large (rows or attention window)");
+        return -1;
+    }
+    const size_t kv_count = d->rows * d->layers;
+    /* Attention groups: up to TILE_ATTN_Q consecutive tokens of one request. */
+    size_t group_count = 0u;
+    for (size_t r = 0; r < d->rows; ++r) {
+        const size_t n = d->count != nullptr ? d->count[r] : d->positions;
+        group_count += (n + TILE_ATTN_Q - 1u) / TILE_ATTN_Q;
+    }
+    const size_t meta_bytes = (2u * d->rows + kv_count) * sizeof(void *) +
+                              2u * d->rows * sizeof(long long) + M * sizeof(int2) +
+                              group_count * sizeof(int2);
+    if (tile_reserve(st, M, d->dim, d->ffn, meta_bytes, e, ec)) return -1;
+    cuda_tile_workspace &w = st->tile;
+
+    /* The pinned staging is reused per call: wait until the previous call's
+     * copy has consumed it before overwriting. */
+    if (ce(cudaEventSynchronize(w.meta_event), e, ec)) return -1;
+    char *host = static_cast<char *>(w.meta_host);
+    const size_t off_out = d->rows * sizeof(void *);
+    const size_t off_kv = 2u * d->rows * sizeof(void *);
+    const size_t off_start = off_kv + kv_count * sizeof(void *);
+    const size_t off_ring = off_start + d->rows * sizeof(long long);
+    const size_t off_map = off_ring + d->rows * sizeof(long long);
+    memcpy(host, d->input, d->rows * sizeof(void *));
+    if (d->output != nullptr)
+        memcpy(host + off_out, d->output, d->rows * sizeof(void *));
+    else
+        memset(host + off_out, 0, d->rows * sizeof(void *));
+    memcpy(host + off_kv, d->kv, kv_count * sizeof(void *));
+    long long *host_start = reinterpret_cast<long long *>(host + off_start);
+    long long *host_ring = reinterpret_cast<long long *>(host + off_ring);
+    int2 *host_map = reinterpret_cast<int2 *>(host + off_map);
+    const size_t off_groups = off_map + M * sizeof(int2);
+    int2 *host_groups = reinterpret_cast<int2 *>(host + off_groups);
+    size_t m = 0u, g = 0u;
+    for (size_t r = 0; r < d->rows; ++r) {
+        host_start[r] = (long long)d->start[r];
+        host_ring[r] = (long long)(d->rings != nullptr ? d->rings[r] : d->ring);
+        const size_t n = d->count != nullptr ? d->count[r] : d->positions;
+        for (size_t t = 0; t < n; t += TILE_ATTN_Q)
+            host_groups[g++] = make_int2((int)(m + t),
+                                         (int)(n - t < TILE_ATTN_Q ? n - t : TILE_ATTN_Q));
+        for (size_t t = 0; t < n; ++t) host_map[m++] = make_int2((int)r, (int)t);
+    }
+    if (ce(cudaMemcpyAsync(w.meta_dev, w.meta_host, meta_bytes,
+                           cudaMemcpyHostToDevice, st->stream), e, ec) ||
+        ce(cudaEventRecord(w.meta_event, st->stream), e, ec))
+        return -1;
+    char *dev = static_cast<char *>(w.meta_dev);
+    const float *const *d_in = reinterpret_cast<const float *const *>(dev);
+    float *const *d_out = reinterpret_cast<float *const *>(dev + off_out);
+    void *const *d_kv = reinterpret_cast<void *const *>(dev + off_kv);
+    const long long *d_start = reinterpret_cast<const long long *>(dev + off_start);
+    const long long *d_ring = reinterpret_cast<const long long *>(dev + off_ring);
+    const int2 *d_map = reinterpret_cast<const int2 *>(dev + off_map);
+    const int2 *d_groups = reinterpret_cast<const int2 *>(dev + off_groups);
+    static const bool grouped = cuda_env_enabled("MYNAH_CUDA_TILE_ATTN_GROUPED", true);
+    const bool use_grouped = grouped && (d->dim / d->heads) <= TILE_ATTN_HW;
+    const dim3 group_grid((unsigned)group_count, (unsigned)d->heads);
+
+    const int dim = (int)d->dim;
+    const int heads = (int)d->heads;
+    const int head_width = dim / heads;
+    const int total = (int)(M * d->dim);
+    w.fixed_order = d->fixed_order != 0;
+    k_tile_gather<<<(total + 255) / 256, 256, 0, st->stream>>>(d_in, d_map, w.x,
+                                                               dim, total);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    const float scale = 1.0f / sqrtf((float)head_width);
+    int warps_per_block = (int)((48u * 1024u) / (window * sizeof(float)));
+    if (warps_per_block > 4) warps_per_block = 4;
+    if (warps_per_block < 1) warps_per_block = 1;
+    const int work = (int)M * heads;
+    const size_t smem = (size_t)warps_per_block * window * sizeof(float);
+    for (size_t l = 0; l < d->layers; ++l) {
+        const mynah_transformer_tile_layer *L = &d->layer[l];
+        if (tile_norm(st, w.x, w.xn, L->norm1_weight, L->norm1_bias, M, d->dim,
+                      d->layernorm_eps, e, ec) ||
+            tile_gemm(st, w.xn, L->in_proj_weight, L->in_proj_bias, w.qkv, M,
+                      3u * d->dim, d->dim, d->weight_bf16, e, ec))
+            return -1;
+        const unsigned blocks = (unsigned)((work + warps_per_block - 1) /
+                                           warps_per_block);
+        if (d->kv_bf16) {
+            k_tile_rope_store<uint16_t><<<(int)M, 256, 0, st->stream>>>(
+                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
+                head_width, d_ring, d->max_period);
+            if (use_grouped)
+                k_tile_attention_grouped<uint16_t><<<group_grid, TILE_ATTN_Q * 32, 0,
+                                                     st->stream>>>(
+                    w.qkv, d_kv, d_start, d_map, d_groups, (int)l, (int)d->layers,
+                    heads, head_width, (long long)d->context, d_ring, scale, w.att);
+            else
+            k_tile_attention<uint16_t><<<blocks, warps_per_block * 32, smem,
+                                          st->stream>>>(
+                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
+                head_width, (long long)d->context, d_ring,
+                (int)window, scale, w.att, (int)M);
+        } else {
+            k_tile_rope_store<float><<<(int)M, 256, 0, st->stream>>>(
+                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
+                head_width, d_ring, d->max_period);
+            if (use_grouped)
+                k_tile_attention_grouped<float><<<group_grid, TILE_ATTN_Q * 32, 0,
+                                                  st->stream>>>(
+                    w.qkv, d_kv, d_start, d_map, d_groups, (int)l, (int)d->layers,
+                    heads, head_width, (long long)d->context, d_ring, scale, w.att);
+            else
+            k_tile_attention<float><<<blocks, warps_per_block * 32, smem,
+                                       st->stream>>>(
+                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
+                head_width, (long long)d->context, d_ring,
+                (int)window, scale, w.att, (int)M);
+        }
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        if (tile_gemm(st, w.att, L->out_proj_weight, L->out_proj_bias, w.proj, M,
+                      d->dim, d->dim, d->weight_bf16, e, ec) ||
+            tile_residual(st, w.x, w.proj, L->layer_scale_1, M, d->dim, e, ec) ||
+            tile_norm(st, w.x, w.xn, L->norm2_weight, L->norm2_bias, M, d->dim,
+                      d->layernorm_eps, e, ec) ||
+            tile_gemm(st, w.xn, L->linear1_weight, L->linear1_bias, w.ffn_buf, M,
+                      d->ffn, d->dim, d->weight_bf16, e, ec))
+            return -1;
+        const int ffn_total = (int)(M * d->ffn);
+        k_gelu<<<(ffn_total + 255) / 256, 256, 0, st->stream>>>(w.ffn_buf,
+                                                                 ffn_total);
+        if (ce(cudaGetLastError(), e, ec) ||
+            tile_gemm(st, w.ffn_buf, L->linear2_weight, L->linear2_bias, w.proj,
+                      M, d->dim, d->ffn, d->weight_bf16, e, ec) ||
+            tile_residual(st, w.x, w.proj, L->layer_scale_2, M, d->dim, e, ec))
+            return -1;
+    }
+    if (d->output != nullptr) {
+        k_tile_scatter<<<(total + 255) / 256, 256, 0, st->stream>>>(
+            w.x, d_out, d_map, (int)d->positions, dim, total);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+    }
+    st->tile_calls.fetch_add(1ull, std::memory_order_relaxed);
+    st->tile_rows.fetch_add((unsigned long long)M, std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" int mynah_cuda_self_attention_bf16_dev(
+    void *opaque, const float *qkv, void *kcache, void *vcache,
+    size_t position, size_t cache_stride, size_t valid, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
+        heads == 0u || head_width == 0u || valid == 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || cache_stride == 0u || position >= valid ||
+        heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA BF16 self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    if (cache_stride < width ||
+        (valid - 1u) > (SIZE_MAX - (width - 1u)) / cache_stride) {
+        set_error(e, ec, "CUDA BF16 self-attention cache stride overflow");
+        return -1;
+    }
+    k_self_attention_bf16<<<(int)heads, attention_threads(head_width), 0,
+                            st->stream>>>(
+        qkv, static_cast<uint16_t *>(kcache), static_cast<uint16_t *>(vcache),
+        position, cache_stride, valid, (int)heads, (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_cross_attention_dev(
+    void *opaque, const float *q, const float *kcache, const float *vcache,
+    size_t valid, size_t cache_stride, size_t heads, size_t head_width,
+    float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (q == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
+        heads == 0 || head_width == 0 || valid == 0 || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || cache_stride == 0) {
+        set_error(e, ec, "invalid CUDA cross-attention dimensions");
+        return -1;
+    }
+    if (heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "CUDA cross-attention width overflow");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    if (cache_stride < width ||
+        (valid - 1u) > (SIZE_MAX - (width - 1u)) / cache_stride) {
+        set_error(e, ec, "CUDA cross-attention cache stride overflow");
+        return -1;
+    }
+    k_cross_attention<<<(int)heads, attention_threads(head_width), 0, st->stream>>>(
+        q, kcache, vcache, valid, cache_stride, (int)heads,
+        (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+__global__ static void k_self_attention_batch(
+    const float *qkv, float *const *kcache, float *const *vcache,
+    const size_t *positions, const size_t *cache_strides, int batch, int heads,
+    int head_width, float scale, float *out) {
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t position = positions[request];
+    const size_t cache_stride = cache_strides[request];
+    const size_t cache_base = position * cache_stride + hbase;
+    float *request_k = kcache[request];
+    float *request_v = vcache[request];
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    const float *q = request_qkv + hbase;
+    const float *k = request_qkv + width + hbase;
+    const float *v = request_qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        request_k[cache_base + (size_t)d] = k[d];
+        request_v[cache_base + (size_t)d] = v[d];
+        out[(size_t)request * width + hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s <= position; ++s) {
+        const float *ks = request_k + s * cache_stride + hbase;
+        const float *vs = request_v + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * ks[d];
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = (size_t)request * width + hbase + (size_t)d;
+            out[index] = out[index] * correction + probability * vs[d];
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[(size_t)request * width + hbase + (size_t)d] *= inv;
+}
+
+__global__ static void k_self_attention_bf16_batch(
+    const float *qkv, const uint16_t *const *kcache,
+    const uint16_t *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, int heads, int head_width,
+    float scale, float *out) {
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch) return;
+    const int tid = (int)threadIdx.x;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t position = positions[request];
+    const size_t cache_stride = cache_strides[request];
+    const size_t cache_base = position * cache_stride + hbase;
+    uint16_t *request_k = const_cast<uint16_t *>(kcache[request]);
+    uint16_t *request_v = const_cast<uint16_t *>(vcache[request]);
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    const float *q = request_qkv + hbase;
+    const float *k = request_qkv + width + hbase;
+    const float *v = request_qkv + width * 2u + hbase;
+    for (int d = tid; d < head_width; d += (int)blockDim.x) {
+        request_k[cache_base + (size_t)d] = cuda_bf16_from_float(k[d]);
+        request_v[cache_base + (size_t)d] = cuda_bf16_from_float(v[d]);
+        out[(size_t)request * width + hbase + (size_t)d] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float correction;
+    __shared__ float probability;
+    if (tid == 0) {
+        maximum = -1.0e30f;
+        denominator = 0.0f;
+    }
+    __syncthreads();
+    for (size_t s = 0; s <= position; ++s) {
+        const uint16_t *ks = kcache[request] + s * cache_stride + hbase;
+        const uint16_t *vs = vcache[request] + s * cache_stride + hbase;
+        float local = 0.0f;
+        for (int d = tid; d < head_width; d += (int)blockDim.x)
+            local += q[d] * cuda_bf16_to_float(ks[d]);
+        partial[tid] = local;
+        __syncthreads();
+        for (int offset = (int)blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) partial[tid] += partial[tid + offset];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float score = partial[0] * scale;
+            const float next = fmaxf(maximum, score);
+            correction = expf(maximum - next);
+            probability = expf(score - next);
+            denominator = denominator * correction + probability;
+            maximum = next;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_width; d += (int)blockDim.x) {
+            const size_t index = (size_t)request * width + hbase + (size_t)d;
+            out[index] = out[index] * correction + probability *
+                         cuda_bf16_to_float(vs[d]);
+        }
+        __syncthreads();
+    }
+    const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int d = tid; d < head_width; d += (int)blockDim.x)
+        out[(size_t)request * width + hbase + (size_t)d] *= inv;
+}
+
+/* Decode attention over a BF16 KV cache, one block per (head, row).  The
+ * legacy kernel above walks the context one position at a time with a block
+ * reduction per position; this one scores a chunk of 128 positions at once
+ * (one thread per position, 128-bit K loads), keeps an online softmax per
+ * chunk and accumulates V in registers.  The reduction order depends only on
+ * the row's own length, so the result is independent of the batch.  Needs
+ * head_width dividing 128 and a multiple of 8, 16-byte aligned rows. */
+static constexpr int CUDA_ATTN_FAST_THREADS = 128;
+
+__device__ static float cuda_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+__device__ static float cuda_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+__global__ static void __launch_bounds__(CUDA_ATTN_FAST_THREADS)
+k_self_attention_bf16_batch_fast(
+    const float *qkv, const uint16_t *const *kcache,
+    const uint16_t *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, int heads, int head_width,
+    float scale, float *out) {
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch) return;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t position = positions[request];
+    const size_t stride = cache_strides[request];
+    uint16_t *request_k = const_cast<uint16_t *>(kcache[request]);
+    uint16_t *request_v = const_cast<uint16_t *>(vcache[request]);
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    __shared__ float qs[CUDA_ATTN_FAST_THREADS];
+    __shared__ float probs[CUDA_ATTN_FAST_THREADS];
+    __shared__ float red_max[CUDA_ATTN_FAST_THREADS / 32];
+    __shared__ float red_sum[CUDA_ATTN_FAST_THREADS / 32];
+    if (tid < head_width) {
+        const size_t at = position * stride + hbase + (size_t)tid;
+        request_k[at] = cuda_bf16_from_float(request_qkv[width + hbase + (size_t)tid]);
+        request_v[at] = cuda_bf16_from_float(request_qkv[width * 2u + hbase + (size_t)tid]);
+        qs[tid] = request_qkv[hbase + (size_t)tid];
+    }
+    __syncthreads();
+    const int groups = CUDA_ATTN_FAST_THREADS / head_width;
+    const int d = tid % head_width;
+    const int g = tid / head_width;
+    const size_t n = position + 1u;
+    float running_max = -1.0e30f;
+    float denominator = 0.0f;
+    float acc = 0.0f;
+    for (size_t c0 = 0; c0 < n; c0 += CUDA_ATTN_FAST_THREADS) {
+        const size_t s = c0 + (size_t)tid;
+        float score = -1.0e30f;
+        if (s < n) {
+            const uint4 *kr = reinterpret_cast<const uint4 *>(
+                request_k + s * stride + hbase);
+            float dot = 0.0f;
+            for (int i = 0; i < head_width / 8; ++i) {
+                const uint4 w = kr[i];
+                const float *qq = qs + i * 8;
+                dot += qq[0] * __uint_as_float(w.x << 16) +
+                       qq[1] * __uint_as_float(w.x & 0xffff0000u) +
+                       qq[2] * __uint_as_float(w.y << 16) +
+                       qq[3] * __uint_as_float(w.y & 0xffff0000u) +
+                       qq[4] * __uint_as_float(w.z << 16) +
+                       qq[5] * __uint_as_float(w.z & 0xffff0000u) +
+                       qq[6] * __uint_as_float(w.w << 16) +
+                       qq[7] * __uint_as_float(w.w & 0xffff0000u);
+            }
+            score = dot * scale;
+        }
+        float m = cuda_warp_max(score);
+        if (lane == 0) red_max[warp] = m;
+        __syncthreads();
+        m = red_max[0];
+        for (int w = 1; w < CUDA_ATTN_FAST_THREADS / 32; ++w) m = fmaxf(m, red_max[w]);
+        const float next = fmaxf(running_max, m);
+        const float p = s < n ? expf(score - next) : 0.0f;
+        probs[tid] = p;
+        float sum = cuda_warp_sum(p);
+        if (lane == 0) red_sum[warp] = sum;
+        __syncthreads();
+        sum = red_sum[0];
+        for (int w = 1; w < CUDA_ATTN_FAST_THREADS / 32; ++w) sum += red_sum[w];
+        const float correction = expf(running_max - next);
+        denominator = denominator * correction + sum;
+        running_max = next;
+        acc *= correction;
+        const size_t left = n - c0;
+        const int count = left < (size_t)CUDA_ATTN_FAST_THREADS
+                              ? (int)left : CUDA_ATTN_FAST_THREADS;
+        const uint16_t *vbase = request_v + c0 * stride + hbase + (size_t)d;
+        for (int j = g; j < count; j += groups)
+            acc += probs[j] * cuda_bf16_to_float(vbase[(size_t)j * stride]);
+        __syncthreads();
+    }
+    probs[tid] = acc;
+    __syncthreads();
+    if (g == 0) {
+        float total = probs[d];
+        for (int k = 1; k < groups; ++k) total += probs[k * head_width + d];
+        out[(size_t)request * width + hbase + (size_t)d] =
+            denominator > 0.0f ? total / denominator : 0.0f;
+    }
+}
+
+static bool cuda_backbone_attn_fast_enabled(void) {
+    static const bool on = [] {
+        const char *s = getenv("MYNAH_CUDA_BACKBONE_ATTN");
+        return s == nullptr || strcmp(s, "legacy") != 0;
+    }();
+    return on;
+}
+
+extern "C" int mynah_cuda_self_attention_batch_dev(
+    void *opaque, const float *qkv, float *const *kcache,
+    float *const *vcache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale,
+    float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u ||
+        batch > st->batch_meta_cap || heads == 0u || head_width == 0u ||
+        heads > (size_t)INT_MAX || head_width > (size_t)INT_MAX ||
+        heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA batched self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t qkv_count = 0;
+    if (!cuda_size_mul(width, 3u, &qkv_count) ||
+        !cuda_size_mul(batch, qkv_count, &qkv_count)) {
+        set_error(e, ec, "CUDA batched self-attention size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            positions[i] == SIZE_MAX ||
+            cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA batched self-attention cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    dim3 grid((unsigned)heads, (unsigned)batch, 1u);
+    k_self_attention_batch<<<grid, attention_threads(head_width), 0, st->stream>>>(
+        qkv, st->dev_batch_k_cache, st->dev_batch_v_cache,
+        st->dev_batch_positions, st->dev_batch_cache_strides,
+        (int)batch, (int)heads,
+        (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
+    void *opaque, const float *qkv, void *const *kcache,
+    void *const *vcache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u || batch > st->batch_meta_cap || heads == 0u ||
+        head_width == 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA BF16 batched self-attention dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t qkv_count = 0u;
+    if (!cuda_size_mul(width, 3u, &qkv_count) ||
+        !cuda_size_mul(batch, qkv_count, &qkv_count)) {
+        set_error(e, ec, "CUDA BF16 batched self-attention size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            positions[i] == SIZE_MAX || cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA BF16 batched self-attention cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    dim3 grid((unsigned)heads, (unsigned)batch, 1u);
+    bool fast = cuda_backbone_attn_fast_enabled() && head_width % 8u == 0u &&
+                head_width <= (size_t)CUDA_ATTN_FAST_THREADS &&
+                (size_t)CUDA_ATTN_FAST_THREADS % head_width == 0u;
+    for (size_t i = 0; fast && i < batch; ++i)
+        fast = cache_strides[i] % 8u == 0u &&
+               ((uintptr_t)kcache[i] & 15u) == 0u &&
+               ((uintptr_t)vcache[i] & 15u) == 0u;
+    if (fast) {
+        k_self_attention_bf16_batch_fast<<<grid, CUDA_ATTN_FAST_THREADS, 0,
+                                           st->stream>>>(
+            qkv,
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+            st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+            (int)heads, (int)head_width, scale, out);
+        return ce(cudaGetLastError(), e, ec);
+    }
+    k_self_attention_bf16_batch<<<grid, attention_threads(head_width), 0,
+                                  st->stream>>>(
+        qkv,
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+        st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+        (int)heads, (int)head_width, scale, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+__global__ static void k_gather_kv_batch(
+    float *const *kcache, float *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, size_t width, float *out) {
+    const size_t index = (size_t)blockIdx.x * (size_t)blockDim.x +
+                         (size_t)threadIdx.x;
+    const size_t total = (size_t)batch * 2u * width;
+    if (index >= total) return;
+    const size_t request = index / (2u * width);
+    const size_t part = (index / width) & 1u;
+    const size_t column = index % width;
+    const size_t source = positions[request] * cache_strides[request] + column;
+    out[index] = (part == 0u ? kcache[request] : vcache[request])[source];
+}
+
+__global__ static void k_gather_kv_bf16_batch(
+    const uint16_t *const *kcache, const uint16_t *const *vcache,
+    const size_t *positions, const size_t *cache_strides, int batch,
+    size_t width, float *out) {
+    const size_t index = (size_t)blockIdx.x * (size_t)blockDim.x +
+                         (size_t)threadIdx.x;
+    const size_t total = (size_t)batch * 2u * width;
+    if (index >= total) return;
+    const size_t request = index / (2u * width);
+    const size_t part = (index / width) & 1u;
+    const size_t column = index % width;
+    const size_t source = positions[request] * cache_strides[request] + column;
+    const uint16_t *row = part == 0u ? kcache[request] : vcache[request];
+    out[index] = cuda_bf16_to_float(row[source]);
+}
+
+extern "C" int mynah_cuda_gather_kv_batch(
+    void *opaque, float *const *kcache, float *const *vcache,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u || batch > st->batch_meta_cap || heads == 0u ||
+        head_width == 0u || heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA batched K/V gather dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t total = 0u;
+    size_t blocks = 0u;
+    if (!cuda_size_mul(batch, 2u, &total) || !cuda_size_mul(total, width, &total) ||
+        !cuda_size_add(total, 255u, &blocks) ||
+        (blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA batched K/V gather size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA batched K/V gather cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides),
+                           cudaMemcpyHostToDevice, st->stream), e, ec)) {
+        return -1;
+    }
+    k_gather_kv_batch<<<(int)blocks, 256, 0, st->stream>>>(
+        st->dev_batch_k_cache, st->dev_batch_v_cache, st->dev_batch_positions,
+        st->dev_batch_cache_strides, (int)batch, width, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_gather_kv_bf16_batch(
+    void *opaque, void *const *kcache, void *const *vcache,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || kcache == nullptr || vcache == nullptr ||
+        positions == nullptr || cache_strides == nullptr || out == nullptr ||
+        batch == 0u || batch > st->batch_meta_cap || heads == 0u ||
+        head_width == 0u || heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA BF16 batched K/V gather dimensions");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    size_t total = 0u;
+    size_t blocks = 0u;
+    if (!cuda_size_mul(batch, 2u, &total) || !cuda_size_mul(total, width, &total) ||
+        !cuda_size_add(total, 255u, &blocks) || (blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA BF16 batched K/V gather size overflow");
+        return -1;
+    }
+    for (size_t i = 0; i < batch; ++i) {
+        if (kcache[i] == nullptr || vcache[i] == nullptr ||
+            cache_strides[i] < width ||
+            positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
+            set_error(e, ec, "invalid CUDA BF16 batched K/V gather cache");
+            return -1;
+        }
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_k_cache, kcache,
+                           batch * sizeof(*kcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_v_cache, vcache,
+                           batch * sizeof(*vcache), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec) ||
+        ce(cudaMemcpyAsync(st->dev_batch_cache_strides, cache_strides,
+                           batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    k_gather_kv_bf16_batch<<<(int)blocks, 256, 0, st->stream>>>(
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+        reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+        st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+        width, out);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_rope_dev(void *opaque, float *qkv,
+                                    size_t position, size_t heads,
+                                    size_t head_width, float max_period,
+                                    char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || heads == 0u || head_width == 0u ||
+        (head_width & 1u) != 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || !(max_period > 0.0f) ||
+        !isfinite(max_period)) {
+        set_error(e, ec, "invalid CUDA RoPE dimensions");
+        return -1;
+    }
+    const size_t half = head_width / 2u;
+    if (half == 0u || heads > SIZE_MAX / half) {
+        set_error(e, ec, "CUDA RoPE dimensions overflow");
+        return -1;
+    }
+    const size_t pairs = heads * half;
+    if (pairs > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA RoPE dimensions overflow launch range");
+        return -1;
+    }
+    k_rope_qk<<<((int)pairs + 255) / 256, 256, 0, st->stream>>>(
+        qkv, position, (int)heads, (int)head_width, max_period);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_rope_batch_dev(
+    void *opaque, float *qkv, const size_t *positions, size_t batch,
+    size_t heads, size_t head_width, float max_period, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || qkv == nullptr || positions == nullptr || batch == 0u ||
+        batch > st->batch_meta_cap || heads == 0u || head_width == 0u ||
+        (head_width & 1u) != 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || !(max_period > 0.0f) ||
+        !isfinite(max_period)) {
+        set_error(e, ec, "invalid CUDA batched RoPE dimensions");
+        return -1;
+    }
+    const size_t half = head_width / 2u;
+    size_t pairs = 0u;
+    size_t blocks = 0u;
+    if (!cuda_size_mul(batch, heads, &pairs) ||
+        !cuda_size_mul(pairs, half, &pairs) ||
+        !cuda_size_add(pairs, 255u, &blocks) ||
+        (blocks /= 256u) > (size_t)INT_MAX) {
+        set_error(e, ec, "CUDA batched RoPE size overflow");
+        return -1;
+    }
+    if (ce(cudaMemcpyAsync(st->dev_batch_positions, positions,
+                           batch * sizeof(*positions), cudaMemcpyHostToDevice,
+                           st->stream), e, ec)) return -1;
+    k_rope_qk_batch<<<(int)blocks, 256, 0, st->stream>>>(
+        qkv, st->dev_batch_positions, (int)batch, (int)heads,
+        (int)head_width, max_period);
+    return ce(cudaGetLastError(), e, ec);
 }
 
 /* GELU on host data: upload → kernel → download → sync. */
@@ -850,22 +8055,172 @@ extern "C" int mynah_cuda_gelu_host_f64(void *opaque, float *data, size_t n,
 }
 
 /* ---- CUDA Graph cache for matmul segments ---- */
-struct cuda_graph_entry {
-    size_t rows, iw, ow;
-    cudaGraph_t graph;
-    cudaGraphExec_t exec;
-    bool valid;
-};
+static void destroy_graphs(cuda_backend_state *st) {
+    if (st == nullptr) return;
+    for (auto &entry : st->graph_cache) {
+        if (entry.exec != nullptr) cudaGraphExecDestroy(entry.exec);
+        if (entry.graph != nullptr) cudaGraphDestroy(entry.graph);
+        entry.exec = nullptr;
+        entry.graph = nullptr;
+        entry.valid = false;
+    }
+    st->graph_cache.clear();
+    for (auto &entry : st->pipeline_graphs) {
+        if (entry.exec != nullptr) cudaGraphExecDestroy(entry.exec);
+        if (entry.graph != nullptr) cudaGraphDestroy(entry.graph);
+        entry.exec = nullptr;
+        entry.graph = nullptr;
+        entry.valid = false;
+        entry.capturing = false;
+    }
+    st->pipeline_graphs.clear();
+}
 
-#define GRAPH_CACHE_SIZE 16
-static cuda_graph_entry g_graph_cache[GRAPH_CACHE_SIZE];
-static int g_graph_count = 0;
+static cuda_pipeline_graph_entry *find_pipeline_graph(
+    cuda_backend_state *st, size_t key, const void *identity) {
+    for (auto &entry : st->pipeline_graphs) {
+        if (entry.key == key && entry.identity == identity) return &entry;
+    }
+    return nullptr;
+}
 
-static cuda_graph_entry *find_graph(size_t rows, size_t iw, size_t ow) {
-    for (int i = 0; i < g_graph_count; ++i)
-        if (g_graph_cache[i].rows == rows && g_graph_cache[i].iw == iw &&
-            g_graph_cache[i].ow == ow)
-            return &g_graph_cache[i];
+extern "C" int mynah_cuda_graph_begin(void *opaque, size_t key,
+                                      const void *identity, int *replay,
+                                      char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (replay != nullptr) *replay = 0;
+    if (st == nullptr || identity == nullptr || key == 0u) return 1;
+    if (!st->graphs_enabled) {
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+        return 1;
+    }
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry != nullptr && entry->valid) {
+        if (replay != nullptr) *replay = 1;
+        st->graph_replays.fetch_add(1ull, std::memory_order_relaxed);
+        return 0;
+    }
+    if (entry != nullptr && entry->capturing) {
+        set_error(e, ec, "CUDA graph capture already active");
+        return -1;
+    }
+    if (st->pipeline_graphs.size() >= CUDA_PIPELINE_GRAPH_CAP) {
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+        return 1;
+    }
+    if (st->cublas_workspace == nullptr) {
+        st->cublas_workspace_cap = 8u * 1024u * 1024u;
+        if (ce(cudaMalloc(&st->cublas_workspace, st->cublas_workspace_cap), e,
+               ec)) return 1;
+    }
+    if (cbe(cublasSetWorkspace(st->cublas, st->cublas_workspace,
+                               st->cublas_workspace_cap), e, ec) ||
+        cbe(cublasSetStream(st->cublas, st->stream), e, ec) ||
+        ce(cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeRelaxed), e,
+           ec)) {
+        return 1;
+    }
+    cuda_pipeline_graph_entry created{};
+    created.key = key;
+    created.identity = identity;
+    created.valid = false;
+    created.capturing = true;
+    st->pipeline_graphs.push_back(created);
+    return 0;
+}
+
+extern "C" int mynah_cuda_graph_end(void *opaque, size_t key,
+                                    const void *identity, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr || key == 0u) return 1;
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry == nullptr || !entry->capturing) return 1;
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status = cudaStreamEndCapture(st->stream, &graph);
+    entry->capturing = false;
+    if (capture_status != cudaSuccess || graph == nullptr) {
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (capture_status != cudaSuccess) ce(capture_status, e, ec);
+        st->pipeline_graphs.pop_back();
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+        return 1;
+    }
+    cudaGraphExec_t exec = nullptr;
+    const cudaError_t instantiate_status =
+        cudaGraphInstantiate(&exec, graph, 0);
+    if (instantiate_status != cudaSuccess || exec == nullptr) {
+        cudaGraphDestroy(graph);
+        if (instantiate_status != cudaSuccess) ce(instantiate_status, e, ec);
+        st->pipeline_graphs.pop_back();
+        st->graph_fallbacks.fetch_add(1ull, std::memory_order_relaxed);
+        return 1;
+    }
+    entry->graph = graph;
+    entry->exec = exec;
+    entry->valid = true;
+    st->graph_captures.fetch_add(1ull, std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" int mynah_cuda_graph_launch(void *opaque, size_t key,
+                                       const void *identity, char *e,
+                                       size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr || key == 0u) return -1;
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry == nullptr || !entry->valid || entry->exec == nullptr) {
+        set_error(e, ec, "CUDA graph is not instantiated");
+        return -1;
+    }
+    return ce(cudaGraphLaunch(entry->exec, st->stream), e, ec);
+}
+
+extern "C" void mynah_cuda_graph_abort(void *opaque, size_t key,
+                                        const void *identity) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr || key == 0u) return;
+    cuda_pipeline_graph_entry *entry =
+        find_pipeline_graph(st, key, identity);
+    if (entry == nullptr || !entry->capturing) return;
+    cudaGraph_t graph = nullptr;
+    (void)cudaStreamEndCapture(st->stream, &graph);
+    if (graph != nullptr) cudaGraphDestroy(graph);
+    st->pipeline_graphs.pop_back();
+}
+
+extern "C" void mynah_cuda_graph_forget(void *opaque, const void *identity) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr) return;
+    (void)cudaStreamSynchronize(st->stream);
+    for (size_t i = 0; i < st->pipeline_graphs.size();) {
+        cuda_pipeline_graph_entry &entry = st->pipeline_graphs[i];
+        if (entry.identity != identity) {
+            ++i;
+            continue;
+        }
+        if (entry.exec != nullptr) cudaGraphExecDestroy(entry.exec);
+        if (entry.graph != nullptr) cudaGraphDestroy(entry.graph);
+        st->pipeline_graphs.erase(st->pipeline_graphs.begin() + i);
+    }
+    /* A pooled Pocket decoder (MYNAH_CUDA_SLOT_POOL) is parked instead of
+     * closed, so forgetting it must also drop the cross-request batch graphs
+     * that name it, as decoder_close does.  Any other identity (a scratch
+     * arena) matches no decoder and this is a no-op. */
+    destroy_decoder_batch_graphs_for(
+        st, static_cast<const mynah_backend_decoder *>(identity));
+}
+
+static cuda_graph_entry *find_graph(cuda_backend_state *st, size_t rows,
+                                    size_t iw, size_t ow,
+                                    const void *weight, const void *bias) {
+    for (auto &entry : st->graph_cache) {
+        if (entry.valid && entry.rows == rows && entry.iw == iw && entry.ow == ow &&
+            entry.weight_pointer == weight && entry.bias_pointer == bias)
+            return &entry;
+    }
     return nullptr;
 }
 
@@ -876,60 +8231,67 @@ extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *
                              const float *weight, const float *bias,
                              char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    size_t in_n = 0, out_n = 0, w_n = 0, total_n = 0;
+    if (st == nullptr || validate_cuda_matmul(input, output, weight, rows, iw, ow,
+                                               &in_n, &out_n, &w_n, &total_n,
+                                               e, ec) != 0) return -1;
+    /* The captured graph below intentionally uses the FP16/Tensor-Core
+     * pipeline.  Keep the default parity mode on the uncaptured FP32 path;
+     * operators opt into this graph together with MYNAH_CUDA_FAST_MATH=1. */
+    if (!st->fast_math) return cuda_matmul(opaque, input, output, rows, iw, ow,
+                                           weight, bias, e, ec);
+    const size_t mapped_need = total_n * sizeof(float);
+    if (ensure_host(st, mapped_need, e, ec)) return -1;
 
     /* Try to find a cached graph. */
-    cuda_graph_entry *entry = find_graph(rows, iw, ow);
+    cuda_graph_entry *entry = find_graph(st, rows, iw, ow, weight, bias);
     if (entry && entry->valid) {
         /* Update input in mapped buffer, replay graph. */
-        const size_t in_n = rows * iw;
-        const size_t out_n = rows * ow;
-        size_t mapped_need = (in_n + out_n) * sizeof(float);
-        if (ensure_host(st, mapped_need, e, ec)) return -1;
         std::memcpy(st->host_buf, input, in_n * sizeof(float));
-        cudaGraphLaunch(entry->exec, st->stream);
+        if (ce(cudaGraphLaunch(entry->exec, st->stream), e, ec)) return -1;
         if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
         std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
         return 0;
     }
 
     /* First call: capture the graph. */
-    const size_t in_n = rows * iw;
-    const size_t out_n = rows * ow;
-    const size_t w_n = iw * ow;
     half *dw16 = nullptr;
     if (cached_weight_fp16(st, weight, w_n, &dw16, e, ec)) return -1;
     float *db = nullptr;
     if (bias && cached_weight(st, bias, ow * sizeof(float), &db, e, ec)) return -1;
     if (ensure_scratch(st, in_n * sizeof(half), e, ec)) return -1;
     half *di16 = (half *)st->dev_scratch;
-    size_t mapped_need = (in_n + out_n) * sizeof(float);
-    if (ensure_host(st, mapped_need, e, ec)) return -1;
     float *d_out_mapped = st->dev_buf + in_n;
     std::memcpy(st->host_buf, input, in_n * sizeof(float));
 
     /* Capture. Alpha/beta must be static (not stack) for graph capture.
      * Pre-allocate cuBLAS workspace to avoid allocation during capture. */
     static const float g_alpha = 1.0f, g_beta = 0.0f;
-    static void *cublas_ws = nullptr;
-    static size_t cublas_ws_size = 4 * 1024 * 1024; /* 4MB workspace */
-    if (!cublas_ws) cudaMalloc(&cublas_ws, cublas_ws_size);
-    cublasSetWorkspace(st->cublas, cublas_ws, cublas_ws_size);
-    cublasSetStream(st->cublas, st->stream);
-    cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeRelaxed);
+    if (st->cublas_workspace == nullptr) {
+        st->cublas_workspace_cap = 4u * 1024u * 1024u;
+        if (ce(cudaMalloc(&st->cublas_workspace, st->cublas_workspace_cap), e, ec)) return -1;
+    }
+    if (cbe(cublasSetWorkspace(st->cublas, st->cublas_workspace,
+                               st->cublas_workspace_cap), e, ec) ||
+        cbe(cublasSetStream(st->cublas, st->stream), e, ec) ||
+        ce(cudaStreamBeginCapture(st->stream, cudaStreamCaptureModeRelaxed), e, ec)) {
+        return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
+    }
     k_f32_to_f16<<<((int)in_n+255)/256, 256, 0, st->stream>>>(st->dev_buf, di16, (int)in_n);
-    cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                 (int)ow, (int)rows, (int)iw,
-                 &g_alpha, dw16, CUDA_R_16F, (int)iw,
-                 di16, CUDA_R_16F, (int)iw,
-                 &g_beta, d_out_mapped, CUDA_R_32F, (int)ow,
-                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    const cublasStatus_t gemm_status = cublasGemmEx(
+        st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)ow, (int)rows, (int)iw,
+        &g_alpha, dw16, CUDA_R_16F, (int)iw,
+        di16, CUDA_R_16F, (int)iw,
+        &g_beta, d_out_mapped, CUDA_R_32F, (int)ow,
+        cuda_compute_type(st), cuda_gemm_algo(st));
     if (db) {
         k_bias_add<<<((int)(rows*ow)+255)/256, 256, 0, st->stream>>>(
             d_out_mapped, db, (int)rows, (int)ow);
     }
     cudaGraph_t graph;
     cudaError_t cap_err = cudaStreamEndCapture(st->stream, &graph);
-    if (cap_err != cudaSuccess || graph == nullptr) {
+    if (gemm_status != CUBLAS_STATUS_SUCCESS || cap_err != cudaSuccess || graph == nullptr) {
         /* Capture failed — fall back to regular matmul. */
         return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
     }
@@ -941,13 +8303,16 @@ extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *
     }
 
     /* Cache the graph. */
-    if (g_graph_count < GRAPH_CACHE_SIZE) {
-        g_graph_cache[g_graph_count] = {rows, iw, ow, graph, exec, true};
-        g_graph_count++;
+    if (st->graph_cache.size() < 16u) {
+        st->graph_cache.push_back({rows, iw, ow, weight, bias, graph, exec, true});
+    } else {
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
     }
 
     /* Replay for this call. */
-    cudaGraphLaunch(exec, st->stream);
+    if (ce(cudaGraphLaunch(exec, st->stream), e, ec)) return -1;
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
     std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
     return 0;

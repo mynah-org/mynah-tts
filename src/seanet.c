@@ -1918,6 +1918,22 @@ void mynah_seanet_state_reset(mynah_seanet_state *state) {
     state->position = 0; /* the half everybody forgets */
 }
 
+int mynah_seanet_state_set_upsample_tail(mynah_seanet_state *state,
+                                         const float *tail, size_t channels,
+                                         size_t tail_length) {
+    if (state == NULL || !state->has_upsample ||
+        channels != state->upsample.spec.out_channels ||
+        tail_length != state->upsample.tail ||
+        (tail_length > 0u && tail == NULL)) return -1;
+    if (tail_length == 0u) return 0;
+    size_t count = 0u;
+    size_t bytes = 0u;
+    if (sea_mul(channels, tail_length, &count) != 0 ||
+        sea_mul(count, sizeof(float), &bytes) != 0) return -1;
+    memcpy(state->upsample.partial, tail, bytes);
+    return 0;
+}
+
 size_t mynah_seanet_state_position(const mynah_seanet_state *state) {
     return (state == NULL) ? 0 : state->position;
 }
@@ -1934,6 +1950,11 @@ void mynah_seanet_state_advance(mynah_seanet_state *state,
 
 size_t mynah_seanet_state_encoder_stride(const mynah_seanet_state *state) {
     return (state == NULL) ? 0 : state->encoder_stride;
+}
+
+size_t mynah_seanet_state_upsample_tail(const mynah_seanet_state *state) {
+    if (state == NULL || !state->has_upsample) return 0u;
+    return state->upsample.tail;
 }
 
 size_t mynah_seanet_state_hop_length(const mynah_seanet_state *state) {

@@ -6,7 +6,30 @@ framework, no dependencies — plain sockets in C, one binary.
 ```bash
 make server
 ./build/cpu/mynah-tts-server -m models/magpie-v2607-pack -p 8080
+
+# PocketTTS on an NVIDIA GPU: see docs/cuda-serving.md (qualified on an L4)
+MYNAH_THREADS=1 MYNAH_CUDA_KV_DTYPE=bf16 ./build/cuda/mynah-tts-server \
+  -m models/pocket-english-24l --device cuda -w 8 --max-batch 160 --max-inflight 160 -p 8080
 ```
+
+The CPU and CUDA servers are separate artifacts. The CPU binary is never
+silently promoted to CUDA; build the opt-in server explicitly when the CUDA
+toolkit is available (a device is required only when running it):
+
+```bash
+make cuda-server CUDA_ARCH=sm_89
+./build/cuda/mynah-tts-server -m models/magpie-v2607-pack \
+  --device cuda -p 8080
+```
+
+`cuda-server` builds without a GPU; running it needs one. **PocketTTS on CUDA
+has its own guide, [cuda-serving.md](cuda-serving.md)**: qualified operating
+points (L4: 160 streams of the 24-layer model, 256 of the 6-layer one), the two
+required variables, every `MYNAH_CUDA_*` switch with its default, measured
+effect and rollback value, monitoring and troubleshooting. A requested CUDA
+backend that cannot open is reported, and a configuration that would run a hot
+Pocket stage on the CPU refuses to start rather than serve slowly under a CUDA
+label.
 
 | flag | meaning |
 |---|---|
@@ -14,6 +37,8 @@ make server
 | `-p, --port N` | listen port (default 8080) |
 | `--host ADDR` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose) |
 | `-w, --workers N` | connection workers (default 4) — see Concurrency |
+| `--max-batch N` | engine/CUDA microbatch width (Pocket default 8 at the server layer, capped by model metadata) |
+| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`; maximum 128 on CPU, 384 for Pocket on CUDA); does not widen one engine call |
 | `--device cpu\|metal\|cuda` | backend, same rules as the CLI |
 
 It binds to loopback by default. Exposing it means `--host 0.0.0.0`, which is a
@@ -73,6 +98,9 @@ X-Channels: 1
 Transfer-Encoding: chunked
 ```
 
+The rate follows the model: 22050 Hz for Magpie (the examples below), 24000 Hz
+for PocketTTS. Read `X-Sample-Rate` rather than assuming it.
+
 Play it as it arrives, rather than writing bytes to disk:
 
 ```bash
@@ -126,6 +154,20 @@ OpenAI-shaped listing of the single pack this process serves.
 
 ```json
 {"status":"ok","model":"magpie-v2607","engine":"magpie","sample_rate":22050,"voices":5}
+```
+
+## GET /metrics
+
+Read-only Prometheus text for scheduler gauges and backend counters. It is
+safe to poll while synthesis is running and does not synchronize CUDA. CPU
+builds expose the same names with zero CUDA values; CUDA builds additionally
+report transfer calls/bytes, graph activity, resident decoder batches,
+matmul/matvec calls and device memory. Request timing is exported as monotonic
+sums for queue wait, TTFA, synthesis service, E2E and represented audio, plus
+an average RTF gauge; TTFB and per-stage timing histograms are future work.
+
+```bash
+curl http://localhost:8080/metrics
 ```
 
 ## Concurrency

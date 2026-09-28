@@ -935,3 +935,76 @@ produced ~20% faster than it plays at C130, so this is the queue and not compute
 `stall_rate@250ms == 0` with **3 stalls (0.005%)**. TTFA p95 336.3 ms, TTFB p95
 77.4 ms, RTF p95 0.818, throughput **158.2 audio-s/s**, ten 180 s windows flat,
 both drift checks PASS. C120 remains the qualified operating point.
+
+## 2026-09-27 · PocketTTS 6L and 24L on the shipped default — GCP Axion, 32 cores
+
+Text segmentation (50 tokens, first 24), the wide I8MM kernel and pooled
+attention are the default since 2026-09-27; a 24-layer pack also gets the int8
+backbone and 16-token prefill slices from the engine. Nothing exported, 16
+workers x 2 threads, same-host client, mixed v2 bank, 30-minute soaks:
+
+| pack | C | slots | requests | TTFA p95 | TTFB p95 | RTF p95 | stalls 250/500 | audio-s/s | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| 6L | **164** | 12 | 77819 | 179 ms | 81.5 ms | 0.881 | 0/0 | 193.3 | GOOD, qualified |
+| 6L | 168 | 12 | 78235 | 182 ms | 82.8 ms | 0.891 | 1/0 | 194.3 | MARGINAL |
+| 24L | **88** | 8 | 41458 | 278 ms | 79.0 ms | 0.756 | 0/0 | 121.4 | GOOD, qualified |
+| 24L | 96 | 8 | 42310 | 292 ms | 82.7 ms | 0.776 | 1/0 | 123.8 | MARGINAL |
+
+The 6L was qualified at C126 (157 audio-s/s, TTFA p95 330 ms) on 2026-09-21:
+the kernels give +22% throughput at equal load with byte-identical audio,
+segmentation halves TTFA (C120: 246 -> 143 ms), and `--max-batch 12` removes
+the 128-place wall of 16 x 8. Segmentation costs ~0.1-0.3 WER points on long
+texts (ASR gate), nothing on single-chunk texts. Detail, including the failed
+experiments: `.work/pocket-tts-24l-cpu-serving-axion.md`; profiles
+`configs/perf/axion-c4a-32c-pocket-en.json` and `-24l.json`.
+
+## 2026-09-28 · PocketTTS 24L on CUDA — one NVIDIA L4, C160 qualified
+
+Build f873125 (sources hashed in the bundle), `mynah-tts-server --device cuda`,
+max-batch/inflight 160, BF16 backbone KV grown on demand, resident f32 weights
+with TF32, every CUDA default of `.work/pocket-cuda-g6-host-cpu.md`. Pack
+`english_2026-04_24l` converted to BF16 (Kyutai's own `switch_to_bf16.py`
+choice; the F32 checkpoint measured equal). Host: vast.ai, EPYC 7702, load
+generator on the same host. Corpus v2 (`tools/corpus/pocket_v2_en.jsonl`, 300
+distinct English utterances, four voices), closed loop, saturated.
+
+| 30-minute soak | requests | failed | audio-s/s | RTF p95 | TTFA p95 | stalls 250/500 ms | drift | VRAM | RSS |
+|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| A, seed 1234 | 43,316 | 0 | 184.5 | 0.857 | 154 ms | 0 / 0 | +0.1% | 13.8-14.7 GB flat | 4.73-4.75 GB |
+| B, seed 5678 | 43,638 | 0 | 184.5 | 0.855 | 155 ms | 0 / 0 | -0.1% | 13.6-14.4 GB flat | 4.74-4.75 GB |
+
+Knee (25 s screens): RTF p95 0.71 / 0.78 / 0.86 / 0.93 / 0.99 at C128 / 144 /
+160 / 176 / 192 with throughput flat at ~138 audio-s/s (GPU saturated); C160
+is the top level under the 0.90 gate. Earlier single soaks: C96 176.8 audio-s/s
+(RTF p95 0.541), C128 186.7 (0.679), both clean.
+
+Audio captured from the live streams (every 10th request) and transcribed with
+faster-whisper small.en (CPU int8): WER 2.02% (A) and 1.94% (B). An unloaded
+control on the same request ids (C8) gives 1.87% with the same per-voice
+profile (alba ~0.4%, marius ~4.7%) and 8 of its 10 >30%-WER utterances shared
+with the loaded run: the load does not degrade the audio; the spread is the
+model/voice pair. Gate WER per voice and per length class, always against an
+unloaded control. The evidence bundle is kept privately and is not published.
+
+## 2026-09-28 · PocketTTS 6L on CUDA — one NVIDIA L4, C256 qualified
+
+Same build, host, corpus and protocol as the 24L section above, pack
+`english_2026-04`, max-batch/inflight 256 (the CUDA batch cap is now 384).
+
+| 30-minute soak | requests | failed | audio-s/s | RTF p95 | TTFA p95 | stalls 250/500 ms | drift | VRAM |
+|---|---:|---:|---:|---:|---:|---|---:|---|
+| A, seed 4321 | 88,073 | 0 | 317.0 | 0.792 | 145 ms | 0 / 0 | +0.2% | 8.1-8.5 GB flat |
+| B, seed 8765 | 88,218 | 0 | 316.1 | 0.794 | 145 ms | 0 / 0 | +0.1% | 8.0-8.5 GB flat |
+
+Knee (25 s screens): RTF p95 0.40 / 0.50 / 0.60 / 0.70 / 0.79-0.85 / 0.90 / 0.99 /
+1.09 at C128 / 160 / 192 / 224 / 256 / 288 / 320 / 352; C352 is not streamable
+(18,207 stalls). C256 is the last level with the same margin as the 24L at C160.
+
+Audio captured under load, every 4th capture transcribed (2,245 and 2,249
+utterances): WER 1.06% (A) and 0.87% (B); alba 0.62/0.44%, javert 0.49/0.34%,
+jean 0.95/1.12%, marius 2.24/1.58%; short 2.80/2.62%; 0.6% of utterances above
+30%. The small model reads better to the recogniser than the large one and its
+voice spread is narrower. No separate unloaded control: the serving path is the
+code measured on the 24L, where load did not change the audio. The evidence
+bundles (per-request records, logs, captured audio) are kept privately and are
+not published.

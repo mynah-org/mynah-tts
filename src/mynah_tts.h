@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYNAH_TTS_VERSION "1.4.0"
+#define MYNAH_TTS_VERSION "1.8.0"
 
 typedef struct mynah_tts_model mynah_tts_model;
 
@@ -13,6 +13,74 @@ typedef enum {
     MYNAH_TTS_DEVICE_METAL = 1,
     MYNAH_TTS_DEVICE_CUDA = 2,
 } mynah_tts_device;
+
+/* Backend counters are process-local diagnostics. The public metrics layout
+ * changed in 1.8.0 when resident Pocket CUDA decoder-graph counters were
+ * added, in 1.9.0 when batch-width histograms were appended, and again when
+ * the codec-gang counters were appended after them; consumers
+ * that cache the struct layout must rebuild against this header. Counters are
+ * intentionally monotonically increasing and may be sampled while synthesis
+ * is running;
+ * callers must not treat one snapshot as a transactional view. CPU builds
+ * return zero for CUDA-only fields. */
+typedef struct {
+    unsigned long long h2d_bytes;
+    unsigned long long d2h_bytes;
+    unsigned long long h2d_calls;
+    unsigned long long d2h_calls;
+    unsigned long long sync_calls;
+    unsigned long long graph_captures;
+    unsigned long long graph_replays;
+    unsigned long long graph_fallbacks;
+    unsigned long long backbone_batch_calls;
+    unsigned long long backbone_batch_items;
+    unsigned long long backbone_batch_max_width;
+    unsigned long long codec_transformer_batch_calls;
+    unsigned long long codec_transformer_batch_items;
+    unsigned long long codec_transformer_batch_max_width;
+    unsigned long long codec_upsample_steps;
+    unsigned long long codec_upsample_fallbacks;
+    unsigned long long decoder_steps;
+    unsigned long long decoder_batch_calls;
+    unsigned long long decoder_batch_items;
+    unsigned long long decoder_batch_max_width;
+    unsigned long long decoder_batch_frames;
+    unsigned long long decoder_graph_captures;
+    unsigned long long decoder_graph_replays;
+    unsigned long long decoder_graph_fallbacks;
+    unsigned long long decoder_failures;
+    unsigned long long resident_fallbacks;
+    unsigned long long matmul_calls;
+    unsigned long long matvec_calls;
+    unsigned long long q8_matmul_calls;
+    unsigned long long q8_rows;
+    unsigned long long q8_weight_uploads;
+    unsigned long long q8_weight_bytes;
+    unsigned long long q8_activation_bytes;
+    unsigned long long device_memory_bytes;
+    unsigned long long device_memory_free_bytes;
+    unsigned graphs_enabled;
+    unsigned fast_math_enabled;
+    unsigned decoder_batch_enabled;
+    unsigned q8_enabled;
+    /* Effective width of each batched CUDA call, by stage (0 backbone step,
+     * 1 Mimi decoder transformer, 2 SEANet decoder) and power-of-two bucket
+     * (1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+). Added in 1.9.0. */
+    unsigned long long batch_width_hist[3][8];
+    /* Resident BF16-weight matmuls (MYNAH_CUDA_QUANT=bf16), appended
+     * after the histograms so the earlier layout is a prefix. */
+    unsigned long long bf16_matmul_calls;
+    unsigned long long bf16_rows;
+    unsigned long long bf16_weight_bytes;
+    /* Cross-request Pocket codec gang (MYNAH_CUDA_CODEC_GANG): stage 0 is the
+     * batched quantizer projection + causal upsample, stage 1 the batched
+     * PCM collect. Calls, rows served, and the same width buckets as above.
+     * Appended after the width histograms so older fields keep their
+     * offsets. */
+    unsigned long long codec_gang_calls[2];
+    unsigned long long codec_gang_rows[2];
+    unsigned long long codec_gang_width_hist[2][8];
+} mynah_tts_backend_metrics;
 
 typedef struct {
     char engine[32];
@@ -68,6 +136,13 @@ typedef struct {
     unsigned topk;
     int use_local_transformer;
     uint64_t seed;
+    /* Optional text segmentation (src/text_segment.h). When segment_count > 1,
+     * text_ids is the concatenation of segment_count chunks whose lengths are
+     * listed here and sum to text_length; an engine that supports it generates
+     * each chunk as its own utterance, in order, into one audio stream. 0 or 1
+     * means one segment, i.e. the whole text at once. Borrowed, like text_ids. */
+    const size_t *segment_lengths;
+    size_t segment_count;
 } mynah_tts_request;
 
 typedef int (*mynah_tts_audio_callback)(const float *samples, size_t count,
@@ -102,6 +177,8 @@ int mynah_tts_model_warm(mynah_tts_model *model, char *error,
                          size_t error_capacity);
 int mynah_tts_model_get_info(const mynah_tts_model *model,
                              mynah_tts_model_info *info);
+int mynah_tts_model_get_backend_metrics(const mynah_tts_model *model,
+                                        mynah_tts_backend_metrics *metrics);
 
 const char *mynah_tts_device_name(mynah_tts_device device);
 int mynah_tts_device_self_test(mynah_tts_device device, char *error,

@@ -220,6 +220,14 @@ void mynah_seanet_state_destroy(mynah_seanet_state *state);
 /* Clears the ring buffers *and* the position counter. */
 void mynah_seanet_state_reset(mynah_seanet_state *state);
 
+/* Import the carried tail of the optional depthwise Mimi upsample after a
+ * resident backend has produced it.  This is a bounded fallback handoff, not
+ * part of the normal CPU decode path; the dimensions must match the model's
+ * upsample state exactly. */
+int mynah_seanet_state_set_upsample_tail(mynah_seanet_state *state,
+                                         const float *tail, size_t channels,
+                                         size_t tail_length);
+
 /* Position in encoder frames.  Feed this to the decoder transformer. */
 size_t mynah_seanet_state_position(const mynah_seanet_state *state);
 /* Advances by n_latent_frames * encoder_stride.  Call once per decode step,
@@ -228,6 +236,8 @@ void mynah_seanet_state_advance(mynah_seanet_state *state,
                                 size_t n_latent_frames);
 
 size_t mynah_seanet_state_encoder_stride(const mynah_seanet_state *state);
+/* The carried tail length of the optional depthwise Mimi upsample. */
+size_t mynah_seanet_state_upsample_tail(const mynah_seanet_state *state);
 /* prod(ratios): waveform samples produced per encoder frame. */
 size_t mynah_seanet_state_hop_length(const mynah_seanet_state *state);
 /* encoder_stride * hop_length: waveform samples per latent frame. */
