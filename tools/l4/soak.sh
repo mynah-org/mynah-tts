@@ -23,6 +23,6 @@ if [ -n "$MYNAH_L4_SAVE_AUDIO" ]; then
 fi
 export MYNAH_L4_LADDER_ARGS="--timeout 300 $mode$extra"
 root="${MYNAH_L4_ROOT:-/root/mynah-head}"; ev="${MYNAH_L4_EVIDENCE:-/root/evidence}"
-"$root/tools/l4/ab.sh" "$tag" models/pocket-english-24l "$lvl" 30 "$secs" "$@"
+"$root/tools/l4/ab.sh" "$tag" "${MYNAH_L4_MODEL:-models/pocket-english-24l}" "$lvl" 30 "$secs" "$@"
 /venv/main/bin/python "$root/tools/pocket_soak_report.py" "$ev/$tag/$tag-c$lvl.jsonl" --windows 10 \
   | tee "$ev/$tag/$tag-report.txt"
