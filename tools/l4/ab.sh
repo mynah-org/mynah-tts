@@ -1,0 +1,22 @@
+#!/bin/bash
+# One serving measurement: start the server, run the ladder under the GPU
+# lock, stop the server, print the summary and the [SERVE] loop profile.
+# usage: ab.sh <tag> <model-dir> <levels> <warmup-s> <duration-s> [VAR=value ...]
+tag=$1; model=$2; lvls=$3; wu=$4; du=$5; shift 5
+root="${MYNAH_L4_ROOT:-/root/mynah-head}"; ev="${MYNAH_L4_EVIDENCE:-/root/evidence}"
+port="${MYNAH_L4_PORT:-18080}"
+mkdir -p "$ev"
+pkill -f "mynah-tts-server.*-p $port"; sleep 2
+tmux kill-session -t "srv-$port" 2>/dev/null
+tmux new-session -d -s "srv-$port" "$root/tools/l4/serve.sh $model 64 64 $port $* > $ev/$tag-server.log 2>&1"
+for i in $(seq 90); do curl -sf "localhost:$port/health" >/dev/null && break; sleep 2; done
+P=$(pgrep -f "mynah-tts-server.*-p $port" | head -1)
+cd "$root" && flock /root/gpu.lock /venv/main/bin/python tools/pocket_ladder.py --port "$port" \
+  --levels "$lvls" --warmup "$wu" --duration "$du" --server-pid "$P" --stop-rtf-p95 50 \
+  ${MYNAH_L4_LADDER_ARGS} --out "$ev/$tag" --tag "$tag" > "$ev/$tag-ladder.out" 2>&1
+pkill -INT -f "mynah-tts-server.*-p $port"; sleep 4
+echo "=== $tag $*"
+grep -E "quant=|resident\{|error|WARN" "$ev/$tag-server.log" | head -3
+python3 "$root/tools/l4/summ.py" "$ev/$tag/$tag-summary.jsonl"
+echo "stream_failed=$(grep -c 'stream failed' "$ev/$tag-server.log")"
+grep -E "SERVE\]   B(1|8|16|32|48|64) |SERVE\] loop" "$ev/$tag-server.log"
