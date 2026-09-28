@@ -1383,6 +1383,7 @@ New, opt-in track. CPU remains the oracle/default; CUDA gets a separate server
 artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
 “GPU Pocket”. The target is a measured C100 on an L40S, not an extrapolation.
 
+- [x] E15-C60 Pocket 24L realtime capacity on one L4: C64 at 90-100 audio-s/s, stream RTF p95 0.4-0.7, TTFA p95 <140 ms, zero failures over 30-min closed-loop and 15-min Poisson soaks, WER gate passed → [`.work/pocket-cuda-c60-l4.md`](.work/pocket-cuda-c60-l4.md) (open: listening test, soak from a separate client host, host scheduler thread is the next limiter)
 - [x] E15-0 as-is audit: Pocket CPU driver/state, current CUDA backend, `../qwen-tts` resident CUDA/CI patterns, and vLLM-Omni CUDA-graph/async-chunk designs
 - [~] E15-1 add `make cuda-server`; compile/link CLI + server in CI for explicit `sm_70`, `sm_89` (L40S) and `sm_90`; model-free check distinguishes compiled CUDA from no device — latest green gate is Build & Test `36124116814`, Code Quality `36124116761`, Memory Safety `36124116778`, including `sm_120`
 - [~] E15-2 explicit backend capability/lifecycle: backend-owned weights, graphs, batch metadata and scratch; host/device conv split and safe CPU retry are implemented, with backend health/capability counters now exposed and runtime validation remaining
