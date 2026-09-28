@@ -250,7 +250,7 @@ not to the serving path.
 
 The exact orchestration scripts that ran on the L4 are archived in
 `.work/l4-scripts-2026-09-28/`; the logs and per-request records travel with the
-report (`l4-evidence-logs/` next to the PDF).
+private evidence, which is not published.
 
 ## Board
 
