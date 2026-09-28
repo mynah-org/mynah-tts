@@ -8092,6 +8092,12 @@ extern "C" void mynah_cuda_graph_forget(void *opaque, const void *identity) {
         if (entry.graph != nullptr) cudaGraphDestroy(entry.graph);
         st->pipeline_graphs.erase(st->pipeline_graphs.begin() + i);
     }
+    /* A pooled Pocket decoder (MYNAH_CUDA_SLOT_POOL) is parked instead of
+     * closed, so forgetting it must also drop the cross-request batch graphs
+     * that name it, as decoder_close does.  Any other identity (a scratch
+     * arena) matches no decoder and this is a no-op. */
+    destroy_decoder_batch_graphs_for(
+        st, static_cast<const mynah_backend_decoder *>(identity));
 }
 
 static cuda_graph_entry *find_graph(cuda_backend_state *st, size_t rows,

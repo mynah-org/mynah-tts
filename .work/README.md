@@ -44,3 +44,4 @@ that holds the detail. Nothing in `PLAN.md` should need more than one line.
 | [int8-backbone.md](int8-backbone.md) | E12 — `backbone:bf16` → `backbone:int8`, and what would actually prove it |
 | [pocket-tts-cuda-streaming-parity.md](pocket-tts-cuda-streaming-parity.md) | E15 — PocketTTS CUDA residency, parity, and Linux GPU streaming |
 | [pocket-cuda-runtime-gaps.md](pocket-cuda-runtime-gaps.md) | E15 follow-up — L4 capacity, row arenas, frame graphs and memory gates |
+| [pocket-cuda-slot-pool.md](pocket-cuda-slot-pool.md) | Pool per-request CUDA resource sets instead of cudaMalloc/cudaFree per admission (`MYNAH_CUDA_SLOT_POOL`) |

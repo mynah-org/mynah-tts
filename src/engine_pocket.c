@@ -915,6 +915,16 @@ struct mynah_engine_state {
     float *cuda_prefill_in;
     size_t cuda_prefill_in_floats;
 
+    /* Idle per-request CUDA resource sets (MYNAH_CUDA_SLOT_POOL).  A retired
+     * CUDA context parks its device buffers, resident decoder and pinned host
+     * staging here instead of freeing them, because every cudaFree and
+     * cudaFreeHost synchronises the whole device.  Only ever non-empty when the
+     * CUDA serving path is active; the CPU path never touches it. */
+    pthread_mutex_t cuda_slot_pool_mutex;
+    int cuda_slot_pool_mutex_ready;
+    struct pocket_cuda_slot *cuda_slot_pool;
+    size_t cuda_slot_pool_count;
+
     mynah_sp *tokenizer;
 };
 
@@ -1007,6 +1017,10 @@ struct mynah_engine_ctx {
     float *cuda_ffn;
     size_t cuda_backbone_capacity;
     size_t cuda_backbone_kv_floats;
+    /* Bytes actually behind `cuda_backbone_kv`.  With the slot pool a reused
+     * cache may be larger than this request needs; the layout still uses
+     * `cuda_backbone_capacity` as its stride, so the tail is simply unused. */
+    size_t cuda_backbone_kv_bytes;
     int cuda_backbone_kv_bf16;
     int cuda_backbone_enabled;
     int cuda_backbone_valid;
@@ -1066,6 +1080,10 @@ struct mynah_engine_ctx {
     mynah_backend_decoder *cuda_decoder;
     float *cuda_decoder_input;
     float *cuda_decoder_output;
+    /* A pooled resource set taken at admission (MYNAH_CUDA_SLOT_POOL).  The
+     * alloc helpers take their parts from it; whatever this request did not
+     * consume stays here and is parked again, with the rest, at ctx_free. */
+    struct pocket_cuda_slot *cuda_slot;
     int cuda_decoder_enabled;
     int cuda_decoder_graph_enabled;
     int cuda_decoder_started;
@@ -3446,8 +3464,15 @@ static int pocket_resolve_singles(mynah_engine_state *state, char *error,
 
 /* -------------------------------------------------------------- model_init */
 
+static void pocket_cuda_slot_pool_drain(mynah_engine_state *state);
+
 static void pocket_model_free(mynah_engine_state *state) {
     if (state == NULL) return;
+    pocket_cuda_slot_pool_drain(state);
+    if (state->cuda_slot_pool_mutex_ready) {
+        pthread_mutex_destroy(&state->cuda_slot_pool_mutex);
+        state->cuda_slot_pool_mutex_ready = 0;
+    }
     if (state->cuda_voice_kv != NULL) {
         for (size_t v = 0; v < state->voice_count; ++v)
             mynah_backend_dev_free(state->backend, (float *)state->cuda_voice_kv[v]);
@@ -3770,6 +3795,9 @@ static int pocket_model_init(const mynah_tts_model *model,
         return -1;
     }
     state->voice_cache_mutex_ready = 1;
+    /* A failed init only disables the CUDA slot pool; `_enabled` checks it. */
+    if (pthread_mutex_init(&state->cuda_slot_pool_mutex, NULL) == 0)
+        state->cuda_slot_pool_mutex_ready = 1;
     state->model_dir = pocket_strdup(model->model_dir, strlen(model->model_dir));
     if (state->model_dir == NULL) {
         pocket_model_free(state);
@@ -4221,6 +4249,324 @@ static void pocket_cuda_drain_before_release(const mynah_backend *backend) {
     (void)mynah_backend_sync(backend, ignored, sizeof(ignored));
 }
 
+/* ------------------------------------------- per-request CUDA resource pool
+ *
+ * MYNAH_CUDA_SLOT_POOL (default on whenever the resident CUDA path is active,
+ * `=0` restores the allocate-per-request behaviour).  Every admission used to
+ * cudaMalloc/cudaHostAlloc a request's device buffers, pinned staging and
+ * resident SEANet decoder, and every retirement freed them again.  cudaFree
+ * and cudaFreeHost synchronise the whole device, so at C64 the scheduler
+ * thread punched a GPU bubble into the pipeline about eleven times a second.
+ *
+ * A retired context now parks its resource set here and the next admission
+ * takes it back.  What a new request must not inherit is reset on take:
+ *   - pinned host staging is zeroed (a fresh allocation was calloc-clean);
+ *   - the Mimi KV window and the decoder input/output are zeroed on the
+ *     stream, the upsample tail is zeroed (and again by the prologue);
+ *   - the SEANet causal rings are cleared with mynah_backend_decoder_reset
+ *     (the prologue clears them again, as it always did);
+ *   - the backbone KV is NOT cleared by default: attention reads only the
+ *     positions this request wrote (voice prefix, text, its own steps), which
+ *     is exactly the property a fresh cudaMalloc -- uninitialised, and often
+ *     the previous owner's memory -- already relied on.
+ *     MYNAH_CUDA_SLOT_POOL_ZERO_KV=1 clears it too, for a leak A/B: the audio
+ *     must be bit-identical either way.
+ * The set is only parked after the existing drain, so nothing queued by the
+ * previous owner still refers to it; everything is on the backend's one
+ * stream, so the new owner's work is ordered after the reset.  Graph caches
+ * keyed by the decoder are forgotten at park exactly as they were at close. */
+#define POCKET_CUDA_SLOT_POOL_CAP POCKET_MAX_BATCH
+
+typedef struct pocket_cuda_slot {
+    struct pocket_cuda_slot *next;
+    /* resident backbone */
+    float *bb_kv;
+    size_t bb_kv_bytes;
+    int bb_kv_bf16;
+    float *bb_x, *bb_norm, *bb_qkv, *bb_attn, *bb_proj, *bb_ffn;
+    /* resident Mimi decoder transformer */
+    float **codec_kv;
+    size_t codec_kv_layers;
+    size_t codec_kv_positions;
+    size_t codec_kv_half;
+    float *codec_x, *codec_norm, *codec_qkv, *codec_attn, *codec_proj,
+        *codec_ffn;
+    /* resident quantizer projection + causal upsample */
+    float *codec_denorm, *codec_up_input, *codec_up, *codec_up_partial;
+    size_t codec_up_tail;
+    int codec_upsample;
+    /* resident SEANet decoder */
+    mynah_backend_decoder *decoder;
+    float *decoder_input, *decoder_output;
+    /* pinned host staging (only ever pinned buffers are parked) */
+    float *step_input, *hidden, *denorm, *codec_seq, *codec_out, *codec_back,
+        *pcm;
+} pocket_cuda_slot;
+
+static int pocket_cuda_slot_pool_enabled(const mynah_engine_state *state) {
+    if (!pocket_cuda_resident_requested(state) ||
+        !state->cuda_slot_pool_mutex_ready) return 0;
+    const char *setting = getenv("MYNAH_CUDA_SLOT_POOL");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+static int pocket_cuda_slot_zero_kv_requested(void) {
+    const char *setting = getenv("MYNAH_CUDA_SLOT_POOL_ZERO_KV");
+    return setting != NULL && strcmp(setting, "0") != 0;
+}
+
+static void pocket_cuda_slot_free_backbone(const mynah_backend *backend,
+                                           pocket_cuda_slot *slot) {
+    mynah_backend_dev_free(backend, slot->bb_kv);
+    mynah_backend_dev_free(backend, slot->bb_x);
+    mynah_backend_dev_free(backend, slot->bb_norm);
+    mynah_backend_dev_free(backend, slot->bb_qkv);
+    mynah_backend_dev_free(backend, slot->bb_attn);
+    mynah_backend_dev_free(backend, slot->bb_proj);
+    mynah_backend_dev_free(backend, slot->bb_ffn);
+    slot->bb_kv = NULL;
+    slot->bb_kv_bytes = 0u;
+    slot->bb_kv_bf16 = 0;
+    slot->bb_x = slot->bb_norm = slot->bb_qkv = NULL;
+    slot->bb_attn = slot->bb_proj = slot->bb_ffn = NULL;
+}
+
+static void pocket_cuda_slot_free_upsample(const mynah_backend *backend,
+                                           pocket_cuda_slot *slot) {
+    mynah_backend_dev_free(backend, slot->codec_denorm);
+    mynah_backend_dev_free(backend, slot->codec_up_input);
+    mynah_backend_dev_free(backend, slot->codec_up);
+    mynah_backend_dev_free(backend, slot->codec_up_partial);
+    slot->codec_denorm = slot->codec_up_input = NULL;
+    slot->codec_up = slot->codec_up_partial = NULL;
+    slot->codec_up_tail = 0u;
+    slot->codec_upsample = 0;
+}
+
+static void pocket_cuda_slot_free_codec(const mynah_backend *backend,
+                                        pocket_cuda_slot *slot) {
+    if (slot->codec_kv != NULL) {
+        for (size_t l = 0; l < slot->codec_kv_layers; ++l)
+            mynah_backend_dev_free(backend, slot->codec_kv[l]);
+        free(slot->codec_kv);
+    }
+    mynah_backend_dev_free(backend, slot->codec_x);
+    mynah_backend_dev_free(backend, slot->codec_norm);
+    mynah_backend_dev_free(backend, slot->codec_qkv);
+    mynah_backend_dev_free(backend, slot->codec_attn);
+    mynah_backend_dev_free(backend, slot->codec_proj);
+    mynah_backend_dev_free(backend, slot->codec_ffn);
+    slot->codec_kv = NULL;
+    slot->codec_kv_layers = 0u;
+    slot->codec_kv_positions = 0u;
+    slot->codec_kv_half = 0u;
+    slot->codec_x = slot->codec_norm = slot->codec_qkv = NULL;
+    slot->codec_attn = slot->codec_proj = slot->codec_ffn = NULL;
+}
+
+static void pocket_cuda_slot_free_decoder(const mynah_backend *backend,
+                                          pocket_cuda_slot *slot) {
+    mynah_backend_dev_free(backend, slot->decoder_input);
+    mynah_backend_dev_free(backend, slot->decoder_output);
+    if (slot->decoder != NULL) mynah_backend_decoder_close(backend, slot->decoder);
+    slot->decoder = NULL;
+    slot->decoder_input = slot->decoder_output = NULL;
+}
+
+static void pocket_cuda_slot_destroy(const mynah_backend *backend,
+                                     pocket_cuda_slot *slot) {
+    if (slot == NULL) return;
+    pocket_cuda_slot_free_backbone(backend, slot);
+    pocket_cuda_slot_free_codec(backend, slot);
+    pocket_cuda_slot_free_upsample(backend, slot);
+    pocket_cuda_slot_free_decoder(backend, slot);
+    mynah_backend_host_free(backend, slot->step_input);
+    mynah_backend_host_free(backend, slot->hidden);
+    mynah_backend_host_free(backend, slot->denorm);
+    mynah_backend_host_free(backend, slot->codec_seq);
+    mynah_backend_host_free(backend, slot->codec_out);
+    mynah_backend_host_free(backend, slot->codec_back);
+    mynah_backend_host_free(backend, slot->pcm);
+    free(slot);
+}
+
+/* Take the idle set whose backbone cache fits `bb_kv_bytes` most tightly (and
+ * has the requested element type); failing that, the one with the largest
+ * cache, whose KV alone is then re-allocated.  NULL when the pool is empty. */
+static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
+                                                  size_t bb_kv_bytes,
+                                                  int bb_kv_bf16) {
+    if (!pocket_cuda_slot_pool_enabled(state)) return NULL;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    pocket_cuda_slot **best = NULL;
+    pocket_cuda_slot **largest = NULL;
+    for (pocket_cuda_slot **link = &state->cuda_slot_pool; *link != NULL;
+         link = &(*link)->next) {
+        const pocket_cuda_slot *slot = *link;
+        if (slot->bb_kv_bf16 == bb_kv_bf16 && slot->bb_kv_bytes >= bb_kv_bytes &&
+            (best == NULL || slot->bb_kv_bytes < (*best)->bb_kv_bytes))
+            best = link;
+        if (largest == NULL || slot->bb_kv_bytes > (*largest)->bb_kv_bytes)
+            largest = link;
+    }
+    pocket_cuda_slot **pick = best != NULL ? best : largest;
+    pocket_cuda_slot *slot = NULL;
+    if (pick != NULL) {
+        slot = *pick;
+        *pick = slot->next;
+        slot->next = NULL;
+        state->cuda_slot_pool_count--;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    return slot;
+}
+
+/* Hand a pooled pinned buffer to the context, zeroed like the calloc it
+ * replaces, or fall back to the ordinary allocation. */
+static float *pocket_cuda_host_take(const mynah_engine_state *state,
+                                    float **pooled, size_t count, int *pinned,
+                                    char *error, size_t capacity) {
+    if (pooled != NULL && *pooled != NULL) {
+        float *buffer = *pooled;
+        *pooled = NULL;
+        memset(buffer, 0, count * sizeof(float));
+        if (pinned != NULL) *pinned = 1;
+        return buffer;
+    }
+    return pocket_cuda_host_buffer(state, count, pinned, error, capacity);
+}
+
+#define POCKET_SLOT_MOVE(dst, src) \
+    do {                           \
+        (dst) = (src);             \
+        (src) = NULL;              \
+    } while (0)
+
+/* Move this context's CUDA resources into a pooled set.  Runs after the
+ * drain in ctx_free; the ctx pointers it moves are left NULL, so the ordinary
+ * release helpers that follow only reset flags.  A disabled pool, a full pool
+ * or an empty set frees instead. */
+static void pocket_cuda_slot_park(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || ctx->state == NULL) return;
+    mynah_engine_state *state = ctx->state;
+    const mynah_backend *backend = state->backend;
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    ctx->cuda_slot = NULL;
+    if (!pocket_cuda_slot_pool_enabled(state)) {
+        pocket_cuda_slot_destroy(backend, slot);
+        return;
+    }
+    if (slot == NULL) {
+        slot = (pocket_cuda_slot *)calloc(1, sizeof(*slot));
+        if (slot == NULL) return; /* the ordinary release frees everything */
+    }
+    if (ctx->cuda_backbone_kv != NULL && ctx->cuda_x != NULL &&
+        ctx->cuda_norm != NULL && ctx->cuda_qkv != NULL &&
+        ctx->cuda_attn != NULL && ctx->cuda_proj != NULL &&
+        ctx->cuda_ffn != NULL && ctx->cuda_backbone_kv_bytes != 0u) {
+        pocket_cuda_slot_free_backbone(backend, slot);
+        POCKET_SLOT_MOVE(slot->bb_kv, ctx->cuda_backbone_kv);
+        slot->bb_kv_bytes = ctx->cuda_backbone_kv_bytes;
+        slot->bb_kv_bf16 = ctx->cuda_backbone_kv_bf16;
+        POCKET_SLOT_MOVE(slot->bb_x, ctx->cuda_x);
+        POCKET_SLOT_MOVE(slot->bb_norm, ctx->cuda_norm);
+        POCKET_SLOT_MOVE(slot->bb_qkv, ctx->cuda_qkv);
+        POCKET_SLOT_MOVE(slot->bb_attn, ctx->cuda_attn);
+        POCKET_SLOT_MOVE(slot->bb_proj, ctx->cuda_proj);
+        POCKET_SLOT_MOVE(slot->bb_ffn, ctx->cuda_ffn);
+        ctx->cuda_backbone_kv_bytes = 0u;
+    }
+    if (ctx->cuda_codec_kv != NULL && ctx->cuda_codec_x != NULL &&
+        ctx->cuda_codec_norm != NULL && ctx->cuda_codec_qkv != NULL &&
+        ctx->cuda_codec_attn != NULL && ctx->cuda_codec_proj != NULL &&
+        ctx->cuda_codec_ffn != NULL && ctx->cuda_codec_kv_positions != 0u) {
+        pocket_cuda_slot_free_codec(backend, slot);
+        POCKET_SLOT_MOVE(slot->codec_kv, ctx->cuda_codec_kv);
+        slot->codec_kv_layers = state->cfg.codec_tf_layers;
+        slot->codec_kv_positions = ctx->cuda_codec_kv_positions;
+        slot->codec_kv_half = ctx->cuda_codec_kv_half;
+        POCKET_SLOT_MOVE(slot->codec_x, ctx->cuda_codec_x);
+        POCKET_SLOT_MOVE(slot->codec_norm, ctx->cuda_codec_norm);
+        POCKET_SLOT_MOVE(slot->codec_qkv, ctx->cuda_codec_qkv);
+        POCKET_SLOT_MOVE(slot->codec_attn, ctx->cuda_codec_attn);
+        POCKET_SLOT_MOVE(slot->codec_proj, ctx->cuda_codec_proj);
+        POCKET_SLOT_MOVE(slot->codec_ffn, ctx->cuda_codec_ffn);
+    }
+    if (ctx->cuda_codec_upsample_enabled && ctx->cuda_codec_denorm != NULL &&
+        ctx->cuda_codec_up_input != NULL && ctx->cuda_codec_up != NULL &&
+        (ctx->cuda_codec_up_tail == 0u || ctx->cuda_codec_up_partial != NULL)) {
+        pocket_cuda_slot_free_upsample(backend, slot);
+        POCKET_SLOT_MOVE(slot->codec_denorm, ctx->cuda_codec_denorm);
+        POCKET_SLOT_MOVE(slot->codec_up_input, ctx->cuda_codec_up_input);
+        POCKET_SLOT_MOVE(slot->codec_up, ctx->cuda_codec_up);
+        POCKET_SLOT_MOVE(slot->codec_up_partial, ctx->cuda_codec_up_partial);
+        slot->codec_up_tail = ctx->cuda_codec_up_tail;
+        slot->codec_upsample = 1;
+    }
+    if (ctx->cuda_decoder != NULL && ctx->cuda_decoder_input != NULL &&
+        ctx->cuda_decoder_output != NULL) {
+        pocket_cuda_slot_free_decoder(backend, slot);
+        /* The same graph bookkeeping decoder_close did: the per-decoder graph
+         * and any cross-request batch graph naming this decoder go now, so
+         * the bounded graph caches never fill up with retired gangs. */
+        mynah_backend_graph_forget(backend, ctx->cuda_decoder);
+        POCKET_SLOT_MOVE(slot->decoder, ctx->cuda_decoder);
+        POCKET_SLOT_MOVE(slot->decoder_input, ctx->cuda_decoder_input);
+        POCKET_SLOT_MOVE(slot->decoder_output, ctx->cuda_decoder_output);
+    }
+#define POCKET_SLOT_PARK_HOST(field, flag)                   \
+    do {                                                     \
+        if (ctx->field != NULL && ctx->flag) {               \
+            mynah_backend_host_free(backend, slot->field);   \
+            POCKET_SLOT_MOVE(slot->field, ctx->field);       \
+            ctx->flag = 0;                                   \
+        }                                                    \
+    } while (0)
+    POCKET_SLOT_PARK_HOST(step_input, step_input_host_pinned);
+    POCKET_SLOT_PARK_HOST(hidden, hidden_host_pinned);
+    POCKET_SLOT_PARK_HOST(denorm, denorm_host_pinned);
+    POCKET_SLOT_PARK_HOST(codec_seq, codec_seq_host_pinned);
+    POCKET_SLOT_PARK_HOST(codec_out, codec_out_host_pinned);
+    POCKET_SLOT_PARK_HOST(codec_back, codec_back_host_pinned);
+    POCKET_SLOT_PARK_HOST(pcm, pcm_host_pinned);
+#undef POCKET_SLOT_PARK_HOST
+    const int any = slot->bb_kv != NULL || slot->codec_kv != NULL ||
+                    slot->codec_upsample || slot->decoder != NULL ||
+                    slot->step_input != NULL || slot->hidden != NULL ||
+                    slot->denorm != NULL || slot->codec_seq != NULL ||
+                    slot->codec_out != NULL || slot->codec_back != NULL ||
+                    slot->pcm != NULL;
+    if (!any) {
+        pocket_cuda_slot_destroy(backend, slot);
+        return;
+    }
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    if (state->cuda_slot_pool_count < POCKET_CUDA_SLOT_POOL_CAP) {
+        slot->next = state->cuda_slot_pool;
+        state->cuda_slot_pool = slot;
+        state->cuda_slot_pool_count++;
+        slot = NULL;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    pocket_cuda_slot_destroy(backend, slot); /* pool full: free as before */
+}
+
+/* Model teardown: every context is gone, free what the pool still holds. */
+static void pocket_cuda_slot_pool_drain(mynah_engine_state *state) {
+    if (state == NULL || !state->cuda_slot_pool_mutex_ready) return;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    pocket_cuda_slot *slot = state->cuda_slot_pool;
+    state->cuda_slot_pool = NULL;
+    state->cuda_slot_pool_count = 0u;
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    if (slot != NULL) pocket_cuda_drain_before_release(state->backend);
+    while (slot != NULL) {
+        pocket_cuda_slot *next = slot->next;
+        pocket_cuda_slot_destroy(state->backend, slot);
+        slot = next;
+    }
+}
+
 /* The resident CUDA kernels currently consume the original float model views.
  * They must not silently replace a CPU qmat projection with an f32 GEMM: that
  * would make the backend-dependent audio differ before the caller ever reaches
@@ -4371,6 +4717,7 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     ctx->cuda_ffn = NULL;
     ctx->cuda_backbone_capacity = 0u;
     ctx->cuda_backbone_kv_floats = 0u;
+    ctx->cuda_backbone_kv_bytes = 0u;
     ctx->cuda_backbone_kv_bf16 = 0;
     ctx->cuda_backbone_valid = 0;
 }
@@ -4461,17 +4808,44 @@ static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
         pocket_mul(cfg->codec_tf_dim, 3u, &qkv_floats) != 0) return 0;
 
     char ignored[256];
-    ctx->cuda_codec_kv = (float **)calloc(cfg->codec_tf_layers,
-                                          sizeof(*ctx->cuda_codec_kv));
+    /* A pooled set (MYNAH_CUDA_SLOT_POOL) brings its buffers when the window
+     * geometry matches exactly; its KV window is cleared below, because the
+     * Mimi ring must start as a fresh request's would. */
+    int reused_kv = 0;
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    if (slot != NULL && slot->codec_kv != NULL) {
+        if (slot->codec_kv_layers == cfg->codec_tf_layers &&
+            slot->codec_kv_positions == positions &&
+            slot->codec_kv_half == half) {
+            POCKET_SLOT_MOVE(ctx->cuda_codec_kv, slot->codec_kv);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_x, slot->codec_x);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_norm, slot->codec_norm);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_qkv, slot->codec_qkv);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_attn, slot->codec_attn);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_proj, slot->codec_proj);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_ffn, slot->codec_ffn);
+            reused_kv = 1;
+        }
+        pocket_cuda_slot_free_codec(backend, slot);
+    }
+    if (ctx->cuda_codec_kv == NULL)
+        ctx->cuda_codec_kv = (float **)calloc(cfg->codec_tf_layers,
+                                              sizeof(*ctx->cuda_codec_kv));
     if (ctx->cuda_codec_kv == NULL) return 0;
 #define POCKET_CODEC_ALLOC(field, count)                                      \
     do {                                                                       \
-        if (mynah_backend_dev_alloc(backend, (count), &(field), ignored,     \
+        if ((field) == NULL &&                                                 \
+            mynah_backend_dev_alloc(backend, (count), &(field), ignored,     \
                                      sizeof(ignored)) != 0)                    \
             goto fail;                                                         \
     } while (0)
-    for (size_t l = 0; l < cfg->codec_tf_layers; ++l)
+    for (size_t l = 0; l < cfg->codec_tf_layers; ++l) {
         POCKET_CODEC_ALLOC(ctx->cuda_codec_kv[l], kv_floats);
+        if (reused_kv &&
+            mynah_backend_zero_dev(backend, ctx->cuda_codec_kv[l], kv_floats,
+                                   ignored, sizeof(ignored)) != 0)
+            goto fail;
+    }
     POCKET_CODEC_ALLOC(ctx->cuda_codec_x, cfg->codec_tf_dim);
     POCKET_CODEC_ALLOC(ctx->cuda_codec_norm, cfg->codec_tf_dim);
     POCKET_CODEC_ALLOC(ctx->cuda_codec_qkv, qkv_floats);
@@ -4485,11 +4859,29 @@ static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
         if (pocket_mul(cfg->upsample_stride, cfg->codec_dim, &up_floats) != 0 ||
             pocket_mul(up_tail, cfg->codec_dim, &up_tail_floats) != 0)
             goto fail;
+        int reused_up = 0;
+        if (slot != NULL && slot->codec_upsample &&
+            slot->codec_up_tail == up_tail) {
+            reused_up = 1;
+            POCKET_SLOT_MOVE(ctx->cuda_codec_denorm, slot->codec_denorm);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_up_input, slot->codec_up_input);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_up, slot->codec_up);
+            POCKET_SLOT_MOVE(ctx->cuda_codec_up_partial, slot->codec_up_partial);
+        }
+        if (slot != NULL) pocket_cuda_slot_free_upsample(backend, slot);
         POCKET_CODEC_ALLOC(ctx->cuda_codec_denorm, cfg->latent_dim);
         POCKET_CODEC_ALLOC(ctx->cuda_codec_up_input, cfg->codec_dim);
         POCKET_CODEC_ALLOC(ctx->cuda_codec_up, up_floats);
-        if (up_tail_floats > 0u)
+        if (up_tail_floats > 0u) {
             POCKET_CODEC_ALLOC(ctx->cuda_codec_up_partial, up_tail_floats);
+            /* The carried upsample tail is request state; the prologue clears
+             * it again, this keeps a reused buffer clean before that. */
+            if (reused_up &&
+                mynah_backend_zero_dev(backend, ctx->cuda_codec_up_partial,
+                                       up_tail_floats, ignored,
+                                       sizeof(ignored)) != 0)
+                goto fail;
+        }
         ctx->cuda_codec_up_tail = up_tail;
         ctx->cuda_codec_upsample_enabled = 1;
     }
@@ -5089,14 +5481,45 @@ static int pocket_cuda_decoder_alloc(mynah_engine_ctx *ctx) {
 
     char ignored[256];
     ignored[0] = '\0';
+    size_t input_floats = 0;
+    size_t output_floats = 0;
+    /* A pooled decoder (MYNAH_CUDA_SLOT_POOL) was opened from the same model
+     * description.  Its causal rings are cleared here -- and again by the
+     * prologue, as for any request -- and its handoff buffers zeroed, so a
+     * new request never starts from the previous owner's audio. */
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    if (slot != NULL && slot->decoder != NULL) {
+        POCKET_SLOT_MOVE(ctx->cuda_decoder, slot->decoder);
+        POCKET_SLOT_MOVE(ctx->cuda_decoder_input, slot->decoder_input);
+        POCKET_SLOT_MOVE(ctx->cuda_decoder_output, slot->decoder_output);
+        if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, &input_floats) != 0 ||
+            pocket_mul(cfg->audio_channels, cfg->samples_per_frame,
+                       &output_floats) != 0 ||
+            ctx->cuda_decoder_input == NULL || ctx->cuda_decoder_output == NULL ||
+            mynah_backend_decoder_reset(state->backend, ctx->cuda_decoder,
+                                        ignored, sizeof(ignored)) != 0 ||
+            mynah_backend_zero_dev(state->backend, ctx->cuda_decoder_input,
+                                   input_floats, ignored, sizeof(ignored)) != 0 ||
+            mynah_backend_zero_dev(state->backend, ctx->cuda_decoder_output,
+                                   output_floats, ignored, sizeof(ignored)) != 0) {
+            /* Drop the pooled handle and open a fresh one below. */
+            pocket_cuda_drain_before_release(state->backend);
+            pocket_cuda_decoder_release(ctx);
+            ctx->cuda_decoder_enabled = 1;
+        } else {
+            const char *graphs = getenv("MYNAH_CUDA_GRAPHS");
+            ctx->cuda_decoder_graph_enabled =
+                graphs == NULL || strcmp(graphs, "0") != 0;
+            ctx->cuda_decoder_started = 0;
+            return 0;
+        }
+    }
     if (mynah_backend_decoder_open(state->backend, &desc, cfg->upsample_stride,
                                    &ctx->cuda_decoder, ignored,
                                    sizeof(ignored)) != 0) {
         ctx->cuda_decoder_enabled = 0;
         return 0; /* optional backend: CPU remains authoritative */
     }
-    size_t input_floats = 0;
-    size_t output_floats = 0;
     if (pocket_mul(cfg->codec_dim, cfg->upsample_stride, &input_floats) != 0 ||
         pocket_mul(cfg->audio_channels, cfg->samples_per_frame, &output_floats) != 0 ||
         mynah_backend_dev_alloc(state->backend, input_floats,
@@ -5468,10 +5891,35 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     }
 
     char ignored[256];
+    /* A pooled set (MYNAH_CUDA_SLOT_POOL) brings its buffers; the cache is
+     * kept when it is at least as large as this request needs, and only the
+     * cache is re-allocated otherwise.  Everything taken is owned by the
+     * context from here on, so the failure paths below free it. */
+    int reused_kv = 0;
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+    if (slot != NULL && slot->bb_kv != NULL) {
+        const mynah_backend *backend = ctx->state->backend;
+        if (slot->bb_kv_bf16 == kv_bf16 && slot->bb_kv_bytes >= kv_bytes) {
+            ctx->cuda_backbone_kv = slot->bb_kv;
+            ctx->cuda_backbone_kv_bytes = slot->bb_kv_bytes;
+            reused_kv = 1;
+        } else {
+            mynah_backend_dev_free(backend, slot->bb_kv);
+        }
+        slot->bb_kv = NULL;
+        slot->bb_kv_bytes = 0u;
+        POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
+        POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
+        POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
+        POCKET_SLOT_MOVE(ctx->cuda_attn, slot->bb_attn);
+        POCKET_SLOT_MOVE(ctx->cuda_proj, slot->bb_proj);
+        POCKET_SLOT_MOVE(ctx->cuda_ffn, slot->bb_ffn);
+    }
 #define POCKET_CUDA_ALLOC(field, count)                                      \
     do {                                                                      \
         ignored[0] = '\0';                                                    \
-        if (mynah_backend_dev_alloc(ctx->state->backend, (count), &(field),  \
+        if ((field) == NULL &&                                                \
+            mynah_backend_dev_alloc(ctx->state->backend, (count), &(field),  \
                                     ignored, sizeof(ignored)) != 0) {          \
             pocket_cuda_backbone_release(ctx);                                \
             ctx->cuda_backbone_enabled = 0;                                   \
@@ -5479,9 +5927,21 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
         }                                                                       \
     } while (0)
     ignored[0] = '\0';
-    if (mynah_backend_dev_alloc_bytes(
-            ctx->state->backend, kv_bytes, (void **)&ctx->cuda_backbone_kv,
-            ignored, sizeof(ignored)) != 0) {
+    if (ctx->cuda_backbone_kv == NULL) {
+        if (mynah_backend_dev_alloc_bytes(
+                ctx->state->backend, kv_bytes, (void **)&ctx->cuda_backbone_kv,
+                ignored, sizeof(ignored)) != 0) {
+            pocket_cuda_backbone_release(ctx);
+            ctx->cuda_backbone_enabled = 0;
+            return 0;
+        }
+        ctx->cuda_backbone_kv_bytes = kv_bytes;
+    } else if (reused_kv && pocket_cuda_slot_zero_kv_requested() &&
+               mynah_backend_zero_dev(ctx->state->backend,
+                                      ctx->cuda_backbone_kv,
+                                      ctx->cuda_backbone_kv_bytes /
+                                          sizeof(float),
+                                      ignored, sizeof(ignored)) != 0) {
         pocket_cuda_backbone_release(ctx);
         ctx->cuda_backbone_enabled = 0;
         return 0;
@@ -6293,6 +6753,10 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     pocket_dump_free(ctx->dump);
     pocket_cuda_drain_before_release(ctx->state == NULL ? NULL
                                                            : ctx->state->backend);
+    /* With MYNAH_CUDA_SLOT_POOL the device buffers, decoder and pinned
+     * staging move to the pool here; the releases below then free nothing
+     * and only reset flags.  Without it this frees a taken-but-unused set. */
+    pocket_cuda_slot_park(ctx);
     pocket_cuda_backbone_release(ctx);
     pocket_cuda_codec_release(ctx);
     pocket_cuda_decoder_release(ctx);
@@ -6587,6 +7051,23 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
         return -1;
     }
 
+    /* MYNAH_CUDA_SLOT_POOL: take an idle CUDA resource set before any of it
+     * would be allocated.  NULL on the CPU path, with the pool off, or when
+     * the pool is empty -- every helper below then allocates as before.  From
+     * here on the set belongs to the context, so every failure path returns it
+     * to the pool through ctx_free. */
+    if (pocket_cuda_slot_pool_enabled(state)) {
+        const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
+        size_t bb_kv_bytes = 0u;
+        if (pocket_mul(backbone_capacity, attn_dim, &bb_kv_bytes) != 0 ||
+            pocket_mul(bb_kv_bytes, 2u * cfg->layers, &bb_kv_bytes) != 0 ||
+            pocket_mul(bb_kv_bytes, kv_bf16 ? sizeof(uint16_t) : sizeof(float),
+                       &bb_kv_bytes) != 0)
+            bb_kv_bytes = SIZE_MAX;
+        ctx->cuda_slot = pocket_cuda_slot_acquire(state, bb_kv_bytes, kv_bf16);
+    }
+    pocket_cuda_slot *slot = ctx->cuda_slot;
+
     /* The default model-owned voice cache is immutable and is copied directly
      * into the request transformer state during seeding.  Do not retain a
      * second decoded voice prefix per request; the legacy file-backed mode
@@ -6594,30 +7075,44 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
     if (!state->voice_cache_enabled)
         ctx->voice_kv = mynah_alloc_floats(voice_floats, error, capacity);
     ctx->text_embed = mynah_alloc_floats(text_floats, error, capacity);
-    ctx->step_input = pocket_cuda_host_buffer(state, cfg->hidden_dim,
-                                              &ctx->step_input_host_pinned,
-                                              error, capacity);
-    ctx->hidden = pocket_cuda_host_buffer(state, cfg->hidden_dim,
-                                          &ctx->hidden_host_pinned, error,
-                                          capacity);
+    ctx->step_input = pocket_cuda_host_take(state,
+                                            slot ? &slot->step_input : NULL,
+                                            cfg->hidden_dim,
+                                            &ctx->step_input_host_pinned,
+                                            error, capacity);
+    ctx->hidden = pocket_cuda_host_take(state, slot ? &slot->hidden : NULL,
+                                        cfg->hidden_dim,
+                                        &ctx->hidden_host_pinned, error,
+                                        capacity);
     ctx->noise = mynah_alloc_floats(cfg->latent_dim, error, capacity);
     ctx->flow_out = mynah_alloc_floats(cfg->latent_dim, error, capacity);
     ctx->latents = mynah_alloc_floats(latent_floats, error, capacity);
-    ctx->denorm = pocket_cuda_host_buffer(state, cfg->latent_dim,
-                                          &ctx->denorm_host_pinned, error,
-                                          capacity);
+    ctx->denorm = pocket_cuda_host_take(state, slot ? &slot->denorm : NULL,
+                                        cfg->latent_dim,
+                                        &ctx->denorm_host_pinned, error,
+                                        capacity);
     ctx->codec_in = mynah_alloc_floats(cfg->codec_dim, error, capacity);
     ctx->codec_up = mynah_alloc_floats(up_floats, error, capacity);
-    ctx->codec_seq = pocket_cuda_host_buffer(state, up_floats,
-                                             &ctx->codec_seq_host_pinned,
-                                             error, capacity);
-    ctx->codec_out = pocket_cuda_host_buffer(state, up_floats,
-                                             &ctx->codec_out_host_pinned,
-                                             error, capacity);
-    ctx->codec_back = pocket_cuda_host_buffer(state, up_floats,
-                                              &ctx->codec_back_host_pinned,
-                                              error, capacity);
-    if (pocket_cuda_resident_requested(state)) {
+    ctx->codec_seq = pocket_cuda_host_take(state,
+                                           slot ? &slot->codec_seq : NULL,
+                                           up_floats,
+                                           &ctx->codec_seq_host_pinned,
+                                           error, capacity);
+    ctx->codec_out = pocket_cuda_host_take(state,
+                                           slot ? &slot->codec_out : NULL,
+                                           up_floats,
+                                           &ctx->codec_out_host_pinned,
+                                           error, capacity);
+    ctx->codec_back = pocket_cuda_host_take(state,
+                                            slot ? &slot->codec_back : NULL,
+                                            up_floats,
+                                            &ctx->codec_back_host_pinned,
+                                            error, capacity);
+    if (slot != NULL && slot->pcm != NULL) {
+        POCKET_SLOT_MOVE(ctx->pcm, slot->pcm);
+        memset(ctx->pcm, 0, pcm_floats * sizeof(float));
+        ctx->pcm_host_pinned = 1;
+    } else if (pocket_cuda_resident_requested(state)) {
         char ignored[256];
         if (mynah_backend_host_alloc(state->backend, pcm_floats, &ctx->pcm,
                                      ignored, sizeof(ignored)) == 0)

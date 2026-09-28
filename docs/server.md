@@ -42,6 +42,7 @@ The current opt-in controls are:
 | `MYNAH_CUDA_GRAPHS=0` | disable resident Pocket batch CUDA-Graph capture/replay; graphs are enabled by default and fall back to ordinary stream submission when capture is unavailable |
 | `MYNAH_CUDA_DECODER_BATCH=0` | disable the async resident decoder gang submit/one-drain path; default is enabled for CUDA |
 | `MYNAH_CUDA_DECODER_GRAPHS=0` | disable cross-request SEANet decoder graph capture/replay; default is enabled, with a bounded cache keyed by the exact stable decoder gang |
+| `MYNAH_CUDA_SLOT_POOL=0` | disable the per-request CUDA resource pool: retired Pocket contexts then free their device buffers, pinned staging and resident decoder (each cudaFree/cudaFreeHost synchronises the device) instead of parking them for the next admission; default is enabled on the resident CUDA path. `MYNAH_CUDA_SLOT_POOL_ZERO_KV=1` also clears a reused backbone KV cache (leak A/B: audio must be identical) |
 | `MYNAH_CUDA_PREFILL_BATCH=0` | disable cross-request CUDA text prefill and use scalar resumable prefill; CPU is unchanged |
 | `MYNAH_POCKET_VOICE_CACHE=0|all|startup` | disable model-owned voice KV caching, or preload every voice at startup; default is lazy first-use caching |
 | `MYNAH_CUDA_CODEC=1` | opt into the existing generic NanoCodec resident path; it is not Pocket's SEANet decoder and is not a qualification claim |
