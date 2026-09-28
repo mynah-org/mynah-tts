@@ -4268,6 +4268,15 @@ static size_t pocket_cuda_kv_initial_capacity(const mynah_engine_ctx *ctx,
     if (steps > SIZE_MAX - (POCKET_CUDA_KV_GROW_CHUNK - 1u)) return full;
     steps = (steps + POCKET_CUDA_KV_GROW_CHUNK - 1u) /
             POCKET_CUDA_KV_GROW_CHUNK * POCKET_CUDA_KV_GROW_CHUNK;
+    {
+        /* Test hook: a tiny start forces growth in the middle of ordinary
+         * requests, so grown and full-capacity runs can be compared. */
+        const char *forced = getenv("MYNAH_CUDA_KV_GROW_INITIAL_STEPS");
+        if (forced != NULL && forced[0] != '\0') {
+            const long value = strtol(forced, NULL, 10);
+            if (value > 0) steps = (size_t)value;
+        }
+    }
     if (steps > max_frames) steps = max_frames;
     if (pocket_add(ctx->voice_positions, ctx->text_capacity, &positions) != 0 ||
         pocket_add(positions, steps, &positions) != 0 || positions > full)
