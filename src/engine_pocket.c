@@ -39,7 +39,11 @@
  * equal lets a GPU worker form one real batch at C128 instead of four C32
  * microbatches.  CPU still remains correct at the wider width, while its
  * operator can choose a smaller --max-batch at serving time. */
-#define POCKET_MAX_BATCH 128u
+/* Storage bound of every per-batch array.  The CPU engine advertises 128 (its
+ * qualified ceiling); the CUDA backend advertises the full 256 once the device
+ * KV grows on demand (MYNAH_CUDA_KV_GROW) and C128 fits in half the card. */
+#define POCKET_MAX_BATCH 256u
+#define POCKET_CPU_MAX_BATCH 128u
 #define POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE ((size_t)0x300000u)
 #define POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE ((size_t)0x400000u)
 
@@ -4133,6 +4137,12 @@ static unsigned pocket_prefill_slice_tokens(const mynah_engine_state *state) {
     return (unsigned)tokens;
 }
 
+static size_t pocket_max_batch_for(const mynah_backend *backend) {
+    return backend != NULL && strcmp(mynah_backend_name(backend), "cuda") == 0
+               ? POCKET_MAX_BATCH
+               : POCKET_CPU_MAX_BATCH;
+}
+
 static int pocket_caps(const mynah_tts_model *model,
                        const mynah_engine_state *state, mynah_engine_caps *out) {
     if (out == NULL) return -1;
@@ -4144,7 +4154,7 @@ static int pocket_caps(const mynah_tts_model *model,
         out->frames_per_step = 1u;
         out->min_audio_frames = model->info.min_generated_frames;
         out->default_max_steps = model->info.max_decoder_steps;
-        out->max_batch = POCKET_MAX_BATCH;
+        out->max_batch = (unsigned)pocket_max_batch_for(model->backend);
         out->voice_count = model->info.speaker_count;
         out->is_discrete_codec = 0u;
         return 0;
@@ -4160,7 +4170,7 @@ static int pocket_caps(const mynah_tts_model *model,
     out->audio_emit_frames = (unsigned)cfg->audio_emit_frames;
     out->min_audio_frames = (unsigned)cfg->min_audio_frames;
     out->default_max_steps = (unsigned)cfg->default_max_steps;
-    out->max_batch = POCKET_MAX_BATCH;
+    out->max_batch = (unsigned)pocket_max_batch_for(state->backend);
     out->voice_count = (unsigned)state->voice_count;
     out->needs_cfg = 0u;
     out->is_discrete_codec = 0u;
