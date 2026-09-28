@@ -226,3 +226,25 @@ different valid samples: WER equal or better and speaker cosine >= 0.965 on
 every one of them, far above the seed-to-seed baseline. Verdict: the serving
 config passes the gate (WER within 1 point, no outliers); do not expect it to
 be sample-identical to the CPU oracle. No listening test yet, English only.
+
+### 30-minute C64 soak, 24L, all CUDA defaults + codec gang (6d5d95e), 2026-09-27
+
+Closed loop, 64 clients, 30 s warm-up discarded, 1800 s measured, host idle
+(load 1.2), GPU serialised. 19,434 requests, 19,434 ok, 0 failed, 0 server
+failures, 0 HTTP rejections, 0 timeouts.
+
+| window (3 min) | audio-s/s | RTF p50 / p95 | TTFA p95 | gap p95 | stalls @250 / @500 |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 99.4 | 0.63 / 0.66 | 129 ms | 134 ms | 0 / 0 |
+| 1-2 | 92.7-93.0 | 0.67 / 0.72 | 136-137 ms | 153-157 ms | 1 / 0 |
+| 3 | 91.4 | 0.69 / 0.73 | 138 ms | 192 ms | 18 / 0 |
+| 4-8 | 90.7-92.7 | 0.68-0.69 / 0.72-0.73 | 136-140 ms | 146-189 ms | 0 / 0 |
+| 9 | 87.6 (tail) | 0.68 / 0.73 | 138 ms | 178 ms | 0 / 0 |
+
+Whole soak: 92.2 audio-s/s, stream RTF p95 0.723, TTFA p95 137 ms, stalls
+@500 0, stalls @250 19 (in 8 of 19,434 requests, max gap 240-249 ms), RTF
+p95 drift first half 0.709 -> second half 0.727 (+2.5%), VRAM peak 12.7 GiB
+flat, server RSS 3.2 GiB, GPU util 70%, scheduler thread ~111% CPU. Gates:
+throughput, RTF, TTFA, failures, VRAM and the 500 ms buffer pass; the 250 ms
+buffer saw one hiccup in window 3 (0.04% of requests). Open-loop (Poisson)
+soak follows.
