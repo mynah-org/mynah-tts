@@ -12,6 +12,8 @@
 #   <tag>/              summary JSONL, per-request JSONL, per-window report,
 #                       server log, MYNAH_* env of the server, ladder output,
 #                       VRAM log, quality/ (CSV + summary), audio-<tag>.zip
+#                       (a listening selection capped at MYNAH_L4_LISTEN_MB,
+#                       default 100 MB per soak; all captures stay on the box)
 #   REPORT.md           headline numbers parsed from the above, plus the
 #                       sections a human still has to fill in
 # Only bash and python3 stdlib. Nothing is recomputed from scratch except the
@@ -174,32 +176,73 @@ for tag in tags:
     for j in sorted(glob.glob(os.path.join(T, "%s-c*.jsonl" % tag))):
         recs += [r for r in load_jsonl(j) if r.get("wav")]
     if recs:
+        # The listening ZIP is capped (MYNAH_L4_LISTEN_MB per soak, default 100,
+        # so two soaks stay near 200 MB for chat attachments): every flagged or
+        # high-WER utterance first (up to a quarter of the budget), then a
+        # round-robin over kind x voice x soak third (start/middle/end), so a
+        # slow degradation is audible too.  All captured WAVs stay on the box;
+        # manifest-all.csv lists every one of them with its ASR verdict.
+        budget = float(os.environ.get("MYNAH_L4_LISTEN_MB", "100")) * 1048576.0
+        rows, missing = [], 0
+        recs.sort(key=lambda r: (r.get("t_send") or 0.0, r.get("id") or 0))
+        for k, r in enumerate(recs):
+            p = r["wav"]
+            if not os.path.isfile(p):
+                missing += 1
+                continue
+            q = qrows.get(p, {})
+            bad = bool(q.get("flags")) or float(q.get("wer") or 0.0) > 0.3
+            third = min(2, 3 * k // max(1, len(recs)))
+            rows.append((r, q, p, os.path.getsize(p), bad, third))
+
+        def mrow(r, q, p):
+            return [os.path.basename(p), r.get("id"), r.get("measured"), r.get("kind"),
+                    r.get("corpus_id"), r.get("voice"), r.get("seed"),
+                    "%.2f" % (r.get("samples", 0) / 24000.0), fmt(r.get("ttfa_s")),
+                    r.get("stalls_250"), q.get("wer", ""), q.get("flags", ""),
+                    r.get("text"), q.get("hyp", "")]
+
+        picked, used = [], 0.0
+        for row in sorted((x for x in rows if x[4]),
+                          key=lambda x: -float(x[1].get("wer") or 0.0)):
+            if used + row[3] > budget / 4.0:
+                break
+            picked.append(row)
+            used += row[3]
+        groups = {}
+        for row in rows:
+            if row[4]:
+                continue
+            groups.setdefault((row[0].get("kind"), row[0].get("voice"), row[5]), []).append(row)
+        queues = [groups[g] for g in sorted(groups, key=lambda g: tuple(str(x) for x in g))]
+        for qu in queues:  # spread picks across each group, deterministically
+            step = max(1, len(qu) // 8)
+            qu[:] = qu[::step] + [x for i, x in enumerate(qu) if i % step]
+        progress = True
+        while progress and used < budget:
+            progress = False
+            for qu in queues:
+                if qu and used + qu[0][3] <= budget:
+                    row = qu.pop(0)
+                    picked.append(row)
+                    used += row[3]
+                    progress = True
+        header = ["file", "id", "measured", "kind", "corpus_id", "voice", "seed",
+                  "seconds", "ttfa_s", "stalls_250", "wer", "flags", "text", "hyp"]
         zp = os.path.join(T, "audio-%s.zip" % tag)
-        man = io.StringIO()
-        w = csv.writer(man)
-        w.writerow(["file", "id", "measured", "kind", "corpus_id", "voice", "seed",
-                    "seconds", "ttfa_s", "stalls_250", "wer", "flags", "text", "hyp"])
-        n = missing = 0
-        mrows = []
         with zipfile.ZipFile(zp, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
-            for r in recs:
-                p = r["wav"]
-                if not os.path.isfile(p):
-                    missing += 1
-                    continue
+            for r, q, p, size, bad, third in picked:
                 z.write(p, "wav/" + os.path.basename(p))
-                n += 1
-                q = qrows.get(p, {})
-                mrows.append([os.path.basename(p), r.get("id"), r.get("measured"), r.get("kind"),
-                              r.get("corpus_id"), r.get("voice"), r.get("seed"),
-                              "%.2f" % (r.get("samples", 0) / 24000.0), fmt(r.get("ttfa_s")),
-                              r.get("stalls_250"), q.get("wer", ""), q.get("flags", ""),
-                              r.get("text"), q.get("hyp", "")])
-            # Listen to the suspicious ones first: flagged, then by WER.
-            mrows.sort(key=lambda m: (not m[11], -float(m[10] or 0), m[1] or 0))
-            w.writerows(mrows)
-            z.writestr("manifest.csv", man.getvalue())
-        zips[tag] = (n, missing, os.path.getsize(zp) / 1048576.0)
+            for name, sel in (("manifest.csv", picked), ("manifest-all.csv", rows)):
+                buf = io.StringIO()
+                w = csv.writer(buf)
+                w.writerow(header)
+                out = [mrow(r, q, p) for r, q, p, size, bad, third in sel]
+                # Listen to the suspicious ones first: flagged, then by WER.
+                out.sort(key=lambda m: (not m[11], -float(m[10] or 0), m[1] or 0))
+                w.writerows(out)
+                z.writestr(name, buf.getvalue())
+        zips[tag] = (len(picked), missing, os.path.getsize(zp) / 1048576.0)
     else:
         zips[tag] = None
 
