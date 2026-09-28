@@ -7445,6 +7445,15 @@ static void *pocket_cuda_voice_kv(mynah_engine_state *state, size_t speaker,
  * Rows are packed, each attends to its own prefix. On success every context
  * has its whole available text in the device cache and is marked valid; on
  * failure nothing on the host moved and the requests must fail. */
+static int pocket_cuda_prefill_fixed_order(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("MYNAH_CUDA_PREFILL_FIXED");
+        cached = s != NULL && strcmp(s, "0") == 0 ? 0 : 1;
+    }
+    return cached;
+}
+
 static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                     int final, char *error, size_t capacity) {
     if (count == 0u) return 0;
@@ -7600,8 +7609,9 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                                  MYNAH_TAR_LINEAR_IN_PROJ) ==
                            MYNAH_BACKEND_QTYPE_BF16,
             /* Text arrives in pieces (segments, appends); every piece must
-             * land in the cache exactly as a one-shot prefill would put it. */
-            .fixed_order = 1,
+             * land in the cache exactly as a one-shot prefill would put it.
+             * MYNAH_CUDA_PREFILL_FIXED=0 trades that for cuBLAS speed. */
+            .fixed_order = pocket_cuda_prefill_fixed_order(),
         };
         mynah_region_begin(MYNAH_RGN_PREFILL);
         const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,

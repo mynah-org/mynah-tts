@@ -150,5 +150,9 @@ Ranked by expected gain at C64; each item gets a switch and a board row.
 | max-batch/inflight 96 | C64 at 64/64: 123.5 | C80 119.5 (RTF p95 0.53, TTFA p95 106 ms), C96 117.4 (0.61, 121 ms), 0 stalls | flat aud/s, +50% streams | C96 realtime on one L4; GPU-bound plateau ~120 aud/s |
 | max-batch 128 (4 cores) | | C112 113.7 (RTF p95 0.70); C128 fails (VRAM 22.4 GB, 20 streams failed) | | ceiling ~C112 at the current per-request VRAM (~180 MB/stream) |
 
+| tile workspace grow-only (was 6 cudaFree + 6 cudaMalloc at every prefill <-> Mimi dim flip) | C32 102.0, C48 110.3, C64 122.0 | 106.8, 118.9, **129.6** (TTFA p95 78 ms) | +5-8% | KEEP; Nsight 12 s at C64: cudaMalloc 2781 -> 5, cudaFree 2781 -> 5 |
+| prefill tile through cuBLAS TF32 (`MYNAH_CUDA_PREFILL_FIXED=0`, diagnostic) | fixed-order SIMT: C64 127.6, C96 130.4 | C64 134.3, C96 **141.2** (RTF p95 0.52, TTFA p95 93 ms) | +5-8% | the prefill split-K SIMT GEMM was 19.5% of GPU time; WER 3.67%. Loses piecewise-prefill bit identity, so not a default yet |
+| WMMA TF32 fixed-order tile GEMM, no split-K (`MYNAH_CUDA_TILE_TC`) | SIMT C64 127.6 | 95.4 | -25% | REVERT (default off): ~48 blocks for a few-row prefill; self-check PASS, WER 3.49%. Retry with split-K |
+
 Rows above the slot pool ran unpinned with `-w 8` (see the correction above);
 all are C32-C64 x 20 s, 24L, BF16 KV unless stated.
