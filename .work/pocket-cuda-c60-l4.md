@@ -261,3 +261,17 @@ timeouts. Whole soak: 89.2 audio-s/s, stream RTF p95 0.404 (windows
 peak 6.3 GiB (fewer rows resident at once than closed loop), scheduler
 ~105% CPU. Every C60 gate passes at this arrival rate, including the 250 ms
 buffer.
+
+### Final tree (b8d52f2 = codec gang + MYNAH_CUDA_QUANT merged), 2026-09-28
+
+24L self-check with all CUDA defaults: PASS (`CUDA quant=f32 backbone=f32
+flow=f32 mimi=f32 kv=bf16`). C64, 20 s, host idle: 100.7 audio-s/s, stream
+RTF p95 0.479, TTFA p95 95 ms, 0 stalls, 301/301 ok, GPU 92%, VRAM 12.7 GiB.
+`MYNAH_CUDA_QUANT=bf16` (deterministic BF16 tile kernel) is 4% slower than
+f32 on the L4 and stays opt-in; int8 remains diagnostic.
+
+Status against the C60 gates (24L, one L4): throughput 89-101 audio-s/s,
+stream RTF p95 0.40-0.72, TTFA p95 72-137 ms, zero failures across 30-minute
+closed-loop and 15-minute Poisson soaks, zero stalls at 500 ms, one 250 ms
+hiccup in the closed-loop soak (8 of 19,434 requests), VRAM flat, WER gate
+passed. Not done: a listening test, and a soak on a separate client machine.
