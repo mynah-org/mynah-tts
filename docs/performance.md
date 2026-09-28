@@ -984,7 +984,7 @@ control on the same request ids (C8) gives 1.87% with the same per-voice
 profile (alba ~0.4%, marius ~4.7%) and 8 of its 10 >30%-WER utterances shared
 with the loaded run: the load does not degrade the audio; the spread is the
 model/voice pair. Gate WER per voice and per length class, always against an
-unloaded control. Evidence bundle on the L4: `/root/evidence/bundles/pocket-24l-c160-final`.
+unloaded control. The evidence bundle is kept privately and is not published.
 
 ## 2026-09-28 · PocketTTS 6L on CUDA — one NVIDIA L4, C256 qualified
 
@@ -1005,6 +1005,6 @@ utterances): WER 1.06% (A) and 0.87% (B); alba 0.62/0.44%, javert 0.49/0.34%,
 jean 0.95/1.12%, marius 2.24/1.58%; short 2.80/2.62%; 0.6% of utterances above
 30%. The small model reads better to the recogniser than the large one and its
 voice spread is narrower. No separate unloaded control: the serving path is the
-code measured on the 24L, where load did not change the audio. Bundle:
-`/root/evidence/bundles/pocket-6l-c256-final`. Report:
-`PocketTTS-CUDA-L4-Small-Large-Report-2026-09-28.pdf` (with both bundles).
+code measured on the 24L, where load did not change the audio. The evidence
+bundles (per-request records, logs, captured audio) are kept privately and are
+not published.

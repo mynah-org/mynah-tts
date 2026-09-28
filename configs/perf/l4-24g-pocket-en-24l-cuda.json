@@ -194,7 +194,7 @@
       "stalls_250ms": 0,
       "stalls_500ms": 0,
       "throughput_audio_s_per_s": 184.5,
-      "evidence": "l4:/root/evidence/bundles/pocket-24l-c160-final (report PocketTTS-CUDA-L4-Small-Large-Report-2026-09-28.pdf), soak B"
+      "evidence": "l4:/root/evidence/bundles/pocket-24l-c160-final (private evidence bundle, not published), soak B"
     },
     "ceiling": [
       {
@@ -292,7 +292,7 @@
         "stalls_250ms": 0,
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 184.5,
-        "evidence": "l4:/root/evidence/bundles/pocket-24l-c160-final (report PocketTTS-CUDA-L4-Small-Large-Report-2026-09-28.pdf), soak A"
+        "evidence": "l4:/root/evidence/bundles/pocket-24l-c160-final (private evidence bundle, not published), soak A"
       },
       {
         "date": "2026-09-28",
@@ -308,7 +308,7 @@
         "stalls_250ms": 0,
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 184.5,
-        "evidence": "l4:/root/evidence/bundles/pocket-24l-c160-final (report PocketTTS-CUDA-L4-Small-Large-Report-2026-09-28.pdf), soak B"
+        "evidence": "l4:/root/evidence/bundles/pocket-24l-c160-final (private evidence bundle, not published), soak B"
       }
     ],
     "notes": "C60-C64 on 2026-09-27 (all CUDA defaults, one 250 ms hiccup in 30 minutes) -> backbone attention rewrite +22-30%, slot pool, decoder graph reuse, tile workspace grow-only -> C96 GOOD 176.8 audio-s/s -> KV grow (-48% VRAM) -> C128 GOOD 186.7 -> 256-wide cap -> C160 qualified by two soaks with captured audio (WER A 2.02%, B 1.94%; unloaded C8 control on soak A's request ids 1.87%, same per-voice profile: alba ~0.4%, marius ~4.7%). The load does not degrade the audio; the voice spread is the model/voice pair. The C96/C128 soaks used the built-in text mix, the C160 soaks the v2 corpus. Detail: .work/pocket-cuda-g6-host-cpu.md and docs/performance.md (2026-09-28). The 6L on the same box is l4-24g-pocket-en-6l-cuda.json."
