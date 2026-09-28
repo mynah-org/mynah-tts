@@ -196,7 +196,7 @@
             "bank_version": { "type": "string" },
             "voices": {
               "type": "array", "items": { "type": "string" }, "minItems": 1,
-              "description": "Voices drawn per request, when the bank does not fix them (the L4 harness's MYNAH_L4_VOICES)."
+              "description": "Voices drawn per request, when the bank does not fix them (the L4 harness's MYNAH_GPU_VOICES)."
             },
             "mode": { "enum": ["closed", "poisson"] },
             "seconds": {

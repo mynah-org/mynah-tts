@@ -1,17 +1,18 @@
 #!/bin/bash
+. "$(dirname "$0")/compat.sh"
 # Prepare a fresh GPU box for Pocket CUDA serving measurements.
 # usage: provision.sh [CUDA_ARCH]      (run from the checkout, e.g. /root/mynah-head)
 #
 # - builds the CUDA server and CLI (CUDA_ARCH defaults to native, e.g. sm_89 for L4)
 # - installs the Python tooling the harness needs (huggingface_hub, numpy,
-#   safetensors, faster-whisper, jiwer) into $MYNAH_L4_PY's environment
+#   safetensors, faster-whisper, jiwer) into $MYNAH_GPU_PY's environment
 # - downloads kyutai/pocket-tts with the read token from $HF_TOKEN or
 #   /root/.hf_token (never from the repo) and converts the English 24L and 6L
 #   packs to models/pocket-english-24l and models/pocket-english-6l
 # Honours HF_HOME (vast.ai images point it at /workspace/.hf_home).
 set -u
 arch="${1:-${CUDA_ARCH:-native}}"
-py="${MYNAH_L4_PY:-/venv/main/bin/python}"; [ -x "$py" ] || py=python3
+py="${MYNAH_GPU_PY:-/venv/main/bin/python}"; [ -x "$py" ] || py=python3
 root="$(pwd)"
 [ -f Makefile ] && [ -d src ] || { echo "run from the mynah-tts checkout" >&2; exit 2; }
 

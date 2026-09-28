@@ -61,7 +61,7 @@ GPU is still at 70-92%.
 
 **Primary production-readiness gate: the 30-minute continuous closed-loop
 soak** (mixed short/medium/long, concurrency saturated, no idle gaps:
-`tools/l4/soak.sh <tag> <C> 1800` with the matching `MYNAH_L4_BATCH`). Every
+`tools/gpu/soak.sh <tag> <C> 1800` with the matching `MYNAH_GPU_BATCH`). Every
 new top concurrency (C96/C112/...) is qualified with it first; Poisson is
 only an extra workload characterisation, never a substitute.
 
@@ -76,14 +76,14 @@ A top concurrency is production-qualified only by this sequence, on one
 recorded build:
 
 1. **Two independent 30-min saturated closed-loop soaks** at that C, each on
-   a freshly started server (`tools/l4/soak.sh <tag> <C> 1800`), different
+   a freshly started server (`tools/gpu/soak.sh <tag> <C> 1800`), different
    tags and ladder seeds, run one after the other.
 2. **v2 corpus**: `tools/corpus/pocket_v2_en.jsonl`, 300 distinct original
    English utterances (short / conversational / medium / long paragraphs;
    lists, parentheses, quotes, dashes, ellipses, numbers as words, names,
    dialogue; American spelling so the ASR does not score spelling), drawn
    with weights .25/.35/.28/.12 and four voices, deterministic by seed.
-3. **Captured audio**: `MYNAH_L4_SAVE_AUDIO` makes the ladder keep the PCM
+3. **Captured audio**: `MYNAH_GPU_SAVE_AUDIO` makes the ladder keep the PCM
    exactly as the server streamed it under load (every Nth request id), as
    WAV, never re-synthesised. The per-request JSONL names corpus id, text,
    voice, seed, WAV and sample count for each.
@@ -94,7 +94,7 @@ recorded build:
    clipping > 0.1%, empty/silent streams and an abrupt end (last 50 ms loud).
 5. **Human listening**: `audio-<tag>.zip` holds the same WAVs plus a
    manifest (text, voice, WER, flags) for spot listening, flagged rows first.
-6. **Bundle**: `tools/l4/bundle.sh <name> <tagA> <tagB>` collects git HEAD
+6. **Bundle**: `tools/gpu/bundle.sh <name> <tagA> <tagB>` collects git HEAD
    plus sha256 of the binaries and sources (the box tree may be rsynced), the
    server profile and its `MYNAH_*` env, the model pack's `source.json` and
    `model.json`, the corpus, each soak's summary / per-request JSONL /
@@ -106,7 +106,7 @@ recorded build:
 Pass: both soaks meet the gates above with zero failures and zero 250 ms
 stalls, no drift between halves, WER in line with the quiet-server gate and
 no unexplained flagged audio. At C128 (~130 audio-s/s) one soak streams
-~234,000 audio-s, 10.5 GiB of PCM16; `MYNAH_L4_SAVE_EVERY=10` keeps ~3,000
+~234,000 audio-s, 10.5 GiB of PCM16; `MYNAH_GPU_SAVE_EVERY=10` keeps ~3,000
 WAVs (~1 GiB, ~6.5 h of audio) per soak, enough for every corpus line
 several times in every voice.
 
@@ -121,8 +121,8 @@ g6.xlarge. Packs re-converted from `english_2026-04_24l` / `english_2026-04`.
 | ~~4 cores, -w 4~~ (NOT pinned, see below) | 53.1 | 76.7 | 88.7 | 97.7 | 0.492 | 94 ms | 117% | 93% |
 
 **Correction (same day):** `ab.sh` started `serve.sh` inside `tmux new-session`,
-which does not inherit the caller's environment, so `MYNAH_L4_CPUS` and
-`MYNAH_L4_WORKERS` were ignored: the "4 cores" rows ran on all 128 threads with
+which does not inherit the caller's environment, so `MYNAH_GPU_CPUS` and
+`MYNAH_GPU_WORKERS` were ignored: the "4 cores" rows ran on all 128 threads with
 `-w 8` (checked with `taskset -cp`). The second row is therefore a repeat of
 the first, and the claim that 4 vCPUs cost only 2.5% is withdrawn. The A/B rows
 of the board stay valid as relative comparisons (every run had the same

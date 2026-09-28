@@ -38,7 +38,7 @@
     "blas": "n/a (CUDA build)",
     "simd": "n/a (CUDA build)",
     "requirements": {
-      "cuda_arch": "sm_89 explicitly: CUDA_ARCH=native is for local bring-up, never a portable artifact (tools/l4/provision.sh defaults to native).",
+      "cuda_arch": "sm_89 explicitly: CUDA_ARCH=native is for local bring-up, never a portable artifact (tools/gpu/provision.sh defaults to native).",
       "binary": "build/cuda/mynah-tts-server"
     }
   },
@@ -47,7 +47,7 @@
     "http_workers": 8,
     "max_batch": 256,
     "max_inflight": 256,
-    "why": "One process, --max-batch = --max-inflight = C (the CUDA batch cap is 384 since d716334). Knee ladder RTF p95 0.40/0.50/0.60/0.70/0.79-0.85/0.90/0.99/1.09 at C128/160/192/224/256/288/320/352: C256 is the last level with the margin the 24L keeps at C160. 8 HTTP workers is the harness default (tools/l4/serve.sh). VRAM 8.0-8.5 GB flat over 30 minutes."
+    "why": "One process, --max-batch = --max-inflight = C (the CUDA batch cap is 384 since d716334). Knee ladder RTF p95 0.40/0.50/0.60/0.70/0.79-0.85/0.90/0.99/1.09 at C128/160/192/224/256/288/320/352: C256 is the last level with the margin the 24L keeps at C160. 8 HTTP workers is the harness default (tools/gpu/serve.sh). VRAM 8.0-8.5 GB flat over 30 minutes."
   },
   "runtime": {
     "matches_shipped_default": false,
@@ -62,7 +62,7 @@
     "environment": {
       "MYNAH_THREADS": {
         "value": "1",
-        "why": "Required: NOT the default (the pool otherwise sizes itself to every allowed CPU, 128 on this host). On CUDA the hot stages are resident on the device and the host pool has nothing hot to run; every point below was measured with 1 (tools/l4/serve.sh)."
+        "why": "Required: NOT the default (the pool otherwise sizes itself to every allowed CPU, 128 on this host). On CUDA the hot stages are resident on the device and the host pool has nothing hot to run; every point below was measured with 1 (tools/gpu/serve.sh)."
       },
       "MYNAH_CUDA_KV_DTYPE": {
         "value": "bf16",
@@ -74,7 +74,7 @@
       },
       "MYNAH_SERVE_PROFILE": {
         "value": "1",
-        "why": "Instrumentation only: the scheduler's occupancy/step counters, printed at shutdown (src/inference.c). Exported by tools/l4/serve.sh for every point below, so it is part of what was measured; it does not change the audio."
+        "why": "Instrumentation only: the scheduler's occupancy/step counters, printed at shutdown (src/inference.c). Exported by tools/gpu/serve.sh for every point below, so it is part of what was measured; it does not change the audio."
       },
       "MYNAH_CUDA_ALLOW_CPU_STAGES": {
         "value": null,
@@ -179,7 +179,7 @@
   "qualification": {
     "status": "qualified",
     "model": "models/pocket-english-6l (kyutai/pocket-tts english_2026-04, revision 75cfe24e3142233bb81887fed3482e9652bb4a6e, converted by tools/convert_pocket.py with the default --dtype bf16)",
-    "workload": "v2 corpus, four voices drawn per request, streaming route, closed loop saturated at C, load generator (tools/pocket_ladder.py) on the same host, 30 s warm-up, ten 180 s windows. Qualified by tools/l4/qualify.sh: two independent 30-minute soaks on freshly started servers with different seeds, audio captured from the live streams and transcribed. Every 10th request captured and every 4th capture transcribed (2,245 and 2,249 utterances) with faster-whisper small.en (CPU int8).",
+    "workload": "v2 corpus, four voices drawn per request, streaming route, closed loop saturated at C, load generator (tools/pocket_ladder.py) on the same host, 30 s warm-up, ten 180 s windows. Qualified by tools/gpu/qualify.sh: two independent 30-minute soaks on freshly started servers with different seeds, audio captured from the live streams and transcribed. Every 10th request captured and every 4th capture transcribed (2,245 and 2,249 utterances) with faster-whisper small.en (CPU int8).",
     "operating_point": {
       "date": "2026-09-28",
       "commit": "d716334",

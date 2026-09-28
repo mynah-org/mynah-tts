@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/compat.sh"
 # Screen a concurrency ladder and pick the qualification level.
 # usage: knee.sh <tag> <model-dir> <levels> [rtf-gate] [seconds-per-level]
 # Runs ab.sh with max-batch = the highest level, then prints the highest level
@@ -7,9 +8,9 @@
 # Last line: "KNEE C<n>" (C0 when nothing passed).
 set -u
 tag=$1; model=$2; lvls=$3; gate="${4:-0.88}"; secs="${5:-25}"
-root="${MYNAH_L4_ROOT:-/root/mynah-head}"; ev="${MYNAH_L4_EVIDENCE:-/root/evidence}"
+root="${MYNAH_GPU_ROOT:-/root/mynah-head}"; ev="${MYNAH_GPU_EVIDENCE:-/root/evidence}"
 top=$(echo "$lvls" | tr ',' '\n' | sort -n | tail -1)
-MYNAH_L4_BATCH="${MYNAH_L4_BATCH:-$top}" "$root/tools/l4/ab.sh" "$tag" "$model" "$lvls" 5 "$secs"
+MYNAH_GPU_BATCH="${MYNAH_GPU_BATCH:-$top}" "$root/tools/gpu/ab.sh" "$tag" "$model" "$lvls" 5 "$secs"
 python3 - "$ev/$tag/$tag-summary.jsonl" "$gate" <<'PY'
 import json, sys
 best = 0

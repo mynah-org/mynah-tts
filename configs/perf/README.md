@@ -92,7 +92,7 @@ configs/perf/l4-24g-pocket-en-6l-cuda.json   one NVIDIA L4 (sm_89), Pocket 6L:  
 ```
 
 ```bash
-tools/l4/provision.sh sm_89       # on the box: builds `make cuda-server cuda`, converts both packs
+tools/gpu/provision.sh sm_89       # on the box: builds `make cuda-server cuda`, converts both packs
 tools/perf_profile.py command l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l --port 8080
 tools/perf_profile.py command l4-24g-pocket-en-6l-cuda  --model models/pocket-english-6l  --port 8080
 tools/perf_profile.py soak    l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l
@@ -101,9 +101,9 @@ tools/perf_profile.py soak    l4-24g-pocket-en-24l-cuda --model models/pocket-en
 `command` prints the exported variables and `build/cuda/mynah-tts-server --device cuda -w
 ... --max-batch ... --max-inflight ...`. `soak` does not start the CPU harness for a cuda
 profile (and `tools/serving_profile.py --profile` refuses one): it prints the
-`tools/l4/qualify.sh` run — two 30-minute soaks on fresh servers, audio captured from
-the live streams, WER, evidence bundle — under `tools/l4/detach.sh`, plus the single
-`tools/l4/soak.sh` screen. The harness starts the server through `tools/l4/serve.sh`,
+`tools/gpu/qualify.sh` run — two 30-minute soaks on fresh servers, audio captured from
+the live streams, WER, evidence bundle — under `tools/gpu/detach.sh`, plus the single
+`tools/gpu/soak.sh` screen. The harness starts the server through `tools/gpu/serve.sh`,
 and `tests/test_perf_profile.py` checks that its exports are exactly the profile's.
 
 Neither L4 profile is the shipped default: `MYNAH_CUDA_KV_DTYPE=bf16` and

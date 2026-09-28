@@ -60,7 +60,7 @@ python3 tools/convert_pocket.py --language english_2026-04     --output models/p
 The converter stores the weights in bfloat16 (as Kyutai's own
 `switch_to_bf16.py` does); `--dtype source` keeps Kyutai's F32 checkpoint. They
 measured equal in quality and speed, because the CUDA path expands weights to
-F32 in GPU memory either way. On a fresh box `tools/l4/provision.sh sm_89` does
+F32 in GPU memory either way. On a fresh box `tools/gpu/provision.sh sm_89` does
 build, tooling, download, conversion and a self-check in one step.
 
 Check the GPU path before serving:
@@ -145,7 +145,7 @@ with zero stalls; beyond ~1.0 streams fall behind playback.
 
 - Large model: ~75 MB of GPU memory per stream plus ~1.8 GB fixed.
 - Small model: ~30 MB per stream plus ~1 GB fixed.
-- A different GPU needs its own screen: `tools/l4/knee.sh <tag> <model> 128,160,192,224,256`
+- A different GPU needs its own screen: `tools/gpu/knee.sh <tag> <model> 128,160,192,224,256`
   prints the top level under the gate (section 10).
 
 For 1,000 concurrent listeners on L4s: 4 GPUs for the small model, 7 for the
@@ -244,9 +244,9 @@ finish without an ssh session:
 
 ```bash
 echo "hf_..." > /root/.hf_token && chmod 600 /root/.hf_token
-tools/l4/detach.sh prov tools/l4/provision.sh sm_89
-tools/l4/detach.sh knee bash -c 'tools/l4/wait_done.sh prov; tools/l4/knee.sh knee24 models/pocket-english-24l 128,144,160,176,192'
-tools/l4/detach.sh qual bash -c 'tools/l4/wait_done.sh knee; MYNAH_Q_CONTROL=1 tools/l4/qualify.sh pocket-24l-c160 models/pocket-english-24l 160'
+tools/gpu/detach.sh prov tools/gpu/provision.sh sm_89
+tools/gpu/detach.sh knee bash -c 'tools/gpu/wait_done.sh prov; tools/gpu/knee.sh knee24 models/pocket-english-24l 128,144,160,176,192'
+tools/gpu/detach.sh qual bash -c 'tools/gpu/wait_done.sh knee; MYNAH_Q_CONTROL=1 tools/gpu/qualify.sh pocket-24l-c160 models/pocket-english-24l 160'
 ```
 
 `qualify.sh` runs two independent 30-minute saturated soaks on the v2 corpus

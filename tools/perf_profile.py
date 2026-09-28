@@ -11,7 +11,7 @@ into an exact argv, an exact environment and an exact set of gates.
     tools/perf_profile.py server-env  recommended
     tools/perf_profile.py forbidden-env recommended
     tools/perf_profile.py soak        recommended --model models/pocket-en   # the soak command
-                                     # (a cuda profile prints the tools/l4/qualify.sh run)
+                                     # (a cuda profile prints the tools/gpu/qualify.sh run)
     tools/perf_profile.py best        recommended
     tools/perf_profile.py new  my-box --like axion-c4a-32c-pocket-en
 
@@ -364,7 +364,7 @@ L4_SERVE = os.path.join(ROOT, "tools", "l4", "serve.sh")
 
 
 def l4_serve_env(path=L4_SERVE):
-    """The MYNAH_* variables tools/l4/serve.sh exports, or None when it is not there.
+    """The MYNAH_* variables tools/gpu/serve.sh exports, or None when it is not there.
 
     The GPU harness starts the server through that script, so its export line IS the
     environment of every qualifying run on those boxes; a profile that disagrees with it
@@ -384,33 +384,33 @@ def l4_serve_env(path=L4_SERVE):
 
 
 def soak_cuda(prof, model, c):
-    """The GPU boxes qualify with tools/l4/qualify.sh (two soaks, captured audio, WER,
+    """The GPU boxes qualify with tools/gpu/qualify.sh (two soaks, captured audio, WER,
     bundle), not with serving_profile.py: print that run instead of starting the CPU
     harness against a CUDA server."""
     pid, srv, s = prof["profile"]["id"], prof["server"], prof["gates"]["soak"]
     serve = l4_serve_env()
     if serve is not None and serve != environ(prof):
-        print("WARNING: tools/l4/serve.sh exports %s but the profile pins %s; the run "
+        print("WARNING: tools/gpu/serve.sh exports %s but the profile pins %s; the run "
               "would not measure this profile"
               % (" ".join("%s=%s" % kv for kv in sorted(serve.items())) or "nothing",
                  env_line(prof) or "nothing"), file=sys.stderr)
     if c != srv["max_batch"]:
         print("NOTE: qualify.sh sets --max-batch to the level (C%d), not to the profile's "
               "max_batch %d" % (c, srv["max_batch"]), file=sys.stderr)
-    knobs = [("MYNAH_L4_WORKERS", str(srv["http_workers"]))]
+    knobs = [("MYNAH_GPU_WORKERS", str(srv["http_workers"]))]
     if srv["max_inflight"] != c:        # ab.sh defaults --max-inflight to the batch
-        knobs.append(("MYNAH_L4_INFLIGHT", str(max(srv["max_inflight"], c))))
-    knobs.append(("MYNAH_L4_CORPUS", s["bank"]))
+        knobs.append(("MYNAH_GPU_INFLIGHT", str(max(srv["max_inflight"], c))))
+    knobs.append(("MYNAH_GPU_CORPUS", s["bank"]))
     if s.get("voices"):
-        knobs.append(("MYNAH_L4_VOICES", ",".join(s["voices"])))
+        knobs.append(("MYNAH_GPU_VOICES", ",".join(s["voices"])))
     one = " ".join("%s=%s" % (k, shlex.quote(v)) for k, v in knobs)
     print("# qualification (two %ds soaks, WER on the captures, evidence bundle); run on "
           "the GPU box from the checkout, detached so it survives the ssh session:"
           % s["seconds"])
-    print("tools/l4/detach.sh %s-q env MYNAH_Q_SECONDS=%d %s tools/l4/qualify.sh %s %s %d"
+    print("tools/gpu/detach.sh %s-q env MYNAH_Q_SECONDS=%d %s tools/gpu/qualify.sh %s %s %d"
           % (pid, s["seconds"], one, pid, shlex.quote(model), c))
     print("# one soak only (a screen, not a qualification):")
-    print("MYNAH_L4_MODEL=%s MYNAH_L4_BATCH=%d %s tools/l4/soak.sh %s %d %d"
+    print("MYNAH_GPU_MODEL=%s MYNAH_GPU_BATCH=%d %s tools/gpu/soak.sh %s %d %d"
           % (shlex.quote(model), c, one, pid, c, s["seconds"]))
     return 0
 

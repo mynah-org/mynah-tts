@@ -1,8 +1,9 @@
 #!/bin/bash
+. "$(dirname "$0")/compat.sh"
 # Collect a qualification evidence bundle from one or more soaks.
 # usage: bundle.sh <bundle-name> <soak-tag> [<soak-tag>...]
 #
-# Output: $MYNAH_L4_EVIDENCE/bundles/<bundle-name>/ (default /root/evidence) with
+# Output: $MYNAH_GPU_EVIDENCE/bundles/<bundle-name>/ (default /root/evidence) with
 #   provenance.txt      git HEAD of the checkout, bundle tree hashes, host, GPU
 #   binaries.sha256     the built binaries (the checkout may be rsynced sources,
 #   sources.sha256      so the hashes are what pins the build, not only git)
@@ -12,7 +13,7 @@
 #   <tag>/              summary JSONL, per-request JSONL, per-window report,
 #                       server log, MYNAH_* env of the server, ladder output,
 #                       VRAM log, quality/ (CSV + summary), audio-<tag>.zip
-#                       (a listening selection capped at MYNAH_L4_LISTEN_MB,
+#                       (a listening selection capped at MYNAH_GPU_LISTEN_MB,
 #                       default 100 MB per soak; all captures stay on the box)
 #   REPORT.md           headline numbers parsed from the above, plus the
 #                       sections a human still has to fill in
@@ -21,8 +22,8 @@
 set -u
 [ $# -ge 2 ] || { echo "usage: $0 <bundle-name> <soak-tag> [<soak-tag>...]" >&2; exit 2; }
 name=$1; shift
-root="${MYNAH_L4_ROOT:-/root/mynah-head}"; ev="${MYNAH_L4_EVIDENCE:-/root/evidence}"
-model="${MYNAH_L4_MODEL:-models/pocket-english-24l}"
+root="${MYNAH_GPU_ROOT:-/root/mynah-head}"; ev="${MYNAH_GPU_EVIDENCE:-/root/evidence}"
+model="${MYNAH_GPU_MODEL:-models/pocket-english-24l}"
 case "$model" in /*) mdir="$model" ;; *) mdir="$root/$model" ;; esac
 B="$ev/bundles/$name"
 mkdir -p "$B/profile" "$B/model" "$B/corpus"
@@ -35,7 +36,7 @@ mkdir -p "$B/profile" "$B/model" "$B/corpus"
 ) > "$B/binaries.sha256"
 (
   cd "$root" || exit 1
-  find src server cli gpu tools/l4 Makefile tools/pocket_ladder.py \
+  find src server cli gpu tools/gpu Makefile tools/pocket_ladder.py \
        tools/pocket_quality.py tools/pocket_soak_report.py -type f \
        \( -name '*.c' -o -name '*.h' -o -name '*.cu' -o -name '*.cuh' \
           -o -name '*.m' -o -name '*.metal' -o -name '*.sh' -o -name '*.py' \
@@ -72,7 +73,7 @@ mkdir -p "$B/profile" "$B/model" "$B/corpus"
   (cc --version 2>/dev/null | head -1) || true
 } > "$B/provenance.txt" 2>&1
 
-cp "$root/tools/l4/serve.sh" "$root/tools/l4/ab.sh" "$root/tools/l4/soak.sh" "$B/profile/" 2>/dev/null
+cp "$root/tools/gpu/serve.sh" "$root/tools/gpu/ab.sh" "$root/tools/gpu/soak.sh" "$B/profile/" 2>/dev/null
 for f in source.json model.json; do
   cp "$mdir/$f" "$B/model/" 2>/dev/null || echo "missing $mdir/$f" >> "$B/model/MISSING.txt"
 done
@@ -176,13 +177,13 @@ for tag in tags:
     for j in sorted(glob.glob(os.path.join(T, "%s-c*.jsonl" % tag))):
         recs += [r for r in load_jsonl(j) if r.get("wav")]
     if recs:
-        # The listening ZIP is capped (MYNAH_L4_LISTEN_MB per soak, default 100,
+        # The listening ZIP is capped (MYNAH_GPU_LISTEN_MB per soak, default 100,
         # so two soaks stay near 200 MB for chat attachments): every flagged or
         # high-WER utterance first (up to a quarter of the budget), then a
         # round-robin over kind x voice x soak third (start/middle/end), so a
         # slow degradation is audible too.  All captured WAVs stay on the box;
         # manifest-all.csv lists every one of them with its ASR verdict.
-        budget = float(os.environ.get("MYNAH_L4_LISTEN_MB", "100")) * 1048576.0
+        budget = float(os.environ.get("MYNAH_GPU_LISTEN_MB", "100")) * 1048576.0
         rows, missing = [], 0
         recs.sort(key=lambda r: (r.get("t_send") or 0.0, r.get("id") or 0))
         for k, r in enumerate(recs):

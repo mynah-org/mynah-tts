@@ -199,13 +199,13 @@ def main():
 
     rc, out, err = capture(["soak", cuda_id, "--model", "models/pocket-english-24l"])
     check("cuda soak prints the L4 qualification, not the CPU harness",
-          rc == 0 and "tools/l4/qualify.sh %s models/pocket-english-24l 160" % cuda_id in out
-          and "tools/l4/soak.sh" in out and "serving_profile.py" not in out)
+          rc == 0 and "tools/gpu/qualify.sh %s models/pocket-english-24l 160" % cuda_id in out
+          and "tools/gpu/soak.sh" in out and "serving_profile.py" not in out)
     check("cuda soak carries the bank, voices and soak length",
-          "MYNAH_L4_CORPUS=tools/corpus/pocket_v2_en.jsonl" in out
-          and "MYNAH_L4_VOICES=alba,marius,javert,jean" in out
+          "MYNAH_GPU_CORPUS=tools/corpus/pocket_v2_en.jsonl" in out
+          and "MYNAH_GPU_VOICES=alba,marius,javert,jean" in out
           and "MYNAH_Q_SECONDS=1800" in out)
-    check("the committed L4 profiles export exactly what tools/l4/serve.sh exports",
+    check("the committed L4 profiles export exactly what tools/gpu/serve.sh exports",
           PP.l4_serve_env() is None or all(
               PP.l4_serve_env() == PP.environ(PP.load(n)[0])
               for n in (cuda_id, "l4-24g-pocket-en-6l-cuda")))
