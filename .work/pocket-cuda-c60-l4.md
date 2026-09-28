@@ -248,3 +248,16 @@ flat, server RSS 3.2 GiB, GPU util 70%, scheduler thread ~111% CPU. Gates:
 throughput, RTF, TTFA, failures, VRAM and the 500 ms buffer pass; the 250 ms
 buffer saw one hiccup in window 3 (0.04% of requests). Open-loop (Poisson)
 soak follows.
+
+### 15-minute Poisson (open-loop) soak, same build, 2026-09-28
+
+Arrivals at 10.5 requests/s (exponential inter-arrival, seeded), at most 64
+open requests (6 arrivals in 15 minutes found all 64 open and were counted
+as client-side rejections), 30 s warm-up discarded, 900 s measured, ten
+90 s windows. 9,410 requests, 9,410 ok, 0 failed, 0 server failures, 0
+timeouts. Whole soak: 89.2 audio-s/s, stream RTF p95 0.404 (windows
+0.33-0.46), TTFA p95 72 ms (windows 62-77 ms), gap p95 65-81 ms, stalls
+@250 0 and @500 0 in every window, RTF p95 drift +1.3%, GPU util 97%, VRAM
+peak 6.3 GiB (fewer rows resident at once than closed loop), scheduler
+~105% CPU. Every C60 gate passes at this arrival rate, including the 250 ms
+buffer.
