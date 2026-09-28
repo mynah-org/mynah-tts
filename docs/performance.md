@@ -957,3 +957,31 @@ the 128-place wall of 16 x 8. Segmentation costs ~0.1-0.3 WER points on long
 texts (ASR gate), nothing on single-chunk texts. Detail, including the failed
 experiments: `.work/pocket-tts-24l-cpu-serving-axion.md`; profiles
 `configs/perf/axion-c4a-32c-pocket-en.json` and `-24l.json`.
+
+## 2026-09-28 · PocketTTS 24L on CUDA — one NVIDIA L4, C160 qualified
+
+Build f873125 (sources hashed in the bundle), `mynah-tts-server --device cuda`,
+max-batch/inflight 160, BF16 backbone KV grown on demand, resident f32 weights
+with TF32, every CUDA default of `.work/pocket-cuda-g6-host-cpu.md`. Pack
+`english_2026-04_24l` converted to BF16 (Kyutai's own `switch_to_bf16.py`
+choice; the F32 checkpoint measured equal). Host: vast.ai, EPYC 7702, load
+generator on the same host. Corpus v2 (`tools/corpus/pocket_v2_en.jsonl`, 300
+distinct English utterances, four voices), closed loop, saturated.
+
+| 30-minute soak | requests | failed | audio-s/s | RTF p95 | TTFA p95 | stalls 250/500 ms | drift | VRAM | RSS |
+|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| A, seed 1234 | 43,316 | 0 | 184.5 | 0.857 | 154 ms | 0 / 0 | +0.1% | 13.8-14.7 GB flat | 4.73-4.75 GB |
+| B, seed 5678 | 43,638 | 0 | 184.5 | 0.855 | 155 ms | 0 / 0 | -0.1% | 13.6-14.4 GB flat | 4.74-4.75 GB |
+
+Knee (25 s screens): RTF p95 0.71 / 0.78 / 0.86 / 0.93 / 0.99 at C128 / 144 /
+160 / 176 / 192 with throughput flat at ~138 audio-s/s (GPU saturated); C160
+is the top level under the 0.90 gate. Earlier single soaks: C96 176.8 audio-s/s
+(RTF p95 0.541), C128 186.7 (0.679), both clean.
+
+Audio captured from the live streams (every 10th request) and transcribed with
+faster-whisper small.en (CPU int8): WER 2.02% (A) and 1.94% (B). An unloaded
+control on the same request ids (C8) gives 1.87% with the same per-voice
+profile (alba ~0.4%, marius ~4.7%) and 8 of its 10 >30%-WER utterances shared
+with the loaded run: the load does not degrade the audio; the spread is the
+model/voice pair. Gate WER per voice and per length class, always against an
+unloaded control. Evidence bundle on the L4: `/root/evidence/bundles/pocket-24l-c160-final`.

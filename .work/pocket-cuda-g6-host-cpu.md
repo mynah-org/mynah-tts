@@ -231,10 +231,22 @@ What it means for any future quality gate:
 - **Always pair a loaded run with an unloaded control on the same requests**
   (same text, voice and seed ids, e.g. C8): only the difference between the two
   attributes errors to load. The C8 control for this soak is queued
-  (`/root/evidence/ctrlA`); this section is completed with it.
+  (`/root/evidence/ctrlA`); see the outcome below.
 - Pocket 24L produces long internal pauses (> 1.5 s) on ~12% of utterances in
   this corpus; the silence flags are therefore a comparison metric (loaded vs
   control), not a pass/fail threshold on their own.
+
+**Outcome (same day): the load does not degrade the audio.** Soak B repeats
+soak A (WER 1.94%, alba 0.42% / javert 0.58% / jean 2.10% / marius 4.88%,
+short 7.00%). The unloaded control (C8, same request ids, text, voice and seed
+as soak A, 268 captured WAVs) gives WER 1.87%, alba 0.44% / javert 0.77% /
+jean 2.67% / marius 4.66%, short 8.68%, 3.7% of utterances above 30%, 20%
+flagged, the same profile as under load. On the 268 identical requests:
+9 are above 30% WER loaded and 10 unloaded, 8 of them the same utterances
+(e.g. "Good night, sleep well." with alba, short sentences with marius); mean
+per-utterance WER 3.6% loaded vs 4.0% unloaded. The voice spread and the long
+pauses belong to the model/voice pair (or the recogniser on those timbres),
+not to the serving path.
 
 ## Board
 
