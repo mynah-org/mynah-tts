@@ -248,6 +248,10 @@ per-utterance WER 3.6% loaded vs 4.0% unloaded. The voice spread and the long
 pauses belong to the model/voice pair (or the recogniser on those timbres),
 not to the serving path.
 
+The exact orchestration scripts that ran on the L4 are archived in
+`.work/l4-scripts-2026-09-28/`; the logs and per-request records travel with the
+report (`l4-evidence-logs/` next to the PDF).
+
 ## Board
 
 | candidate | baseline | candidate | delta | decision |
