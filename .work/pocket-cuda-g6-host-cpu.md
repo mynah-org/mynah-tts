@@ -59,6 +59,12 @@ GPU is still at 70-92%.
 
 ## Acceptance gates
 
+**Primary production-readiness gate: the 30-minute continuous closed-loop
+soak** (mixed short/medium/long, concurrency saturated, no idle gaps:
+`tools/l4/soak.sh <tag> <C> 1800` with the matching `MYNAH_L4_BATCH`). Every
+new top concurrency (C96/C112/...) is qualified with it first; Poisson is
+only an extra workload characterisation, never a substitute.
+
 Same as `.work/pocket-cuda-c60-l4.md` at C60, measured with the server
 confined to 4 cores, plus: scheduler thread < 70% of one core at C60, zero
 stalls at 250 ms over a 30-minute soak, and CPU `make test` green after every
@@ -153,6 +159,10 @@ Ranked by expected gain at C64; each item gets a switch and a board row.
 | tile workspace grow-only (was 6 cudaFree + 6 cudaMalloc at every prefill <-> Mimi dim flip) | C32 102.0, C48 110.3, C64 122.0 | 106.8, 118.9, **129.6** (TTFA p95 78 ms) | +5-8% | KEEP; Nsight 12 s at C64: cudaMalloc 2781 -> 5, cudaFree 2781 -> 5 |
 | prefill tile through cuBLAS TF32 (`MYNAH_CUDA_PREFILL_FIXED=0`, diagnostic) | fixed-order SIMT: C64 127.6, C96 130.4 | C64 134.3, C96 **141.2** (RTF p95 0.52, TTFA p95 93 ms) | +5-8% | the prefill split-K SIMT GEMM was 19.5% of GPU time; WER 3.67%. Loses piecewise-prefill bit identity, so not a default yet |
 | WMMA TF32 fixed-order tile GEMM, no split-K (`MYNAH_CUDA_TILE_TC`) | SIMT C64 127.6 | 95.4 | -25% | REVERT (default off): ~48 blocks for a few-row prefill; self-check PASS, WER 3.49%. Retry with split-K |
+
+| WMMA TF32 fixed-order with split-K (`MYNAH_CUDA_TILE_TC=1`) | SIMT C64 127.3, C96 130.4 | 128.4, 133.4 | +1-2% | opt-in only: invariant (self-check PASS, WER 3.14%) but far from cuBLAS; needs a pipelined kernel (cp.async double buffer, 128-wide tiles) to be worth it |
+| cuBLAS prefill vs fixed order, re-run | fixed C64 127.3, C96 130.4 | C64 133.0, C96 141.8 | +4-9% | opt-in only: the long-form self-check fails (text pushed in pieces vs whole: sample 12003/23040 -0.2719 vs -0.2706). Determinism vs throughput is a product decision |
+| pack converted with `--dtype source` (Kyutai F32, 1.30 GB) vs default BF16 pack (672 MB) | BF16 pack: WER 3.32%, C64 94.4 (TC binary) | F32 pack: WER 3.41%, C64 95.1 | = | keep the BF16 pack (Kyutai's own `switch_to_bf16.py` choice); CUDA expands weights to F32 either way |
 
 Rows above the slot pool ran unpinned with `-w 8` (see the correction above);
 all are C32-C64 x 20 s, 24L, BF16 KV unless stated.
