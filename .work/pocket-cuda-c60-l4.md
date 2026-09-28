@@ -203,3 +203,61 @@ Open before any production claim: the 30-minute Poisson soak; the BF16 KV
 quality gate; the 24L/6L self-check solo-vs-gang tolerance (1e-4) now fails
 at ~2.5e-4 with TF32 in SEANet; merge and re-measure the two agent branches
 (`pocket-cuda-codec-gang` d18ebbc, `MYNAH_CUDA_QUANT` + BF16 weights 80c9880).
+
+### Quality gate: BF16 KV and TF32 vs the CPU f32 oracle (2026-09-27)
+
+120 utterances per mode (20 sentences x 3 voices x 2 seeds), 24L, ASR =
+faster-whisper small.en (CPU), WER with jiwer after normalisation, speaker
+similarity = resemblyzer cosine. Raw WAVs, CSVs and transcripts on the L4
+under `/root/evidence/quality/`.
+
+| mode | WER | SNR vs CPU (mean) | log-spec dist | speaker cos mean / min | utt. WER > 30% |
+|---|---:|---:|---:|---:|---|
+| A CPU f32 | 3.04% | - | - | - | one (a digit-reading artefact common to all modes) |
+| B CUDA invariant kernels | 3.10% | 63.2 dB | 0.041 | 0.9998 / 0.988 | same one |
+| C CUDA defaults (TF32, cuBLAS tile), f32 KV | 3.04% | 53.7 dB | 0.107 | 0.9997 / 0.988 | same one |
+| D CUDA defaults + BF16 KV (serving config) | 2.51% | 16.5 dB | 0.293 | 0.9958 / 0.951 | none |
+| seed-to-seed baseline (A, seed 1 vs 2) | - | -2.6 dB | 1.82 | 0.940 | - |
+
+TF32 changes rounding but not one sampled trajectory (120/120 same WER as
+CPU). BF16 KV makes the sampler diverge on many utterances (only 46/120 stay
+above 20 dB SNR, 13/120 change duration), yet the diverged renderings are
+different valid samples: WER equal or better and speaker cosine >= 0.965 on
+every one of them, far above the seed-to-seed baseline. Verdict: the serving
+config passes the gate (WER within 1 point, no outliers); do not expect it to
+be sample-identical to the CPU oracle. No listening test yet, English only.
+
+### 30-minute C64 soak, 24L, all CUDA defaults + codec gang (6d5d95e), 2026-09-27
+
+Closed loop, 64 clients, 30 s warm-up discarded, 1800 s measured, host idle
+(load 1.2), GPU serialised. 19,434 requests, 19,434 ok, 0 failed, 0 server
+failures, 0 HTTP rejections, 0 timeouts.
+
+| window (3 min) | audio-s/s | RTF p50 / p95 | TTFA p95 | gap p95 | stalls @250 / @500 |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 99.4 | 0.63 / 0.66 | 129 ms | 134 ms | 0 / 0 |
+| 1-2 | 92.7-93.0 | 0.67 / 0.72 | 136-137 ms | 153-157 ms | 1 / 0 |
+| 3 | 91.4 | 0.69 / 0.73 | 138 ms | 192 ms | 18 / 0 |
+| 4-8 | 90.7-92.7 | 0.68-0.69 / 0.72-0.73 | 136-140 ms | 146-189 ms | 0 / 0 |
+| 9 | 87.6 (tail) | 0.68 / 0.73 | 138 ms | 178 ms | 0 / 0 |
+
+Whole soak: 92.2 audio-s/s, stream RTF p95 0.723, TTFA p95 137 ms, stalls
+@500 0, stalls @250 19 (in 8 of 19,434 requests, max gap 240-249 ms), RTF
+p95 drift first half 0.709 -> second half 0.727 (+2.5%), VRAM peak 12.7 GiB
+flat, server RSS 3.2 GiB, GPU util 70%, scheduler thread ~111% CPU. Gates:
+throughput, RTF, TTFA, failures, VRAM and the 500 ms buffer pass; the 250 ms
+buffer saw one hiccup in window 3 (0.04% of requests). Open-loop (Poisson)
+soak follows.
+
+### 15-minute Poisson (open-loop) soak, same build, 2026-09-28
+
+Arrivals at 10.5 requests/s (exponential inter-arrival, seeded), at most 64
+open requests (6 arrivals in 15 minutes found all 64 open and were counted
+as client-side rejections), 30 s warm-up discarded, 900 s measured, ten
+90 s windows. 9,410 requests, 9,410 ok, 0 failed, 0 server failures, 0
+timeouts. Whole soak: 89.2 audio-s/s, stream RTF p95 0.404 (windows
+0.33-0.46), TTFA p95 72 ms (windows 62-77 ms), gap p95 65-81 ms, stalls
+@250 0 and @500 0 in every window, RTF p95 drift +1.3%, GPU util 97%, VRAM
+peak 6.3 GiB (fewer rows resident at once than closed loop), scheduler
+~105% CPU. Every C60 gate passes at this arrival rate, including the 250 ms
+buffer.
