@@ -182,5 +182,7 @@ only ~0.65 GB once.
 | cuBLAS prefill vs fixed order, re-run | fixed C64 127.3, C96 130.4 | C64 133.0, C96 141.8 | +4-9% | opt-in only: the long-form self-check fails (text pushed in pieces vs whole: sample 12003/23040 -0.2719 vs -0.2706). Determinism vs throughput is a product decision |
 | pack converted with `--dtype source` (Kyutai F32, 1.30 GB) vs default BF16 pack (672 MB) | BF16 pack: WER 3.32%, C64 94.4 (TC binary) | F32 pack: WER 3.41%, C64 95.1 | = | keep the BF16 pack (Kyutai's own `switch_to_bf16.py` choice); CUDA expands weights to F32 either way |
 
+| **30-min closed-loop soak C96** (tree bb498a6 defaults, max-batch 96, unpinned) | | 38,140 requests, 0 failed, **176.8 aud/s**, RTF p95 0.541, TTFA p95 97 ms, 0 stalls @250/@500, RTF p95 drift +0.6%, VRAM 18.48 -> 18.72 GB, RSS 3.71 -> 3.73 GB | | screening PASS (single soak, built-in text mix, no audio capture; the final qualification needs two soaks on the v2 corpus with capture). Short ladders under-count long requests: soak aud/s is the reference |
+
 Rows above the slot pool ran unpinned with `-w 8` (see the correction above);
 all are C32-C64 x 20 s, 24L, BF16 KV unless stated.
