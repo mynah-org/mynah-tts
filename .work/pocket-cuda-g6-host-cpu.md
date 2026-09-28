@@ -227,5 +227,15 @@ only ~0.65 GB once.
 | **device backbone KV grows on demand** (`MYNAH_CUDA_KV_GROW`, 2716bca) | VRAM C64 13.2 GB, C96 18.9 GB, C128 OOM | C64 6.8 GB, C96 9.2 GB, **C128 11.5 GB** | -48% VRAM | KEEP (default on). Self-check PASS on and off; forced growth (`MYNAH_CUDA_KV_GROW_INITIAL_STEPS=16`, warm voices) logs 4 growths (e.g. 147 -> 403 positions) and the PCM is md5-identical to full capacity, with the slot pool on and off; WER with rows growing inside the C64 batch 3.32% |
 | **30-min closed-loop soak C128** (KV grow, max-batch 128, unpinned) | | 40,300 requests, 0 failed, **186.7 aud/s**, RTF p95 0.679, TTFA p95 121 ms, 0 stalls, RTF p95 drift +0.2%, RSS flat 4.16 -> 4.18 GB | | screening PASS. VRAM 10.8 -> 12.5 GB, decelerating (+750 MB the first 3 min, +30 MB the last 3): parked slot-pool sets keep the KV their requests grew to; add a pool trim before the final qualification |
 
+| knee ladder, 25 s per level (28658f9, 256-wide cap, max-batch 192, unpinned) | | C128 136.5 aud/s (RTF p95 0.713, TTFA p95 132 ms), C144 136.9 (0.783, 148), C160 138.7 (0.857, 156), C176 138.9 (0.926, 169), C192 138.4 (0.992, 184); 0 stalls, 0 failures; VRAM 11.0 -> 16.5 GB | | GPU saturated, RTF p95 linear in C. With the Arm report's gate (RTF p95 < 0.90) C160 is the top level with margin; C176 fails it. Qualification point: C160 |
+| **qualification soak A, C160** (f873125 sources, v2 corpus, 4 voices, seed 1234, capture every 10th) | | 43,316 requests, 0 failed, **184.5 aud/s**, RTF p95 0.857, TTFA p95 154 ms, 0 stalls, drift +0.1%, VRAM 13.8-14.7 GB flat, RSS 4.73-4.75 GB, 4,423 WAVs | | PASS (1 of 2) |
+
+Notes: the C128 30-min soak ran on 0e0019f (KV grow + test hook, before the
+256 cap). The first forced-growth test did not grow: a voice's device cache
+loads on first use, so the first request per voice got the full KV and the pool
+reused it; re-run with warmed voices it logged 4 growths (e.g. 147 -> 403
+positions) and matched full capacity md5 for md5. The commit message of 97e1e0c
+says "confined to 4 cores"; those rows ran unpinned (see the correction above).
+
 Rows above the slot pool ran unpinned with `-w 8` (see the correction above);
 all are C32-C64 x 20 s, 24L, BF16 KV unless stated.
