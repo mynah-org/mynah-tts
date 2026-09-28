@@ -3,12 +3,13 @@
 # lock, stop the server, print the summary and the [SERVE] loop profile.
 # usage: ab.sh <tag> <model-dir> <levels> <warmup-s> <duration-s> [VAR=value ...]
 tag=$1; model=$2; lvls=$3; wu=$4; du=$5; shift 5
+mb="${MYNAH_L4_BATCH:-64}"; mi="${MYNAH_L4_INFLIGHT:-$mb}"
 root="${MYNAH_L4_ROOT:-/root/mynah-head}"; ev="${MYNAH_L4_EVIDENCE:-/root/evidence}"
 port="${MYNAH_L4_PORT:-18080}"
 mkdir -p "$ev"
 pkill -f "mynah-tts-server.*-p $port"; sleep 2
 tmux kill-session -t "srv-$port" 2>/dev/null
-tmux new-session -d -s "srv-$port" "$root/tools/l4/serve.sh $model 64 64 $port $* > $ev/$tag-server.log 2>&1"
+tmux new-session -d -s "srv-$port" "$root/tools/l4/serve.sh $model $mb $mi $port $* > $ev/$tag-server.log 2>&1"
 for i in $(seq 90); do curl -sf "localhost:$port/health" >/dev/null && break; sleep 2; done
 P=$(pgrep -f "mynah-tts-server.*-p $port" | head -1)
 cd "$root" && flock /root/gpu.lock /venv/main/bin/python tools/pocket_ladder.py --port "$port" \

@@ -64,8 +64,74 @@ confined to 4 cores, plus: scheduler thread < 70% of one core at C60, zero
 stalls at 250 ms over a 30-minute soak, and CPU `make test` green after every
 shared-code change (the CPU path stays untouched).
 
+## Baseline on the new box (2026-09-28, tree 72cade4+, 24L, C16-C64 x 20 s)
+
+The box is an EPYC 7702 with 128 threads; `taskset -c 0-3 -w 4` models the
+g6.xlarge. Packs re-converted from `english_2026-04_24l` / `english_2026-04`.
+
+| run | C16 | C32 | C48 | C64 aud/s | C64 RTF p95 | C64 TTFA p95 | srv CPU | GPU util |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| unpinned, -w 8 | 53.9 | 79.6 | 91.4 | 100.1 | 0.483 | 94 ms | 117% | 94% |
+| 4 cores, -w 4 | 53.1 | 76.7 | 88.7 | 97.7 | 0.492 | 94 ms | 117% | 93% |
+
+Findings:
+
+- Four vCPUs cost only ~2.5% at C64, with no stalls or failures. The host is
+  not the throughput limiter; the ~117% CPU is mostly the driver spinning in
+  `cudaStreamSynchronize` (device flags were `cudaDeviceScheduleAuto`).
+- The GPU is 93-94% busy, so throughput past C64 has to come from device time.
+  B64 step: 34 ms mean, 0.5 ms per slot.
+- `decoder_graph_captures` > `decoder_graph_replays` at every level (C64: 575
+  captures for 207 replays). The SEANet decoder graph is re-captured more
+  often than it is reused. This is a device and host cost to chase.
+
+## Audit (2026-09-28, three read-only passes: host CPU, GPU step, web)
+
+Ranked by expected gain at C64; each item gets a switch and a board row.
+
+1. **Backbone decode attention** (`k_self_attention_bf16_batch`): the kernel
+   walks the context one position at a time, with a 64-thread tree reduction
+   and ~9 `__syncthreads` per position, for 24 layers x 16 heads x 64 rows at
+   ~250 positions. It is issue-bound, and it fits the measured 0.5 ms/slot
+   slope of the B64 step. Rewrite: chunked online softmax, one thread per
+   position, 128-bit BF16 K loads, V accumulated in registers, fixed order per
+   row. Switch `MYNAH_CUDA_BACKBONE_ATTN=legacy`.
+2. **SEANet decoder graph cache**: the key is the exact ordered gang, so every
+   admission or retirement misses (capture + instantiate + `cudaMalloc`/
+   `cudaHostAlloc`), and decoder close destroys every graph holding it. Fix:
+   one graph per width, re-recorded only to rewrite the pinned pointer tables
+   that its memcpy nodes read at launch. Switch
+   `MYNAH_CUDA_DECODER_GRAPH_REUSE=0`.
+3. **Admission and retirement allocate on the scheduler thread**: ~7
+   `cudaHostAlloc`, backbone KV, codec and decoder `cudaMalloc`, and on retire
+   dozens of `cudaFree`, each of which synchronises the device. There is also
+   a ~100 MB host KV `calloc` per request that device-owned rows never touch.
+   Fix: a slot pool of `max_batch` resource sets created at start-up, plus a
+   decoder reset instead of close.
+4. **Five syncs per frame** (condition, backbone, EOS, flow, PCM), with the
+   GPU idle while the host works after each one. `MYNAH_CUDA_SYNC=blocking`
+   proved each wake-up gap costs throughput. Fix: condition + backbone + EOS +
+   flow in one graph with one sync (noise pre-generated on the host), and
+   drop the 256 KB condition D2H and the hidden re-upload.
+5. **SEANet fusion**: ELU folded into im2col; kernel-1 convs straight to the
+   GEMM; bias via beta; `CUBLAS_COMPUTE_32F_FAST_16F` for the decoder only.
+6. **Shared voice-prefix KV** (read the device voice cache instead of a copy
+   per request): ~40% less KV traffic when voices repeat, less VRAM, no copy
+   at admission.
+7. **Backbone per-layer tables**: 120 memcpy nodes per step (positions and
+   strides uploaded 24 times). Upload once per step, and use cuBLASLt
+   bias/GELU epilogues (15 -> 8 kernels per layer).
+8. **Stream output**: `writev` per chunk, a per-slot PCM buffer instead of
+   `malloc` per frame, and cancellation read from an atomic set by the writer
+   instead of `poll` + `recv(MSG_PEEK)` per row per frame.
+9. Later: BF16 backbone and flow with the Mimi tile kept on TF32 cuBLAS (the
+   BF16 slowdown came from the Mimi tile falling back to the SIMT kernel); a
+   tensor-core batch-invariant tile GEMM for prefill; B>64 once the step is
+   lean; codec every 2 frames for streams with a deep buffer.
+
 ## Board
 
 | candidate | baseline | candidate | delta | decision |
 |---|---:|---:|---:|---|
-| (none yet) | | | | |
+| `MYNAH_CUDA_SYNC=blocking` (host sleeps in sync) | C64 97.7 aud/s, 117% CPU | 88.9, 43% CPU | -9% | REVERT as default (opt-in only): each wake-up leaves the GPU idle |
+| `MYNAH_CUDA_SYNC=yield` | 97.7, 117% | 96.6, 116% | -1% | REVERT (no CPU saved) |

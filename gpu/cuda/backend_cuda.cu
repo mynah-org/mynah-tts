@@ -908,6 +908,13 @@ struct cuda_decoder_batch_graph_entry {
     float **device_tables;
     float **host_tables;
     size_t upload_slots;
+    size_t used_slots;
+    /* Topology signature for reuse across gangs: every per-row pointer the
+     * graph touches lives in host_tables, so a graph captured for one gang
+     * serves any gang of the same width once the tables are rewritten. */
+    size_t sig_ops;
+    const float *sig_weight;
+    cudaEvent_t done;
     bool valid;
 };
 
@@ -2720,7 +2727,17 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     /* Mapped host staging is part of the FP32 bring-up path.  Device flags
      * must be set before any runtime call that can initialise the primary
      * context; otherwise cudaHostGetDevicePointer may be unavailable. */
-    if (ce(cudaSetDeviceFlags(cudaDeviceMapHost), e, ec)) return -1;
+    unsigned int sched = cudaDeviceScheduleAuto;
+    {
+        /* MYNAH_CUDA_SYNC picks how the host waits on the device: the
+         * default lets the driver spin, which burns a whole core per
+         * waiting thread; "blocking" sleeps on an OS primitive instead. */
+        const char *s = getenv("MYNAH_CUDA_SYNC");
+        if (s != nullptr && strcmp(s, "blocking") == 0) sched = cudaDeviceScheduleBlockingSync;
+        else if (s != nullptr && strcmp(s, "yield") == 0) sched = cudaDeviceScheduleYield;
+        else if (s != nullptr && strcmp(s, "spin") == 0) sched = cudaDeviceScheduleSpin;
+    }
+    if (ce(cudaSetDeviceFlags(cudaDeviceMapHost | sched), e, ec)) return -1;
     int dc = 0;
     if (ce(cudaGetDeviceCount(&dc), e, ec) || dc == 0) {
         if (dc == 0) set_error(e, ec, "no CUDA device"); return -1; }
@@ -4712,6 +4729,11 @@ static bool cuda_decoder_graphs_enabled(void) {
     return cuda_env_enabled("MYNAH_CUDA_DECODER_GRAPHS", true);
 }
 
+static bool cuda_decoder_graph_reuse_enabled(void) {
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_GRAPH_REUSE", true);
+    return on;
+}
+
 static size_t decoder_conv1d_upload_count(const cuda_decoder_op *op) {
     /* causal-window pointers, columns pointers, output/weight pointers and
      * the tail copy pointers; the tail-free case has no window or tail copy. */
@@ -4759,6 +4781,8 @@ static void decoder_batch_graph_free(cuda_decoder_batch_graph_entry *entry) {
     if (entry->graph != nullptr) cudaGraphDestroy(entry->graph);
     if (entry->device_tables != nullptr) cudaFree(entry->device_tables);
     if (entry->host_tables != nullptr) cudaFreeHost(entry->host_tables);
+    if (entry->done != nullptr) cudaEventDestroy(entry->done);
+    entry->done = nullptr;
     entry->exec = nullptr;
     entry->graph = nullptr;
     entry->device_tables = nullptr;
@@ -4805,6 +4829,16 @@ static void destroy_decoder_batch_graphs_for(
             ++i;
             continue;
         }
+        if (cuda_decoder_graph_reuse_enabled() && entry->valid &&
+            entry->done != nullptr) {
+            /* Keep the executable graph; only its rows go stale.  The next
+             * gang of this width rewrites the tables before any launch. */
+            entry->decoders.clear();
+            entry->inputs.clear();
+            entry->outputs.clear();
+            ++i;
+            continue;
+        }
         backend->decoder_batch_graphs.erase(
             backend->decoder_batch_graphs.begin() + i);
         decoder_batch_graph_free(entry);
@@ -4832,6 +4866,21 @@ static cuda_decoder_batch_graph_entry *find_decoder_batch_graph(
             }
         }
         if (same) return entry;
+    }
+    return nullptr;
+}
+
+static cuda_decoder_batch_graph_entry *find_decoder_batch_graph_shape(
+    cuda_backend_state *backend, const mynah_backend_decoder *first,
+    size_t batch, size_t encoder_frames) {
+    if (backend == nullptr || first == nullptr || first->ops.empty())
+        return nullptr;
+    for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs) {
+        if (entry->valid && entry->done != nullptr && entry->batch == batch &&
+            entry->encoder_frames == encoder_frames &&
+            entry->sig_ops == first->ops.size() &&
+            entry->sig_weight == first->ops[0].weight)
+            return entry;
     }
     return nullptr;
 }
@@ -4867,6 +4916,10 @@ static cuda_decoder_batch_graph_entry *decoder_batch_graph_create(
     entry->device_tables = nullptr;
     entry->host_tables = nullptr;
     entry->upload_slots = upload_slots;
+    entry->used_slots = 0u;
+    entry->sig_ops = decoders[0]->ops.size();
+    entry->sig_weight = decoders[0]->ops[0].weight;
+    entry->done = nullptr;
     entry->valid = false;
     try {
         entry->decoders.assign(decoders, decoders + batch);
@@ -5638,6 +5691,78 @@ extern "C" int mynah_cuda_decoder_step_batch(
                                                    std::memory_order_relaxed);
             return -1;
         }
+        if (entry->done != nullptr)
+            (void)cudaEventRecord(entry->done, backend->stream);
+        backend->decoder_graph_replays.fetch_add(1ull,
+                                                 std::memory_order_relaxed);
+        backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                         std::memory_order_relaxed);
+        return 0;
+    }
+
+    entry = cuda_decoder_graph_reuse_enabled()
+                ? find_decoder_batch_graph_shape(backend, decoders[0], batch,
+                                                 encoder_frames)
+                : nullptr;
+    if (entry != nullptr) {
+        /* Same width, different gang: re-record only to rewrite the pinned
+         * pointer tables that the instantiated graph's memcpy nodes read at
+         * launch, then drop the recording.  No instantiate on this path. */
+        if (ce(cudaEventSynchronize(entry->done), e, ec) != 0) return -1;
+        cudaError_t begin = cudaStreamBeginCapture(backend->stream,
+                                                    cudaStreamCaptureModeRelaxed);
+        if (begin != cudaSuccess) {
+            ce(begin, e, ec);
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                       std::memory_order_relaxed);
+            return eager();
+        }
+        backend->active_decoder_batch_graph = entry;
+        backend->active_decoder_upload_slot = 0u;
+        const int build = decoder_step_batch_impl(
+            backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs,
+            e, ec);
+        const size_t used = backend->active_decoder_upload_slot;
+        backend->active_decoder_batch_graph = nullptr;
+        for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
+        cudaGraph_t scratch = nullptr;
+        const cudaError_t end = cudaStreamEndCapture(backend->stream, &scratch);
+        if (scratch != nullptr) cudaGraphDestroy(scratch);
+        if (build != 0 || end != cudaSuccess || used != entry->used_slots) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(1ull,
+                                                       std::memory_order_relaxed);
+            if (build < 0) {
+                backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                    std::memory_order_relaxed);
+                backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                       std::memory_order_relaxed);
+                return -1;
+            }
+            if (end != cudaSuccess) ce(end, e, ec);
+            return eager();
+        }
+        try {
+            entry->decoders.assign(decoders, decoders + batch);
+            entry->inputs.assign(dev_inputs, dev_inputs + batch);
+            entry->outputs.assign(dev_outputs, dev_outputs + batch);
+        } catch (const std::bad_alloc &) {
+            entry->decoders.clear();
+            entry->inputs.clear();
+            entry->outputs.clear();
+        }
+        if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
+            decoder_batch_graph_remove(backend, entry);
+            backend->decoder_graph_fallbacks.fetch_add(
+                1ull, std::memory_order_relaxed);
+            backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                std::memory_order_relaxed);
+            backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                   std::memory_order_relaxed);
+            return -1;
+        }
+        (void)cudaEventRecord(entry->done, backend->stream);
         backend->decoder_graph_replays.fetch_add(1ull,
                                                  std::memory_order_relaxed);
         backend->decoder_steps.fetch_add((unsigned long long)batch,
@@ -5697,6 +5822,7 @@ extern "C" int mynah_cuda_decoder_step_batch(
     const int build = decoder_step_batch_impl(
         backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs, e,
         ec);
+    entry->used_slots = backend->active_decoder_upload_slot;
     backend->active_decoder_batch_graph = nullptr;
     for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
 
@@ -5739,6 +5865,9 @@ extern "C" int mynah_cuda_decoder_step_batch(
     entry->graph = graph;
     entry->exec = exec;
     entry->valid = true;
+    if (cuda_decoder_graph_reuse_enabled() &&
+        cudaEventCreateWithFlags(&entry->done, cudaEventDisableTiming) != cudaSuccess)
+        entry->done = nullptr;
     backend->decoder_graph_captures.fetch_add(1ull,
                                              std::memory_order_relaxed);
     if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
@@ -5751,6 +5880,7 @@ extern "C" int mynah_cuda_decoder_step_batch(
                                                std::memory_order_relaxed);
         return -1;
     }
+    if (entry->done != nullptr) (void)cudaEventRecord(entry->done, backend->stream);
     backend->decoder_steps.fetch_add((unsigned long long)batch,
                                      std::memory_order_relaxed);
     return 0;
@@ -7344,6 +7474,126 @@ __global__ static void k_self_attention_bf16_batch(
         out[(size_t)request * width + hbase + (size_t)d] *= inv;
 }
 
+/* Decode attention over a BF16 KV cache, one block per (head, row).  The
+ * legacy kernel above walks the context one position at a time with a block
+ * reduction per position; this one scores a chunk of 128 positions at once
+ * (one thread per position, 128-bit K loads), keeps an online softmax per
+ * chunk and accumulates V in registers.  The reduction order depends only on
+ * the row's own length, so the result is independent of the batch.  Needs
+ * head_width dividing 128 and a multiple of 8, 16-byte aligned rows. */
+static constexpr int CUDA_ATTN_FAST_THREADS = 128;
+
+__device__ static float cuda_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+__device__ static float cuda_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+__global__ static void __launch_bounds__(CUDA_ATTN_FAST_THREADS)
+k_self_attention_bf16_batch_fast(
+    const float *qkv, const uint16_t *const *kcache,
+    const uint16_t *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, int heads, int head_width,
+    float scale, float *out) {
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch) return;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const size_t width = (size_t)heads * (size_t)head_width;
+    const size_t hbase = (size_t)head * (size_t)head_width;
+    const size_t position = positions[request];
+    const size_t stride = cache_strides[request];
+    uint16_t *request_k = const_cast<uint16_t *>(kcache[request]);
+    uint16_t *request_v = const_cast<uint16_t *>(vcache[request]);
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    __shared__ float qs[CUDA_ATTN_FAST_THREADS];
+    __shared__ float probs[CUDA_ATTN_FAST_THREADS];
+    __shared__ float red_max[CUDA_ATTN_FAST_THREADS / 32];
+    __shared__ float red_sum[CUDA_ATTN_FAST_THREADS / 32];
+    if (tid < head_width) {
+        const size_t at = position * stride + hbase + (size_t)tid;
+        request_k[at] = cuda_bf16_from_float(request_qkv[width + hbase + (size_t)tid]);
+        request_v[at] = cuda_bf16_from_float(request_qkv[width * 2u + hbase + (size_t)tid]);
+        qs[tid] = request_qkv[hbase + (size_t)tid];
+    }
+    __syncthreads();
+    const int groups = CUDA_ATTN_FAST_THREADS / head_width;
+    const int d = tid % head_width;
+    const int g = tid / head_width;
+    const size_t n = position + 1u;
+    float running_max = -1.0e30f;
+    float denominator = 0.0f;
+    float acc = 0.0f;
+    for (size_t c0 = 0; c0 < n; c0 += CUDA_ATTN_FAST_THREADS) {
+        const size_t s = c0 + (size_t)tid;
+        float score = -1.0e30f;
+        if (s < n) {
+            const uint4 *kr = reinterpret_cast<const uint4 *>(
+                request_k + s * stride + hbase);
+            float dot = 0.0f;
+            for (int i = 0; i < head_width / 8; ++i) {
+                const uint4 w = kr[i];
+                const float *qq = qs + i * 8;
+                dot += qq[0] * __uint_as_float(w.x << 16) +
+                       qq[1] * __uint_as_float(w.x & 0xffff0000u) +
+                       qq[2] * __uint_as_float(w.y << 16) +
+                       qq[3] * __uint_as_float(w.y & 0xffff0000u) +
+                       qq[4] * __uint_as_float(w.z << 16) +
+                       qq[5] * __uint_as_float(w.z & 0xffff0000u) +
+                       qq[6] * __uint_as_float(w.w << 16) +
+                       qq[7] * __uint_as_float(w.w & 0xffff0000u);
+            }
+            score = dot * scale;
+        }
+        float m = cuda_warp_max(score);
+        if (lane == 0) red_max[warp] = m;
+        __syncthreads();
+        m = red_max[0];
+        for (int w = 1; w < CUDA_ATTN_FAST_THREADS / 32; ++w) m = fmaxf(m, red_max[w]);
+        const float next = fmaxf(running_max, m);
+        const float p = s < n ? expf(score - next) : 0.0f;
+        probs[tid] = p;
+        float sum = cuda_warp_sum(p);
+        if (lane == 0) red_sum[warp] = sum;
+        __syncthreads();
+        sum = red_sum[0];
+        for (int w = 1; w < CUDA_ATTN_FAST_THREADS / 32; ++w) sum += red_sum[w];
+        const float correction = expf(running_max - next);
+        denominator = denominator * correction + sum;
+        running_max = next;
+        acc *= correction;
+        const size_t left = n - c0;
+        const int count = left < (size_t)CUDA_ATTN_FAST_THREADS
+                              ? (int)left : CUDA_ATTN_FAST_THREADS;
+        const uint16_t *vbase = request_v + c0 * stride + hbase + (size_t)d;
+        for (int j = g; j < count; j += groups)
+            acc += probs[j] * cuda_bf16_to_float(vbase[(size_t)j * stride]);
+        __syncthreads();
+    }
+    probs[tid] = acc;
+    __syncthreads();
+    if (g == 0) {
+        float total = probs[d];
+        for (int k = 1; k < groups; ++k) total += probs[k * head_width + d];
+        out[(size_t)request * width + hbase + (size_t)d] =
+            denominator > 0.0f ? total / denominator : 0.0f;
+    }
+}
+
+static bool cuda_backbone_attn_fast_enabled(void) {
+    static const bool on = [] {
+        const char *s = getenv("MYNAH_CUDA_BACKBONE_ATTN");
+        return s == nullptr || strcmp(s, "legacy") != 0;
+    }();
+    return on;
+}
+
 extern "C" int mynah_cuda_self_attention_batch_dev(
     void *opaque, const float *qkv, float *const *kcache,
     float *const *vcache, const size_t *positions,
@@ -7439,6 +7689,23 @@ extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
                            batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
                            st->stream), e, ec)) return -1;
     dim3 grid((unsigned)heads, (unsigned)batch, 1u);
+    bool fast = cuda_backbone_attn_fast_enabled() && head_width % 8u == 0u &&
+                head_width <= (size_t)CUDA_ATTN_FAST_THREADS &&
+                (size_t)CUDA_ATTN_FAST_THREADS % head_width == 0u;
+    for (size_t i = 0; fast && i < batch; ++i)
+        fast = cache_strides[i] % 8u == 0u &&
+               ((uintptr_t)kcache[i] & 15u) == 0u &&
+               ((uintptr_t)vcache[i] & 15u) == 0u;
+    if (fast) {
+        k_self_attention_bf16_batch_fast<<<grid, CUDA_ATTN_FAST_THREADS, 0,
+                                           st->stream>>>(
+            qkv,
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+            st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+            (int)heads, (int)head_width, scale, out);
+        return ce(cudaGetLastError(), e, ec);
+    }
     k_self_attention_bf16_batch<<<grid, attention_threads(head_width), 0,
                                   st->stream>>>(
         qkv,
