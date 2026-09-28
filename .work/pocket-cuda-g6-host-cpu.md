@@ -200,6 +200,42 @@ codec window 266 instead of 500 and BF16 (-3 MB); trim the slot pool above
 the in-flight high-water mark (idle VRAM only). BF16-resident weights save
 only ~0.65 GB once.
 
+## Finding: ASR quality depends on the voice and the utterance length, not only on the serving path (2026-09-28, preliminary)
+
+Qualification soak A, 24L at C160, v2 corpus, 4,423 WAVs captured under load
+(34,025 s of audio), faster-whisper small.en:
+
+| slice | WER |
+|---|---:|
+| overall | 2.02% |
+| long / medium | 1.42% / 1.36% |
+| conversational / short | 3.54% / 6.25% |
+| alba / javert / jean / marius | 0.45% / 0.79% / 2.20% / 4.72% |
+
+138 utterances (3.1%) above 30% WER; 833 flagged (536 internal silence > 1.5 s,
+91 slow and 80 fast words per second, 78 leading silence, 33 abrupt end). The
+2-minute check at the same level gave 1.99%, so WER does not drift under a
+sustained load.
+
+What it means for any future quality gate:
+
+- **Report WER per voice and per length class, never only the aggregate.** A
+  10x spread between voices (alba 0.45%, marius 4.72%) hides inside a 2%
+  average, and a change that hurts one voice can pass unnoticed.
+- **Short utterances inflate WER by construction**: one wrong word in a 3-5 word
+  sentence is 20-33%, and the recogniser is weakest on short clips. Count the
+  "WER > 30%" outliers separately for short and for medium/long.
+- **Serving-induced damage would not be voice-specific.** Scheduling, batching or
+  a stale buffer would hit every voice alike; a strong voice dependence points
+  at the model/voice pair (or the recogniser on that timbre).
+- **Always pair a loaded run with an unloaded control on the same requests**
+  (same text, voice and seed ids, e.g. C8): only the difference between the two
+  attributes errors to load. The C8 control for this soak is queued
+  (`/root/evidence/ctrlA`); this section is completed with it.
+- Pocket 24L produces long internal pauses (> 1.5 s) on ~12% of utterances in
+  this corpus; the silence flags are therefore a comparison metric (loaded vs
+  control), not a pass/fail threshold on their own.
+
 ## Board
 
 | candidate | baseline | candidate | delta | decision |
