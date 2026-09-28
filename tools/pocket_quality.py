@@ -157,6 +157,12 @@ def main():
                     help="max random start delay per request, seconds")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--whisper", default="small.en")
+    ap.add_argument("--asr-device", default="cpu", choices=["cpu", "cuda"],
+                    help="cuda runs the recogniser on the (idle) GPU; keep one "
+                         "device per report so WER figures stay comparable")
+    ap.add_argument("--asr-compute", default="",
+                    help="CTranslate2 compute type (default int8 on cpu, "
+                         "float16 on cuda)")
     ap.add_argument("--out", default="")
     ap.add_argument("--phase", choices=["all", "synth", "asr"], default="all",
                     help="synth only, ASR only on a previous --out, or both")
@@ -229,7 +235,8 @@ def transcribe(a, rows, rows_path):
 
     from faster_whisper import WhisperModel
     import jiwer
-    model = WhisperModel(a.whisper, device="cpu", compute_type="int8",
+    model = WhisperModel(a.whisper, device=a.asr_device,
+                         compute_type=a.asr_compute or ("float16" if a.asr_device == "cuda" else "int8"),
                          cpu_threads=a.asr_threads)
     refs, hyps, bad = [], [], []
     for r in rows:
@@ -355,11 +362,12 @@ def flags_for(r, st, a):
     return f
 
 
-def _asr_init(whisper, threads, use_asr):
+def _asr_init(whisper, threads, use_asr, device="cpu", compute=""):
     if use_asr:
         from faster_whisper import WhisperModel
-        _ASR["model"] = WhisperModel(whisper, device="cpu", compute_type="int8",
-                                     cpu_threads=threads)
+        kind = compute or ("float16" if device == "cuda" else "int8")
+        _ASR["model"] = WhisperModel(whisper, device=device, compute_type=kind,
+                                     cpu_threads=threads or 0)
 
 
 def _analyse(job):
@@ -410,7 +418,8 @@ def captured(a):
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(
             workers, mp_context=ctx, initializer=_asr_init,
-            initargs=(a.whisper, a.asr_threads, use_asr)) as ex:
+            initargs=(a.whisper, a.asr_threads, use_asr, a.asr_device,
+                      a.asr_compute)) as ex:
         for i, res in enumerate(ex.map(_analyse, [(r, a_dict) for r in todo],
                                        chunksize=4 if use_asr else 32), 1):
             results[i - 1] = res
