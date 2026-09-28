@@ -72,13 +72,20 @@ g6.xlarge. Packs re-converted from `english_2026-04_24l` / `english_2026-04`.
 | run | C16 | C32 | C48 | C64 aud/s | C64 RTF p95 | C64 TTFA p95 | srv CPU | GPU util |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | unpinned, -w 8 | 53.9 | 79.6 | 91.4 | 100.1 | 0.483 | 94 ms | 117% | 94% |
-| 4 cores, -w 4 | 53.1 | 76.7 | 88.7 | 97.7 | 0.492 | 94 ms | 117% | 93% |
+| ~~4 cores, -w 4~~ (NOT pinned, see below) | 53.1 | 76.7 | 88.7 | 97.7 | 0.492 | 94 ms | 117% | 93% |
+
+**Correction (same day):** `ab.sh` started `serve.sh` inside `tmux new-session`,
+which does not inherit the caller's environment, so `MYNAH_L4_CPUS` and
+`MYNAH_L4_WORKERS` were ignored: the "4 cores" rows ran on all 128 threads with
+`-w 8` (checked with `taskset -cp`). The second row is therefore a repeat of
+the first, and the claim that 4 vCPUs cost only 2.5% is withdrawn. The A/B rows
+of the board stay valid as relative comparisons (every run had the same
+unpinned setup). Fixed in the tools; the real 4-core baseline is re-run.
 
 Findings:
 
-- Four vCPUs cost only ~2.5% at C64, with no stalls or failures. The host is
-  not the throughput limiter; the ~117% CPU is mostly the driver spinning in
-  `cudaStreamSynchronize` (device flags were `cudaDeviceScheduleAuto`).
+- The ~117% CPU is mostly the driver spinning in `cudaStreamSynchronize`
+  (device flags were `cudaDeviceScheduleAuto`).
 - The GPU is 93-94% busy, so throughput past C64 has to come from device time.
   B64 step: 34 ms mean, 0.5 ms per slot.
 - `decoder_graph_captures` > `decoder_graph_replays` at every level (C64: 575
