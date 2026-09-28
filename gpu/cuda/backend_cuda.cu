@@ -1113,8 +1113,8 @@ struct mynah_backend_decoder {
     std::vector<cuda_decoder_op> ops;
 };
 
-static constexpr size_t CUDA_BATCH_META_CAP = 256u;
-static constexpr size_t CUDA_DECODER_GRAPH_CAP = 256u;
+static constexpr size_t CUDA_BATCH_META_CAP = 384u;
+static constexpr size_t CUDA_DECODER_GRAPH_CAP = 384u;
 /* A server can retain one decoder graph per live context in addition to the
  * width-bucketed backbone/flow graphs.  The condition-projection input graph
  * is a separate bucket because its input is already resident in `cuda_x` and

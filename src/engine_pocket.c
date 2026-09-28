@@ -40,9 +40,9 @@
  * microbatches.  CPU still remains correct at the wider width, while its
  * operator can choose a smaller --max-batch at serving time. */
 /* Storage bound of every per-batch array.  The CPU engine advertises 128 (its
- * qualified ceiling); the CUDA backend advertises the full 256 once the device
- * KV grows on demand (MYNAH_CUDA_KV_GROW) and C128 fits in half the card. */
-#define POCKET_MAX_BATCH 256u
+ * qualified ceiling); the CUDA backend advertises the full 384: with the device
+ * KV grown on demand the 6L pack still has realtime margin at 256 on an L4. */
+#define POCKET_MAX_BATCH 384u
 #define POCKET_CPU_MAX_BATCH 128u
 #define POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE ((size_t)0x300000u)
 #define POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE ((size_t)0x400000u)
