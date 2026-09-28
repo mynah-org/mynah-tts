@@ -1383,7 +1383,7 @@ New, opt-in track. CPU remains the oracle/default; CUDA gets a separate server
 artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
 “GPU Pocket”. The target is a measured C100 on an L40S, not an extrapolation.
 
-- [ ] E15-G6 the same gates on a 4-vCPU L4 host (AWS g6.xlarge): host-CPU cost map, stalls, further kernel/quant/allocation speedups → [`.work/pocket-cuda-g6-host-cpu.md`](.work/pocket-cuda-g6-host-cpu.md)
+- [x] E15-G6 one L4 on a 4-vCPU-class host: 24L qualified at C160 (184.5 audio-s/s, RTF p95 0.86) and 6L at C256 (316.5 audio-s/s, RTF p95 0.79), two 30-min soaks each on the v2 corpus with captured audio; 4 pinned cores cost 1.5% (2026-09-28) → [`.work/pocket-cuda-g6-host-cpu.md`](.work/pocket-cuda-g6-host-cpu.md), `docs/performance.md`
 - [x] E15-C60 Pocket 24L realtime capacity on one L4: C64 at 90-100 audio-s/s, stream RTF p95 0.4-0.7, TTFA p95 <140 ms, zero failures over 30-min closed-loop and 15-min Poisson soaks, WER gate passed → [`.work/pocket-cuda-c60-l4.md`](.work/pocket-cuda-c60-l4.md) (open: listening test, soak from a separate client host, host scheduler thread is the next limiter)
 - [x] E15-0 as-is audit: Pocket CPU driver/state, current CUDA backend, `../qwen-tts` resident CUDA/CI patterns, and vLLM-Omni CUDA-graph/async-chunk designs
 - [~] E15-1 add `make cuda-server`; compile/link CLI + server in CI for explicit `sm_70`, `sm_89` (L40S) and `sm_90`; model-free check distinguishes compiled CUDA from no device — latest green gate is Build & Test `36124116814`, Code Quality `36124116761`, Memory Safety `36124116778`, including `sm_120`

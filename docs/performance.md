@@ -985,3 +985,26 @@ profile (alba ~0.4%, marius ~4.7%) and 8 of its 10 >30%-WER utterances shared
 with the loaded run: the load does not degrade the audio; the spread is the
 model/voice pair. Gate WER per voice and per length class, always against an
 unloaded control. Evidence bundle on the L4: `/root/evidence/bundles/pocket-24l-c160-final`.
+
+## 2026-09-28 · PocketTTS 6L on CUDA — one NVIDIA L4, C256 qualified
+
+Same build, host, corpus and protocol as the 24L section above, pack
+`english_2026-04`, max-batch/inflight 256 (the CUDA batch cap is now 384).
+
+| 30-minute soak | requests | failed | audio-s/s | RTF p95 | TTFA p95 | stalls 250/500 ms | drift | VRAM |
+|---|---:|---:|---:|---:|---:|---|---:|---|
+| A, seed 4321 | 88,073 | 0 | 317.0 | 0.792 | 145 ms | 0 / 0 | +0.2% | 8.1-8.5 GB flat |
+| B, seed 8765 | 88,218 | 0 | 316.1 | 0.794 | 145 ms | 0 / 0 | +0.1% | 8.0-8.5 GB flat |
+
+Knee (25 s screens): RTF p95 0.40 / 0.50 / 0.60 / 0.70 / 0.79-0.85 / 0.90 / 0.99 /
+1.09 at C128 / 160 / 192 / 224 / 256 / 288 / 320 / 352; C352 is not streamable
+(18,207 stalls). C256 is the last level with the same margin as the 24L at C160.
+
+Audio captured under load, every 4th capture transcribed (2,245 and 2,249
+utterances): WER 1.06% (A) and 0.87% (B); alba 0.62/0.44%, javert 0.49/0.34%,
+jean 0.95/1.12%, marius 2.24/1.58%; short 2.80/2.62%; 0.6% of utterances above
+30%. The small model reads better to the recogniser than the large one and its
+voice spread is narrower. No separate unloaded control: the serving path is the
+code measured on the 24L, where load did not change the audio. Bundle:
+`/root/evidence/bundles/pocket-6l-c256-final`. Report:
+`PocketTTS-CUDA-L4-Small-Large-Report-2026-09-28.pdf` (with both bundles).

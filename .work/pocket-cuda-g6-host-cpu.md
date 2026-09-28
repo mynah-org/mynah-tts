@@ -280,6 +280,9 @@ not to the serving path.
 
 | **6L knee ladder**, 25 s per level (256 cap, then 384 cap build) | | C128 280.9 aud/s (RTF p95 0.403, TTFA p95 74 ms), C160 278.4 (0.500), C192 273.7 (0.596), C224 265.2 (0.695), C256 252-260 (0.79-0.85, 146-183 ms), C288 252.6 (0.896), C320 257.4 (0.986), C352 258.5 (**1.086**, 18,207 stalls @250 in 607 requests); VRAM 4.6 GB @C128 -> 11.1 GB @C352; self-check PASS | | realtime breaks between C320 and C352; C288 sits at the 0.90 gate with no margin; qualification point **C256** (same margin rule as the 24L at C160). 6L plateau ~255 aud/s vs ~185 for the 24L: the backbone is 4x lighter, the Mimi/SEANet codec costs the same |
 
+| **qualification soak B, C160 (24L)** | | 43,638 requests, 0 failed, 184.5 aud/s, RTF p95 0.855, TTFA p95 155 ms, 0 stalls, drift -0.1%, VRAM 13.6-14.4 GB flat; WER 1.94% (A 2.02%), unloaded C8 control 1.87% with the same per-voice profile | | **24L QUALIFIED at C160** |
+| **6L qualification, C256** (d716334, 384 cap) | | soak A 88,073 / soak B 88,218 requests, 0 failed, 317.0 / 316.1 aud/s, RTF p95 0.792 / 0.794, TTFA p95 145 ms, 0 stalls, drift +0.2% / +0.1%, VRAM 8.0-8.5 GB flat; WER 1.06% / 0.87% on every 4th capture | | **6L QUALIFIED at C256**; no C8 control (serving path shared with the 24L) |
+
 Notes: the C128 30-min soak ran on 0e0019f (KV grow + test hook, before the
 256 cap). The first forced-growth test did not grow: a voice's device cache
 loads on first use, so the first request per voice got the full KV and the pool
