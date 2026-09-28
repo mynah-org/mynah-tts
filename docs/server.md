@@ -7,10 +7,9 @@ framework, no dependencies — plain sockets in C, one binary.
 make server
 ./build/cpu/mynah-tts-server -m models/magpie-v2607-pack -p 8080
 
-# CUDA sizing: bounded engine calls with many resident request slots.
-# Runtime qualification on a real NVIDIA box is still required.
-./build/cuda/mynah-tts-server -m models/pocket-en --device cuda \
-  --max-batch 16 --max-inflight 128 -p 8080
+# PocketTTS on an NVIDIA GPU: see docs/cuda-serving.md (qualified on an L4)
+MYNAH_THREADS=1 MYNAH_CUDA_KV_DTYPE=bf16 ./build/cuda/mynah-tts-server \
+  -m models/pocket-english-24l --device cuda -w 8 --max-batch 160 --max-inflight 160 -p 8080
 ```
 
 The CPU and CUDA servers are separate artifacts. The CPU binary is never
@@ -23,29 +22,14 @@ make cuda-server CUDA_ARCH=sm_89
   --device cuda -p 8080
 ```
 
-`cuda-server` proves the CUDA-linked server builds without a GPU. PocketTTS
-resident CUDA execution and its parity/serving qualification are tracked in
-[the CUDA work item](../.work/pocket-tts-cuda-streaming-parity.md). Failure to
-open an explicitly requested CUDA backend is reported; inside a compatible
-Pocket request, recoverable resident-backbone or flow-head allocation, launch
-or graph-capture failures retry the same stage on the CPU path. The Pocket
-SEANet decoder has a resident causal CUDA path; its CPU↔CUDA stage parity and
-true cross-request batch-kernel gate remain open.
-
-The current opt-in controls are:
-
-| environment | effect |
-|---|---|
-| `MYNAH_CUDA_RESIDENT=0` | disable Pocket's resident transformer slice and use the CPU engine path |
-| `MYNAH_CUDA_FLOW=0` | disable the optional resident Pocket flow-head batch path; CPU flow remains the fallback |
-| `MYNAH_CUDA_FAST_MATH=1` | opt into FP16/Tensor-Core GEMM; default is FP32 parity mode |
-| `MYNAH_CUDA_GRAPHS=0` | disable resident Pocket batch CUDA-Graph capture/replay; graphs are enabled by default and fall back to ordinary stream submission when capture is unavailable |
-| `MYNAH_CUDA_DECODER_BATCH=0` | disable the async resident decoder gang submit/one-drain path; default is enabled for CUDA |
-| `MYNAH_CUDA_DECODER_GRAPHS=0` | disable cross-request SEANet decoder graph capture/replay; default is enabled, with a bounded cache keyed by the exact stable decoder gang |
-| `MYNAH_CUDA_SLOT_POOL=0` | disable the per-request CUDA resource pool: retired Pocket contexts then free their device buffers, pinned staging and resident decoder (each cudaFree/cudaFreeHost synchronises the device) instead of parking them for the next admission; default is enabled on the resident CUDA path. `MYNAH_CUDA_SLOT_POOL_ZERO_KV=1` also clears a reused backbone KV cache (leak A/B: audio must be identical) |
-| `MYNAH_CUDA_PREFILL_BATCH=0` | disable cross-request CUDA text prefill and use scalar resumable prefill; CPU is unchanged |
-| `MYNAH_POCKET_VOICE_CACHE=0|all|startup` | disable model-owned voice KV caching, or preload every voice at startup; default is lazy first-use caching |
-| `MYNAH_CUDA_CODEC=1` | opt into the existing generic NanoCodec resident path; it is not Pocket's SEANet decoder and is not a qualification claim |
+`cuda-server` builds without a GPU; running it needs one. **PocketTTS on CUDA
+has its own guide, [cuda-serving.md](cuda-serving.md)**: qualified operating
+points (L4: 160 streams of the 24-layer model, 256 of the 6-layer one), the two
+required variables, every `MYNAH_CUDA_*` switch with its default, measured
+effect and rollback value, monitoring and troubleshooting. A requested CUDA
+backend that cannot open is reported, and a configuration that would run a hot
+Pocket stage on the CPU refuses to start rather than serve slowly under a CUDA
+label.
 
 | flag | meaning |
 |---|---|
@@ -54,7 +38,7 @@ The current opt-in controls are:
 | `--host ADDR` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose) |
 | `-w, --workers N` | connection workers (default 4) — see Concurrency |
 | `--max-batch N` | engine/CUDA microbatch width (Pocket default 8 at the server layer, capped by model metadata) |
-| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`, maximum 128); does not widen one engine call |
+| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`; maximum 128 on CPU, 384 for Pocket on CUDA); does not widen one engine call |
 | `--device cpu\|metal\|cuda` | backend, same rules as the CLI |
 
 It binds to loopback by default. Exposing it means `--host 0.0.0.0`, which is a
@@ -113,6 +97,9 @@ X-Bits-Per-Sample: 16
 X-Channels: 1
 Transfer-Encoding: chunked
 ```
+
+The rate follows the model: 22050 Hz for Magpie (the examples below), 24000 Hz
+for PocketTTS. Read `X-Sample-Rate` rather than assuming it.
 
 Play it as it arrives, rather than writing bytes to disk:
 
