@@ -45,3 +45,4 @@ that holds the detail. Nothing in `PLAN.md` should need more than one line.
 | [pocket-tts-cuda-streaming-parity.md](pocket-tts-cuda-streaming-parity.md) | E15 — PocketTTS CUDA residency, parity, and Linux GPU streaming |
 | [pocket-cuda-runtime-gaps.md](pocket-cuda-runtime-gaps.md) | E15 follow-up — L4 capacity, row arenas, frame graphs and memory gates |
 | [pocket-cuda-slot-pool.md](pocket-cuda-slot-pool.md) | Pool per-request CUDA resource sets instead of cudaMalloc/cudaFree per admission (`MYNAH_CUDA_SLOT_POOL`) |
+| [pocket-cuda-kv-grow.md](pocket-cuda-kv-grow.md) | Grow the device backbone KV on demand instead of sizing it for max_steps (`MYNAH_CUDA_KV_GROW`) |

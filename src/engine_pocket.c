@@ -1015,6 +1015,10 @@ struct mynah_engine_ctx {
     float *cuda_attn;
     float *cuda_proj;
     float *cuda_ffn;
+    /* Positions per K/V plane of the device cache: its stride.  Equal to the
+     * host state's `max_seq_len` unless MYNAH_CUDA_KV_GROW started it smaller,
+     * in which case `pocket_cuda_backbone_reserve` widens it on demand; never
+     * larger than `max_seq_len`. */
     size_t cuda_backbone_capacity;
     size_t cuda_backbone_kv_floats;
     /* Bytes actually behind `cuda_backbone_kv`.  With the slot pool a reused
@@ -4202,6 +4206,75 @@ static void *pocket_cuda_kv_offset(float *base, size_t elements,
     return (void *)((unsigned char *)base + elements * width);
 }
 
+/* ------------------------------------------- growable device backbone KV
+ *
+ * MYNAH_CUDA_KV_GROW (default on; `=0` restores the full-capacity
+ * allocation).  The backbone cache is sized at admission for the worst case,
+ * voice + text + max_steps + 1, and with the default 1500-frame budget that is
+ * ~1700 positions of 96 KiB each (24L, BF16) while a typical request touches
+ * ~300 of them.  At C128 on a 23 GB L4 that worst case is what runs out.
+ *
+ * With this on, a context whose backbone is expected to be device-owned (the
+ * prefill tile path, the only one the host cannot shadow) starts from a
+ * conservative estimate and the device cache grows in 256-position chunks
+ * right before a writer would pass its end.  The host transformer state keeps
+ * its full `max_seq_len` untouched: it is the CPU path and its ceiling.  The
+ * device stride is `cuda_backbone_capacity`, which may now be smaller than
+ * `max_seq_len` and never larger. */
+#define POCKET_CUDA_KV_GROW_CHUNK ((size_t)256u)
+
+static int pocket_cuda_prefill_tile_enabled(void);
+
+static int pocket_cuda_kv_grow_enabled(void) {
+    const char *setting = getenv("MYNAH_CUDA_KV_GROW");
+    return setting == NULL || strcmp(setting, "0") != 0;
+}
+
+static int pocket_cuda_kv_grow_logged(void) {
+    const char *setting = getenv("MYNAH_CUDA_KV_GROW_LOG");
+    return setting != NULL && strcmp(setting, "0") != 0;
+}
+
+/* Admission-time prediction of `pocket_cuda_prefill_tile_usable`: every clause
+ * that does not depend on the cache this decides the size of.  A wrong "yes"
+ * is still correct -- every writer grows the cache before it passes the end --
+ * it only moves the growth from admission to the first step. */
+static int pocket_cuda_kv_grow_expected(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL || ctx->state == NULL || !ctx->cuda_backbone_enabled ||
+        !pocket_cuda_kv_grow_enabled() || !pocket_cuda_prefill_tile_enabled() ||
+        ctx->state->backend == NULL ||
+        !mynah_backend_has_tile_transformer(ctx->state->backend))
+        return 0;
+    const mynah_engine_state *state = ctx->state;
+    return state->cfg.heads * state->cfg.head_dim == state->cfg.hidden_dim &&
+           ctx->speaker < state->voice_count &&
+           state->voices[ctx->speaker].kv != NULL;
+}
+
+/* The positions a device cache starts with.  Pocket emits about 2-2.6 frames
+ * per text token (measured table in ctx_new: 1.96..2.57), so 3 per token plus
+ * a 64-frame tail covers an ordinary request without growing; a floor of 256
+ * keeps short prompts from growing at all.  Rounded to the growth chunk and
+ * never more than the full worst case `full`. */
+static size_t pocket_cuda_kv_initial_capacity(const mynah_engine_ctx *ctx,
+                                              size_t full) {
+    if (!pocket_cuda_kv_grow_expected(ctx)) return full;
+    size_t steps = 0u, positions = 0u, max_frames = 0u;
+    if (pocket_mul(ctx->text_capacity, 3u, &steps) != 0 ||
+        pocket_add(steps, 64u, &steps) != 0 ||
+        pocket_add(ctx->max_steps, 1u, &max_frames) != 0)
+        return full;
+    if (steps < POCKET_CUDA_KV_GROW_CHUNK) steps = POCKET_CUDA_KV_GROW_CHUNK;
+    if (steps > SIZE_MAX - (POCKET_CUDA_KV_GROW_CHUNK - 1u)) return full;
+    steps = (steps + POCKET_CUDA_KV_GROW_CHUNK - 1u) /
+            POCKET_CUDA_KV_GROW_CHUNK * POCKET_CUDA_KV_GROW_CHUNK;
+    if (steps > max_frames) steps = max_frames;
+    if (pocket_add(ctx->voice_positions, ctx->text_capacity, &positions) != 0 ||
+        pocket_add(positions, steps, &positions) != 0 || positions > full)
+        return full;
+    return positions;
+}
+
 /* Pageable CUDA copies are allowed by the API but commonly turn an
  * ostensibly asynchronous transfer into a host-side staging/synchronisation
  * point.  These small request buffers sit exactly on the single-request seam
@@ -4390,12 +4463,22 @@ static void pocket_cuda_slot_destroy(const mynah_backend *backend,
     free(slot);
 }
 
+/* Whether a parked backbone cache of `have` bytes may serve a request that
+ * needs `need`.  With a growable cache (`bounded`) a short request must not sit
+ * on an arbitrarily large parked cache: at most twice what it needs, otherwise
+ * the parked one is freed and a right-sized one allocated. */
+static int pocket_cuda_slot_kv_fits(size_t have, size_t need, int bounded) {
+    if (have < need) return 0;
+    return !bounded || need > SIZE_MAX / 2u || have <= 2u * need;
+}
+
 /* Take the idle set whose backbone cache fits `bb_kv_bytes` most tightly (and
  * has the requested element type); failing that, the one with the largest
- * cache, whose KV alone is then re-allocated.  NULL when the pool is empty. */
+ * cache, whose KV alone is then re-allocated (with `bounded` that is also the
+ * set whose oversized cache frees the most).  NULL when the pool is empty. */
 static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
                                                   size_t bb_kv_bytes,
-                                                  int bb_kv_bf16) {
+                                                  int bb_kv_bf16, int bounded) {
     if (!pocket_cuda_slot_pool_enabled(state)) return NULL;
     pthread_mutex_lock(&state->cuda_slot_pool_mutex);
     pocket_cuda_slot **best = NULL;
@@ -4403,7 +4486,8 @@ static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
     for (pocket_cuda_slot **link = &state->cuda_slot_pool; *link != NULL;
          link = &(*link)->next) {
         const pocket_cuda_slot *slot = *link;
-        if (slot->bb_kv_bf16 == bb_kv_bf16 && slot->bb_kv_bytes >= bb_kv_bytes &&
+        if (slot->bb_kv_bf16 == bb_kv_bf16 &&
+            pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, bb_kv_bytes, bounded) &&
             (best == NULL || slot->bb_kv_bytes < (*best)->bb_kv_bytes))
             best = link;
         if (largest == NULL || slot->bb_kv_bytes > (*largest)->bb_kv_bytes)
@@ -5878,14 +5962,23 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     size_t kv_floats = 0;
     size_t kv_bytes = 0;
     size_t qkv = 0;
+    size_t position_bytes = 0;
     const int kv_bf16 = pocket_cuda_kv_bf16_requested(ctx->state);
+    const size_t kv_element = kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    /* MYNAH_CUDA_KV_GROW: the device cache may start below the host state's
+     * `max_seq_len`; with it off (or a non-tile context) this is exactly the
+     * full capacity and every line below is what it was. */
+    size_t kv_capacity = pocket_cuda_kv_initial_capacity(ctx, bc->max_seq_len);
+    const int kv_growable = kv_capacity < bc->max_seq_len;
     if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
-        pocket_mul(bc->max_seq_len, attn_dim, &layer_half) != 0 ||
+        pocket_mul(kv_capacity, attn_dim, &layer_half) != 0 ||
         pocket_mul(layer_half, 2u, &layer_span) != 0 ||
         pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
         pocket_mul(attn_dim, 3u, &qkv) != 0 ||
-        pocket_mul(kv_floats, kv_bf16 ? sizeof(uint16_t) : sizeof(float),
-                   &kv_bytes) != 0) {
+        pocket_mul(kv_floats, kv_element, &kv_bytes) != 0 ||
+        pocket_mul(cfg->layers, 2u * attn_dim, &position_bytes) != 0 ||
+        pocket_mul(position_bytes, kv_element, &position_bytes) != 0 ||
+        position_bytes == 0u) {
         ctx->cuda_backbone_enabled = 0;
         return 0;
     }
@@ -5899,10 +5992,22 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     pocket_cuda_slot *slot = ctx->cuda_slot;
     if (slot != NULL && slot->bb_kv != NULL) {
         const mynah_backend *backend = ctx->state->backend;
-        if (slot->bb_kv_bf16 == kv_bf16 && slot->bb_kv_bytes >= kv_bytes) {
+        if (slot->bb_kv_bf16 == kv_bf16 &&
+            pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, kv_bytes, kv_growable)) {
             ctx->cuda_backbone_kv = slot->bb_kv;
             ctx->cuda_backbone_kv_bytes = slot->bb_kv_bytes;
             reused_kv = 1;
+            if (kv_growable) {
+                /* A larger parked cache is capacity already paid for: lay it
+                 * out over all of its bytes (never past the host ceiling), so
+                 * the request grows later or not at all. */
+                size_t fits = slot->bb_kv_bytes / position_bytes;
+                if (fits > bc->max_seq_len) fits = bc->max_seq_len;
+                if (fits > kv_capacity) {
+                    kv_capacity = fits;
+                    kv_floats = cfg->layers * 2u * kv_capacity * attn_dim;
+                }
+            }
         } else {
             mynah_backend_dev_free(backend, slot->bb_kv);
         }
@@ -5953,10 +6058,117 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     POCKET_CUDA_ALLOC(ctx->cuda_proj, cfg->hidden_dim);
     POCKET_CUDA_ALLOC(ctx->cuda_ffn, cfg->ffn_dim);
 #undef POCKET_CUDA_ALLOC
-    ctx->cuda_backbone_capacity = bc->max_seq_len;
+    ctx->cuda_backbone_capacity = kv_capacity;
     ctx->cuda_backbone_kv_floats = kv_floats;
     ctx->cuda_backbone_kv_bf16 = kv_bf16;
     ctx->cuda_backbone_valid = 0;
+    return 0;
+}
+
+/* Make the device backbone cache hold at least `needed` positions
+ * (MYNAH_CUDA_KV_GROW).  Called by every writer before it could pass the end:
+ * the prefill tile, the upload of a host prefix, the single-row step, the
+ * batched step and the step pre-flight.  Never inside a stream capture: the
+ * callers run it before `batch_begin`/`graph_begin`.
+ *
+ * All-or-nothing: the new cache is allocated and the live prefix of every
+ * layer's K and V planes copied into the wider layout before the old one is
+ * released, so a failure leaves the context on the cache it had.  The copy is
+ * of the host offset's worth of positions -- the only ones any kernel reads;
+ * anything past it is unreachable and overwritten before it becomes readable
+ * (the invariant `_state_reset` relies on).  A sync separates the copy from
+ * the free: the stream is the only one touching this cache, and growth is rare
+ * (a request that outlives its estimate, once per 256 frames).
+ *
+ * Nothing caches the old pointer or capacity past this call: the batched step
+ * rebuilds its per-layer pointer tables from `cuda_backbone_kv` every step
+ * (graph replay reads those host tables), the prefill tile rebuilds its
+ * kv/ring arrays every call, and the single-row step reads the fields
+ * directly. */
+static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
+                                        char *error, size_t capacity) {
+    if (ctx == NULL || ctx->cuda_backbone_kv == NULL ||
+        needed <= ctx->cuda_backbone_capacity)
+        return 0;
+    const mynah_engine_state *state = ctx->state;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_backend *backend = state->backend;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    if (bc == NULL || needed > bc->max_seq_len ||
+        ctx->cuda_backbone_capacity == 0u) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA backbone KV cannot hold %zu positions", needed);
+        return -1;
+    }
+    const size_t old_capacity = ctx->cuda_backbone_capacity;
+    const size_t chunks = (needed - old_capacity + POCKET_CUDA_KV_GROW_CHUNK - 1u) /
+                          POCKET_CUDA_KV_GROW_CHUNK;
+    size_t new_capacity = bc->max_seq_len;
+    if (chunks <= (bc->max_seq_len - old_capacity) / POCKET_CUDA_KV_GROW_CHUNK)
+        new_capacity = old_capacity + chunks * POCKET_CUDA_KV_GROW_CHUNK;
+    const size_t element = ctx->cuda_backbone_kv_bf16 ? sizeof(uint16_t)
+                                                      : sizeof(float);
+    size_t attn_dim = 0u, old_half = 0u, new_half = 0u, new_floats = 0u;
+    size_t new_bytes = 0u, valid = 0u, valid_bytes = 0u;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+        pocket_mul(old_capacity, attn_dim, &old_half) != 0 ||
+        pocket_mul(new_capacity, attn_dim, &new_half) != 0 ||
+        pocket_mul(new_half, 2u * cfg->layers, &new_floats) != 0 ||
+        pocket_mul(new_floats, element, &new_bytes) != 0) {
+        pocket_error(error, capacity, "pocket: CUDA KV growth size overflow");
+        return -1;
+    }
+    valid = mynah_transformer_ar_state_offset(ctx->backbone);
+    if (valid > old_capacity) valid = old_capacity;
+    valid_bytes = valid * attn_dim * element;
+
+    char local[256];
+    local[0] = '\0';
+    void *grown = NULL;
+    if (mynah_backend_dev_alloc_bytes(backend, new_bytes, &grown, local,
+                                      sizeof(local)) != 0 || grown == NULL) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA backbone KV growth %zu -> %zu positions: %s",
+                     old_capacity, new_capacity,
+                     local[0] != '\0' ? local : "out of device memory");
+        return -1;
+    }
+    const unsigned char *src = (const unsigned char *)ctx->cuda_backbone_kv;
+    unsigned char *dst = (unsigned char *)grown;
+    int failed = 0;
+    for (size_t l = 0; l < cfg->layers && valid_bytes > 0u && !failed; ++l) {
+        const size_t from_k = l * 2u * old_half * element;
+        const size_t to_k = l * 2u * new_half * element;
+        failed = mynah_backend_copy_dev_bytes(backend, dst + to_k, src + from_k,
+                                              valid_bytes, local,
+                                              sizeof(local)) != 0 ||
+                 mynah_backend_copy_dev_bytes(
+                     backend, dst + to_k + new_half * element,
+                     src + from_k + old_half * element, valid_bytes, local,
+                     sizeof(local)) != 0;
+    }
+    /* The copies must land before the old cache goes, and a failed copy must
+     * surface here rather than as a wrong attention later. */
+    if (!failed) failed = mynah_backend_sync(backend, local, sizeof(local)) != 0;
+    if (failed) {
+        pocket_cuda_drain_before_release(backend);
+        mynah_backend_dev_free(backend, (float *)grown);
+        pocket_error(error, capacity,
+                     "pocket: CUDA backbone KV growth copy: %s",
+                     local[0] != '\0' ? local : "failed");
+        return -1;
+    }
+    mynah_backend_dev_free(backend, ctx->cuda_backbone_kv);
+    ctx->cuda_backbone_kv = (float *)grown;
+    ctx->cuda_backbone_capacity = new_capacity;
+    ctx->cuda_backbone_kv_floats = new_floats;
+    ctx->cuda_backbone_kv_bytes = new_bytes;
+    if (pocket_cuda_kv_grow_logged())
+        fprintf(stderr,
+                "pocket: CUDA backbone KV grew %zu -> %zu positions "
+                "(%zu live, %zu bytes)\n",
+                old_capacity, new_capacity, valid, new_bytes);
     return 0;
 }
 
@@ -5985,12 +6197,23 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
                                         ? sizeof(uint16_t)
                                         : sizeof(float);
     const size_t position = mynah_transformer_ar_state_offset(ctx->backbone);
+    /* A growable device cache (MYNAH_CUDA_KV_GROW) may be shorter than the
+     * host prefix; widen it first.  The device stride is its own capacity. */
+    if (bc != NULL && position <= bc->max_seq_len &&
+        pocket_cuda_backbone_reserve(ctx, position, error, capacity) != 0) {
+        ctx->cuda_backbone_valid = 0;
+        return -1;
+    }
+    size_t device_floats = 0;
     if (bc == NULL || position > bc->max_seq_len ||
+        position > ctx->cuda_backbone_capacity ||
         pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
-        pocket_mul(bc->max_seq_len, attn_dim, &device_layer_half) != 0 ||
+        pocket_mul(ctx->cuda_backbone_capacity, attn_dim,
+                   &device_layer_half) != 0 ||
         pocket_mul(half, 2u, &layer_span) != 0 ||
         pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
-        kv_floats > ctx->cuda_backbone_kv_floats ||
+        pocket_mul(cfg->layers, 2u * device_layer_half, &device_floats) != 0 ||
+        device_floats > ctx->cuda_backbone_kv_floats ||
         pocket_mul(position, attn_dim, &valid_floats) != 0 ||
         valid_floats > half) {
         pocket_error(error, capacity, "pocket: CUDA KV upload size overflow");
@@ -6016,7 +6239,8 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
          * for a future caller that legitimately fills the whole capacity.
          * Validate the host shadow before the first H2D so an injected or
          * corrupted value cannot leave a partially updated device cache. */
-        if (position == bc->max_seq_len && half == device_layer_half) {
+        if (position == ctx->cuda_backbone_capacity &&
+            half == device_layer_half) {
             if (!pocket_all_finite(source, layer_span)) {
                 ctx->cuda_backbone_valid = 0;
                 pocket_error(error, capacity,
@@ -6084,7 +6308,8 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
     const mynah_backend *backend = ctx->state->backend;
     const mynah_transformer_ar_config *bc =
         mynah_transformer_ar_state_config(ctx->backbone);
-    if (bc == NULL || ctx->cuda_backbone_capacity != bc->max_seq_len ||
+    if (bc == NULL || ctx->cuda_backbone_capacity == 0u ||
+        ctx->cuda_backbone_capacity > bc->max_seq_len ||
         ctx->cuda_x == NULL || ctx->cuda_norm == NULL || ctx->cuda_qkv == NULL ||
         ctx->cuda_attn == NULL || ctx->cuda_proj == NULL || ctx->cuda_ffn == NULL) {
         return 1;
@@ -6094,8 +6319,18 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
         pocket_error(error, capacity, "pocket: CUDA backbone KV capacity exhausted");
         return -1;
     }
+    /* MYNAH_CUDA_KV_GROW: widen the device cache before this step writes past
+     * it.  Nothing is queued yet, so a failure leaves the row untouched: a
+     * host-shadowed row continues on CPU, a device-owned one fails. */
+    if (pocket_cuda_backbone_reserve(ctx, position + 1u, error, capacity) != 0) {
+        if (!ctx->cuda_backbone_device_owned) {
+            ctx->cuda_backbone_enabled = 0;
+            ctx->cuda_backbone_valid = 0;
+        }
+        return -1;
+    }
     const size_t attn_dim = cfg->heads * cfg->head_dim;
-    const size_t layer_half = bc->max_seq_len * attn_dim;
+    const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
     char local[256];
     char drain_error[256];
     local[0] = '\0';
@@ -6288,10 +6523,16 @@ static int pocket_cuda_backbone_step_batch(
             config->max_period != first_config->max_period ||
             config->layernorm_eps != first_config->layernorm_eps) return 1;
         if (config->max_seq_len == 0u ||
-            ctx->cuda_backbone_capacity != config->max_seq_len) return 1;
+            ctx->cuda_backbone_capacity > config->max_seq_len) return 1;
         scratch->cuda_positions[i] =
             mynah_transformer_ar_state_offset(ctx->backbone);
         if (scratch->cuda_positions[i] >= config->max_seq_len) return -1;
+        /* MYNAH_CUDA_KV_GROW: widen a short device cache here, before
+         * `batch_begin` and any graph capture.  The step pre-flight has
+         * normally done it already; a failure leaves every row untouched and
+         * reports "not eligible", so the per-row path decides the row. */
+        if (pocket_cuda_backbone_reserve(ctx, scratch->cuda_positions[i] + 1u,
+                                         NULL, 0u) != 0) return 1;
         /* The resident KV allocation is [K/V][position][head].  max_seq_len
          * is the extent of one cache plane, not the stride between positions.
          * The old batch path multiplied by max_seq_len here, so the first
@@ -6316,7 +6557,8 @@ static int pocket_cuda_backbone_step_batch(
             size_t layer_span = 0u;
             size_t layer_offset = 0u;
             if (config == NULL ||
-                pocket_mul(config->max_seq_len, attn_dim, &layer_half) != 0 ||
+                pocket_mul(ctxs[i]->cuda_backbone_capacity, attn_dim,
+                           &layer_half) != 0 ||
                 pocket_mul(layer_half, 2u, &layer_span) != 0 ||
                 pocket_mul(l, layer_span, &layer_offset) != 0) return -1;
             const size_t metadata_offset = l * scratch->cuda_batch_capacity + i;
@@ -7058,13 +7300,18 @@ static int pocket_ctx_new(const mynah_tts_model *model, mynah_engine_state *stat
      * to the pool through ctx_free. */
     if (pocket_cuda_slot_pool_enabled(state)) {
         const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
+        /* What `pocket_cuda_backbone_alloc` will ask for: the full worst case,
+         * or the growable cache's starting size (MYNAH_CUDA_KV_GROW). */
+        const size_t bb_positions =
+            pocket_cuda_kv_initial_capacity(ctx, backbone_capacity);
         size_t bb_kv_bytes = 0u;
-        if (pocket_mul(backbone_capacity, attn_dim, &bb_kv_bytes) != 0 ||
+        if (pocket_mul(bb_positions, attn_dim, &bb_kv_bytes) != 0 ||
             pocket_mul(bb_kv_bytes, 2u * cfg->layers, &bb_kv_bytes) != 0 ||
             pocket_mul(bb_kv_bytes, kv_bf16 ? sizeof(uint16_t) : sizeof(float),
                        &bb_kv_bytes) != 0)
             bb_kv_bytes = SIZE_MAX;
-        ctx->cuda_slot = pocket_cuda_slot_acquire(state, bb_kv_bytes, kv_bf16);
+        ctx->cuda_slot = pocket_cuda_slot_acquire(
+            state, bb_kv_bytes, kv_bf16, bb_positions < backbone_capacity);
     }
     pocket_cuda_slot *slot = ctx->cuda_slot;
 
@@ -7479,6 +7726,13 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         const size_t target = final ? ctx->text_length : pocket_prepare_target(ctx);
         take[i] = target > ctx->text_prefilled ? target - ctx->text_prefilled : 0u;
         start[i] = ctx->voice_positions + ctx->text_prefilled;
+        /* MYNAH_CUDA_KV_GROW: the tile writes [start, start + take) and the
+         * voice copy [0, voice); both land in the cache as it is after this.
+         * Admission sizes the cache for voice + the whole text ceiling, so
+         * this is a guard, not the normal path. */
+        if (pocket_cuda_backbone_reserve(ctx, start[i] + take[i], error,
+                                         capacity) != 0)
+            return -1;
         total += take[i];
         if (take[i] > widest) widest = take[i];
     }
@@ -8217,6 +8471,29 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                              "pocket: request %zu has no KV capacity left (%zu positions)",
                              i, offset_before[i]);
                 return -1;
+            }
+            /* MYNAH_CUDA_KV_GROW: a growable device cache is widened here,
+             * before anything is queued or captured, so every backbone path
+             * below finds room for this step.  Growth moves no observable
+             * state (the live prefix is copied), so a refusal after it is
+             * still a refusal of an untouched batch.  A device-owned row that
+             * cannot grow fails the batch, and the driver's isolation retires
+             * only that row; a host-shadowed row just continues on CPU. */
+            if (ctx->cuda_backbone_enabled && ctx->cuda_backbone_kv != NULL &&
+                offset_before[i] >= ctx->cuda_backbone_capacity) {
+                char grow_error[256];
+                grow_error[0] = '\0';
+                if (pocket_cuda_backbone_reserve(ctx, offset_before[i] + 1u,
+                                                 grow_error,
+                                                 sizeof(grow_error)) != 0) {
+                    if (ctx->cuda_backbone_device_owned) {
+                        pocket_error(error, capacity, "pocket: request %zu: %s",
+                                     i, grow_error);
+                        return -1;
+                    }
+                    ctx->cuda_backbone_enabled = 0;
+                    ctx->cuda_backbone_valid = 0;
+                }
             }
         }
     }
