@@ -70,6 +70,46 @@ confined to 4 cores, plus: scheduler thread < 70% of one core at C60, zero
 stalls at 250 ms over a 30-minute soak, and CPU `make test` green after every
 shared-code change (the CPU path stays untouched).
 
+## Final qualification protocol
+
+A top concurrency is production-qualified only by this sequence, on one
+recorded build:
+
+1. **Two independent 30-min saturated closed-loop soaks** at that C, each on
+   a freshly started server (`tools/l4/soak.sh <tag> <C> 1800`), different
+   tags and ladder seeds, run one after the other.
+2. **v2 corpus**: `tools/corpus/pocket_v2_en.jsonl`, 300 distinct original
+   English utterances (short / conversational / medium / long paragraphs;
+   lists, parentheses, quotes, dashes, ellipses, numbers as words, names,
+   dialogue; American spelling so the ASR does not score spelling), drawn
+   with weights .25/.35/.28/.12 and four voices, deterministic by seed.
+3. **Captured audio**: `MYNAH_L4_SAVE_AUDIO` makes the ladder keep the PCM
+   exactly as the server streamed it under load (every Nth request id), as
+   WAV, never re-synthesised. The per-request JSONL names corpus id, text,
+   voice, seed, WAV and sample count for each.
+4. **WER on the captured audio**: `tools/pocket_quality.py --from-jsonl`
+   (faster-whisper small.en int8 CPU, parallel workers) gives WER overall,
+   per kind and per voice, every utterance > 30% WER, and auto-flags
+   words/s outside [1.2, 5.0], silences > 1.5 s (lead, trail, internal),
+   clipping > 0.1%, empty/silent streams and an abrupt end (last 50 ms loud).
+5. **Human listening**: `audio-<tag>.zip` holds the same WAVs plus a
+   manifest (text, voice, WER, flags) for spot listening, flagged rows first.
+6. **Bundle**: `tools/l4/bundle.sh <name> <tagA> <tagB>` collects git HEAD
+   plus sha256 of the binaries and sources (the box tree may be rsynced), the
+   server profile and its `MYNAH_*` env, the model pack's `source.json` and
+   `model.json`, the corpus, each soak's summary / per-request JSONL /
+   per-window report / server log / VRAM log / quality CSV and summary, the
+   audio ZIPs, and a `REPORT.md` with the headline numbers filled in
+   (throughput, TTFA and RTF p50/p95, stalls, failures, VRAM, WER) and the
+   listening and verdict sections left to a human.
+
+Pass: both soaks meet the gates above with zero failures and zero 250 ms
+stalls, no drift between halves, WER in line with the quiet-server gate and
+no unexplained flagged audio. At C128 (~130 audio-s/s) one soak streams
+~234,000 audio-s, 10.5 GiB of PCM16; `MYNAH_L4_SAVE_EVERY=10` keeps ~3,000
+WAVs (~1 GiB, ~6.5 h of audio) per soak, enough for every corpus line
+several times in every voice.
+
 ## Baseline on the new box (2026-09-28, tree 72cade4+, 24L, C16-C64 x 20 s)
 
 The box is an EPYC 7702 with 128 threads; `taskset -c 0-3 -w 4` models the

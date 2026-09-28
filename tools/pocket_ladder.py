@@ -18,18 +18,33 @@ measurement window. A request belongs to the window in which it was sent.
 
 Output: <out>/<tag>-c<C>.jsonl (one record per request) and a summary JSON
 line per level on stdout and in <out>/<tag>-summary.jsonl.
+
+Qualification options (all off by default; without them nothing changes):
+  --corpus PATH     JSONL of {"id","kind","text"} used instead of the built-in
+                    texts; kinds are drawn with --mix weights, and the
+                    utterance and seed are a pure function of (--seed, request id).
+  --voices a,b,c    one voice drawn per request, by seed (default: --voice).
+  --save-audio DIR  keep the PCM exactly as the server streamed it under load
+                    and write DIR/<tag>-c<C>-<reqid>.wav after the stream ends
+                    (on a writer thread, off the request's timed path). The
+                    per-request record gains the corpus id, text, voice, seed,
+                    wav path and sample count. --save-every N keeps every Nth
+                    request id; --save-max-mb stops saving past a disk cap.
 """
 
 import argparse
+import hashlib
 import http.client
 import json
 import math
 import os
+import queue
 import random
 import subprocess
 import sys
 import threading
 import time
+import wave
 
 TEXTS = {
     "short": [
@@ -68,16 +83,60 @@ TEXTS = {
 }
 
 MIX = {"short": 0.25, "conversational": 0.40, "medium": 0.25, "long": 0.10}
+CORPUS_MIX = "short=.25,conversational=.35,medium=.28,long=.12"
 
 
-def pick_text(rng):
+def builtin_pool():
+    """The built-in texts as the (id, text) pool a corpus produces."""
+    return {k: [("%s-%d" % (k, i), t) for i, t in enumerate(v)]
+            for k, v in TEXTS.items()}
+
+
+def load_corpus(path):
+    pool, ids = {}, set()
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r["id"] in ids:
+                raise SystemExit("%s:%d: duplicate id %s" % (path, n, r["id"]))
+            ids.add(r["id"])
+            pool.setdefault(r["kind"], []).append((r["id"], r["text"]))
+    if not pool:
+        raise SystemExit("%s: empty corpus" % path)
+    return pool
+
+
+def parse_mix(spec, pool):
+    mix = {}
+    for part in spec.split(","):
+        k, w = part.split("=")
+        mix[k.strip()] = float(w)
+    missing = [k for k, w in mix.items() if w > 0 and k not in pool]
+    if missing:
+        raise SystemExit("--mix kinds not in the corpus: %s" % ",".join(missing))
+    total = sum(mix.values())
+    if total <= 0:
+        raise SystemExit("--mix weights sum to zero")
+    return {k: w / total for k, w in mix.items() if w > 0}
+
+
+def pick_text(rng, mix=MIX, pool=None):
+    """(kind, id, text). Draws from rng exactly as the original built-in
+    picker did, so a default run sends the same requests as before."""
+    if pool is None:
+        pool = builtin_pool()
     r = rng.random()
     acc = 0.0
-    for kind, w in MIX.items():
+    for kind, w in mix.items():
         acc += w
         if r <= acc:
-            return kind, rng.choice(TEXTS[kind])
-    return "long", TEXTS["long"][0]
+            cid, text = rng.choice(pool[kind])
+            return kind, cid, text
+    kind = list(mix)[-1]
+    cid, text = pool[kind][0]
+    return kind, cid, text
 
 
 def pct(values, p):
@@ -138,7 +197,9 @@ class Recorder:
             self.records.append(rec)
 
 
-def one_request(host, port, body, bytes_per_s, timeout):
+def one_request(host, port, body, bytes_per_s, timeout, keep=None):
+    """keep: a list that receives each raw PCM chunk as it arrives (a
+    reference append, no copy and no I/O), or None when not saving."""
     rec = {"t_send": time.monotonic()}
     chunks = []
     try:
@@ -157,6 +218,8 @@ def one_request(host, port, body, bytes_per_s, timeout):
             if not data:
                 break
             chunks.append((time.monotonic(), len(data)))
+            if keep is not None:
+                keep.append(data)
         conn.close()
     except Exception as e:  # timeouts and disconnects are data, not crashes
         rec["error"] = "%s: %s" % (type(e).__name__, e)
@@ -190,6 +253,66 @@ def finish_record(rec, chunks, bytes_per_s, kind):
             rec["stall_s_%d" % int(pb * 1000)] = d
     rec["ok"] = rec.get("status") == 200 and "error" not in rec and nbytes > 0
     return rec
+
+
+class AudioSaver:
+    """Writes captured streams as WAV on one background thread, so a request
+    worker never waits on the disk. The PCM is written exactly as received
+    (an odd trailing byte, never expected, is dropped and flagged)."""
+
+    def __init__(self, a):
+        self.dir = a.save_audio
+        self.every = max(1, a.save_every)
+        self.cap = int(a.save_max_mb * 1048576)
+        self.rate = a.sample_rate
+        self.bytes = 0
+        self.saved = 0
+        self.skipped_cap = 0
+        self.errors = 0
+        self.closed = False
+        self.lock = threading.Lock()
+        self.q = queue.Queue()
+        os.makedirs(self.dir, exist_ok=True)
+        self.th = threading.Thread(target=self._run, daemon=True)
+        self.th.start()
+
+    def wants(self, reqid):
+        return reqid % self.every == 0
+
+    def submit(self, path, parts, nbytes):
+        """Queue one finished stream; False once the disk cap is reached."""
+        with self.lock:
+            if self.closed or self.bytes + nbytes + 44 > self.cap:
+                self.skipped_cap += 1
+                return False
+            self.bytes += nbytes + 44
+            self.saved += 1
+        self.q.put((path, parts))
+        return True
+
+    def _run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            path, parts = item
+            try:
+                pcm = b"".join(parts)
+                with wave.open(path, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(self.rate)
+                    w.writeframes(pcm[:len(pcm) & ~1])
+            except Exception as e:
+                with self.lock:
+                    self.errors += 1
+                print("save-audio: %s: %s" % (path, e), file=sys.stderr)
+
+    def close(self):
+        with self.lock:
+            self.closed = True  # a straggler finishing later is not saved
+        self.q.put(None)
+        self.th.join()
 
 
 def gpu_sampler(stop, out):
@@ -262,7 +385,7 @@ def parse_metrics(text):
 def run_level(a, conc, seed):
     rng = random.Random(seed)
     rec = Recorder()
-    stop_load = threading.Event()
+    saver = AudioSaver(a) if a.save_audio else None
     t_start = time.monotonic()
     t_meas = t_start + a.warmup
     t_end = t_meas + a.duration
@@ -271,10 +394,13 @@ def run_level(a, conc, seed):
 
     def body_for(i):
         r = random.Random(seed * 1000003 + i)
-        kind, text = pick_text(r)
-        return kind, {"model": "pocket", "input": text, "voice": a.voice,
-                      "response_format": "pcm", "stream": True,
-                      "seed": (seed * 7919 + i) % 1000000}
+        kind, cid, text = pick_text(r, a.mix_w, a.pool)
+        # Drawn, not i % len: --save-every N on ids would otherwise keep
+        # only the voices whose index shares a factor with N.
+        voice = r.choice(a.voice_list) if a.voice_list else a.voice
+        return kind, cid, {"model": "pocket", "input": text, "voice": voice,
+                           "response_format": "pcm", "stream": True,
+                           "seed": (seed * 7919 + i) % 1000000}
 
     def next_id():
         with seq_lock:
@@ -282,11 +408,28 @@ def run_level(a, conc, seed):
             return req_seq[0]
 
     def do_one(i):
-        kind, body = body_for(i)
+        kind, cid, body = body_for(i)
+        keep = [] if saver is not None and saver.wants(i) else None
         rec.enter()
-        r, chunks = one_request(a.host, a.port, body, a.bytes_per_s, a.timeout)
+        r, chunks = one_request(a.host, a.port, body, a.bytes_per_s, a.timeout,
+                                keep)
         r["id"] = i
-        rec.leave(finish_record(r, chunks, a.bytes_per_s, kind))
+        finish_record(r, chunks, a.bytes_per_s, kind)
+        if a.annotate:
+            r["corpus_id"] = cid
+            r["text"] = body["input"]
+            r["voice"] = body["voice"]
+            r["seed"] = body["seed"]
+        if keep is not None and r["bytes"] > 0:
+            r["samples"] = r["bytes"] // 2
+            if r["bytes"] & 1:
+                r["odd_byte"] = True
+            path = os.path.join(a.save_audio, "%s-c%d-%06d.wav" % (a.tag, conc, i))
+            if saver.submit(path, keep, r["bytes"]):
+                r["wav"] = os.path.abspath(path)
+            else:
+                r["wav_skipped"] = "save-max-mb"
+        rec.leave(r)
 
     threads = []
     rejected_client = [0]
@@ -338,6 +481,8 @@ def run_level(a, conc, seed):
     m1 = parse_metrics(fetch(a.host, a.port, "/metrics"))
     stop.set()
     t_last = time.monotonic()
+    if saver is not None:
+        saver.close()
 
     meas = [r for r in rec.records if r["t_send"] >= t_meas]
     ok = [r for r in meas if r["ok"]]
@@ -390,6 +535,18 @@ def run_level(a, conc, seed):
         "metrics_delta": delta,
         "wall_s": t_last - t_start,
     }
+    if a.annotate:
+        summary["corpus"] = os.path.abspath(a.corpus) if a.corpus else None
+        summary["corpus_sha256"] = a.corpus_sha256
+        summary["mix"] = a.mix_w
+        summary["voices"] = a.voice_list or [a.voice]
+    if saver is not None:
+        summary["save_audio"] = os.path.abspath(a.save_audio)
+        summary["save_every"] = saver.every
+        summary["saved_wavs"] = saver.saved
+        summary["saved_mb"] = saver.bytes / 1048576.0
+        summary["save_skipped_cap"] = saver.skipped_cap
+        summary["save_errors"] = saver.errors
     return summary
 
 
@@ -415,8 +572,31 @@ def main():
     ap.add_argument("--tag", default="run")
     ap.add_argument("--stop-rtf-p95", type=float, default=3.0,
                     help="stop escalating once streaming RTF p95 exceeds this")
+    ap.add_argument("--corpus", default="",
+                    help="JSONL corpus {id,kind,text} instead of the built-in texts")
+    ap.add_argument("--mix", default="",
+                    help="kind weights (default with --corpus: %s)" % CORPUS_MIX)
+    ap.add_argument("--voices", default="",
+                    help="comma list of voices, one drawn per request (by seed)")
+    ap.add_argument("--save-audio", default="",
+                    help="directory for WAVs of the audio as streamed")
+    ap.add_argument("--save-every", type=int, default=1,
+                    help="save every Nth request id (default 1: all)")
+    ap.add_argument("--save-max-mb", type=float, default=4000.0,
+                    help="stop saving once this many MB were written")
     a = ap.parse_args()
     a.bytes_per_s = a.sample_rate * 2
+    a.voice_list = [v.strip() for v in a.voices.split(",") if v.strip()]
+    a.corpus_sha256 = None
+    if a.corpus:
+        with open(a.corpus, "rb") as f:
+            a.corpus_sha256 = hashlib.sha256(f.read()).hexdigest()
+        a.pool = load_corpus(a.corpus)
+        a.mix_w = parse_mix(a.mix or CORPUS_MIX, a.pool)
+    else:
+        a.pool = builtin_pool()
+        a.mix_w = parse_mix(a.mix, a.pool) if a.mix else MIX
+    a.annotate = bool(a.corpus or a.save_audio or a.voice_list or a.mix)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "%s-health.json" % a.tag), "w") as f:
         f.write(fetch(a.host, a.port, "/health"))

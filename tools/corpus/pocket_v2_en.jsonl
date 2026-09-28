@@ -1,0 +1,300 @@
+{"id": "s001", "kind": "short", "text": "Yes, that works for me."}
+{"id": "s002", "kind": "short", "text": "Thanks, I'll call you back."}
+{"id": "s003", "kind": "short", "text": "Sure, one moment please."}
+{"id": "s004", "kind": "short", "text": "No problem at all."}
+{"id": "s005", "kind": "short", "text": "Good morning, everyone!"}
+{"id": "s006", "kind": "short", "text": "See you on Thursday."}
+{"id": "s007", "kind": "short", "text": "That's exactly what I meant."}
+{"id": "s008", "kind": "short", "text": "Hold on, let me check."}
+{"id": "s009", "kind": "short", "text": "Wow, that was fast!"}
+{"id": "s010", "kind": "short", "text": "Please close the door."}
+{"id": "s011", "kind": "short", "text": "It's raining again."}
+{"id": "s012", "kind": "short", "text": "Happy birthday, Margaret!"}
+{"id": "s013", "kind": "short", "text": "The kettle is boiling."}
+{"id": "s014", "kind": "short", "text": "I'm almost ready."}
+{"id": "s015", "kind": "short", "text": "Could you repeat that?"}
+{"id": "s016", "kind": "short", "text": "Welcome back, Daniel."}
+{"id": "s017", "kind": "short", "text": "Not today, thank you."}
+{"id": "s018", "kind": "short", "text": "Great news, honestly."}
+{"id": "s019", "kind": "short", "text": "The meeting starts soon."}
+{"id": "s020", "kind": "short", "text": "Where did you park?"}
+{"id": "s021", "kind": "short", "text": "Take the second exit."}
+{"id": "s022", "kind": "short", "text": "Dinner is on the table."}
+{"id": "s023", "kind": "short", "text": "Well... maybe tomorrow."}
+{"id": "s024", "kind": "short", "text": "Absolutely, count me in!"}
+{"id": "s025", "kind": "short", "text": "My phone just died."}
+{"id": "s026", "kind": "short", "text": "Let's try once more."}
+{"id": "s027", "kind": "short", "text": "The window won't open."}
+{"id": "s028", "kind": "short", "text": "Twenty minutes, give or take."}
+{"id": "s029", "kind": "short", "text": "Oh no, I forgot!"}
+{"id": "s030", "kind": "short", "text": "She said yes!"}
+{"id": "s031", "kind": "short", "text": "Turn the music down, please."}
+{"id": "s032", "kind": "short", "text": "We're out of milk."}
+{"id": "s033", "kind": "short", "text": "Nice to meet you, Priya."}
+{"id": "s034", "kind": "short", "text": "Is anyone sitting here?"}
+{"id": "s035", "kind": "short", "text": "Keep the change."}
+{"id": "s036", "kind": "short", "text": "Your order has shipped."}
+{"id": "s037", "kind": "short", "text": "The line is busy."}
+{"id": "s038", "kind": "short", "text": "Hmm, I'm not sure."}
+{"id": "s039", "kind": "short", "text": "Goodnight, sleep well."}
+{"id": "s040", "kind": "short", "text": "Seven o'clock sounds perfect."}
+{"id": "s041", "kind": "short", "text": "Mind the gap."}
+{"id": "s042", "kind": "short", "text": "I'll be right there."}
+{"id": "s043", "kind": "short", "text": "The printer is jammed again."}
+{"id": "s044", "kind": "short", "text": "Pass the salt, please."}
+{"id": "s045", "kind": "short", "text": "Congratulations on the new job!"}
+{"id": "s046", "kind": "short", "text": "It's colder than yesterday."}
+{"id": "s047", "kind": "short", "text": "Right, let's get started."}
+{"id": "s048", "kind": "short", "text": "That's a lovely garden."}
+{"id": "s049", "kind": "short", "text": "The battery is low."}
+{"id": "s050", "kind": "short", "text": "Don't worry about it."}
+{"id": "s051", "kind": "short", "text": "Leave it by the door."}
+{"id": "s052", "kind": "short", "text": "Three coffees and one tea."}
+{"id": "s053", "kind": "short", "text": "Honestly? I loved it."}
+{"id": "s054", "kind": "short", "text": "Check your inbox."}
+{"id": "s055", "kind": "short", "text": "The shop closes at six."}
+{"id": "s056", "kind": "short", "text": "Here you go."}
+{"id": "s057", "kind": "short", "text": "We missed the bus."}
+{"id": "s058", "kind": "short", "text": "Sounds good to me."}
+{"id": "s059", "kind": "short", "text": "Is this seat taken?"}
+{"id": "s060", "kind": "short", "text": "The results are in."}
+{"id": "s061", "kind": "short", "text": "Please sign here."}
+{"id": "s062", "kind": "short", "text": "Thank you so much, Oliver."}
+{"id": "s063", "kind": "short", "text": "Wait - which platform?"}
+{"id": "s064", "kind": "short", "text": "Almost there, keep going!"}
+{"id": "s065", "kind": "short", "text": "The soup needs more salt."}
+{"id": "s066", "kind": "short", "text": "Ask me again later."}
+{"id": "s067", "kind": "short", "text": "Everything looks fine."}
+{"id": "s068", "kind": "short", "text": "I can't hear you."}
+{"id": "s069", "kind": "short", "text": "Let me think about it."}
+{"id": "s070", "kind": "short", "text": "Good luck with the exam!"}
+{"id": "s071", "kind": "short", "text": "Fifteen people signed up."}
+{"id": "s072", "kind": "short", "text": "The cat is hiding again."}
+{"id": "s073", "kind": "short", "text": "Yes, please."}
+{"id": "s074", "kind": "short", "text": "Not bad at all."}
+{"id": "s075", "kind": "short", "text": "Say hello to Grandma."}
+{"id": "c001", "kind": "conversational", "text": "Hi, thanks for calling! How can I help you today?"}
+{"id": "c002", "kind": "conversational", "text": "Oh, you're looking for the blue one? I think we've got it in the back."}
+{"id": "c003", "kind": "conversational", "text": "I'm sorry, could you spell your last name for me?"}
+{"id": "c004", "kind": "conversational", "text": "Honestly, I didn't expect it to be so busy on a Tuesday."}
+{"id": "c005", "kind": "conversational", "text": "Wait, you're telling me the train's already gone?"}
+{"id": "c006", "kind": "conversational", "text": "Yeah, I know what you mean. It's been a long week."}
+{"id": "c007", "kind": "conversational", "text": "Would you like me to send the details by email or by text message?"}
+{"id": "c008", "kind": "conversational", "text": "Let me see... no, I can't find a booking under that name."}
+{"id": "c009", "kind": "conversational", "text": "Ah, there it is! Your table's ready whenever you are."}
+{"id": "c010", "kind": "conversational", "text": "Don't you think we should wait for Sam before we order?"}
+{"id": "c011", "kind": "conversational", "text": "Okay, so you'd like two nights, starting on Friday. Is that right?"}
+{"id": "c012", "kind": "conversational", "text": "Well, that's one way to look at it, I suppose."}
+{"id": "c013", "kind": "conversational", "text": "Are you sure? I could've sworn it was on the left."}
+{"id": "c014", "kind": "conversational", "text": "Oh dear, that doesn't sound good at all. What happened next?"}
+{"id": "c015", "kind": "conversational", "text": "I'll put you on hold for a moment while I check with my manager."}
+{"id": "c016", "kind": "conversational", "text": "Right, so the parcel left the warehouse yesterday and it's due tomorrow."}
+{"id": "c017", "kind": "conversational", "text": "Can I ask what the call is about, just so I can pass it on?"}
+{"id": "c018", "kind": "conversational", "text": "Ha! I told you it would work if we tried it again."}
+{"id": "c019", "kind": "conversational", "text": "Sorry, I didn't catch that. Could you say it one more time?"}
+{"id": "c020", "kind": "conversational", "text": "That's fine, we're not in a hurry. Take all the time you need."}
+{"id": "c021", "kind": "conversational", "text": "Excuse me, is this the way to the north entrance?"}
+{"id": "c022", "kind": "conversational", "text": "You've been really patient, and I appreciate it."}
+{"id": "c023", "kind": "conversational", "text": "So, what did the doctor say? Is everything all right?"}
+{"id": "c024", "kind": "conversational", "text": "No, no, it's my fault. I should've read the instructions first."}
+{"id": "c025", "kind": "conversational", "text": "Do you want the good news or the bad news first?"}
+{"id": "c026", "kind": "conversational", "text": "Well, I'd rather not. Maybe next time, okay?"}
+{"id": "c027", "kind": "conversational", "text": "Let's see, you've got a window seat and one checked bag."}
+{"id": "c028", "kind": "conversational", "text": "Why didn't anybody tell me the meeting had moved?"}
+{"id": "c029", "kind": "conversational", "text": "Oh, brilliant! That saves us a trip to the post office."}
+{"id": "c030", "kind": "conversational", "text": "It's no trouble at all. I was heading that way anyway."}
+{"id": "c031", "kind": "conversational", "text": "Could you hold the elevator, please? I'll just be a second!"}
+{"id": "c032", "kind": "conversational", "text": "I'm afraid we're fully booked tonight, but we have space on Sunday."}
+{"id": "c033", "kind": "conversational", "text": "Hey, Lucas! Long time no see. How've you been?"}
+{"id": "c034", "kind": "conversational", "text": "They're saying it'll clear up by the afternoon, so fingers crossed."}
+{"id": "c035", "kind": "conversational", "text": "Wait, wait, wait. Say that again, slowly."}
+{"id": "c036", "kind": "conversational", "text": "I wouldn't worry too much. These things usually sort themselves out."}
+{"id": "c037", "kind": "conversational", "text": "Would it help if I sent you a reminder the day before?"}
+{"id": "c038", "kind": "conversational", "text": "Yes, I can confirm that your refund has been approved."}
+{"id": "c039", "kind": "conversational", "text": "Oops, I think I pressed the wrong button. Can we start over?"}
+{"id": "c040", "kind": "conversational", "text": "Isn't it funny how the quiet ones always surprise you?"}
+{"id": "c041", "kind": "conversational", "text": "Thanks for waiting. I've found three options that might suit you."}
+{"id": "c042", "kind": "conversational", "text": "What time do you close on weekends?"}
+{"id": "c043", "kind": "conversational", "text": "Oh, you're kidding! She actually won?"}
+{"id": "c044", "kind": "conversational", "text": "Sure thing. I'll put it in the mail first thing tomorrow."}
+{"id": "c045", "kind": "conversational", "text": "Let me just double check the address. Is it still Maple Lane?"}
+{"id": "c046", "kind": "conversational", "text": "We'd love to come, but we've already made plans for Saturday."}
+{"id": "c047", "kind": "conversational", "text": "Is there anything else I can help you with today?"}
+{"id": "c048", "kind": "conversational", "text": "Oh, the traffic was terrible. I'm so sorry I'm late."}
+{"id": "c049", "kind": "conversational", "text": "Right, you'll need your passport, your ticket, and a pen."}
+{"id": "c050", "kind": "conversational", "text": "How long have you been waiting? Not too long, I hope."}
+{"id": "c051", "kind": "conversational", "text": "I see. And when did you first notice the noise?"}
+{"id": "c052", "kind": "conversational", "text": "Oh, that's a shame. Is there any chance they'll reopen next month?"}
+{"id": "c053", "kind": "conversational", "text": "Honestly, you've done more than enough. Go home and rest."}
+{"id": "c054", "kind": "conversational", "text": "Would you mind if I opened the window a little?"}
+{"id": "c055", "kind": "conversational", "text": "Hang on, I've got a better idea."}
+{"id": "c056", "kind": "conversational", "text": "Yes, yes, that's the account I'm calling about."}
+{"id": "c057", "kind": "conversational", "text": "Could you tell me a bit more about what you're looking for?"}
+{"id": "c058", "kind": "conversational", "text": "Well done, Aisha! That was a brilliant presentation."}
+{"id": "c059", "kind": "conversational", "text": "I'm not sure I follow. Do you mean the old office or the new one?"}
+{"id": "c060", "kind": "conversational", "text": "That's all right, it happens to all of us."}
+{"id": "c061", "kind": "conversational", "text": "So you're saying we should leave before sunrise? Really?"}
+{"id": "c062", "kind": "conversational", "text": "Of course! I'd be happy to walk you through it."}
+{"id": "c063", "kind": "conversational", "text": "Sorry to bother you, but have you seen a small black umbrella?"}
+{"id": "c064", "kind": "conversational", "text": "Okay, I've updated your number. You should get a confirmation shortly."}
+{"id": "c065", "kind": "conversational", "text": "Believe me, I've tried everything. It still won't start."}
+{"id": "c066", "kind": "conversational", "text": "Didn't you say you'd already booked the tickets?"}
+{"id": "c067", "kind": "conversational", "text": "Oh, that's really sweet of you. Thank you!"}
+{"id": "c068", "kind": "conversational", "text": "If you'd like, I can transfer you to our billing team."}
+{"id": "c069", "kind": "conversational", "text": "Is it just me, or is it getting warmer in here?"}
+{"id": "c070", "kind": "conversational", "text": "Good question. I'll have to check and get back to you."}
+{"id": "c071", "kind": "conversational", "text": "Look, I'm not angry. I just want to understand what went wrong."}
+{"id": "c072", "kind": "conversational", "text": "All right then, see you at the station at half past seven."}
+{"id": "c073", "kind": "conversational", "text": "You're welcome. Enjoy the rest of your day!"}
+{"id": "c074", "kind": "conversational", "text": "Hmm, that's odd. It worked perfectly fine yesterday."}
+{"id": "c075", "kind": "conversational", "text": "Can you hear me now? Is that any better?"}
+{"id": "c076", "kind": "conversational", "text": "I'd go with the smaller one, if I were you."}
+{"id": "c077", "kind": "conversational", "text": "Yes! Finally! I've been waiting all week for this."}
+{"id": "c078", "kind": "conversational", "text": "What do you think, should we take the coast road?"}
+{"id": "c079", "kind": "conversational", "text": "No worries, just let me know when you've decided."}
+{"id": "c080", "kind": "conversational", "text": "I've got good news: your application's been accepted."}
+{"id": "c081", "kind": "conversational", "text": "Hold on, isn't that Rosa's car parked outside?"}
+{"id": "c082", "kind": "conversational", "text": "Oh, go on then, just one more slice."}
+{"id": "c083", "kind": "conversational", "text": "It's been lovely chatting with you, Henry."}
+{"id": "c084", "kind": "conversational", "text": "Where would you like me to put these boxes?"}
+{"id": "c085", "kind": "conversational", "text": "Honestly, I think the first draft was better."}
+{"id": "c086", "kind": "conversational", "text": "That's the thing, isn't it? Nobody ever asks."}
+{"id": "c087", "kind": "conversational", "text": "Could we move the call to tomorrow morning instead?"}
+{"id": "c088", "kind": "conversational", "text": "Ah, I see what's happened. The form wasn't submitted."}
+{"id": "c089", "kind": "conversational", "text": "Are you coming to the party, or are you still working?"}
+{"id": "c090", "kind": "conversational", "text": "Oh my goodness, look at the size of that cake!"}
+{"id": "c091", "kind": "conversational", "text": "Don't forget your keys this time, okay?"}
+{"id": "c092", "kind": "conversational", "text": "I'm calling to check on the status of my repair."}
+{"id": "c093", "kind": "conversational", "text": "Okay, and would you like a receipt with that?"}
+{"id": "c094", "kind": "conversational", "text": "Seriously, though, thank you for everything you did today."}
+{"id": "c095", "kind": "conversational", "text": "You'll find the forms on the desk by the entrance."}
+{"id": "c096", "kind": "conversational", "text": "Well, well, look who finally decided to show up!"}
+{"id": "c097", "kind": "conversational", "text": "Shall I read the list back to you, just to be sure?"}
+{"id": "c098", "kind": "conversational", "text": "Nope, not a single message since this morning."}
+{"id": "c099", "kind": "conversational", "text": "I get it, really. Change is hard for everyone."}
+{"id": "c100", "kind": "conversational", "text": "Can I get back to you after lunch? I'm swamped right now."}
+{"id": "m001", "kind": "medium", "text": "The train leaves the central station at a quarter past eight and arrives just before noon. If you prefer a quieter trip, the later service has more free seats."}
+{"id": "m002", "kind": "medium", "text": "Our support team is available every day from nine in the morning to six in the evening, and outside those hours you can leave a message."}
+{"id": "m003", "kind": "medium", "text": "Before you leave, please remember to switch off the lights, lock the back door, and feed the cat."}
+{"id": "m004", "kind": "medium", "text": "The recipe calls for two cups of flour, one egg, a pinch of salt, and enough milk to make a smooth batter."}
+{"id": "m005", "kind": "medium", "text": "Anna looked at the map for a long time, then folded it carefully and said, \"We're going the wrong way.\""}
+{"id": "m006", "kind": "medium", "text": "The museum (which reopened last spring) now has a garden restaurant on the roof, and it's open until late on Fridays."}
+{"id": "m007", "kind": "medium", "text": "Nobody expected the storm to arrive so early — the boats were still out, and the harbor was full of tourists."}
+{"id": "m008", "kind": "medium", "text": "Three things matter most in this job: patience, honesty, and a good sense of humor."}
+{"id": "m009", "kind": "medium", "text": "I waited, and waited, and waited... and then the bus drove straight past without stopping."}
+{"id": "m010", "kind": "medium", "text": "The new bridge is almost two miles long, and it took nearly four years to build."}
+{"id": "m011", "kind": "medium", "text": "When Maria finally opened the letter, she laughed out loud and called her sister right away."}
+{"id": "m012", "kind": "medium", "text": "If the weather holds, we'll walk along the river to the old mill and have lunch by the waterfall."}
+{"id": "m013", "kind": "medium", "text": "The doctor said, \"Rest for a week, drink plenty of water, and call me if the fever comes back.\""}
+{"id": "m014", "kind": "medium", "text": "Please bring the following items on Monday: a packed lunch, a waterproof jacket, and sturdy walking shoes."}
+{"id": "m015", "kind": "medium", "text": "My grandfather kept bees for fifty years, and he still remembers the name of every single queen."}
+{"id": "m016", "kind": "medium", "text": "The concert was supposed to start at eight, but the pianist didn't arrive until nearly half past nine."}
+{"id": "m017", "kind": "medium", "text": "Ben and Chloe spent the whole afternoon repainting the fence — white at first, then a pale shade of green."}
+{"id": "m018", "kind": "medium", "text": "Honestly, the hardest part of learning to swim wasn't the water; it was trusting that it would hold me up."}
+{"id": "m019", "kind": "medium", "text": "The library will be closed on Friday for maintenance, so any books due that day can be returned on Saturday."}
+{"id": "m020", "kind": "medium", "text": "There are four seasons in a year, twelve months, and roughly three hundred and sixty five days."}
+{"id": "m021", "kind": "medium", "text": "Our neighbor, a retired sailor named Walter, tells the same story about a whale every single summer."}
+{"id": "m022", "kind": "medium", "text": "The children lined up by the gate, each holding a lantern, and waited for the parade to begin."}
+{"id": "m023", "kind": "medium", "text": "It wasn't the view that impressed me (although it was spectacular); it was how quiet everything was."}
+{"id": "m024", "kind": "medium", "text": "The shop sells fresh bread, local cheese, homemade jam, and — if you're lucky — warm apple pie."}
+{"id": "m025", "kind": "medium", "text": "After three failed attempts, Tom finally managed to fix the leaking faucet with nothing but an old key."}
+{"id": "m026", "kind": "medium", "text": "\"Is it far?\" asked the boy. \"Not far at all,\" replied the old woman, pointing toward the hills."}
+{"id": "m027", "kind": "medium", "text": "The hotel offers a free breakfast between seven and ten, and the pool is open until nine in the evening."}
+{"id": "m028", "kind": "medium", "text": "We planted sunflowers along the fence last spring, and by August they were taller than the shed."}
+{"id": "m029", "kind": "medium", "text": "The final exam covers chapters one through six, so please review your notes carefully before next week."}
+{"id": "m030", "kind": "medium", "text": "Grace switched off the radio, sat down by the window, and watched the snow slowly cover the street."}
+{"id": "m031", "kind": "medium", "text": "Every morning at dawn, the fishermen gather at the pier to check the weather and share the latest news."}
+{"id": "m032", "kind": "medium", "text": "The package contains one charger, two cables, a short manual, and a small card with the warranty details."}
+{"id": "m033", "kind": "medium", "text": "It's not that I don't like surprises... it's just that I prefer to know about them in advance."}
+{"id": "m034", "kind": "medium", "text": "Our flight was delayed by two hours, which meant we arrived just as the sun was setting over the bay."}
+{"id": "m035", "kind": "medium", "text": "The committee met three times this month, and each meeting lasted well over an hour."}
+{"id": "m036", "kind": "medium", "text": "Samuel says he can cook anything, but so far we've only ever seen him make toast!"}
+{"id": "m037", "kind": "medium", "text": "The trail climbs steeply for the first mile, then levels out along a ridge with views across the valley."}
+{"id": "m038", "kind": "medium", "text": "Please remember that the office moves to the second floor next week, right beside the meeting rooms."}
+{"id": "m039", "kind": "medium", "text": "Leo tried to explain the rules of the game, but by the end even he looked confused."}
+{"id": "m040", "kind": "medium", "text": "The garden is at its best in June, when the roses bloom and the evenings stay light until ten."}
+{"id": "m041", "kind": "medium", "text": "According to the guide, the castle was built over six hundred years ago and has never been captured."}
+{"id": "m042", "kind": "medium", "text": "We ordered soup, salad, and bread to share — and then, of course, three different desserts."}
+{"id": "m043", "kind": "medium", "text": "Isabel kept a small notebook in her pocket, where she wrote down every interesting word she heard."}
+{"id": "m044", "kind": "medium", "text": "If you're feeling tired, take a short break, stretch your legs, and have a glass of water."}
+{"id": "m045", "kind": "medium", "text": "The storm knocked out the power for most of the night, so we played cards by candlelight."}
+{"id": "m046", "kind": "medium", "text": "Our cousin Mateo arrives on Thursday evening, and he's staying with us for the whole summer."}
+{"id": "m047", "kind": "medium", "text": "The market square fills up quickly on Saturdays, so it's best to arrive before nine if you want a table."}
+{"id": "m048", "kind": "medium", "text": "She paused at the door, turned around, and whispered, \"Thank you for listening.\""}
+{"id": "m049", "kind": "medium", "text": "The team scored twice in the last ten minutes, and the crowd went absolutely wild!"}
+{"id": "m050", "kind": "medium", "text": "My advice? Start early, pack light, and always carry a spare pair of socks."}
+{"id": "m051", "kind": "medium", "text": "The painting shows a quiet harbor at sunset, with small boats resting on the calm, golden water."}
+{"id": "m052", "kind": "medium", "text": "Before the lecture began, the professor wrote a single question on the board: \"Why do we forget?\""}
+{"id": "m053", "kind": "medium", "text": "Julia's bakery opens at six every morning, and there's usually a line outside by half past five."}
+{"id": "m054", "kind": "medium", "text": "When the lights went out, everyone froze... and then somebody started to laugh."}
+{"id": "m055", "kind": "medium", "text": "The instructions were simple: fill the tank, check the tires, and don't forget to return the keys."}
+{"id": "m056", "kind": "medium", "text": "We walked for hours along the empty beach, collecting shells and talking about everything and nothing."}
+{"id": "m057", "kind": "medium", "text": "The concert hall holds roughly two thousand people, yet on Tuesday it felt strangely empty."}
+{"id": "m058", "kind": "medium", "text": "Oscar isn't a morning person; he needs at least two cups of coffee before he'll say a single word."}
+{"id": "m059", "kind": "medium", "text": "The recipe says to bake the bread for forty minutes, but in our old oven it always takes longer."}
+{"id": "m060", "kind": "medium", "text": "On clear nights you can see the lighthouse from the top of the hill, blinking slowly out at sea."}
+{"id": "m061", "kind": "medium", "text": "My sister studies marine biology, and she spends most of her summers counting seals on a tiny island."}
+{"id": "m062", "kind": "medium", "text": "\"We'll be back before dark,\" they promised — but of course, they weren't."}
+{"id": "m063", "kind": "medium", "text": "The school play was a huge success, even though the scenery fell over during the second act."}
+{"id": "m064", "kind": "medium", "text": "Please make sure your seat belt is fastened and your bags are stored under the seat in front of you."}
+{"id": "m065", "kind": "medium", "text": "The river was so clear that we could see small silver fish darting between the stones."}
+{"id": "m066", "kind": "medium", "text": "Nora's plan was ambitious (some said impossible), but she finished the whole project in a single month."}
+{"id": "m067", "kind": "medium", "text": "It took the builders eleven weeks to repair the roof, mostly because it rained almost every day."}
+{"id": "m068", "kind": "medium", "text": "Wait for the green light, look both ways, and then cross the road quickly and carefully."}
+{"id": "m069", "kind": "medium", "text": "The village holds a fair every fall, with music, games, and a competition for the largest pumpkin."}
+{"id": "m070", "kind": "medium", "text": "Ethan swore he'd never go camping again — and yet, here he is, packing a tent for the weekend."}
+{"id": "m071", "kind": "medium", "text": "Some people love the city at night, with its bright windows and busy streets; others prefer the silence of the countryside."}
+{"id": "m072", "kind": "medium", "text": "Our guide, a cheerful woman called Hannah, knew the history of every building we passed."}
+{"id": "m073", "kind": "medium", "text": "The meeting ended early, so we grabbed lunch at the little place across the street."}
+{"id": "m074", "kind": "medium", "text": "The more I think about it... the less sure I am that this is a good idea."}
+{"id": "m075", "kind": "medium", "text": "Dinner will be served at eight, followed by music and dancing in the main hall."}
+{"id": "m076", "kind": "medium", "text": "The old clock in the square stopped at a quarter to four, and nobody has ever managed to fix it."}
+{"id": "m077", "kind": "medium", "text": "The puppy chewed one slipper, two cushions, and — somehow — the corner of the kitchen table."}
+{"id": "m078", "kind": "medium", "text": "When you reach the fountain, turn right and follow the narrow lane until you see a blue door."}
+{"id": "m079", "kind": "medium", "text": "The weather forecast promises sunshine all weekend, which is perfect for the picnic on Sunday."}
+{"id": "m080", "kind": "medium", "text": "Victor read the last page of the novel, closed the book, and sat in silence for a very long time."}
+{"id": "m081", "kind": "medium", "text": "We've got plenty of chairs, but we'll need at least three more tables for the guests."}
+{"id": "m082", "kind": "medium", "text": "The theater was packed, the actors were brilliant, and the ending left everyone in tears."}
+{"id": "m083", "kind": "medium", "text": "My favorite sound in the world is rain on a tin roof while I'm warm and dry inside."}
+{"id": "m084", "kind": "medium", "text": "The shop assistant wrapped the vase in paper, then in a cloth, and finally placed it in a sturdy box."}
+{"id": "m085", "kind": "medium", "text": "Twenty years later, they met again by chance at the same small station where they had first said goodbye."}
+{"id": "l001", "kind": "long", "text": "When the old lighthouse was finally restored, the whole village came down to the harbor to watch the lamp being lit for the first time in forty years. Children climbed onto the sea wall, fishermen left their nets half mended, and the baker handed out warm bread to anyone who passed his door. As the light swept across the water, a few of the older residents admitted that they had never expected to see it shine again, and for a long moment nobody said anything at all."}
+{"id": "l002", "kind": "long", "text": "Every summer, my grandmother would take us to a little cottage by the lake. There was no television, no internet, and only one radio that picked up a single station. At first we complained constantly, but after a day or two something changed. We spent our mornings swimming, our afternoons reading on the porch, and our evenings playing cards by the light of an old oil lamp. Looking back now, I think those were some of the happiest weeks of my life, and I still dream about the sound of the water against the dock."}
+{"id": "l003", "kind": "long", "text": "The bakery on the corner has been run by the same family for three generations. Every morning, long before the sun comes up, the ovens are already warm and the first loaves are rising. By six o'clock there is a line outside the door: nurses coming off the night shift, builders on their way to work, and a few sleepy students who have not yet been to bed. The owner, a quiet man named Arthur, greets each of them by name, and he never lets anyone leave without something warm to eat."}
+{"id": "l004", "kind": "long", "text": "Setting up your new speaker is simple. First, plug the power cable into the back of the unit and wait until the light on the front turns white. Next, open the app on your phone, tap the button that says add device, and follow the instructions on the screen. If the speaker does not appear in the list, move a little closer and try again. Once it is connected, you can adjust the volume, choose a playlist, or group it with other speakers in your home. That's it! You're ready to enjoy your music."}
+{"id": "l005", "kind": "long", "text": "\"Are you sure this is the right road?\" asked Clara, peering through the rain. \"Absolutely,\" said her brother, although he did not sound sure at all. They drove on in silence for another ten minutes, passing nothing but fields and the occasional sleepy cow. Then, just as Clara was about to suggest turning back, a small wooden sign appeared at the side of the road. It was crooked, faded, and half covered in ivy, but they could just make out the words: welcome to Little Harbor. Her brother grinned. \"Told you so.\""}
+{"id": "l006", "kind": "long", "text": "The town council announced on Wednesday that the old railway line will be turned into a walking and cycling path. The project, which is expected to take about two years, will connect four villages along the valley and pass through some of the most beautiful countryside in the region. Local residents have welcomed the news, although some have raised concerns about parking near the entrances. A public meeting will be held next month, where people can see the plans, ask questions, and suggest names for the new path."}
+{"id": "l007", "kind": "long", "text": "People often ask me why I decided to become a teacher. The honest answer is that I never really decided at all; it simply happened, one small step at a time. I helped a friend with her homework, then a neighbor's son, then a whole group of children at the community center. Somewhere along the way I noticed that the best part of my week was the moment when someone finally understood something they had been struggling with. That moment, that little spark of surprise, is still the reason I go to work every day."}
+{"id": "l008", "kind": "long", "text": "Bees are remarkable navigators. When a worker bee finds a good patch of flowers, she returns to the hive and performs a short dance for her sisters. The direction of the dance tells the others which way to fly, relative to the position of the sun, and the length of the dance tells them how far to go. Even more surprisingly, bees can adjust their directions as the sun moves across the sky during the day. Scientists have studied this behavior for nearly a century, and they are still discovering new details about how it works."}
+{"id": "l009", "kind": "long", "text": "For the camping trip, each person will need to bring the following: a sleeping bag, a warm sweater, a flashlight with spare batteries, a water bottle, and a pair of comfortable boots. We will provide the tents, the cooking equipment, and all of the food, so please do not bring any snacks that might attract animals. The walk to the campsite takes about two hours, with a short break halfway. If it rains, and it probably will at least once, we'll shelter in the old barn near the river and carry on when the weather clears."}
+{"id": "l010", "kind": "long", "text": "Thank you for contacting our customer support team. We are currently experiencing a higher than usual number of calls, so your wait may be a little longer than normal. While you wait, you might find the answer to your question on our website, where you can track your order, update your address, or request a refund in just a few steps. If you would prefer to speak to someone directly, please stay on the line. Your call is important to us, and one of our advisers will be with you as soon as possible."}
+{"id": "l011", "kind": "long", "text": "I remember standing at the edge of the stage, waiting for my name to be called... my hands were shaking, my mouth was completely dry, and I had forgotten the first line of my speech. Then the lights came up, and I saw my mother sitting in the third row, smiling as though nothing in the world could go wrong. I took a deep breath, stepped forward, and somehow the words came back to me. I don't remember anything else about that evening, but I will never forget that smile."}
+{"id": "l012", "kind": "long", "text": "The old stone bridge in the center of town was built more than four hundred years ago, when the river was the main route for traders traveling inland. Over the centuries it has survived floods, fires, and at least one very determined attempt to replace it with something more modern. Today it carries only pedestrians and the occasional bicycle, but on summer evenings it is one of the busiest places in town, crowded with people eating ice cream, taking photographs, and watching the boats drift slowly underneath."}
+{"id": "l013", "kind": "long", "text": "To make a simple tomato soup, start by gently frying a chopped onion and two cloves of garlic in a little olive oil. When they are soft, add two pounds of ripe tomatoes, a pinch of salt, and a teaspoon of sugar, then let everything simmer for about twenty minutes. Blend the soup until it is smooth, taste it, and add more salt or pepper if it needs it. Serve it hot with a spoonful of cream and some fresh bread. It is even better the next day, so don't be afraid to make a large pot."}
+{"id": "l014", "kind": "long", "text": "It was the final minute of the match, and the score was still level. The crowd had been on its feet for nearly ten minutes, singing and shouting and waving their scarves above their heads. Then, almost out of nowhere, the young midfielder picked up a loose ball, dodged one defender, then another, and sent a low shot curling toward the far corner. For a moment the whole stadium seemed to hold its breath. The keeper stretched, the ball struck the inside of the post... and rolled into the net."}
+{"id": "l015", "kind": "long", "text": "If you only have one day in the city, start early with a walk through the old market, where the stalls open at sunrise and the coffee is strong and cheap. From there, follow the river toward the cathedral, stopping to look at the painted houses along the way. After lunch, take the little tram up the hill to the gardens, which offer the best view of the rooftops. Finally, as the sun goes down, find a table in one of the small squares, order something to eat, and simply watch the city come alive."}
+{"id": "l016", "kind": "long", "text": "\"Hello? Hello, can you hear me?\" \"Yes, I can hear you now. Where are you?\" \"I'm at the station, but the last train has been canceled, and there are no taxis anywhere.\" \"Oh no. Do you want me to come and get you?\" \"Would you? I'm so sorry, I know it's late.\" \"Don't be silly, it's fine. Stay inside where it's warm, and I'll be there in about twenty minutes. Look out for the red car.\" \"Thank you. Honestly, you're a lifesaver.\""}
+{"id": "l017", "kind": "long", "text": "The forest was completely silent after the snowfall. Every branch was coated in white, and the path had disappeared beneath a smooth, untouched blanket that sparkled faintly in the low winter sun. Somewhere in the distance a bird called once and then fell quiet again. We walked slowly, leaving the first footprints of the day, and every now and then a small clump of snow would slide from a branch and land with a soft thud beside us. It felt as though the whole world had paused to rest."}
+{"id": "l018", "kind": "long", "text": "Good morning, everyone, and thank you for joining this call. Before we begin, I'd like to share a few quick updates. First, the new office will be ready at the end of next month, and we'll send out a floor plan later this week. Second, the annual survey is now open, and we would really appreciate your feedback, whether it's positive or negative. Finally, a big thank you to Fatima and her team, who worked through the weekend to fix the problem with the booking system. Right, let's get started with the first item on the agenda."}
+{"id": "l019", "kind": "long", "text": "Once upon a time, in a village at the edge of a great forest, there lived a little fox who was afraid of the dark. Every evening, when the sun began to set, he would curl up in his den and cover his eyes with his tail. One night, a friendly owl landed on the branch above him and asked what was wrong. \"The dark is full of things I cannot see,\" said the fox. The owl laughed softly. \"Then come with me,\" she said, \"and I will show you the stars.\""}
+{"id": "l020", "kind": "long", "text": "Getting a good night's sleep is one of the simplest things you can do for your health. Try to go to bed and wake up at the same time every day, even on weekends. Keep your bedroom cool, dark, and quiet, and avoid looking at bright screens for an hour or so before you sleep. Caffeine can stay in your body for many hours, so it's best to switch to water or herbal tea after lunch. And if you can't fall asleep after twenty minutes, get up, do something calm, and try again later."}
+{"id": "l021", "kind": "long", "text": "Detective Moreau studied the room carefully. The window was locked from the inside, the fire had been lit recently, and a half finished cup of tea sat on the desk, still slightly warm. Nothing appeared to be missing, and yet the owner of the house insisted that someone had been there. Moreau walked slowly around the desk, then stopped and knelt beside the fireplace. Among the ashes lay a small scrap of paper, blackened at the edges, with just three words still visible: meet me tonight."}
+{"id": "l022", "kind": "long", "text": "A password manager is a program that remembers your passwords for you, so you only need to remember one strong master password. When you create an account on a new website, the manager can generate a long, random password and store it safely. The next time you visit, it fills in the details automatically. This means you can use a different password for every site without writing them down or reusing the same one again and again, which is one of the most common ways that accounts are stolen."}
+{"id": "l023", "kind": "long", "text": "My first job was washing dishes in a busy restaurant near the harbor. The kitchen was hot, loud, and chaotic, and the head chef, a tall woman called Beatrice, shouted instructions at everyone from the moment we arrived. I was terrified of her for about a week. Then, one evening after a particularly difficult shift, she sat down beside me, handed me a plate of pasta, and said, \"You did well today.\" It was only four words, but I have never forgotten them."}
+{"id": "l024", "kind": "long", "text": "Here is the weather forecast for the rest of the week. Tomorrow will start cloudy, with a chance of light showers in the morning, but it should brighten up by the afternoon. Thursday looks mostly dry and a little warmer, although a strong wind will make it feel cooler near the coast. On Friday, a band of heavy rain will move in from the west, bringing the risk of flooding in low lying areas. The weekend should be calmer, with sunny spells and only the occasional shower."}
+{"id": "l025", "kind": "long", "text": "Some people say that cities are too crowded, too noisy, and too expensive — and in many ways, they're right. But cities are also where strangers meet, where new ideas spread quickly, and where you can find almost anything at any hour of the day. For every person who dreams of escaping to a quiet cottage in the countryside, there is another who has just arrived from a small village, full of excitement and ready to begin a completely new life. Perhaps both of them are looking for the same thing."}
+{"id": "l026", "kind": "long", "text": "Welcome to the east gallery. The large painting in front of you was completed in the spring of the artist's final year, when she was already too ill to leave her home. Look closely at the window on the left: the light falling across the floor was painted with only three colors, yet it seems to glow. Notice, too, the small figure in the doorway. For many years, experts believed it was her daughter, but recent research suggests it may actually be a self portrait. When you are ready, please continue to the next room."}
+{"id": "l027", "kind": "long", "text": "What a day! First, the alarm didn't go off, so I woke up twenty minutes late. Then I discovered we had run out of coffee. Then the bus broke down halfway into town, and we all had to walk the rest of the way in the rain. By the time I finally reached the office, soaked and grumpy, I found a note on my desk saying that the meeting had been canceled. Honestly! I just stood there for a moment, and then I started laughing so hard that my colleagues came over to see what was wrong."}
+{"id": "l028", "kind": "long", "text": "Fall is a surprisingly busy time in the garden. The leaves need raking, of course, but they shouldn't be thrown away; piled up in a quiet corner, they will slowly turn into rich, dark soil for next year. This is also the perfect moment to plant bulbs, such as tulips, daffodils, and crocuses, which will rest underground all winter and appear as if by magic in the spring. Finally, remember to clean and sharpen your tools before you put them away, so they're ready when the warmer days return."}
+{"id": "l029", "kind": "long", "text": "The ship left the harbor just before dawn, its sails heavy with the morning mist. On deck, a young sailor named Elias watched the lights of the town fade one by one until only the lighthouse remained, a single point of gold on the dark horizon. He had dreamed of this moment for years, and now that it had finally come, he felt strangely calm. Behind him, the captain called out orders, the ropes creaked, and the ship turned slowly toward the open sea."}
+{"id": "l030", "kind": "long", "text": "Dear neighbors, I'm writing to apologize for the noise coming from our house over the past few weeks. As some of you may know, we are replacing the kitchen and the old floors, and the work has turned out to be much louder than we expected. The builders have promised that the noisiest part will be finished by the end of this week. In the meantime, if there is anything we can do to make things easier, please knock on our door. Thank you for your patience and understanding."}
+{"id": "l031", "kind": "long", "text": "The rules of the game are simple. Each player starts with seven cards, and the aim is to be the first to get rid of all of them. On your turn, you may play one card that matches either the color or the number of the card on the table. If you cannot play, you must draw a card from the pile. Special cards let you skip the next player, reverse the direction of play, or force someone to draw extra cards. And remember: when you have only one card left, you have to say so out loud!"}
+{"id": "l032", "kind": "long", "text": "At night the city changes completely. The offices empty out, the traffic thins, and the streets fill with a different kind of crowd: musicians carrying their instruments to late shows, cooks stepping outside for a breath of air, couples strolling slowly home after dinner. The shop windows glow softly, the river reflects a thousand lights, and from somewhere above the rooftops comes the faint sound of a trumpet playing a slow, sad tune. Even people who have lived here all their lives sometimes stop and simply listen."}
+{"id": "l033", "kind": "long", "text": "Imagine standing on the surface of the moon and looking back toward the earth. You would see a small, bright, blue and white ball hanging in the black sky, slowly turning, with no borders or lines to divide it. Many astronauts have said that this view changed the way they think about our planet. From that distance, the oceans, the deserts, and the swirling clouds all look fragile and precious, and the arguments that seem so important down here suddenly appear very small indeed."}
+{"id": "l034", "kind": "long", "text": "Thank you for coming in today, Jonathan. Before we start, let me tell you a little about the role. You would be joining a small team of five people, working mostly on the design of our mobile app. The hours are flexible, and you could work from home two or three days a week if you prefer. We're looking for someone who is curious, who enjoys solving problems, and who isn't afraid to ask questions. So, to begin with, could you tell me a bit about yourself and why you applied?"}
+{"id": "l035", "kind": "long", "text": "My grandparents' house always smelled of wood smoke and freshly baked bread. There was a creaky staircase, a clock that chimed every quarter of an hour, and a cupboard under the stairs full of board games with missing pieces. In the evenings, my grandfather would tell stories about his years as a mailman, cycling through the hills in all kinds of weather, while my grandmother knitted in her armchair and corrected every detail he got wrong. They argued constantly, laughed constantly, and were married for sixty two years."}
+{"id": "l036", "kind": "long", "text": "The festival (now in its twentieth year) will run for three days at the end of July. Tickets go on sale next Monday, and there are several options: a single day pass, a weekend pass, and a family ticket (which covers two adults and up to three children). Camping is available on the site, although spaces are limited, so it's a good idea to book early. As always, the organizers ask everyone to bring a reusable cup, to use the recycling bins, and to leave the fields exactly as they found them."}
+{"id": "l037", "kind": "long", "text": "Good afternoon, ladies and gentlemen, and welcome aboard this service to the coast. We will be calling at Riverside, Oakfield, Marston, and Seaview, where this train will terminate. Refreshments are available from the cart, which will be passing through the train shortly. Please keep your belongings with you at all times, and let a member of staff know if you see anything unusual. We are currently running about five minutes late, due to a slow train ahead of us, but we expect to make up some of that time along the way."}
+{"id": "l038", "kind": "long", "text": "One of the most useful things I've ever learned is how to listen properly. It sounds easy, but most of us are really just waiting for our turn to speak. Real listening means putting your phone away, looking at the other person, and paying attention not only to their words but also to the way they say them. Ask questions, let silences happen, and resist the urge to give advice straight away. You will be surprised by how much people tell you when they feel that someone is truly listening."}
+{"id": "l039", "kind": "long", "text": "Our dog, a small brown terrier called Biscuit, went missing on Sunday afternoon near the park by the river. He was wearing a red collar with a little silver bell, and he is very friendly, although he may be nervous around strangers. If you see him, please don't chase him; instead, call his name gently and offer him something to eat. We have put posters up on every street corner in the neighborhood, and we are offering a reward to anyone who helps bring him home. Thank you so much for your help."}
+{"id": "l040", "kind": "long", "text": "At the end of the evening, when the guests had gone and the dishes were stacked beside the sink, we sat together on the back step and looked up at the sky. Neither of us said very much. The air was warm, the crickets were singing in the long grass, and somewhere down the road a dog barked twice and fell silent. After a while, you took my hand and said, quietly, that it had been a good year after all. And for the first time in months, I believed it."}
