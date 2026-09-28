@@ -224,5 +224,8 @@ only ~0.65 GB once.
 
 | **30-min closed-loop soak C96** (tree bb498a6 defaults, max-batch 96, unpinned) | | 38,140 requests, 0 failed, **176.8 aud/s**, RTF p95 0.541, TTFA p95 97 ms, 0 stalls @250/@500, RTF p95 drift +0.6%, VRAM 18.48 -> 18.72 GB, RSS 3.71 -> 3.73 GB | | screening PASS (single soak, built-in text mix, no audio capture; the final qualification needs two soaks on the v2 corpus with capture). Short ladders under-count long requests: soak aud/s is the reference |
 
+| **device backbone KV grows on demand** (`MYNAH_CUDA_KV_GROW`, 2716bca) | VRAM C64 13.2 GB, C96 18.9 GB, C128 OOM | C64 6.8 GB, C96 9.2 GB, **C128 11.5 GB** | -48% VRAM | KEEP (default on). Self-check PASS on and off; forced growth (`MYNAH_CUDA_KV_GROW_INITIAL_STEPS=16`, warm voices) logs 4 growths (e.g. 147 -> 403 positions) and the PCM is md5-identical to full capacity, with the slot pool on and off; WER with rows growing inside the C64 batch 3.32% |
+| **30-min closed-loop soak C128** (KV grow, max-batch 128, unpinned) | | 40,300 requests, 0 failed, **186.7 aud/s**, RTF p95 0.679, TTFA p95 121 ms, 0 stalls, RTF p95 drift +0.2%, RSS flat 4.16 -> 4.18 GB | | screening PASS. VRAM 10.8 -> 12.5 GB, decelerating (+750 MB the first 3 min, +30 MB the last 3): parked slot-pool sets keep the KV their requests grew to; add a pool trim before the final qualification |
+
 Rows above the slot pool ran unpinned with `-w 8` (see the correction above);
 all are C32-C64 x 20 s, 24L, BF16 KV unless stated.
