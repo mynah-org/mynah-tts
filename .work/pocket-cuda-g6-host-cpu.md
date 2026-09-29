@@ -248,40 +248,52 @@ per-utterance WER 3.6% loaded vs 4.0% unloaded. The voice spread and the long
 pauses belong to the model/voice pair (or the recogniser on those timbres),
 not to the serving path.
 
-## Finding: metallic short sentences, voice timbre and leading silence (2026-09-29)
+## Finding: metallic clips, voice timbre and leading silence (2026-09-29)
 
-Listening to the under-load ZIPs: some clips sound metallic or hissy although
-the recogniser reads them perfectly (WER measures intelligibility, not
-timbre); marius sounds rough on every clip, alba clean. `tools/pocket_audio_noise.py`
-measured all 1,166 clips of the four listening ZIPs (24L C160 A/B, 6L C256
-A/B): energy 4-11 kHz over 80 Hz-4 kHz, harmonicity (autocorrelation of the
-1 kHz low-passed signal), cepstral peak prominence and pause noise floor, each
-as a robust z-score within (model, voice); outlier above z 3.5. Calibrated on
-four clips judged by ear (6L javert "Pass the salt, please." metallic ->
-flagged; 6L javert medium, 24L alba medium clean -> not flagged; 24L marius
-rough -> not flagged, it is the voice's baseline).
+Listening to the under-load ZIPs: some clips sound metallic although the
+recogniser reads them perfectly (WER measures intelligibility, not timbre).
+`tools/pocket_audio_noise.py` measured all 1,166 clips of the four listening
+ZIPs (24L C160 A/B, 6L C256 A/B): `hf_db` (energy 4-11 kHz over 80 Hz-4 kHz),
+`harm` (autocorrelation peak of the 1 kHz low-passed signal), cepstral peak
+prominence and pause noise floor.
 
-- **49 / 1,166 outliers (4.2%)**: short 44/409 (10.8%), conversational 5/406,
-  medium 0/170, long 0/181. Same on both models and soaks (2.5-5.1%) and at
-  low load (warm-up 3.6% vs measured 4.2%): model behaviour on tiny inputs,
-  not the GPU path or the load.
-- **Text-driven, across voices**: "Pass the salt, please." 8/10, "Yes,
-  please." 7/8, "The shop closes at six." 5/10, "Wait - which platform?"
-  5/13. Spectrograms show the final /s/ stretched to 300-400 ms of broadband
-  hiss. Part of that energy is in the text; a same-seed CPU rendering is the
-  check still to do to separate model from backend.
-- **Voice sets the timbre** (24L medians): harmonicity alba 0.63, jean 0.58,
-  javert 0.34, marius 0.34; pause floor alba -54 dB ... marius -48 dB.
-  Matches the per-voice WER spread above.
+**First pass, rejected by ear.** Flagging clips far from the other clips of
+the same voice (robust z > 3.5) gave 49 clips (4.2%), mostly sibilant
+one-liners on every voice. Listening to the alba ones ("Keep the change.",
+"Yes, please.", "Good night, sleep well.") found them fine: on a very clean
+voice the relative score fires on inaudible differences. It stays in the tool
+as `outlier` (a listening queue), not as a defect count.
+
+**Metallic rule.** `hf_db > -27` AND `harm < 0.34`: strong hiss *and* smeared
+harmonics. The two clips heard as metallic (6L javert "Pass the salt,
+please." -24.7/0.31, 24L marius "Wow, that was fast!" -26.1/0.28) pass both;
+the alba clips heard as fine reach the same hiss (-23 to -25 dB) but keep
+their harmonics (0.40-0.55). Rests on a handful of clips; a wider listening
+check (strong, borderline and near-miss clips) is pending.
+
+- **120 / 1,166 metallic (10.3%)**: 24L marius 103/330 (31%), 24L javert
+  9/119, 24L jean 1/157, 6L marius 3/124, 6L javert 4/133, alba 0/204.
+- **Sentence length**: short 88/409 (21.5%), conversational 32/406 (7.9%),
+  medium 0/170, long 0/181.
+- **24L is rougher than 6L on marius**, also on clips the recogniser did not
+  flag (the ZIPs over-sample flagged clips, 43% of the 24L sample vs 6% of
+  6L): 18/120 (15%) vs 3/113 (2.7%). Matches the per-voice WER (marius 4.7%
+  24L, 2.2% 6L).
+- **Voice timbre** (24L medians): harm alba 0.63, jean 0.58, javert 0.34,
+  marius 0.34; pause floor alba -54 dB ... marius -48 dB.
+- **Not the serving path or the load**: same voices and sentences in both
+  soaks, the unloaded C8 control has the same per-voice WER profile, clean
+  voices stay clean at C160/C256. A same-seed CPU rendering is the check
+  still to do.
 - **javert opens with silence** from its reference clip: median 0.73 s (24L),
   1.02 s (6L), max 1.6 s; jean 0.42 / 0.22 s; alba, marius ~0. TTFA counts the
   first PCM sample, so the heard onset for javert is ~1 s later than TTFA.
   Trimming leading silence from the voice prompt (or from the stream) would be
   a cheap product fix; not done.
 
-The listening ZIPs over-represent WER-flagged, short and marius clips, so the
-shares describe that sample. The ZIPs, per-clip CSV and spectrograms stay in
-the private evidence.
+Production advice: default to alba or jean, avoid marius on the 24L for short
+prompts, use a clean reference clip for custom voices. The ZIPs, per-clip CSV
+and spectrograms stay in the private evidence.
 
 The exact orchestration scripts that ran on the L4 are archived in
 `.work/l4-scripts-2026-09-28/`; the logs and per-request records travel with the

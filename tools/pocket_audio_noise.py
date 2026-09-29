@@ -19,16 +19,28 @@ percentile):
             high = audible background noise in the pauses
   lead_s    silence before the first speech frame
 
-A clip is an outlier when it sits far from the other clips of the same voice
-(and model set): robust z-score (median/MAD) of hf_db, -harm, -cpp or floor_db
-above --z. Voice-level traits show up in the per-voice medians instead.
+Two flags per clip:
+
+  metallic  absolute: hf_db above --hf-db AND harm below --harm, i.e. strong
+            broadband hiss on a voice whose harmonics are smeared. Calibrated
+            by ear on the CUDA qualification sets (29 Sep 2026): the clips
+            heard as metallic (javert "Pass the salt, please.", a marius
+            one-liner) pass both; clean alba clips with sibilant-heavy text
+            reach the same hf_db but keep their harmonics and do not.
+  unusual   relative: far from the other clips of the same voice and model
+            (robust z-score of hf_db, -harm, -cpp or floor_db above --z).
+            On a very clean voice this fires on differences nobody hears, so
+            it is a listening queue, not a defect count.
+
+Voice-level traits (a voice rough on every clip) show up in the per-voice
+medians.
 
 Input is the manifest.csv written by tools/gpu/bundle.sh next to the wav/
 folder (columns file, voice, kind, seed, text, wer, flags, measured):
 
     uv run --with numpy --with scipy python tools/pocket_audio_noise.py \
         --set 24L-A=DIR_A --set 24L-B=DIR_B --set 6L-A=DIR_C --out OUT \
-        [--z 3.5] [--spectrograms 24]   # PNGs need matplotlib too
+        [--hf-db -27 --harm 0.34 --z 3.5] [--spectrograms 24]   # PNGs need matplotlib
 
 Offline tooling only. It writes OUT/noise.csv (one row per clip) and
 OUT/noise-summary.txt; with --spectrograms N also OUT/spec/*.png for the N
@@ -127,14 +139,15 @@ def table(title, rows, key, out):
     groups = {}
     for r in rows:
         groups.setdefault(key(r), []).append(r)
-    out.append("\n%s\n  %-22s %6s %8s %6s   %7s %6s %6s %8s" % (
-        title, "group", "clips", "outliers", "%", "hf_db", "harm", "cpp", "floor_db"))
-    for g in sorted(groups, key=lambda g: (-np.mean([r["outlier"] for r in groups[g]]), str(g))):
+    out.append("\n%s\n  %-22s %6s %8s %6s %8s   %7s %6s %6s %8s" % (
+        title, "group", "clips", "metallic", "%", "unusual", "hf_db", "harm", "cpp", "floor_db"))
+    order = lambda g: (-np.mean([r["metallic"] for r in groups[g]]), -np.mean([r["outlier"] for r in groups[g]]), str(g))
+    for g in sorted(groups, key=order):
         rs = groups[g]
-        bad = sum(r["outlier"] for r in rs)
+        bad = sum(r["metallic"] for r in rs)
         med = [np.nanmedian([r[f] for r in rs]) for f in FEATS]
-        out.append("  %-22s %6d %8d %5.1f%%   %7.1f %6.3f %6.3f %8.1f" % (
-            (str(g)[:22], len(rs), bad, 100.0 * bad / len(rs)) + tuple(med)))
+        out.append("  %-22s %6d %8d %5.1f%% %8d   %7.1f %6.3f %6.3f %8.1f" % (
+            (str(g)[:22], len(rs), bad, 100.0 * bad / len(rs), sum(r["outlier"] for r in rs)) + tuple(med)))
 
 
 def main():
@@ -142,7 +155,9 @@ def main():
     ap.add_argument("--set", action="append", required=True, metavar="NAME=DIR",
                     help="a folder holding manifest.csv and wav/ (repeatable)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--z", type=float, default=3.5, help="robust z-score above which a clip is an outlier")
+    ap.add_argument("--z", type=float, default=3.5, help="robust z-score above which a clip is unusual for its voice")
+    ap.add_argument("--hf-db", type=float, default=-27.0, help="metallic: hf_db above this ...")
+    ap.add_argument("--harm", type=float, default=0.34, help="... and harm below this")
     ap.add_argument("--spectrograms", type=int, default=0, metavar="N")
     args = ap.parse_args()
 
@@ -175,22 +190,28 @@ def main():
             r["why"] = ";".join(f for f in FEATS if zs[f][i] > args.z)
             r["outlier"] = int(r["score"] > args.z)
     for r in rows:
+        # > 0 only when both conditions hold; larger = further past both.
+        r["metal_score"] = min((r["hf_db"] - args.hf_db) / 3.0, (args.harm - r["harm"]) / 0.05)
+        r["metallic"] = int(r["metal_score"] > 0)
         r["len"] = length_class(r["dur_s"])
         r["first"] = first_word(r["text"])
 
     os.makedirs(args.out, exist_ok=True)
-    cols = ["set", "file", "voice", "kind", "len", "dur_s", "seed", "first", "outlier", "score", "why",
+    cols = ["set", "file", "voice", "kind", "len", "dur_s", "seed", "first", "metallic", "metal_score", "outlier", "score", "why",
             "hf_db", "harm", "cpp", "floor_db", "lead_s", "wer", "asr_flags", "measured", "text"]
-    rows.sort(key=lambda r: -r["score"])
+    rows.sort(key=lambda r: (-r["metallic"], -r["metal_score"] if r["metallic"] else -r["score"]))
     with open(os.path.join(args.out, "noise.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()})
 
-    out = ["Pocket audio noise map: %d clips, outlier = robust z > %.1f within (model, voice)" % (len(rows), args.z)]
+    out = ["Pocket audio noise map: %d clips; metallic = hf_db > %.1f and harm < %.2f; "
+           "unusual = robust z > %.1f within (model, voice)" % (len(rows), args.hf_db, args.harm, args.z)]
+    nm = sum(r["metallic"] for r in rows)
     nb = sum(r["outlier"] for r in rows)
-    out.append("outliers: %d (%.1f%%)" % (nb, 100.0 * nb / len(rows)))
+    out.append("metallic: %d (%.1f%%)   unusual for their voice: %d (%.1f%%)" % (
+        nm, 100.0 * nm / len(rows), nb, 100.0 * nb / len(rows)))
     table("By model / voice (medians show the voice's own timbre)", rows, lambda r: "%s %s" % (r["model"], r["voice"]), out)
     table("By set", rows, lambda r: r["set"], out)
     table("By sentence kind", rows, lambda r: r["kind"], out)
@@ -205,17 +226,17 @@ def main():
     table("By opening word (words with >= 8 clips)", common, lambda r: r["first"], out)
     seeds = {}
     for r in rows:
-        seeds.setdefault((r["model"], r["seed"]), []).append(r["outlier"])
+        seeds.setdefault((r["model"], r["seed"]), []).append(r["metallic"])
     rep = [(k, v) for k, v in seeds.items() if len(v) > 1]
     if rep:
         both = sum(1 for _, v in rep if all(v))
         some = sum(1 for _, v in rep if any(v))
-        out.append("\nSeeds seen more than once: %d; outlier in all of them %d, in some %d" % (len(rep), both, some))
-    out.append("\nWorst clips:")
+        out.append("\nSeeds seen more than once: %d; metallic in all of them %d, in some %d" % (len(rep), both, some))
+    out.append("\nMetallic clips, worst first (then the most unusual ones):")
     for r in rows[:40]:
-        out.append("  %5.1f %-6s %-26s %-7s %-14s %-5s %5.2fs wer %.2f why=%s  %s" % (
-            r["score"], r["set"], r["file"], r["voice"], r["kind"], r["len"], r["dur_s"],
-            r["wer"], r["why"] or "-", r["text"][:50]))
+        out.append("  %s %5.1f %-6s %-26s %-7s %-14s %-5s %5.2fs hf %6.1f harm %.3f wer %.2f  %s" % (
+            "M" if r["metallic"] else "u", r["metal_score"] if r["metallic"] else r["score"], r["set"], r["file"],
+            r["voice"], r["kind"], r["len"], r["dur_s"], r["hf_db"], r["harm"], r["wer"], r["text"][:50]))
     txt = "\n".join(out) + "\n"
     with open(os.path.join(args.out, "noise-summary.txt"), "w") as f:
         f.write(txt)
@@ -232,7 +253,8 @@ def main():
             fig, ax = plt.subplots(figsize=(10, 2.6))
             ax.specgram(x, NFFT=1024, Fs=sr, noverlap=768, vmin=-130, cmap="magma")
             ax.set_ylim(0, min(12000, sr / 2))
-            ax.set_title("%s %s %s z=%.1f %s" % (r["set"], r["file"], r["voice"], r["score"], r["why"]), fontsize=9)
+            ax.set_title("%s %s %s %s hf %.1f harm %.2f" % (r["set"], r["file"], r["voice"],
+                         "metallic" if r["metallic"] else "unusual", r["hf_db"], r["harm"]), fontsize=9)
             fig.tight_layout()
             fig.savefig(os.path.join(sd, "%02d-%s-%s.png" % (i, r["set"], r["file"][:-4])), dpi=70)
             plt.close(fig)

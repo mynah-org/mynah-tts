@@ -238,7 +238,7 @@ resolves the default to the same thing, so it is harmless and optional.
 | the first seconds after start are slower | CUDA graphs are captured per batch width on first use |
 | a voice sounds rough or noisy on every clip | the built-in voice's own timbre (Pocket clones its reference clip, noise included): marius and javert are the roughest, alba and jean the cleanest; use a clean reference clip for custom voices |
 | speech starts ~1 s after the first audio | javert (and less so jean) open with silence copied from the reference clip; TTFA counts that silence |
-| metallic hiss on very short sentences | model behaviour on 1-2 s sibilant-heavy inputs ("Yes, please."), same at every load level and on both models; map it with `tools/pocket_audio_noise.py` |
+| metallic timbre on short sentences | model behaviour of the rougher voices (marius, javert) on one-liners, worst on the 24-layer model; not load-related. Prefer alba or jean; count it with `tools/pocket_audio_noise.py` |
 
 ## 10. Qualifying a new GPU box
 
