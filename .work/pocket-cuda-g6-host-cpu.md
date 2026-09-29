@@ -268,8 +268,9 @@ as `outlier` (a listening queue), not as a defect count.
 harmonics. The two clips heard as metallic (6L javert "Pass the salt,
 please." -24.7/0.31, 24L marius "Wow, that was fast!" -26.1/0.28) pass both;
 the alba clips heard as fine reach the same hiss (-23 to -25 dB) but keep
-their harmonics (0.40-0.55). Rests on a handful of clips; a wider listening
-check (strong, borderline and near-miss clips) is pending.
+their harmonics (0.40-0.55). Confirmed on a second listening sample (strong,
+borderline and near-miss clips, 2026-09-29): the metallic effect is almost
+entirely marius, on some sentences, not all.
 
 - **120 / 1,166 metallic (10.3%)**: 24L marius 103/330 (31%), 24L javert
   9/119, 24L jean 1/157, 6L marius 3/124, 6L javert 4/133, alba 0/204.
