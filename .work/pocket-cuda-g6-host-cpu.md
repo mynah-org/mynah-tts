@@ -248,6 +248,41 @@ per-utterance WER 3.6% loaded vs 4.0% unloaded. The voice spread and the long
 pauses belong to the model/voice pair (or the recogniser on those timbres),
 not to the serving path.
 
+## Finding: metallic short sentences, voice timbre and leading silence (2026-09-29)
+
+Listening to the under-load ZIPs: some clips sound metallic or hissy although
+the recogniser reads them perfectly (WER measures intelligibility, not
+timbre); marius sounds rough on every clip, alba clean. `tools/pocket_audio_noise.py`
+measured all 1,166 clips of the four listening ZIPs (24L C160 A/B, 6L C256
+A/B): energy 4-11 kHz over 80 Hz-4 kHz, harmonicity (autocorrelation of the
+1 kHz low-passed signal), cepstral peak prominence and pause noise floor, each
+as a robust z-score within (model, voice); outlier above z 3.5. Calibrated on
+four clips judged by ear (6L javert "Pass the salt, please." metallic ->
+flagged; 6L javert medium, 24L alba medium clean -> not flagged; 24L marius
+rough -> not flagged, it is the voice's baseline).
+
+- **49 / 1,166 outliers (4.2%)**: short 44/409 (10.8%), conversational 5/406,
+  medium 0/170, long 0/181. Same on both models and soaks (2.5-5.1%) and at
+  low load (warm-up 3.6% vs measured 4.2%): model behaviour on tiny inputs,
+  not the GPU path or the load.
+- **Text-driven, across voices**: "Pass the salt, please." 8/10, "Yes,
+  please." 7/8, "The shop closes at six." 5/10, "Wait - which platform?"
+  5/13. Spectrograms show the final /s/ stretched to 300-400 ms of broadband
+  hiss. Part of that energy is in the text; a same-seed CPU rendering is the
+  check still to do to separate model from backend.
+- **Voice sets the timbre** (24L medians): harmonicity alba 0.63, jean 0.58,
+  javert 0.34, marius 0.34; pause floor alba -54 dB ... marius -48 dB.
+  Matches the per-voice WER spread above.
+- **javert opens with silence** from its reference clip: median 0.73 s (24L),
+  1.02 s (6L), max 1.6 s; jean 0.42 / 0.22 s; alba, marius ~0. TTFA counts the
+  first PCM sample, so the heard onset for javert is ~1 s later than TTFA.
+  Trimming leading silence from the voice prompt (or from the stream) would be
+  a cheap product fix; not done.
+
+The listening ZIPs over-represent WER-flagged, short and marius clips, so the
+shares describe that sample. The ZIPs, per-clip CSV and spectrograms stay in
+the private evidence.
+
 The exact orchestration scripts that ran on the L4 are archived in
 `.work/l4-scripts-2026-09-28/`; the logs and per-request records travel with the
 private evidence, which is not published.

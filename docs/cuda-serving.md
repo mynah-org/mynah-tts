@@ -236,6 +236,9 @@ resolves the default to the same thing, so it is harmless and optional.
 | stalls or RTF p95 above 0.9 | too many streams for this GPU: lower `--max-batch/--max-inflight` or re-screen (section 6) |
 | slow first request per voice | the voice prompt is loaded on first use; `MYNAH_POCKET_VOICE_CACHE=startup` preloads |
 | the first seconds after start are slower | CUDA graphs are captured per batch width on first use |
+| a voice sounds rough or noisy on every clip | the built-in voice's own timbre (Pocket clones its reference clip, noise included): marius and javert are the roughest, alba and jean the cleanest; use a clean reference clip for custom voices |
+| speech starts ~1 s after the first audio | javert (and less so jean) open with silence copied from the reference clip; TTFA counts that silence |
+| metallic hiss on very short sentences | model behaviour on 1-2 s sibilant-heavy inputs ("Yes, please."), same at every load level and on both models; map it with `tools/pocket_audio_noise.py` |
 
 ## 10. Qualifying a new GPU box
 
@@ -257,6 +260,10 @@ evidence bundle with capped listening ZIPs. Record the result as a profile
 throughput only from 30-minute soaks: short screens under-count long
 utterances. Report ASR quality per voice and per length class, against the
 unloaded control.
+
+WER does not hear timbre: a metallic clip that reads correctly scores 0%.
+After listening, run `tools/pocket_audio_noise.py` on the unzipped listening
+sets to count noisy/metallic outliers per voice, sentence kind and length.
 
 ## Related
 
