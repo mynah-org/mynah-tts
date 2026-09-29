@@ -284,8 +284,10 @@ entirely marius, on some sentences, not all.
   marius 0.34; pause floor alba -54 dB ... marius -48 dB.
 - **Not the serving path or the load**: same voices and sentences in both
   soaks, the unloaded C8 control has the same per-voice WER profile, clean
-  voices stay clean at C160/C256. A same-seed CPU rendering is the check
-  still to do.
+  voices stay clean at C160/C256. Cross-check by the user (2026-09-29): the
+  official Python Pocket TTS engine, vanilla, on an L4 (no mynah-tts, no
+  speed-ups) also gives a slightly metallic alba now and then, never at
+  marius levels: the timbre belongs to the model's voices.
 - **javert opens with silence** from its reference clip: median 0.73 s (24L),
   1.02 s (6L), max 1.6 s; jean 0.42 / 0.22 s; alba, marius ~0. TTFA counts the
   first PCM sample, so the heard onset for javert is ~1 s later than TTFA.
