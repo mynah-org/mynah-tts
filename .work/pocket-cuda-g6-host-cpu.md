@@ -294,8 +294,8 @@ entirely marius, on some sentences, not all.
   Trimming leading silence from the voice prompt (or from the stream) would be
   a cheap product fix; not done.
 
-Production advice: default to alba or jean, avoid marius on the 24L for short
-prompts, use a clean reference clip for custom voices. The ZIPs, per-clip CSV
+Production advice: default to alba (jean is as clean but CC-BY-NC-4.0, not
+for commercial use), avoid marius on the 24L for short prompts, use a clean reference clip for custom voices. The ZIPs, per-clip CSV
 and spectrograms stay in the private evidence.
 
 The exact orchestration scripts that ran on the L4 are archived in

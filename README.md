@@ -269,6 +269,8 @@ diverge from the streaming one.
   request batching and its memory cost
 - **[Voices and languages](docs/voices-and-languages.md)** — speaker IDs and
   their names, the 12 language codes, and the three ways to pass text
+- **[Pocket voices](docs/pocket-voices.md)** — which Pocket TTS voice to use
+  (`alba`), measured quality and licence of each
 - **[Oracle parity](docs/oracle-parity.md)** — validation against the official
   NeMo implementation
 
