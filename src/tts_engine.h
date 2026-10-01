@@ -289,6 +289,25 @@ typedef struct {
                                 size_t budget, int *done,
                                 mynah_engine_scratch *scratch,
                                 char *error, size_t error_capacity);
+
+    /* ---- two-phase context creation (APPENDED) ----------------------------
+     *
+     * OPTIONAL, both or neither. `ctx_new_host` + `ctx_attach` must build the same
+     * context `ctx_new` builds; the split exists so the driver can run the first
+     * half OFF the scheduler thread (MYNAH_ASYNC_ADMIT) while the batch steps.
+     *
+     *  - `ctx_new_host`: host-only work. It may run on any thread, concurrently
+     *    with any other engine call on OTHER contexts, so it must not touch a
+     *    device, a stream, or engine state that the scheduler thread mutates
+     *    without a lock. Same arguments and ownership as `ctx_new`.
+     *  - `ctx_attach`: the rest (device resources, pools, pinned buffers), on the
+     *    scheduler thread, before the context's first `prepare*` call. On failure
+     *    the context stays owned by the caller, who frees it with `ctx_free`. */
+    int  (*ctx_new_host)(const mynah_tts_model *model, mynah_engine_state *state,
+                         const mynah_tts_request *request, size_t max_steps,
+                         uint64_t seed, mynah_engine_ctx **out_ctx,
+                         char *error, size_t error_capacity);
+    int  (*ctx_attach)(mynah_engine_ctx *ctx, char *error, size_t error_capacity);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

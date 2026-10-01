@@ -7087,6 +7087,116 @@ k_tile_gemm_tc(const float *A, const float *W, const float *bias, float *C,
 #endif
 }
 
+/* MYNAH_CUDA_TILE_TC=2: the same fixed-order TF32 tile with 4x the work per
+ * block. 128x128 outputs per block, 8 warps of 32x64, and the next K slab
+ * prefetched into registers while the current one is multiplied. Every output
+ * still accumulates in exactly k_tile_gemm_tc's order: the same split-K ranges,
+ * 32-wide slabs ascending, 8-wide MMA steps ascending, operands rounded with
+ * __float_to_tf32, and 16x16 fragments that start on multiples of 16 in both M
+ * and N. The results are therefore bit-identical to k_tile_gemm_tc (the box
+ * check compares them), and the prefill invariance carries over. The
+ * epilogue goes through a small per-warp staging tile, so the static shared
+ * memory stays under 48 KiB without an opt-in. */
+static constexpr int TC2_BM = 128, TC2_BN = 128, TC2_BK = 32, TC2_LD = TC2_BK + 4;
+static constexpr int TC2_THREADS = 256;
+static constexpr int TC2_SLD = 20; /* per-warp 16x16 staging, padded */
+
+__global__ static void __launch_bounds__(TC2_THREADS)
+k_tile_gemm_tc2(const float *A, const float *W, const float *bias, float *C,
+                int M, int N, int K, int KC, float *P) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    __shared__ __align__(32) float As[TC2_BM * TC2_LD];
+    __shared__ __align__(32) float Ws[TC2_BN * TC2_LD];
+    __shared__ __align__(32) float St[8 * 16 * TC2_SLD];
+    const int m0 = (int)blockIdx.y * TC2_BM;
+    const int n0 = (int)blockIdx.x * TC2_BN;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wm = warp >> 1, wn = warp & 1;   /* 4 x 2 warps: 32 rows x 64 cols each */
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc[2][4];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 4; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+    const int kbeg = (int)blockIdx.z * KC;
+    const int kend = kbeg + KC < K ? kbeg + KC : K;
+    constexpr int PER = (TC2_BM * TC2_BK) / TC2_THREADS; /* 16 per operand */
+    float ra[PER], rw[PER];
+    auto fetch = [&](int k0) {
+        for (int i = 0; i < PER; ++i) {
+            const int idx = tid + TC2_THREADS * i;
+            const int r = idx / TC2_BK, c = idx % TC2_BK;
+            const int gk = k0 + c, gm = m0 + r, gn = n0 + r;
+            ra[i] = gm < M && gk < kend
+                ? wmma::__float_to_tf32(A[(size_t)gm * (size_t)K + (size_t)gk]) : 0.0f;
+            rw[i] = gn < N && gk < kend
+                ? wmma::__float_to_tf32(W[(size_t)gn * (size_t)K + (size_t)gk]) : 0.0f;
+        }
+    };
+    auto stash = [&]() {
+        for (int i = 0; i < PER; ++i) {
+            const int idx = tid + TC2_THREADS * i;
+            const int r = idx / TC2_BK, c = idx % TC2_BK;
+            As[r * TC2_LD + c] = ra[i];
+            Ws[r * TC2_LD + c] = rw[i];
+        }
+    };
+    if (kbeg < kend) fetch(kbeg);
+    for (int k0 = kbeg; k0 < kend; k0 += TC2_BK) {
+        stash();
+        __syncthreads();
+        if (k0 + TC2_BK < kend) fetch(k0 + TC2_BK);   /* overlaps the MMAs below */
+        for (int kk = 0; kk < TC2_BK; kk += 8) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32,
+                           wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32,
+                           wmma::col_major> b[4];
+            for (int i = 0; i < 2; ++i)
+                wmma::load_matrix_sync(a[i], As + (wm * 32 + i * 16) * TC2_LD + kk, TC2_LD);
+            for (int j = 0; j < 4; ++j)
+                wmma::load_matrix_sync(b[j], Ws + (wn * 64 + j * 16) * TC2_LD + kk, TC2_LD);
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 4; ++j)
+                    wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float *st = St + warp * 16 * TC2_SLD;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            wmma::store_matrix_sync(st, acc[i][j], TC2_SLD, wmma::mem_row_major);
+            __syncwarp();
+            const int rb = m0 + wm * 32 + i * 16, cb = n0 + wn * 64 + j * 16;
+            for (int e = lane; e < 256; e += 32) {
+                const int r = e >> 4, c = e & 15;
+                const int gm = rb + r, gn = cb + c;
+                if (gm >= M || gn >= N) continue;
+                const size_t o = (size_t)gm * (size_t)N + (size_t)gn;
+                const float v = st[r * TC2_SLD + c];
+                if (P != nullptr)
+                    P[(size_t)blockIdx.z * (size_t)M * (size_t)N + o] = v;
+                else
+                    C[o] = v + (bias != nullptr ? bias[gn] : 0.0f);
+            }
+            __syncwarp();
+        }
+    }
+#endif
+}
+
+static int cuda_tile_tc_level(void) {
+    static const int level = [] {
+        const char *v = std::getenv("MYNAH_CUDA_TILE_TC");
+        if (v == nullptr || std::strcmp(v, "0") == 0) return 0;
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            major < 8)
+            return 0;
+        return std::strcmp(v, "2") == 0 ? 2 : 1;
+    }();
+    return level;
+}
+
 static bool cuda_tile_tc_usable(void) {
     static const bool on = [] {
         if (!cuda_env_enabled("MYNAH_CUDA_TILE_TC", false)) return false;
@@ -7127,11 +7237,18 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
         if (w.splitk == nullptr || (size_t)S * M * N > w.splitk_cap) S = 1;
         int KC = (int)((K + (size_t)S - 1u) / (size_t)S);
         KC = (KC + TILE_TC_BK - 1) / TILE_TC_BK * TILE_TC_BK;
-        const dim3 tgrid((unsigned)((N + TILE_TC_BN - 1) / TILE_TC_BN),
-                         (unsigned)((M + TILE_TC_BM - 1) / TILE_TC_BM),
-                         (unsigned)S);
-        k_tile_gemm_tc<<<tgrid, 128, 0, st->stream>>>(
-            A, dw, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+        if (cuda_tile_tc_level() == 2) {
+            const dim3 tgrid((unsigned)((N + TC2_BN - 1) / TC2_BN),
+                             (unsigned)((M + TC2_BM - 1) / TC2_BM), (unsigned)S);
+            k_tile_gemm_tc2<<<tgrid, TC2_THREADS, 0, st->stream>>>(
+                A, dw, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+        } else {
+            const dim3 tgrid((unsigned)((N + TILE_TC_BN - 1) / TILE_TC_BN),
+                             (unsigned)((M + TILE_TC_BM - 1) / TILE_TC_BM),
+                             (unsigned)S);
+            k_tile_gemm_tc<<<tgrid, 128, 0, st->stream>>>(
+                A, dw, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+        }
         if (ce(cudaGetLastError(), e, ec)) return -1;
         if (S == 1) return 0;
         const dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);

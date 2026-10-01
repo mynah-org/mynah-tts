@@ -71,6 +71,21 @@ typedef struct {
  *              retires the slot immediately as MYNAH_GRAPH_CANCELLED.
  *   running    optional; non-zero while the service should keep admitting.
  *              Requests already in flight always run to completion.
+ *   phase      optional, and called only when MYNAH_SERVE_PROFILE is set:
+ *              the driver's thread reports each iteration's phase boundaries,
+ *              0 = top of the iteration (before admission), 1 = admission done,
+ *              2 = prefill done (before the step), 3 = step, emit and codec
+ *              decode done (before retirement). `index` counts iterations
+ *              from 0. It exists so a sink can place its requests' events on
+ *              the driver's clock; it must not call back into the driver.
+ *   wait_arrival  optional. When set, the driver runs a second admission pass
+ *              immediately before each step if a slot is free: it calls
+ *              wait_arrival(ud, us), which returns non-zero when a job is
+ *              queued, waiting at most `us` microseconds for one (0 = only
+ *              look). The pass admits and prefills whatever is there, so a
+ *              request that arrived during this iteration joins this step
+ *              instead of the next one. Unset = one admission pass per
+ *              iteration, unchanged.
  */
 typedef struct {
     void *ud;
@@ -78,6 +93,8 @@ typedef struct {
     void (*on_done)(void *ud, void *tag, int result);
     int  (*cancelled)(void *ud, void *tag);
     int  (*running)(void *ud);
+    void (*phase)(void *ud, unsigned long long index, int phase);
+    int  (*wait_arrival)(void *ud, unsigned wait_us);
 } mynah_graph_sink;
 
 /* Serve from `sink` until it stops handing out work, stepping up to

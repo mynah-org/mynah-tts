@@ -21,10 +21,12 @@
 #include "threads.h"
 #include "tts_engine.h"
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* The default `decode_audio_batch`: one `decode_audio` per context.
  *
@@ -203,6 +205,12 @@ typedef struct {
      * actually reaches the sink. */
     lane_unit unit;
     int lane_busy;
+    /* MYNAH_ASYNC_ADMIT: the host half of the context is being built on a
+     * helper thread. Not active, not preparing, and NOT finished either, so
+     * neither the step nor the retire loop may touch it until the result is
+     * collected by `ticket`. */
+    int starting;
+    unsigned long long ticket;
 } synth_slot;
 
 static int slot_fail(synth_slot *slot, const char *message) {
@@ -1048,6 +1056,325 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     }
 }
 
+/* The admission pass: fill free slots from the sink until it has nothing, a
+ * slot limit is reached, or the service stops admitting. Lifted out of the
+ * loop unchanged so that the optional late pass before the step (see
+ * `wait_arrival` in graph.h) runs exactly the same code. */
+/* ---- asynchronous admission (MYNAH_ASYNC_ADMIT) -------------------------
+ *
+ * Admission is serial host work on this thread: building a request context
+ * costs ~1.5-2 ms of host allocation and state setup per request, and a burst
+ * of N requests pays it N times before its last request can be prefilled. With
+ * the flag, and an engine that splits context creation (tts_engine.h,
+ * `ctx_new_host` / `ctx_attach`), the host half runs on helper threads while
+ * the batch keeps stepping; this thread only attaches the device half when a
+ * result comes back. Off (the default), none of this exists. */
+typedef struct async_item {
+    unsigned long long ticket;
+    const mynah_tts_request *request;
+    size_t max_steps;
+    uint64_t seed;
+    mynah_engine_ctx *ctx;
+    int rc;
+    char error[256];
+    struct async_item *next;
+} async_item;
+
+#define ASYNC_MAX_THREADS 8
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t work_cv;
+    pthread_cond_t done_cv;
+    async_item *work_head, *work_tail;
+    async_item *done_head, *done_tail;
+    size_t in_flight;          /* submitted and not yet collected */
+    int stop;
+    const mynah_tts_engine *engine;
+    const mynah_tts_model *model;
+    mynah_engine_state *state;
+    pthread_t threads[ASYNC_MAX_THREADS];
+    int nthreads;
+} async_admit;
+
+static void *async_admit_main(void *arg) {
+    async_admit *q = (async_admit *)arg;
+    for (;;) {
+        pthread_mutex_lock(&q->mu);
+        while (!q->stop && q->work_head == NULL) pthread_cond_wait(&q->work_cv, &q->mu);
+        async_item *it = q->work_head;
+        if (it == NULL) { pthread_mutex_unlock(&q->mu); return NULL; }
+        q->work_head = it->next;
+        if (q->work_head == NULL) q->work_tail = NULL;
+        it->next = NULL;
+        pthread_mutex_unlock(&q->mu);
+
+        it->rc = q->engine->ctx_new_host(q->model, q->state, it->request, it->max_steps,
+                                         it->seed, &it->ctx, it->error, sizeof(it->error));
+
+        pthread_mutex_lock(&q->mu);
+        if (q->done_tail != NULL) q->done_tail->next = it; else q->done_head = it;
+        q->done_tail = it;
+        pthread_cond_signal(&q->done_cv);
+        pthread_mutex_unlock(&q->mu);
+    }
+}
+
+/* 0 = off; else the number of helper threads (1 means the default, 2). */
+static int async_admit_threads(const mynah_tts_engine *engine) {
+    if (engine->ctx_new_host == NULL || engine->ctx_attach == NULL) return 0;
+    const char *env = getenv("MYNAH_ASYNC_ADMIT");
+    if (env == NULL || *env == '\0' || strcmp(env, "0") == 0) return 0;
+    char *end = NULL;
+    const long v = strtol(env, &end, 10);
+    if (end == env || v < 1) return 0;
+    if (v == 1) return 2;
+    return v > ASYNC_MAX_THREADS ? ASYNC_MAX_THREADS : (int)v;
+}
+
+static int async_admit_start(async_admit *q, int nthreads, const mynah_tts_engine *engine,
+                             const mynah_tts_model *model, mynah_engine_state *state) {
+    memset(q, 0, sizeof(*q));
+    q->engine = engine;
+    q->model = model;
+    q->state = state;
+    if (pthread_mutex_init(&q->mu, NULL) != 0) return -1;
+    if (pthread_cond_init(&q->work_cv, NULL) != 0) {
+        pthread_mutex_destroy(&q->mu);
+        return -1;
+    }
+    if (pthread_cond_init(&q->done_cv, NULL) != 0) {
+        pthread_cond_destroy(&q->work_cv);
+        pthread_mutex_destroy(&q->mu);
+        return -1;
+    }
+    for (int i = 0; i < nthreads; ++i) {
+        if (pthread_create(&q->threads[q->nthreads], NULL, async_admit_main, q) != 0) break;
+        ++q->nthreads;
+    }
+    return q->nthreads > 0 ? 0 : -1;
+}
+
+/* Joins the helpers, then frees anything still queued or uncollected. */
+static void async_admit_stop(async_admit *q) {
+    pthread_mutex_lock(&q->mu);
+    q->stop = 1;
+    pthread_cond_broadcast(&q->work_cv);
+    pthread_mutex_unlock(&q->mu);
+    for (int i = 0; i < q->nthreads; ++i) pthread_join(q->threads[i], NULL);
+    for (async_item *it = q->done_head; it != NULL;) {
+        async_item *next = it->next;
+        if (it->ctx != NULL) q->engine->ctx_free(it->ctx);
+        free(it);
+        it = next;
+    }
+    for (async_item *it = q->work_head; it != NULL;) {
+        async_item *next = it->next;
+        free(it);
+        it = next;
+    }
+    pthread_cond_destroy(&q->done_cv);
+    pthread_cond_destroy(&q->work_cv);
+    pthread_mutex_destroy(&q->mu);
+}
+
+typedef struct {
+    const mynah_tts_engine *engine;
+    const mynah_tts_model *model;
+    mynah_engine_state *state;
+    const mynah_engine_caps *caps;
+    mynah_graph_sink *sink;
+    synth_slot *slots;
+    size_t slot_capacity;
+    int compact_rows;
+    int dump_all;
+    int serve_profile;
+    size_t *used;
+    size_t *admitted;
+    int *drained;
+    int *result;
+    unsigned long long *prep_seq_next;
+    double *occ_blocked_s;
+    size_t *occ_free_nothing_queued;
+    size_t *occ_admits;
+    /* MYNAH_ADMIT_PER_ITER: at most `admit_cap` new requests per scheduler
+     * iteration (0 = no cap, the default). `iter_admits` counts this
+     * iteration's admissions across its admission passes. */
+    size_t admit_cap;
+    size_t *iter_admits;
+    /* MYNAH_ASYNC_ADMIT: non-NULL when context creation is split.
+     * `async_inline`: the first N admissions of an iteration still build their
+     * context here, synchronously (MYNAH_ASYNC_ADMIT_INLINE, default 8). In
+     * steady state an iteration admits a handful of requests and the inline path
+     * reaches its first frame in THIS iteration; handing those to a helper would
+     * collect them one iteration later and cost a whole step of first audio.
+     * Only a burst's excess goes to the helpers. */
+    async_admit *async;
+    size_t async_inline;
+    unsigned long long *ticket_next;
+    /* MYNAH_SERVE_PROFILE: where admission's own time goes. */
+    double *adm_next_job_s;
+    double *adm_start_s;
+    size_t *adm_count;
+} admit_ctx;
+
+/* The request checks `slot_start` makes, then the host half of the context goes
+ * to a helper thread. The slot is `starting` until `async_collect` sees it. */
+static int async_submit(const admit_ctx *a, synth_slot *slot) {
+    const mynah_tts_request *request = slot->request;
+    if (slot->samples != NULL) *slot->samples = NULL;
+    if (slot->sample_count != NULL) *slot->sample_count = 0;
+    if (request == NULL ||
+        ((slot->samples == NULL || slot->sample_count == NULL) && slot->callback == NULL) ||
+        slot->error == NULL || slot->error_capacity == 0 || request->text_ids == NULL ||
+        request->text_length == 0 || (slot->callback != NULL && slot->chunk_samples == 0)) {
+        return slot_fail(slot, "invalid synthesis request");
+    }
+    async_item *it = (async_item *)calloc(1, sizeof(*it));
+    if (it == NULL) return slot_fail(slot, "out of memory queueing admission");
+    it->ticket = (*a->ticket_next)++;
+    it->request = request;
+    it->max_steps = request->max_steps == 0u ? a->caps->default_max_steps : request->max_steps;
+    it->seed = request->seed;
+    slot->starting = 1;
+    slot->ticket = it->ticket;
+    async_admit *q = a->async;
+    pthread_mutex_lock(&q->mu);
+    if (q->work_tail != NULL) q->work_tail->next = it; else q->work_head = it;
+    q->work_tail = it;
+    ++q->in_flight;
+    pthread_cond_signal(&q->work_cv);
+    pthread_mutex_unlock(&q->mu);
+    return 0;
+}
+
+static void admit_pass(const admit_ctx *a) {
+    mynah_graph_sink *sink = a->sink;
+    synth_slot *slots = a->slots;
+    const size_t slot_capacity = a->slot_capacity;
+    while (!*a->drained && *a->used < slot_capacity &&
+           (a->admit_cap == 0u || *a->iter_admits < a->admit_cap) &&
+           (sink->running == NULL || sink->running(sink->ud) != 0)) {
+        size_t index = slot_capacity;
+        if (a->compact_rows) {
+            index = *a->used;
+        } else {
+            for (size_t i = 0; i < slot_capacity; ++i) {
+                if (!slots[i].in_use) { index = i; break; }
+            }
+        }
+        if (index == slot_capacity) break;
+
+        mynah_graph_job job;
+        memset(&job, 0, sizeof(job));
+        void *tag = NULL;
+        const int block = (*a->used == 0u);
+        const double t_block = (a->serve_profile && block) ? mynah_phase_seconds() : 0.0;
+        const double t_nj = (a->serve_profile && !block) ? mynah_phase_seconds() : 0.0;
+        const int got = sink->next_job(sink->ud, &job, &tag, block);
+        if (a->serve_profile && block) *a->occ_blocked_s += mynah_phase_seconds() - t_block;
+        if (a->serve_profile && !block && got == 1) *a->adm_next_job_s += mynah_phase_seconds() - t_nj;
+        if (got != 1) {
+            /* Nothing available. If we asked it to block and it still had
+             * nothing, the service is over.  A free slot that stayed free
+             * because the queue was empty is the loop telling us the box is
+             * ahead of its arrivals, which is the opposite of saturation. */
+            if (a->serve_profile) ++*a->occ_free_nothing_queued;
+            if (block) *a->drained = 1;
+            break;
+        }
+        if (a->serve_profile) ++*a->occ_admits;
+        synth_slot *slot = &slots[index];
+        memset(slot, 0, sizeof(*slot));
+        slot->in_use = 1;
+        slot->tag = tag;
+        slot->request = job.request;
+        slot->samples = job.samples;
+        slot->sample_count = job.sample_count;
+        slot->callback = job.callback;
+        slot->user_data = job.user_data;
+        slot->chunk_samples = job.chunk_samples;
+        slot->error = job.error;
+        slot->error_capacity = job.error_capacity;
+        ++*a->used;
+        ++*a->admitted;
+        ++*a->iter_admits;
+        const double t_st = a->serve_profile ? mynah_phase_seconds() : 0.0;
+        const int start_rc = (a->async != NULL && *a->iter_admits > a->async_inline)
+            ? async_submit(a, slot)
+            : slot_start(a->engine, a->model, a->state, a->caps, slot, a->dump_all,
+                         a->prep_seq_next);
+        if (a->serve_profile) {
+            *a->adm_start_s += mynah_phase_seconds() - t_st;
+            if (++*a->adm_count % 160u == 0u)
+                fprintf(stderr, "[ADM] %zu admissions: next_job %.3f ms, start %.3f ms (mean, "
+                                "non-blocking calls)%s\n", *a->adm_count,
+                        1e3 * *a->adm_next_job_s / (double)*a->adm_count,
+                        1e3 * *a->adm_start_s / (double)*a->adm_count,
+                        a->async != NULL ? ", async" : "");
+        }
+        if (start_rc != 0) {
+            /* A request that cannot start never occupies the batch. */
+            if (slot_retire(a->engine, sink, slot, a->dump_all) != 0) *a->result = -1;
+            --*a->used;
+        }
+    }
+}
+
+/* MYNAH_ASYNC_ADMIT: take every finished host context, attach its device
+ * half on this thread and finish what `slot_start` would have done. With
+ * `wait` set and nothing runnable, waits (bounded) for a first result, so a
+ * loop holding only `starting` slots does not spin. */
+static void async_collect(const admit_ctx *a, int wait) {
+    async_admit *q = a->async;
+    pthread_mutex_lock(&q->mu);
+    if (wait && q->done_head == NULL && q->in_flight > 0u) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 2000000L;   /* 2 ms, then look at arrivals again */
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_nsec -= 1000000000L; ++deadline.tv_sec; }
+        while (q->done_head == NULL && q->in_flight > 0u) {
+            if (pthread_cond_timedwait(&q->done_cv, &q->mu, &deadline) != 0) break;
+        }
+    }
+    async_item *list = q->done_head;
+    q->done_head = q->done_tail = NULL;
+    for (async_item *it = list; it != NULL; it = it->next) --q->in_flight;
+    pthread_mutex_unlock(&q->mu);
+
+    while (list != NULL) {
+        async_item *it = list;
+        list = it->next;
+        synth_slot *slot = NULL;
+        for (size_t i = 0; i < a->slot_capacity; ++i) {
+            if (a->slots[i].in_use && a->slots[i].starting && a->slots[i].ticket == it->ticket) {
+                slot = &a->slots[i];
+                break;
+            }
+        }
+        if (slot == NULL) {   /* cannot happen: a starting slot is never retired */
+            if (it->ctx != NULL) a->engine->ctx_free(it->ctx);
+            free(it);
+            continue;
+        }
+        slot->starting = 0;
+        slot->ctx = it->ctx;
+        if (it->rc != 0) {
+            (void)slot_fail(slot, it->error[0] != '\0' ? it->error : "cannot create the request context");
+        } else if (a->engine->ctx_attach(slot->ctx, slot->error, slot->error_capacity) != 0) {
+            (void)slot_fail(slot, NULL);
+        } else if (a->engine->prepare_slice != NULL && prefill_slice_budget(a->caps) != 0u) {
+            slot->preparing = 1;
+            slot->prep_seq = (*a->prep_seq_next)++;
+        } else if (a->engine->prepare(slot->ctx, slot->error, slot->error_capacity) != 0) {
+            (void)slot_fail(slot, NULL);
+        } else {
+            slot->active = 1;
+        }
+        free(it);
+    }
+}
+
 /* The one driver.
  *
  * `want_batch` is how wide the caller would like to run; `strict_batch` says
@@ -1200,6 +1527,9 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * variance. */
     const int serve_profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
     const double t_profile0 = serve_profile ? mynah_phase_seconds() : 0.0;
+    /* Phase boundaries for the sink (graph.h: `phase`), profile runs only. */
+    const int report_phase = serve_profile && sink->phase != NULL;
+    unsigned long long iteration = 0ull;
     prefill_acct prefill_profile;
     memset(&prefill_profile, 0, sizeof(prefill_profile));
     size_t occ_hist[MYNAH_GRAPH_MAX_JOBS + 1u];
@@ -1223,6 +1553,86 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             ? (double)(caps.frames_per_step ? caps.frames_per_step : 1u) / caps.frame_rate
             : 0.0;
 
+    admit_ctx adm;
+    memset(&adm, 0, sizeof(adm));
+    adm.engine = engine;
+    adm.model = model;
+    adm.state = state;
+    adm.caps = &caps;
+    adm.sink = sink;
+    adm.slots = slots;
+    adm.slot_capacity = slot_capacity;
+    adm.compact_rows = compact_rows;
+    adm.dump_all = dump_all;
+    adm.serve_profile = serve_profile;
+    adm.used = &used;
+    adm.admitted = &admitted;
+    adm.drained = &drained;
+    adm.result = &result;
+    adm.prep_seq_next = &prep_seq_next;
+    adm.occ_blocked_s = &occ_blocked_s;
+    adm.occ_free_nothing_queued = &occ_free_nothing_queued;
+    adm.occ_admits = &occ_admits;
+    size_t iter_admits = 0u;
+    adm.iter_admits = &iter_admits;
+    {
+        /* A burst larger than the cap is admitted over several iterations, so
+         * the first rows reach their first frame one prefill tile and one step
+         * later instead of after the whole wave's prefill. */
+        const char *cap = getenv("MYNAH_ADMIT_PER_ITER");
+        if (cap != NULL && *cap != '\0') {
+            char *end = NULL;
+            const unsigned long v = strtoul(cap, &end, 10);
+            if (end != cap && v <= (unsigned long)slot_capacity) adm.admit_cap = (size_t)v;
+        }
+    }
+
+    async_admit async_q;
+    int async_on = 0;
+    unsigned long long ticket_next = 1ull;
+    double adm_next_job_s = 0.0, adm_start_s = 0.0;
+    size_t adm_count = 0u;
+    adm.ticket_next = &ticket_next;
+    adm.adm_next_job_s = &adm_next_job_s;
+    adm.adm_start_s = &adm_start_s;
+    adm.adm_count = &adm_count;
+    {
+        const int n = async_admit_threads(engine);
+        if (n > 0 && async_admit_start(&async_q, n, engine, model, state) == 0) {
+            async_on = 1;
+            adm.async = &async_q;
+            adm.async_inline = 8u;
+            const char *inl = getenv("MYNAH_ASYNC_ADMIT_INLINE");
+            if (inl != NULL && *inl != '\0') {
+                char *end = NULL;
+                const unsigned long v = strtoul(inl, &end, 10);
+                if (end != inl && v <= (unsigned long)slot_capacity) adm.async_inline = (size_t)v;
+            }
+            fprintf(stderr, "driver: asynchronous admission ON (MYNAH_ASYNC_ADMIT, %d helper "
+                            "threads build the host half of each request context beyond the "
+                            "first %zu of an iteration)\n",
+                    async_q.nthreads, adm.async_inline);
+        }
+    }
+
+    /* Late admission (graph.h, `wait_arrival`): a sink that offers it gets a
+     * second admission pass right before each step, so a request that
+     * arrived after the top-of-iteration pass joins this step instead of the
+     * next. `late_wait_us` optionally holds the step for an arrival that a
+     * retirement in the previous iteration makes likely (closed-loop clients
+     * send their next request as the previous one completes). */
+    const int late_admit = sink->wait_arrival != NULL;
+    unsigned late_wait_us = 0u;
+    if (late_admit) {
+        const char *w = getenv("MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US");
+        if (w != NULL && *w != '\0') {
+            char *end = NULL;
+            const unsigned long v = strtoul(w, &end, 10);
+            if (end != w && v <= 20000ul) late_wait_us = (unsigned)v;
+        }
+    }
+    size_t retired_last = 0u;
+
     for (;;) {
         /* ---- reap whatever the decoder lane finished --------------------
          * Non-blocking, and first, so that a unit that completed while the
@@ -1230,6 +1640,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * slot's cursors. A slot whose unit is still running is simply left
          * alone; it is not waited for here and never on another slot's
          * account. */
+        if (report_phase) sink->phase(sink->ud, iteration, 0);
         if (lane_on) {
             for (size_t i = 0; i < slot_capacity; ++i) {
                 if (slots[i].in_use) lane_reap(&slots[i], i, 0);
@@ -1242,56 +1653,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * up waiting for an arrival that may not come. */
         const unsigned long long t_admit =
             mynah_costmap_level() ? mynah_costmap_now_ns() : 0ull;
-        while (!drained && used < slot_capacity &&
-               (sink->running == NULL || sink->running(sink->ud) != 0)) {
-            size_t index = slot_capacity;
-            if (compact_rows) {
-                index = used;
-            } else {
-                for (size_t i = 0; i < slot_capacity; ++i) {
-                    if (!slots[i].in_use) { index = i; break; }
-                }
-            }
-            if (index == slot_capacity) break;
-
-            mynah_graph_job job;
-            memset(&job, 0, sizeof(job));
-            void *tag = NULL;
-            const int block = (used == 0u);
-            const double t_block = (serve_profile && block) ? mynah_phase_seconds() : 0.0;
-            const int got = sink->next_job(sink->ud, &job, &tag, block);
-            if (serve_profile && block) occ_blocked_s += mynah_phase_seconds() - t_block;
-            if (got != 1) {
-                /* Nothing available. If we asked it to block and it still had
-                 * nothing, the service is over.  A free slot that stayed free
-                 * because the queue was empty is the loop telling us the box is
-                 * ahead of its arrivals, which is the opposite of saturation. */
-                if (serve_profile) ++occ_free_nothing_queued;
-                if (block) drained = 1;
-                break;
-            }
-            if (serve_profile) ++occ_admits;
-            synth_slot *slot = &slots[index];
-            memset(slot, 0, sizeof(*slot));
-            slot->in_use = 1;
-            slot->tag = tag;
-            slot->request = job.request;
-            slot->samples = job.samples;
-            slot->sample_count = job.sample_count;
-            slot->callback = job.callback;
-            slot->user_data = job.user_data;
-            slot->chunk_samples = job.chunk_samples;
-            slot->error = job.error;
-            slot->error_capacity = job.error_capacity;
-            ++used;
-            ++admitted;
-            if (slot_start(engine, model, state, &caps, slot, dump_all,
-                           &prep_seq_next) != 0) {
-                /* A request that cannot start never occupies the batch. */
-                if (slot_retire(engine, sink, slot, dump_all) != 0) result = -1;
-                --used;
-            }
-        }
+        iter_admits = 0u;
+        admit_pass(&adm);
         /* Admission is submitted rather than bracketed: it is declared
          * "derived" in the table because the region it sits under -- the
          * request -- is itself derived, and a blocking next_job() waiting for
@@ -1304,6 +1667,16 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         }
         if (timing && t_prep == t_start) t_prep = mynah_phase_seconds();
         if (used == 0u) break;
+        if (async_on) {
+            /* Wait only when nothing can step or prefill: every held slot is
+             * still being built. */
+            int runnable = 0;
+            const size_t rows = compact_rows ? used : slot_capacity;
+            for (size_t i = 0; i < rows && !runnable; ++i)
+                runnable = slots[i].in_use && (slots[i].active || slots[i].preparing);
+            async_collect(&adm, !runnable);
+        }
+        if (report_phase) sink->phase(sink->ud, iteration, 1);
 
         /* ---- cancellation --------------------------------------------- */
         if (sink->cancelled != NULL) {
@@ -1320,6 +1693,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             }
         }
 
+        if (async_on) async_collect(&adm, 0);
+
         /* ---- finish the prefills that are in flight -------------------- */
         if (engine->prepare_slice != NULL) {
             const size_t prefill_rows = compact_rows ? used : slot_capacity;
@@ -1328,6 +1703,20 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                                     max_batch, dump_all, &prefill_rr,
                                     serve_profile ? &prefill_profile : NULL);
         }
+
+        if (late_admit && !drained && used < slot_capacity &&
+            (sink->running == NULL || sink->running(sink->ud) != 0) &&
+            sink->wait_arrival(sink->ud, retired_last ? late_wait_us : 0u) != 0) {
+            const size_t before = used;
+            admit_pass(&adm);
+            if (used > before && engine->prepare_slice != NULL) {
+                const size_t prefill_rows = compact_rows ? used : slot_capacity;
+                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
+                                    max_batch, dump_all, &prefill_rr,
+                                    serve_profile ? &prefill_profile : NULL);
+            }
+        }
+        if (report_phase) sink->phase(sink->ud, iteration, 2);
 
         /* ---- one bounded step over the live set -----------------------
          * A continuous service may retain 128 request contexts while the
@@ -1370,6 +1759,10 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             }
         }
 
+        if (report_phase) sink->phase(sink->ud, iteration, 3);
+        ++iteration;
+        const size_t used_before_retire = used;
+
         /* ---- retire, per slot, as soon as it stops ---------------------
          * Not after the whole group: the slot is the unit of capacity, and
          * holding a finished one until its neighbours catch up is exactly the
@@ -1379,7 +1772,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
              * after the move: the last row may itself already be finished. */
             size_t i = 0u;
             while (i < used) {
-                if (!slots[i].in_use || slots[i].active || slots[i].preparing) {
+                if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
+                    slots[i].starting) {
                     ++i;
                     continue;
                 }
@@ -1395,7 +1789,8 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             for (size_t i = 0; i < slot_capacity; ++i) {
                 /* `preparing` is the third state this loop has to know about:
                  * not active, and not finished either. */
-                if (!slots[i].in_use || slots[i].active || slots[i].preparing)
+                if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
+                    slots[i].starting)
                     continue;
                 /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates
                  * the frame history and frees the context; a unit still
@@ -1406,6 +1801,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 --used;
             }
         }
+        retired_last = used_before_retire - used;
     }
     if (serve_profile) {
         const double wall = mynah_phase_seconds() - t_start;
@@ -1473,6 +1869,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         fprintf(stderr, "phase: prep=%.3fs ar=%.3fs (requests=%zu)\n",
                 t_prep - t_start, t_ar - t_prep, admitted);
     }
+    if (async_on) async_admit_stop(&async_q);
     engine->scratch_free(scratch);
     engine->model_free(state);
     return result;
