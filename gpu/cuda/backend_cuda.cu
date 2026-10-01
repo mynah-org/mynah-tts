@@ -1230,13 +1230,14 @@ static bool cuda_decoder_batch_enabled(void) {
  * FP32 accumulation and an FP32 output.  Causal states, bias, ELU, residual
  * adds and the returned audio stay FP32.  Read once per process: decoders
  * opened later must agree with the ones already in a gang. */
-/* MYNAH_CUDA_SEANET_BF16: 1 = every GEMM-form decoder conv in BF16; the
+/* MYNAH_CUDA_SEANET_BF16 (default on; 0 = FP32 decoder convs): every GEMM-form decoder conv in BF16; the
  * diagnostic values "conv" and "convtr" restrict it to one kind, to locate a
  * solo-vs-gang divergence. */
 static int cuda_seanet_bf16_mask(void) {
     static const int mask = [] {
         const char *v = std::getenv("MYNAH_CUDA_SEANET_BF16");
-        if (v == nullptr || *v == '\0' || std::strcmp(v, "0") == 0) return 0;
+        if (v != nullptr && std::strcmp(v, "0") == 0) return 0;
+        if (v == nullptr || *v == '\0') return 3; /* default on; =0 is the rollback */
         if (std::strcmp(v, "conv") == 0) return 1;
         if (std::strcmp(v, "convtr") == 0) return 2;
         return 3;

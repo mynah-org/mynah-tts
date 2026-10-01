@@ -63,13 +63,14 @@
 static const size_t pocket_default_width_buckets[] = {
     1u, 2u, 4u, 8u, 16u, 24u, 32u, 48u, 64u, 96u, 128u, 160u, 192u, 256u, 384u};
 static size_t pocket_width_buckets[POCKET_WIDTH_BUCKETS_MAX];
-static size_t pocket_width_bucket_count; /* 0 = exact widths (default) */
+static size_t pocket_width_bucket_count; /* 0 = exact widths (MYNAH_CUDA_WIDTH_BUCKETS=0) */
 static pthread_once_t pocket_width_buckets_once = PTHREAD_ONCE_INIT;
 
 static void pocket_width_buckets_parse(void) {
     pocket_width_bucket_count = 0u;
     const char *setting = getenv("MYNAH_CUDA_WIDTH_BUCKETS");
-    if (setting == NULL || setting[0] == '\0' || strcmp(setting, "0") == 0)
+    if (setting == NULL || setting[0] == '\0') setting = "1"; /* default on */
+    if (strcmp(setting, "0") == 0)
         return;
     if (strcmp(setting, "1") == 0) {
         const size_t n = sizeof(pocket_default_width_buckets) /
@@ -11807,7 +11808,7 @@ typedef struct {
 
 static int pocket_bf16_codec_requested(void) {
     const char *v = getenv("MYNAH_CUDA_SEANET_BF16");
-    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+    return v == NULL || v[0] == '\0' || strcmp(v, "0") != 0; /* default on */
 }
 
 /* Two sets of contexts built from the SAME cases.  Everything in this engine is

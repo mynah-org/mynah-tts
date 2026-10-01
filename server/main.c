@@ -1130,7 +1130,8 @@ static int warmup_run(unsigned count) {
  * Returns how many sets to prefill. */
 static size_t pool_prefill_count(int cuda) {
     const char *setting = getenv("MYNAH_CUDA_SLOT_POOL_PREFILL");
-    if (setting == NULL || setting[0] == '\0' || !cuda) return 0u;
+    if (!cuda) return 0u;
+    if (setting == NULL || setting[0] == '\0') setting = "1"; /* default on (CUDA) */
     char *end = NULL;
     const long value = strtol(setting, &end, 10);
     if (end == setting || value <= 0) return 0u;
@@ -1220,7 +1221,8 @@ static size_t pool_prefill_run(size_t count) {
  * leaves one parked set per request in the slot pool, like the pool prefill. */
 static int width_buckets_requested(int cuda) {
     const char *setting = getenv("MYNAH_CUDA_WIDTH_BUCKETS");
-    return cuda && setting != NULL && setting[0] != '\0' && strcmp(setting, "0") != 0;
+    /* Default on for CUDA; =0 is the rollback to exact widths. */
+    return cuda && (setting == NULL || setting[0] == '\0' || strcmp(setting, "0") != 0);
 }
 
 static size_t width_walk_run(size_t count) {
