@@ -11546,6 +11546,19 @@ typedef struct {
  * bit-level identity; a real batching defect is orders of magnitude larger. */
 #define POCKET_BATCH_PARITY_ATOL_TC 1.0e-3f
 #define POCKET_BATCH_PARITY_RTOL_TC 1.0e-3f
+/* With the CUDA SEANet decoder convolutions in BF16 (MYNAH_CUDA_SEANET_BF16)
+ * the solo and gang paths run different cuBLAS BF16 kernels (single vs batched
+ * GEMM), and the codec amplifies their rounding: measured on the L4 at
+ * 1.3e-3 of full scale (about -58 dB), for the conv1d and the transposed-conv
+ * GEMMs alike. The gate then asks for -50 dB agreement; a real batching defect
+ * (a wrong row, offset or state) is still orders of magnitude larger. */
+#define POCKET_BATCH_PARITY_ATOL_BF16_CODEC 3.0e-3f
+#define POCKET_BATCH_PARITY_RTOL_BF16_CODEC 3.0e-3f
+
+static int pocket_bf16_codec_requested(void) {
+    const char *v = getenv("MYNAH_CUDA_SEANET_BF16");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
 
 /* Two sets of contexts built from the SAME cases.  Everything in this engine is
  * a deterministic function of (weights, text, voice, seed), so set A and set B
@@ -11883,10 +11896,13 @@ static int pocket_check_gang(mynah_engine_state *state,
                              size_t max_steps, mynah_engine_scratch *scratch,
                              char *error, size_t capacity) {
     const int invariant = mynah_backend_batch_invariant(state->backend);
-    const float parity_atol = invariant ? POCKET_BATCH_PARITY_ATOL
-                                        : POCKET_BATCH_PARITY_ATOL_TC;
-    const float parity_rtol = invariant ? POCKET_BATCH_PARITY_RTOL
-                                        : POCKET_BATCH_PARITY_RTOL_TC;
+    const int bf16_codec = !invariant && pocket_bf16_codec_requested();
+    const float parity_atol = invariant    ? POCKET_BATCH_PARITY_ATOL
+                              : bf16_codec ? POCKET_BATCH_PARITY_ATOL_BF16_CODEC
+                                           : POCKET_BATCH_PARITY_ATOL_TC;
+    const float parity_rtol = invariant    ? POCKET_BATCH_PARITY_RTOL
+                              : bf16_codec ? POCKET_BATCH_PARITY_RTOL_BF16_CODEC
+                                           : POCKET_BATCH_PARITY_RTOL_TC;
     pocket_check_set a, b;
     if (pocket_check_set_new(state, model, cases, count, max_steps, &a, error,
                              capacity) != 0) {

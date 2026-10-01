@@ -202,6 +202,7 @@ resolves the default to the same thing, so it is harmless and optional.
 | `MYNAH_CUDA_TILE_TC=1` | own tensor-core fixed-order GEMM for the prefill | +1-2% only |
 | `MYNAH_CUDA_QUANT=bf16\|int8` | bfloat16 / int8 resident weights | bf16 -4%, int8 diagnostic only |
 | `MYNAH_CUDA_FAST_MATH=1` | FP16 GEMMs | not qualified |
+| `MYNAH_CUDA_SEANET_BF16=1` | SEANet decoder convolution GEMMs with bf16 operands on tensor cores; fp32 accumulation, causal states and audio | not yet measured on the L4; quality gate `tests/codec_int8_quality.py --mode seanet-bf16` |
 | `MYNAH_CUDA_CODEC_BATCH=1` | older multi-row codec path | fails the waveform parity gate |
 | `MYNAH_CUDA_ALLOW_CPU_STAGES=1` | lets hot stages run on the CPU | 20-30x slower while reporting CUDA: never in production |
 
