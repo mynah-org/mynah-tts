@@ -1048,6 +1048,87 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     }
 }
 
+/* The admission pass: fill free slots from the sink until it has nothing, a
+ * slot limit is reached, or the service stops admitting. Lifted out of the
+ * loop unchanged so that the optional late pass before the step (see
+ * `wait_arrival` in graph.h) runs exactly the same code. */
+typedef struct {
+    const mynah_tts_engine *engine;
+    const mynah_tts_model *model;
+    mynah_engine_state *state;
+    const mynah_engine_caps *caps;
+    mynah_graph_sink *sink;
+    synth_slot *slots;
+    size_t slot_capacity;
+    int compact_rows;
+    int dump_all;
+    int serve_profile;
+    size_t *used;
+    size_t *admitted;
+    int *drained;
+    int *result;
+    unsigned long long *prep_seq_next;
+    double *occ_blocked_s;
+    size_t *occ_free_nothing_queued;
+    size_t *occ_admits;
+} admit_ctx;
+
+static void admit_pass(const admit_ctx *a) {
+    mynah_graph_sink *sink = a->sink;
+    synth_slot *slots = a->slots;
+    const size_t slot_capacity = a->slot_capacity;
+    while (!*a->drained && *a->used < slot_capacity &&
+           (sink->running == NULL || sink->running(sink->ud) != 0)) {
+        size_t index = slot_capacity;
+        if (a->compact_rows) {
+            index = *a->used;
+        } else {
+            for (size_t i = 0; i < slot_capacity; ++i) {
+                if (!slots[i].in_use) { index = i; break; }
+            }
+        }
+        if (index == slot_capacity) break;
+
+        mynah_graph_job job;
+        memset(&job, 0, sizeof(job));
+        void *tag = NULL;
+        const int block = (*a->used == 0u);
+        const double t_block = (a->serve_profile && block) ? mynah_phase_seconds() : 0.0;
+        const int got = sink->next_job(sink->ud, &job, &tag, block);
+        if (a->serve_profile && block) *a->occ_blocked_s += mynah_phase_seconds() - t_block;
+        if (got != 1) {
+            /* Nothing available. If we asked it to block and it still had
+             * nothing, the service is over.  A free slot that stayed free
+             * because the queue was empty is the loop telling us the box is
+             * ahead of its arrivals, which is the opposite of saturation. */
+            if (a->serve_profile) ++*a->occ_free_nothing_queued;
+            if (block) *a->drained = 1;
+            break;
+        }
+        if (a->serve_profile) ++*a->occ_admits;
+        synth_slot *slot = &slots[index];
+        memset(slot, 0, sizeof(*slot));
+        slot->in_use = 1;
+        slot->tag = tag;
+        slot->request = job.request;
+        slot->samples = job.samples;
+        slot->sample_count = job.sample_count;
+        slot->callback = job.callback;
+        slot->user_data = job.user_data;
+        slot->chunk_samples = job.chunk_samples;
+        slot->error = job.error;
+        slot->error_capacity = job.error_capacity;
+        ++*a->used;
+        ++*a->admitted;
+        if (slot_start(a->engine, a->model, a->state, a->caps, slot, a->dump_all,
+                       a->prep_seq_next) != 0) {
+            /* A request that cannot start never occupies the batch. */
+            if (slot_retire(a->engine, sink, slot, a->dump_all) != 0) *a->result = -1;
+            --*a->used;
+        }
+    }
+}
+
 /* The one driver.
  *
  * `want_batch` is how wide the caller would like to run; `strict_batch` says
@@ -1200,6 +1281,9 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * variance. */
     const int serve_profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
     const double t_profile0 = serve_profile ? mynah_phase_seconds() : 0.0;
+    /* Phase boundaries for the sink (graph.h: `phase`), profile runs only. */
+    const int report_phase = serve_profile && sink->phase != NULL;
+    unsigned long long iteration = 0ull;
     prefill_acct prefill_profile;
     memset(&prefill_profile, 0, sizeof(prefill_profile));
     size_t occ_hist[MYNAH_GRAPH_MAX_JOBS + 1u];
@@ -1223,6 +1307,45 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             ? (double)(caps.frames_per_step ? caps.frames_per_step : 1u) / caps.frame_rate
             : 0.0;
 
+    admit_ctx adm;
+    memset(&adm, 0, sizeof(adm));
+    adm.engine = engine;
+    adm.model = model;
+    adm.state = state;
+    adm.caps = &caps;
+    adm.sink = sink;
+    adm.slots = slots;
+    adm.slot_capacity = slot_capacity;
+    adm.compact_rows = compact_rows;
+    adm.dump_all = dump_all;
+    adm.serve_profile = serve_profile;
+    adm.used = &used;
+    adm.admitted = &admitted;
+    adm.drained = &drained;
+    adm.result = &result;
+    adm.prep_seq_next = &prep_seq_next;
+    adm.occ_blocked_s = &occ_blocked_s;
+    adm.occ_free_nothing_queued = &occ_free_nothing_queued;
+    adm.occ_admits = &occ_admits;
+
+    /* Late admission (graph.h, `wait_arrival`): a sink that offers it gets a
+     * second admission pass right before each step, so a request that
+     * arrived after the top-of-iteration pass joins this step instead of the
+     * next. `late_wait_us` optionally holds the step for an arrival that a
+     * retirement in the previous iteration makes likely (closed-loop clients
+     * send their next request as the previous one completes). */
+    const int late_admit = sink->wait_arrival != NULL;
+    unsigned late_wait_us = 0u;
+    if (late_admit) {
+        const char *w = getenv("MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US");
+        if (w != NULL && *w != '\0') {
+            char *end = NULL;
+            const unsigned long v = strtoul(w, &end, 10);
+            if (end != w && v <= 20000ul) late_wait_us = (unsigned)v;
+        }
+    }
+    size_t retired_last = 0u;
+
     for (;;) {
         /* ---- reap whatever the decoder lane finished --------------------
          * Non-blocking, and first, so that a unit that completed while the
@@ -1230,6 +1353,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * slot's cursors. A slot whose unit is still running is simply left
          * alone; it is not waited for here and never on another slot's
          * account. */
+        if (report_phase) sink->phase(sink->ud, iteration, 0);
         if (lane_on) {
             for (size_t i = 0; i < slot_capacity; ++i) {
                 if (slots[i].in_use) lane_reap(&slots[i], i, 0);
@@ -1242,56 +1366,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * up waiting for an arrival that may not come. */
         const unsigned long long t_admit =
             mynah_costmap_level() ? mynah_costmap_now_ns() : 0ull;
-        while (!drained && used < slot_capacity &&
-               (sink->running == NULL || sink->running(sink->ud) != 0)) {
-            size_t index = slot_capacity;
-            if (compact_rows) {
-                index = used;
-            } else {
-                for (size_t i = 0; i < slot_capacity; ++i) {
-                    if (!slots[i].in_use) { index = i; break; }
-                }
-            }
-            if (index == slot_capacity) break;
-
-            mynah_graph_job job;
-            memset(&job, 0, sizeof(job));
-            void *tag = NULL;
-            const int block = (used == 0u);
-            const double t_block = (serve_profile && block) ? mynah_phase_seconds() : 0.0;
-            const int got = sink->next_job(sink->ud, &job, &tag, block);
-            if (serve_profile && block) occ_blocked_s += mynah_phase_seconds() - t_block;
-            if (got != 1) {
-                /* Nothing available. If we asked it to block and it still had
-                 * nothing, the service is over.  A free slot that stayed free
-                 * because the queue was empty is the loop telling us the box is
-                 * ahead of its arrivals, which is the opposite of saturation. */
-                if (serve_profile) ++occ_free_nothing_queued;
-                if (block) drained = 1;
-                break;
-            }
-            if (serve_profile) ++occ_admits;
-            synth_slot *slot = &slots[index];
-            memset(slot, 0, sizeof(*slot));
-            slot->in_use = 1;
-            slot->tag = tag;
-            slot->request = job.request;
-            slot->samples = job.samples;
-            slot->sample_count = job.sample_count;
-            slot->callback = job.callback;
-            slot->user_data = job.user_data;
-            slot->chunk_samples = job.chunk_samples;
-            slot->error = job.error;
-            slot->error_capacity = job.error_capacity;
-            ++used;
-            ++admitted;
-            if (slot_start(engine, model, state, &caps, slot, dump_all,
-                           &prep_seq_next) != 0) {
-                /* A request that cannot start never occupies the batch. */
-                if (slot_retire(engine, sink, slot, dump_all) != 0) result = -1;
-                --used;
-            }
-        }
+        admit_pass(&adm);
         /* Admission is submitted rather than bracketed: it is declared
          * "derived" in the table because the region it sits under -- the
          * request -- is itself derived, and a blocking next_job() waiting for
@@ -1304,6 +1379,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         }
         if (timing && t_prep == t_start) t_prep = mynah_phase_seconds();
         if (used == 0u) break;
+        if (report_phase) sink->phase(sink->ud, iteration, 1);
 
         /* ---- cancellation --------------------------------------------- */
         if (sink->cancelled != NULL) {
@@ -1328,6 +1404,20 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                                     max_batch, dump_all, &prefill_rr,
                                     serve_profile ? &prefill_profile : NULL);
         }
+
+        if (late_admit && !drained && used < slot_capacity &&
+            (sink->running == NULL || sink->running(sink->ud) != 0) &&
+            sink->wait_arrival(sink->ud, retired_last ? late_wait_us : 0u) != 0) {
+            const size_t before = used;
+            admit_pass(&adm);
+            if (used > before && engine->prepare_slice != NULL) {
+                const size_t prefill_rows = compact_rows ? used : slot_capacity;
+                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
+                                    max_batch, dump_all, &prefill_rr,
+                                    serve_profile ? &prefill_profile : NULL);
+            }
+        }
+        if (report_phase) sink->phase(sink->ud, iteration, 2);
 
         /* ---- one bounded step over the live set -----------------------
          * A continuous service may retain 128 request contexts while the
@@ -1370,6 +1460,10 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             }
         }
 
+        if (report_phase) sink->phase(sink->ud, iteration, 3);
+        ++iteration;
+        const size_t used_before_retire = used;
+
         /* ---- retire, per slot, as soon as it stops ---------------------
          * Not after the whole group: the slot is the unit of capacity, and
          * holding a finished one until its neighbours catch up is exactly the
@@ -1406,6 +1500,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 --used;
             }
         }
+        retired_last = used_before_retire - used;
     }
     if (serve_profile) {
         const double wall = mynah_phase_seconds() - t_start;
