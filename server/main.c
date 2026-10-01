@@ -204,6 +204,88 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
+/* ------------------------------------------------- first-chunk anatomy
+ *
+ * MYNAH_SERVE_PROFILE only; read once at start-up, and with it unset every
+ * hook below is one branch on `g_prof`. The mean TTFA on /metrics says how
+ * long a request waited for its first audio, not where: queued behind a full
+ * batch, queued with a free slot while the driver was busy with the rest of
+ * its iteration, or admitted and still one or more iterations short of its
+ * first chunk. Those have different fixes. The driver reports each
+ * iteration's phase boundaries (graph.h, sink.phase); each request records
+ * where in an iteration it arrived, whether a slot was free for it then, and
+ * the iteration index at admission and at its first chunk. GET
+ * /debug/first-chunk prints fixed-bucket histograms, so it can be read while
+ * the server runs. */
+#define PROF_BUCKETS 64          /* 5 ms each: [0,5) ... [315,inf) */
+#define PROF_BUCKET_MS 5.0
+enum { PH_ADMIT, PH_PREFILL, PH_STEP, PH_RETIRE, PH_COUNT };
+enum {
+    H_WAIT_SLOT_FREE,        /* queue wait when a slot was free at arrival */
+    H_WAIT_SLOT_FULL,        /* queue wait when every slot was taken */
+    H_ADMIT_TO_FIRST,        /* admitted -> first chunk handed to the writer */
+    H_TTFA,                  /* created -> first chunk */
+    H_ARRIVAL_OFFSET,        /* arrival time minus the current iteration's start */
+    H_ITERATION,             /* one whole driver iteration */
+    H_COUNT
+};
+static const char *const PROF_HIST_NAME[H_COUNT] = {
+    "queue_wait_slot_free", "queue_wait_slot_full", "admitted_to_first_chunk",
+    "ttfa", "arrival_offset_in_iteration", "iteration",
+};
+static const char *const PROF_PHASE_NAME[PH_COUNT] = {
+    "admission", "prefill", "step_emit_decode", "retire_and_rest",
+};
+static int g_prof;
+static int g_cuda_serving;   /* --device cuda; set once in main before the scheduler starts */
+static struct {
+    atomic_ulong hist[H_COUNT][PROF_BUCKETS];
+    atomic_ulong first_iters[4];      /* first chunk 0, 1, 2, 3+ iterations after admission */
+    atomic_ulong phase_us[PH_COUNT];
+    atomic_ulong iterations;
+    atomic_ulong arrived_slot_full;
+    atomic_ulong arrived_slot_free;
+    atomic_ullong iteration_start_us; /* monotonic; read by the HTTP workers */
+} g_prof_stats;
+/* Scheduler thread only. */
+static unsigned long long g_iter_index;
+static double g_iter_t[PH_COUNT];
+
+static void prof_hist_add(int h, double ms) {
+    if (!(ms >= 0.0)) ms = 0.0;
+    size_t b = (size_t)(ms / PROF_BUCKET_MS);
+    if (b >= PROF_BUCKETS) b = PROF_BUCKETS - 1u;
+    atomic_fetch_add(&g_prof_stats.hist[h][b], 1ul);
+}
+
+static void prof_phase_add(int ph, double ms) {
+    if (ms > 0.0) atomic_fetch_add(&g_prof_stats.phase_us[ph], (unsigned long)(ms * 1000.0));
+}
+
+/* The driver's phase report (sink.phase). Runs on the scheduler thread. */
+static void sink_phase(void *ud, unsigned long long index, int phase) {
+    (void)ud;
+    const double t = now_ms();
+    if (phase == 0) {
+        if (g_iter_t[PH_RETIRE] > 0.0) {
+            /* Close the previous iteration: its last phase ends here. */
+            prof_phase_add(PH_ADMIT, g_iter_t[PH_PREFILL] - g_iter_t[PH_ADMIT]);
+            prof_phase_add(PH_PREFILL, g_iter_t[PH_STEP] - g_iter_t[PH_PREFILL]);
+            prof_phase_add(PH_STEP, g_iter_t[PH_RETIRE] - g_iter_t[PH_STEP]);
+            prof_phase_add(PH_RETIRE, t - g_iter_t[PH_RETIRE]);
+            prof_hist_add(H_ITERATION, t - g_iter_t[PH_ADMIT]);
+            atomic_fetch_add(&g_prof_stats.iterations, 1ul);
+        }
+        g_iter_index = index;
+        for (int i = 0; i < PH_COUNT; ++i) g_iter_t[i] = 0.0;
+        g_iter_t[PH_ADMIT] = t;
+        atomic_store(&g_prof_stats.iteration_start_us, (unsigned long long)(t * 1000.0));
+    } else if (phase >= 1 && phase <= 3) {
+        /* Phase p ends the p-th span and starts the next one. */
+        g_iter_t[phase] = t;
+    }
+}
+
 /* ------------------------------------------------------- synthesis jobs
  *
  * An offline request that reaches synthesis is a heap `synth_job`, never a
@@ -248,6 +330,7 @@ typedef struct {
     int expired;
     double first_audio_ms;
     int first_audio_seen;
+    unsigned long long first_iter;   /* MYNAH_SERVE_PROFILE: driver iteration of the first chunk */
     size_t audio_samples;
     /* Written and read only on the scheduler thread (sink_cancelled and
      * sink_on_done are both driver callbacks), so it needs no atomic. It
@@ -310,6 +393,10 @@ typedef struct synth_job {
     double admitted_ms;
     double first_audio_ms;
     int first_audio_seen;
+    /* MYNAH_SERVE_PROFILE only (see "first-chunk anatomy"). */
+    double arrival_offset_ms;        /* arrival minus the driver iteration's start */
+    int arrived_slot_full;           /* every slot taken when it was queued */
+    unsigned long long admit_iter;   /* driver iteration that admitted it */
     struct synth_job *next;
 } synth_job;
 
@@ -402,6 +489,15 @@ static int job_enqueue(synth_job *j) {
         return -1;
     }
     job_retain(j);
+    if (g_prof) {
+        const double t = now_ms();
+        j->arrival_offset_ms =
+            t - (double)atomic_load(&g_prof_stats.iteration_start_us) / 1000.0;
+        j->arrived_slot_full =
+            atomic_load(&g_stats.active) + g_batch.pending >= (unsigned long)g.max_active;
+        atomic_fetch_add(j->arrived_slot_full ? &g_prof_stats.arrived_slot_full
+                                              : &g_prof_stats.arrived_slot_free, 1ul);
+    }
     j->next = NULL;
     if (g_batch.tail == NULL) g_batch.head = j;
     else g_batch.tail->next = j;
@@ -487,6 +583,7 @@ static int stream_callback(const float *samples, size_t count, void *user_data) 
         if (!sink->first_audio_seen) {
             sink->first_audio_ms = now_ms();
             sink->first_audio_seen = 1;
+            if (g_prof) sink->first_iter = g_iter_index;
         }
         if (count <= SIZE_MAX - sink->audio_samples)
             sink->audio_samples += count;
@@ -517,6 +614,15 @@ static void record_job_timing(const synth_job *j, double finished_ms,
     atomic_fetch_add(&g_stats.e2e_us,
                      timing_us(finished_ms - j->created_ms));
     atomic_fetch_add(&g_stats.audio_us, timing_us(audio_seconds * 1000.0));
+    if (g_prof && j->is_stream && j->first_audio_seen) {
+        prof_hist_add(j->arrived_slot_full ? H_WAIT_SLOT_FULL : H_WAIT_SLOT_FREE,
+                      j->admitted_ms - j->created_ms);
+        prof_hist_add(H_ADMIT_TO_FIRST, first_ms - j->admitted_ms);
+        prof_hist_add(H_TTFA, first_ms - j->created_ms);
+        prof_hist_add(H_ARRIVAL_OFFSET, j->arrival_offset_ms);
+        const unsigned long long d = j->sink.first_iter - j->admit_iter;
+        atomic_fetch_add(&g_prof_stats.first_iters[d < 3ull ? d : 3ull], 1ul);
+    }
 }
 
 /* ------------------------------------------------------- the driver's sink
@@ -560,6 +666,7 @@ static int sink_next_job(void *ud, mynah_graph_job *job, void **tag, int block) 
             continue;
         }
         j->admitted_ms = now_ms();
+        if (g_prof) j->admit_iter = g_iter_index;
 
         if (j->is_stream) {
             const int fd = job_claim_fd(j);
@@ -592,6 +699,29 @@ static int sink_next_job(void *ud, mynah_graph_job *job, void **tag, int block) 
         atomic_fetch_add(&g_stats.active, 1ul);
         return 1;
     }
+}
+
+/* MYNAH_CUDA_FAST_FIRST_CHUNK: the driver's late admission probe (graph.h,
+ * `wait_arrival`). Non-zero when a job is queued; waits at most `wait_us` for
+ * one. Scheduler thread. */
+static int sink_wait_arrival(void *ud, unsigned wait_us) {
+    (void)ud;
+    pthread_mutex_lock(&g_batch.mu);
+    if (g_batch.head == NULL && !g_batch.stop && wait_us > 0u) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += (long)wait_us * 1000L;
+        while (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_nsec -= 1000000000L;
+            ++deadline.tv_sec;
+        }
+        while (g_batch.head == NULL && !g_batch.stop) {
+            if (pthread_cond_timedwait(&g_batch.arrived, &g_batch.mu, &deadline) != 0) break;
+        }
+    }
+    const int any = g_batch.head != NULL && !g_batch.stop;
+    pthread_mutex_unlock(&g_batch.mu);
+    return any;
 }
 
 /* Completion, exactly once per admitted request. A streaming job has no
@@ -744,6 +874,16 @@ static void *scheduler_main(void *arg) {
     sink.on_done = sink_on_done;
     sink.cancelled = sink_cancelled;
     sink.running = sink_running;
+    if (g_prof) sink.phase = sink_phase;
+    /* Late admission before each step: CUDA serving only, opt-in. */
+    {
+        const char *f = getenv("MYNAH_CUDA_FAST_FIRST_CHUNK");
+        if (f != NULL && strcmp(f, "0") != 0 && *f != '\0' &&
+            g_cuda_serving) {
+            sink.wait_arrival = sink_wait_arrival;
+            fprintf(stderr, "late admission before each step: on (MYNAH_CUDA_FAST_FIRST_CHUNK)\n");
+        }
+    }
     /* Returns -1 if any single request failed, which is routine; the only
      * interesting case is coming back before anyone asked it to stop. */
     (void)mynah_graph_serve_continuous_capacity(g.model, g.max_batch,
@@ -967,6 +1107,136 @@ static int warmup_run(unsigned count) {
     }
     free(ids);
     return failures == 0 ? 0 : -1;
+}
+
+/* MYNAH_CUDA_SLOT_POOL_PREFILL (CUDA only; unset or 0 = off, 1 = one set per
+ * `--max-inflight` slot, N = N sets, clamped to `--max-inflight`). The
+ * ordinary warm-up runs its requests one at a time, so it leaves one
+ * per-request resource set in the engine's slot pool (MYNAH_CUDA_SLOT_POOL).
+ * The first burst after start-up then allocates device state serially at
+ * admission, one request after another, and that is what a fresh server's
+ * first-audio spread is made of.
+ *
+ * This runs N synthetic requests through the queue AT THE SAME TIME, so N
+ * contexts are live together and each parks its set in the pool when it
+ * retires: the first N client admissions take parked sets instead of
+ * allocating. The text is one sentence of about first-segment length, so the
+ * parked backbone caches (voice + text + max(256, 3*text + 64) positions under
+ * MYNAH_CUDA_KV_GROW) serve ordinary first segments under the pool's reuse
+ * rule (parked <= 2x needed). It uses the normal request path, like the
+ * warm-up: nothing here allocates device memory itself, and the pool reuse it
+ * relies on is already byte-identical by construction.
+ *
+ * Returns how many sets to prefill. */
+static size_t pool_prefill_count(int cuda) {
+    const char *setting = getenv("MYNAH_CUDA_SLOT_POOL_PREFILL");
+    if (setting == NULL || setting[0] == '\0' || !cuda) return 0u;
+    char *end = NULL;
+    const long value = strtol(setting, &end, 10);
+    if (end == setting || value <= 0) return 0u;
+    size_t n = value == 1 ? g.max_active : (size_t)value;
+    if (n > g.max_active) n = g.max_active;
+    return n;
+}
+
+/* Returns how many of the `count` concurrent requests completed.  With
+ * `stagger` 0 every request runs to its own end (the slot-pool prefill);
+ * otherwise request i is capped at 4 + stagger*i steps (see width_walk_run). */
+static size_t startup_burst_run(size_t count, const char *PREFILL_TEXT,
+                                unsigned stagger) {
+    if (count == 0u) return 0u;
+    int *ids = NULL;
+    size_t id_count = 0;
+    char err[512];
+    const int encode_failed = g.sp != NULL
+        ? mynah_sp_encode(g.sp, PREFILL_TEXT, strlen(PREFILL_TEXT), &ids, &id_count,
+                          err, sizeof(err))
+        : mynah_tokenizer_encode(g.tokenizer, "en", PREFILL_TEXT, &ids, &id_count,
+                                 err, sizeof(err));
+    if (encode_failed != 0 || id_count == 0u) {
+        fprintf(stderr, "slot-pool prefill skipped: cannot tokenize (%s)\n",
+                encode_failed != 0 ? err : "no tokens");
+        free(ids);
+        return 0u;
+    }
+    synth_job **jobs = (synth_job **)calloc(count, sizeof(*jobs));
+    if (jobs == NULL) {
+        free(ids);
+        return 0u;
+    }
+    size_t queued = 0u;
+    for (; queued < count; ++queued) {
+        int *copy = (int *)malloc(id_count * sizeof(*copy));
+        if (copy == NULL) break;
+        memcpy(copy, ids, id_count * sizeof(*copy));
+        synth_job *job = job_new(-1);     /* no client: nothing to answer */
+        if (job == NULL) { free(copy); break; }
+        job->is_warmup = 1;               /* not traffic: kept out of jobs.completed */
+        job->text_ids = copy;
+        job->request.text_ids = copy;
+        job->request.text_length = id_count;
+        job->request.speaker = g.default_speaker;
+        job->request.max_steps = stagger == 0u
+            ? 0u                          /* the pack's own default */
+            : 4u + stagger * (unsigned)queued;
+        job->request.temperature = (float)g.info.default_temperature;
+        job->request.topk = g.info.default_topk;
+        job->request.use_local_transformer = 1;
+        job->request.seed = 42u;
+        job->sink.deadline_ms = 0.0;
+        if (job_enqueue(job) != 0) {
+            job_release(job);
+            break;
+        }
+        jobs[queued] = job;
+    }
+    size_t done = 0u;
+    for (size_t i = 0; i < queued; ++i) {
+        if (job_wait(jobs[i], 0u) == 0 && jobs[i]->result == 0) ++done;
+        job_release(jobs[i]);
+    }
+    free(jobs);
+    free(ids);
+    return done;
+}
+
+static size_t pool_prefill_run(size_t count) {
+    return startup_burst_run(
+        count,
+        "The morning train left the quiet station on time, and everyone "
+        "on board settled in for the long ride north.",
+        0u);
+}
+
+/* MYNAH_CUDA_WIDTH_BUCKETS (CUDA only): with bucketed step widths a small,
+ * fixed set of backbone/flow graphs covers every live width, and this walk
+ * captures all of them before the server takes traffic.  `--max-inflight`
+ * synthetic requests start together; request i stops after 4 + 2*i steps, so
+ * the live batch shrinks by one row every second step from the full width
+ * down to 1.  Every bucket is visited, both on a step where no row retired
+ * (the device-resident condition input is reused) and on one where a row did
+ * (the input is re-staged): those are two graph keys per bucket.  The text is
+ * long enough that no request reaches its natural end first.  The same walk
+ * leaves one parked set per request in the slot pool, like the pool prefill. */
+static int width_buckets_requested(int cuda) {
+    const char *setting = getenv("MYNAH_CUDA_WIDTH_BUCKETS");
+    return cuda && setting != NULL && setting[0] != '\0' && strcmp(setting, "0") != 0;
+}
+
+static size_t width_walk_run(size_t count) {
+    return startup_burst_run(
+        count,
+        "The morning train left the quiet station on time, and everyone on board "
+        "settled in for the long ride north. Outside, the fields turned from green "
+        "to gold as the sun climbed over the hills, and a thin mist still lay along "
+        "the river. A child by the window counted the bridges out loud, while an "
+        "old man across the aisle folded his newspaper and closed his eyes. Somewhere "
+        "near the back, two friends were planning a weekend by the sea, arguing "
+        "happily about whether to take the coastal road or the faster motorway. "
+        "The conductor walked slowly through the carriage, checking tickets and "
+        "answering questions about the next connection, and the train kept its "
+        "steady rhythm across the wide and quiet countryside.",
+        2u);
 }
 
 /* -------------------------------------------------------------------- http */
@@ -1982,6 +2252,51 @@ static void handle_metrics(int fd) {
     send_status(fd, "200 OK", "text/plain; version=0.0.4", body, n);
 }
 
+/* GET /debug/first-chunk: the MYNAH_SERVE_PROFILE first-chunk anatomy
+ * (see its declaration). Plain text, one line per non-empty bucket; the
+ * counters are cumulative since start-up, so difference two reads to isolate
+ * a run. */
+static void handle_debug_first_chunk(int fd) {
+    if (!g_prof) {
+        send_error(fd, "404 Not Found", "invalid_request_error",
+                   "set MYNAH_SERVE_PROFILE=1 to enable /debug/first-chunk");
+        return;
+    }
+    const size_t cap = 65536u;
+    char *body = (char *)malloc(cap);
+    if (body == NULL) {
+        send_error(fd, "500 Internal Server Error", "server_error", "out of memory");
+        return;
+    }
+    size_t n = 0u;
+#define OUT(...) do { \
+        if (n < cap) { \
+            const int _w = snprintf(body + n, cap - n, __VA_ARGS__); \
+            if (_w > 0) n += (size_t)_w < cap - n ? (size_t)_w : cap - n; \
+        } \
+    } while (0)
+    OUT("iterations %lu\n", atomic_load(&g_prof_stats.iterations));
+    for (int p = 0; p < PH_COUNT; ++p)
+        OUT("phase_ms_total %s %.3f\n", PROF_PHASE_NAME[p],
+            (double)atomic_load(&g_prof_stats.phase_us[p]) / 1000.0);
+    OUT("arrived slot_free %lu\narrived slot_full %lu\n",
+        atomic_load(&g_prof_stats.arrived_slot_free),
+        atomic_load(&g_prof_stats.arrived_slot_full));
+    for (int k = 0; k < 4; ++k)
+        OUT("first_chunk_iterations_after_admission %d%s %lu\n", k, k == 3 ? "+" : "",
+            atomic_load(&g_prof_stats.first_iters[k]));
+    for (int h = 0; h < H_COUNT; ++h) {
+        for (size_t b = 0; b < PROF_BUCKETS; ++b) {
+            const unsigned long c = atomic_load(&g_prof_stats.hist[h][b]);
+            if (c == 0ul) continue;
+            OUT("hist %s %.0f %lu\n", PROF_HIST_NAME[h], (double)b * PROF_BUCKET_MS, c);
+        }
+    }
+#undef OUT
+    send_status(fd, "200 OK", "text/plain", body, n);
+    free(body);
+}
+
 /* ------------------------------------------------------------- routing
  *
  * Routing compares a whole path against a table, not a prefix against the
@@ -2000,6 +2315,7 @@ typedef enum {
     ROUTE_MODELS,
     ROUTE_HEALTH,
     ROUTE_METRICS,
+    ROUTE_DEBUG_FIRST_CHUNK,
     ROUTE_NONE,        /* no such path: the caller answers 404 */
     ROUTE_ANSWERED     /* the precheck already replied (405/415/400) */
 } route_id;
@@ -2015,6 +2331,7 @@ static const struct {
     { "/v1/models",       "GET",  ROUTE_MODELS },
     { "/health",          "GET",  ROUTE_HEALTH },
     { "/metrics",         "GET",  ROUTE_METRICS },
+    { "/debug/first-chunk", "GET", ROUTE_DEBUG_FIRST_CHUNK },
 };
 
 /* Resolves method+path to a route, answering the protocol-level refusals
@@ -2245,6 +2562,7 @@ static void handle_connection(int fd) {
             case ROUTE_MODELS:   handle_models(fd); break;
             case ROUTE_HEALTH:   handle_health(fd); break;
             case ROUTE_METRICS:  handle_metrics(fd); break;
+            case ROUTE_DEBUG_FIRST_CHUNK: handle_debug_first_chunk(fd); break;
             case ROUTE_ANSWERED: break;
             case ROUTE_NONE:
             default:
@@ -2784,6 +3102,8 @@ int main(int argc, char **argv) {
         g.max_batch = g.max_active;
     }
 
+    g_prof = getenv("MYNAH_SERVE_PROFILE") != NULL;
+    g_cuda_serving = device == MYNAH_TTS_DEVICE_CUDA;
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_usr1_dump);
@@ -3040,6 +3360,36 @@ int main(int argc, char **argv) {
                 now_ms() - t0,
                 warm == 0 ? "" : "  <-- INCOMPLETE: the first served request may "
                                  "differ from the second");
+    }
+    if (width_buckets_requested(device == MYNAH_TTS_DEVICE_CUDA) && g.max_active > 1u) {
+        mynah_tts_backend_metrics before, after;
+        memset(&before, 0, sizeof(before));
+        memset(&after, 0, sizeof(after));
+        (void)mynah_tts_model_get_backend_metrics(g.model, &before);
+        const double t0 = now_ms();
+        const size_t done = width_walk_run(g.max_active);
+        (void)mynah_tts_model_get_backend_metrics(g.model, &after);
+        const double freed_mb =
+            ((double)before.device_memory_free_bytes -
+             (double)after.device_memory_free_bytes) / (1024.0 * 1024.0);
+        fprintf(stderr, "width-bucket graph warm-up: %zu/%zu concurrent requests walked the "
+                        "batch width down to 1 in %.0f ms; graphs captured +%llu "
+                        "(backbone/flow) +%llu (decoder gang); device memory %+.0f MiB "
+                        "(MYNAH_CUDA_WIDTH_BUCKETS)\n",
+                done, g.max_active, now_ms() - t0,
+                after.graph_captures - before.graph_captures,
+                after.decoder_graph_captures - before.decoder_graph_captures,
+                freed_mb);
+    }
+    {
+        const size_t prefill = pool_prefill_count(device == MYNAH_TTS_DEVICE_CUDA);
+        if (prefill > 0u) {
+            const double t0 = now_ms();
+            const size_t done = pool_prefill_run(prefill);
+            fprintf(stderr, "slot-pool prefill: %zu/%zu concurrent requests through the "
+                            "queue in %.0f ms (MYNAH_CUDA_SLOT_POOL_PREFILL)\n",
+                    done, prefill, now_ms() - t0);
+        }
     }
 
     queue_init(&g_queue);
