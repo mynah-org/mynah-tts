@@ -8412,6 +8412,217 @@ static int pocket_all_finite(const float *v, size_t n) {
  * the same reason: on a refused call the context has to look untouched, and a
  * flag the caller can observe is part of "untouched".
  */
+/* ------------------------------------------ experimental KV-offload probe
+ *
+ * MYNAH_CUDA_KV_OFFLOAD_POC=1 (default off).  A transfer-cost probe, not a
+ * scheduler: every MYNAH_CUDA_KV_OFFLOAD_POC_PERIOD_MS (default 2000) it takes
+ * the live device-owned row with the most backbone positions, copies the used
+ * prefix of its BF16/F32 KV (layers x 2 strided rows) to pinned host memory on
+ * a side stream, then restores the same bytes into the row's current buffer
+ * (later compute waits for the restore, as a real resume would) and reads the
+ * prefix back once more to check the round trip.  The row keeps stepping the
+ * whole time; the prefix is append-only, so the restore rewrites identical
+ * bytes.  One `[KVPROBE]` line per round.  The pinned buffers grow on demand,
+ * which is an allocation in the decode loop: acceptable only because this is
+ * an off-by-default experiment, never a serving path. */
+typedef struct {
+    int phase; /* 0 idle, 1 evicting, 2 restoring, 3 verifying */
+    double last_s;
+    const mynah_engine_ctx *target;
+    size_t rows, width, used;
+    float *host_a, *host_b;
+    size_t host_cap; /* bytes of each pinned buffer */
+    float d2h_ms, h2d_ms;
+    double t_issue;
+    unsigned long rounds, verified, mismatched, aborted;
+    double sum_d2h_ms, sum_h2d_ms, sum_bytes;
+} pocket_kv_probe_state;
+
+static pocket_kv_probe_state g_kv_probe;
+
+static int pocket_kv_probe_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("MYNAH_CUDA_KV_OFFLOAD_POC");
+        cached = v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+    }
+    return cached;
+}
+
+static double pocket_kv_probe_period_s(void) {
+    const char *v = getenv("MYNAH_CUDA_KV_OFFLOAD_POC_PERIOD_MS");
+    const long ms = v != NULL ? strtol(v, NULL, 10) : 2000;
+    return (ms > 0 ? (double)ms : 2000.0) / 1000.0;
+}
+
+static int pocket_kv_probe_live(mynah_engine_ctx *const *ctxs, size_t count,
+                                const mynah_engine_ctx *target) {
+    for (size_t i = 0; i < count; ++i)
+        if (ctxs[i] == target) return 1;
+    return 0;
+}
+
+static void pocket_kv_probe_tick(mynah_engine_ctx *const *ctxs, size_t count,
+                                 const mynah_backend *backend) {
+    pocket_kv_probe_state *p = &g_kv_probe;
+    char err[256];
+    mynah_backend_kv_probe_req req;
+    memset(&req, 0, sizeof(req));
+    const double now = mynah_phase_seconds();
+    if (backend == NULL) return;
+    if (p->phase == 0) {
+        if (now - p->last_s < pocket_kv_probe_period_s()) return;
+        const mynah_engine_ctx *best = NULL;
+        size_t best_used = 0u;
+        for (size_t i = 0; i < count; ++i) {
+            const mynah_engine_ctx *c = ctxs[i];
+            if (c == NULL || !c->cuda_backbone_device_owned || c->cuda_backbone_kv == NULL ||
+                c->backbone == NULL)
+                continue;
+            const size_t used = mynah_transformer_ar_state_offset(c->backbone);
+            if (used > best_used && used <= c->cuda_backbone_capacity) {
+                best = c;
+                best_used = used;
+            }
+        }
+        if (best == NULL || best_used < 16u) return;
+        const pocket_config *cfg = &best->state->cfg;
+        const size_t elem = best->cuda_backbone_kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+        size_t attn_dim = 0u, width = 0u, rows = 0u, bytes = 0u;
+        if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
+            pocket_mul(best_used * attn_dim, elem, &width) != 0 ||
+            pocket_mul(cfg->layers, 2u, &rows) != 0 ||
+            pocket_mul(rows, width, &bytes) != 0)
+            return;
+        if (bytes > p->host_cap) {
+            if (p->host_a != NULL) mynah_backend_host_free(backend, p->host_a);
+            if (p->host_b != NULL) mynah_backend_host_free(backend, p->host_b);
+            p->host_a = p->host_b = NULL;
+            p->host_cap = 0u;
+            const size_t cap = bytes * 2u;
+            if (mynah_backend_host_alloc(backend, cap / sizeof(float) + 1u, &p->host_a, err, sizeof(err)) != 0 ||
+                mynah_backend_host_alloc(backend, cap / sizeof(float) + 1u, &p->host_b, err, sizeof(err)) != 0) {
+                fprintf(stderr, "[KVPROBE] pinned alloc failed: %s\n", err);
+                p->last_s = now;
+                return;
+            }
+            p->host_cap = cap;
+        }
+        req.op = 1;
+        req.slot = 0;
+        req.dev = best->cuda_backbone_kv;
+        req.host = p->host_a;
+        req.rows = rows;
+        req.width = width;
+        req.dev_pitch = best->cuda_backbone_capacity * attn_dim * elem;
+        req.host_pitch = width;
+        if (mynah_backend_kv_probe(backend, &req, err, sizeof(err)) != 0) {
+            fprintf(stderr, "[KVPROBE] evict issue failed: %s\n", err);
+            p->last_s = now;
+            return;
+        }
+        p->target = best;
+        p->rows = rows;
+        p->width = width;
+        p->used = best_used;
+        p->t_issue = now;
+        p->phase = 1;
+        return;
+    }
+    req.op = 3;
+    req.slot = p->phase - 1;
+    const int done = mynah_backend_kv_probe(backend, &req, err, sizeof(err));
+    if (done < 0) {
+        fprintf(stderr, "[KVPROBE] poll failed: %s\n", err);
+        p->phase = 0;
+        p->last_s = now;
+        return;
+    }
+    if (done == 0) return;
+    const int live = pocket_kv_probe_live(ctxs, count, p->target);
+    if (p->phase == 1) {
+        p->d2h_ms = req.elapsed_ms;
+        if (!live) { /* retired while in flight: never restore into a reused set */
+            ++p->aborted;
+            p->phase = 0;
+            p->last_s = now;
+            return;
+        }
+        const mynah_engine_ctx *t = p->target;
+        const pocket_config *cfg = &t->state->cfg;
+        const size_t elem = t->cuda_backbone_kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+        memset(&req, 0, sizeof(req));
+        req.op = 2;
+        req.slot = 1;
+        req.dev = t->cuda_backbone_kv; /* re-read: KV_GROW may have moved it */
+        req.host = p->host_a;
+        req.rows = p->rows;
+        req.width = p->width;
+        req.dev_pitch = t->cuda_backbone_capacity * cfg->heads * cfg->head_dim * elem;
+        req.host_pitch = p->width;
+        if (mynah_backend_kv_probe(backend, &req, err, sizeof(err)) != 0) {
+            fprintf(stderr, "[KVPROBE] restore issue failed: %s\n", err);
+            p->phase = 0;
+            p->last_s = now;
+            return;
+        }
+        p->phase = 2;
+        return;
+    }
+    if (p->phase == 2) {
+        p->h2d_ms = req.elapsed_ms;
+        p->phase = 0;
+        p->last_s = now;
+        const double bytes = (double)p->rows * (double)p->width;
+        ++p->rounds;
+        p->sum_d2h_ms += p->d2h_ms;
+        p->sum_h2d_ms += p->h2d_ms;
+        p->sum_bytes += bytes;
+        int verified = -1; /* -1 skipped: row retired */
+        if (live) {
+            const mynah_engine_ctx *t = p->target;
+            const pocket_config *cfg = &t->state->cfg;
+            const size_t elem = t->cuda_backbone_kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+            memset(&req, 0, sizeof(req));
+            req.op = 1;
+            req.slot = 2;
+            req.dev = t->cuda_backbone_kv;
+            req.host = p->host_b;
+            req.rows = p->rows;
+            req.width = p->width;
+            req.dev_pitch = t->cuda_backbone_capacity * cfg->heads * cfg->head_dim * elem;
+            req.host_pitch = p->width;
+            if (mynah_backend_kv_probe(backend, &req, err, sizeof(err)) == 0) {
+                /* Verification is outside the timed path: wait for it here. */
+                mynah_backend_kv_probe_req poll;
+                memset(&poll, 0, sizeof(poll));
+                poll.op = 3;
+                poll.slot = 2;
+                int r = 0;
+                while ((r = mynah_backend_kv_probe(backend, &poll, err, sizeof(err))) == 0) {
+                }
+                verified = r == 1 && memcmp(p->host_a, p->host_b, (size_t)bytes) == 0;
+            }
+        }
+        if (verified == 1) ++p->verified;
+        if (verified == 0) ++p->mismatched;
+        fprintf(stderr,
+                "[KVPROBE] round %lu used=%zu positions bytes=%.2f MiB d2h=%.3f ms (%.1f GB/s) "
+                "h2d=%.3f ms (%.1f GB/s) wall=%.1f ms verify=%s | totals ok=%lu bad=%lu aborted=%lu "
+                "mean d2h=%.3f h2d=%.3f ms\n",
+                p->rounds, p->used, bytes / 1048576.0, p->d2h_ms,
+                p->d2h_ms > 0.0f ? bytes / (p->d2h_ms * 1.0e6) : 0.0, p->h2d_ms,
+                p->h2d_ms > 0.0f ? bytes / (p->h2d_ms * 1.0e6) : 0.0,
+                (now - p->t_issue) * 1000.0,
+                verified == 1 ? "ok" : (verified == 0 ? "MISMATCH" : "skipped"),
+                p->verified, p->mismatched, p->aborted,
+                p->sum_d2h_ms / (double)p->rounds, p->sum_h2d_ms / (double)p->rounds);
+        return;
+    }
+    p->phase = 0;
+    p->last_s = now;
+}
+
 static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                              mynah_engine_scratch *scratch, char *error,
                              size_t capacity) {
@@ -8715,6 +8926,8 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                    ctx->hidden, cfg->hidden_dim * sizeof(float));
         }
     }
+    if (pocket_kv_probe_enabled() && cuda_used && scratch != NULL)
+        pocket_kv_probe_tick(ctxs, count, scratch->backend);
     return 0;
 }
 

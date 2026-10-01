@@ -1069,6 +1069,12 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> bf16_weight_bytes;
     bool q8_enabled;
     bool decoder_batch_enabled;
+    /* Experimental KV-offload transfer probe (MYNAH_CUDA_KV_OFFLOAD_POC):
+     * a side stream and four start/end event pairs, created on first use. */
+    cudaStream_t kv_probe_stream = nullptr;
+    cudaEvent_t kv_probe_after = nullptr;
+    cudaEvent_t kv_probe_start[4] = {nullptr, nullptr, nullptr, nullptr};
+    cudaEvent_t kv_probe_end[4] = {nullptr, nullptr, nullptr, nullptr};
 };
 
 enum cuda_decoder_op_kind {
@@ -2715,6 +2721,12 @@ static void cuda_close(void *opaque) {
     if (st->dev_decoder_ptr1) cudaFree(st->dev_decoder_ptr1);
     if (st->dev_decoder_ptr2) cudaFree(st->dev_decoder_ptr2);
     if (st->dev_decoder_ptr3) cudaFree(st->dev_decoder_ptr3);
+    for (int i = 0; i < 4; ++i) {
+        if (st->kv_probe_start[i]) cudaEventDestroy(st->kv_probe_start[i]);
+        if (st->kv_probe_end[i]) cudaEventDestroy(st->kv_probe_end[i]);
+    }
+    if (st->kv_probe_after) cudaEventDestroy(st->kv_probe_after);
+    if (st->kv_probe_stream) cudaStreamDestroy(st->kv_probe_stream);
     cublasDestroy(st->cublas);
     cudaStreamDestroy(st->stream);
     delete st;
@@ -3017,6 +3029,63 @@ extern "C" int mynah_cuda_h2d(void *opaque, const float *host, float *dev_ptr,
     st->h2d_calls.fetch_add(1ull, std::memory_order_relaxed);
     return ce(cudaMemcpyAsync(dev_ptr, host, n*sizeof(float),
                               cudaMemcpyHostToDevice, st->stream), e, ec);
+}
+
+/* Experimental KV-offload transfer probe; see mynah_backend_kv_probe in
+ * backend.h.  The side stream waits for the compute work already issued, so a
+ * copied prefix is the one the last step wrote; an H2D restore makes later
+ * compute-stream work wait for it. */
+extern "C" int mynah_cuda_kv_probe(void *opaque, mynah_backend_kv_probe_req *req,
+                                   char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || req == nullptr || req->slot < 0 || req->slot > 3) {
+        set_error(e, ec, "invalid KV probe request");
+        return -1;
+    }
+    if (st->kv_probe_stream == nullptr) {
+        if (ce(cudaStreamCreateWithFlags(&st->kv_probe_stream, cudaStreamNonBlocking), e, ec) ||
+            ce(cudaEventCreateWithFlags(&st->kv_probe_after, cudaEventDisableTiming), e, ec))
+            return -1;
+        for (int i = 0; i < 4; ++i) {
+            if (ce(cudaEventCreate(&st->kv_probe_start[i]), e, ec) ||
+                ce(cudaEventCreate(&st->kv_probe_end[i]), e, ec))
+                return -1;
+        }
+    }
+    const int k = req->slot;
+    if (req->op == 3) {
+        const cudaError_t q = cudaEventQuery(st->kv_probe_end[k]);
+        if (q == cudaErrorNotReady) return 0;
+        if (ce(q, e, ec)) return -1;
+        float ms = 0.0f;
+        if (ce(cudaEventElapsedTime(&ms, st->kv_probe_start[k], st->kv_probe_end[k]), e, ec))
+            return -1;
+        req->elapsed_ms = ms;
+        return 1;
+    }
+    if ((req->op != 1 && req->op != 2) || req->dev == nullptr || req->host == nullptr ||
+        req->rows == 0u || req->width == 0u || req->width > req->dev_pitch ||
+        req->width > req->host_pitch) {
+        set_error(e, ec, "invalid KV probe copy");
+        return -1;
+    }
+    if (ce(cudaEventRecord(st->kv_probe_after, st->stream), e, ec) ||
+        ce(cudaStreamWaitEvent(st->kv_probe_stream, st->kv_probe_after, 0), e, ec) ||
+        ce(cudaEventRecord(st->kv_probe_start[k], st->kv_probe_stream), e, ec))
+        return -1;
+    const int to_host = req->op == 1;
+    if (ce(cudaMemcpy2DAsync(to_host ? req->host : req->dev,
+                             to_host ? req->host_pitch : req->dev_pitch,
+                             to_host ? req->dev : req->host,
+                             to_host ? req->dev_pitch : req->host_pitch,
+                             req->width, req->rows,
+                             to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice,
+                             st->kv_probe_stream), e, ec) ||
+        ce(cudaEventRecord(st->kv_probe_end[k], st->kv_probe_stream), e, ec))
+        return -1;
+    if (!to_host && ce(cudaStreamWaitEvent(st->stream, st->kv_probe_end[k], 0), e, ec))
+        return -1;
+    return 0;
 }
 
 extern "C" int mynah_cuda_d2h(void *opaque, const float *dev_ptr, float *host,

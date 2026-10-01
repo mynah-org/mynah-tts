@@ -584,6 +584,29 @@ int mynah_backend_host_alloc(const mynah_backend *backend, size_t n,
                              size_t error_capacity);
 void mynah_backend_host_free(const mynah_backend *backend, float *host_ptr);
 
+/* Experimental KV-offload transfer probe (MYNAH_CUDA_KV_OFFLOAD_POC, CUDA
+ * only).  Moves a strided region (rows x width bytes, each row dev_pitch /
+ * host_pitch apart) between a device buffer and pinned host memory on a side
+ * stream, ordered after the compute work already issued.  op 1 = device to
+ * host; op 2 = host to device, and later compute-stream work waits for it (a
+ * restore must land before the row is stepped again); op 3 = poll event pair
+ * `slot`: returns 1 and fills elapsed_ms when done, 0 while pending.  Ops 1/2
+ * return 0 once issued.  -1 on error or when the backend has no probe. */
+typedef struct {
+    int op;
+    int slot;
+    void *dev;
+    void *host;
+    size_t rows;
+    size_t width;
+    size_t dev_pitch;
+    size_t host_pitch;
+    float elapsed_ms;
+} mynah_backend_kv_probe_req;
+int mynah_backend_kv_probe(const mynah_backend *backend,
+                           mynah_backend_kv_probe_req *req, char *error,
+                           size_t error_capacity);
+
 /* Which CPU matmul path a shape takes: "parallel" (output rows split over the
  * pool), "simd" (serial in-tree matvec) or "sgemm" (one sgemm call -- whose
  * provider is a separate question, answered by the sgemm.provider row).

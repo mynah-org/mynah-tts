@@ -120,6 +120,7 @@ struct mynah_backend {
     int (*rope_batch_dev)(void *, float *, const size_t *, size_t, size_t, size_t, float, char *, size_t);
     int (*host_alloc)(void *, size_t, float **, char *, size_t);
     void (*host_free)(void *, float *);
+    int (*kv_probe)(void *, mynah_backend_kv_probe_req *, char *, size_t);
     int metal_cpu_matmul;
     int metal_cpu_codec;
 };
@@ -186,6 +187,7 @@ extern int mynah_cuda_dev_alloc_bytes(void *, size_t, void **, char *, size_t);
 extern void mynah_cuda_dev_free(void *, float *);
 extern int mynah_cuda_host_alloc(void *, size_t, float **, char *, size_t);
 extern void mynah_cuda_host_free(void *, float *);
+extern int mynah_cuda_kv_probe(void *, mynah_backend_kv_probe_req *, char *, size_t);
 extern int mynah_cuda_h2d(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_cuda_d2h(void *, const float *, float *, size_t, char *, size_t);
 extern int mynah_cuda_h2d_bf16(void *, const float *, void *, size_t, char *, size_t);
@@ -701,6 +703,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->dev_free = mynah_cuda_dev_free;
         backend->host_alloc = mynah_cuda_host_alloc;
         backend->host_free = mynah_cuda_host_free;
+        backend->kv_probe = mynah_cuda_kv_probe;
         backend->h2d = mynah_cuda_h2d;
         backend->d2h = mynah_cuda_d2h;
         backend->h2d_bf16 = mynah_cuda_h2d_bf16;
@@ -1428,6 +1431,13 @@ void mynah_backend_host_free(const mynah_backend *backend, float *host_ptr) {
         return;
     }
     free(host_ptr);
+}
+
+int mynah_backend_kv_probe(const mynah_backend *backend,
+                           mynah_backend_kv_probe_req *req, char *error,
+                           size_t error_capacity) {
+    if (backend == NULL || req == NULL || backend->kv_probe == NULL) return -1;
+    return backend->kv_probe(backend->state, req, error, error_capacity);
 }
 
 int mynah_backend_has_dev_ops(const mynah_backend *backend) {
