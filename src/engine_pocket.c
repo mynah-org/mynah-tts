@@ -665,11 +665,12 @@ enum {
 #define POCKET_QG_CUDA_INT8_SPEC "backbone:int8,flow_net:int8"
 
 /* MYNAH_CUDA_QUANT_STAGES: the resident stages that take the BF16 weight
- * copies under MYNAH_CUDA_QUANT=bf16.  A comma list of backbone, flow, mimi
- * (or all / none); unset means all three, the historical meaning of
- * MYNAH_CUDA_QUANT=bf16.  `backbone` alone is the scope of the reference
- * PyTorch engine: FlowLM transformer Linears in bf16, flow head, EOS head and
- * codec in fp32.  It never selects anything the qgroup spec would not run
+ * copies under MYNAH_CUDA_QUANT=bf16 (the CUDA default, see
+ * pocket_cuda_quant_default).  A comma list of backbone, flow, mimi (or all /
+ * none); unset or empty means `backbone`, the scope of the reference PyTorch
+ * engine: FlowLM transformer Linears in bf16, flow head, EOS head and codec in
+ * fp32 (bf16 flow head and Mimi measured no gain on the L4).  `all` is what
+ * MYNAH_CUDA_QUANT=bf16 meant before backbone became the default.  It never selects anything the qgroup spec would not run
  * resident: it only narrows the stages an f32 group upgrades to BF16 on.  An
  * unknown name fails the load, like MYNAH_QUANT_GROUPS. */
 enum {
@@ -683,8 +684,8 @@ static int pocket_cuda_quant_stages_parse(const char *spec, unsigned *out,
                                           char *error, size_t capacity) {
     unsigned mask = 0u;
     const char *p = spec;
-    if (spec == NULL) {
-        *out = POCKET_CUDA_STAGE_ALL;
+    if (spec == NULL || spec[0] == '\0') {
+        *out = POCKET_CUDA_STAGE_BACKBONE; /* default: backbone only */
         return 0;
     }
     while (*p != '\0') {
@@ -724,7 +725,7 @@ static int pocket_cuda_quant_stages_parse(const char *spec, unsigned *out,
     return 0;
 }
 
-/* MYNAH_CUDA_BF16_FUSE (default 0 while measured): in the batched decode
+/* MYNAH_CUDA_BF16_FUSE (default on; =0 is the rollback): in the batched decode
  * step, a layer whose four Linears all read BF16 weight copies takes the
  * fused BF16 sequence (mynah_backend_has_bf16_fused): LayerNorm, GELU and the
  * decode attention write the BF16 GEMM operand directly, and every bias is
@@ -737,8 +738,7 @@ static int pocket_cuda_bf16_fuse_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *setting = getenv("MYNAH_CUDA_BF16_FUSE");
-        cached = setting != NULL && setting[0] != '\0' &&
-                 strcmp(setting, "0") != 0;
+        cached = setting == NULL || strcmp(setting, "0") != 0;
     }
     return cached;
 }
@@ -1006,14 +1006,15 @@ struct mynah_engine_state {
     const mynah_backend *backend;
     unsigned qgroups; /* resolved MYNAH_QUANT_GROUPS, 0 when quant is off */
     int cuda_q8_enabled; /* explicit MYNAH_CUDA_Q8=1 policy for int8 groups */
-    /* MYNAH_CUDA_QUANT as resolved for this CUDA state (f32 on any other
-     * backend), and whether f32 hot-stage projections take resident BF16
-     * weight copies (MYNAH_CUDA_QUANT=bf16). The CPU oracle never sees it. */
+    /* MYNAH_CUDA_QUANT as resolved for this CUDA state (bf16 when unset,
+     * pocket_cuda_quant_default; f32 on any other backend), and whether f32
+     * hot-stage projections take resident BF16 weight copies. The CPU oracle
+     * never sees it. */
     int cuda_quant;
     int cuda_bf16_weights;
     /* MYNAH_CUDA_QUANT_STAGES: which resident stages take the BF16 copies
-     * when cuda_bf16_weights is set (POCKET_CUDA_STAGE_* bits).  Default all
-     * three, which is what MYNAH_CUDA_QUANT=bf16 has always meant. */
+     * when cuda_bf16_weights is set (POCKET_CUDA_STAGE_* bits).  Default
+     * backbone only; `all` adds the flow head and the Mimi transformer. */
     unsigned cuda_bf16_stages;
     signed char qgroup_qtype[POCKET_QG_BITS]; /* per-bit override, -1 = cache */
     signed char cond_in_qtype;
@@ -1492,7 +1493,7 @@ struct mynah_engine_scratch {
     int cuda_flow_graph_enabled;
     int cuda_flow_graph_ready;
 
-    /* MYNAH_CUDA_ONE_SYNC (default 0): one stream sync for condition,
+    /* MYNAH_CUDA_ONE_SYNC (default on): one stream sync for condition,
      * backbone, EOS and flow head.  Allocated only with the flag on. */
     float *cuda_onesync_host_latent_in; /* pinned [batch][latent] condition input */
     float *cuda_onesync_host_eos;       /* pinned [batch] EOS logits */
@@ -4020,6 +4021,22 @@ static void pocket_prepack(mynah_engine_state *state) {
     free(out);
 }
 
+/* MYNAH_CUDA_QUANT for the resident Pocket CUDA path.  Unset (or empty) means
+ * bf16: the FlowLM backbone Linears read BF16 weight copies
+ * (MYNAH_CUDA_QUANT_STAGES defaults to backbone), measured on the L4 at -10 %
+ * stream RTF p95 and +14 % audio-s/s against TF32 with cuBLASLt.  f32 restores
+ * the fp32/TF32 weights everywhere.  The default is Pocket's own: the shared
+ * mynah_cuda_quant_from_env still reads unset as f32 for every other caller.
+ * An explicit MYNAH_CUDA_Q8 (the expert int8 path) keeps the old f32 base, so
+ * that recipe is unchanged.  MYNAH_QUANT_GROUPS does not turn it off: groups
+ * select int8; the f32 groups ("none" = all of them) are what bf16 upgrades. */
+static mynah_cuda_quant_mode pocket_cuda_quant_default(void) {
+    const char *value = getenv("MYNAH_CUDA_QUANT");
+    if ((value == NULL || value[0] == '\0') && getenv("MYNAH_CUDA_Q8") == NULL)
+        return MYNAH_CUDA_QUANT_BF16;
+    return mynah_cuda_quant_from_env();
+}
+
 static int pocket_model_init(const mynah_tts_model *model,
                              mynah_engine_state **out, char *error,
                              size_t capacity) {
@@ -4121,7 +4138,7 @@ static int pocket_model_init(const mynah_tts_model *model,
      * the expert overrides it resolves to, and an explicit one still wins. */
     state->cuda_quant = MYNAH_CUDA_QUANT_F32;
     if (on_cuda) {
-        const mynah_cuda_quant_mode mode = mynah_cuda_quant_from_env();
+        const mynah_cuda_quant_mode mode = pocket_cuda_quant_default();
         if (mode == MYNAH_CUDA_QUANT_INVALID) {
             pocket_error(error, capacity,
                          "MYNAH_CUDA_QUANT='%s' is not one of f32, bf16, int8",
@@ -4520,7 +4537,7 @@ static int pocket_cuda_kv_bf16_requested(const mynah_engine_state *state) {
            (strcmp(setting, "bf16") == 0 || strcmp(setting, "bfloat16") == 0);
 }
 
-/* MYNAH_CUDA_SHARED_VOICE (default 0): the batched decode attention reads
+/* MYNAH_CUDA_SHARED_VOICE (default on; =0 is the rollback): the batched decode attention reads
  * each row's voice prefix from the model-owned device voice cache instead of
  * the row's copy. Same bf16 values, so the audio is bit-identical; the rows of
  * one voice share one copy in L2 instead of streaming it from DRAM per row. */
@@ -4528,8 +4545,7 @@ static int pocket_cuda_shared_voice_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *setting = getenv("MYNAH_CUDA_SHARED_VOICE");
-        cached = setting != NULL && strcmp(setting, "0") != 0 &&
-                 setting[0] != '\0';
+        cached = setting == NULL || strcmp(setting, "0") != 0;
     }
     return cached;
 }
@@ -4541,8 +4557,8 @@ static void *pocket_cuda_kv_offset(float *base, size_t elements,
     return (void *)((unsigned char *)base + elements * width);
 }
 
-/* MYNAH_CUDA_SHARED_VOICE_STRIP (default on; only meaningful with
- * MYNAH_CUDA_SHARED_VOICE=1): rows whose voice prefix is read from the shared
+/* MYNAH_CUDA_SHARED_VOICE_STRIP (default on; only meaningful while
+ * MYNAH_CUDA_SHARED_VOICE is on, which is the default): rows whose voice prefix is read from the shared
  * device voice cache stop storing it, so each row's backbone cache shrinks by
  * the voice positions (~12 MB per row on the 24L model). `=0` keeps the
  * phase-1 behaviour (the prefix is still copied into every row), for A/B. */
@@ -8083,9 +8099,10 @@ static void pocket_host_free_bytes(const mynah_backend *backend, void *ptr);
 static int pocket_cuda_one_sync_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
+        /* Default on; MYNAH_CUDA_ONE_SYNC=0 is the rollback to one sync per
+         * stage. */
         const char *setting = getenv("MYNAH_CUDA_ONE_SYNC");
-        cached = setting != NULL && setting[0] != '\0' &&
-                 strcmp(setting, "0") != 0;
+        cached = setting == NULL || strcmp(setting, "0") != 0;
     }
     return cached;
 }
@@ -9328,11 +9345,20 @@ static void *pocket_cuda_voice_kv(mynah_engine_state *state, size_t speaker,
  * Rows are packed, each attends to its own prefix. On success every context
  * has its whole available text in the device cache and is marked valid; on
  * failure nothing on the host moved and the requests must fail. */
+/* MYNAH_CUDA_PREFILL_FIXED: 1 = the prefill tile runs fixed-order GEMMs, so
+ * a text sent in pieces gives the same audio as the same text sent whole; with
+ * bf16 backbone weights (the CUDA default) that is the bf16 tensor-core tile
+ * (MYNAH_CUDA_PREFILL_BF16TC, default on).  0 = cuBLAS, faster on TF32 weights
+ * but M-dependent.  The variable always wins; this is the default when unset.
+ * DEFAULT SWITCH: set to 0 to make the cuBLAS prefill the default instead. */
+#define POCKET_CUDA_PREFILL_FIXED_DEFAULT 1
+
 static int pocket_cuda_prefill_fixed_order(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *s = getenv("MYNAH_CUDA_PREFILL_FIXED");
-        cached = s != NULL && strcmp(s, "0") == 0 ? 0 : 1;
+        cached = s == NULL || s[0] == '\0' ? POCKET_CUDA_PREFILL_FIXED_DEFAULT
+                                           : strcmp(s, "0") != 0;
     }
     return cached;
 }
@@ -13721,6 +13747,16 @@ done:
     return rc;
 }
 
+/* Whether a row's bits are independent of its batch mates on this state:
+ * the backend's own answer, and not when the resident backbone runs BF16
+ * weight copies.  The backend reads MYNAH_CUDA_QUANT itself and only knows
+ * an explicit bf16; the Pocket default (bf16 when unset) is resolved here, so
+ * the pedantic setup must say MYNAH_CUDA_QUANT=f32 to get the bitwise gates. */
+static int pocket_batch_invariant(const mynah_engine_state *state) {
+    return mynah_backend_batch_invariant(state->backend) &&
+           !state->cuda_bf16_weights;
+}
+
 /* E8-4.  `decode_audio_batch` must hand each context exactly what
  * `decode_audio` would have handed it alone.
  *
@@ -13734,7 +13770,7 @@ static int pocket_check_gang(mynah_engine_state *state,
                              const pocket_check_case *cases, size_t count,
                              size_t max_steps, mynah_engine_scratch *scratch,
                              char *error, size_t capacity) {
-    const int invariant = mynah_backend_batch_invariant(state->backend);
+    const int invariant = pocket_batch_invariant(state);
     const int bf16_codec = !invariant && pocket_bf16_codec_requested();
     const float parity_atol = invariant    ? POCKET_BATCH_PARITY_ATOL
                               : bf16_codec ? POCKET_BATCH_PARITY_ATOL_BF16_CODEC
@@ -14051,7 +14087,7 @@ static int pocket_lf_same(const mynah_engine_state *state, const char *what,
     /* Bit identity is the contract on a batch-invariant backend. With cuBLAS
      * or tensor-core GEMMs the prefill of "the text in pieces" runs at a
      * different M from "the text whole", so only the tolerance gate applies. */
-    const float tol = mynah_backend_batch_invariant(state->backend)
+    const float tol = pocket_batch_invariant(state)
                           ? 0.0f
                           : POCKET_BATCH_PARITY_ATOL_TC;
     if (an != bn) {

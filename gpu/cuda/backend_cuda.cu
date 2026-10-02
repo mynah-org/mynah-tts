@@ -1385,10 +1385,13 @@ struct cuda_backend_state {
      * the GEMMs reduced-precision weights, whose tensor-core paths are not
      * batch-invariant. */
     bool quant_weights;
-    /* MYNAH_CUDA_BF16_LT: the bf16 Linears through cuBLASLt with a per-shape
-     * heuristic algorithm (what a PyTorch bf16 F.linear does), instead of
-     * cublasGemmEx with CUBLAS_GEMM_DEFAULT. Null handle = off. */
+    /* MYNAH_CUDA_BF16_LT (default on; =0 is the rollback): the bf16 Linears
+     * through cuBLASLt with a per-shape heuristic algorithm (what a PyTorch
+     * bf16 F.linear does), instead of cublasGemmEx with CUBLAS_GEMM_DEFAULT.
+     * Created by the first bf16 workspace reserve (cuda_lt_init), so a run
+     * without bf16 weights never creates it. Null handle = off. */
     cublasLtHandle_t lt = nullptr;
+    bool lt_tried = false;
     void *lt_ws = nullptr;
     size_t lt_ws_cap = 0u;
     struct lt_algo_entry { int m, n, k; bool ok; cublasLtMatmulAlgo_t algo; };
@@ -1810,10 +1813,39 @@ static int ensure_bf16_activation(cuda_backend_state *st, size_t elements,
     return 0;
 }
 
+/* MYNAH_CUDA_BF16_LT (default on): create the cuBLASLt handle and its
+ * workspace once, on the first bf16 workspace reserve.  That reserve runs
+ * before any graph capture and only when an engine really has bf16 weights,
+ * so an f32 run (or another model on this backend) never pays the 32 MiB or
+ * prints the line.  A failure leaves the bf16 Linears on cublasGemmEx. */
+static void cuda_lt_init(cuda_backend_state *st) {
+    if (st == nullptr || st->lt_tried) return;
+    st->lt_tried = true;
+    if (!cuda_env_enabled("MYNAH_CUDA_BF16_LT", true)) return;
+    /* 32 MiB of workspace, allocated once, so no algorithm the heuristic
+     * picks ever needs an allocation inside a graph capture. */
+    const size_t ws = (size_t)32 << 20;
+    if (cublasLtCreate(&st->lt) != CUBLAS_STATUS_SUCCESS ||
+        cudaMalloc(&st->lt_ws, ws) != cudaSuccess) {
+        if (st->lt) cublasLtDestroy(st->lt);
+        st->lt = nullptr;
+        st->lt_ws = nullptr;
+        std::fprintf(stderr, "mynah-tts: MYNAH_CUDA_BF16_LT unavailable, "
+                             "bf16 Linears stay on cublasGemmEx\n");
+    } else {
+        st->lt_ws_cap = ws;
+        std::fprintf(stderr, "mynah-tts: CUDA bf16 Linears through cuBLASLt "
+                             "with per-shape heuristic algorithms "
+                             "(MYNAH_CUDA_BF16_LT=1)\n");
+    }
+}
+
 extern "C" int mynah_cuda_bf16_reserve(void *opaque, size_t activation_count,
                                         char *e, size_t ec) {
-    return ensure_bf16_activation(static_cast<cuda_backend_state *>(opaque),
-                                  activation_count, e, ec);
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    const int rc = ensure_bf16_activation(st, activation_count, e, ec);
+    if (rc == 0) cuda_lt_init(st);
+    return rc;
 }
 
 static int cuda_q8_round(float value) {
@@ -3656,24 +3688,6 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
     if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
         set_error(e,ec,"cuBLAS init"); cudaStreamDestroy(st->stream); delete st; return -1; }
-    if (cuda_env_enabled("MYNAH_CUDA_BF16_LT", false)) {
-        /* 32 MiB of workspace, allocated once, so no algorithm the heuristic
-         * picks ever needs an allocation inside a graph capture. */
-        const size_t ws = (size_t)32 << 20;
-        if (cublasLtCreate(&st->lt) != CUBLAS_STATUS_SUCCESS ||
-            cudaMalloc(&st->lt_ws, ws) != cudaSuccess) {
-            if (st->lt) cublasLtDestroy(st->lt);
-            st->lt = nullptr;
-            st->lt_ws = nullptr;
-            std::fprintf(stderr, "mynah-tts: MYNAH_CUDA_BF16_LT unavailable, "
-                                 "bf16 Linears stay on cublasGemmEx\n");
-        } else {
-            st->lt_ws_cap = ws;
-            std::fprintf(stderr, "mynah-tts: CUDA bf16 Linears through cuBLASLt "
-                                 "with per-shape heuristic algorithms "
-                                 "(MYNAH_CUDA_BF16_LT=1)\n");
-        }
-    }
     if (ce(cudaMalloc(&st->dev_batch_k_cache,
                       CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_k_cache)), e, ec) ||
         ce(cudaMalloc(&st->dev_batch_v_cache,
@@ -5575,13 +5589,14 @@ static bool decoder_convtr_gemm_enabled(void) {
     return on;
 }
 
-/* MYNAH_CUDA_DECODER_FUSE: in the cross-request decoder, ELU and the causal
+/* MYNAH_CUDA_DECODER_FUSE (default on; =0 is the rollback to the unfused
+ * kernel sequence): in the cross-request decoder, ELU and the causal
  * window are folded into the im2col / gather kernels that read them, the
  * residual add and (see below) the conv bias into the next reader, and the
  * transposed conv's overlap, fold and prefix copy into one pass (same float
  * operations in the same order, so the audio is bit-identical). */
 static bool decoder_fuse_enabled(void) {
-    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_FUSE", false);
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_FUSE", true);
     return on;
 }
 
@@ -8948,21 +8963,23 @@ k_tile_gemm_bf16tc(const float *A, const uint16_t *W, const float *bias,
 #endif
 }
 
-static bool cuda_prefill_bf16tc_usable(void) {
-    static const bool on = [] {
-        if (!cuda_env_enabled("MYNAH_CUDA_PREFILL_BF16TC", false)) return false;
+/* MYNAH_CUDA_PREFILL_BF16TC: 0 = never; unset or empty = default on for
+ * tiles whose weights are already bf16 (MYNAH_CUDA_QUANT=bf16, the Pocket
+ * default), so MYNAH_CUDA_QUANT=f32 keeps the f32 weights in the prefill too;
+ * any other value = also the fixed-order f32-weight prefill (the explicit
+ * opt-in measured before bf16 weights became the default).  Needs sm_80+. */
+static int cuda_prefill_bf16tc_level(void) {
+    static const int level = [] {
+        const char *v = std::getenv("MYNAH_CUDA_PREFILL_BF16TC");
+        if (v != nullptr && std::strcmp(v, "0") == 0) return 0;
         int dev = 0, major = 0;
-        const bool ok = cudaGetDevice(&dev) == cudaSuccess &&
+        if (cudaGetDevice(&dev) != cudaSuccess ||
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                                   dev) == cudaSuccess && major >= 8;
-        if (ok)
-            std::fprintf(stderr,
-                         "mynah-tts: CUDA fixed-order prefill tile on bf16 "
-                         "tensor cores (MYNAH_CUDA_PREFILL_BF16TC=1; fp32 "
-                         "accumulate, batch-invariant)\n");
-        return ok;
+                                   dev) != cudaSuccess || major < 8)
+            return 0;
+        return v == nullptr || *v == '\0' ? 1 : 2;
     }();
-    return on;
+    return level;
 }
 
 static int cuda_tile_tc_level(void) {
@@ -8991,14 +9008,23 @@ static bool cuda_tile_tc_usable(void) {
 }
 
 /* The BF16 tensor-core tile (k_tile_gemm_bf16tc) for one tile GEMM, when
- * MYNAH_CUDA_PREFILL_BF16TC is on and the shape fits; returns 1 when the shape
- * does not fit (the caller takes another path), 0 on success, -1 on error. */
+ * MYNAH_CUDA_PREFILL_BF16TC allows it for these weights (`f32_weights`: the
+ * engine resolved f32 for this stage) and the shape fits; returns 1 when it
+ * does not (the caller takes another path), 0 on success, -1 on error. */
 static int tile_gemm_bf16tc(cuda_backend_state *st, const float *A,
                             const float *hw, const float *db, float *C,
-                            size_t M, size_t N, size_t K, char *e, size_t ec) {
-    if (K % (size_t)TB_BK != 0u || ((uintptr_t)A & 15u) != 0u ||
-        !cuda_prefill_bf16tc_usable())
+                            size_t M, size_t N, size_t K, bool f32_weights,
+                            char *e, size_t ec) {
+    const int level = cuda_prefill_bf16tc_level();
+    if (K % (size_t)TB_BK != 0u || ((uintptr_t)A & 15u) != 0u || level == 0 ||
+        (f32_weights && level < 2))
         return 1;
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true))
+        std::fprintf(stderr,
+                     "mynah-tts: CUDA fixed-order prefill tile on bf16 "
+                     "tensor cores (MYNAH_CUDA_PREFILL_BF16TC=1; fp32 "
+                     "accumulate, batch-invariant)\n");
     cuda_tile_workspace &w = st->tile;
     uint16_t *dw16 = nullptr;
     if (cached_weight_bf16(st, hw, N * K, &dw16, e, ec)) return -1;
@@ -9034,13 +9060,20 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
          * M-dependent rounding put the Mimi solo-vs-gang gap at 1.1e-3,
          * outside the tensor-core parity band the self-check allows; this
          * kernel keeps the tile batch-invariant at bf16 weight traffic.
-         * MYNAH_CUDA_PREFILL_BF16TC: the same invariance on tensor cores. */
-        const int tc = tile_gemm_bf16tc(st, A, hw, db, C, M, N, K, e, ec);
-        if (tc <= 0) return tc;
+         * MYNAH_CUDA_PREFILL_BF16TC: the same invariance on tensor cores,
+         * taken whenever the call asks for a fixed order, or when there is no
+         * cuBLAS bf16 path for it; a call that does not (the Mimi tile,
+         * MYNAH_CUDA_PREFILL_FIXED=0) keeps cuBLAS below. */
+        const bool cublas_bf16 = st->tile_cublas && !w.fixed_order &&
+                                 w.a16 != nullptr && M * K <= w.a16_cap;
+        if (!cublas_bf16) {
+            const int tc = tile_gemm_bf16tc(st, A, hw, db, C, M, N, K, false,
+                                            e, ec);
+            if (tc <= 0) return tc;
+        }
         uint16_t *dw16 = nullptr;
         if (cached_weight_bf16(st, hw, N * K, &dw16, e, ec)) return -1;
-        if (st->tile_cublas && !w.fixed_order && w.a16 != nullptr &&
-            M * K <= w.a16_cap) {
+        if (cublas_bf16) {
             /* Order not fixed: the same bf16 tensor-core GEMM as the decode
              * step's bf16 Linears (activation rounded to bf16, fp32
              * accumulate), instead of the SIMT kernel. */
@@ -9067,7 +9100,9 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
         return ce(cudaGetLastError(), e, ec);
     }
     if (w.fixed_order) {
-        const int tc = tile_gemm_bf16tc(st, A, hw, db, C, M, N, K, e, ec);
+        /* f32 weights: only an explicit MYNAH_CUDA_PREFILL_BF16TC=1. */
+        const int tc = tile_gemm_bf16tc(st, A, hw, db, C, M, N, K, true, e,
+                                        ec);
         if (tc <= 0) return tc;
     }
     float *dw = nullptr;
@@ -9989,8 +10024,10 @@ k_self_attention_bf16_batch_split(
 
 static bool cuda_backbone_attn_split_enabled(void) {
     static const bool on = [] {
+        /* Default on; MYNAH_CUDA_ATTN_SPLIT=0 is the rollback to the fast
+         * kernel. */
         const char *s = getenv("MYNAH_CUDA_ATTN_SPLIT");
-        return s != nullptr && strcmp(s, "1") == 0;
+        return s == nullptr || strcmp(s, "0") != 0;
     }();
     return on;
 }

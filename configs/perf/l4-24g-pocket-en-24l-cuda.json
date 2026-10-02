@@ -2,14 +2,14 @@
   "schema_version": 1,
   "profile": {
     "id": "l4-24g-pocket-en-24l-cuda",
-    "description": "One NVIDIA L4 (24 GB, sm_89), PocketTTS English 24L (english_2026-04_24l) streaming on the CUDA server. C160 is the qualified operating point: two independent 30-minute soaks on the v2 corpus, 184.5 audio-s/s, RTF p95 0.855-0.857, TTFA p95 154-155 ms, 0 stalls, 0 failures, WER 2.02/1.94% against 1.87% for an unloaded C8 control. NOT the shipped default: BF16 KV and one host thread are exported. Host-scoped: another GPU is another profile.",
+    "description": "One NVIDIA L4 (24 GB, sm_89), PocketTTS English 24L (english_2026-04_24l) streaming on the CUDA server. C160 is the qualified operating point: two independent 30-minute soaks on the v2 corpus, 184.5 audio-s/s, RTF p95 0.855-0.857, TTFA p95 154-155 ms, 0 stalls, 0 failures, WER 2.02/1.94% against 1.87% for an unloaded C8 control. Since 2026-10-02 the CUDA defaults include the shared voice prefix, split decode attention, bf16 backbone Linears (cuBLASLt, fused), the fused decoder and one sync per frame; with them the server runs at --max-batch 256 (60-s screens: RTF p95 0.594-0.607 at C208, 0.710-0.714 at C256, ~303-306 audio-s/s), C256 soak qualification pending, so C160 below is still the qualified point (measured on the 2026-09-28 defaults). NOT the shipped default: BF16 KV and one host thread are exported. Host-scoped: another GPU is another profile.",
     "engine": "pocket",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
       "concurrency_range": [
         1,
-        192
+        256
       ],
       "preferred_concurrency": 160,
       "quality_changes_allowed": false
@@ -45,14 +45,14 @@
   "server": {
     "device": "cuda",
     "http_workers": 8,
-    "max_batch": 160,
-    "max_inflight": 160,
-    "why": "One process, --max-batch = --max-inflight = C so every admitted stream is in the batch and the GPU runs one gang per step. The knee ladder (25 s per level) is flat at ~138 audio-s/s from C128 with RTF p95 linear in C (0.71/0.78/0.86/0.93/0.99 at C128/144/160/176/192): C160 is the last level under the 0.90 gate. 8 HTTP workers is the harness default (tools/gpu/serve.sh); the server needs ~1.1-1.25 host cores. VRAM 13.6-14.7 GB flat over 30 minutes."
+    "max_batch": 256,
+    "max_inflight": 256,
+    "why": "One process, --max-batch = --max-inflight = C so every admitted stream is in the batch and the GPU runs one gang per step. 256 is the screening level of the 2026-10-02 defaults (60-s closed-loop knees, v2 corpus, 4 voices: RTF p95 0.710-0.714 at C256, ~303-306 audio-s/s, 0 stalls, peak VRAM ~21.5 GB); the 2 x 30-min soak qualification at C256 is pending. The qualified C160 point below was measured with --max-batch 160 on the 2026-09-28 defaults, where the knee ladder (25 s per level) was flat at ~138 audio-s/s from C128 with RTF p95 linear in C (0.71/0.78/0.86/0.93/0.99 at C128/144/160/176/192). 8 HTTP workers is the harness default (tools/gpu/serve.sh); the server needs ~1.1-1.25 host cores."
   },
   "runtime": {
     "matches_shipped_default": false,
     "quant_groups": {
-      "backbone": "f32",
+      "backbone": "bf16",
       "flow_net": "f32",
       "conditioner": "f32",
       "codec_transformer": "f32",
@@ -70,7 +70,7 @@
       },
       "MYNAH_QUANT_GROUPS": {
         "value": "none",
-        "why": "Pinned to what every point was measured with. Since the 2026-09-27 trap fix it is also what a resident CUDA build resolves 'default' to (src/engine_pocket.c: raw f32 weights), so it no longer changes the run; it stays explicit because before that fix an unset variable inherited the CPU bf16/f16 groups and ran backbone, flow and Mimi on the CPU oracle while the server said device=cuda (C1 RTF 8.7). Any other spec now refuses to start unless MYNAH_CUDA_ALLOW_CPU_STAGES=1."
+        "why": "Pinned to what every point was measured with. Since the 2026-09-27 trap fix it is also what a resident CUDA build resolves 'default' to (src/engine_pocket.c: raw f32 weights), so it no longer changes the run; it stays explicit because before that fix an unset variable inherited the CPU bf16/f16 groups and ran backbone, flow and Mimi on the CPU oracle while the server said device=cuda (C1 RTF 8.7). Any other spec now refuses to start unless MYNAH_CUDA_ALLOW_CPU_STAGES=1. It does not turn off the bf16 backbone default: the groups select int8 encodings, and the f32 groups ('none' = all of them) are what MYNAH_CUDA_QUANT upgrades to bf16."
       },
       "MYNAH_SERVE_PROFILE": {
         "value": "1",
@@ -130,11 +130,11 @@
       },
       "MYNAH_CUDA_PREFILL_FIXED": {
         "value": null,
-        "why": "Must be ABSENT (default: fixed-order prefill). =0 routes the prefill tile through cuBLAS TF32: +4-9% (C64 127.3 -> 133.0, C96 130.4 -> 141.8 audio-s/s) but the long-form self-check fails (text pushed in pieces vs whole differs), i.e. it loses piecewise-prefill identity. Opt-in only: determinism vs throughput is a product decision not taken here."
+        "why": "Must be ABSENT (default: fixed-order prefill; with the bf16 backbone default that is the bf16 tensor-core tile, MYNAH_CUDA_PREFILL_BF16TC). =0 routes the prefill tile through cuBLAS (bf16 on bf16 weights, TF32 on f32): on f32 weights +4-9% (C64 127.3 -> 133.0, C96 130.4 -> 141.8 audio-s/s) and -7% RTF p95 at C160-C208 (2026-10-02), but the long-form self-check fails (text pushed in pieces vs whole differs), i.e. it loses piecewise-prefill identity. Opt-in only: determinism vs throughput is a product decision."
       },
       "MYNAH_CUDA_TILE_TC": {
         "value": null,
-        "why": "Must be ABSENT (default off). WMMA TF32 fixed-order tile GEMM: -25% without split-K (C64 127.6 -> 95.4), +1-2% with it (127.3 -> 128.4 at C64); invariant but far from cuBLAS. Opt-in experiment."
+        "why": "Must be ABSENT (default off). WMMA TF32 fixed-order tile GEMM: -25% without split-K (C64 127.6 -> 95.4), +1-2% with it (127.3 -> 128.4 at C64); invariant but far from cuBLAS. Opt-in experiment; it only concerns f32-weight prefill (MYNAH_CUDA_QUANT=f32)."
       },
       "MYNAH_CUDA_SYNC": {
         "value": null,
@@ -142,7 +142,7 @@
       },
       "MYNAH_CUDA_QUANT": {
         "value": null,
-        "why": "Must be ABSENT (default f32 resident weights). bf16 (deterministic BF16 tile) is 4% slower than f32 on the L4; int8 is diagnostic. Neither has a qualified point."
+        "why": "Must be ABSENT (default bf16 for the Pocket CUDA engine since 2026-10-02: FlowLM backbone Linears read BF16 weight copies with fp32 accumulate, MYNAH_CUDA_QUANT_STAGES default backbone; residual stream, norms, flow head, EOS head and codec stay fp32). L4 60-s knees, all other 2026-10-02 defaults on: TF32 f32 weights -> bf16 backbone with MYNAH_CUDA_BF16_FUSE and MYNAH_CUDA_BF16_LT: C208 RTF p95 0.676 -> 0.607, C256 0.788 -> 0.714, 266 -> 303 audio-s/s, TTFA p95 C208 115 -> 104 ms. =f32 is the rollback to fp32/TF32 weights everywhere (the C160 point below was measured that way); int8 is diagnostic."
       },
       "MYNAH_CUDA_SEANET_BF16": {
         "value": null,
@@ -155,6 +155,46 @@
       "MYNAH_CUDA_WIDTH_BUCKETS": {
         "value": null,
         "why": "Must be ABSENT (default on, CUDA). Gang widths rounded up to buckets whose graphs are captured at start-up: no graph capture during traffic. Start-up 2 s -> 33 s on the L4 (24L, --max-batch 160). =0 is the rollback to exact widths captured on first use."
+      },
+      "MYNAH_CUDA_QUANT_STAGES": {
+        "value": null,
+        "why": "Must be ABSENT (default backbone). =all adds bf16 flow head and Mimi transformer: no measurable gain (C256 0.714 -> 0.712, 303 -> 305 audio-s/s), not a default."
+      },
+      "MYNAH_CUDA_BF16_FUSE": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Fused bf16 decode layers: LayerNorm/GELU/attention write the bf16 GEMM operand, biases folded into the consumers; 456 -> 264 graph nodes per 24-layer step, bit-identical to the unfused bf16 path (--gpu-self-test checks the kernels bitwise). =0 is the rollback."
+      },
+      "MYNAH_CUDA_BF16_LT": {
+        "value": null,
+        "why": "Must be ABSENT (default on). bf16 Linears through cuBLASLt with a per-shape heuristic algorithm (created only when bf16 weights are in use): without it cublasGemmEx picked small bf16 tiles and the bf16 backbone was 10% slower than TF32. =0 is the rollback to cublasGemmEx."
+      },
+      "MYNAH_CUDA_PREFILL_BF16TC": {
+        "value": null,
+        "why": "Must be ABSENT (default on for bf16 weights). Fixed-order prefill tile on bf16 tensor cores: keeps text-in-pieces == text-whole bit for bit at bf16 weight traffic. =0 is the rollback to the SIMT bf16 tile; =1 explicitly also applies it to f32 weights."
+      },
+      "MYNAH_CUDA_SHARED_VOICE": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Decode attention reads each row's voice prefix from the shared device voice cache, and (MYNAH_CUDA_SHARED_VOICE_STRIP, default on) rows do not store it (~12 MB less per row). L4 A/B, 2 rounds: C160 0.811/0.818 -> 0.731/0.733, C192 0.947/0.949 -> 0.845/0.847, C208 1.031/1.038 (stalls) -> 0.921/0.922 (0 stalls), 163 -> 185 audio-s/s; bit-identical audio. =0 is the rollback."
+      },
+      "MYNAH_CUDA_SHARED_VOICE_STRIP": {
+        "value": null,
+        "why": "Must be ABSENT (default on under MYNAH_CUDA_SHARED_VOICE). =0 keeps the voice prefix copied into every row (phase 1), for A/B; it removes the VRAM headroom C224+ needs."
+      },
+      "MYNAH_CUDA_ATTN_SPLIT": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Split (flash-decoding) bf16 decode attention: C208 0.705 -> 0.674, C224 0.745 -> 0.711, C240 0.787 -> 0.749, 250 -> 267 audio-s/s at C240. Deterministic and batch-invariant; last-bit differences vs the fast kernel (self-test max rel diff 5e-7). =0 is the rollback."
+      },
+      "MYNAH_CUDA_DECODER_FUSE": {
+        "value": null,
+        "why": "Must be ABSENT (default on). SEANet gang decoder: ELU, causal window, residual add, conv bias (MYNAH_CUDA_DECODER_FUSE_BIAS, default on with it) and the transposed-conv fold folded into the kernels that read them: 36 -> 20 elementwise launches per step, bit-identical audio (temperature-0 runs 99 dB). =0 is the rollback."
+      },
+      "MYNAH_CUDA_ONE_SYNC": {
+        "value": null,
+        "why": "Must be ABSENT (default on). Condition, backbone, EOS and flow head share one stream sync per batched frame (3 fewer per frame); same audio. =0 is the rollback to one sync per stage."
+      },
+      "MYNAH_CUDA_KV_VMM": {
+        "value": null,
+        "why": "Must be ABSENT (default off). KV rows as VMM ranges that grow in place, aimed at C272+ with --max-batch 288; not measured as a default."
       }
     }
   },
@@ -238,6 +278,36 @@
         "throughput_audio_s_per_s": 138.4,
         "evidence": ".work/pocket-cuda-g6-host-cpu.md (knee ladder, 25 s per level)",
         "why_not_promoted": "RTF p95 0.992: still below 1.0 but with no margin at all; realtime is about to break."
+      },
+      {
+        "date": "2026-10-02",
+        "commit": "ae151ab",
+        "version": "pocket-cuda-c208 flags (now the defaults), max-batch 256, 60-s closed-loop screen",
+        "concurrency": 208,
+        "verdict": "INCONCLUSIVE",
+        "configuration": "environment-override",
+        "soak_seconds": 60,
+        "ttfa_p95_ms": 104,
+        "rtf_p95": 0.607,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "evidence": ".work/pocket-cuda-c208.md (2026-10-02 14:35 knee)",
+        "why_not_promoted": "60-s screen only: the 2 x 30-min soak qualification with captured audio and WER is pending."
+      },
+      {
+        "date": "2026-10-02",
+        "commit": "ae151ab",
+        "version": "pocket-cuda-c208 flags (now the defaults), max-batch 256, 60-s closed-loop screen",
+        "concurrency": 256,
+        "verdict": "INCONCLUSIVE",
+        "configuration": "environment-override",
+        "soak_seconds": 60,
+        "rtf_p95": 0.714,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 303,
+        "evidence": ".work/pocket-cuda-c208.md (2026-10-02 14:35 knee)",
+        "why_not_promoted": "60-s screen only: the new screening level of the 2026-10-02 defaults; the 2 x 30-min soak qualification is pending."
       }
     ],
     "history": [
