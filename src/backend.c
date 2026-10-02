@@ -95,6 +95,12 @@ struct mynah_backend {
     int (*q8_reserve)(void *, size_t, size_t, size_t, char *, size_t);
     int (*matmul_bf16_d2d)(void *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
     int (*bf16_reserve)(void *, size_t, char *, size_t);
+    int (*layer_norm_bf16_stage_dev)(void *, const float *, const float *, const float *, size_t, size_t, char *, size_t);
+    int (*bias_gelu_bf16_stage_dev)(void *, const float *, const float *, size_t, size_t, char *, size_t);
+    int (*matmul_bf16_staged_d2d)(void *, float *, size_t, size_t, size_t, const float *, char *, size_t);
+    int (*rope_bias_batch_dev)(void *, float *, const float *, const size_t *, size_t, size_t, size_t, float, char *, size_t);
+    int (*residual_bias_add_dev)(void *, float *, const float *, const float *, size_t, size_t, char *, size_t);
+    int (*self_attention_bf16_stage_batch_dev)(void *, const float *, void *const *, void *const *, void *const *, void *const *, const size_t *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*im2col)(void *, const float *, float *, int, int, int, int, char *, size_t);
     int (*conv1d)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
     int (*conv1d_dev)(void *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
@@ -226,6 +232,12 @@ extern int mynah_cuda_self_attention_batch_dev(void *, const float *, float *con
 extern int mynah_cuda_self_attention_bf16_dev(void *, const float *, void *, void *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_batch_dev(void *, const float *, void *const *, void *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_prefix_batch_dev(void *, const float *, void *const *, void *const *, void *const *, void *const *, const size_t *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+extern int mynah_cuda_self_attention_bf16_stage_batch_dev(void *, const float *, void *const *, void *const *, void *const *, void *const *, const size_t *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+extern int mynah_cuda_layer_norm_bf16_stage_dev(void *, const float *, const float *, const float *, size_t, size_t, char *, size_t);
+extern int mynah_cuda_bias_gelu_bf16_stage_dev(void *, const float *, const float *, size_t, size_t, char *, size_t);
+extern int mynah_cuda_matmul_bf16_staged_d2d(void *, float *, size_t, size_t, size_t, const float *, char *, size_t);
+extern int mynah_cuda_rope_bias_batch_dev(void *, float *, const float *, const size_t *, size_t, size_t, size_t, float, char *, size_t);
+extern int mynah_cuda_residual_bias_add_dev(void *, float *, const float *, const float *, size_t, size_t, char *, size_t);
 extern int mynah_cuda_gather_kv_batch(void *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float *, char *, size_t);
 extern int mynah_cuda_gather_kv_bf16_batch(void *, void *const *, void *const *, const size_t *, const size_t *, size_t, size_t, size_t, float *, char *, size_t);
 extern int mynah_cuda_cross_attention_dev(void *, const float *, const float *, const float *, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
@@ -741,6 +753,12 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->self_attention_bf16_dev = mynah_cuda_self_attention_bf16_dev;
         backend->self_attention_bf16_batch_dev = mynah_cuda_self_attention_bf16_batch_dev;
         backend->self_attention_bf16_prefix_batch_dev = mynah_cuda_self_attention_bf16_prefix_batch_dev;
+        backend->self_attention_bf16_stage_batch_dev = mynah_cuda_self_attention_bf16_stage_batch_dev;
+        backend->layer_norm_bf16_stage_dev = mynah_cuda_layer_norm_bf16_stage_dev;
+        backend->bias_gelu_bf16_stage_dev = mynah_cuda_bias_gelu_bf16_stage_dev;
+        backend->matmul_bf16_staged_d2d = mynah_cuda_matmul_bf16_staged_d2d;
+        backend->rope_bias_batch_dev = mynah_cuda_rope_bias_batch_dev;
+        backend->residual_bias_add_dev = mynah_cuda_residual_bias_add_dev;
         backend->gather_kv_batch = mynah_cuda_gather_kv_batch;
         backend->gather_kv_bf16_batch = mynah_cuda_gather_kv_bf16_batch;
         backend->cross_attention_dev = mynah_cuda_cross_attention_dev;
@@ -1668,6 +1686,84 @@ int mynah_backend_bf16_reserve(const mynah_backend *bk,
                                size_t activation_count, char *e, size_t ec) {
     if (bk != NULL && bk->bf16_reserve != NULL)
         return bk->bf16_reserve(bk->state, activation_count, e, ec);
+    return -1;
+}
+
+int mynah_backend_has_bf16_fused(const mynah_backend *bk) {
+    return bk != NULL && bk->layer_norm_bf16_stage_dev != NULL &&
+           bk->bias_gelu_bf16_stage_dev != NULL &&
+           bk->matmul_bf16_staged_d2d != NULL &&
+           bk->rope_bias_batch_dev != NULL &&
+           bk->residual_bias_add_dev != NULL &&
+           bk->self_attention_bf16_stage_batch_dev != NULL &&
+           bk->matmul_bf16_d2d != NULL;
+}
+
+int mynah_backend_layer_norm_bf16_stage_dev(const mynah_backend *bk,
+                                            const float *din,
+                                            const float *gain,
+                                            const float *bias, size_t rows,
+                                            size_t width, char *e,
+                                            size_t ec) {
+    if (bk && bk->layer_norm_bf16_stage_dev)
+        return bk->layer_norm_bf16_stage_dev(bk->state, din, gain, bias, rows,
+                                             width, e, ec);
+    return -1;
+}
+
+int mynah_backend_bias_gelu_bf16_stage_dev(const mynah_backend *bk,
+                                           const float *din, const float *bias,
+                                           size_t rows, size_t cols, char *e,
+                                           size_t ec) {
+    if (bk && bk->bias_gelu_bf16_stage_dev)
+        return bk->bias_gelu_bf16_stage_dev(bk->state, din, bias, rows, cols, e,
+                                            ec);
+    return -1;
+}
+
+int mynah_backend_matmul_bf16_staged_d2d(const mynah_backend *bk, float *dout,
+                                         size_t rows, size_t iw, size_t ow,
+                                         const float *w, char *e, size_t ec) {
+    if (bk && bk->matmul_bf16_staged_d2d)
+        return bk->matmul_bf16_staged_d2d(bk->state, dout, rows, iw, ow, w, e,
+                                          ec);
+    return -1;
+}
+
+int mynah_backend_rope_bias_batch_dev(const mynah_backend *bk, float *dev_qkv,
+                                      const float *bias,
+                                      const size_t *positions, size_t batch,
+                                      size_t heads, size_t head_width,
+                                      float max_period, char *e, size_t ec) {
+    if (bk && bk->rope_bias_batch_dev)
+        return bk->rope_bias_batch_dev(bk->state, dev_qkv, bias, positions,
+                                       batch, heads, head_width, max_period, e,
+                                       ec);
+    return -1;
+}
+
+int mynah_backend_residual_bias_add_dev(const mynah_backend *bk, float *dout,
+                                        const float *din, const float *bias,
+                                        size_t rows, size_t cols, char *e,
+                                        size_t ec) {
+    if (bk && bk->residual_bias_add_dev)
+        return bk->residual_bias_add_dev(bk->state, dout, din, bias, rows, cols,
+                                         e, ec);
+    return -1;
+}
+
+int mynah_backend_self_attention_bf16_stage_batch_dev(
+    const mynah_backend *bk, const float *dev_qkv, void *const *dev_k_cache,
+    void *const *dev_v_cache, void *const *dev_k_prefix,
+    void *const *dev_v_prefix, const size_t *prefix_len,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float scale, float *dev_scratch,
+    char *e, size_t ec) {
+    if (bk && bk->self_attention_bf16_stage_batch_dev)
+        return bk->self_attention_bf16_stage_batch_dev(
+            bk->state, dev_qkv, dev_k_cache, dev_v_cache, dev_k_prefix,
+            dev_v_prefix, prefix_len, positions, cache_strides, batch, heads,
+            head_width, scale, dev_scratch, e, ec);
     return -1;
 }
 

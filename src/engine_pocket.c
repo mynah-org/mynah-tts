@@ -664,6 +664,85 @@ enum {
 /* What MYNAH_CUDA_QUANT=int8 selects when MYNAH_QUANT_GROUPS is unset. */
 #define POCKET_QG_CUDA_INT8_SPEC "backbone:int8,flow_net:int8"
 
+/* MYNAH_CUDA_QUANT_STAGES: the resident stages that take the BF16 weight
+ * copies under MYNAH_CUDA_QUANT=bf16.  A comma list of backbone, flow, mimi
+ * (or all / none); unset means all three, the historical meaning of
+ * MYNAH_CUDA_QUANT=bf16.  `backbone` alone is the scope of the reference
+ * PyTorch engine: FlowLM transformer Linears in bf16, flow head, EOS head and
+ * codec in fp32.  It never selects anything the qgroup spec would not run
+ * resident: it only narrows the stages an f32 group upgrades to BF16 on.  An
+ * unknown name fails the load, like MYNAH_QUANT_GROUPS. */
+enum {
+    POCKET_CUDA_STAGE_BACKBONE = 1u << 0,
+    POCKET_CUDA_STAGE_FLOW = 1u << 1,
+    POCKET_CUDA_STAGE_MIMI = 1u << 2,
+    POCKET_CUDA_STAGE_ALL = (1u << 3) - 1u
+};
+
+static int pocket_cuda_quant_stages_parse(const char *spec, unsigned *out,
+                                          char *error, size_t capacity) {
+    unsigned mask = 0u;
+    const char *p = spec;
+    if (spec == NULL) {
+        *out = POCKET_CUDA_STAGE_ALL;
+        return 0;
+    }
+    while (*p != '\0') {
+        while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+        if (*p == '\0') break;
+        const char *start = p;
+        while (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t') ++p;
+        const size_t len = (size_t)(p - start);
+        static const struct {
+            const char *name;
+            unsigned mask;
+        } names[] = {
+            {"all", POCKET_CUDA_STAGE_ALL},
+            {"none", 0u},
+            {"backbone", POCKET_CUDA_STAGE_BACKBONE},
+            {"flow", POCKET_CUDA_STAGE_FLOW},
+            {"mimi", POCKET_CUDA_STAGE_MIMI},
+        };
+        int hit = -1;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+            if (strlen(names[i].name) == len &&
+                strncmp(names[i].name, start, len) == 0) {
+                hit = (int)i;
+                break;
+            }
+        }
+        if (hit < 0) {
+            pocket_error(error, capacity,
+                         "MYNAH_CUDA_QUANT_STAGES: unknown stage '%.*s' "
+                         "(known: all, none, backbone, flow, mimi)",
+                         (int)len, start);
+            return -1;
+        }
+        mask |= names[hit].mask;
+    }
+    *out = mask;
+    return 0;
+}
+
+/* MYNAH_CUDA_BF16_FUSE (default 0 while measured): in the batched decode
+ * step, a layer whose four Linears all read BF16 weight copies takes the
+ * fused BF16 sequence (mynah_backend_has_bf16_fused): LayerNorm, GELU and the
+ * decode attention write the BF16 GEMM operand directly, and every bias is
+ * added by the elementwise kernel that consumes the GEMM output (RoPE for
+ * QKV, GELU for FFN1, the residual add for out_proj and FFN2).  Same GEMM
+ * call, same FP32 values, same BF16 roundings: the audio is meant to be
+ * bit-identical to MYNAH_CUDA_BF16_FUSE=0 under MYNAH_CUDA_QUANT=bf16.
+ * Without BF16 backbone weights the flag does nothing. */
+static int pocket_cuda_bf16_fuse_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_CUDA_BF16_FUSE");
+        cached = setting != NULL && setting[0] != '\0' &&
+                 strcmp(setting, "0") != 0;
+    }
+    return cached;
+}
+
 typedef struct {
     const char *name;
     unsigned mask;
@@ -932,6 +1011,10 @@ struct mynah_engine_state {
      * weight copies (MYNAH_CUDA_QUANT=bf16). The CPU oracle never sees it. */
     int cuda_quant;
     int cuda_bf16_weights;
+    /* MYNAH_CUDA_QUANT_STAGES: which resident stages take the BF16 copies
+     * when cuda_bf16_weights is set (POCKET_CUDA_STAGE_* bits).  Default all
+     * three, which is what MYNAH_CUDA_QUANT=bf16 has always meant. */
+    unsigned cuda_bf16_stages;
     signed char qgroup_qtype[POCKET_QG_BITS]; /* per-bit override, -1 = cache */
     signed char cond_in_qtype;
     signed char cond_eos_qtype;
@@ -1722,10 +1805,14 @@ static int pocket_cs_qtype(const pocket_proj *p) {
 }
 
 /* The resident encoding of a projection the CPU would run in exact f32:
- * raw f32, or the BF16 device copy under MYNAH_CUDA_QUANT=bf16. */
-static int pocket_cuda_f32_qtype(const mynah_engine_state *state) {
-    return state != NULL && state->cuda_bf16_weights ? MYNAH_BACKEND_QTYPE_BF16
-                                                     : 0;
+ * raw f32, or the BF16 device copy under MYNAH_CUDA_QUANT=bf16 when `stage`
+ * is one of MYNAH_CUDA_QUANT_STAGES. */
+static int pocket_cuda_f32_qtype(const mynah_engine_state *state,
+                                 unsigned stage) {
+    return state != NULL && state->cuda_bf16_weights &&
+                   (state->cuda_bf16_stages & stage) != 0u
+               ? MYNAH_BACKEND_QTYPE_BF16
+               : 0;
 }
 
 static int pocket_cuda_tar_qtype(const mynah_engine_state *state,
@@ -1734,7 +1821,7 @@ static int pocket_cuda_tar_qtype(const mynah_engine_state *state,
     pocket_proj proj;
     if (state == NULL || pocket_tar_proj(&state->backbone_hook, layer, kind,
                                          &proj) != 0 || !proj.quantized)
-        return pocket_cuda_f32_qtype(state);
+        return pocket_cuda_f32_qtype(state, POCKET_CUDA_STAGE_BACKBONE);
     return pocket_cs_qtype(&proj);
 }
 
@@ -1744,7 +1831,7 @@ static int pocket_cuda_codec_qtype(const mynah_engine_state *state,
     pocket_proj proj;
     if (state == NULL || pocket_tar_proj(&state->codec_hook, layer, kind,
                                          &proj) != 0 || !proj.quantized)
-        return pocket_cuda_f32_qtype(state);
+        return pocket_cuda_f32_qtype(state, POCKET_CUDA_STAGE_MIMI);
     return pocket_cs_qtype(&proj);
 }
 
@@ -1753,7 +1840,7 @@ static int pocket_cuda_flow_qtype(const mynah_engine_state *state,
     pocket_proj proj;
     if (state == NULL || pocket_flow_proj(&state->flow_hook, index, kind,
                                           &proj) != 0 || !proj.quantized)
-        return pocket_cuda_f32_qtype(state);
+        return pocket_cuda_f32_qtype(state, POCKET_CUDA_STAGE_FLOW);
     return pocket_cs_qtype(&proj);
 }
 
@@ -3984,6 +4071,16 @@ static int pocket_model_init(const mynah_tts_model *model,
     state->cuda_bf16_weights =
         on_cuda && pocket_cuda_resident_requested(state) &&
         state->cuda_quant == MYNAH_CUDA_QUANT_BF16;
+    state->cuda_bf16_stages = POCKET_CUDA_STAGE_ALL;
+    if (on_cuda &&
+        pocket_cuda_quant_stages_parse(getenv("MYNAH_CUDA_QUANT_STAGES"),
+                                       &state->cuda_bf16_stages, error,
+                                       capacity) != 0) {
+        pocket_model_free(state);
+        return -1;
+    }
+    /* No stage left to upgrade: no BF16 copies and no BF16 workspace. */
+    if (state->cuda_bf16_stages == 0u) state->cuda_bf16_weights = 0;
     for (size_t b = 0; b < POCKET_QG_BITS; ++b) state->qgroup_qtype[b] = -1;
     state->qgroups = 0u;
     const char *qgroups_spec = "none";
@@ -4053,20 +4150,50 @@ static int pocket_model_init(const mynah_tts_model *model,
              * fallback alone, and the line must say so. */
             if (strcmp(mimi, "int8") == 0 && pocket_cuda_mimi_tile_enabled())
                 mimi = "int8(tile=f32)";
+            /* Under bf16, MYNAH_CUDA_QUANT_STAGES says which stages are
+             * expected to read bf16; an excluded stage is expected at f32. */
+            const unsigned bf16_stages = state->cuda_bf16_stages;
+            const char *want_bb =
+                (bf16_stages & POCKET_CUDA_STAGE_BACKBONE) ? "bf16" : "f32";
+            const char *want_flow =
+                (bf16_stages & POCKET_CUDA_STAGE_FLOW) ? "bf16" : "f32";
+            const char *want_mimi =
+                (bf16_stages & POCKET_CUDA_STAGE_MIMI) ? "bf16" : "f32";
             const int overridden =
                 (state->cuda_quant == MYNAH_CUDA_QUANT_INT8 &&
                  (strcmp(bb, "int8") != 0 || strcmp(flow, "int8") != 0)) ||
                 (state->cuda_quant == MYNAH_CUDA_QUANT_BF16 &&
-                 (strcmp(bb, "bf16") != 0 || strcmp(flow, "bf16") != 0 ||
-                  strcmp(mimi, "bf16") != 0)) ||
+                 (strcmp(bb, want_bb) != 0 || strcmp(flow, want_flow) != 0 ||
+                  strcmp(mimi, want_mimi) != 0)) ||
                 (state->cuda_quant == MYNAH_CUDA_QUANT_F32 &&
                  (strcmp(bb, "f32") != 0 || strcmp(flow, "f32") != 0 ||
                   strcmp(mimi, "f32") != 0));
+            char stages_note[64] = "";
+            if (state->cuda_quant == MYNAH_CUDA_QUANT_BF16 &&
+                bf16_stages != POCKET_CUDA_STAGE_ALL)
+                snprintf(stages_note, sizeof(stages_note),
+                         " bf16_stages=%s%s%s%s",
+                         bf16_stages == 0u ? "none" : "",
+                         (bf16_stages & POCKET_CUDA_STAGE_BACKBONE)
+                             ? "backbone" : "",
+                         (bf16_stages & POCKET_CUDA_STAGE_FLOW)
+                             ? ((bf16_stages & POCKET_CUDA_STAGE_BACKBONE)
+                                    ? ",flow" : "flow")
+                             : "",
+                         (bf16_stages & POCKET_CUDA_STAGE_MIMI)
+                             ? ((bf16_stages & (POCKET_CUDA_STAGE_BACKBONE |
+                                                POCKET_CUDA_STAGE_FLOW))
+                                    ? ",mimi" : "mimi")
+                             : "");
             fprintf(stderr,
                     "mynah-tts: CUDA quant=%s backbone=%s flow=%s mimi=%s "
-                    "kv=%s%s\n",
+                    "kv=%s%s%s%s\n",
                     requested, bb, flow, mimi,
                     pocket_cuda_kv_bf16_requested(state) ? "bf16" : "f32",
+                    stages_note,
+                    strcmp(bb, "bf16") == 0 && pocket_cuda_bf16_fuse_enabled() &&
+                            mynah_backend_has_bf16_fused(state->backend)
+                        ? " bf16_fuse=on" : "",
                     overridden ? " (stages differ from MYNAH_CUDA_QUANT: "
                                  "overridden by MYNAH_QUANT_GROUPS/MYNAH_QUANT/"
                                  "MYNAH_CUDA_Q8 or a per-stage switch)"
@@ -4823,8 +4950,17 @@ static int pocket_cuda_groups_are_resident_compatible(
 static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
                                               unsigned groups) {
     if (!pocket_cuda_groups_are_resident_compatible(state, groups)) return "cpu";
-    if (pocket_cuda_groups_are_f32(state, groups))
-        return state->cuda_bf16_weights ? "bf16" : "f32";
+    if (pocket_cuda_groups_are_f32(state, groups)) {
+        /* The same stage mapping the qtype helpers use. */
+        const unsigned stage =
+            (groups & (POCKET_QG_ATTENTION | POCKET_QG_FFN)) != 0u
+                ? POCKET_CUDA_STAGE_BACKBONE
+            : (groups & POCKET_QG_FLOW_NET) != 0u ? POCKET_CUDA_STAGE_FLOW
+            : (groups & POCKET_QG_CODEC_TF) != 0u ? POCKET_CUDA_STAGE_MIMI
+                                                  : 0u;
+        return pocket_cuda_f32_qtype(state, stage) == MYNAH_BACKEND_QTYPE_BF16
+                   ? "bf16" : "f32";
+    }
     const unsigned selected = state->qgroups & groups;
     if (selected != groups) return "mixed";
     const int cache_qtype = state->qcache == NULL
@@ -6577,6 +6713,99 @@ fail:
     return -1;
 }
 
+/* One transformer layer of the batched decode step on the fused BF16
+ * sequence (MYNAH_CUDA_BF16_FUSE; all four Linears BF16).  Kernels, with the
+ * unfused BF16 kernels each one replaces:
+ *
+ *   LN1 -> staged bf16           (k_layer_norm + k_f32_to_bf16)
+ *   QKV GEMM, no bias            (GEMM + k_bias_add)
+ *   RoPE + QKV bias              (k_rope_qk_batch)
+ *   attention -> staged bf16     (attention + k_f32_to_bf16; f32 KV keeps the
+ *                                 cast, inside mynah_backend_matmul_bf16_d2d)
+ *   out_proj GEMM, no bias       (GEMM + k_bias_add)
+ *   residual + out_proj bias     (k_residual_add)
+ *   LN2 -> staged bf16           (k_layer_norm + k_f32_to_bf16)
+ *   FFN1 GEMM, no bias           (GEMM + k_bias_add)
+ *   GELU + FFN1 bias -> staged   (k_gelu + k_f32_to_bf16)
+ *   FFN2 GEMM, no bias           (GEMM + k_bias_add)
+ *   residual + FFN2 bias         (k_residual_add)
+ *
+ * 11 kernels (4 of them cuBLAS GEMMs) against 19.  Every buffer is a scratch
+ * buffer or the backend's reserved staged activation: nothing is allocated,
+ * so the sequence is graph-capture safe.  cuda_norm, cuda_ffn and (BF16 KV)
+ * cuda_attn are not written; nothing after the layer reads them. */
+static int pocket_cuda_backbone_layer_bf16_fused(
+    mynah_engine_scratch *scratch, const mynah_engine_state *state,
+    const mynah_transformer_ar_layer *layer, size_t l, size_t exec,
+    size_t attn_dim, int kv_bf16, int shared_voice, float max_period,
+    char *local, size_t local_capacity) {
+    const pocket_config *cfg = &state->cfg;
+    const mynah_backend *backend = scratch->backend;
+    const size_t meta = l * scratch->cuda_batch_capacity;
+    const float scale = 1.0f / sqrtf((float)cfg->head_dim);
+    if (mynah_backend_layer_norm_bf16_stage_dev(
+            backend, scratch->cuda_x, layer->norm1_weight, layer->norm1_bias,
+            exec, cfg->hidden_dim, local, local_capacity) != 0 ||
+        mynah_backend_matmul_bf16_staged_d2d(
+            backend, scratch->cuda_qkv, exec, cfg->hidden_dim, 3u * attn_dim,
+            layer->in_proj_weight, local, local_capacity) != 0 ||
+        mynah_backend_rope_bias_batch_dev(
+            backend, scratch->cuda_qkv, layer->in_proj_bias,
+            scratch->cuda_positions, exec, cfg->heads, cfg->head_dim,
+            max_period, local, local_capacity) != 0)
+        return -1;
+    if (kv_bf16) {
+        /* Attention output straight into the staged activation. */
+        if (mynah_backend_self_attention_bf16_stage_batch_dev(
+                backend, scratch->cuda_qkv,
+                (void *const *)(scratch->cuda_kcache + meta),
+                (void *const *)(scratch->cuda_vcache + meta),
+                shared_voice ? scratch->cuda_kprefix + meta : NULL,
+                shared_voice ? scratch->cuda_vprefix + meta : NULL,
+                shared_voice ? scratch->cuda_prefix_len : NULL,
+                scratch->cuda_positions, scratch->cuda_cache_strides, exec,
+                cfg->heads, cfg->head_dim, scale, scratch->cuda_attn, local,
+                local_capacity) != 0 ||
+            mynah_backend_matmul_bf16_staged_d2d(
+                backend, scratch->cuda_proj, exec, attn_dim, cfg->hidden_dim,
+                layer->out_proj_weight, local, local_capacity) != 0)
+            return -1;
+    } else {
+        /* f32 KV: the FP32 attention kernel, then the cast + GEMM of the
+         * unfused path without its bias epilogue. */
+        if (mynah_backend_self_attention_batch_dev(
+                backend, scratch->cuda_qkv, scratch->cuda_kcache + meta,
+                scratch->cuda_vcache + meta, scratch->cuda_positions,
+                scratch->cuda_cache_strides, exec, cfg->heads, cfg->head_dim,
+                scale, scratch->cuda_attn, local, local_capacity) != 0 ||
+            mynah_backend_matmul_bf16_d2d(
+                backend, scratch->cuda_attn, scratch->cuda_proj, exec,
+                attn_dim, cfg->hidden_dim, layer->out_proj_weight, NULL, local,
+                local_capacity) != 0)
+            return -1;
+    }
+    if (mynah_backend_residual_bias_add_dev(
+            backend, scratch->cuda_x, scratch->cuda_proj, layer->out_proj_bias,
+            exec, cfg->hidden_dim, local, local_capacity) != 0 ||
+        mynah_backend_layer_norm_bf16_stage_dev(
+            backend, scratch->cuda_x, layer->norm2_weight, layer->norm2_bias,
+            exec, cfg->hidden_dim, local, local_capacity) != 0 ||
+        mynah_backend_matmul_bf16_staged_d2d(
+            backend, scratch->cuda_ffn, exec, cfg->hidden_dim, cfg->ffn_dim,
+            layer->linear1_weight, local, local_capacity) != 0 ||
+        mynah_backend_bias_gelu_bf16_stage_dev(
+            backend, scratch->cuda_ffn, layer->linear1_bias, exec, cfg->ffn_dim,
+            local, local_capacity) != 0 ||
+        mynah_backend_matmul_bf16_staged_d2d(
+            backend, scratch->cuda_proj, exec, cfg->ffn_dim, cfg->hidden_dim,
+            layer->linear2_weight, local, local_capacity) != 0 ||
+        mynah_backend_residual_bias_add_dev(
+            backend, scratch->cuda_x, scratch->cuda_proj, layer->linear2_bias,
+            exec, cfg->hidden_dim, local, local_capacity) != 0)
+        return -1;
+    return 0;
+}
+
 /* Cross-request CUDA batch: projections and residual/FFN work are stacked,
  * while every row keeps its own KV pointer and absolute position.  A return of
  * 1 means "not eligible" and leaves all host state untouched; -1 means a CUDA
@@ -6694,6 +6923,11 @@ static int pocket_cuda_backbone_step_batch(
      * changes kernels. */
     const int shared_voice = kv_bf16 && pocket_cuda_shared_voice_enabled() &&
         mynah_backend_has_self_attention_bf16_prefix_batch(scratch->backend);
+    /* Fixed per process like shared_voice, so a captured graph never mixes
+     * the fused and the unfused sequence. */
+    const int bf16_fuse = state->cuda_bf16_weights &&
+        pocket_cuda_bf16_fuse_enabled() &&
+        mynah_backend_has_bf16_fused(scratch->backend);
     /* Graph replay reads one persistent host pointer table per transformer
      * layer.  The table cannot be a stack array and it cannot be shared by all
      * layers: each layer owns a different KV allocation, while the captured
@@ -6778,6 +7012,45 @@ static int pocket_cuda_backbone_step_batch(
 
         for (size_t l = 0; l < cfg->layers; ++l) {
             const mynah_transformer_ar_layer *layer = &state->backbone_layers[l];
+            if (bf16_fuse &&
+                pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_IN_PROJ) ==
+                    MYNAH_BACKEND_QTYPE_BF16 &&
+                pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_OUT_PROJ) ==
+                    MYNAH_BACKEND_QTYPE_BF16 &&
+                pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_FFN1) ==
+                    MYNAH_BACKEND_QTYPE_BF16 &&
+                pocket_cuda_tar_qtype(state, l, MYNAH_TAR_LINEAR_FFN2) ==
+                    MYNAH_BACKEND_QTYPE_BF16) {
+                if (pocket_cuda_backbone_layer_bf16_fused(
+                        scratch, state, layer, l, exec, attn_dim, kv_bf16,
+                        shared_voice, first_config->max_period, local,
+                        sizeof(local)) != 0) goto fail;
+                if (mirror_host &&
+                    (kv_bf16
+                         ? mynah_backend_gather_kv_bf16_batch(
+                               scratch->backend,
+                               (void *const *)(scratch->cuda_kcache +
+                                               l * scratch->cuda_batch_capacity),
+                               (void *const *)(scratch->cuda_vcache +
+                                               l * scratch->cuda_batch_capacity),
+                               scratch->cuda_positions,
+                               scratch->cuda_cache_strides, exec, cfg->heads,
+                               cfg->head_dim,
+                               scratch->cuda_kv_shadow + l * exec * shadow_row,
+                               local, sizeof(local))
+                         : mynah_backend_gather_kv_batch(
+                               scratch->backend,
+                               scratch->cuda_kcache +
+                                   l * scratch->cuda_batch_capacity,
+                               scratch->cuda_vcache +
+                                   l * scratch->cuda_batch_capacity,
+                               scratch->cuda_positions,
+                               scratch->cuda_cache_strides, exec, cfg->heads,
+                               cfg->head_dim,
+                               scratch->cuda_kv_shadow + l * exec * shadow_row,
+                               local, sizeof(local))) != 0) goto fail;
+                continue;
+            }
             if (mynah_backend_layer_norm_dev(
                     scratch->backend, scratch->cuda_x, scratch->cuda_norm,
                     layer->norm1_weight, layer->norm1_bias, exec,
