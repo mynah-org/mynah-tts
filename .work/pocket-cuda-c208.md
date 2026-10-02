@@ -365,3 +365,105 @@ E-D whether bf16 flow/Mimi add anything on top, F the combination with the BF16 
 C160 (`--cuda-graph-trace=node`) should show per layer 4 bf16 GEMMs, `k_layer_norm_bf16` x2, `k_rope_qk_bias_batch`,
 `k_bias_gelu_bf16`, `k_residual_bias_add` x2 and the attention, and no `k_bias_add`/`k_f32_to_bf16` in
 `step.backbone`.
+
+## One sync per frame (`MYNAH_CUDA_ONE_SYNC`, default 0)
+
+Branch `pocket-cuda-onesync` from e4b465e. Target: action 1 of `.work/pocket-cuda-inefficiencies-and-l40s.md`
+(the measured ~7 `mynah_backend_sync` per step). Scope done here: the four syncs on the critical path between the
+condition projection and the flow head; the PCM sync of the decoder gang stays (see "Not done").
+
+### Sync map (steady state, batched decode, Mimi tile + decoder gang defaults; line numbers at this commit)
+
+| # | stage | flag off | flag on |
+|---|---|---|---|
+| 1 | condition (`input_linear`) | `pocket_cuda_condition_batch`, sync `src/engine_pocket.c:1988` (+ 4 KB/row D2H, host finite scan) | queued, no D2H (`pocket_onesync_step`, `:8034`) |
+| 2 | backbone | `pocket_cuda_backbone_step_batch_impl`, sync `:7470`, host commit | same graph, queued with `defer = 1`; host commit after the frame sync (`pocket_cuda_backbone_step_commit`, `:7005`) |
+| 3 | EOS logits | `pocket_cuda_eos_batch`, sync `:2047` | queued linear + 1 float/row D2H into pinned memory |
+| 4 | flow head | `pocket_cuda_flow_step_batch`, hidden re-uploaded from the host, sync `:7676` | `pocket_cuda_onesync_flow_queue` (`:7835`): cond gathered from `cuda_norm` on the device, own graph per width |
+| 5 | noise + LSD add | host, `pocket_emit_batch` | noise: host, drawn in step; add: device (`k_residual_add`), latent D2H |
+|   | **the one sync** | | `pocket_onesync_step`, `:8084` |
+| 6 | PCM handoff | `pocket_decode_audio_batch`, sync `:11723` | unchanged |
+
+Other syncs that exist with either setting and are not per frame: KV growth (`:6554`), prefill/admission, the
+non-tile codec transformer (`:11326`, only with `MYNAH_CUDA_MIMI_TILE=0`), fallbacks. So per batched frame:
+5 -> 2 counted syncs, i.e. **3 fewer per frame**; the measured 6.94 syncs/step should drop by ~3 at equal load (the
+rest is admission/prefill/growth).
+
+### What runs where with the flag on
+`pocket_step_batch` (`:9866`) tries `pocket_onesync_step` first when the scratch has the chain and every row steps
+(batch >= 2, no budget-exhausted row, no `noise_fn`, resident CUDA backbone + flow, COND_IN/COND_EOS groups resident):
+1. host: previous latents -> pinned buffer; each row's noise for this step drawn (RNG state saved first).
+2. queue: H2D latents, `input_linear` -> `cuda_x` (the backbone's condition-input graph key, unchanged graph).
+3. queue: backbone (graph replay/capture exactly as before; hidden D2H and the optional host K/V mirror D2H are
+   graph nodes as before).
+4. queue: EOS linear on `cuda_norm` (count rows, same call as before) + D2H.
+5. queue (graph key `0x500000 + width`): noise H2D, time H2D, `gather_rows_to_batch` cond (rows >= count repeat row 0,
+   as the ordinary flow does), `flow_batch_dev`, latent = copy(noise) + flow, D2H flow output and latent.
+6. one `mynah_backend_sync`; then the backbone commit (finite gate, hidden rows, offsets, valid flags), EOS logits into
+   each ctx, flow finite flag. `pocket_emit_batch` then only decides EOS, keeps or undoes the early draw, and copies
+   flow output and latent.
+
+### Why sampling and the audio stay identical
+- Noise: same RNG, same expression (`noise_std * pocket_rng_normal(ctx)`), same per-row order; only the moment moves
+  (before the chain instead of after the EOS logit). The RNG has no other consumer between step and emit. The one case
+  where the ordinary emit draws nothing is a terminal step (`step >= eos_step + frames_after_eos`, or a budget row):
+  there emit restores the saved RNG state (`pocket_onesync_rng_restore`), so the next segment's draws are unchanged.
+  A draw no emit consumed (an emit that never ran) is undone at the next step; `reset` clears it.
+- Condition, backbone, EOS: the same calls on the same buffers and widths (same graph keys); only the syncs between
+  them are gone.
+- Flow: the cond rows are the same bytes (device copy of `cuda_norm` instead of the host round trip of the same
+  floats), the noise is the same floats, the width is `exec(count)`, the buffers and kernels are the ordinary ones.
+  That equals the ordinary call only when every row takes a latent. In a step where some row ends, emit ignores the
+  chained result and runs the ordinary `pocket_cuda_flow_step_batch` on the subset (one extra sync, once per request
+  or segment end), so that step is the ordinary one too.
+- Latent: `k_residual_add` computes `noise + flow` as one fp32 addition (no multiply, so no FMA contraction; no fast
+  math), bit-equal to the host `noise[d] + flow_out[d]`.
+- Flag off: no buffers are allocated, `cuda_onesync_enabled` stays 0, and every changed line on the ordinary path is
+  either a no-op test of a zero field or the backbone tail moved verbatim into `pocket_cuda_backbone_step_commit`.
+
+### Failure behaviour
+- Not eligible this step (backbone returns 1, e.g. a row off the device): nothing committed, early draws undone, the
+  ordinary path runs (the queued projection is simply redone on the same stream).
+- Non-finite hidden/flow row, or an offset that cannot advance: nothing committed, the ordinary path redoes the frame
+  (the backbone rewrites the same K/V slot with the same values) and reports it as before; a non-finite chained flow
+  makes emit run the ordinary flow.
+- Launch or sync error: drain, forget the scratch's graphs, disable the chain for this scratch (stderr line
+  "MYNAH_CUDA_ONE_SYNC disabled after a failure"), continue on the per-stage path.
+
+### How to verify on the L4
+1. Start-up line: `MYNAH_CUDA_ONE_SYNC: condition, backbone, EOS and flow head share one stream sync per batched
+   frame`; no "disabled after a failure" line during the runs.
+2. Sync count: under a fixed closed loop (e.g. C64 for 60 s), `mynah_backend_sync_calls_total` delta divided by the
+   step delta (`/health` steps), flag off vs on: expect about -3 per step. nsys: one `cudaStreamSynchronize` between
+   `step.backbone` start and the decoder, not four.
+3. Bit identity: the same 24 seeded requests, temperature 0, SEANet fp32, sent at once at a fixed concurrency to a
+   fresh server, flag off vs on, same build: md5 per request identical (the gang-history caveat of the correctness
+   section applies; compare off vs off first). Include requests long enough to end at different steps (terminal-step
+   subset flow), multi-segment requests (RNG continues across the segment boundary) and `frames_after_eos` 0.
+4. Stronger, per tensor: `MYNAH_POCKET_DUMP=<dir>` on both arms; `hidden`, `eos`, `flow_out`, `latent` .npy files
+   byte-identical.
+5. `--pocket-self-check` with the flag on (pedantic `MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0`): PASS, including the
+   latent-NaN and KV-NaN atomicity cases (they now go through the chain, fall back, and must still refuse atomically).
+   `--gpu-self-test` PASS. Also `MYNAH_CUDA_GRAPHS=0` (uncaptured chain) and `MYNAH_CUDA_WIDTH_BUCKETS=0`.
+6. Knee A/B at C192/C208 on top of the best flag set: step time and scheduler CPU.
+
+### Risks
+- One extra graph per width bucket (15 by default; cap 384).
+- The chain runs the flow head on rows whose step turns out terminal, then reruns the ordinary flow on the subset:
+  one extra flow pass and sync per request end (rare).
+- The hidden rows still come back to the host (4 KB/row, in the same sync): needed for the finite gate, the dump and
+  the CPU fallbacks. A device NaN flag could replace the gate later.
+- `gather_rows_to_batch` uses the backend's shared metadata buffer (`dev_batch_k_cache`), which the backbone's
+  attention tables also use; this is correct because everything is ordered on one stream.
+- Rows with a host `noise_fn` (parity harness) never take the chain.
+
+### Not done (the rest of action 1)
+- PCM sync (#6): the decoder gang is a separate engine call (`decode_audio_batch`) issued by the driver after
+  `emit_batch`, and the codec input is the host latent (`pocket_cuda_codec_gang_upsample` uploads `denorm`). Merging it
+  into the frame sync needs (a) the denormalisation, upsample, Mimi tile and SEANet fed from the device latent, and
+  (b) knowing before the sync whether frame N exists, because the codec state cannot be rewound. (b) is decidable on
+  the host before the step whenever `frames_after_eos >= 1`: a row terminates at step N only if its `eos_step` was set
+  at an earlier step; only `frames_after_eos == 0` makes it depend on the logit of step N. So a frame-major chain is
+  possible for the default config, but it changes the driver/engine contract (step, emit and decode in one call) and
+  the delivery logic in `src/inference.c` (`stream_gang`).
+- PCM in int16 on the device, the hidden D2H, and the EOS/latent/flow/hidden copies packed into one D2H.
