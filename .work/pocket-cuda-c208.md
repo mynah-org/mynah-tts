@@ -76,3 +76,16 @@ cuBLAS number and keep the invariance.
   their algorithm by width): the same 24 seeded requests at concurrency 24 and 3 differ in all 24 md5s, flags off.
   So md5 comparisons between two server runs only hold when the gang history is the same; at temperature 0 two runs
   of one build are usually identical (99 dB) but one request in 24 can diverge (24 dB) from timing alone.
+
+## Work items (2026-10-02)
+1. [running] knee: shared voice + decoder fuse + bf16 prefill tile vs cuBLAS prefill at C192/C208/C224.
+2. [running] knee: all-bf16 weights (MYNAH_CUDA_QUANT=bf16 + PREFILL_BF16TC) vs fp32 weights; listening pack for
+   the stages a reference PyTorch engine kept fp32 (flow head, Mimi transformer).
+3. [branch pocket-cuda-shv2] shared voice phase 2: rows without the voice prefix (VRAM for C224+; C224 OOMs today at
+   22.5 GB during KV growth).
+4. [branch pocket-cuda-bf16dec] bf16 decode linears: per-stage switch, LN/GELU writing bf16, bias folded.
+5. [branch pocket-cuda-decfuse] decoder fusion part 2: bias, residual, convtr overlap/fold/copy.
+6. [analysis] .work/pocket-cuda-inefficiencies-and-l40s.md: syncs, copies, allocations, threads, FP8, L40S knobs.
+7. Then: measured wins default ON for Pocket (env flags kept to switch off), C208 2-min + 10-min soaks, C224+,
+   docs/cuda-serving.md update, PR, merge, remove worktrees.
+8. Later (future option): an L40S (same sm_89 family, 142 SMs, ~2.9x bandwidth, 48 GB) 1-2 h knee session.
