@@ -857,3 +857,16 @@ the only limit; the warm-up line at 256 should drop by ~1.3 GiB.
   saves 45 MiB more), but growing them later invalidates captured graphs that bake the pointers.
 - Decoder gang graphs per exact width (tables grow with the sum of widths); bucketing the gang width like the
   backbone would cap them.
+
+### 2026-10-02 16:30 CEST — soaks with the shipped defaults (no env), --max-batch 288
+| soak | requests | failed | stalls 250/500 | stream RTF p95 | TTFA p95 | audio-s/s |
+|---|---|---|---|---|---|---|
+| 2 min C208 | 5,061 | 0 | 0/0 | 0.622 | 108 ms | 311 |
+| 2 min C288 | 5,324 | 0 | 0/0 | 0.816 | 140 ms | 320 |
+| 10 min C208 | 25,382 | 0 | 0/0 | 0.628 | 108 ms | 323 |
+| 10 min C288 | 26,870 | 0 | 0/0 | 0.821 (windows 0.818-0.823, drift -0.3 %) | 141 ms | 341 |
+Peak VRAM 21.2 GB. Self-checks PASS (defaults and pedantic).
+
+Next items: admission that refuses work (503) before an OOM can fail a step; recover the 2-3 % of the fixed-order
+bf16 prefill tile (bigger tiles, cp.async); KV_VMM block-major pages (remove the ~4 % TLB cost) for C320 on GPUs with
+more compute; L40S session (raise the 384 compile-time caps, width buckets past 384).
