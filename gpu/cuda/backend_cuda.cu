@@ -7316,10 +7316,16 @@ __global__ static void k_cross_attention(const float *q, const float *kcache,
         out[hbase + (size_t)d] *= inv;
 }
 
+/* SHARED: positions [0, prefix_len) are read from the shared voice prefix
+ * planes (stride `width`) instead of the cache, which is then never touched
+ * below prefix_len (MYNAH_CUDA_SHARED_VOICE). SHARED=false is the plain
+ * kernel; both walk the positions in the same order. */
+template <bool SHARED>
 __global__ static void k_self_attention_bf16(
     const float *qkv, uint16_t *kcache, uint16_t *vcache, size_t position,
     size_t cache_stride, size_t valid, int heads, int head_width, float scale,
-    float *out) {
+    float *out, const uint16_t *kprefix, const uint16_t *vprefix,
+    size_t prefix_len) {
     const int head = (int)blockIdx.x;
     if (head >= heads) return;
     const int tid = (int)threadIdx.x;
@@ -7346,8 +7352,11 @@ __global__ static void k_self_attention_bf16(
     }
     __syncthreads();
     for (size_t s = 0; s <= position; ++s) {
-        const uint16_t *ks = kcache + s * cache_stride + hbase;
-        const uint16_t *vs = vcache + s * cache_stride + hbase;
+        const bool from_prefix = SHARED && s < prefix_len;
+        const uint16_t *ks = from_prefix ? kprefix + s * width + hbase
+                                         : kcache + s * cache_stride + hbase;
+        const uint16_t *vs = from_prefix ? vprefix + s * width + hbase
+                                         : vcache + s * cache_stride + hbase;
         float local = 0.0f;
         for (int d = tid; d < head_width; d += (int)blockDim.x)
             local += q[d] * cuda_bf16_to_float(ks[d]);
@@ -7719,23 +7728,31 @@ __device__ static inline void tile_kv_store(uint16_t *p, float v) {
 
 /* RoPE on q and k at each row's absolute position (the formula of k_rope_qk),
  * then k and v into the request's cache at slot (absolute % ring), layout
- * [K ring][V ring] per layer. One block per row. */
-template <typename KV>
+ * [K ring][V ring] per layer. One block per row.
+ *
+ * PREFIX (mynah_backend_tile_desc.skip): the row does not store its first
+ * skip[r] positions, the slot is (absolute - skip) % ring and `ring` counts
+ * the stored slots. The host refuses a start below the skip, so nothing is
+ * written there. PREFIX=false is the plain layout, the same code as before. */
+template <typename KV, bool PREFIX>
 __global__ static void k_tile_rope_store(float *qkv, void *const *kv,
                                          const long long *start,
                                          const int2 *rowmap, int layer,
                                          int layers, int heads, int head_width,
-                                         const long long *rings, float max_period) {
+                                         const long long *rings, float max_period,
+                                         const long long *skips) {
     const int m = (int)blockIdx.x;
     const int2 rt = rowmap[m];
     const long long ring = rings[rt.x];
     const long long absolute = start[rt.x] + rt.y;
+    const long long skip = PREFIX ? skips[rt.x] : 0;
+    const long long slot = (absolute - skip) % ring;
     const int half = head_width / 2;
     const int dim = heads * head_width;
     float *row = qkv + (size_t)m * 3u * (size_t)dim;
     KV *kbase = static_cast<KV *>(kv[(size_t)rt.x * layers + layer]);
-    KV *kslot = kbase + (size_t)(absolute % ring) * dim;
-    KV *vslot = kbase + (size_t)ring * dim + (size_t)(absolute % ring) * dim;
+    KV *kslot = kbase + (size_t)slot * dim;
+    KV *vslot = kbase + (size_t)ring * dim + (size_t)slot * dim;
     const float slope = (float)(-log((double)max_period) * 2.0 /
                                 (double)head_width);
     for (int pair = (int)threadIdx.x; pair < heads * half;
@@ -7761,15 +7778,21 @@ __global__ static void k_tile_rope_store(float *qkv, void *const *kv,
 /* One warp per (row, head): scores over the causal window in shared memory,
  * a two-pass softmax, then each lane owns output dims. Every reduction order
  * depends only on the window length, never on the batch. `context` 0 means
- * the whole prefix; `window_cap` bounds the per-warp score buffer. */
-template <typename KV>
+ * the whole prefix; `window_cap` bounds the per-warp score buffer.
+ *
+ * PREFIX: positions below skip[r] are read from the shared planes
+ * prefix[r * layers + layer] ([K skip][V skip] x dim), the rest from the row
+ * at slot (p - skip) % ring. Same values in the same order as a row that
+ * stores its prefix, so the result is bit-identical. */
+template <typename KV, bool PREFIX>
 __global__ static void k_tile_attention(const float *qkv, void *const *kv,
                                         const long long *start,
                                         const int2 *rowmap, int layer,
                                         int layers, int heads, int head_width,
                                         long long context, const long long *rings,
                                         int window_cap, float scale, float *out,
-                                        int rows_total) {
+                                        int rows_total, const long long *skips,
+                                        void *const *prefix) {
     extern __shared__ float tile_scores[];
     const int lane = (int)threadIdx.x & 31;
     const int warp = (int)threadIdx.x >> 5;
@@ -7789,10 +7812,16 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
     const float *q = qkv + (size_t)m * 3u * dim + (size_t)h * head_width;
     const KV *kbase = static_cast<const KV *>(kv[(size_t)rt.x * layers + layer]);
     const KV *vbase = kbase + (size_t)ring * dim;
+    const long long skip = PREFIX ? skips[rt.x] : 0;
+    const KV *pkbase = PREFIX && skip > 0
+        ? static_cast<const KV *>(prefix[(size_t)rt.x * layers + layer]) : nullptr;
+    const KV *pvbase = PREFIX && skip > 0 ? pkbase + (size_t)skip * dim : nullptr;
     float local_max = -INFINITY;
     for (int s = lane; s < n; s += 32) {
-        const KV *k = kbase + (size_t)((first + s) % ring) * dim +
-                      (size_t)h * head_width;
+        const long long p = first + s;
+        const KV *k = (PREFIX && p < skip)
+            ? pkbase + (size_t)p * dim + (size_t)h * head_width
+            : kbase + (size_t)((p - skip) % ring) * dim + (size_t)h * head_width;
         float dot = 0.0f;
         for (int d = 0; d < head_width; ++d)
             dot = fmaf(q[d], tile_kv_load(k + d), dot);
@@ -7815,8 +7844,10 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
     for (int d = lane; d < head_width; d += 32) {
         float acc = 0.0f;
         for (int s = 0; s < n; ++s) {
-            const KV *v = vbase + (size_t)((first + s) % ring) * dim +
-                          (size_t)h * head_width;
+            const long long p = first + s;
+            const KV *v = (PREFIX && p < skip)
+                ? pvbase + (size_t)p * dim + (size_t)h * head_width
+                : vbase + (size_t)((p - skip) % ring) * dim + (size_t)h * head_width;
             acc = fmaf(scores[s], tile_kv_load(v + d), acc);
         }
         out[(size_t)m * dim + (size_t)h * head_width + d] = acc * inv;
@@ -7832,12 +7863,14 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
 #define TILE_ATTN_Q 16
 #define TILE_ATTN_CH 32
 #define TILE_ATTN_HW 128
-template <typename KV>
+/* PREFIX: as in k_tile_attention, positions below skip[r] come from the
+ * shared prefix planes and the row stores slot (p - skip) % ring. */
+template <typename KV, bool PREFIX>
 __global__ static void k_tile_attention_grouped(
     const float *qkv, void *const *kv, const long long *start,
     const int2 *rowmap, const int2 *groups, int layer, int layers, int heads,
     int head_width, long long context, const long long *rings, float scale,
-    float *out) {
+    float *out, const long long *skips, void *const *prefix) {
     __shared__ float ks[TILE_ATTN_CH][TILE_ATTN_HW + 1];
     __shared__ float vs[TILE_ATTN_CH][TILE_ATTN_HW];
     __shared__ float qs[TILE_ATTN_Q][TILE_ATTN_HW];
@@ -7854,6 +7887,10 @@ __global__ static void k_tile_attention_grouped(
     const long long lo = (context > 0 && abs0 + 1 > context) ? abs0 + 1 - context : 0;
     const KV *kbase = static_cast<const KV *>(kv[(size_t)r * layers + layer]);
     const KV *vbase = kbase + (size_t)ring * dim;
+    const long long skip = PREFIX ? skips[r] : 0;
+    const KV *pkbase = PREFIX && skip > 0
+        ? static_cast<const KV *>(prefix[(size_t)r * layers + layer]) : nullptr;
+    const KV *pvbase = PREFIX && skip > 0 ? pkbase + (size_t)skip * dim : nullptr;
     for (int i = (int)threadIdx.x; i < group.y * head_width; i += (int)blockDim.x) {
         const int q = i / head_width, d = i % head_width;
         qs[q][d] = qkv[(size_t)(group.x + q) * 3u * dim + (size_t)h * head_width + d];
@@ -7872,8 +7909,13 @@ __global__ static void k_tile_attention_grouped(
             const int j = i / head_width, d = i % head_width;
             const long long p = c0 + j;
             float kval = 0.0f, vval = 0.0f;
-            if (p <= abs_last) {
-                const size_t slot = (size_t)(p % ring) * dim + (size_t)h * head_width + d;
+            if (PREFIX && p < skip) {
+                const size_t at = (size_t)p * dim + (size_t)h * head_width + d;
+                kval = tile_kv_load(pkbase + at);
+                vval = tile_kv_load(pvbase + at);
+            } else if (p <= abs_last) {
+                const size_t slot = (size_t)((p - skip) % ring) * dim +
+                                    (size_t)h * head_width + d;
                 kval = tile_kv_load(kbase + slot);
                 vval = tile_kv_load(vbase + slot);
             }
@@ -7918,6 +7960,35 @@ __global__ static void k_tile_attention_grouped(
         const int d = lane + 32 * k;
         if (d < head_width) o[d] = acc[k] * inv;
     }
+}
+
+/* One layer's RoPE + K/V store + attention of the tile, the launches the
+ * driver below always made, with the PREFIX variants selected by template. */
+template <typename KV, bool PREFIX>
+static void tile_attention_layer(cuda_backend_state *st, float *qkv,
+                                 void *const *kv, const long long *start,
+                                 const int2 *rowmap, const int2 *groups,
+                                 int layer, int layers, int heads,
+                                 int head_width, long long context,
+                                 const long long *rings, float max_period,
+                                 size_t M, bool use_grouped, dim3 group_grid,
+                                 unsigned blocks, int warps_per_block,
+                                 size_t smem, int window, float scale,
+                                 float *att, const long long *skips,
+                                 void *const *prefix) {
+    k_tile_rope_store<KV, PREFIX><<<(int)M, 256, 0, st->stream>>>(
+        qkv, kv, start, rowmap, layer, layers, heads, head_width, rings,
+        max_period, skips);
+    if (use_grouped)
+        k_tile_attention_grouped<KV, PREFIX><<<group_grid, TILE_ATTN_Q * 32, 0,
+                                               st->stream>>>(
+            qkv, kv, start, rowmap, groups, layer, layers, heads, head_width,
+            context, rings, scale, att, skips, prefix);
+    else
+        k_tile_attention<KV, PREFIX><<<blocks, warps_per_block * 32, smem,
+                                       st->stream>>>(
+            qkv, kv, start, rowmap, layer, layers, heads, head_width, context,
+            rings, window, scale, att, (int)M, skips, prefix);
 }
 
 static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
@@ -8506,6 +8577,10 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
     /* Pack the rows and bound every attention window before touching the GPU. */
     size_t M = 0u;
     size_t window = 0u;
+    /* Rows that do not store a leading prefix (desc.skip). The PREFIX kernel
+     * variants run only when at least one row has one, so a call without
+     * skips launches exactly the kernels it always did. */
+    bool prefixed = false;
     for (size_t r = 0; r < d->rows; ++r) {
         const size_t n = d->count != nullptr ? d->count[r] : d->positions;
         if (n > d->positions) {
@@ -8514,12 +8589,30 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
         }
         const size_t end = d->start[r] + n;
         const size_t ring = d->rings != nullptr ? d->rings[r] : d->ring;
+        const size_t skip = d->skip != nullptr ? d->skip[r] : 0u;
         if (ring == 0u ||
             (d->context != 0u && ring < d->context + d->positions - 1u)) {
             set_error(e, ec, "CUDA tile ring cannot hold the attention window");
             return -1;
         }
-        if (d->context == 0u && end > ring) {
+        if (skip != 0u) {
+            /* The prefix is read-only and the row holds [skip, end): a start
+             * below the skip would write into the shared planes' place, and a
+             * windowed (ring) cache would wrap into it. */
+            if (d->prefix == nullptr || d->context != 0u || d->start[r] < skip ||
+                skip > (size_t)LLONG_MAX) {
+                set_error(e, ec, "invalid CUDA tile shared prefix");
+                return -1;
+            }
+            for (size_t l = 0; l < d->layers; ++l) {
+                if (d->prefix[r * d->layers + l] == nullptr) {
+                    set_error(e, ec, "invalid CUDA tile shared prefix");
+                    return -1;
+                }
+            }
+            prefixed = true;
+        }
+        if (d->context == 0u && end - skip > ring) {
             set_error(e, ec, "CUDA tile position exceeds the cache");
             return -1;
         }
@@ -8539,9 +8632,14 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
         const size_t n = d->count != nullptr ? d->count[r] : d->positions;
         group_count += (n + TILE_ATTN_Q - 1u) / TILE_ATTN_Q;
     }
-    const size_t meta_bytes = (2u * d->rows + kv_count) * sizeof(void *) +
-                              2u * d->rows * sizeof(long long) + M * sizeof(int2) +
-                              group_count * sizeof(int2);
+    /* With prefixed rows the staging also carries the prefix pointer table
+     * (after the kv table) and the per-row skip (after the rings); without,
+     * the layout is the one it always was. */
+    const size_t prefix_count = prefixed ? kv_count : 0u;
+    const size_t skip_count = prefixed ? d->rows : 0u;
+    const size_t meta_bytes = (2u * d->rows + kv_count + prefix_count) * sizeof(void *) +
+                              (2u * d->rows + skip_count) * sizeof(long long) +
+                              M * sizeof(int2) + group_count * sizeof(int2);
     if (tile_reserve(st, M, d->dim, d->ffn, meta_bytes, e, ec)) return -1;
     cuda_tile_workspace &w = st->tile;
 
@@ -8551,15 +8649,28 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
     char *host = static_cast<char *>(w.meta_host);
     const size_t off_out = d->rows * sizeof(void *);
     const size_t off_kv = 2u * d->rows * sizeof(void *);
-    const size_t off_start = off_kv + kv_count * sizeof(void *);
+    const size_t off_prefix = off_kv + kv_count * sizeof(void *);
+    const size_t off_start = off_prefix + prefix_count * sizeof(void *);
     const size_t off_ring = off_start + d->rows * sizeof(long long);
-    const size_t off_map = off_ring + d->rows * sizeof(long long);
+    const size_t off_skip = off_ring + d->rows * sizeof(long long);
+    const size_t off_map = off_skip + skip_count * sizeof(long long);
     memcpy(host, d->input, d->rows * sizeof(void *));
     if (d->output != nullptr)
         memcpy(host + off_out, d->output, d->rows * sizeof(void *));
     else
         memset(host + off_out, 0, d->rows * sizeof(void *));
     memcpy(host + off_kv, d->kv, kv_count * sizeof(void *));
+    if (prefixed) {
+        /* Rows without a skip get a null entry; the kernels never read it. */
+        void **host_prefix = reinterpret_cast<void **>(host + off_prefix);
+        long long *host_skip = reinterpret_cast<long long *>(host + off_skip);
+        for (size_t r = 0; r < d->rows; ++r) {
+            host_skip[r] = (long long)d->skip[r];
+            for (size_t l = 0; l < d->layers; ++l)
+                host_prefix[r * d->layers + l] =
+                    d->skip[r] != 0u ? d->prefix[r * d->layers + l] : nullptr;
+        }
+    }
     long long *host_start = reinterpret_cast<long long *>(host + off_start);
     long long *host_ring = reinterpret_cast<long long *>(host + off_ring);
     int2 *host_map = reinterpret_cast<int2 *>(host + off_map);
@@ -8585,6 +8696,10 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
     void *const *d_kv = reinterpret_cast<void *const *>(dev + off_kv);
     const long long *d_start = reinterpret_cast<const long long *>(dev + off_start);
     const long long *d_ring = reinterpret_cast<const long long *>(dev + off_ring);
+    void *const *d_prefix =
+        prefixed ? reinterpret_cast<void *const *>(dev + off_prefix) : nullptr;
+    const long long *d_skip =
+        prefixed ? reinterpret_cast<const long long *>(dev + off_skip) : nullptr;
     const int2 *d_map = reinterpret_cast<const int2 *>(dev + off_map);
     const int2 *d_groups = reinterpret_cast<const int2 *>(dev + off_groups);
     static const bool grouped = cuda_env_enabled("MYNAH_CUDA_TILE_ATTN_GROUPED", true);
@@ -8615,35 +8730,35 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
         const unsigned blocks = (unsigned)((work + warps_per_block - 1) /
                                            warps_per_block);
         if (d->kv_bf16) {
-            k_tile_rope_store<uint16_t><<<(int)M, 256, 0, st->stream>>>(
-                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
-                head_width, d_ring, d->max_period);
-            if (use_grouped)
-                k_tile_attention_grouped<uint16_t><<<group_grid, TILE_ATTN_Q * 32, 0,
-                                                     st->stream>>>(
-                    w.qkv, d_kv, d_start, d_map, d_groups, (int)l, (int)d->layers,
-                    heads, head_width, (long long)d->context, d_ring, scale, w.att);
+            if (prefixed)
+                tile_attention_layer<uint16_t, true>(
+                    st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
+                    (int)d->layers, heads, head_width, (long long)d->context,
+                    d_ring, d->max_period, M, use_grouped, group_grid, blocks,
+                    warps_per_block, smem, (int)window, scale, w.att, d_skip,
+                    d_prefix);
             else
-            k_tile_attention<uint16_t><<<blocks, warps_per_block * 32, smem,
-                                          st->stream>>>(
-                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
-                head_width, (long long)d->context, d_ring,
-                (int)window, scale, w.att, (int)M);
+                tile_attention_layer<uint16_t, false>(
+                    st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
+                    (int)d->layers, heads, head_width, (long long)d->context,
+                    d_ring, d->max_period, M, use_grouped, group_grid, blocks,
+                    warps_per_block, smem, (int)window, scale, w.att, nullptr,
+                    nullptr);
         } else {
-            k_tile_rope_store<float><<<(int)M, 256, 0, st->stream>>>(
-                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
-                head_width, d_ring, d->max_period);
-            if (use_grouped)
-                k_tile_attention_grouped<float><<<group_grid, TILE_ATTN_Q * 32, 0,
-                                                  st->stream>>>(
-                    w.qkv, d_kv, d_start, d_map, d_groups, (int)l, (int)d->layers,
-                    heads, head_width, (long long)d->context, d_ring, scale, w.att);
+            if (prefixed)
+                tile_attention_layer<float, true>(
+                    st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
+                    (int)d->layers, heads, head_width, (long long)d->context,
+                    d_ring, d->max_period, M, use_grouped, group_grid, blocks,
+                    warps_per_block, smem, (int)window, scale, w.att, d_skip,
+                    d_prefix);
             else
-            k_tile_attention<float><<<blocks, warps_per_block * 32, smem,
-                                       st->stream>>>(
-                w.qkv, d_kv, d_start, d_map, (int)l, (int)d->layers, heads,
-                head_width, (long long)d->context, d_ring,
-                (int)window, scale, w.att, (int)M);
+                tile_attention_layer<float, false>(
+                    st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
+                    (int)d->layers, heads, head_width, (long long)d->context,
+                    d_ring, d->max_period, M, use_grouped, group_grid, blocks,
+                    warps_per_block, smem, (int)window, scale, w.att, nullptr,
+                    nullptr);
         }
         if (ce(cudaGetLastError(), e, ec)) return -1;
         if (tile_gemm(st, w.att, L->out_proj_weight, L->out_proj_bias, w.proj, M,
@@ -8691,10 +8806,44 @@ extern "C" int mynah_cuda_self_attention_bf16_dev(
         set_error(e, ec, "CUDA BF16 self-attention cache stride overflow");
         return -1;
     }
-    k_self_attention_bf16<<<(int)heads, attention_threads(head_width), 0,
-                            st->stream>>>(
+    k_self_attention_bf16<false><<<(int)heads, attention_threads(head_width), 0,
+                                   st->stream>>>(
         qkv, static_cast<uint16_t *>(kcache), static_cast<uint16_t *>(vcache),
-        position, cache_stride, valid, (int)heads, (int)head_width, scale, out);
+        position, cache_stride, valid, (int)heads, (int)head_width, scale, out,
+        nullptr, nullptr, 0u);
+    return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_self_attention_bf16_prefix_dev(
+    void *opaque, const float *qkv, void *kcache, void *vcache,
+    const void *kprefix, const void *vprefix, size_t prefix_len,
+    size_t position, size_t cache_stride, size_t valid, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (qkv == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
+        heads == 0u || head_width == 0u || valid == 0u || heads > (size_t)INT_MAX ||
+        head_width > (size_t)INT_MAX || cache_stride == 0u || position >= valid ||
+        heads > SIZE_MAX / head_width) {
+        set_error(e, ec, "invalid CUDA BF16 self-attention dimensions");
+        return -1;
+    }
+    if (prefix_len > position ||
+        (prefix_len != 0u && (kprefix == nullptr || vprefix == nullptr))) {
+        set_error(e, ec, "invalid CUDA BF16 shared voice prefix");
+        return -1;
+    }
+    const size_t width = heads * head_width;
+    if (cache_stride < width ||
+        (valid - 1u) > (SIZE_MAX - (width - 1u)) / cache_stride) {
+        set_error(e, ec, "CUDA BF16 self-attention cache stride overflow");
+        return -1;
+    }
+    k_self_attention_bf16<true><<<(int)heads, attention_threads(head_width), 0,
+                                  st->stream>>>(
+        qkv, static_cast<uint16_t *>(kcache), static_cast<uint16_t *>(vcache),
+        position, cache_stride, valid, (int)heads, (int)head_width, scale, out,
+        static_cast<const uint16_t *>(kprefix),
+        static_cast<const uint16_t *>(vprefix), prefix_len);
     return ce(cudaGetLastError(), e, ec);
 }
 
@@ -8792,11 +8941,17 @@ __global__ static void k_self_attention_batch(
         out[(size_t)request * width + hbase + (size_t)d] *= inv;
 }
 
+/* SHARED: positions [0, prefix_len[request]) come from the shared voice
+ * prefix planes (stride `width`), as in k_self_attention_bf16_batch_fast; the
+ * row's own cache is then never touched below the prefix, so a row that does
+ * not store its prefix (MYNAH_CUDA_SHARED_VOICE) is correct here too. */
+template <bool SHARED>
 __global__ static void k_self_attention_bf16_batch(
     const float *qkv, const uint16_t *const *kcache,
     const uint16_t *const *vcache, const size_t *positions,
     const size_t *cache_strides, int batch, int heads, int head_width,
-    float scale, float *out) {
+    float scale, float *out, const uint16_t *const *kprefix,
+    const uint16_t *const *vprefix, const size_t *prefix_len) {
     const int head = (int)blockIdx.x;
     const int request = (int)blockIdx.y;
     if (head >= heads || request >= batch) return;
@@ -8828,9 +8983,15 @@ __global__ static void k_self_attention_bf16_batch(
         denominator = 0.0f;
     }
     __syncthreads();
+    const size_t shared_len = SHARED ? prefix_len[request] : 0u;
     for (size_t s = 0; s <= position; ++s) {
-        const uint16_t *ks = kcache[request] + s * cache_stride + hbase;
-        const uint16_t *vs = vcache[request] + s * cache_stride + hbase;
+        const bool from_prefix = SHARED && s < shared_len;
+        const uint16_t *ks = from_prefix
+            ? kprefix[request] + s * width + hbase
+            : kcache[request] + s * cache_stride + hbase;
+        const uint16_t *vs = from_prefix
+            ? vprefix[request] + s * width + hbase
+            : vcache[request] + s * cache_stride + hbase;
         float local = 0.0f;
         for (int d = tid; d < head_width; d += (int)blockDim.x)
             local += q[d] * cuda_bf16_to_float(ks[d]);
@@ -9131,14 +9292,18 @@ static int cuda_self_attention_bf16_batch(
         fast = cache_strides[i] % 8u == 0u &&
                ((uintptr_t)kcache[i] & 15u) == 0u &&
                ((uintptr_t)vcache[i] & 15u) == 0u;
-    /* The shared prefix is a read-side shortcut: the row still holds its own
-     * copy, so any configuration the fast kernel cannot take simply reads
-     * the row as before. */
-    bool shared = fast && prefix_len != nullptr && width % 8u == 0u;
+    /* With prefix tables every kernel reads positions [0, prefix_len) from
+     * the shared planes: a row may not store its prefix at all
+     * (MYNAH_CUDA_SHARED_VOICE), so no fallback may read the row there. The
+     * fast kernel additionally needs 16-byte aligned prefix rows; otherwise
+     * the legacy kernel takes the prefix variant. Without prefix tables the
+     * kernels are exactly the ones this function always launched. */
+    const bool prefixed = prefix_len != nullptr;
+    bool shared = fast && prefixed && width % 8u == 0u;
     for (size_t i = 0; shared && i < batch; ++i)
         shared = ((uintptr_t)kprefix[i] & 15u) == 0u &&
                  ((uintptr_t)vprefix[i] & 15u) == 0u;
-    if (shared &&
+    if (prefixed &&
         (ce(cudaMemcpyAsync(st->dev_batch_k_prefix, kprefix,
                             batch * sizeof(*kprefix), cudaMemcpyHostToDevice,
                             st->stream), e, ec) ||
@@ -9148,7 +9313,7 @@ static int cuda_self_attention_bf16_batch(
          ce(cudaMemcpyAsync(st->dev_batch_prefix_len, prefix_len,
                             batch * sizeof(*prefix_len), cudaMemcpyHostToDevice,
                             st->stream), e, ec))) return -1;
-    if (shared) {
+    if (prefixed) {
         /* One line per process, the first time the shared path really runs. */
         static std::atomic<bool> announced{false};
         if (!announced.exchange(true))
@@ -9156,6 +9321,25 @@ static int cuda_self_attention_bf16_batch(
                          "mynah-tts: CUDA decode attention reads voice prefixes "
                          "from the shared device voice cache "
                          "(MYNAH_CUDA_SHARED_VOICE=1)\n");
+        if (!shared) {
+            k_self_attention_bf16_batch<true><<<grid, attention_threads(head_width),
+                                                0, st->stream>>>(
+                qkv,
+                reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+                reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+                st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+                (int)heads, (int)head_width, scale, out,
+                reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_prefix),
+                reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_prefix),
+                st->dev_batch_prefix_len);
+            if (ce(cudaGetLastError(), e, ec)) return -1;
+            if (stage) {
+                k_f32_to_bf16<<<((int)out_count + 255) / 256, 256, 0, st->stream>>>(
+                    out, staged, (int)out_count);
+                return ce(cudaGetLastError(), e, ec);
+            }
+            return 0;
+        }
         if (stage) {
             k_self_attention_bf16_batch_fast<true, true>
                 <<<grid, CUDA_ATTN_FAST_THREADS, 0, st->stream>>>(
@@ -9203,13 +9387,13 @@ static int cuda_self_attention_bf16_batch(
         }
         return ce(cudaGetLastError(), e, ec);
     }
-    k_self_attention_bf16_batch<<<grid, attention_threads(head_width), 0,
-                                  st->stream>>>(
+    k_self_attention_bf16_batch<false><<<grid, attention_threads(head_width), 0,
+                                         st->stream>>>(
         qkv,
         reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
         reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
         st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
-        (int)heads, (int)head_width, scale, out);
+        (int)heads, (int)head_width, scale, out, nullptr, nullptr, nullptr);
     if (ce(cudaGetLastError(), e, ec)) return -1;
     if (stage) {
         k_f32_to_bf16<<<((int)out_count + 255) / 256, 256, 0, st->stream>>>(

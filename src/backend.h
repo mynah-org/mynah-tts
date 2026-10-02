@@ -483,6 +483,18 @@ typedef struct {
      * rows were split across calls (a prefill pushed in pieces must equal one
      * pushed whole). Costs tensor-core speed; the prefill can afford it. */
     int fixed_order;
+    /* Rows whose cache does not store a leading prefix (MYNAH_CUDA_SHARED_VOICE
+     * with the voice prefix dropped from the row). NULL = every row stores
+     * every position, exactly the layout described above. Otherwise row r
+     * reads positions [0, skip[r]) from the shared planes
+     * prefix[r * layers + l] (layout [K skip[r]][V skip[r]] x dim, same element
+     * type as the cache, read only) and stores absolute position a >= skip[r]
+     * in its own cache at slot (a - skip[r]) % ring_r, where ring_r
+     * (`rings`/`ring`) then counts the STORED slots per plane. Every start[r]
+     * must be >= skip[r]: nothing is ever written below the skip. A row with
+     * skip[r] == 0 is the plain layout and its prefix entries are ignored. */
+    const size_t *skip;         /* [rows] or NULL                         */
+    void *const *prefix;        /* [rows * layers] device, or NULL        */
 } mynah_backend_tile_desc;
 /* 1 when a row's result cannot depend on the other rows of a batched call
  * (every kernel reduces in a fixed order). 0 when the backend runs cuBLAS
@@ -550,10 +562,27 @@ int mynah_backend_self_attention_bf16_batch_dev(
     const size_t *positions, const size_t *cache_strides, size_t batch,
     size_t heads, size_t head_width, float scale, float *dev_out,
     char *error, size_t error_capacity);
+/* mynah_backend_self_attention_bf16_dev with positions [0, prefix_len) read
+ * from the shared voice-prefix planes dev_k_prefix / dev_v_prefix (stride
+ * heads * head_width) instead of the cache (MYNAH_CUDA_SHARED_VOICE). Same
+ * kernel and reduction order as the plain call; the cache is never read or
+ * written below prefix_len, so it may be a pointer biased below an
+ * allocation that does not store the prefix. Requires prefix_len <= position. */
+int mynah_backend_has_self_attention_bf16_prefix(const mynah_backend *backend);
+int mynah_backend_self_attention_bf16_prefix_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    void *dev_k_cache, void *dev_v_cache, const void *dev_k_prefix,
+    const void *dev_v_prefix, size_t prefix_len, size_t position,
+    size_t cache_stride, size_t valid, size_t heads, size_t head_width,
+    float scale, float *dev_out, char *error, size_t error_capacity);
 /* As above, with positions [0, prefix_len[i]) of row i read from the shared
  * voice-prefix planes dev_k_prefix[i] / dev_v_prefix[i] (stride heads *
- * head_width), which must hold the same values as the row's own cache
- * (MYNAH_CUDA_SHARED_VOICE). A row with prefix_len 0 reads only its cache. */
+ * head_width) instead of the row's own cache (MYNAH_CUDA_SHARED_VOICE). A row
+ * with prefix_len 0 reads only its cache. Whatever kernel the backend picks,
+ * positions below prefix_len[i] of the row's own cache are never read or
+ * written (the new position is always >= prefix_len[i]), so a row whose cache
+ * does not store the prefix at all may pass cache pointers biased below its
+ * allocation by prefix_len[i] positions. */
 int mynah_backend_has_self_attention_bf16_prefix_batch(const mynah_backend *backend);
 int mynah_backend_self_attention_bf16_prefix_batch_dev(
     const mynah_backend *backend, const float *dev_qkv,

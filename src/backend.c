@@ -119,6 +119,7 @@ struct mynah_backend {
     int (*self_attention_batch_dev)(void *, const float *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*self_attention_bf16_dev)(void *, const float *, void *, void *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*self_attention_bf16_batch_dev)(void *, const float *, void *const *, void *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+    int (*self_attention_bf16_prefix_dev)(void *, const float *, void *, void *, const void *, const void *, size_t, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*self_attention_bf16_prefix_batch_dev)(void *, const float *, void *const *, void *const *, void *const *, void *const *, const size_t *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
     int (*gather_kv_batch)(void *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float *, char *, size_t);
     int (*gather_kv_bf16_batch)(void *, void *const *, void *const *, const size_t *, const size_t *, size_t, size_t, size_t, float *, char *, size_t);
@@ -231,6 +232,7 @@ extern int mynah_cuda_batch_invariant(void *);
 extern int mynah_cuda_self_attention_batch_dev(void *, const float *, float *const *, float *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_dev(void *, const float *, void *, void *, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_batch_dev(void *, const float *, void *const *, void *const *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
+extern int mynah_cuda_self_attention_bf16_prefix_dev(void *, const float *, void *, void *, const void *, const void *, size_t, size_t, size_t, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_prefix_batch_dev(void *, const float *, void *const *, void *const *, void *const *, void *const *, const size_t *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_self_attention_bf16_stage_batch_dev(void *, const float *, void *const *, void *const *, void *const *, void *const *, const size_t *, const size_t *, const size_t *, size_t, size_t, size_t, float, float *, char *, size_t);
 extern int mynah_cuda_layer_norm_bf16_stage_dev(void *, const float *, const float *, const float *, size_t, size_t, char *, size_t);
@@ -752,6 +754,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->self_attention_batch_dev = mynah_cuda_self_attention_batch_dev;
         backend->self_attention_bf16_dev = mynah_cuda_self_attention_bf16_dev;
         backend->self_attention_bf16_batch_dev = mynah_cuda_self_attention_bf16_batch_dev;
+        backend->self_attention_bf16_prefix_dev = mynah_cuda_self_attention_bf16_prefix_dev;
         backend->self_attention_bf16_prefix_batch_dev = mynah_cuda_self_attention_bf16_prefix_batch_dev;
         backend->self_attention_bf16_stage_batch_dev = mynah_cuda_self_attention_bf16_stage_batch_dev;
         backend->layer_norm_bf16_stage_dev = mynah_cuda_layer_norm_bf16_stage_dev;
@@ -1319,6 +1322,23 @@ int mynah_backend_self_attention_bf16_batch_dev(
 
 int mynah_backend_has_self_attention_bf16_prefix_batch(const mynah_backend *backend) {
     return backend != NULL && backend->self_attention_bf16_prefix_batch_dev != NULL;
+}
+
+int mynah_backend_has_self_attention_bf16_prefix(const mynah_backend *backend) {
+    return backend != NULL && backend->self_attention_bf16_prefix_dev != NULL;
+}
+
+int mynah_backend_self_attention_bf16_prefix_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    void *dev_k_cache, void *dev_v_cache, const void *dev_k_prefix,
+    const void *dev_v_prefix, size_t prefix_len, size_t position,
+    size_t cache_stride, size_t valid, size_t heads, size_t head_width,
+    float scale, float *dev_out, char *error, size_t error_capacity) {
+    if (backend == NULL || backend->self_attention_bf16_prefix_dev == NULL) return -1;
+    return backend->self_attention_bf16_prefix_dev(
+        backend->state, dev_qkv, dev_k_cache, dev_v_cache, dev_k_prefix,
+        dev_v_prefix, prefix_len, position, cache_stride, valid, heads,
+        head_width, scale, dev_out, error, error_capacity);
 }
 
 int mynah_backend_self_attention_bf16_prefix_batch_dev(

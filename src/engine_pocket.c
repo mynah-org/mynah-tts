@@ -1181,6 +1181,14 @@ struct mynah_engine_ctx {
      * cache may be larger than this request needs; the layout still uses
      * `cuda_backbone_capacity` as its stride, so the tail is simply unused. */
     size_t cuda_backbone_kv_bytes;
+    /* MYNAH_CUDA_SHARED_VOICE, phase 2: leading positions the device cache
+     * does NOT store (the voice prefix, read from the model-owned device voice
+     * cache by every reader instead). 0 = the plain layout. With a skip S the
+     * cache is [layer][K|V][capacity - S][attn]: position p >= S lives at
+     * plane slot p - S, and `cuda_backbone_capacity` still counts absolute
+     * positions (the first one the cache cannot hold). Fixed at allocation;
+     * see pocket_cuda_kv_skip_planned for when a row gets one. */
+    size_t cuda_backbone_kv_skip;
     int cuda_backbone_kv_bf16;
     int cuda_backbone_enabled;
     int cuda_backbone_valid;
@@ -4440,6 +4448,56 @@ static void *pocket_cuda_kv_offset(float *base, size_t elements,
     return (void *)((unsigned char *)base + elements * width);
 }
 
+/* MYNAH_CUDA_SHARED_VOICE_STRIP (default on; only meaningful with
+ * MYNAH_CUDA_SHARED_VOICE=1): rows whose voice prefix is read from the shared
+ * device voice cache stop storing it, so each row's backbone cache shrinks by
+ * the voice positions (~12 MB per row on the 24L model). `=0` keeps the
+ * phase-1 behaviour (the prefix is still copied into every row), for A/B. */
+static int pocket_cuda_shared_voice_strip_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_CUDA_SHARED_VOICE_STRIP");
+        cached = setting == NULL || strcmp(setting, "0") != 0;
+    }
+    return cached;
+}
+
+/* Positions per K/V plane the device cache really stores. */
+static size_t pocket_cuda_kv_stored(const mynah_engine_ctx *ctx) {
+    return ctx->cuda_backbone_capacity - ctx->cuda_backbone_kv_skip;
+}
+
+/* Start of layer `layer`'s K (`plane` 0) or V (`plane` 1) plane in the
+ * device cache, as allocated: element 0 is position `cuda_backbone_kv_skip`.
+ * This is what the prefill tile and the growth copy address. */
+static void *pocket_cuda_kv_plane(const mynah_engine_ctx *ctx, size_t layer,
+                                  int plane) {
+    const size_t stored = pocket_cuda_kv_stored(ctx) *
+                          ctx->state->cfg.heads * ctx->state->cfg.head_dim;
+    return pocket_cuda_kv_offset(ctx->cuda_backbone_kv,
+                                 (layer * 2u + (plane ? 1u : 0u)) * stored,
+                                 ctx->cuda_backbone_kv_bf16);
+}
+
+/* The same plane addressed by ABSOLUTE position, the way the decode kernels
+ * index a row (base + position * attn): without a skip this is the plane
+ * start, exactly the pointer every reader always used. With a skip S it is
+ * biased S positions below the allocation, so position p >= S lands on plane
+ * slot p - S. The biased pointer is never dereferenced below S: every decode
+ * kernel reads [0, S) from the shared prefix planes (that is the contract of
+ * mynah_backend_self_attention_bf16_prefix_batch_dev) and writes only the
+ * current position, which is >= S. Computed in integer arithmetic because it
+ * may point outside the allocation; it is only ever handed to the device. */
+static void *pocket_cuda_kv_position_base(const mynah_engine_ctx *ctx,
+                                          size_t layer, int plane) {
+    unsigned char *start = (unsigned char *)pocket_cuda_kv_plane(ctx, layer, plane);
+    if (start == NULL || ctx->cuda_backbone_kv_skip == 0u) return start;
+    const size_t width = ctx->cuda_backbone_kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t bias = ctx->cuda_backbone_kv_skip * ctx->state->cfg.heads *
+                        ctx->state->cfg.head_dim * width;
+    return (void *)((uintptr_t)start - (uintptr_t)bias);
+}
+
 /* ------------------------------------------- growable device backbone KV
  *
  * MYNAH_CUDA_KV_GROW (default on; `=0` restores the full-capacity
@@ -4483,6 +4541,48 @@ static int pocket_cuda_kv_grow_expected(const mynah_engine_ctx *ctx) {
     return state->cfg.heads * state->cfg.head_dim == state->cfg.hidden_dim &&
            ctx->speaker < state->voice_count &&
            state->voices[ctx->speaker].kv != NULL;
+}
+
+/* MYNAH_CUDA_SHARED_VOICE, phase 2: the positions a new device cache will NOT
+ * store (`cuda_backbone_kv_skip`), decided once at allocation for a cache of
+ * `kv_capacity` absolute positions.
+ *
+ * A row may drop its voice prefix only if every reader of its cache can get
+ * the prefix elsewhere, so this is the conjunction of:
+ *   - the prefill tile will seed it (the same clauses as
+ *     `pocket_cuda_prefill_tile_usable`, minus the cache this sizes): the
+ *     tile is then the only writer of [voice, ...) before the first step,
+ *     the row is device-owned (never uploaded from the host, never stepped
+ *     on the CPU), and the tile's attention reads the prefix from the shared
+ *     planes (mynah_backend_tile_desc.skip);
+ *   - BF16 KV and a backend with the prefix-aware decode attention (batched
+ *     and single-row), which the two decode steps then use for this row;
+ *   - a non-empty voice that leaves at least one stored position.
+ * Anything else (voice cloning without a model voice entry, the file-backed
+ * voice mode, f32 KV, CPU-only backends, MYNAH_CUDA_PREFILL_TILE=0) gets 0,
+ * the plain layout, exactly as before. If a planned row nevertheless ends up
+ * outside the tile path, `pocket_seed_backbone` drops its device cache and
+ * the row runs on the CPU (correct, slow, and not expected to happen). */
+static size_t pocket_cuda_kv_skip_planned(const mynah_engine_ctx *ctx,
+                                          size_t kv_capacity, int kv_bf16) {
+    if (ctx == NULL || ctx->state == NULL || !kv_bf16 ||
+        !ctx->cuda_backbone_enabled || !pocket_cuda_shared_voice_enabled() ||
+        !pocket_cuda_shared_voice_strip_enabled() ||
+        !pocket_cuda_prefill_tile_enabled())
+        return 0u;
+    const mynah_engine_state *state = ctx->state;
+    if (state->backend == NULL ||
+        !mynah_backend_has_tile_transformer(state->backend) ||
+        !mynah_backend_has_self_attention_bf16_prefix_batch(state->backend) ||
+        !mynah_backend_has_self_attention_bf16_prefix(state->backend))
+        return 0u;
+    if (state->cfg.heads * state->cfg.head_dim != state->cfg.hidden_dim ||
+        ctx->speaker >= state->voice_count ||
+        state->voices[ctx->speaker].kv == NULL)
+        return 0u;
+    if (ctx->voice_positions == 0u || ctx->voice_positions >= kv_capacity)
+        return 0u;
+    return ctx->voice_positions;
 }
 
 /* The positions a device cache starts with.  Pocket emits about 2-2.6 frames
@@ -5052,6 +5152,7 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     ctx->cuda_proj = NULL;
     ctx->cuda_ffn = NULL;
     ctx->cuda_backbone_capacity = 0u;
+    ctx->cuda_backbone_kv_skip = 0u;
     ctx->cuda_backbone_kv_floats = 0u;
     ctx->cuda_backbone_kv_bytes = 0u;
     ctx->cuda_backbone_kv_bf16 = 0;
@@ -6222,8 +6323,12 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
      * full capacity and every line below is what it was. */
     size_t kv_capacity = pocket_cuda_kv_initial_capacity(ctx, bc->max_seq_len);
     const int kv_growable = kv_capacity < bc->max_seq_len;
+    /* MYNAH_CUDA_SHARED_VOICE phase 2: positions [0, kv_skip) are not stored;
+     * every size below counts stored positions (capacity - skip). With no
+     * skip every line is what it was. */
+    const size_t kv_skip = pocket_cuda_kv_skip_planned(ctx, kv_capacity, kv_bf16);
     if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
-        pocket_mul(kv_capacity, attn_dim, &layer_half) != 0 ||
+        pocket_mul(kv_capacity - kv_skip, attn_dim, &layer_half) != 0 ||
         pocket_mul(layer_half, 2u, &layer_span) != 0 ||
         pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
         pocket_mul(attn_dim, 3u, &qkv) != 0 ||
@@ -6254,10 +6359,12 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
                  * out over all of its bytes (never past the host ceiling), so
                  * the request grows later or not at all. */
                 size_t fits = slot->bb_kv_bytes / position_bytes;
-                if (fits > bc->max_seq_len) fits = bc->max_seq_len;
+                /* Stored positions; the skipped prefix is free on top. */
+                if (fits > bc->max_seq_len - kv_skip) fits = bc->max_seq_len - kv_skip;
+                fits += kv_skip;
                 if (fits > kv_capacity) {
                     kv_capacity = fits;
-                    kv_floats = cfg->layers * 2u * kv_capacity * attn_dim;
+                    kv_floats = cfg->layers * 2u * (kv_capacity - kv_skip) * attn_dim;
                 }
             }
         } else {
@@ -6311,9 +6418,19 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     POCKET_CUDA_ALLOC(ctx->cuda_ffn, cfg->ffn_dim);
 #undef POCKET_CUDA_ALLOC
     ctx->cuda_backbone_capacity = kv_capacity;
+    ctx->cuda_backbone_kv_skip = kv_skip;
     ctx->cuda_backbone_kv_floats = kv_floats;
     ctx->cuda_backbone_kv_bf16 = kv_bf16;
     ctx->cuda_backbone_valid = 0;
+    if (kv_skip != 0u) {
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "pocket: CUDA backbone KV rows do not store the %zu-position "
+                    "voice prefix (MYNAH_CUDA_SHARED_VOICE=1)\n", kv_skip);
+        }
+    }
     return 0;
 }
 
@@ -6331,6 +6448,10 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
  * (the invariant `_state_reset` relies on).  A sync separates the copy from
  * the free: the stream is the only one touching this cache, and growth is rare
  * (a request that outlives its estimate, once per 256 frames).
+ *
+ * With a skip (MYNAH_CUDA_SHARED_VOICE phase 2) the planes hold positions
+ * [skip, capacity): both plane sizes and the live count are in stored
+ * positions, and the skip itself never changes.
  *
  * Nothing caches the old pointer or capacity past this call: the batched step
  * rebuilds its per-layer pointer tables from `cuda_backbone_kv` every step
@@ -6361,18 +6482,21 @@ static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
         new_capacity = old_capacity + chunks * POCKET_CUDA_KV_GROW_CHUNK;
     const size_t element = ctx->cuda_backbone_kv_bf16 ? sizeof(uint16_t)
                                                       : sizeof(float);
+    const size_t skip = ctx->cuda_backbone_kv_skip; /* < old_capacity */
     size_t attn_dim = 0u, old_half = 0u, new_half = 0u, new_floats = 0u;
     size_t new_bytes = 0u, valid = 0u, valid_bytes = 0u;
     if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
-        pocket_mul(old_capacity, attn_dim, &old_half) != 0 ||
-        pocket_mul(new_capacity, attn_dim, &new_half) != 0 ||
+        pocket_mul(old_capacity - skip, attn_dim, &old_half) != 0 ||
+        pocket_mul(new_capacity - skip, attn_dim, &new_half) != 0 ||
         pocket_mul(new_half, 2u * cfg->layers, &new_floats) != 0 ||
         pocket_mul(new_floats, element, &new_bytes) != 0) {
         pocket_error(error, capacity, "pocket: CUDA KV growth size overflow");
         return -1;
     }
+    /* Live stored positions: [skip, offset) of the absolute range. */
     valid = mynah_transformer_ar_state_offset(ctx->backbone);
     if (valid > old_capacity) valid = old_capacity;
+    valid = valid > skip ? valid - skip : 0u;
     valid_bytes = valid * attn_dim * element;
 
     char local[256];
@@ -6416,11 +6540,16 @@ static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
     ctx->cuda_backbone_capacity = new_capacity;
     ctx->cuda_backbone_kv_floats = new_floats;
     ctx->cuda_backbone_kv_bytes = new_bytes;
-    if (pocket_cuda_kv_grow_logged())
+    if (pocket_cuda_kv_grow_logged() && skip == 0u)
         fprintf(stderr,
                 "pocket: CUDA backbone KV grew %zu -> %zu positions "
                 "(%zu live, %zu bytes)\n",
                 old_capacity, new_capacity, valid, new_bytes);
+    else if (pocket_cuda_kv_grow_logged())
+        fprintf(stderr,
+                "pocket: CUDA backbone KV grew %zu -> %zu positions "
+                "(%zu live stored, %zu-position prefix not stored, %zu bytes)\n",
+                old_capacity, new_capacity, valid, skip, new_bytes);
     return 0;
 }
 
@@ -6434,6 +6563,15 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
         pocket_error(error, capacity,
                      "pocket: refusing to upload a stale host cache over a "
                      "device-owned backbone");
+        return -1;
+    }
+    if (ctx->cuda_backbone_kv_skip != 0u) {
+        /* A cache without the voice prefix is only ever filled by the
+         * prefill tile (pocket_cuda_kv_skip_planned); the host layout below
+         * assumes every position is stored. Unreachable by construction. */
+        pocket_error(error, capacity,
+                     "pocket: refusing to upload a host cache into a device "
+                     "cache that does not store the voice prefix");
         return -1;
     }
     const pocket_config *cfg = &ctx->state->cfg;
@@ -6582,7 +6720,21 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
         return -1;
     }
     const size_t attn_dim = cfg->heads * cfg->head_dim;
-    const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
+    /* A cache without the voice prefix (MYNAH_CUDA_SHARED_VOICE phase 2) is
+     * read through the prefix-aware variant of the same single-row kernel:
+     * positions [0, skip) from the shared device voice cache, the rest from
+     * the row, in the same order as the plain kernel. */
+    const size_t kv_skip = ctx->cuda_backbone_kv_skip;
+    if (kv_skip != 0u &&
+        (ctx->cuda_voice_shared == NULL ||
+         ctx->cuda_voice_shared_positions != kv_skip ||
+         !ctx->cuda_backbone_kv_bf16 ||
+         !mynah_backend_has_self_attention_bf16_prefix(backend))) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA backbone row without its voice prefix has no "
+                     "shared voice cache to read it from");
+        return -1;
+    }
     char local[256];
     char drain_error[256];
     local[0] = '\0';
@@ -6607,13 +6759,20 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
             mynah_backend_rope_dev(backend, ctx->cuda_qkv, position, cfg->heads,
                                    cfg->head_dim, bc->max_period, local,
                                    sizeof(local)) != 0) goto fail;
-        void *layer_kv = pocket_cuda_kv_offset(
-            ctx->cuda_backbone_kv, l * (2u * layer_half),
-            ctx->cuda_backbone_kv_bf16);
-        void *layer_v = pocket_cuda_kv_offset(
-            ctx->cuda_backbone_kv, l * (2u * layer_half) + layer_half,
-            ctx->cuda_backbone_kv_bf16);
-        const int attention_failed = ctx->cuda_backbone_kv_bf16
+        /* Position-addressed planes: the plane start without a skip. */
+        void *layer_kv = pocket_cuda_kv_position_base(ctx, l, 0);
+        void *layer_v = pocket_cuda_kv_position_base(ctx, l, 1);
+        /* Device voice cache layout: [layer][K|V][kv_skip][attn]. */
+        const uint16_t *voice = (const uint16_t *)ctx->cuda_voice_shared;
+        const int attention_failed = kv_skip != 0u
+            ? mynah_backend_self_attention_bf16_prefix_dev(
+                  backend, ctx->cuda_qkv, layer_kv, layer_v,
+                  voice + l * 2u * kv_skip * attn_dim,
+                  voice + (l * 2u + 1u) * kv_skip * attn_dim, kv_skip,
+                  position, attn_dim, position + 1u, cfg->heads,
+                  cfg->head_dim, 1.0f / sqrtf((float)cfg->head_dim),
+                  ctx->cuda_attn, local, sizeof(local))
+            : ctx->cuda_backbone_kv_bf16
             ? mynah_backend_self_attention_bf16_dev(
                   backend, ctx->cuda_qkv, layer_kv, layer_v, position,
                   attn_dim, position + 1u, cfg->heads, cfg->head_dim,
@@ -6671,11 +6830,12 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
     const size_t host_slot = position * attn_dim;
     for (size_t l = 0; l < cfg->layers; ++l) {
         float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
+        /* position >= kv_skip: always a stored slot. */
         void *device_k = pocket_cuda_kv_offset(
-            ctx->cuda_backbone_kv, l * (2u * layer_half) + host_slot,
+            (float *)pocket_cuda_kv_position_base(ctx, l, 0), host_slot,
             ctx->cuda_backbone_kv_bf16);
         void *device_v = pocket_cuda_kv_offset(
-            ctx->cuda_backbone_kv, l * (2u * layer_half) + layer_half + host_slot,
+            (float *)pocket_cuda_kv_position_base(ctx, l, 1), host_slot,
             ctx->cuda_backbone_kv_bf16);
         if (host_kv == NULL ||
             (ctx->cuda_backbone_kv_bf16
@@ -6928,6 +7088,16 @@ static int pocket_cuda_backbone_step_batch(
     const int bf16_fuse = state->cuda_bf16_weights &&
         pocket_cuda_bf16_fuse_enabled() &&
         mynah_backend_has_bf16_fused(scratch->backend);
+    /* A row without its voice prefix in the cache (phase 2) can only be read
+     * through the prefix tables, from the voice cache entry it was seeded
+     * with; anything else is "not eligible", before any state moves. */
+    for (size_t i = 0; i < count; ++i) {
+        const size_t skip = ctxs[i]->cuda_backbone_kv_skip;
+        if (skip != 0u &&
+            (!shared_voice || ctxs[i]->cuda_voice_shared == NULL ||
+             ctxs[i]->cuda_voice_shared_positions != skip))
+            return 1;
+    }
     /* Graph replay reads one persistent host pointer table per transformer
      * layer.  The table cannot be a stack array and it cannot be shared by all
      * layers: each layer owns a different KV allocation, while the captured
@@ -6940,15 +7110,19 @@ static int pocket_cuda_backbone_step_batch(
             size_t layer_span = 0u;
             size_t layer_offset = 0u;
             if (config == NULL ||
-                pocket_mul(ctxs[i]->cuda_backbone_capacity, attn_dim,
+                pocket_mul(pocket_cuda_kv_stored(ctxs[i]), attn_dim,
                            &layer_half) != 0 ||
                 pocket_mul(layer_half, 2u, &layer_span) != 0 ||
                 pocket_mul(l, layer_span, &layer_offset) != 0) return -1;
             const size_t metadata_offset = l * scratch->cuda_batch_capacity + i;
-            scratch->cuda_kcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
-                ctxs[i]->cuda_backbone_kv, layer_offset, kv_bf16);
-            scratch->cuda_vcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
-                ctxs[i]->cuda_backbone_kv, layer_offset + layer_half, kv_bf16);
+            /* Position-addressed planes (pocket_cuda_kv_position_base): the
+             * plane start for a plain row, biased below it by the skip for a
+             * row without its voice prefix. The kernels index base + position
+             * * stride and never touch a position below the prefix length. */
+            scratch->cuda_kcache[metadata_offset] =
+                (float *)pocket_cuda_kv_position_base(ctxs[i], l, 0);
+            scratch->cuda_vcache[metadata_offset] =
+                (float *)pocket_cuda_kv_position_base(ctxs[i], l, 1);
             if (shared_voice) {
                 /* Device voice cache layout: [layer][K|V][positions][attn]. */
                 const size_t p = ctxs[i]->cuda_voice_shared != NULL
@@ -8338,7 +8512,10 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                                           : sizeof(float);
     char local[256];
     local[0] = '\0';
-    /* Voice prefixes first: one D2D per layer and plane per fresh request. */
+    /* Voice prefixes first: one D2D per layer and plane per fresh request.
+     * A row that does not store its prefix (cuda_backbone_kv_skip, phase 2
+     * of MYNAH_CUDA_SHARED_VOICE) copies nothing: it only records the shared
+     * entry, which the tile below and both decode steps read instead. */
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         if (!ctx->cuda_voice_pending) continue;
@@ -8354,6 +8531,19 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         if (voice == NULL) {
             pocket_error(error, capacity, "pocket: CUDA voice cache: %s", local);
             return -1;
+        }
+        if (ctx->cuda_backbone_kv_skip != 0u) {
+            if (ctx->cuda_backbone_kv_skip != ctx->voice_positions ||
+                !ctx->cuda_backbone_kv_bf16) {
+                pocket_error(error, capacity,
+                             "pocket: CUDA backbone cache skips %zu positions, "
+                             "the voice has %zu",
+                             ctx->cuda_backbone_kv_skip, ctx->voice_positions);
+                return -1;
+            }
+            ctx->cuda_voice_shared = voice;
+            ctx->cuda_voice_shared_positions = ctx->voice_positions;
+            continue;
         }
         unsigned char *base = (unsigned char *)ctx->cuda_backbone_kv;
         for (size_t l = 0; l < layers && span > 0u; ++l) {
@@ -8393,6 +8583,33 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         }
         const float *input[POCKET_MAX_BATCH];
         void *kv[POCKET_MAX_BATCH * 64u];
+        /* Rows without their voice prefix (MYNAH_CUDA_SHARED_VOICE phase 2):
+         * the skipped length per row and the shared planes per row and layer
+         * (mynah_backend_tile_desc.skip/prefix). The pointer table is as large
+         * as `kv`, so it lives on the heap, and only when a row needs it. */
+        size_t row_skip[POCKET_MAX_BATCH];
+        int any_skip = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const mynah_engine_ctx *ctx = ctxs[i];
+            if (take[i] == 0u || ctx->cuda_backbone_kv_skip == 0u) continue;
+            if (ctx->cuda_voice_shared == NULL ||
+                ctx->cuda_voice_shared_positions != ctx->cuda_backbone_kv_skip) {
+                pocket_error(error, capacity,
+                             "pocket: CUDA prefill tile row without its voice "
+                             "prefix has no shared voice cache");
+                return -1;
+            }
+            any_skip = 1;
+        }
+        void **prefix = NULL;
+        if (any_skip) {
+            prefix = (void **)calloc(count * layers, sizeof(*prefix));
+            if (prefix == NULL) {
+                pocket_error(error, capacity,
+                             "pocket: out of memory for the CUDA prefill tile");
+                return -1;
+            }
+        }
         size_t rows = 0u, offset = 0u;
         size_t row_take[POCKET_MAX_BATCH], row_start[POCKET_MAX_BATCH];
         size_t row_ring[POCKET_MAX_BATCH];
@@ -8406,16 +8623,26 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                   dst, take[i] * cfg->hidden_dim, local,
                                   sizeof(local)) != 0) {
                 pocket_error(error, capacity, "pocket: CUDA prefill H2D: %s", local);
+                free(prefix);
                 return -1;
             }
             input[rows] = dst;
             row_take[rows] = take[i];
             row_start[rows] = start[i];
-            row_ring[rows] = ctx->cuda_backbone_capacity;
-            const size_t layer_half = ctx->cuda_backbone_capacity * attn_dim;
-            for (size_t l = 0; l < layers; ++l)
-                kv[rows * layers + l] = (unsigned char *)ctx->cuda_backbone_kv +
-                                        l * 2u * layer_half * kv_elem;
+            /* The tile's ring is the STORED slots per plane, slot =
+             * (absolute - skip) % ring; with no skip, exactly the capacity
+             * and the plane layout this always passed. */
+            const size_t skip = ctx->cuda_backbone_kv_skip;
+            row_ring[rows] = pocket_cuda_kv_stored(ctx);
+            row_skip[rows] = skip;
+            for (size_t l = 0; l < layers; ++l) {
+                kv[rows * layers + l] = pocket_cuda_kv_plane(ctx, l, 0);
+                /* Device voice cache layout: [layer][K|V][skip][attn]. */
+                if (skip != 0u)
+                    prefix[rows * layers + l] =
+                        (void *)((const unsigned char *)ctx->cuda_voice_shared +
+                                 l * 2u * skip * attn_dim * kv_elem);
+            }
             offset += take[i];
             ++rows;
         }
@@ -8466,11 +8693,16 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
              * land in the cache exactly as a one-shot prefill would put it.
              * MYNAH_CUDA_PREFILL_FIXED=0 trades that for cuBLAS speed. */
             .fixed_order = pocket_cuda_prefill_fixed_order(),
+            /* NULL unless a row skips its prefix: the plain call otherwise. */
+            .skip = any_skip ? row_skip : NULL,
+            .prefix = any_skip ? prefix : NULL,
         };
         mynah_region_begin(MYNAH_RGN_PREFILL);
         const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
                                                           local, sizeof(local));
         mynah_region_end(MYNAH_RGN_PREFILL);
+        /* The backend copied the tables into its staging before returning. */
+        free(prefix);
         if (rc != 0) {
             pocket_error(error, capacity, "pocket: CUDA prefill tile: %s",
                          local[0] != '\0' ? local : "unavailable");
@@ -8614,6 +8846,16 @@ static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capac
         }
         ctx->text_prefilled = 0;
         return 0;
+    }
+    if (ctx->cuda_backbone_kv_skip != 0u) {
+        /* A device cache without the voice prefix (MYNAH_CUDA_SHARED_VOICE)
+         * was planned for the tile path, which this row is not taking; the
+         * host-seeded path below uploads every position, so that cache
+         * cannot serve it. Not expected (the plan mirrors the tile's own
+         * test); the row stays correct on the CPU. */
+        pocket_cuda_drain_before_release(state->backend);
+        pocket_cuda_backbone_release(ctx);
+        ctx->cuda_backbone_enabled = 0;
     }
     char name[POCKET_NAME_MAX];
     for (size_t l = 0; l < cfg->layers; ++l) {
