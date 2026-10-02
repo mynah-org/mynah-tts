@@ -143,6 +143,18 @@
       "MYNAH_CUDA_QUANT": {
         "value": null,
         "why": "Must be ABSENT (default f32 resident weights). bf16 (deterministic BF16 tile) is 4% slower than f32 on the L4; int8 is diagnostic. Neither has a qualified point."
+      },
+      "MYNAH_CUDA_SEANET_BF16": {
+        "value": null,
+        "why": "Must be ABSENT (default on). SEANet decoder convolution GEMMs with BF16 operands and FP32 accumulate; states, ELU, residuals and audio stay FP32. L4 A/B/A/B (60-s closed loop, v2 corpus, 4 voices): C160 RTF p95 0.855/0.875 -> 0.832/0.837, 152-156 -> 162 audio-s/s; C192 0.874 -> 0.845. Temperature 0 vs FP32: SNR 47.5-49 dB (tests/codec_int8_quality.py --mode seanet-bf16). =0 is the rollback to the FP32 decoder GEMMs (byte-identical to v1.5.0)."
+      },
+      "MYNAH_CUDA_SLOT_POOL_PREFILL": {
+        "value": null,
+        "why": "Must be ABSENT (default on, CUDA). The slot pool is filled at start-up with --max-batch resource sets, so a fresh server's first burst runs like a warm one. =0 is the rollback to filling on first use."
+      },
+      "MYNAH_CUDA_WIDTH_BUCKETS": {
+        "value": null,
+        "why": "Must be ABSENT (default on, CUDA). Gang widths rounded up to buckets whose graphs are captured at start-up: no graph capture during traffic. Start-up 2 s -> 33 s on the L4 (24L, --max-batch 160). =0 is the rollback to exact widths captured on first use."
       }
     }
   },

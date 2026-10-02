@@ -311,6 +311,22 @@ __global__ static void k_bf16_to_f32(const uint16_t *in, float *out, int n) {
     if (i < n) out[i] = cuda_bf16_to_float(in[i]);
 }
 
+/* Element store for the SEANet GEMM operand builders (im2col columns and the
+ * transposed-convolution gather).  The float overload is the plain store the
+ * FP32 decoder has always done; the uint16_t overload rounds to BF16 (RNE, the
+ * same helper as the BF16 KV cache) for MYNAH_CUDA_SEANET_BF16.  Only GEMM
+ * operands go through the BF16 store: causal states, bias, residual and the
+ * GEMM output stay FP32. */
+__device__ __forceinline__ static void decoder_put(float *dst, size_t i,
+                                                   float value) {
+    dst[i] = value;
+}
+
+__device__ __forceinline__ static void decoder_put(uint16_t *dst, size_t i,
+                                                   float value) {
+    dst[i] = cuda_bf16_from_float(value);
+}
+
 /* Q8 activation packing used by the resident Pocket linear path.  The CPU
  * qmat reference uses symmetric per-row absmax, ties-away-from-zero rounding
  * and the signed range [-127, 127].  Keep those choices explicit here: CUDA's
@@ -415,8 +431,9 @@ __global__ static void k_decoder_causal_window(const float *previous,
     }
 }
 
+template <typename T>
 __global__ static void k_decoder_causal_columns(const float *window,
-                                                float *columns, int channels,
+                                                T *columns, int channels,
                                                 int length, int kernel,
                                                 int dilation, int stride,
                                                 int tail) {
@@ -433,9 +450,9 @@ __global__ static void k_decoder_causal_columns(const float *window,
      * `tail` here would skip the causal padding and shift every convolution
      * into the future. */
     const int source = out_pos * stride + tap * dilation;
-    columns[index] = source >= 0 && source < window_len
+    decoder_put(columns, (size_t)index, source >= 0 && source < window_len
         ? window[(size_t)channel * (size_t)window_len + (size_t)source]
-        : 0.0f;
+        : 0.0f);
 }
 
 __global__ static void k_decoder_copy_tail(const float *window, float *previous,
@@ -534,8 +551,9 @@ __global__ static void k_decoder_causal_window_batch(
                           (size_t)(pos - tail)];
 }
 
+template <typename T>
 __global__ static void k_decoder_causal_columns_batch(
-    float *const *windows, float *const *columns, int batch, int channels,
+    float *const *windows, T *const *columns, int batch, int channels,
     int length, int kernel, int dilation, int stride, int tail) {
     const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     const int per_request = channels * kernel * length;
@@ -549,17 +567,19 @@ __global__ static void k_decoder_causal_columns_batch(
     const int channel = tap_channel / kernel;
     const int window_len = tail + length;
     const int source = out_pos * stride + tap * dilation;
-    columns[request][local] = source >= 0 && source < window_len
-        ? windows[request][(size_t)channel * (size_t)window_len +
-                           (size_t)source]
-        : 0.0f;
+    decoder_put(columns[request], (size_t)local,
+                source >= 0 && source < window_len
+                    ? windows[request][(size_t)channel * (size_t)window_len +
+                                       (size_t)source]
+                    : 0.0f);
 }
 
 /* One-GEMM variant: every request's im2col columns side by side in one
  * [inner][batch * length] buffer, so a single GEMM reads the weights once for
  * the whole gang instead of once per request. */
+template <typename T>
 __global__ static void k_decoder_causal_columns_shared(
-    float *const *windows, float *columns, int batch, int channels,
+    float *const *windows, T *columns, int batch, int channels,
     int length, int kernel, int dilation, int stride, int tail) {
     const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     const int per_request = channels * kernel * length;
@@ -573,12 +593,13 @@ __global__ static void k_decoder_causal_columns_shared(
     const int channel = tap_channel / kernel;
     const int window_len = tail + length;
     const int source = out_pos * stride + tap * dilation;
-    columns[(size_t)tap_channel * (size_t)batch * length +
-            (size_t)request * length + out_pos] =
-        source >= 0 && source < window_len
-            ? windows[request][(size_t)channel * (size_t)window_len +
-                               (size_t)source]
-            : 0.0f;
+    decoder_put(columns,
+                (size_t)tap_channel * (size_t)batch * length +
+                    (size_t)request * length + out_pos,
+                source >= 0 && source < window_len
+                    ? windows[request][(size_t)channel * (size_t)window_len +
+                                       (size_t)source]
+                    : 0.0f);
 }
 
 /* [channels][batch * length] back to each request's [channels][length],
@@ -654,7 +675,8 @@ __global__ static void k_decoder_convtr_batch(
 /* GEMM form of the batched transposed convolution (groups == 1): gather
  * every request's input into one [in][batch * length] matrix, one GEMM makes
  * Y[(out, tap)][batch * length], and this fold adds the taps back onto time. */
-__global__ static void k_decoder_convtr_gather(float *const *inputs, float *x,
+template <typename T>
+__global__ static void k_decoder_convtr_gather(float *const *inputs, T *x,
                                                int batch, int channels,
                                                int length) {
     const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -664,7 +686,7 @@ __global__ static void k_decoder_convtr_gather(float *const *inputs, float *x,
     const int j = index - channel * n;
     const int request = j / length;
     const int t = j - request * length;
-    x[index] = inputs[request][(size_t)channel * length + t];
+    decoder_put(x, (size_t)index, inputs[request][(size_t)channel * length + t]);
 }
 
 __global__ static void k_decoder_convtr_overlap(const float *y, float *const *full,
@@ -687,6 +709,28 @@ __global__ static void k_decoder_convtr_overlap(const float *y, float *const *fu
         value += y[(size_t)oc * kernel + k + (size_t)(request * length + i) * m];
     }
     full[request][local] = value;
+}
+
+/* Single-request form of k_decoder_convtr_overlap (batch == 1, no pointer
+ * table), used only by the BF16 SEANet path so a solo decode runs the same
+ * GEMM arithmetic as the gang. */
+__global__ static void k_decoder_convtr_overlap_one(const float *y, float *full,
+                                                    const float *bias,
+                                                    int out_channels, int length,
+                                                    int full_len, int kernel,
+                                                    int stride) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (index >= out_channels * full_len) return;
+    const int oc = index / full_len;
+    const int t = index - oc * full_len;
+    const size_t m = (size_t)out_channels * kernel;
+    float value = bias == nullptr ? 0.0f : bias[oc];
+    for (int k = t % stride; k < kernel && k <= t; k += stride) {
+        const int i = (t - k) / stride;
+        if (i >= length) continue;
+        value += y[(size_t)oc * kernel + k + (size_t)i * m];
+    }
+    full[index] = value;
 }
 
 __global__ static void k_decoder_convtr_fold_batch(
@@ -1091,6 +1135,11 @@ struct cuda_decoder_op {
     size_t max_full_len;
     float *weight;
     float *bias;
+    /* MYNAH_CUDA_SEANET_BF16: BF16 copy of `weight`, same layout, shared
+     * through the backend BF16 weight cache (never freed by the op).  Null
+     * when the flag is off or the op has no GEMM form; a null pointer selects
+     * the FP32 path, so with the flag off nothing below changes. */
+    uint16_t *weight_bf16;
     float *previous;
     float *window;
     float *partial;
@@ -1174,6 +1223,53 @@ static bool cuda_env_enabled(const char *name, bool fallback) {
 static bool cuda_decoder_batch_enabled(void) {
     return cuda_env_enabled("MYNAH_CUDA_DECODER_BATCH", true);
 }
+
+/* MYNAH_CUDA_SEANET_BF16=1 (default off): the resident SEANet decoder's
+ * convolution GEMMs read BF16 operands (im2col columns / gathered input and a
+ * BF16 weight copy made once when the decoder is built) on tensor cores with
+ * FP32 accumulation and an FP32 output.  Causal states, bias, ELU, residual
+ * adds and the returned audio stay FP32.  Read once per process: decoders
+ * opened later must agree with the ones already in a gang. */
+/* MYNAH_CUDA_SEANET_BF16 (default on; 0 = FP32 decoder convs): every GEMM-form decoder conv in BF16; the
+ * diagnostic values "conv" and "convtr" restrict it to one kind, to locate a
+ * solo-vs-gang divergence. */
+static int cuda_seanet_bf16_mask(void) {
+    static const int mask = [] {
+        const char *v = std::getenv("MYNAH_CUDA_SEANET_BF16");
+        if (v != nullptr && std::strcmp(v, "0") == 0) return 0;
+        if (v == nullptr || *v == '\0') return 3; /* default on; =0 is the rollback */
+        if (std::strcmp(v, "conv") == 0) return 1;
+        if (std::strcmp(v, "convtr") == 0) return 2;
+        return 3;
+    }();
+    return mask;
+}
+static bool cuda_seanet_bf16_enabled(void) { return cuda_seanet_bf16_mask() != 0; }
+
+/* CUBLAS_PEDANTIC_MATH (MYNAH_CUDA_TF32=0) turns CUBLAS_COMPUTE_32F into its
+ * pedantic form, which may refuse tensor cores for BF16 inputs.  The BF16
+ * SEANet GEMMs ask for tensor cores explicitly, so they lift a pedantic mode
+ * for the duration of the call and restore it.  The math mode is host-side
+ * handle state, so this is safe inside a stream capture.  In the default
+ * TF32 mode, and in fast-math mode, the guard does nothing. */
+struct cuda_bf16_math_scope {
+    cublasHandle_t handle;
+    cublasMath_t saved;
+    bool restore;
+    explicit cuda_bf16_math_scope(cublasHandle_t h)
+        : handle(h), saved(CUBLAS_DEFAULT_MATH), restore(false) {
+        if (cublasGetMathMode(handle, &saved) == CUBLAS_STATUS_SUCCESS &&
+            (((int)saved) & 0xf) == (int)CUBLAS_PEDANTIC_MATH &&
+            cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH) ==
+                CUBLAS_STATUS_SUCCESS)
+            restore = true;
+    }
+    ~cuda_bf16_math_scope() {
+        if (restore) (void)cublasSetMathMode(handle, saved);
+    }
+    cuda_bf16_math_scope(const cuda_bf16_math_scope &) = delete;
+    cuda_bf16_math_scope &operator=(const cuda_bf16_math_scope &) = delete;
+};
 
 static bool cuda_graphs_enabled(void) {
     const char *value = std::getenv("MYNAH_CUDA_GRAPHS");
@@ -4333,6 +4429,18 @@ static bool decoder_add_op(mynah_backend_decoder *decoder,
         (!decoder_mul(out_channels, sizeof(float), &bias_bytes) ||
          cached_weight(decoder->backend, weights->bias, bias_bytes, &op.bias,
                        e, ec))) return false;
+    /* Every conv1d is an im2col GEMM; a transposed conv has a GEMM form only
+     * with groups == 1 (the grouped one stays on its FP32 SIMT kernel).  The
+     * copy is made here, at decoder open, never during a graph capture: the
+     * conversion synchronises the stream once per weight, and every later
+     * decoder hits the cache. */
+    if (cuda_seanet_bf16_enabled() &&
+        ((kind == CUDA_DECODER_CONV && (cuda_seanet_bf16_mask() & 1)) ||
+         (kind == CUDA_DECODER_CONVTR && groups == 1u &&
+          (cuda_seanet_bf16_mask() & 2))) &&
+        cached_weight_bf16(decoder->backend, weights->weight, weight_count,
+                           &op.weight_bf16, e, ec) != 0)
+        return false;
 
     size_t n = 0u;
     size_t bytes = 0u;
@@ -4606,10 +4714,21 @@ static int decoder_conv1d(mynah_backend_decoder *decoder, cuda_decoder_op *op,
     }
     const size_t inner = (size_t)op->in_channels * (size_t)op->kernel;
     const size_t columns = inner * out_len;
-    k_decoder_causal_columns<<<((int)columns + 255) / 256, 256,
-                               0, decoder->backend->stream>>>(
-        source, decoder->columns, op->in_channels, (int)out_len, op->kernel,
-        op->dilation, op->stride, (int)op->tail);
+    /* BF16 columns live in the same per-decoder buffer (sized in floats, so
+     * half of it is used). */
+    uint16_t *columns_bf16 = op->weight_bf16 != nullptr
+        ? reinterpret_cast<uint16_t *>(decoder->columns) : nullptr;
+    if (columns_bf16 != nullptr) {
+        k_decoder_causal_columns<<<((int)columns + 255) / 256, 256,
+                                   0, decoder->backend->stream>>>(
+            source, columns_bf16, op->in_channels, (int)out_len, op->kernel,
+            op->dilation, op->stride, (int)op->tail);
+    } else {
+        k_decoder_causal_columns<<<((int)columns + 255) / 256, 256,
+                                   0, decoder->backend->stream>>>(
+            source, decoder->columns, op->in_channels, (int)out_len, op->kernel,
+            op->dilation, op->stride, (int)op->tail);
+    }
     if (ce(cudaGetLastError(), e, ec)) return -1;
     if (op->bias != nullptr) {
         k_broadcast_bias<<<((int)((size_t)op->out_channels * out_len) + 255) / 256,
@@ -4621,7 +4740,16 @@ static int decoder_conv1d(mynah_backend_decoder *decoder, cuda_decoder_op *op,
     if (ce(cudaGetLastError(), e, ec)) return -1;
     const float alpha = 1.0f;
     const float beta = 1.0f;
-    if (cbe(cublasGemmEx(decoder->backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+    if (columns_bf16 != nullptr) {
+        cuda_bf16_math_scope math(decoder->backend->cublas);
+        if (cbe(cublasGemmEx(decoder->backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                             (int)out_len, op->out_channels, (int)inner,
+                             &alpha, columns_bf16, CUDA_R_16BF, (int)out_len,
+                             op->weight_bf16, CUDA_R_16BF, (int)inner, &beta,
+                             output, CUDA_R_32F, (int)out_len,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), e, ec))
+            return -1;
+    } else if (cbe(cublasGemmEx(decoder->backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                          (int)out_len, op->out_channels, (int)inner,
                          &alpha, decoder->columns, CUDA_R_32F, (int)out_len,
                          op->weight, CUDA_R_32F, (int)inner, &beta, output,
@@ -4646,10 +4774,43 @@ static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
     const size_t output_len = length * (size_t)op->stride;
     const size_t full_len = output_len + op->tail;
     const size_t total = (size_t)op->out_channels * full_len;
-    k_conv_transpose<<<((int)total + 255) / 256, 256, 0, decoder->backend->stream>>>(
-        input, op->weight, op->bias, op->full, op->in_channels,
-        op->out_channels, (int)length, (int)full_len, op->kernel, op->stride,
-        op->groups);
+    cuda_backend_state *backend = decoder->backend;
+    if (op->weight_bf16 != nullptr && decoder_convtr_gemm_enabled() &&
+        op->groups == 1 &&
+        (size_t)op->in_channels * length <= backend->dec_tr_x_cap &&
+        (size_t)op->out_channels * (size_t)op->kernel * length <=
+            backend->dec_tr_y_cap) {
+        /* BF16 SEANet: the gang's GEMM form at batch 1, so a solo decode
+         * rounds exactly like its gang (the gather is the identity layout
+         * here, only the BF16 rounding remains). */
+        const int m = op->out_channels * op->kernel;
+        const int n = (int)length;
+        const int x_total = op->in_channels * n;
+        uint16_t *x = reinterpret_cast<uint16_t *>(backend->dec_tr_x);
+        k_f32_to_bf16<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
+            input, x, x_total);
+        if (ce(cudaGetLastError(), e, ec)) return -1;
+        const float alpha = 1.0f, beta = 0.0f;
+        {
+            cuda_bf16_math_scope math(backend->cublas);
+            if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m,
+                                 n, op->in_channels, &alpha, op->weight_bf16,
+                                 CUDA_R_16BF, m, x, CUDA_R_16BF, n, &beta,
+                                 backend->dec_tr_y, CUDA_R_32F, m,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                    e, ec))
+                return -1;
+        }
+        k_decoder_convtr_overlap_one<<<((int)total + 255) / 256, 256, 0,
+                                       backend->stream>>>(
+            backend->dec_tr_y, op->full, op->bias, op->out_channels,
+            (int)length, (int)full_len, op->kernel, op->stride);
+    } else {
+        k_conv_transpose<<<((int)total + 255) / 256, 256, 0, decoder->backend->stream>>>(
+            input, op->weight, op->bias, op->full, op->in_channels,
+            op->out_channels, (int)length, (int)full_len, op->kernel, op->stride,
+            op->groups);
+    }
     if (ce(cudaGetLastError(), e, ec)) return -1;
     if (op->tail > 0u) {
         const size_t state = (size_t)op->out_channels * op->tail;
@@ -4726,7 +4887,8 @@ static bool decoder_ops_compatible(const cuda_decoder_op *a,
            a->stride == b->stride && a->dilation == b->dilation &&
            a->groups == b->groups && a->max_in_len == b->max_in_len &&
            a->tail == b->tail && a->max_full_len == b->max_full_len &&
-           a->weight == b->weight && a->bias == b->bias;
+           a->weight == b->weight && a->bias == b->bias &&
+           a->weight_bf16 == b->weight_bf16;
 }
 
 static bool cuda_decoder_graphs_enabled(void) {
@@ -5039,6 +5201,7 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         length % (size_t)ops[0]->stride != 0u)
         return -1;
     cuda_decoder_op *op = ops[0];
+    const bool bf16 = op->weight_bf16 != nullptr;
     const size_t out_len = length / (size_t)op->stride;
     size_t window_len = 0u;
     size_t window_elements = 0u;
@@ -5129,16 +5292,35 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
             decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
                                 ec) != 0)
             return -1;
-        k_decoder_causal_columns_shared<<<blocks, 256, 0, backend->stream>>>(
-            decoder_current_table(backend, backend->dev_decoder_ptr0),
-            backend->dec_cols, (int)batch, op->in_channels, (int)out_len,
-            op->kernel, op->dilation, op->stride, (int)op->tail);
+        uint16_t *cols_bf16 = op->weight_bf16 != nullptr
+            ? reinterpret_cast<uint16_t *>(backend->dec_cols) : nullptr;
+        if (cols_bf16 != nullptr) {
+            k_decoder_causal_columns_shared<<<blocks, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                cols_bf16, (int)batch, op->in_channels, (int)out_len,
+                op->kernel, op->dilation, op->stride, (int)op->tail);
+        } else {
+            k_decoder_causal_columns_shared<<<blocks, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                backend->dec_cols, (int)batch, op->in_channels, (int)out_len,
+                op->kernel, op->dilation, op->stride, (int)op->tail);
+        }
         if (ce(cudaGetLastError(), e, ec) != 0 ||
             cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
             return -1;
         const float alpha = 1.0f, beta = 0.0f;
         const int m = (int)(batch * out_len);
-        if (cbe(cublasSgemm(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m,
+        if (cols_bf16 != nullptr) {
+            cuda_bf16_math_scope math(backend->cublas);
+            if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m,
+                                 op->out_channels, (int)inner, &alpha,
+                                 cols_bf16, CUDA_R_16BF, m, op->weight_bf16,
+                                 CUDA_R_16BF, (int)inner, &beta,
+                                 backend->dec_out, CUDA_R_32F, m,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                    e, ec) != 0)
+                return -1;
+        } else if (cbe(cublasSgemm(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m,
                             op->out_channels, (int)inner, &alpha,
                             backend->dec_cols, m, op->weight, (int)inner, &beta,
                             backend->dec_out, m),
@@ -5160,7 +5342,10 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
             return -1;
         p1[i] = decoders[i]->columns;
         p2[i] = outputs[i];
-        p3[i] = op->weight;
+        /* The pointer tables are float * on the device; with BF16 SEANet the
+         * columns and weight entries point at BF16 data (the per-decoder
+         * columns buffer is sized in floats, so BF16 uses half of it). */
+        p3[i] = bf16 ? reinterpret_cast<float *>(op->weight_bf16) : op->weight;
     }
     int blocks = 0;
     if (!decoder_batch_launch_range(columns, &blocks) ||
@@ -5169,12 +5354,22 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
                             ec) != 0)
         return -1;
+    if (bf16) {
+        k_decoder_causal_columns_batch<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            reinterpret_cast<uint16_t *const *>(
+                decoder_current_table(backend, backend->dev_decoder_ptr1)),
+            (int)batch,
+            op->in_channels, (int)out_len, op->kernel, op->dilation, op->stride,
+            (int)op->tail);
+    } else {
     k_decoder_causal_columns_batch<<<blocks, 256, 0, backend->stream>>>(
         decoder_current_table(backend, backend->dev_decoder_ptr0),
         decoder_current_table(backend, backend->dev_decoder_ptr1),
         (int)batch,
         op->in_channels, (int)out_len, op->kernel, op->dilation, op->stride,
         (int)op->tail);
+    }
     if (ce(cudaGetLastError(), e, ec) != 0 ||
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch, e,
                             ec) != 0)
@@ -5191,7 +5386,26 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         return -1;
     const float alpha = 1.0f;
     const float beta = 1.0f;
-    if (cbe(cublasSgemmBatched(
+    if (bf16) {
+        /* Same batched GEMM, BF16 operands on tensor cores, FP32 accumulate,
+         * FP32 output on top of the bias written above (beta = 1). */
+        cuda_bf16_math_scope math(backend->cublas);
+        if (cbe(cublasGemmBatchedEx(
+                    backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)out_len, op->out_channels, (int)inner, &alpha,
+                    (const void *const *)decoder_current_table(
+                        backend, backend->dev_decoder_ptr1), CUDA_R_16BF,
+                    (int)out_len,
+                    (const void *const *)decoder_current_table(
+                        backend, backend->dev_decoder_ptr3), CUDA_R_16BF,
+                    (int)inner, &beta,
+                    (void *const *)decoder_current_table(
+                        backend, backend->dev_decoder_ptr2), CUDA_R_32F,
+                    (int)out_len, (int)batch, CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT),
+                e, ec) != 0)
+            return -1;
+    } else if (cbe(cublasSgemmBatched(
                 backend->cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                 (int)out_len, op->out_channels, (int)inner, &alpha,
                 (const float *const *)decoder_current_table(
@@ -5274,14 +5488,33 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
         const int m = op->out_channels * op->kernel;
         const int n = (int)gemm_n;
         const int x_total = op->in_channels * n;
-        k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
-            decoder_current_table(backend, backend->dev_decoder_ptr0),
-            backend->dec_tr_x, (int)batch, op->in_channels, (int)length);
+        /* BF16 SEANet: the gather rounds the input to BF16 into the same
+         * buffer (sized in floats, half of it used). */
+        uint16_t *x_bf16 = op->weight_bf16 != nullptr
+            ? reinterpret_cast<uint16_t *>(backend->dec_tr_x) : nullptr;
+        if (x_bf16 != nullptr) {
+            k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                x_bf16, (int)batch, op->in_channels, (int)length);
+        } else {
+            k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                backend->dec_tr_x, (int)batch, op->in_channels, (int)length);
+        }
         if (ce(cudaGetLastError(), e, ec) != 0 ||
             cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
             return -1;
         const float alpha = 1.0f, beta = 0.0f;
-        if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m, n,
+        if (x_bf16 != nullptr) {
+            cuda_bf16_math_scope math(backend->cublas);
+            if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m,
+                                 n, op->in_channels, &alpha, op->weight_bf16,
+                                 CUDA_R_16BF, m, x_bf16, CUDA_R_16BF, n, &beta,
+                                 backend->dec_tr_y, CUDA_R_32F, m,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                    e, ec) != 0)
+                return -1;
+        } else if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m, n,
                              op->in_channels, &alpha, op->weight, CUDA_R_32F, m,
                              backend->dec_tr_x, CUDA_R_32F, n, &beta,
                              backend->dec_tr_y, CUDA_R_32F, m,
@@ -5580,6 +5813,15 @@ extern "C" int mynah_cuda_decoder_open(
         decoder_destroy(decoder);
         set_error(e, ec, "out of memory building resident decoder topology");
         return -1;
+    }
+    if (cuda_seanet_bf16_enabled()) {
+        /* One line per process, so an A/B log shows which arm it is. */
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true))
+            std::fprintf(stderr,
+                         "mynah-tts: CUDA SEANet decoder convolutions in bf16 "
+                         "(MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states "
+                         "and audio)\n");
     }
     *out = decoder;
     return 0;
@@ -7087,6 +7329,116 @@ k_tile_gemm_tc(const float *A, const float *W, const float *bias, float *C,
 #endif
 }
 
+/* MYNAH_CUDA_TILE_TC=2: the same fixed-order TF32 tile with 4x the work per
+ * block. 128x128 outputs per block, 8 warps of 32x64, and the next K slab
+ * prefetched into registers while the current one is multiplied. Every output
+ * still accumulates in exactly k_tile_gemm_tc's order: the same split-K ranges,
+ * 32-wide slabs ascending, 8-wide MMA steps ascending, operands rounded with
+ * __float_to_tf32, and 16x16 fragments that start on multiples of 16 in both M
+ * and N. The results are therefore bit-identical to k_tile_gemm_tc (the box
+ * check compares them), and the prefill invariance carries over. The
+ * epilogue goes through a small per-warp staging tile, so the static shared
+ * memory stays under 48 KiB without an opt-in. */
+static constexpr int TC2_BM = 128, TC2_BN = 128, TC2_BK = 32, TC2_LD = TC2_BK + 4;
+static constexpr int TC2_THREADS = 256;
+static constexpr int TC2_SLD = 20; /* per-warp 16x16 staging, padded */
+
+__global__ static void __launch_bounds__(TC2_THREADS)
+k_tile_gemm_tc2(const float *A, const float *W, const float *bias, float *C,
+                int M, int N, int K, int KC, float *P) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    __shared__ __align__(32) float As[TC2_BM * TC2_LD];
+    __shared__ __align__(32) float Ws[TC2_BN * TC2_LD];
+    __shared__ __align__(32) float St[8 * 16 * TC2_SLD];
+    const int m0 = (int)blockIdx.y * TC2_BM;
+    const int n0 = (int)blockIdx.x * TC2_BN;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wm = warp >> 1, wn = warp & 1;   /* 4 x 2 warps: 32 rows x 64 cols each */
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc[2][4];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 4; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+    const int kbeg = (int)blockIdx.z * KC;
+    const int kend = kbeg + KC < K ? kbeg + KC : K;
+    constexpr int PER = (TC2_BM * TC2_BK) / TC2_THREADS; /* 16 per operand */
+    float ra[PER], rw[PER];
+    auto fetch = [&](int k0) {
+        for (int i = 0; i < PER; ++i) {
+            const int idx = tid + TC2_THREADS * i;
+            const int r = idx / TC2_BK, c = idx % TC2_BK;
+            const int gk = k0 + c, gm = m0 + r, gn = n0 + r;
+            ra[i] = gm < M && gk < kend
+                ? wmma::__float_to_tf32(A[(size_t)gm * (size_t)K + (size_t)gk]) : 0.0f;
+            rw[i] = gn < N && gk < kend
+                ? wmma::__float_to_tf32(W[(size_t)gn * (size_t)K + (size_t)gk]) : 0.0f;
+        }
+    };
+    auto stash = [&]() {
+        for (int i = 0; i < PER; ++i) {
+            const int idx = tid + TC2_THREADS * i;
+            const int r = idx / TC2_BK, c = idx % TC2_BK;
+            As[r * TC2_LD + c] = ra[i];
+            Ws[r * TC2_LD + c] = rw[i];
+        }
+    };
+    if (kbeg < kend) fetch(kbeg);
+    for (int k0 = kbeg; k0 < kend; k0 += TC2_BK) {
+        stash();
+        __syncthreads();
+        if (k0 + TC2_BK < kend) fetch(k0 + TC2_BK);   /* overlaps the MMAs below */
+        for (int kk = 0; kk < TC2_BK; kk += 8) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32,
+                           wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32,
+                           wmma::col_major> b[4];
+            for (int i = 0; i < 2; ++i)
+                wmma::load_matrix_sync(a[i], As + (wm * 32 + i * 16) * TC2_LD + kk, TC2_LD);
+            for (int j = 0; j < 4; ++j)
+                wmma::load_matrix_sync(b[j], Ws + (wn * 64 + j * 16) * TC2_LD + kk, TC2_LD);
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 4; ++j)
+                    wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float *st = St + warp * 16 * TC2_SLD;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            wmma::store_matrix_sync(st, acc[i][j], TC2_SLD, wmma::mem_row_major);
+            __syncwarp();
+            const int rb = m0 + wm * 32 + i * 16, cb = n0 + wn * 64 + j * 16;
+            for (int e = lane; e < 256; e += 32) {
+                const int r = e >> 4, c = e & 15;
+                const int gm = rb + r, gn = cb + c;
+                if (gm >= M || gn >= N) continue;
+                const size_t o = (size_t)gm * (size_t)N + (size_t)gn;
+                const float v = st[r * TC2_SLD + c];
+                if (P != nullptr)
+                    P[(size_t)blockIdx.z * (size_t)M * (size_t)N + o] = v;
+                else
+                    C[o] = v + (bias != nullptr ? bias[gn] : 0.0f);
+            }
+            __syncwarp();
+        }
+    }
+#endif
+}
+
+static int cuda_tile_tc_level(void) {
+    static const int level = [] {
+        const char *v = std::getenv("MYNAH_CUDA_TILE_TC");
+        if (v == nullptr || std::strcmp(v, "0") == 0) return 0;
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            major < 8)
+            return 0;
+        return std::strcmp(v, "2") == 0 ? 2 : 1;
+    }();
+    return level;
+}
+
 static bool cuda_tile_tc_usable(void) {
     static const bool on = [] {
         if (!cuda_env_enabled("MYNAH_CUDA_TILE_TC", false)) return false;
@@ -7127,11 +7479,18 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
         if (w.splitk == nullptr || (size_t)S * M * N > w.splitk_cap) S = 1;
         int KC = (int)((K + (size_t)S - 1u) / (size_t)S);
         KC = (KC + TILE_TC_BK - 1) / TILE_TC_BK * TILE_TC_BK;
-        const dim3 tgrid((unsigned)((N + TILE_TC_BN - 1) / TILE_TC_BN),
-                         (unsigned)((M + TILE_TC_BM - 1) / TILE_TC_BM),
-                         (unsigned)S);
-        k_tile_gemm_tc<<<tgrid, 128, 0, st->stream>>>(
-            A, dw, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+        if (cuda_tile_tc_level() == 2) {
+            const dim3 tgrid((unsigned)((N + TC2_BN - 1) / TC2_BN),
+                             (unsigned)((M + TC2_BM - 1) / TC2_BM), (unsigned)S);
+            k_tile_gemm_tc2<<<tgrid, TC2_THREADS, 0, st->stream>>>(
+                A, dw, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+        } else {
+            const dim3 tgrid((unsigned)((N + TILE_TC_BN - 1) / TILE_TC_BN),
+                             (unsigned)((M + TILE_TC_BM - 1) / TILE_TC_BM),
+                             (unsigned)S);
+            k_tile_gemm_tc<<<tgrid, 128, 0, st->stream>>>(
+                A, dw, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+        }
         if (ce(cudaGetLastError(), e, ec)) return -1;
         if (S == 1) return 0;
         const dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
@@ -7208,11 +7567,13 @@ static int tile_residual(cuda_backend_state *st, float *x, const float *y,
  * modes round inputs, so a row's bits then depend on its batch mates.  The
  * same holds for the reduced-precision weight paths (MYNAH_CUDA_QUANT=bf16
  * runs cuBLAS BF16 GEMMs; int8 dequantizes through its own tensor-core
- * kernels), whichever tile mode is set. */
+ * kernels), whichever tile mode is set, and for the BF16 SEANet decoder
+ * (MYNAH_CUDA_SEANET_BF16: single vs batched BF16 GEMMs). */
 extern "C" int mynah_cuda_batch_invariant(void *opaque) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (st == nullptr) return 1;
-    return !(st->fast_math || st->tf32 || st->tile_cublas || st->quant_weights);
+    return !(st->fast_math || st->tf32 || st->tile_cublas || st->quant_weights ||
+             cuda_seanet_bf16_enabled());
 }
 
 extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,

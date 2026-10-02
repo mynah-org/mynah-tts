@@ -39,6 +39,15 @@ THE BOUNDS ARE CALIBRATED, not chosen.  Two reference points:
 Observed over three texts x three seeds on `models/pocket-en`: waveform
 correlation 0.999886-0.999920, log-mel 0.996234-0.997161, SNR 36.4-37.9 dB,
 and the sample count identical in every pair.
+
+`--mode seanet-bf16` reuses the same three measurements for a different arm:
+the CUDA build with the resident SEANet decoder's convolution GEMMs in BF16
+(`MYNAH_CUDA_SEANET_BF16=1`) against the same binary with the flag off, at
+temperature 0 by default and optionally with `--batch N` so the batched
+decoder gang is exercised (batch 1 runs the solo decoder path).  Its bounds
+are provisional until the first L4 run calibrates them: BF16 operands with
+FP32 accumulation must at least beat the int8 conv stack shipped on the CPU
+(36.4-37.9 dB), so the floor is 38 dB.
 """
 import argparse
 import math
@@ -105,9 +114,12 @@ SPEC_CONVTR = ("codec_transformer:int8,codec_conv:int8,codec_convtr:int8,"
                "backbone:f16,flow_net:f16,conditioner:f16")
 
 
-def synth(binary, model, text, seed, out, q8, mode):
+def synth(binary, model, text, seed, out, q8, mode, extra=None):
     env = dict(os.environ)
-    if mode == "convtr":
+    if mode == "seanet-bf16":
+        # Both arms are the CUDA build; only the SEANet operand type differs.
+        env["MYNAH_CUDA_SEANET_BF16"] = "1" if q8 else "0"
+    elif mode == "convtr":
         # Both arms keep the conv1d stack in int8: this isolates the
         # transposed half, which is the thing being decided.
         env["MYNAH_QUANT_GROUPS"] = SPEC_CONVTR if q8 else SPEC_BASE
@@ -116,7 +128,7 @@ def synth(binary, model, text, seed, out, q8, mode):
         env["MYNAH_CODEC_CONV_Q8"] = "1" if q8 else "0"
     env.setdefault("MYNAH_THREADS", "2")
     cmd = [binary, "--synthesize", model, "--text", text, "--lang", "en",
-           "--seed", str(seed), "--output", out]
+           "--seed", str(seed), "--output", out] + list(extra or [])
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit("synthesis failed (%d): %s" % (r.returncode, r.stderr[-800:]))
@@ -137,12 +149,42 @@ def main():
     ap.add_argument("--min-wave-corr", type=float, default=0.9995)
     ap.add_argument("--min-mel-corr", type=float, default=0.995)
     ap.add_argument("--min-snr-db", type=float, default=34.0)
-    ap.add_argument("--mode", choices=("conv", "convtr"), default="conv",
+    ap.add_argument("--mode", choices=("conv", "convtr", "seanet-bf16"),
+                    default="conv",
                     help="conv: the conv1d stack against f32 (the shipped "
                          "default). convtr: the transposed convolutions "
                          "against f32, with the conv1d stack int8 on both "
-                         "sides, which is the opt-in codec_convtr group.")
+                         "sides, which is the opt-in codec_convtr group. "
+                         "seanet-bf16: a CUDA build, MYNAH_CUDA_SEANET_BF16=1 "
+                         "against =0.")
+    ap.add_argument("--device", default=None,
+                    help="passed to --synthesize (seanet-bf16 defaults to cuda)")
+    ap.add_argument("--temperature", default=None,
+                    help="passed to --synthesize (seanet-bf16 defaults to 0)")
+    ap.add_argument("--batch", type=int, default=1,
+                    help="seanet-bf16 only: step N requests together and "
+                         "compare every one of them (exercises the decoder gang)")
     args = ap.parse_args()
+    extra = []
+    if args.mode == "seanet-bf16":
+        if args.device is None:
+            args.device = "cuda"
+        if args.temperature is None:
+            args.temperature = "0"
+        if args.min_snr_db == 34.0:
+            args.min_snr_db = 38.0
+        if args.min_wave_corr == 0.9995:
+            args.min_wave_corr = 0.9998
+        if args.min_mel_corr == 0.995:
+            args.min_mel_corr = 0.998
+        if args.batch > 1:
+            extra += ["--batch", str(args.batch)]
+    elif args.batch != 1:
+        ap.error("--batch is only meaningful with --mode seanet-bf16")
+    if args.device is not None:
+        extra += ["--device", args.device]
+    if args.temperature is not None:
+        extra += ["--temperature", str(args.temperature)]
     if args.mode == "convtr":
         # Its own bounds, because it is its own trade -- see the module
         # docstring.  Measured over three texts x three seeds: SNR
@@ -166,44 +208,65 @@ def main():
             for seed in range(1, args.seeds + 1):
                 a_path = os.path.join(tmp, "f32.wav")
                 b_path = os.path.join(tmp, "q8.wav")
-                synth(args.binary, args.model, text, seed, a_path, False, args.mode)
-                synth(args.binary, args.model, text, seed, b_path, True, args.mode)
-                a, rate = read_wav(a_path)
-                b, _ = read_wav(b_path)
-                tag = "text %d seed %d" % (ti, seed)
-                if len(a) != len(b):
-                    failures.append("%s: sample count moved, %d -> %d -- the "
-                                    "conv stack reached the frame count"
-                                    % (tag, len(a), len(b)))
-                    continue
-                n = len(a)
-                err = math.sqrt(float(((a - b) ** 2).sum()) / n)
-                rms = math.sqrt(float((a ** 2).sum()) / n)
-                snr = 20.0 * math.log10(rms / err) if err > 0 else 99.0
-                wc = corr(a, b)
-                mc = corr(log_mel(a, rate), log_mel(b, rate))
-                worst_wave = min(worst_wave, wc)
-                worst_mel = min(worst_mel, mc)
-                worst_snr = min(worst_snr, snr)
-                print("  %-16s n=%6d  wave corr %.6f  mel corr %.6f  SNR %5.1f dB"
-                      % (tag, n, wc, mc, snr))
-                if wc < args.min_wave_corr:
-                    failures.append("%s: waveform correlation %.6f < %.6f"
-                                    % (tag, wc, args.min_wave_corr))
-                if mc < args.min_mel_corr:
-                    failures.append("%s: log-mel correlation %.6f < %.6f"
-                                    % (tag, mc, args.min_mel_corr))
-                if snr < args.min_snr_db:
-                    failures.append("%s: SNR %.1f dB < %.1f dB"
-                                    % (tag, snr, args.min_snr_db))
+                synth(args.binary, args.model, text, seed, a_path, False,
+                      args.mode, extra)
+                synth(args.binary, args.model, text, seed, b_path, True,
+                      args.mode, extra)
+                # --batch N writes OUT, OUT.1 ... OUT.(N-1): one pair per row.
+                pairs = [(a_path, b_path, "text %d seed %d" % (ti, seed))]
+                for row in range(1, max(args.batch, 1)):
+                    pairs.append(("%s.%d" % (a_path, row), "%s.%d" % (b_path, row),
+                                  "text %d seed %d row %d" % (ti, seed, row)))
+                for a_file, b_file, tag in pairs:
+                    measured = measure(a_file, b_file, tag, args, failures)
+                    if measured is None:
+                        continue
+                    wc, mc, snr = measured
+                    worst_wave = min(worst_wave, wc)
+                    worst_mel = min(worst_mel, mc)
+                    worst_snr = min(worst_snr, snr)
     print("worst: wave %.6f, mel %.6f, SNR %.1f dB"
           % (worst_wave, worst_mel, worst_snr))
     if failures:
         for f in failures:
             print("FAIL: " + f, file=sys.stderr)
         return 1
-    print("codec int8 %s quality gate: PASS" % args.mode)
+    if args.mode == "seanet-bf16":
+        print("SEANet bf16 quality gate: PASS")
+    else:
+        print("codec int8 %s quality gate: PASS" % args.mode)
     return 0
+
+
+def measure(a_path, b_path, tag, args, failures):
+    """One pair: sample count, then waveform SNR/correlation and log-mel
+    correlation.  Returns (wave corr, mel corr, SNR), or None when the sample
+    count moved (the failure is recorded)."""
+    a, rate = read_wav(a_path)
+    b, _ = read_wav(b_path)
+    if len(a) != len(b):
+        failures.append("%s: sample count moved, %d -> %d -- the "
+                        "conv stack reached the frame count"
+                        % (tag, len(a), len(b)))
+        return None
+    n = len(a)
+    err = math.sqrt(float(((a - b) ** 2).sum()) / n)
+    rms = math.sqrt(float((a ** 2).sum()) / n)
+    snr = 20.0 * math.log10(rms / err) if err > 0 else 99.0
+    wc = corr(a, b)
+    mc = corr(log_mel(a, rate), log_mel(b, rate))
+    print("  %-16s n=%6d  wave corr %.6f  mel corr %.6f  SNR %5.1f dB"
+          % (tag, n, wc, mc, snr))
+    if wc < args.min_wave_corr:
+        failures.append("%s: waveform correlation %.6f < %.6f"
+                        % (tag, wc, args.min_wave_corr))
+    if mc < args.min_mel_corr:
+        failures.append("%s: log-mel correlation %.6f < %.6f"
+                        % (tag, mc, args.min_mel_corr))
+    if snr < args.min_snr_db:
+        failures.append("%s: SNR %.1f dB < %.1f dB"
+                        % (tag, snr, args.min_snr_db))
+    return wc, mc, snr
 
 
 if __name__ == "__main__":

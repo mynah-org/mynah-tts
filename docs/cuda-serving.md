@@ -191,6 +191,9 @@ resolves the default to the same thing, so it is harmless and optional.
 | `MYNAH_CUDA_BACKBONE_ATTN` | `legacy` | fast decode attention (128 positions at once) | C64: +22% |
 | `MYNAH_CUDA_SLOT_POOL` | `0` | GPU buffers of finished streams reused, not freed | +4% |
 | `MYNAH_CUDA_KV_GROW` | `0` | attention cache grows with the text instead of being sized for 120 s | GPU memory -48% |
+| `MYNAH_CUDA_SEANET_BF16` | `0` | SEANet decoder convolution GEMMs with bf16 operands on tensor cores; fp32 accumulation, causal states and audio | L4 24L: stream RTF p95 -3 to -4 %, +3-4 % audio-s/s; SNR 47.5-49 dB vs fp32 at temperature 0 (`tests/codec_int8_quality.py --mode seanet-bf16`) |
+| `MYNAH_CUDA_SLOT_POOL_PREFILL` | `0` | the slot pool is filled at start-up (all `--max-batch` sets) instead of on the first burst | a fresh server's first burst runs like a warm one |
+| `MYNAH_CUDA_WIDTH_BUCKETS` | `0` | gang widths rounded up to a few buckets, their graphs captured at start-up | no graph capture during traffic; longer start-up |
 | `MYNAH_POCKET_VOICE_CACHE` | `0` (or `all` / `startup` to preload) | voice prompts cached on first use | |
 
 ### Opt-in (off by default; not production settings)
@@ -236,6 +239,9 @@ resolves the default to the same thing, so it is harmless and optional.
 | stalls or RTF p95 above 0.9 | too many streams for this GPU: lower `--max-batch/--max-inflight` or re-screen (section 6) |
 | slow first request per voice | the voice prompt is loaded on first use; `MYNAH_POCKET_VOICE_CACHE=startup` preloads |
 | the first seconds after start are slower | CUDA graphs are captured per batch width on first use |
+| a voice sounds rough or noisy on every clip | the built-in voice's own timbre (Pocket clones its reference clip, noise included): marius and javert are the roughest, alba the cleanest ([pocket-voices.md](pocket-voices.md)); use a clean reference clip for custom voices |
+| speech starts ~1 s after the first audio | javert (and less so jean) open with silence copied from the reference clip; TTFA counts that silence |
+| metallic timbre on short sentences | model behaviour of the rougher voices (marius, javert) on one-liners, worst on the 24-layer model; not load-related. Prefer alba; count it with `tools/pocket_audio_noise.py` |
 
 ## 10. Qualifying a new GPU box
 
@@ -258,9 +264,14 @@ throughput only from 30-minute soaks: short screens under-count long
 utterances. Report ASR quality per voice and per length class, against the
 unloaded control.
 
+WER does not hear timbre: a metallic clip that reads correctly scores 0%.
+After listening, run `tools/pocket_audio_noise.py` on the unzipped listening
+sets to count noisy/metallic outliers per voice, sentence kind and length.
+
 ## Related
 
 - [server.md](server.md): the HTTP API and the CPU server.
+- [pocket-voices.md](pocket-voices.md): which voice to serve (alba), measured quality and licences.
 - [performance.md](performance.md): the measured results, CPU and GPU.
 - [`configs/perf/`](../configs/perf/README.md): serving profiles and their validator.
 - [`.work/pocket-cuda-g6-host-cpu.md`](../.work/pocket-cuda-g6-host-cpu.md) and
