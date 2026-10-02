@@ -142,7 +142,7 @@
       },
       "MYNAH_CUDA_QUANT": {
         "value": null,
-        "why": "Must be ABSENT (default f32 resident weights). bf16 (deterministic BF16 tile) is 4% slower than f32 on the L4; int8 is diagnostic. Neither has a qualified point."
+        "why": "Must be ABSENT. Since 2026-10-02 the Pocket CUDA default is bf16 backbone Linears (MYNAH_CUDA_QUANT_STAGES default backbone), measured on the 24L (l4-24g-pocket-en-24l-cuda); the C256 point below was measured on the 2026-09-28 defaults with f32 weights and has not been re-screened on the 6L. =f32 is the rollback to fp32/TF32 weights; int8 is diagnostic."
       }
     }
   },

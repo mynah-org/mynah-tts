@@ -52,12 +52,16 @@ typedef int (*mynah_backend_sgemm_fn)(void *, int trans_a, int trans_b,
                                       char *, size_t);
 
 /* MYNAH_CUDA_QUANT: the one operator-facing weight-precision switch of the
- * resident CUDA path.  f32 (default) keeps the raw f32 GEMMs; bf16 keeps the
- * CPU representation f32 and gives the resident backbone, flow net and Mimi
- * transformer BF16 weight copies on tensor cores; int8 turns on the Q8
- * policy, the int8 qmat cache and the resident-compatible int8 groups.  The
- * low-level variables (MYNAH_CUDA_Q8, MYNAH_QUANT, MYNAH_QUANT_GROUPS) remain
- * expert overrides and win when set.  It never changes a CPU backend. */
+ * resident CUDA path.  f32 keeps the raw f32 GEMMs; bf16 keeps the CPU
+ * representation f32 and gives resident stages BF16 weight copies on tensor
+ * cores; int8 turns on the Q8 policy, the int8 qmat cache and the
+ * resident-compatible int8 groups.  The low-level variables (MYNAH_CUDA_Q8,
+ * MYNAH_QUANT, MYNAH_QUANT_GROUPS) remain expert overrides and win when set.
+ * It never changes a CPU backend.  mynah_cuda_quant_from_env reads unset as
+ * f32; the Pocket CUDA engine alone defaults to bf16 when it is unset
+ * (pocket_cuda_quant_default in src/engine_pocket.c).
+ * MYNAH_CUDA_QUANT_STAGES (Pocket: backbone, flow, mimi; default backbone)
+ * names the stages bf16 applies to; `all` adds the flow head and Mimi. */
 typedef enum {
     MYNAH_CUDA_QUANT_INVALID = -1,
     MYNAH_CUDA_QUANT_F32 = 0,
@@ -126,6 +130,12 @@ int mynah_backend_decoder_note_step(const mynah_backend *backend,
  * increment this counter. */
 int mynah_backend_decoder_note_batch(const mynah_backend *backend,
                                      size_t items, size_t frames);
+/* Device bytes a resident decoder owns now (`owned`) and would own without
+ * MYNAH_CUDA_ROW_MEM_DIET (`legacy`). -1 when the backend has no such
+ * decoder (CPU/Metal). */
+int mynah_backend_decoder_device_bytes(const mynah_backend *backend,
+                                       const mynah_backend_decoder *decoder,
+                                       size_t *owned, size_t *legacy);
 /* Record one successful cross-request Pocket backbone batch. CPU/Metal are
  * intentionally no-ops; CUDA exposes the counters for server observability. */
 int mynah_backend_note_backbone_batch(const mynah_backend *backend,
@@ -167,6 +177,59 @@ int mynah_backend_q8_reserve(const mynah_backend *, size_t activation_count,
 int mynah_backend_matmul_bf16_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 int mynah_backend_bf16_reserve(const mynah_backend *, size_t activation_count,
                                char *, size_t);
+/* Fused BF16 decode linears (MYNAH_CUDA_BF16_FUSE, CUDA only).  The backend
+ * owns one STAGED BF16 activation: the buffer mynah_backend_matmul_bf16_d2d
+ * casts its input into, reserved by mynah_backend_bf16_reserve before any
+ * graph capture.  The producers below write the RNE BF16 rounding of the
+ * same FP32 value the unfused path computes straight into it, and
+ * mynah_backend_matmul_bf16_staged_d2d runs the very same cuBLAS call as
+ * mynah_backend_matmul_bf16_d2d on it, without the bias epilogue.  The bias
+ * is then folded into the elementwise kernel that consumes the GEMM output
+ * (RoPE, residual add, GELU), with the same FP32 add.  Stream-ordered: a
+ * staged value must be consumed by the next staged GEMM before another
+ * producer or a BF16 matmul overwrites it.  `bias` arguments are host
+ * model-pack views, cached by the backend like the GEMM bias. */
+int mynah_backend_has_bf16_fused(const mynah_backend *);
+/* LayerNorm of `rows` x `width` into the staged activation. */
+int mynah_backend_layer_norm_bf16_stage_dev(const mynah_backend *,
+                                            const float *in, const float *gain,
+                                            const float *bias, size_t rows,
+                                            size_t width, char *, size_t);
+/* GELU(in + bias) of `rows` x `cols` into the staged activation; `in` is not
+ * written. */
+int mynah_backend_bias_gelu_bf16_stage_dev(const mynah_backend *,
+                                           const float *in, const float *bias,
+                                           size_t rows, size_t cols, char *,
+                                           size_t);
+/* out[rows][ow] = staged[rows][iw] x W^T, BF16 weight copy, FP32 output, no
+ * bias. */
+int mynah_backend_matmul_bf16_staged_d2d(const mynah_backend *, float *out,
+                                         size_t rows, size_t iw, size_t ow,
+                                         const float *weight, char *, size_t);
+/* mynah_backend_rope_batch_dev with the fused-QKV bias added first to all
+ * three of q, k and v. */
+int mynah_backend_rope_bias_batch_dev(const mynah_backend *, float *dev_qkv,
+                                      const float *bias,
+                                      const size_t *positions, size_t batch,
+                                      size_t heads, size_t head_width,
+                                      float max_period, char *, size_t);
+/* out[r][c] += in[r][c] + bias[c] (bias may be NULL: a plain residual). */
+int mynah_backend_residual_bias_add_dev(const mynah_backend *, float *out,
+                                        const float *in, const float *bias,
+                                        size_t rows, size_t cols, char *,
+                                        size_t);
+/* mynah_backend_self_attention_bf16_prefix_batch_dev (prefix tables may be
+ * NULL: no shared prefix) whose output goes to the staged activation.
+ * `dev_scratch` ([batch][heads*head_width] FP32) is used only when the fast
+ * kernel cannot take the call: the legacy kernel writes it and a cast stages
+ * it, so the staged values are the same either way. */
+int mynah_backend_self_attention_bf16_stage_batch_dev(
+    const mynah_backend *, const float *dev_qkv, void *const *dev_k_cache,
+    void *const *dev_v_cache, void *const *dev_k_prefix,
+    void *const *dev_v_prefix, const size_t *prefix_len,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float scale, float *dev_scratch, char *,
+    size_t);
 int mynah_backend_im2col(const mynah_backend *, const float *, float *, int, int, int, int, char *, size_t);
 int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 /* Device-resident causal conv1d.  `input` and `output` are backend-owned
@@ -427,6 +490,23 @@ typedef struct {
      * rows were split across calls (a prefill pushed in pieces must equal one
      * pushed whole). Costs tensor-core speed; the prefill can afford it. */
     int fixed_order;
+    /* Rows whose cache does not store a leading prefix (MYNAH_CUDA_SHARED_VOICE
+     * with the voice prefix dropped from the row). NULL = every row stores
+     * every position, exactly the layout described above. Otherwise row r
+     * reads positions [0, skip[r]) from the shared planes
+     * prefix[r * layers + l] (layout [K skip[r]][V skip[r]] x dim, same element
+     * type as the cache, read only) and stores absolute position a >= skip[r]
+     * in its own cache at slot (a - skip[r]) % ring_r, where ring_r
+     * (`rings`/`ring`) then counts the STORED slots per plane. Every start[r]
+     * must be >= skip[r]: nothing is ever written below the skip. A row with
+     * skip[r] == 0 is the plain layout and its prefix entries are ignored. */
+    const size_t *skip;         /* [rows] or NULL                         */
+    void *const *prefix;        /* [rows * layers] device, or NULL        */
+    /* MYNAH_CUDA_KV_VMM (position-major rows): per row the pair
+     * (pitch, voff) in elements: slot s of layer l's K is at kv[r * layers +
+     * l] + s * pitch and of its V at kv[...] + voff + s * pitch. NULL = the
+     * plain layout above, (dim, ring_r * dim) for every row. CUDA only. */
+    const size_t *kv_strides;   /* [rows * 2] or NULL                     */
 } mynah_backend_tile_desc;
 /* 1 when a row's result cannot depend on the other rows of a batched call
  * (every kernel reduces in a fixed order). 0 when the backend runs cuBLAS
@@ -494,6 +574,36 @@ int mynah_backend_self_attention_bf16_batch_dev(
     const size_t *positions, const size_t *cache_strides, size_t batch,
     size_t heads, size_t head_width, float scale, float *dev_out,
     char *error, size_t error_capacity);
+/* mynah_backend_self_attention_bf16_dev with positions [0, prefix_len) read
+ * from the shared voice-prefix planes dev_k_prefix / dev_v_prefix (stride
+ * heads * head_width) instead of the cache (MYNAH_CUDA_SHARED_VOICE). Same
+ * kernel and reduction order as the plain call; the cache is never read or
+ * written below prefix_len, so it may be a pointer biased below an
+ * allocation that does not store the prefix. Requires prefix_len <= position. */
+int mynah_backend_has_self_attention_bf16_prefix(const mynah_backend *backend);
+int mynah_backend_self_attention_bf16_prefix_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    void *dev_k_cache, void *dev_v_cache, const void *dev_k_prefix,
+    const void *dev_v_prefix, size_t prefix_len, size_t position,
+    size_t cache_stride, size_t valid, size_t heads, size_t head_width,
+    float scale, float *dev_out, char *error, size_t error_capacity);
+/* As above, with positions [0, prefix_len[i]) of row i read from the shared
+ * voice-prefix planes dev_k_prefix[i] / dev_v_prefix[i] (stride heads *
+ * head_width) instead of the row's own cache (MYNAH_CUDA_SHARED_VOICE). A row
+ * with prefix_len 0 reads only its cache. Whatever kernel the backend picks,
+ * positions below prefix_len[i] of the row's own cache are never read or
+ * written (the new position is always >= prefix_len[i]), so a row whose cache
+ * does not store the prefix at all may pass cache pointers biased below its
+ * allocation by prefix_len[i] positions. */
+int mynah_backend_has_self_attention_bf16_prefix_batch(const mynah_backend *backend);
+int mynah_backend_self_attention_bf16_prefix_batch_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    void *const *dev_k_cache, void *const *dev_v_cache,
+    void *const *dev_k_prefix, void *const *dev_v_prefix,
+    const size_t *prefix_len, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale, float *dev_out, char *error,
+    size_t error_capacity);
 /* Gather the newly-written K/V slot of each independent request into one
  * fixed device buffer.  The pointer/position metadata is copied by the
  * backend, so the operation remains graph-capturable while requests rotate
@@ -556,6 +666,36 @@ int mynah_backend_copy_dev(const mynah_backend *backend, float *dev_dst,
 int mynah_backend_copy_dev_bytes(const mynah_backend *backend, void *dev_dst,
                                  const void *dev_src, size_t bytes,
                                  char *error, size_t error_capacity);
+/* Strided device-to-device bytes: `rows` rows of `width` bytes, row r from
+ * dev_src + r * src_pitch to dev_dst + r * dst_pitch. Asynchronous; returns
+ * 1 when the backend has no such copy (nothing queued). */
+int mynah_backend_copy_dev_bytes_2d(const mynah_backend *backend,
+                                    void *dev_dst, size_t dst_pitch,
+                                    const void *dev_src, size_t src_pitch,
+                                    size_t width, size_t rows, char *error,
+                                    size_t error_capacity);
+/* MYNAH_CUDA_KV_VMM: growable device buffers on the CUDA virtual memory
+ * management API (CUDA only).  A buffer is a virtual reservation of
+ * `reserve` bytes whose first `mapped` bytes are backed by device memory; it
+ * grows by mapping more pages after the mapped ones, so its address never
+ * changes and nothing is copied.  Sizes are rounded up to the allocation
+ * granularity.  `probe` returns 0 and the granularity when the path is
+ * usable, -1 and the reason otherwise (no driver entry points, device
+ * without VMM support).  `resize` maps up to `want` bytes, or unmaps whole
+ * trailing chunks while the rest still covers `want`; it must not run inside
+ * a stream capture, and shrinking (like `free`) requires that no queued work
+ * still uses the pages.  mynah_backend_dev_free also releases such a buffer
+ * correctly. */
+int mynah_backend_kv_vmm_probe(const mynah_backend *backend,
+                               size_t *granularity, char *error,
+                               size_t error_capacity);
+int mynah_backend_kv_vmm_alloc(const mynah_backend *backend, size_t reserve,
+                               size_t map, void **dev_ptr, size_t *mapped,
+                               char *error, size_t error_capacity);
+int mynah_backend_kv_vmm_resize(const mynah_backend *backend, void *dev_ptr,
+                                size_t want, size_t *mapped, char *error,
+                                size_t error_capacity);
+void mynah_backend_kv_vmm_free(const mynah_backend *backend, void *dev_ptr);
 int mynah_backend_scale_dev(const mynah_backend *backend, float *dev_data,
                             size_t n, float scale,
                             char *error, size_t error_capacity);
