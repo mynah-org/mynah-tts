@@ -697,3 +697,13 @@ To verify on the L4 before merging (not compiled here, no nvcc):
 3. One knee with no flag exported (defaults only) at C208/C256 must reproduce the C arm (0.607 / 0.714); the 14:35
    C arm ran `PREFILL_FIXED=0` (cuBLAS prefill), the defaults run the bf16 tensor-core fixed-order prefill.
 4. With every flag `=0` and `MYNAH_CUDA_QUANT=f32`, md5-identical to main 5ae4fd2 defaults (same seeded requests).
+
+### 2026-10-02 15:40 CEST — beyond C256
+- Prefill A/B on the C config (max-batch 256): fixed-order bf16 tile 0.615 / 0.692 / 0.735 at C208/C240/C256
+  (self-check PASS) vs cuBLAS bf16 0.606 / 0.677 / 0.715 (long-form self-check FAIL). Fixed order chosen as the
+  default (2-3 % slower; tuning item: bigger tiles, cp.async pipeline).
+- `--max-batch 320` fails even at C256 (OOM in the step), with or without KV_VMM, with or without the slot-pool
+  prefill: start-up already holds ~70 MB per concurrent request (17.9 GB at 256), of which only ~27-38 MB is KV.
+  KV_VMM alone does not move the ceiling. Next lever: per-request device memory (branch pocket-cuda-rowmem).
+- Robustness item: after an OOM the server degrades (stream RTF p95 30+, ONE_SYNC disabled, rows failing) instead
+  of refusing work. Admission should account for free device memory and answer 503 before a step can fail.
