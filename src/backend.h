@@ -495,6 +495,11 @@ typedef struct {
      * skip[r] == 0 is the plain layout and its prefix entries are ignored. */
     const size_t *skip;         /* [rows] or NULL                         */
     void *const *prefix;        /* [rows * layers] device, or NULL        */
+    /* MYNAH_CUDA_KV_VMM (position-major rows): per row the pair
+     * (pitch, voff) in elements: slot s of layer l's K is at kv[r * layers +
+     * l] + s * pitch and of its V at kv[...] + voff + s * pitch. NULL = the
+     * plain layout above, (dim, ring_r * dim) for every row. CUDA only. */
+    const size_t *kv_strides;   /* [rows * 2] or NULL                     */
 } mynah_backend_tile_desc;
 /* 1 when a row's result cannot depend on the other rows of a batched call
  * (every kernel reduces in a fixed order). 0 when the backend runs cuBLAS
@@ -654,6 +659,36 @@ int mynah_backend_copy_dev(const mynah_backend *backend, float *dev_dst,
 int mynah_backend_copy_dev_bytes(const mynah_backend *backend, void *dev_dst,
                                  const void *dev_src, size_t bytes,
                                  char *error, size_t error_capacity);
+/* Strided device-to-device bytes: `rows` rows of `width` bytes, row r from
+ * dev_src + r * src_pitch to dev_dst + r * dst_pitch. Asynchronous; returns
+ * 1 when the backend has no such copy (nothing queued). */
+int mynah_backend_copy_dev_bytes_2d(const mynah_backend *backend,
+                                    void *dev_dst, size_t dst_pitch,
+                                    const void *dev_src, size_t src_pitch,
+                                    size_t width, size_t rows, char *error,
+                                    size_t error_capacity);
+/* MYNAH_CUDA_KV_VMM: growable device buffers on the CUDA virtual memory
+ * management API (CUDA only).  A buffer is a virtual reservation of
+ * `reserve` bytes whose first `mapped` bytes are backed by device memory; it
+ * grows by mapping more pages after the mapped ones, so its address never
+ * changes and nothing is copied.  Sizes are rounded up to the allocation
+ * granularity.  `probe` returns 0 and the granularity when the path is
+ * usable, -1 and the reason otherwise (no driver entry points, device
+ * without VMM support).  `resize` maps up to `want` bytes, or unmaps whole
+ * trailing chunks while the rest still covers `want`; it must not run inside
+ * a stream capture, and shrinking (like `free`) requires that no queued work
+ * still uses the pages.  mynah_backend_dev_free also releases such a buffer
+ * correctly. */
+int mynah_backend_kv_vmm_probe(const mynah_backend *backend,
+                               size_t *granularity, char *error,
+                               size_t error_capacity);
+int mynah_backend_kv_vmm_alloc(const mynah_backend *backend, size_t reserve,
+                               size_t map, void **dev_ptr, size_t *mapped,
+                               char *error, size_t error_capacity);
+int mynah_backend_kv_vmm_resize(const mynah_backend *backend, void *dev_ptr,
+                                size_t want, size_t *mapped, char *error,
+                                size_t error_capacity);
+void mynah_backend_kv_vmm_free(const mynah_backend *backend, void *dev_ptr);
 int mynah_backend_scale_dev(const mynah_backend *backend, float *dev_data,
                             size_t n, float scale,
                             char *error, size_t error_capacity);

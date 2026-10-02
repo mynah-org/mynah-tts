@@ -2,6 +2,10 @@
 #include "costmap.h"
 
 #include <cublas_v2.h>
+/* Driver API TYPES only (MYNAH_CUDA_KV_VMM): the functions are resolved at
+ * run time through cudaGetDriverEntryPoint, so nothing links libcuda and a
+ * host without a driver still loads the binary. */
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -15,7 +19,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <mutex>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 /*
@@ -1253,6 +1259,73 @@ struct cuda_codec_gang_workspace {
     size_t pcm_cap = 0u; /* floats */
 };
 
+/* MYNAH_CUDA_KV_VMM: growable device ranges built with the CUDA virtual
+ * memory management API.  A range is one virtual address reservation
+ * (cuMemAddressReserve) whose prefix [0, mapped) is backed by device memory
+ * (cuMemCreate, CU_MEM_LOCATION_TYPE_DEVICE: VRAM, never host memory) in
+ * chunks, each its own cuMemCreate + cuMemMap, so the tail can be unmapped
+ * chunk by chunk.  Growing maps a new chunk right after the last one: the
+ * base pointer never moves and nothing is copied. */
+typedef CUresult (*cuda_pfn_cuDeviceGet)(CUdevice *, int);
+typedef CUresult (*cuda_pfn_cuDeviceGetAttribute)(int *, CUdevice_attribute,
+                                                  CUdevice);
+typedef CUresult (*cuda_pfn_cuMemGetAllocationGranularity)(
+    size_t *, const CUmemAllocationProp *, CUmemAllocationGranularity_flags);
+typedef CUresult (*cuda_pfn_cuMemAddressReserve)(CUdeviceptr *, size_t, size_t,
+                                                 CUdeviceptr, unsigned long long);
+typedef CUresult (*cuda_pfn_cuMemAddressFree)(CUdeviceptr, size_t);
+typedef CUresult (*cuda_pfn_cuMemCreate)(CUmemGenericAllocationHandle *, size_t,
+                                         const CUmemAllocationProp *,
+                                         unsigned long long);
+typedef CUresult (*cuda_pfn_cuMemRelease)(CUmemGenericAllocationHandle);
+typedef CUresult (*cuda_pfn_cuMemMap)(CUdeviceptr, size_t, size_t,
+                                      CUmemGenericAllocationHandle,
+                                      unsigned long long);
+typedef CUresult (*cuda_pfn_cuMemUnmap)(CUdeviceptr, size_t);
+typedef CUresult (*cuda_pfn_cuMemSetAccess)(CUdeviceptr, size_t,
+                                            const CUmemAccessDesc *, size_t);
+typedef CUresult (*cuda_pfn_cuGetErrorString)(CUresult, const char **);
+
+struct cuda_kv_vmm_chunk {
+    CUmemGenericAllocationHandle handle;
+    size_t offset; /* bytes from the range base */
+    size_t bytes;
+};
+
+struct cuda_kv_vmm_range {
+    size_t reserved = 0u; /* virtual bytes */
+    size_t mapped = 0u;   /* physical bytes behind [0, mapped) */
+    std::vector<cuda_kv_vmm_chunk> chunks;
+};
+
+struct cuda_kv_vmm {
+    std::mutex mutex;
+    int status = 0; /* 0 not probed, 1 usable, -1 unsupported */
+    char reason[192] = {0};
+    int device = 0;
+    size_t granularity = 0u;
+    CUmemAllocationProp prop{};
+    CUmemAccessDesc access{};
+    cuda_pfn_cuDeviceGet DeviceGet = nullptr;
+    cuda_pfn_cuDeviceGetAttribute DeviceGetAttribute = nullptr;
+    cuda_pfn_cuMemGetAllocationGranularity MemGetAllocationGranularity = nullptr;
+    cuda_pfn_cuMemAddressReserve MemAddressReserve = nullptr;
+    cuda_pfn_cuMemAddressFree MemAddressFree = nullptr;
+    cuda_pfn_cuMemCreate MemCreate = nullptr;
+    cuda_pfn_cuMemRelease MemRelease = nullptr;
+    cuda_pfn_cuMemMap MemMap = nullptr;
+    cuda_pfn_cuMemUnmap MemUnmap = nullptr;
+    cuda_pfn_cuMemSetAccess MemSetAccess = nullptr;
+    cuda_pfn_cuGetErrorString GetErrorString = nullptr;
+    std::unordered_map<uintptr_t, cuda_kv_vmm_range> ranges;
+    /* Live ranges, read without the lock by mynah_cuda_dev_free. */
+    std::atomic<size_t> live{0u};
+    std::atomic<unsigned long long> mapped_bytes{0ull};
+    std::atomic<unsigned long long> reserved_bytes{0ull};
+    std::atomic<unsigned long long> maps{0ull};
+    std::atomic<unsigned long long> unmaps{0ull};
+};
+
 struct cuda_backend_state {
     cublasHandle_t cublas;
     cudaStream_t stream;
@@ -1368,6 +1441,7 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> bf16_weight_bytes;
     bool q8_enabled;
     bool decoder_batch_enabled;
+    cuda_kv_vmm kv_vmm;
 };
 
 enum cuda_decoder_op_kind {
@@ -2338,6 +2412,23 @@ extern "C" int mynah_cuda_copy_dev_bytes(void *opaque, void *dst,
                               st->stream), e, ec);
 }
 
+/* Strided device-to-device copy of `rows` rows of `width` bytes: row r goes
+ * from src + r * src_pitch to dst + r * dst_pitch. Stream-ordered. */
+extern "C" int mynah_cuda_copy_dev_bytes_2d(void *opaque, void *dst,
+                                            size_t dst_pitch, const void *src,
+                                            size_t src_pitch, size_t width,
+                                            size_t rows, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dst == nullptr || src == nullptr ||
+        dst_pitch < width || src_pitch < width) {
+        set_error(e, ec, "invalid CUDA strided byte copy");
+        return -1;
+    }
+    if (width == 0u || rows == 0u) return 0;
+    return ce(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, width, rows,
+                                cudaMemcpyDeviceToDevice, st->stream), e, ec);
+}
+
 extern "C" int mynah_cuda_scale_dev(void *opaque, float *data, size_t n,
                                      float scale, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
@@ -3009,6 +3100,7 @@ static int cuda_bf16_fuse_self_test(cuda_backend_state *st, char *e,
                                     size_t ec);
 static int cuda_attn_split_self_test(cuda_backend_state *st, char *e,
                                      size_t ec);
+static int cuda_kv_vmm_self_test(cuda_backend_state *st, char *e, size_t ec);
 
 static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float in[6]={1,2,3,-1,0.5f,2};
@@ -3034,7 +3126,358 @@ static int cuda_self_test(void *opaque, char *e, size_t ec) {
     if (cuda_attn_split_self_test(static_cast<cuda_backend_state *>(opaque),
                                   e, ec) != 0)
         return -1;
+    if (cuda_kv_vmm_self_test(static_cast<cuda_backend_state *>(opaque), e,
+                              ec) != 0)
+        return -1;
     return cuda_q8_self_test(opaque, e, ec);
+}
+
+/* ------------------------------------------------ MYNAH_CUDA_KV_VMM
+ *
+ * Driver entry points through the runtime (no -lcuda): the runtime already
+ * loaded the driver, and a binary built here must still start on a host
+ * without one (the compile-only CI runs --gpu-self-test with no driver). */
+static void *cuda_driver_symbol(const char *name) {
+    void *fn = nullptr;
+    cudaError_t rc = cudaSuccess;
+#if CUDART_VERSION >= 12050
+    cudaDriverEntryPointQueryResult query = cudaDriverEntryPointSymbolNotFound;
+    rc = cudaGetDriverEntryPointByVersion(name, &fn, 12000u, cudaEnableDefault,
+                                          &query);
+    if (query != cudaDriverEntryPointSuccess) fn = nullptr;
+#elif CUDART_VERSION >= 12000
+    cudaDriverEntryPointQueryResult query = cudaDriverEntryPointSymbolNotFound;
+    rc = cudaGetDriverEntryPoint(name, &fn, cudaEnableDefault, &query);
+    if (query != cudaDriverEntryPointSuccess) fn = nullptr;
+#elif CUDART_VERSION >= 11030
+    rc = cudaGetDriverEntryPoint(name, &fn, cudaEnableDefault);
+#else
+    (void)name;
+#endif
+    if (rc != cudaSuccess) {
+        fn = nullptr;
+        /* A failed lookup must not surface later as a kernel launch error. */
+        (void)cudaGetLastError();
+    }
+    return fn;
+}
+
+static int cuda_vmm_check(const cuda_kv_vmm &v, CUresult r, const char *what,
+                          char *e, size_t ec) {
+    if (r == CUDA_SUCCESS) return 0;
+    const char *text = nullptr;
+    if (v.GetErrorString == nullptr || v.GetErrorString(r, &text) != CUDA_SUCCESS ||
+        text == nullptr)
+        text = "unknown driver error";
+    if (e != nullptr && ec > 0u)
+        std::snprintf(e, ec, "CUDA VMM %s: %s (%d)", what, text, (int)r);
+    return -1;
+}
+
+/* Resolve the entry points and the device's support once. Caller holds
+ * v.mutex. */
+static int cuda_kv_vmm_probe_locked(cuda_kv_vmm &v) {
+    if (v.status != 0) return v.status > 0 ? 0 : -1;
+    v.status = -1;
+#define CUDA_VMM_SYMBOL(field, name)                                       \
+    v.field = reinterpret_cast<cuda_pfn_##name>(cuda_driver_symbol(#name)); \
+    if (v.field == nullptr) {                                              \
+        std::snprintf(v.reason, sizeof(v.reason),                          \
+                      "the CUDA driver does not expose %s", #name);        \
+        return -1;                                                         \
+    }
+    CUDA_VMM_SYMBOL(GetErrorString, cuGetErrorString)
+    CUDA_VMM_SYMBOL(DeviceGet, cuDeviceGet)
+    CUDA_VMM_SYMBOL(DeviceGetAttribute, cuDeviceGetAttribute)
+    CUDA_VMM_SYMBOL(MemGetAllocationGranularity, cuMemGetAllocationGranularity)
+    CUDA_VMM_SYMBOL(MemAddressReserve, cuMemAddressReserve)
+    CUDA_VMM_SYMBOL(MemAddressFree, cuMemAddressFree)
+    CUDA_VMM_SYMBOL(MemCreate, cuMemCreate)
+    CUDA_VMM_SYMBOL(MemRelease, cuMemRelease)
+    CUDA_VMM_SYMBOL(MemMap, cuMemMap)
+    CUDA_VMM_SYMBOL(MemUnmap, cuMemUnmap)
+    CUDA_VMM_SYMBOL(MemSetAccess, cuMemSetAccess)
+#undef CUDA_VMM_SYMBOL
+    int ordinal = 0;
+    if (cudaGetDevice(&ordinal) != cudaSuccess) {
+        (void)cudaGetLastError();
+        std::snprintf(v.reason, sizeof(v.reason), "no current CUDA device");
+        return -1;
+    }
+    CUdevice device = 0;
+    int supported = 0;
+    char detail[160];
+    detail[0] = '\0';
+    if (cuda_vmm_check(v, v.DeviceGet(&device, ordinal), "cuDeviceGet", detail,
+                       sizeof(detail)) ||
+        cuda_vmm_check(v,
+                       v.DeviceGetAttribute(
+                           &supported,
+                           CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                           device),
+                       "cuDeviceGetAttribute", detail, sizeof(detail))) {
+        std::snprintf(v.reason, sizeof(v.reason), "%s", detail);
+        return -1;
+    }
+    if (!supported) {
+        std::snprintf(v.reason, sizeof(v.reason),
+                      "the device does not support virtual memory management");
+        return -1;
+    }
+    std::memset(&v.prop, 0, sizeof(v.prop));
+    v.prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    v.prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; /* VRAM */
+    v.prop.location.id = device;
+    size_t granularity = 0u;
+    if (cuda_vmm_check(v,
+                       v.MemGetAllocationGranularity(
+                           &granularity, &v.prop,
+                           CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                       "cuMemGetAllocationGranularity", detail,
+                       sizeof(detail)) ||
+        granularity == 0u) {
+        std::snprintf(v.reason, sizeof(v.reason), "%s",
+                      detail[0] != '\0' ? detail : "zero allocation granularity");
+        return -1;
+    }
+    std::memset(&v.access, 0, sizeof(v.access));
+    v.access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    v.access.location.id = device;
+    v.access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    v.device = ordinal;
+    v.granularity = granularity;
+    v.status = 1;
+    return 0;
+}
+
+static size_t cuda_round_up(size_t value, size_t unit, bool *ok) {
+    if (unit == 0u || value > SIZE_MAX - (unit - 1u)) {
+        *ok = false;
+        return 0u;
+    }
+    return (value + unit - 1u) / unit * unit;
+}
+
+/* Back [range.mapped, range.mapped + bytes) with one new device chunk.
+ * Caller holds v.mutex; on failure nothing changed. */
+static int cuda_kv_vmm_map_locked(cuda_kv_vmm &v, CUdeviceptr base,
+                                  cuda_kv_vmm_range &range, size_t bytes,
+                                  char *e, size_t ec) {
+    CUmemGenericAllocationHandle handle = 0;
+    const CUdeviceptr at = base + (CUdeviceptr)range.mapped;
+    if (cuda_vmm_check(v, v.MemCreate(&handle, bytes, &v.prop, 0ull),
+                       "cuMemCreate", e, ec))
+        return -1;
+    if (cuda_vmm_check(v, v.MemMap(at, bytes, 0u, handle, 0ull), "cuMemMap", e,
+                       ec)) {
+        (void)v.MemRelease(handle);
+        return -1;
+    }
+    if (cuda_vmm_check(v, v.MemSetAccess(at, bytes, &v.access, 1u),
+                       "cuMemSetAccess", e, ec)) {
+        (void)v.MemUnmap(at, bytes);
+        (void)v.MemRelease(handle);
+        return -1;
+    }
+    try {
+        range.chunks.push_back(cuda_kv_vmm_chunk{handle, range.mapped, bytes});
+    } catch (...) {
+        (void)v.MemUnmap(at, bytes);
+        (void)v.MemRelease(handle);
+        set_error(e, ec, "out of host memory for a CUDA VMM chunk");
+        return -1;
+    }
+    range.mapped += bytes;
+    v.mapped_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
+    v.maps.fetch_add(1ull, std::memory_order_relaxed);
+    return 0;
+}
+
+/* Unmap and release the last chunk. Caller holds v.mutex. cuMemUnmap may
+ * synchronize the device; callers only shrink idle ranges. */
+static void cuda_kv_vmm_unmap_last_locked(cuda_kv_vmm &v, CUdeviceptr base,
+                                          cuda_kv_vmm_range &range) {
+    const cuda_kv_vmm_chunk chunk = range.chunks.back();
+    range.chunks.pop_back();
+    (void)v.MemUnmap(base + (CUdeviceptr)chunk.offset, chunk.bytes);
+    (void)v.MemRelease(chunk.handle);
+    range.mapped = chunk.offset;
+    v.mapped_bytes.fetch_sub((unsigned long long)chunk.bytes,
+                             std::memory_order_relaxed);
+    v.unmaps.fetch_add(1ull, std::memory_order_relaxed);
+}
+
+static void cuda_kv_vmm_destroy_locked(cuda_kv_vmm &v, CUdeviceptr base,
+                                       cuda_kv_vmm_range &range) {
+    while (!range.chunks.empty()) cuda_kv_vmm_unmap_last_locked(v, base, range);
+    (void)v.MemAddressFree(base, range.reserved);
+    v.reserved_bytes.fetch_sub((unsigned long long)range.reserved,
+                               std::memory_order_relaxed);
+}
+
+/* 0 and the granularity when the VMM path is usable; -1 and the reason
+ * otherwise. Probes once per backend. */
+extern "C" int mynah_cuda_kv_vmm_probe(void *opaque, size_t *granularity,
+                                        char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) {
+        set_error(e, ec, "no CUDA backend");
+        return -1;
+    }
+    cuda_kv_vmm &v = st->kv_vmm;
+    std::lock_guard<std::mutex> lock(v.mutex);
+    if (cuda_kv_vmm_probe_locked(v) != 0) {
+        set_error(e, ec, v.reason[0] != '\0' ? v.reason : "CUDA VMM unavailable");
+        return -1;
+    }
+    if (granularity != nullptr) *granularity = v.granularity;
+    return 0;
+}
+
+/* Reserve `reserve` virtual bytes and map the first `map` of them (both
+ * rounded up to the granularity; `map` may be 0). */
+extern "C" int mynah_cuda_kv_vmm_alloc(void *opaque, size_t reserve,
+                                        size_t map, void **dev_ptr,
+                                        size_t *mapped, char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dev_ptr == nullptr || reserve == 0u || map > reserve) {
+        set_error(e, ec, "invalid CUDA VMM allocation");
+        return -1;
+    }
+    *dev_ptr = nullptr;
+    if (mapped != nullptr) *mapped = 0u;
+    cuda_kv_vmm &v = st->kv_vmm;
+    std::lock_guard<std::mutex> lock(v.mutex);
+    if (cuda_kv_vmm_probe_locked(v) != 0) {
+        set_error(e, ec, v.reason);
+        return -1;
+    }
+    bool ok = true;
+    const size_t reserve_bytes = cuda_round_up(reserve, v.granularity, &ok);
+    const size_t map_bytes = map == 0u ? 0u : cuda_round_up(map, v.granularity, &ok);
+    if (!ok || map_bytes > reserve_bytes) {
+        set_error(e, ec, "CUDA VMM allocation size overflow");
+        return -1;
+    }
+    /* Driver calls need the runtime's primary context current here. */
+    if (ce(cudaSetDevice(v.device), e, ec)) return -1;
+    CUdeviceptr base = 0;
+    if (cuda_vmm_check(v, v.MemAddressReserve(&base, reserve_bytes,
+                                              v.granularity, 0, 0ull),
+                       "cuMemAddressReserve", e, ec))
+        return -1;
+    v.reserved_bytes.fetch_add((unsigned long long)reserve_bytes,
+                               std::memory_order_relaxed);
+    cuda_kv_vmm_range *range = nullptr;
+    try {
+        range = &v.ranges[(uintptr_t)base];
+        range->chunks.reserve(8u);
+    } catch (...) {
+        if (range != nullptr) v.ranges.erase((uintptr_t)base);
+        (void)v.MemAddressFree(base, reserve_bytes);
+        v.reserved_bytes.fetch_sub((unsigned long long)reserve_bytes,
+                                   std::memory_order_relaxed);
+        set_error(e, ec, "out of host memory for a CUDA VMM range");
+        return -1;
+    }
+    range->reserved = reserve_bytes;
+    if (map_bytes != 0u &&
+        cuda_kv_vmm_map_locked(v, base, *range, map_bytes, e, ec) != 0) {
+        cuda_kv_vmm_destroy_locked(v, base, *range);
+        v.ranges.erase((uintptr_t)base);
+        return -1;
+    }
+    v.live.fetch_add(1u, std::memory_order_relaxed);
+    *dev_ptr = reinterpret_cast<void *>((uintptr_t)base);
+    if (mapped != nullptr) *mapped = map_bytes;
+    return 0;
+}
+
+/* Make the mapped prefix of the range at `dev_ptr` at least `want` bytes
+ * (rounded up to the granularity) by mapping one new chunk, or, when it is
+ * larger than `want`, unmap whole trailing chunks while what stays mapped
+ * still covers `want`. The base never moves and mapped bytes are never
+ * copied. Growth is stream-independent: it only adds pages after the ones in
+ * use, so work already queued on them is unaffected. */
+extern "C" int mynah_cuda_kv_vmm_resize(void *opaque, void *dev_ptr,
+                                         size_t want, size_t *mapped,
+                                         char *e, size_t ec) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dev_ptr == nullptr) {
+        set_error(e, ec, "invalid CUDA VMM resize");
+        return -1;
+    }
+    cuda_kv_vmm &v = st->kv_vmm;
+    std::lock_guard<std::mutex> lock(v.mutex);
+    auto it = v.ranges.find((uintptr_t)dev_ptr);
+    if (it == v.ranges.end()) {
+        set_error(e, ec, "CUDA VMM resize of an unknown range");
+        return -1;
+    }
+    cuda_kv_vmm_range &range = it->second;
+    const CUdeviceptr base = (CUdeviceptr)(uintptr_t)dev_ptr;
+    bool ok = true;
+    const size_t want_bytes = cuda_round_up(want, v.granularity, &ok);
+    if (!ok || want_bytes > range.reserved) {
+        set_error(e, ec, "CUDA VMM resize past the reservation");
+        return -1;
+    }
+    if (want_bytes > range.mapped) {
+        if (ce(cudaSetDevice(v.device), e, ec) ||
+            cuda_kv_vmm_map_locked(v, base, range, want_bytes - range.mapped, e,
+                                   ec) != 0)
+            return -1;
+    } else {
+        while (!range.chunks.empty() &&
+               range.chunks.back().offset >= want_bytes)
+            cuda_kv_vmm_unmap_last_locked(v, base, range);
+    }
+    if (mapped != nullptr) *mapped = range.mapped;
+    return 0;
+}
+
+/* Reserved bytes of the range at `dev_ptr`, 0 when it is not one. */
+extern "C" size_t mynah_cuda_kv_vmm_reserved(void *opaque, const void *dev_ptr) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || dev_ptr == nullptr ||
+        st->kv_vmm.live.load(std::memory_order_relaxed) == 0u)
+        return 0u;
+    std::lock_guard<std::mutex> lock(st->kv_vmm.mutex);
+    auto it = st->kv_vmm.ranges.find((uintptr_t)dev_ptr);
+    return it == st->kv_vmm.ranges.end() ? 0u : it->second.reserved;
+}
+
+/* Unmap, release and unreserve. Nothing queued may still use the range
+ * (callers drain first, as for cudaFree). Returns 1 when `dev_ptr` is not a
+ * VMM range (nothing done). */
+static int cuda_kv_vmm_free(cuda_backend_state *st, void *dev_ptr) {
+    if (st == nullptr || dev_ptr == nullptr ||
+        st->kv_vmm.live.load(std::memory_order_relaxed) == 0u)
+        return 1;
+    cuda_kv_vmm &v = st->kv_vmm;
+    std::lock_guard<std::mutex> lock(v.mutex);
+    auto it = v.ranges.find((uintptr_t)dev_ptr);
+    if (it == v.ranges.end()) return 1;
+    (void)cudaSetDevice(v.device);
+    cuda_kv_vmm_destroy_locked(v, (CUdeviceptr)(uintptr_t)dev_ptr, it->second);
+    v.ranges.erase(it);
+    v.live.fetch_sub(1u, std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" void mynah_cuda_kv_vmm_free(void *opaque, void *dev_ptr) {
+    (void)cuda_kv_vmm_free(static_cast<cuda_backend_state *>(opaque), dev_ptr);
+}
+
+static void cuda_kv_vmm_release_all(cuda_backend_state *st) {
+    cuda_kv_vmm &v = st->kv_vmm;
+    std::lock_guard<std::mutex> lock(v.mutex);
+    if (v.ranges.empty()) return;
+    (void)cudaSetDevice(v.device);
+    for (auto &entry : v.ranges)
+        cuda_kv_vmm_destroy_locked(v, (CUdeviceptr)entry.first, entry.second);
+    v.ranges.clear();
+    v.live.store(0u, std::memory_order_relaxed);
 }
 
 static void cuda_close(void *opaque) {
@@ -3047,6 +3490,7 @@ static void cuda_close(void *opaque) {
     destroy_decoder_batch_graphs(st);
     destroy_graphs(st);
     tile_release(st);
+    cuda_kv_vmm_release_all(st);
     cudaFree(st->dec_cols);
     cudaFree(st->dec_out);
     cudaFree(st->dec_tr_x);
@@ -3328,6 +3772,14 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         metrics->device_memory_bytes = (unsigned long long)total_bytes;
         metrics->device_memory_free_bytes = (unsigned long long)free_bytes;
     }
+    metrics->kv_vmm_rows =
+        (unsigned long long)st->kv_vmm.live.load(std::memory_order_relaxed);
+    metrics->kv_vmm_mapped_bytes =
+        st->kv_vmm.mapped_bytes.load(std::memory_order_relaxed);
+    metrics->kv_vmm_reserved_bytes =
+        st->kv_vmm.reserved_bytes.load(std::memory_order_relaxed);
+    metrics->kv_vmm_maps = st->kv_vmm.maps.load(std::memory_order_relaxed);
+    metrics->kv_vmm_unmaps = st->kv_vmm.unmaps.load(std::memory_order_relaxed);
     metrics->graphs_enabled = st->graphs_enabled ? 1u : 0u;
     metrics->fast_math_enabled = st->fast_math ? 1u : 0u;
     metrics->decoder_batch_enabled = st->decoder_batch_enabled ? 1u : 0u;
@@ -3357,8 +3809,12 @@ extern "C" int mynah_cuda_dev_alloc_bytes(void *opaque, size_t bytes,
 }
 
 extern "C" void mynah_cuda_dev_free(void *opaque, float *dev_ptr) {
-    (void)opaque;
-    if (dev_ptr) cudaFree(dev_ptr);
+    if (dev_ptr == nullptr) return;
+    /* A MYNAH_CUDA_KV_VMM range is not a cudaMalloc pointer; route it to its
+     * own release (no lookup at all while no range is live). */
+    if (cuda_kv_vmm_free(static_cast<cuda_backend_state *>(opaque), dev_ptr) == 0)
+        return;
+    cudaFree(dev_ptr);
 }
 
 extern "C" int mynah_cuda_host_alloc(void *opaque, size_t n, float **host_ptr,
@@ -7744,13 +8200,17 @@ __device__ static inline void tile_kv_store(uint16_t *p, float v) {
  * skip[r] positions, the slot is (absolute - skip) % ring and `ring` counts
  * the stored slots. The host refuses a start below the skip, so nothing is
  * written there. PREFIX=false is the plain layout, the same code as before. */
+/* `strides` (MYNAH_CUDA_KV_VMM, desc.kv_strides): per row, elements between
+ * consecutive slots and from the K slot to the V slot. NULL = the plain
+ * layout (dim, ring * dim), the arithmetic this kernel always did. */
 template <typename KV, bool PREFIX>
 __global__ static void k_tile_rope_store(float *qkv, void *const *kv,
                                          const long long *start,
                                          const int2 *rowmap, int layer,
                                          int layers, int heads, int head_width,
                                          const long long *rings, float max_period,
-                                         const long long *skips) {
+                                         const long long *skips,
+                                         const long long *strides) {
     const int m = (int)blockIdx.x;
     const int2 rt = rowmap[m];
     const long long ring = rings[rt.x];
@@ -7761,8 +8221,11 @@ __global__ static void k_tile_rope_store(float *qkv, void *const *kv,
     const int dim = heads * head_width;
     float *row = qkv + (size_t)m * 3u * (size_t)dim;
     KV *kbase = static_cast<KV *>(kv[(size_t)rt.x * layers + layer]);
-    KV *kslot = kbase + (size_t)slot * dim;
-    KV *vslot = kbase + (size_t)ring * dim + (size_t)slot * dim;
+    const size_t pitch = strides != nullptr ? (size_t)strides[2 * rt.x] : (size_t)dim;
+    const size_t voff = strides != nullptr ? (size_t)strides[2 * rt.x + 1]
+                                           : (size_t)ring * dim;
+    KV *kslot = kbase + (size_t)slot * pitch;
+    KV *vslot = kbase + voff + (size_t)slot * pitch;
     const float slope = (float)(-log((double)max_period) * 2.0 /
                                 (double)head_width);
     for (int pair = (int)threadIdx.x; pair < heads * half;
@@ -7802,7 +8265,8 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
                                         long long context, const long long *rings,
                                         int window_cap, float scale, float *out,
                                         int rows_total, const long long *skips,
-                                        void *const *prefix) {
+                                        void *const *prefix,
+                                        const long long *strides) {
     extern __shared__ float tile_scores[];
     const int lane = (int)threadIdx.x & 31;
     const int warp = (int)threadIdx.x >> 5;
@@ -7821,7 +8285,9 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
     float *scores = tile_scores + (size_t)warp * window_cap;
     const float *q = qkv + (size_t)m * 3u * dim + (size_t)h * head_width;
     const KV *kbase = static_cast<const KV *>(kv[(size_t)rt.x * layers + layer]);
-    const KV *vbase = kbase + (size_t)ring * dim;
+    const size_t pitch = strides != nullptr ? (size_t)strides[2 * rt.x] : (size_t)dim;
+    const KV *vbase = kbase + (strides != nullptr ? (size_t)strides[2 * rt.x + 1]
+                                                  : (size_t)ring * dim);
     const long long skip = PREFIX ? skips[rt.x] : 0;
     const KV *pkbase = PREFIX && skip > 0
         ? static_cast<const KV *>(prefix[(size_t)rt.x * layers + layer]) : nullptr;
@@ -7831,7 +8297,7 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
         const long long p = first + s;
         const KV *k = (PREFIX && p < skip)
             ? pkbase + (size_t)p * dim + (size_t)h * head_width
-            : kbase + (size_t)((p - skip) % ring) * dim + (size_t)h * head_width;
+            : kbase + (size_t)((p - skip) % ring) * pitch + (size_t)h * head_width;
         float dot = 0.0f;
         for (int d = 0; d < head_width; ++d)
             dot = fmaf(q[d], tile_kv_load(k + d), dot);
@@ -7857,7 +8323,7 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
             const long long p = first + s;
             const KV *v = (PREFIX && p < skip)
                 ? pvbase + (size_t)p * dim + (size_t)h * head_width
-                : vbase + (size_t)((p - skip) % ring) * dim + (size_t)h * head_width;
+                : vbase + (size_t)((p - skip) % ring) * pitch + (size_t)h * head_width;
             acc = fmaf(scores[s], tile_kv_load(v + d), acc);
         }
         out[(size_t)m * dim + (size_t)h * head_width + d] = acc * inv;
@@ -7880,7 +8346,8 @@ __global__ static void k_tile_attention_grouped(
     const float *qkv, void *const *kv, const long long *start,
     const int2 *rowmap, const int2 *groups, int layer, int layers, int heads,
     int head_width, long long context, const long long *rings, float scale,
-    float *out, const long long *skips, void *const *prefix) {
+    float *out, const long long *skips, void *const *prefix,
+    const long long *strides) {
     __shared__ float ks[TILE_ATTN_CH][TILE_ATTN_HW + 1];
     __shared__ float vs[TILE_ATTN_CH][TILE_ATTN_HW];
     __shared__ float qs[TILE_ATTN_Q][TILE_ATTN_HW];
@@ -7896,7 +8363,9 @@ __global__ static void k_tile_attention_grouped(
     const long long abs_last = abs0 + group.y - 1;
     const long long lo = (context > 0 && abs0 + 1 > context) ? abs0 + 1 - context : 0;
     const KV *kbase = static_cast<const KV *>(kv[(size_t)r * layers + layer]);
-    const KV *vbase = kbase + (size_t)ring * dim;
+    const size_t pitch = strides != nullptr ? (size_t)strides[2 * r] : (size_t)dim;
+    const KV *vbase = kbase + (strides != nullptr ? (size_t)strides[2 * r + 1]
+                                                  : (size_t)ring * dim);
     const long long skip = PREFIX ? skips[r] : 0;
     const KV *pkbase = PREFIX && skip > 0
         ? static_cast<const KV *>(prefix[(size_t)r * layers + layer]) : nullptr;
@@ -7924,7 +8393,7 @@ __global__ static void k_tile_attention_grouped(
                 kval = tile_kv_load(pkbase + at);
                 vval = tile_kv_load(pvbase + at);
             } else if (p <= abs_last) {
-                const size_t slot = (size_t)((p - skip) % ring) * dim +
+                const size_t slot = (size_t)((p - skip) % ring) * pitch +
                                     (size_t)h * head_width + d;
                 kval = tile_kv_load(kbase + slot);
                 vval = tile_kv_load(vbase + slot);
@@ -7985,20 +8454,21 @@ static void tile_attention_layer(cuda_backend_state *st, float *qkv,
                                  unsigned blocks, int warps_per_block,
                                  size_t smem, int window, float scale,
                                  float *att, const long long *skips,
-                                 void *const *prefix) {
+                                 void *const *prefix,
+                                 const long long *strides) {
     k_tile_rope_store<KV, PREFIX><<<(int)M, 256, 0, st->stream>>>(
         qkv, kv, start, rowmap, layer, layers, heads, head_width, rings,
-        max_period, skips);
+        max_period, skips, strides);
     if (use_grouped)
         k_tile_attention_grouped<KV, PREFIX><<<group_grid, TILE_ATTN_Q * 32, 0,
                                                st->stream>>>(
             qkv, kv, start, rowmap, groups, layer, layers, heads, head_width,
-            context, rings, scale, att, skips, prefix);
+            context, rings, scale, att, skips, prefix, strides);
     else
         k_tile_attention<KV, PREFIX><<<blocks, warps_per_block * 32, smem,
                                        st->stream>>>(
             qkv, kv, start, rowmap, layer, layers, heads, head_width, context,
-            rings, window, scale, att, (int)M, skips, prefix);
+            rings, window, scale, att, (int)M, skips, prefix, strides);
 }
 
 static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
@@ -8659,6 +9129,19 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
             set_error(e, ec, "CUDA tile position exceeds the cache");
             return -1;
         }
+        if (d->kv_strides != nullptr) {
+            /* MYNAH_CUDA_KV_VMM: slot s of K at s * pitch, of V at voff +
+             * s * pitch; the two must not overlap within one slot. */
+            const size_t pitch = d->kv_strides[2u * r];
+            const size_t voff = d->kv_strides[2u * r + 1u];
+            if (pitch < d->dim || pitch > (size_t)LLONG_MAX ||
+                voff > (size_t)LLONG_MAX ||
+                !((voff >= d->dim && voff <= pitch - d->dim) ||
+                  (ring <= (size_t)LLONG_MAX / pitch && voff >= ring * pitch))) {
+                set_error(e, ec, "invalid CUDA tile cache stride");
+                return -1;
+            }
+        }
         const size_t w = d->context != 0u && end > d->context ? d->context : end;
         if (w > window) window = w;
         M += n;
@@ -8680,8 +9163,12 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
      * the layout is the one it always was. */
     const size_t prefix_count = prefixed ? kv_count : 0u;
     const size_t skip_count = prefixed ? d->rows : 0u;
+    /* MYNAH_CUDA_KV_VMM: per-row (pitch, V offset) pairs after the skips;
+     * absent (and the layout unchanged) without kv_strides. */
+    const size_t stride_count = d->kv_strides != nullptr ? 2u * d->rows : 0u;
     const size_t meta_bytes = (2u * d->rows + kv_count + prefix_count) * sizeof(void *) +
-                              (2u * d->rows + skip_count) * sizeof(long long) +
+                              (2u * d->rows + skip_count + stride_count) *
+                                  sizeof(long long) +
                               M * sizeof(int2) + group_count * sizeof(int2);
     if (tile_reserve(st, M, d->dim, d->ffn, meta_bytes, e, ec)) return -1;
     cuda_tile_workspace &w = st->tile;
@@ -8696,7 +9183,8 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
     const size_t off_start = off_prefix + prefix_count * sizeof(void *);
     const size_t off_ring = off_start + d->rows * sizeof(long long);
     const size_t off_skip = off_ring + d->rows * sizeof(long long);
-    const size_t off_map = off_skip + skip_count * sizeof(long long);
+    const size_t off_stride = off_skip + skip_count * sizeof(long long);
+    const size_t off_map = off_stride + stride_count * sizeof(long long);
     memcpy(host, d->input, d->rows * sizeof(void *));
     if (d->output != nullptr)
         memcpy(host + off_out, d->output, d->rows * sizeof(void *));
@@ -8713,6 +9201,11 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
                 host_prefix[r * d->layers + l] =
                     d->skip[r] != 0u ? d->prefix[r * d->layers + l] : nullptr;
         }
+    }
+    if (stride_count != 0u) {
+        long long *host_stride = reinterpret_cast<long long *>(host + off_stride);
+        for (size_t i = 0; i < stride_count; ++i)
+            host_stride[i] = (long long)d->kv_strides[i];
     }
     long long *host_start = reinterpret_cast<long long *>(host + off_start);
     long long *host_ring = reinterpret_cast<long long *>(host + off_ring);
@@ -8743,6 +9236,8 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
         prefixed ? reinterpret_cast<void *const *>(dev + off_prefix) : nullptr;
     const long long *d_skip =
         prefixed ? reinterpret_cast<const long long *>(dev + off_skip) : nullptr;
+    const long long *d_stride = stride_count != 0u
+        ? reinterpret_cast<const long long *>(dev + off_stride) : nullptr;
     const int2 *d_map = reinterpret_cast<const int2 *>(dev + off_map);
     const int2 *d_groups = reinterpret_cast<const int2 *>(dev + off_groups);
     static const bool grouped = cuda_env_enabled("MYNAH_CUDA_TILE_ATTN_GROUPED", true);
@@ -8779,14 +9274,14 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
                     (int)d->layers, heads, head_width, (long long)d->context,
                     d_ring, d->max_period, M, use_grouped, group_grid, blocks,
                     warps_per_block, smem, (int)window, scale, w.att, d_skip,
-                    d_prefix);
+                    d_prefix, d_stride);
             else
                 tile_attention_layer<uint16_t, false>(
                     st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
                     (int)d->layers, heads, head_width, (long long)d->context,
                     d_ring, d->max_period, M, use_grouped, group_grid, blocks,
                     warps_per_block, smem, (int)window, scale, w.att, nullptr,
-                    nullptr);
+                    nullptr, d_stride);
         } else {
             if (prefixed)
                 tile_attention_layer<float, true>(
@@ -8794,14 +9289,14 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
                     (int)d->layers, heads, head_width, (long long)d->context,
                     d_ring, d->max_period, M, use_grouped, group_grid, blocks,
                     warps_per_block, smem, (int)window, scale, w.att, d_skip,
-                    d_prefix);
+                    d_prefix, d_stride);
             else
                 tile_attention_layer<float, false>(
                     st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
                     (int)d->layers, heads, head_width, (long long)d->context,
                     d_ring, d->max_period, M, use_grouped, group_grid, blocks,
                     warps_per_block, smem, (int)window, scale, w.att, nullptr,
-                    nullptr);
+                    nullptr, d_stride);
         }
         if (ce(cudaGetLastError(), e, ec)) return -1;
         if (tile_gemm(st, w.att, L->out_proj_weight, L->out_proj_bias, w.proj, M,
@@ -10574,4 +11069,274 @@ extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *
     if (ce(cudaStreamSynchronize(st->stream), e, ec)) return -1;
     std::memcpy(output, st->host_buf + in_n, out_n * sizeof(float));
     return 0;
+}
+
+/* MYNAH_CUDA_KV_VMM self-test, always run by --gpu-self-test when the device
+ * supports virtual memory management (skipped otherwise, flag-independent).
+ * Part 1, the range: a mapped prefix survives growth in place (same base,
+ * old bytes intact, new chunk writable), a trim keeps what is still covered,
+ * a resize past the reservation is refused, and mynah_cuda_dev_free releases
+ * a range. Part 2, the layout: the decode attention kernels (fast, split,
+ * legacy, with shared prefix tables) and the K/V gather give bit-identical
+ * results on a plane-major cache (stride = width) and on the same values laid
+ * out position-major in a VMM range (stride = layers * 2 * width, per-layer
+ * bases inside the position, a row without its prefix biased below its
+ * start), and the new K/V lands on the same values in both. */
+static int cuda_kv_vmm_layout_case(cuda_backend_state *st, char *e, size_t ec) {
+    constexpr int heads = 4, hw = 64, layers = 3, rows = 3;
+    constexpr size_t width = (size_t)heads * hw;
+    constexpr size_t position_elems = (size_t)layers * 2u * width;
+    const size_t positions[rows] = {5u, 130u, 300u};
+    const size_t skip[rows] = {0u, 3u, 0u}; /* row 1 reads [0, 3) from the prefix */
+    const float scale = 0.125f;
+    uint32_t seed = 0x6d2b79f5u;
+    auto uniform = [&](float span) {
+        seed = seed * 1664525u + 1013904223u;
+        return ((float)(seed >> 8) / 16777216.0f - 0.5f) * 2.0f * span;
+    };
+    auto bf16 = [](float v) {
+        uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return (uint16_t)(bits >> 16);
+    };
+    /* Plane-major rows [layer][K|V][cap][width] in one cudaMalloc slab;
+     * position-major rows [cap - skip][layer][K|V][width] in one VMM range,
+     * the row without its prefix first so its biased base points below the
+     * range. The prefix planes [layer][K|V][3][width] follow the plane slab. */
+    size_t cap[rows], plane_off[rows], vmm_off[rows], plane_total = 0u, vmm_total = 0u;
+    const int vmm_order[rows] = {1, 0, 2};
+    for (int r = 0; r < rows; ++r) {
+        cap[r] = positions[r] + 1u;
+        plane_off[r] = plane_total;
+        plane_total += (size_t)layers * 2u * cap[r] * width;
+    }
+    for (int k = 0; k < rows; ++k) {
+        const int r = vmm_order[k];
+        vmm_off[r] = vmm_total;
+        vmm_total += (cap[r] - skip[r]) * position_elems;
+    }
+    const size_t prefix_n = 3u;
+    const size_t prefix_off = plane_total;
+    const size_t slab_total = plane_total + (size_t)layers * 2u * prefix_n * width;
+    std::vector<uint16_t> plane(slab_total), vmm(vmm_total, 0x7fc0u);
+    for (int r = 0; r < rows; ++r)
+        for (int l = 0; l < layers; ++l)
+            for (int kv = 0; kv < 2; ++kv)
+                for (size_t p = 0; p < cap[r]; ++p)
+                    for (size_t d = 0; d < width; ++d) {
+                        const uint16_t x = bf16(uniform(2.0f));
+                        plane[plane_off[r] + (((size_t)l * 2u + kv) * cap[r] + p) * width + d] = x;
+                        if (p >= skip[r])
+                            vmm[vmm_off[r] + (p - skip[r]) * position_elems +
+                                ((size_t)l * 2u + kv) * width + d] = x;
+                        else
+                            plane[prefix_off + (((size_t)l * 2u + kv) * prefix_n + p) * width + d] = x;
+                    }
+    std::vector<float> qkv((size_t)rows * 3u * width);
+    for (auto &x : qkv) x = uniform(3.0f);
+    const size_t out_n = (size_t)rows * width;
+    const size_t gather_n = (size_t)rows * 2u * width;
+    uint16_t *d_plane = nullptr;
+    void *d_vmm = nullptr;
+    float *d_f = nullptr; /* qkv | 6 attention outputs | 2 gathers */
+    void *d_tab = nullptr;
+    size_t mapped = 0u;
+    int result = -1;
+    do {
+        if (mynah_cuda_kv_vmm_alloc(st, vmm_total * sizeof(uint16_t),
+                                    vmm_total * sizeof(uint16_t), &d_vmm,
+                                    &mapped, e, ec) != 0 ||
+            ce(cudaMalloc((void **)&d_plane, slab_total * sizeof(uint16_t)), e, ec) ||
+            ce(cudaMalloc((void **)&d_f, (qkv.size() + 6u * out_n + 2u * gather_n) *
+                                             sizeof(float)), e, ec) ||
+            ce(cudaMalloc(&d_tab, (size_t)rows * 16u * sizeof(void *)), e, ec))
+            break;
+        if (ce(cudaMemcpy(d_plane, plane.data(), slab_total * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(d_vmm, vmm.data(), vmm_total * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(d_f, qkv.data(), qkv.size() * sizeof(float),
+                          cudaMemcpyHostToDevice), e, ec))
+            break;
+        static_assert(sizeof(size_t) == sizeof(void *), "table layout");
+        auto **t = static_cast<const uint16_t **>(d_tab);
+        /* [0] plane K, [1] plane V, [2] vmm K, [3] vmm V, [4] prefix K,
+         * [5] prefix V, [6] positions, [7] plane strides, [8] vmm strides,
+         * [9] prefix lengths; `rows` entries each. */
+        auto *t_pos = reinterpret_cast<size_t *>(t + 6 * rows);
+        auto *t_ps = reinterpret_cast<size_t *>(t + 7 * rows);
+        auto *t_vs = reinterpret_cast<size_t *>(t + 8 * rows);
+        auto *t_pl = reinterpret_cast<size_t *>(t + 9 * rows);
+        float *d_qkv = d_f;
+        float *d_out = d_f + qkv.size();
+        float *d_gather = d_out + 6u * out_n;
+        const uint16_t *vbase = static_cast<const uint16_t *>(d_vmm);
+        result = 0;
+        for (int l = 0; l < layers && result == 0; l += layers - 1) {
+            const uint16_t *h[6][rows];
+            size_t hp[rows], hps[rows], hvs[rows];
+            for (int r = 0; r < rows; ++r) {
+                h[0][r] = d_plane + plane_off[r] + (size_t)l * 2u * cap[r] * width;
+                h[1][r] = h[0][r] + cap[r] * width;
+                /* Biased below the row by its skip (integer arithmetic). */
+                h[2][r] = reinterpret_cast<const uint16_t *>(
+                    (uintptr_t)(vbase + vmm_off[r] + (size_t)l * 2u * width) -
+                    (uintptr_t)(skip[r] * position_elems * sizeof(uint16_t)));
+                h[3][r] = reinterpret_cast<const uint16_t *>(
+                    (uintptr_t)h[2][r] + width * sizeof(uint16_t));
+                h[4][r] = d_plane + prefix_off + (size_t)l * 2u * prefix_n * width;
+                h[5][r] = h[4][r] + prefix_n * width;
+                hp[r] = skip[r];
+                hps[r] = width;
+                hvs[r] = position_elems;
+            }
+            for (int k = 0; k < 6 && result == 0; ++k)
+                if (ce(cudaMemcpy(t + k * rows, h[k], sizeof(h[k]),
+                                  cudaMemcpyHostToDevice), e, ec))
+                    result = -1;
+            if (result != 0 ||
+                ce(cudaMemcpy(t_pos, positions, sizeof(positions), cudaMemcpyHostToDevice), e, ec) ||
+                ce(cudaMemcpy(t_ps, hps, sizeof(hps), cudaMemcpyHostToDevice), e, ec) ||
+                ce(cudaMemcpy(t_vs, hvs, sizeof(hvs), cudaMemcpyHostToDevice), e, ec) ||
+                ce(cudaMemcpy(t_pl, hp, sizeof(hp), cudaMemcpyHostToDevice), e, ec)) {
+                result = -1;
+                break;
+            }
+            const dim3 grid((unsigned)heads, (unsigned)rows, 1u);
+            for (int lay = 0; lay < 2; ++lay) {
+                const uint16_t *const *kc = t + (lay == 0 ? 0 : 2) * rows;
+                const uint16_t *const *vc = t + (lay == 0 ? 1 : 3) * rows;
+                const size_t *str = lay == 0 ? t_ps : t_vs;
+                k_self_attention_bf16_batch_fast<true, false>
+                    <<<grid, CUDA_ATTN_FAST_THREADS, 0, st->stream>>>(
+                    d_qkv, kc, vc, t_pos, str, rows, heads, hw, scale,
+                    d_out + (size_t)lay * out_n, t + 4 * rows, t + 5 * rows,
+                    t_pl, nullptr);
+                k_self_attention_bf16_batch_split<true, false>
+                    <<<grid, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+                    d_qkv, kc, vc, t_pos, str, rows, heads, hw, scale,
+                    d_out + (size_t)(2 + lay) * out_n, t + 4 * rows,
+                    t + 5 * rows, t_pl, nullptr);
+                k_self_attention_bf16_batch<true>
+                    <<<grid, attention_threads((size_t)hw), 0, st->stream>>>(
+                    d_qkv, kc, vc, t_pos, str, rows, heads, hw, scale,
+                    d_out + (size_t)(4 + lay) * out_n, t + 4 * rows,
+                    t + 5 * rows, t_pl);
+                k_gather_kv_bf16_batch<<<(int)((gather_n + 255u) / 256u), 256, 0,
+                                         st->stream>>>(
+                    kc, vc, t_pos, str, rows, width,
+                    d_gather + (size_t)lay * gather_n);
+            }
+            if (ce(cudaGetLastError(), e, ec) ||
+                ce(cudaStreamSynchronize(st->stream), e, ec)) {
+                result = -1;
+                break;
+            }
+            std::vector<float> got(6u * out_n + 2u * gather_n);
+            if (ce(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost), e, ec)) {
+                result = -1;
+                break;
+            }
+            const char *names[3] = {"fast", "split", "legacy"};
+            for (int k = 0; k < 3 && result == 0; ++k) {
+                const float *a = got.data() + (size_t)(2 * k) * out_n;
+                if (std::memcmp(a, a + out_n, out_n * sizeof(float)) != 0) {
+                    std::snprintf(e, ec,
+                                  "KV VMM layout: %s attention differs between "
+                                  "plane-major and position-major (layer %d)",
+                                  names[k], l);
+                    result = -1;
+                }
+                for (size_t i = 0; i < out_n && result == 0; ++i)
+                    if (!std::isfinite(a[i])) {
+                        std::snprintf(e, ec,
+                                      "KV VMM layout: %s attention read an "
+                                      "unwritten slot (layer %d)", names[k], l);
+                        result = -1;
+                    }
+            }
+            const float *g = got.data() + 6u * out_n;
+            if (result == 0 &&
+                std::memcmp(g, g + gather_n, gather_n * sizeof(float)) != 0) {
+                std::snprintf(e, ec,
+                              "KV VMM layout: K/V gather differs between the "
+                              "layouts (layer %d)", l);
+                result = -1;
+            }
+        }
+    } while (false);
+    if (d_vmm != nullptr) mynah_cuda_kv_vmm_free(st, d_vmm);
+    cudaFree(d_plane);
+    cudaFree(d_f);
+    cudaFree(d_tab);
+    return result;
+}
+
+static int cuda_kv_vmm_self_test(cuda_backend_state *st, char *e, size_t ec) {
+    if (st == nullptr) return -1;
+    size_t gran = 0u;
+    char why[192];
+    why[0] = '\0';
+    if (mynah_cuda_kv_vmm_probe(st, &gran, why, sizeof(why)) != 0) {
+        if (getenv("MYNAH_CUDA_KV_VMM") != nullptr)
+            std::fprintf(stderr, "mynah-tts: KV VMM self-test skipped: %s\n", why);
+        return 0;
+    }
+    void *p = nullptr;
+    size_t mapped = 0u;
+    if (mynah_cuda_kv_vmm_alloc(st, 4u * gran, gran, &p, &mapped, e, ec) != 0)
+        return -1;
+    int result = -1;
+    std::vector<unsigned char> host(3u * gran);
+    do {
+        char refused[192];
+        if (mapped != gran) {
+            set_error(e, ec, "KV VMM self-test: initial mapping size");
+            break;
+        }
+        if (ce(cudaMemsetAsync(p, 0xab, gran, st->stream), e, ec) ||
+            mynah_cuda_kv_vmm_resize(st, p, 2u * gran + 1u, &mapped, e, ec) != 0)
+            break;
+        if (mapped != 3u * gran) {
+            set_error(e, ec, "KV VMM self-test: growth mapping size");
+            break;
+        }
+        if (ce(cudaMemsetAsync(static_cast<unsigned char *>(p) + gran, 0xcd,
+                               2u * gran, st->stream), e, ec) ||
+            ce(cudaStreamSynchronize(st->stream), e, ec) ||
+            ce(cudaMemcpy(host.data(), p, 3u * gran, cudaMemcpyDeviceToHost), e, ec))
+            break;
+        bool ok = true;
+        for (size_t i = 0; i < 3u * gran && ok; ++i)
+            ok = host[i] == (i < gran ? 0xabu : 0xcdu);
+        if (!ok) {
+            set_error(e, ec, "KV VMM self-test: bytes lost across growth in place");
+            break;
+        }
+        if (mynah_cuda_kv_vmm_resize(st, p, gran, &mapped, e, ec) != 0) break;
+        if (mapped != gran) {
+            set_error(e, ec, "KV VMM self-test: trim mapping size");
+            break;
+        }
+        if (ce(cudaMemcpy(host.data(), p, gran, cudaMemcpyDeviceToHost), e, ec)) break;
+        for (size_t i = 0; i < gran && ok; ++i) ok = host[i] == 0xabu;
+        if (!ok) {
+            set_error(e, ec, "KV VMM self-test: bytes lost across a trim");
+            break;
+        }
+        if (mynah_cuda_kv_vmm_resize(st, p, 5u * gran, &mapped, refused,
+                                     sizeof(refused)) == 0) {
+            set_error(e, ec, "KV VMM self-test: resize past the reservation accepted");
+            break;
+        }
+        result = 0;
+    } while (false);
+    mynah_cuda_dev_free(st, static_cast<float *>(p)); /* routed to the VMM release */
+    if (result == 0 && st->kv_vmm.live.load(std::memory_order_relaxed) != 0u) {
+        set_error(e, ec, "KV VMM self-test: dev_free did not release the range");
+        result = -1;
+    }
+    if (result != 0) return -1;
+    return cuda_kv_vmm_layout_case(st, e, ec);
 }

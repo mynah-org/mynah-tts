@@ -1978,7 +1978,9 @@ static void handle_metrics(int fd) {
     const unsigned long audio_us = atomic_load(&g_stats.audio_us);
     const double rtf = audio_us > 0ul
         ? (double)service_us / (double)audio_us : 0.0;
-    char body[16384];
+    /* ~15 KB before the MYNAH_CUDA_KV_VMM gauges; keep headroom so a
+     * longer exposition is never cut short. */
+    char body[24576];
     size_t n = 0u;
 #define METRIC(...) do { \
         if (n < sizeof(body)) { \
@@ -2238,6 +2240,26 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_device_memory_free_bytes gauge\n"
            "mynah_backend_device_memory_free_bytes %llu\n",
            m.device_memory_free_bytes);
+    METRIC("# HELP mynah_backend_kv_vmm_rows Backbone KV rows in CUDA VMM ranges (MYNAH_CUDA_KV_VMM), parked rows included.\n"
+           "# TYPE mynah_backend_kv_vmm_rows gauge\n"
+           "mynah_backend_kv_vmm_rows %llu\n",
+           m.kv_vmm_rows);
+    METRIC("# HELP mynah_backend_kv_vmm_mapped_bytes Device memory mapped behind the VMM KV rows (part of the used device memory).\n"
+           "# TYPE mynah_backend_kv_vmm_mapped_bytes gauge\n"
+           "mynah_backend_kv_vmm_mapped_bytes %llu\n",
+           m.kv_vmm_mapped_bytes);
+    METRIC("# HELP mynah_backend_kv_vmm_reserved_bytes Virtual address space reserved for the VMM KV rows (no memory).\n"
+           "# TYPE mynah_backend_kv_vmm_reserved_bytes gauge\n"
+           "mynah_backend_kv_vmm_reserved_bytes %llu\n",
+           m.kv_vmm_reserved_bytes);
+    METRIC("# HELP mynah_backend_kv_vmm_maps_total VMM chunks mapped (allocation and in-place growth).\n"
+           "# TYPE mynah_backend_kv_vmm_maps_total counter\n"
+           "mynah_backend_kv_vmm_maps_total %llu\n",
+           m.kv_vmm_maps);
+    METRIC("# HELP mynah_backend_kv_vmm_unmaps_total VMM chunks unmapped (trim on reuse and release).\n"
+           "# TYPE mynah_backend_kv_vmm_unmaps_total counter\n"
+           "mynah_backend_kv_vmm_unmaps_total %llu\n",
+           m.kv_vmm_unmaps);
     METRIC("# HELP mynah_backend_graphs_enabled Whether CUDA graphs are enabled.\n"
            "# TYPE mynah_backend_graphs_enabled gauge\n"
            "mynah_backend_graphs_enabled %u\n", m.graphs_enabled);
