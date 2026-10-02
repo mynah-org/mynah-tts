@@ -1105,6 +1105,19 @@ static int pocket_cuda_kv_bf16_requested(const mynah_engine_state *state);
 static int pocket_cuda_flow_requested(const mynah_engine_state *state);
 static int pocket_cuda_codec_requested(const mynah_engine_state *state);
 static int pocket_cuda_mimi_tile_enabled(void);
+static int pocket_cuda_codec_device_handoff_enabled(void);
+
+/* MYNAH_CUDA_ROW_MEM_DIET (default 0): per-request device memory that is not
+ * request state is shared or right-sized (the SEANet decoder scratch in the
+ * CUDA backend, the Mimi transformer KV here). Only placement changes. */
+static int pocket_cuda_row_mem_diet(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_ROW_MEM_DIET");
+        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    return cached;
+}
 static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
                                               unsigned groups);
 static int pocket_cuda_kv_grow_enabled(void);
@@ -1252,6 +1265,11 @@ struct mynah_engine_ctx {
     size_t cuda_codec_kv_positions;
     size_t cuda_codec_kv_half;
     size_t cuda_codec_kv_base;
+    /* MYNAH_CUDA_ROW_MEM_DIET: the device KV is only the Mimi tile's ring
+     * (context + upsample_stride - 1 positions), smaller
+     * than the host window, so the paths that mirror the host window
+     * (prepare/sync) refuse this row and it runs on the tile or the CPU. */
+    int cuda_codec_ring_only;
     int cuda_codec_enabled;
     int cuda_codec_valid;
     int cuda_codec_needs_host_sync;
@@ -5409,6 +5427,7 @@ static void pocket_cuda_codec_release(mynah_engine_ctx *ctx) {
     ctx->cuda_codec_device_input_ready = 0;
     ctx->cuda_codec_kv_positions = 0u;
     ctx->cuda_codec_kv_half = 0u;
+    ctx->cuda_codec_ring_only = 0;
     ctx->cuda_codec_kv_base = 0u;
     ctx->cuda_codec_enabled = 0;
     ctx->cuda_codec_valid = 0;
@@ -5451,10 +5470,38 @@ static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
         mynah_transformer_ar_state_kv_positions(ctx->codec_transformer);
     const size_t half =
         mynah_transformer_ar_state_kv_half_floats(ctx->codec_transformer);
+    /* MYNAH_CUDA_ROW_MEM_DIET: a row that will run its Mimi transformer in
+     * the cross-request tile only needs the tile's ring on the device: the
+     * tile writes slot p % ring and every query reads positions
+     * [p - context + 1, p] by absolute position, so any ring of at least
+     * context + upsample_stride - 1 slots gives the same values in the same
+     * order (the backend refuses a smaller one). The host window keeps its
+     * own size. Off, or any clause unmet: the old mirror of the host
+     * window. */
+    size_t dev_positions = positions;
+    size_t dev_half = half;
+    int ring_only = 0;
+    if (pocket_cuda_row_mem_diet() && pocket_cuda_mimi_tile_enabled() &&
+        codec_conv_f32 && ctx->cuda_decoder_enabled &&
+        pocket_cuda_codec_device_handoff_enabled() &&
+        cfg->codec_dim == cfg->codec_tf_dim &&
+        mynah_backend_has_tile_transformer(backend) && positions > 0u &&
+        half == positions * cfg->codec_tf_dim) {
+        size_t ring = 0u;
+        if (pocket_add(tc->context, cfg->upsample_stride - 1u, &ring) == 0) {
+            if (ring < positions &&
+                pocket_mul(ring, cfg->codec_tf_dim, &dev_half) == 0) {
+                dev_positions = ring;
+                ring_only = 1;
+            } else {
+                dev_half = half;
+            }
+        }
+    }
     size_t kv_floats = 0u;
     size_t qkv_floats = 0u;
     if (positions == 0u || half == 0u ||
-        pocket_mul(half, 2u, &kv_floats) != 0 ||
+        pocket_mul(dev_half, 2u, &kv_floats) != 0 ||
         pocket_mul(cfg->codec_tf_dim, 3u, &qkv_floats) != 0) return 0;
 
     char ignored[256];
@@ -5465,8 +5512,8 @@ static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
     pocket_cuda_slot *slot = ctx->cuda_slot;
     if (slot != NULL && slot->codec_kv != NULL) {
         if (slot->codec_kv_layers == cfg->codec_tf_layers &&
-            slot->codec_kv_positions == positions &&
-            slot->codec_kv_half == half) {
+            slot->codec_kv_positions == dev_positions &&
+            slot->codec_kv_half == dev_half) {
             POCKET_SLOT_MOVE(ctx->cuda_codec_kv, slot->codec_kv);
             POCKET_SLOT_MOVE(ctx->cuda_codec_x, slot->codec_x);
             POCKET_SLOT_MOVE(ctx->cuda_codec_norm, slot->codec_norm);
@@ -5536,8 +5583,9 @@ static int pocket_cuda_codec_alloc(mynah_engine_ctx *ctx) {
         ctx->cuda_codec_upsample_enabled = 1;
     }
 #undef POCKET_CODEC_ALLOC
-    ctx->cuda_codec_kv_positions = positions;
-    ctx->cuda_codec_kv_half = half;
+    ctx->cuda_codec_kv_positions = dev_positions;
+    ctx->cuda_codec_kv_half = dev_half;
+    ctx->cuda_codec_ring_only = ring_only;
     ctx->cuda_codec_kv_base = 0u;
     ctx->cuda_codec_enabled = 1;
     ctx->cuda_codec_valid = 0;
@@ -5743,6 +5791,9 @@ static int pocket_cuda_codec_prepare_window(mynah_engine_ctx *ctx,
                                             size_t capacity) {
     if (ctx == NULL || !ctx->cuda_codec_enabled || ctx->codec_transformer == NULL)
         return 1;
+    /* MYNAH_CUDA_ROW_MEM_DIET: the device KV is the tile's ring, not a
+     * mirror of the host window; this path is not available to the row. */
+    if (ctx->cuda_codec_ring_only) return 1;
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
     const mynah_transformer_ar_config *tc =
@@ -5803,6 +5854,12 @@ static int pocket_cuda_codec_sync_host_window(mynah_engine_ctx *ctx, char *error
                                               size_t capacity) {
     if (ctx == NULL || ctx->state == NULL || ctx->codec_transformer == NULL)
         return -1;
+    if (ctx->cuda_codec_ring_only) {
+        pocket_error(error, capacity,
+                     "pocket: CUDA codec KV is a tile ring "
+                     "(MYNAH_CUDA_ROW_MEM_DIET); it has no host window to sync");
+        return -1;
+    }
     const mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
     if (mynah_transformer_ar_state_kv_base(ctx->codec_transformer) !=
@@ -8769,6 +8826,52 @@ static int pocket_ctx_plain(mynah_engine_ctx *ctx, const pocket_ctx_sizes *z,
     return 0;
 }
 
+/* MYNAH_CUDA_ROW_MEM_DIET: one start-up line with the device bytes a request
+ * owns besides its backbone KV, now and without the diet (from the sizes
+ * this context really allocated). Printed once, by the first context that
+ * has its codec and decoder on the device. */
+static void pocket_cuda_row_mem_report(const mynah_engine_ctx *ctx) {
+    static int reported = 0;
+    if (reported || !pocket_cuda_row_mem_diet() || ctx == NULL ||
+        ctx->state == NULL || ctx->cuda_decoder == NULL ||
+        ctx->cuda_codec_kv == NULL || ctx->codec_transformer == NULL)
+        return;
+    const pocket_config *cfg = &ctx->state->cfg;
+    size_t decoder_now = 0u, decoder_old = 0u;
+    if (mynah_backend_decoder_device_bytes(ctx->state->backend,
+                                           ctx->cuda_decoder, &decoder_now,
+                                           &decoder_old) != 0)
+        return;
+    reported = 1;
+    const size_t f = sizeof(float);
+    const size_t attn = cfg->heads * cfg->head_dim;
+    const size_t host_half =
+        mynah_transformer_ar_state_kv_half_floats(ctx->codec_transformer);
+    const size_t mimi_now = cfg->codec_tf_layers * 2u * ctx->cuda_codec_kv_half * f;
+    const size_t mimi_old = cfg->codec_tf_layers * 2u * host_half * f;
+    size_t other = 0u;
+    if (ctx->cuda_x != NULL)
+        other += (3u * cfg->hidden_dim + 4u * attn + cfg->ffn_dim) * f;
+    other += (7u * cfg->codec_tf_dim + cfg->codec_tf_ffn) * f;
+    if (ctx->cuda_codec_upsample_enabled)
+        other += (cfg->latent_dim + cfg->codec_dim +
+                  cfg->upsample_stride * cfg->codec_dim +
+                  ctx->cuda_codec_up_tail * cfg->codec_dim) * f;
+    other += (cfg->codec_dim * cfg->upsample_stride +
+              cfg->audio_channels * cfg->samples_per_frame) * f;
+    fprintf(stderr,
+            "pocket: MYNAH_CUDA_ROW_MEM_DIET=1: device memory per request "
+            "besides the backbone KV %zu KiB (was %zu KiB): SEANet decoder "
+            "%zu KiB (was %zu), Mimi transformer KV %zu KiB (was %zu; %zu "
+            "positions instead of %zu), other %zu KiB\n",
+            (decoder_now + mimi_now + other) / 1024u,
+            (decoder_old + mimi_old + other) / 1024u, decoder_now / 1024u,
+            decoder_old / 1024u, mimi_now / 1024u, mimi_old / 1024u,
+            ctx->cuda_codec_kv_positions,
+            mynah_transformer_ar_state_kv_positions(ctx->codec_transformer),
+            other / 1024u);
+}
+
 /* The device half: resident backbone/codec/decoder allocations. Scheduler
  * thread. If the optional resident path cannot reserve them the context stays a
  * valid CPU context, which is the backend contract's safe fallback. */
@@ -8779,6 +8882,7 @@ static void pocket_ctx_device(mynah_engine_ctx *ctx, double *ctxp_t) {
     (void)pocket_cuda_codec_alloc(ctx);
     ctxp_mark(CTXP_CODEC, ctxp_t);
     (void)pocket_cuda_decoder_alloc(ctx);
+    pocket_cuda_row_mem_report(ctx);
     ctxp_mark(CTXP_DECODER, ctxp_t);
     ctxp_count();
     /* Set last, so the failure paths (which call `_ctx_free`) cannot submit a
@@ -11385,8 +11489,18 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
         mynah_transformer_ar_state_config(ctxs[index[0]]->codec_transformer);
     /* A ring shared by every request of the call: all of them were sized from
      * the same model, and the smallest one bounds the slot arithmetic. */
-    for (size_t r = 0; r < rows; ++r)
-        if (ctxs[index[r]]->cuda_codec_kv_positions != ring) return 0;
+    size_t row_rings[POCKET_MAX_BATCH];
+    int mixed_rings = 0;
+    for (size_t r = 0; r < rows; ++r) {
+        row_rings[r] = ctxs[index[r]]->cuda_codec_kv_positions;
+        if (row_rings[r] != ring) mixed_rings = 1;
+    }
+    /* MYNAH_CUDA_ROW_MEM_DIET: a ring-only row cannot fall back to the
+     * per-request device path, so rows of different rings (a short
+     * max_steps next to the default) share the call with per-row rings
+     * (mynah_backend_tile_desc.rings) instead of refusing it. Off: the
+     * old refusal. */
+    if (mixed_rings && !pocket_cuda_row_mem_diet()) return 0;
     const mynah_backend_tile_desc desc = {
         .rows = rows,
         .positions = cfg->upsample_stride,
@@ -11396,6 +11510,7 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
         .layers = layers,
         .context = tc->context,
         .ring = ring,
+        .rings = mixed_rings ? row_rings : NULL,
         .max_period = tc->max_period,
         .layernorm_eps = tc->layernorm_eps,
         .layer = layer,
