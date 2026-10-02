@@ -80,6 +80,16 @@ typedef struct {
     unsigned long long codec_gang_calls[2];
     unsigned long long codec_gang_rows[2];
     unsigned long long codec_gang_width_hist[2][8];
+    /* MYNAH_CUDA_KV_VMM: backbone KV rows living in VMM ranges (gauge), the
+     * device bytes mapped behind them and the virtual bytes reserved for
+     * them (gauges), and the map/unmap calls so far (counters). The mapped
+     * bytes are already part of device_memory_bytes - free. Appended so
+     * older fields keep their offsets. */
+    unsigned long long kv_vmm_rows;
+    unsigned long long kv_vmm_mapped_bytes;
+    unsigned long long kv_vmm_reserved_bytes;
+    unsigned long long kv_vmm_maps;
+    unsigned long long kv_vmm_unmaps;
 } mynah_tts_backend_metrics;
 
 typedef struct {

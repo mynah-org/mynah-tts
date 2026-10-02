@@ -81,6 +81,11 @@ struct mynah_backend {
     int (*d2h_bf16)(void *, const void *, float *, size_t, char *, size_t);
     int (*copy_dev)(void *, float *, const float *, size_t, char *, size_t);
     int (*copy_dev_bytes)(void *, void *, const void *, size_t, char *, size_t);
+    int (*copy_dev_bytes_2d)(void *, void *, size_t, const void *, size_t, size_t, size_t, char *, size_t);
+    int (*kv_vmm_probe)(void *, size_t *, char *, size_t);
+    int (*kv_vmm_alloc)(void *, size_t, size_t, void **, size_t *, char *, size_t);
+    int (*kv_vmm_resize)(void *, void *, size_t, size_t *, char *, size_t);
+    void (*kv_vmm_free)(void *, void *);
     int (*scale_dev)(void *, float *, size_t, float, char *, size_t);
     int (*clip_dev)(void *, float *, size_t, char *, size_t);
     int (*argmax_dev)(void *, const float *, size_t, size_t, size_t, int,
@@ -223,6 +228,11 @@ extern int mynah_cuda_matmul_graph(void *, const float *, float *, size_t, size_
 extern int mynah_cuda_batch_begin(void *, char *, size_t);
 extern int mynah_cuda_copy_dev(void *, float *, const float *, size_t, char *, size_t);
 extern int mynah_cuda_copy_dev_bytes(void *, void *, const void *, size_t, char *, size_t);
+extern int mynah_cuda_copy_dev_bytes_2d(void *, void *, size_t, const void *, size_t, size_t, size_t, char *, size_t);
+extern int mynah_cuda_kv_vmm_probe(void *, size_t *, char *, size_t);
+extern int mynah_cuda_kv_vmm_alloc(void *, size_t, size_t, void **, size_t *, char *, size_t);
+extern int mynah_cuda_kv_vmm_resize(void *, void *, size_t, size_t *, char *, size_t);
+extern void mynah_cuda_kv_vmm_free(void *, void *);
 extern int mynah_cuda_scale_dev(void *, float *, size_t, float, char *, size_t);
 extern int mynah_cuda_clip_dev(void *, float *, size_t, char *, size_t);
 extern int mynah_cuda_argmax_dev(void *, const float *, size_t, size_t, size_t, int, unsigned *, char *, size_t);
@@ -723,6 +733,11 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->d2h_bf16 = mynah_cuda_d2h_bf16;
         backend->copy_dev = mynah_cuda_copy_dev;
         backend->copy_dev_bytes = mynah_cuda_copy_dev_bytes;
+        backend->copy_dev_bytes_2d = mynah_cuda_copy_dev_bytes_2d;
+        backend->kv_vmm_probe = mynah_cuda_kv_vmm_probe;
+        backend->kv_vmm_alloc = mynah_cuda_kv_vmm_alloc;
+        backend->kv_vmm_resize = mynah_cuda_kv_vmm_resize;
+        backend->kv_vmm_free = mynah_cuda_kv_vmm_free;
         backend->scale_dev = mynah_cuda_scale_dev;
         backend->clip_dev = mynah_cuda_clip_dev;
         backend->argmax_dev = mynah_cuda_argmax_dev;
@@ -1537,6 +1552,63 @@ int mynah_backend_copy_dev_bytes(const mynah_backend *backend, void *dev_dst,
     if (backend->copy_dev_bytes == NULL) return 1;
     return backend->copy_dev_bytes(backend->state, dev_dst, dev_src, bytes,
                                    error, error_capacity);
+}
+
+int mynah_backend_copy_dev_bytes_2d(const mynah_backend *backend,
+                                    void *dev_dst, size_t dst_pitch,
+                                    const void *dev_src, size_t src_pitch,
+                                    size_t width, size_t rows, char *error,
+                                    size_t error_capacity) {
+    if (backend == NULL || dev_dst == NULL || dev_src == NULL) return -1;
+    if (backend->copy_dev_bytes_2d == NULL) return 1;
+    return backend->copy_dev_bytes_2d(backend->state, dev_dst, dst_pitch,
+                                      dev_src, src_pitch, width, rows, error,
+                                      error_capacity);
+}
+
+int mynah_backend_kv_vmm_probe(const mynah_backend *backend,
+                               size_t *granularity, char *error,
+                               size_t error_capacity) {
+    if (backend == NULL || backend->kv_vmm_probe == NULL) {
+        set_error(error, error_capacity,
+                  "the backend has no virtual memory management path");
+        return -1;
+    }
+    return backend->kv_vmm_probe(backend->state, granularity, error,
+                                 error_capacity);
+}
+
+int mynah_backend_kv_vmm_alloc(const mynah_backend *backend, size_t reserve,
+                               size_t map, void **dev_ptr, size_t *mapped,
+                               char *error, size_t error_capacity) {
+    if (dev_ptr != NULL) *dev_ptr = NULL;
+    if (backend == NULL || backend->kv_vmm_alloc == NULL || dev_ptr == NULL) {
+        set_error(error, error_capacity,
+                  "the backend has no virtual memory management path");
+        return -1;
+    }
+    return backend->kv_vmm_alloc(backend->state, reserve, map, dev_ptr, mapped,
+                                 error, error_capacity);
+}
+
+int mynah_backend_kv_vmm_resize(const mynah_backend *backend, void *dev_ptr,
+                                size_t want, size_t *mapped, char *error,
+                                size_t error_capacity) {
+    if (backend == NULL || backend->kv_vmm_resize == NULL || dev_ptr == NULL) {
+        set_error(error, error_capacity, "invalid virtual memory resize");
+        return -1;
+    }
+    return backend->kv_vmm_resize(backend->state, dev_ptr, want, mapped, error,
+                                  error_capacity);
+}
+
+void mynah_backend_kv_vmm_free(const mynah_backend *backend, void *dev_ptr) {
+    if (backend == NULL || dev_ptr == NULL) return;
+    if (backend->kv_vmm_free != NULL) {
+        backend->kv_vmm_free(backend->state, dev_ptr);
+        return;
+    }
+    mynah_backend_dev_free(backend, (float *)dev_ptr);
 }
 
 int mynah_backend_copy_dev(const mynah_backend *backend, float *dev_dst,

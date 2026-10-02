@@ -1080,6 +1080,12 @@ struct mynah_engine_state {
     int cuda_slot_pool_mutex_ready;
     struct pocket_cuda_slot *cuda_slot_pool;
     size_t cuda_slot_pool_count;
+    /* MYNAH_CUDA_KV_VMM, resolved once at model load: 1 when the flag is on,
+     * the KV growth and prefill tile paths it extends are on, and the
+     * backend's virtual memory management probe passed. Then
+     * `cuda_kv_vmm_granularity` is the physical page size in bytes. */
+    int cuda_kv_vmm;
+    size_t cuda_kv_vmm_granularity;
 
     mynah_sp *tokenizer;
 };
@@ -1101,6 +1107,17 @@ static int pocket_cuda_codec_requested(const mynah_engine_state *state);
 static int pocket_cuda_mimi_tile_enabled(void);
 static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
                                               unsigned groups);
+static int pocket_cuda_kv_grow_enabled(void);
+static int pocket_cuda_prefill_tile_enabled(void);
+static int pocket_cuda_kv_vmm_requested(void);
+static size_t pocket_cuda_kv_vmm_chunk(void);
+/* Virtual reservation per MYNAH_CUDA_KV_VMM row, in positions: the host
+ * ceiling `max_seq_len` (the most any writer may ever reach, see
+ * pocket_cuda_backbone_reserve) rounded up to this unit, so requests of
+ * ordinary length all reserve the same span and a parked row serves any of
+ * them. Virtual space only: at 24 layers BF16 a 2048-position reservation is
+ * 192 MiB of addresses and no memory. */
+#define POCKET_CUDA_KV_VMM_RESERVE_UNIT ((size_t)1024u)
 
 static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                     int final, char *error, size_t capacity);
@@ -1189,6 +1206,23 @@ struct mynah_engine_ctx {
      * positions (the first one the cache cannot hold). Fixed at allocation;
      * see pocket_cuda_kv_skip_planned for when a row gets one. */
     size_t cuda_backbone_kv_skip;
+    /* MYNAH_CUDA_KV_VMM: the cache is a VMM range (backend virtual memory
+     * management), laid out POSITION-MAJOR: stored position s (absolute
+     * s + skip) holds [layer][K|V][attn], so one position is
+     * layers * 2 * attn elements (96 KiB at 24 layers BF16) and growing the
+     * cache maps pages after the last ones, in place: no copy, no sync, no
+     * second allocation, and `cuda_backbone_kv` never moves. Every reader
+     * addresses it through pocket_cuda_kv_plane / _position_base with
+     * pocket_cuda_kv_stride (layers * 2 * attn) as the position stride.
+     * `cuda_backbone_kv_bytes` is then the MAPPED size and
+     * `cuda_backbone_kv_reserved` the virtual reservation (the most this row
+     * can ever map). 0 = the plane-major layout above, unchanged. */
+    int cuda_backbone_kv_vmm;
+    size_t cuda_backbone_kv_reserved;
+    /* Set when this context must not use a VMM cache again (it left the
+     * prefill tile path, or a VMM allocation failed): the next allocation
+     * is the plain one. */
+    int cuda_kv_vmm_refused;
     int cuda_backbone_kv_bf16;
     int cuda_backbone_enabled;
     int cuda_backbone_valid;
@@ -4232,6 +4266,40 @@ static int pocket_model_init(const mynah_tts_model *model,
                                  "MYNAH_CUDA_Q8 or a per-stage switch)"
                                : "");
         }
+        if (pocket_cuda_kv_vmm_requested()) {
+            /* MYNAH_CUDA_KV_VMM: resolved once here; contexts only read
+             * state->cuda_kv_vmm. It extends the growable cache of the
+             * prefill tile path, so it needs both of those on. */
+            char reason[256];
+            reason[0] = '\0';
+            size_t granularity = 0u;
+            if (!resident_on || !pocket_cuda_kv_grow_enabled() ||
+                !pocket_cuda_prefill_tile_enabled()) {
+                snprintf(reason, sizeof(reason),
+                         "it needs MYNAH_CUDA_RESIDENT, MYNAH_CUDA_KV_GROW and "
+                         "MYNAH_CUDA_PREFILL_TILE on");
+            } else if (mynah_backend_kv_vmm_probe(state->backend, &granularity,
+                                                  reason, sizeof(reason)) == 0 &&
+                       granularity != 0u) {
+                state->cuda_kv_vmm = 1;
+                state->cuda_kv_vmm_granularity = granularity;
+            } else if (reason[0] == '\0') {
+                snprintf(reason, sizeof(reason), "no allocation granularity");
+            }
+            if (state->cuda_kv_vmm)
+                fprintf(stderr,
+                        "mynah-tts: MYNAH_CUDA_KV_VMM=1: backbone KV rows of the "
+                        "prefill tile path are position-major VMM ranges that "
+                        "grow in place (granularity %zu KiB, growth chunk %zu "
+                        "positions, reservation in units of %zu positions)\n",
+                        granularity / 1024u, pocket_cuda_kv_vmm_chunk(),
+                        POCKET_CUDA_KV_VMM_RESERVE_UNIT);
+            else
+                fprintf(stderr,
+                        "mynah-tts: warning: MYNAH_CUDA_KV_VMM=1 ignored (%s); "
+                        "backbone KV growth keeps cudaMalloc + copy\n",
+                        reason);
+        }
         fprintf(stderr,
                 "mynah-tts: pocket backend=cuda resident=%s qgroups=0x%04x "
                 "q8=%s resident{backbone=%s flow=%s codec_transformer=%s} "
@@ -4492,15 +4560,31 @@ static size_t pocket_cuda_kv_stored(const mynah_engine_ctx *ctx) {
     return ctx->cuda_backbone_capacity - ctx->cuda_backbone_kv_skip;
 }
 
+/* Elements between two consecutive positions of one K or V plane: the
+ * attention width for the plane-major layout, layers * 2 * attention width
+ * for a position-major VMM row (MYNAH_CUDA_KV_VMM). This is the
+ * `cache_stride` every decode kernel and the K/V gather take per row. */
+static size_t pocket_cuda_kv_stride(const mynah_engine_ctx *ctx) {
+    const size_t attn = ctx->state->cfg.heads * ctx->state->cfg.head_dim;
+    return ctx->cuda_backbone_kv_vmm ? ctx->state->cfg.layers * 2u * attn : attn;
+}
+
 /* Start of layer `layer`'s K (`plane` 0) or V (`plane` 1) plane in the
- * device cache, as allocated: element 0 is position `cuda_backbone_kv_skip`.
- * This is what the prefill tile and the growth copy address. */
+ * device cache, as allocated: element 0 is position `cuda_backbone_kv_skip`,
+ * position p of the plane is `p * pocket_cuda_kv_stride` elements further.
+ * Plane-major: [layer][K|V][stored][attn]. Position-major (VMM):
+ * [stored][layer][K|V][attn], so the plane "starts" at (layer * 2 + plane) *
+ * attn inside the first stored position. This is what the prefill tile
+ * addresses. */
 static void *pocket_cuda_kv_plane(const mynah_engine_ctx *ctx, size_t layer,
                                   int plane) {
-    const size_t stored = pocket_cuda_kv_stored(ctx) *
-                          ctx->state->cfg.heads * ctx->state->cfg.head_dim;
-    return pocket_cuda_kv_offset(ctx->cuda_backbone_kv,
-                                 (layer * 2u + (plane ? 1u : 0u)) * stored,
+    const size_t attn = ctx->state->cfg.heads * ctx->state->cfg.head_dim;
+    const size_t plane_index = layer * 2u + (plane ? 1u : 0u);
+    if (ctx->cuda_backbone_kv_vmm)
+        return pocket_cuda_kv_offset(ctx->cuda_backbone_kv, plane_index * attn,
+                                     ctx->cuda_backbone_kv_bf16);
+    const size_t stored = pocket_cuda_kv_stored(ctx) * attn;
+    return pocket_cuda_kv_offset(ctx->cuda_backbone_kv, plane_index * stored,
                                  ctx->cuda_backbone_kv_bf16);
 }
 
@@ -4518,8 +4602,8 @@ static void *pocket_cuda_kv_position_base(const mynah_engine_ctx *ctx,
     unsigned char *start = (unsigned char *)pocket_cuda_kv_plane(ctx, layer, plane);
     if (start == NULL || ctx->cuda_backbone_kv_skip == 0u) return start;
     const size_t width = ctx->cuda_backbone_kv_bf16 ? sizeof(uint16_t) : sizeof(float);
-    const size_t bias = ctx->cuda_backbone_kv_skip * ctx->state->cfg.heads *
-                        ctx->state->cfg.head_dim * width;
+    const size_t bias = ctx->cuda_backbone_kv_skip * pocket_cuda_kv_stride(ctx) *
+                        width;
     return (void *)((uintptr_t)start - (uintptr_t)bias);
 }
 
@@ -4566,6 +4650,72 @@ static int pocket_cuda_kv_grow_expected(const mynah_engine_ctx *ctx) {
     return state->cfg.heads * state->cfg.head_dim == state->cfg.hidden_dim &&
            ctx->speaker < state->voice_count &&
            state->voices[ctx->speaker].kv != NULL;
+}
+
+/* ------------------------------------------- MYNAH_CUDA_KV_VMM
+ *
+ * Default 0. With it on (and the backend's virtual memory management probe
+ * passing at model load, state->cuda_kv_vmm), every context whose cache is
+ * growable (pocket_cuda_kv_grow_expected: the prefill tile path) gets its
+ * backbone KV as a VMM range laid out position-major (see
+ * `cuda_backbone_kv_vmm`). Growth then maps more device pages after the
+ * mapped ones instead of cudaMalloc + 48 copies + sync + cudaFree, so there
+ * is no transient old + new peak and no copy. Off: nothing below runs and
+ * every allocation, layout and kernel argument is the old one. */
+static int pocket_cuda_kv_vmm_requested(void) {
+    const char *setting = getenv("MYNAH_CUDA_KV_VMM");
+    return setting != NULL && setting[0] != '\0' && strcmp(setting, "0") != 0;
+}
+
+/* Positions one VMM growth maps at least (MYNAH_CUDA_KV_VMM_CHUNK, default
+ * the plain growth chunk, 256): the cadence of growth stays the old one,
+ * and the mapped size is then rounded up to whole pages, every byte of which
+ * the row may use. */
+static size_t pocket_cuda_kv_vmm_chunk(void) {
+    static size_t cached = 0u;
+    if (cached == 0u) {
+        size_t chunk = POCKET_CUDA_KV_GROW_CHUNK;
+        const char *setting = getenv("MYNAH_CUDA_KV_VMM_CHUNK");
+        if (setting != NULL && setting[0] != '\0') {
+            const long value = strtol(setting, NULL, 10);
+            if (value > 0 && value <= 65536) chunk = (size_t)value;
+        }
+        cached = chunk;
+    }
+    return cached;
+}
+
+static int pocket_cuda_kv_vmm_planned(const mynah_engine_ctx *ctx) {
+    return ctx != NULL && ctx->state != NULL && ctx->state->cuda_kv_vmm &&
+           !ctx->cuda_kv_vmm_refused && pocket_cuda_kv_grow_expected(ctx);
+}
+
+/* Bytes of one position-major position, and the reservation of a VMM row
+ * whose host ceiling is `max_seq_len`. -1 on overflow. */
+static int pocket_cuda_kv_vmm_sizes(const mynah_engine_state *state,
+                                    size_t max_seq_len, int kv_bf16,
+                                    size_t *position_bytes,
+                                    size_t *reserve_bytes) {
+    const pocket_config *cfg = &state->cfg;
+    size_t per = 0u, positions = 0u;
+    if (pocket_mul(cfg->heads, cfg->head_dim, &per) != 0 ||
+        pocket_mul(per, 2u * cfg->layers, &per) != 0 ||
+        pocket_mul(per, kv_bf16 ? sizeof(uint16_t) : sizeof(float), &per) != 0 ||
+        per == 0u ||
+        max_seq_len > SIZE_MAX - (POCKET_CUDA_KV_VMM_RESERVE_UNIT - 1u))
+        return -1;
+    positions = (max_seq_len + POCKET_CUDA_KV_VMM_RESERVE_UNIT - 1u) /
+                POCKET_CUDA_KV_VMM_RESERVE_UNIT * POCKET_CUDA_KV_VMM_RESERVE_UNIT;
+    if (pocket_mul(positions, per, reserve_bytes) != 0) return -1;
+    *position_bytes = per;
+    return 0;
+}
+
+/* Free a backbone cache with the call that matches how it was made. */
+static void pocket_cuda_kv_free(const mynah_backend *backend, void *kv, int vmm) {
+    if (kv == NULL) return;
+    if (vmm) mynah_backend_kv_vmm_free(backend, kv);
+    else mynah_backend_dev_free(backend, (float *)kv);
 }
 
 /* MYNAH_CUDA_SHARED_VOICE, phase 2: the positions a new device cache will NOT
@@ -4724,6 +4874,10 @@ typedef struct pocket_cuda_slot {
     float *bb_kv;
     size_t bb_kv_bytes;
     int bb_kv_bf16;
+    /* MYNAH_CUDA_KV_VMM: bb_kv is a position-major VMM range; bb_kv_bytes
+     * is what is mapped, bb_kv_reserved its virtual reservation. */
+    int bb_kv_vmm;
+    size_t bb_kv_reserved;
     float *bb_x, *bb_norm, *bb_qkv, *bb_attn, *bb_proj, *bb_ffn;
     /* resident Mimi decoder transformer */
     float **codec_kv;
@@ -4756,9 +4910,11 @@ static int pocket_cuda_slot_zero_kv_requested(void) {
     return setting != NULL && strcmp(setting, "0") != 0;
 }
 
+static void pocket_cuda_kv_free(const mynah_backend *backend, void *kv, int vmm);
+
 static void pocket_cuda_slot_free_backbone(const mynah_backend *backend,
                                            pocket_cuda_slot *slot) {
-    mynah_backend_dev_free(backend, slot->bb_kv);
+    pocket_cuda_kv_free(backend, slot->bb_kv, slot->bb_kv_vmm);
     mynah_backend_dev_free(backend, slot->bb_x);
     mynah_backend_dev_free(backend, slot->bb_norm);
     mynah_backend_dev_free(backend, slot->bb_qkv);
@@ -4768,6 +4924,8 @@ static void pocket_cuda_slot_free_backbone(const mynah_backend *backend,
     slot->bb_kv = NULL;
     slot->bb_kv_bytes = 0u;
     slot->bb_kv_bf16 = 0;
+    slot->bb_kv_vmm = 0;
+    slot->bb_kv_reserved = 0u;
     slot->bb_x = slot->bb_norm = slot->bb_qkv = NULL;
     slot->bb_attn = slot->bb_proj = slot->bb_ffn = NULL;
 }
@@ -4843,24 +5001,45 @@ static int pocket_cuda_slot_kv_fits(size_t have, size_t need, int bounded) {
 /* Take the idle set whose backbone cache fits `bb_kv_bytes` most tightly (and
  * has the requested element type); failing that, the one with the largest
  * cache, whose KV alone is then re-allocated (with `bounded` that is also the
- * set whose oversized cache frees the most).  NULL when the pool is empty. */
+ * set whose oversized cache frees the most).  NULL when the pool is empty.
+ *
+ * MYNAH_CUDA_KV_VMM (`vmm`): only a VMM cache with at least `vmm_reserve`
+ * reserved bytes fits, whatever it has mapped (the allocation maps more or
+ * unmaps the excess in place); the tightest mapped size at or above the
+ * need wins, else the largest. A plain request never takes a VMM cache
+ * (different layout) and vice versa. */
 static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
                                                   size_t bb_kv_bytes,
-                                                  int bb_kv_bf16, int bounded) {
+                                                  int bb_kv_bf16, int bounded,
+                                                  int vmm, size_t vmm_reserve) {
     if (!pocket_cuda_slot_pool_enabled(state)) return NULL;
     pthread_mutex_lock(&state->cuda_slot_pool_mutex);
     pocket_cuda_slot **best = NULL;
     pocket_cuda_slot **largest = NULL;
+    pocket_cuda_slot **vmm_any = NULL;
     for (pocket_cuda_slot **link = &state->cuda_slot_pool; *link != NULL;
          link = &(*link)->next) {
         const pocket_cuda_slot *slot = *link;
-        if (slot->bb_kv_bf16 == bb_kv_bf16 &&
-            pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, bb_kv_bytes, bounded) &&
-            (best == NULL || slot->bb_kv_bytes < (*best)->bb_kv_bytes))
+        if (vmm) {
+            if (slot->bb_kv != NULL && slot->bb_kv_vmm &&
+                slot->bb_kv_bf16 == bb_kv_bf16 &&
+                slot->bb_kv_reserved >= vmm_reserve) {
+                if (slot->bb_kv_bytes >= bb_kv_bytes &&
+                    (best == NULL || slot->bb_kv_bytes < (*best)->bb_kv_bytes))
+                    best = link;
+                if (vmm_any == NULL || slot->bb_kv_bytes > (*vmm_any)->bb_kv_bytes)
+                    vmm_any = link;
+            }
+        } else if (!slot->bb_kv_vmm && slot->bb_kv_bf16 == bb_kv_bf16 &&
+                   pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, bb_kv_bytes,
+                                            bounded) &&
+                   (best == NULL || slot->bb_kv_bytes < (*best)->bb_kv_bytes)) {
             best = link;
+        }
         if (largest == NULL || slot->bb_kv_bytes > (*largest)->bb_kv_bytes)
             largest = link;
     }
+    if (best == NULL) best = vmm_any;
     pocket_cuda_slot **pick = best != NULL ? best : largest;
     pocket_cuda_slot *slot = NULL;
     if (pick != NULL) {
@@ -4920,6 +5099,12 @@ static void pocket_cuda_slot_park(mynah_engine_ctx *ctx) {
         POCKET_SLOT_MOVE(slot->bb_kv, ctx->cuda_backbone_kv);
         slot->bb_kv_bytes = ctx->cuda_backbone_kv_bytes;
         slot->bb_kv_bf16 = ctx->cuda_backbone_kv_bf16;
+        /* A VMM cache is parked with its mappings: the next owner maps more
+         * or unmaps the excess in place (pocket_cuda_backbone_alloc). */
+        slot->bb_kv_vmm = ctx->cuda_backbone_kv_vmm;
+        slot->bb_kv_reserved = ctx->cuda_backbone_kv_reserved;
+        ctx->cuda_backbone_kv_vmm = 0;
+        ctx->cuda_backbone_kv_reserved = 0u;
         POCKET_SLOT_MOVE(slot->bb_x, ctx->cuda_x);
         POCKET_SLOT_MOVE(slot->bb_norm, ctx->cuda_norm);
         POCKET_SLOT_MOVE(slot->bb_qkv, ctx->cuda_qkv);
@@ -5161,7 +5346,8 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     const mynah_backend *backend =
         (ctx->state == NULL) ? NULL : ctx->state->backend;
     if (backend != NULL) {
-        mynah_backend_dev_free(backend, ctx->cuda_backbone_kv);
+        pocket_cuda_kv_free(backend, ctx->cuda_backbone_kv,
+                            ctx->cuda_backbone_kv_vmm);
         mynah_backend_dev_free(backend, ctx->cuda_x);
         mynah_backend_dev_free(backend, ctx->cuda_norm);
         mynah_backend_dev_free(backend, ctx->cuda_qkv);
@@ -5180,6 +5366,8 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     ctx->cuda_backbone_kv_skip = 0u;
     ctx->cuda_backbone_kv_floats = 0u;
     ctx->cuda_backbone_kv_bytes = 0u;
+    ctx->cuda_backbone_kv_vmm = 0;
+    ctx->cuda_backbone_kv_reserved = 0u;
     ctx->cuda_backbone_kv_bf16 = 0;
     ctx->cuda_backbone_valid = 0;
 }
@@ -6366,15 +6554,62 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     }
 
     char ignored[256];
+    /* MYNAH_CUDA_KV_VMM: a growable (tile-path) cache becomes a VMM range,
+     * position-major, reserving `vmm_reserve` virtual bytes. Its byte size
+     * for `kv_capacity` positions is the same `kv_bytes` (stored positions x
+     * position_bytes); only the order of the bytes differs. */
+    int kv_vmm = pocket_cuda_kv_vmm_planned(ctx);
+    size_t vmm_position = 0u, vmm_reserve = 0u;
+    if (kv_vmm && pocket_cuda_kv_vmm_sizes(ctx->state, bc->max_seq_len, kv_bf16,
+                                           &vmm_position, &vmm_reserve) != 0)
+        kv_vmm = 0;
+    size_t vmm_mapped = 0u;
     /* A pooled set (MYNAH_CUDA_SLOT_POOL) brings its buffers; the cache is
      * kept when it is at least as large as this request needs, and only the
      * cache is re-allocated otherwise.  Everything taken is owned by the
      * context from here on, so the failure paths below free it. */
     int reused_kv = 0;
     pocket_cuda_slot *slot = ctx->cuda_slot;
-    if (slot != NULL && slot->bb_kv != NULL) {
+    if (slot != NULL && slot->bb_kv != NULL && kv_vmm) {
+        /* A parked VMM cache with a large enough reservation is kept, its
+         * mappings resized in place: grown to this request's start, or
+         * trimmed (whole trailing chunks) to at most twice it, the same bound
+         * the plain path enforces by reallocating. Anything else is freed. */
         const mynah_backend *backend = ctx->state->backend;
-        if (slot->bb_kv_bf16 == kv_bf16 &&
+        int kept = 0;
+        if (slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16 &&
+            slot->bb_kv_reserved >= vmm_reserve) {
+            size_t want = slot->bb_kv_bytes;
+            if (want < kv_bytes) want = kv_bytes;
+            else if (kv_bytes <= SIZE_MAX / 2u && want > 2u * kv_bytes)
+                want = 2u * kv_bytes;
+            ignored[0] = '\0';
+            if (mynah_backend_kv_vmm_resize(backend, slot->bb_kv, want,
+                                            &vmm_mapped, ignored,
+                                            sizeof(ignored)) == 0 &&
+                vmm_mapped >= kv_bytes) {
+                ctx->cuda_backbone_kv = slot->bb_kv;
+                ctx->cuda_backbone_kv_bytes = vmm_mapped;
+                ctx->cuda_backbone_kv_vmm = 1;
+                ctx->cuda_backbone_kv_reserved = slot->bb_kv_reserved;
+                reused_kv = 1;
+                kept = 1;
+            }
+        }
+        if (!kept) pocket_cuda_kv_free(backend, slot->bb_kv, slot->bb_kv_vmm);
+        slot->bb_kv = NULL;
+        slot->bb_kv_bytes = 0u;
+        slot->bb_kv_vmm = 0;
+        slot->bb_kv_reserved = 0u;
+        POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
+        POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
+        POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
+        POCKET_SLOT_MOVE(ctx->cuda_attn, slot->bb_attn);
+        POCKET_SLOT_MOVE(ctx->cuda_proj, slot->bb_proj);
+        POCKET_SLOT_MOVE(ctx->cuda_ffn, slot->bb_ffn);
+    } else if (slot != NULL && slot->bb_kv != NULL) {
+        const mynah_backend *backend = ctx->state->backend;
+        if (!slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16 &&
             pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, kv_bytes, kv_growable)) {
             ctx->cuda_backbone_kv = slot->bb_kv;
             ctx->cuda_backbone_kv_bytes = slot->bb_kv_bytes;
@@ -6393,10 +6628,12 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
                 }
             }
         } else {
-            mynah_backend_dev_free(backend, slot->bb_kv);
+            pocket_cuda_kv_free(backend, slot->bb_kv, slot->bb_kv_vmm);
         }
         slot->bb_kv = NULL;
         slot->bb_kv_bytes = 0u;
+        slot->bb_kv_vmm = 0;
+        slot->bb_kv_reserved = 0u;
         POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
         POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
         POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
@@ -6416,6 +6653,32 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
         }                                                                       \
     } while (0)
     ignored[0] = '\0';
+    if (ctx->cuda_backbone_kv == NULL && kv_vmm) {
+        void *range = NULL;
+        if (mynah_backend_kv_vmm_alloc(ctx->state->backend, vmm_reserve,
+                                       kv_bytes, &range, &vmm_mapped, ignored,
+                                       sizeof(ignored)) == 0 &&
+            range != NULL) {
+            ctx->cuda_backbone_kv = (float *)range;
+            ctx->cuda_backbone_kv_bytes = vmm_mapped;
+            ctx->cuda_backbone_kv_vmm = 1;
+            ctx->cuda_backbone_kv_reserved = vmm_reserve;
+        } else {
+            /* Out of device memory is out of device memory either way; any
+             * other refusal leaves this context on the plain cache. */
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr,
+                        "pocket: MYNAH_CUDA_KV_VMM allocation failed (%s); "
+                        "this row uses the plain KV cache\n",
+                        ignored[0] != '\0' ? ignored : "unknown error");
+            }
+            ctx->cuda_kv_vmm_refused = 1;
+            kv_vmm = 0;
+            ignored[0] = '\0';
+        }
+    }
     if (ctx->cuda_backbone_kv == NULL) {
         if (mynah_backend_dev_alloc_bytes(
                 ctx->state->backend, kv_bytes, (void **)&ctx->cuda_backbone_kv,
@@ -6442,6 +6705,23 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     POCKET_CUDA_ALLOC(ctx->cuda_proj, cfg->hidden_dim);
     POCKET_CUDA_ALLOC(ctx->cuda_ffn, cfg->ffn_dim);
 #undef POCKET_CUDA_ALLOC
+    if (ctx->cuda_backbone_kv_vmm) {
+        /* Every mapped byte is usable: the capacity is what the mapped pages
+         * hold (never past the host ceiling), at least `kv_capacity`. */
+        size_t stored = ctx->cuda_backbone_kv_bytes / vmm_position;
+        if (stored > bc->max_seq_len - kv_skip) stored = bc->max_seq_len - kv_skip;
+        if (stored + kv_skip > kv_capacity) kv_capacity = stored + kv_skip;
+        kv_floats = cfg->layers * 2u * (kv_capacity - kv_skip) * attn_dim;
+        static int announced_vmm = 0;
+        if (!announced_vmm) {
+            announced_vmm = 1;
+            fprintf(stderr,
+                    "pocket: first CUDA backbone KV row in a VMM range: %zu "
+                    "positions mapped (%zu bytes), %zu bytes reserved\n",
+                    kv_capacity, ctx->cuda_backbone_kv_bytes,
+                    ctx->cuda_backbone_kv_reserved);
+        }
+    }
     ctx->cuda_backbone_capacity = kv_capacity;
     ctx->cuda_backbone_kv_skip = kv_skip;
     ctx->cuda_backbone_kv_floats = kv_floats;
@@ -6500,6 +6780,57 @@ static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
         return -1;
     }
     const size_t old_capacity = ctx->cuda_backbone_capacity;
+    if (ctx->cuda_backbone_kv_vmm) {
+        /* MYNAH_CUDA_KV_VMM: map more pages after the mapped ones. The cache
+         * keeps its address, nothing is copied, nothing is freed, no sync:
+         * queued work on the mapped pages is unaffected, and the host tables
+         * of the next step see the same pointers. Not inside a capture (the
+         * callers run this before batch_begin/graph_begin). */
+        const size_t chunk = pocket_cuda_kv_vmm_chunk();
+        const size_t skip = ctx->cuda_backbone_kv_skip;
+        size_t target = bc->max_seq_len;
+        const size_t grow = (needed - old_capacity + chunk - 1u) / chunk;
+        if (grow <= (bc->max_seq_len - old_capacity) / chunk)
+            target = old_capacity + grow * chunk;
+        size_t position_bytes = 0u, reserve = 0u, want = 0u, mapped = 0u;
+        char local[256];
+        local[0] = '\0';
+        if (pocket_cuda_kv_vmm_sizes(state, bc->max_seq_len,
+                                     ctx->cuda_backbone_kv_bf16, &position_bytes,
+                                     &reserve) != 0 ||
+            pocket_mul(target - skip, position_bytes, &want) != 0) {
+            pocket_error(error, capacity, "pocket: CUDA KV growth size overflow");
+            return -1;
+        }
+        if (mynah_backend_kv_vmm_resize(backend, ctx->cuda_backbone_kv, want,
+                                        &mapped, local, sizeof(local)) != 0) {
+            pocket_error(error, capacity,
+                         "pocket: CUDA backbone KV growth %zu -> %zu positions "
+                         "(in place): %s",
+                         old_capacity, target,
+                         local[0] != '\0' ? local : "out of device memory");
+            return -1;
+        }
+        size_t stored = mapped / position_bytes;
+        if (stored > bc->max_seq_len - skip) stored = bc->max_seq_len - skip;
+        if (stored + skip < needed) {
+            pocket_error(error, capacity,
+                         "pocket: CUDA backbone KV growth mapped %zu bytes for "
+                         "%zu positions", mapped, needed);
+            return -1;
+        }
+        size_t attn = 0u;
+        (void)pocket_mul(cfg->heads, cfg->head_dim, &attn);
+        ctx->cuda_backbone_capacity = stored + skip;
+        ctx->cuda_backbone_kv_floats = cfg->layers * 2u * stored * attn;
+        ctx->cuda_backbone_kv_bytes = mapped;
+        if (pocket_cuda_kv_grow_logged())
+            fprintf(stderr,
+                    "pocket: CUDA backbone KV grew %zu -> %zu positions in place "
+                    "(VMM, %zu-position prefix not stored, %zu bytes mapped)\n",
+                    old_capacity, ctx->cuda_backbone_capacity, skip, mapped);
+        return 0;
+    }
     const size_t chunks = (needed - old_capacity + POCKET_CUDA_KV_GROW_CHUNK - 1u) /
                           POCKET_CUDA_KV_GROW_CHUNK;
     size_t new_capacity = bc->max_seq_len;
@@ -6597,6 +6928,16 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
         pocket_error(error, capacity,
                      "pocket: refusing to upload a host cache into a device "
                      "cache that does not store the voice prefix");
+        return -1;
+    }
+    if (ctx->cuda_backbone_kv_vmm) {
+        /* A position-major VMM cache is only ever filled by the prefill tile
+         * (pocket_cuda_kv_vmm_planned); pocket_seed_backbone swaps it for a
+         * plain cache before a host-seeded row could get here, and the
+         * plane-major copies below would scatter it. */
+        pocket_error(error, capacity,
+                     "pocket: refusing to upload a host cache into a "
+                     "position-major (MYNAH_CUDA_KV_VMM) device cache");
         return -1;
     }
     const pocket_config *cfg = &ctx->state->cfg;
@@ -6745,6 +7086,9 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
         return -1;
     }
     const size_t attn_dim = cfg->heads * cfg->head_dim;
+    /* Position stride of the row's planes: attn_dim, or layers * 2 * attn_dim
+     * for a position-major VMM row (MYNAH_CUDA_KV_VMM). */
+    const size_t kv_stride = pocket_cuda_kv_stride(ctx);
     /* A cache without the voice prefix (MYNAH_CUDA_SHARED_VOICE phase 2) is
      * read through the prefix-aware variant of the same single-row kernel:
      * positions [0, skip) from the shared device voice cache, the rest from
@@ -6794,18 +7138,18 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
                   backend, ctx->cuda_qkv, layer_kv, layer_v,
                   voice + l * 2u * kv_skip * attn_dim,
                   voice + (l * 2u + 1u) * kv_skip * attn_dim, kv_skip,
-                  position, attn_dim, position + 1u, cfg->heads,
+                  position, kv_stride, position + 1u, cfg->heads,
                   cfg->head_dim, 1.0f / sqrtf((float)cfg->head_dim),
                   ctx->cuda_attn, local, sizeof(local))
             : ctx->cuda_backbone_kv_bf16
             ? mynah_backend_self_attention_bf16_dev(
                   backend, ctx->cuda_qkv, layer_kv, layer_v, position,
-                  attn_dim, position + 1u, cfg->heads, cfg->head_dim,
+                  kv_stride, position + 1u, cfg->heads, cfg->head_dim,
                   1.0f / sqrtf((float)cfg->head_dim), ctx->cuda_attn, local,
                   sizeof(local))
             : mynah_backend_self_attention_dev(
                   backend, ctx->cuda_qkv, (float *)layer_kv, (float *)layer_v,
-                  position, attn_dim, position + 1u, cfg->heads, cfg->head_dim,
+                  position, kv_stride, position + 1u, cfg->heads, cfg->head_dim,
                   1.0f / sqrtf((float)cfg->head_dim), ctx->cuda_attn, local,
                   sizeof(local));
         if (attention_failed != 0 ||
@@ -6853,14 +7197,15 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
     const size_t host_half =
         mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
     const size_t host_slot = position * attn_dim;
+    const size_t device_slot = position * kv_stride;
     for (size_t l = 0; l < cfg->layers; ++l) {
         float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
         /* position >= kv_skip: always a stored slot. */
         void *device_k = pocket_cuda_kv_offset(
-            (float *)pocket_cuda_kv_position_base(ctx, l, 0), host_slot,
+            (float *)pocket_cuda_kv_position_base(ctx, l, 0), device_slot,
             ctx->cuda_backbone_kv_bf16);
         void *device_v = pocket_cuda_kv_offset(
-            (float *)pocket_cuda_kv_position_base(ctx, l, 1), host_slot,
+            (float *)pocket_cuda_kv_position_base(ctx, l, 1), device_slot,
             ctx->cuda_backbone_kv_bf16);
         if (host_kv == NULL ||
             (ctx->cuda_backbone_kv_bf16
@@ -7149,8 +7494,11 @@ static int pocket_cuda_backbone_step_batch_impl(
          * is the extent of one cache plane, not the stride between positions.
          * The old batch path multiplied by max_seq_len here, so the first
          * multi-request step wrote past every per-request cache while the
-         * single-request path (which already uses attn_dim) stayed correct. */
-        scratch->cuda_cache_strides[i] = attn_dim;
+         * single-request path (which already uses attn_dim) stayed correct.
+         * A position-major VMM row (MYNAH_CUDA_KV_VMM) has its own stride,
+         * layers * 2 * attn_dim; the tables are replayed from these host
+         * arrays, so rows of both layouts share one graph. */
+        scratch->cuda_cache_strides[i] = pocket_cuda_kv_stride(ctx);
         if (!ctx->cuda_backbone_valid) all_kv_valid = 0;
         const float *input = input_rows != NULL ? input_rows[i] : ctx->step_input;
         if (input == NULL) return 1;
@@ -8338,8 +8686,16 @@ static int pocket_ctx_pinned(mynah_engine_ctx *ctx, const pocket_ctx_sizes *z,
             pocket_mul(bb_kv_bytes, kv_bf16 ? sizeof(uint16_t) : sizeof(float),
                        &bb_kv_bytes) != 0)
             bb_kv_bytes = SIZE_MAX;
+        /* MYNAH_CUDA_KV_VMM: the allocation will want a VMM cache reserving
+         * at least this much. */
+        const int vmm = pocket_cuda_kv_vmm_planned(ctx);
+        size_t vmm_position = 0u, vmm_reserve = 0u;
+        if (vmm && pocket_cuda_kv_vmm_sizes(state, z->backbone_capacity, kv_bf16,
+                                            &vmm_position, &vmm_reserve) != 0)
+            vmm_reserve = SIZE_MAX;
         ctx->cuda_slot = pocket_cuda_slot_acquire(
-            state, bb_kv_bytes, kv_bf16, bb_positions < z->backbone_capacity);
+            state, bb_kv_bytes, kv_bf16, bb_positions < z->backbone_capacity,
+            vmm, vmm_reserve);
     }
     pocket_cuda_slot *slot = ctx->cuda_slot;
     ctx->step_input = pocket_cuda_host_take(state,
@@ -9054,6 +9410,33 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             continue;
         }
         unsigned char *base = (unsigned char *)ctx->cuda_backbone_kv;
+        if (ctx->cuda_backbone_kv_vmm) {
+            /* Position-major VMM row (MYNAH_CUDA_KV_VMM): each of the voice's
+             * planes [P][attn] lands strided, one position every
+             * layers * 2 * attn elements; one 2D copy per layer and plane,
+             * as many copies as the plane-major path makes. */
+            const size_t row_bytes = attn_dim * kv_elem;
+            const size_t pitch = pocket_cuda_kv_stride(ctx) * kv_elem;
+            for (size_t l = 0; l < layers && span > 0u; ++l) {
+                for (int plane = 0; plane < 2; ++plane) {
+                    const unsigned char *src =
+                        voice + (l * 2u + (size_t)plane) * span * kv_elem;
+                    unsigned char *dst =
+                        (unsigned char *)pocket_cuda_kv_plane(ctx, l, plane);
+                    if (mynah_backend_copy_dev_bytes_2d(
+                            state->backend, dst, pitch, src, row_bytes,
+                            row_bytes, ctx->voice_positions, local,
+                            sizeof(local)) != 0) {
+                        pocket_error(error, capacity, "pocket: CUDA voice copy: %s",
+                                     local[0] != '\0' ? local : "unavailable");
+                        return -1;
+                    }
+                }
+            }
+            ctx->cuda_voice_shared = ctx->cuda_backbone_kv_bf16 ? voice : NULL;
+            ctx->cuda_voice_shared_positions = ctx->voice_positions;
+            continue;
+        }
         for (size_t l = 0; l < layers && span > 0u; ++l) {
             const unsigned char *src = voice + l * 2u * span * kv_elem;
             unsigned char *dst = base + l * 2u * layer_half * kv_elem;
@@ -9097,6 +9480,13 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
          * as `kv`, so it lives on the heap, and only when a row needs it. */
         size_t row_skip[POCKET_MAX_BATCH];
         int any_skip = 0;
+        /* MYNAH_CUDA_KV_VMM: (pitch, V offset) per row, passed only when a
+         * row is position-major; plain rows then get their plane-major pair,
+         * which is the arithmetic the kernels do without the table. */
+        size_t row_strides[2u * POCKET_MAX_BATCH];
+        int any_vmm = 0;
+        for (size_t i = 0; i < count; ++i)
+            if (take[i] != 0u && ctxs[i]->cuda_backbone_kv_vmm) any_vmm = 1;
         for (size_t i = 0; i < count; ++i) {
             const mynah_engine_ctx *ctx = ctxs[i];
             if (take[i] == 0u || ctx->cuda_backbone_kv_skip == 0u) continue;
@@ -9143,6 +9533,9 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             const size_t skip = ctx->cuda_backbone_kv_skip;
             row_ring[rows] = pocket_cuda_kv_stored(ctx);
             row_skip[rows] = skip;
+            row_strides[2u * rows] = pocket_cuda_kv_stride(ctx);
+            row_strides[2u * rows + 1u] = ctx->cuda_backbone_kv_vmm
+                ? attn_dim : row_ring[rows] * attn_dim;
             for (size_t l = 0; l < layers; ++l) {
                 kv[rows * layers + l] = pocket_cuda_kv_plane(ctx, l, 0);
                 /* Device voice cache layout: [layer][K|V][skip][attn]. */
@@ -9204,6 +9597,8 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             /* NULL unless a row skips its prefix: the plain call otherwise. */
             .skip = any_skip ? row_skip : NULL,
             .prefix = any_skip ? prefix : NULL,
+            /* NULL unless a row is position-major (MYNAH_CUDA_KV_VMM). */
+            .kv_strides = any_vmm ? row_strides : NULL,
         };
         mynah_region_begin(MYNAH_RGN_PREFILL);
         const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
@@ -9355,6 +9750,17 @@ static int pocket_seed_backbone(mynah_engine_ctx *ctx, char *error, size_t capac
         }
         ctx->text_prefilled = 0;
         return 0;
+    }
+    if (ctx->cuda_backbone_kv_vmm && ctx->cuda_backbone_kv_skip == 0u) {
+        /* A position-major VMM cache (MYNAH_CUDA_KV_VMM) was planned for the
+         * tile path, which this row is not taking; the host-seeded path
+         * uploads plane-major. Swap it for the plain cache (same capacity
+         * rules, MYNAH_CUDA_KV_GROW growth by copy) and carry on as always.
+         * Not expected: the plan mirrors the tile's own test. */
+        pocket_cuda_drain_before_release(state->backend);
+        pocket_cuda_backbone_release(ctx);
+        ctx->cuda_kv_vmm_refused = 1;
+        (void)pocket_cuda_backbone_alloc(ctx);
     }
     if (ctx->cuda_backbone_kv_skip != 0u) {
         /* A device cache without the voice prefix (MYNAH_CUDA_SHARED_VOICE)

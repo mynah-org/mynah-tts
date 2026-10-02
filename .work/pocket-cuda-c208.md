@@ -485,3 +485,136 @@ Stream RTF p95 (60 s closed loop, 4 voices, one round; 0 stalls, 0 failures ever
 - Temperature-0 identity (same build, SEANet fp32, 24 requests): strip and fusion part 2 median 99 dB (identical;
   a few requests diverge from gang timing alone); ATTN_SPLIT changes the summation order (self-test max rel diff
   5e-7 vs the fast kernel), so trajectories diverge at temperature 0 (median 24 dB), the same class as TF32 vs fp32.
+
+## KV growth in place (VMM) (`MYNAH_CUDA_KV_VMM`, default 0)
+
+Branch `pocket-cuda-kvvmm` from 500479b. Target: the C272 failure ("the CUDA backbone step failed for a device-owned
+request", peak 22.55 GB with `--max-batch 288`). `.work/pocket-cuda-inefficiencies-and-l40s.md` (1.3): the KV growth
+of `pocket_cuda_backbone_reserve` does `cudaMalloc(new)` + 2 x 24 D2D copies + a stream sync + `cudaFree(old)` inside
+the step pre-flight, so every growth briefly holds old + new (a 512 -> 768 stored-position growth of one 24L BF16 row
+holds 48 + 72 MB to end at 72 MB) and stalls the stream twice (sync + the implicit sync of `cudaFree`). With the flag
+on, a growable row is a virtual address range whose growth maps more device pages after the mapped ones: no copy, no
+sync of ours, no second allocation, the base pointer never moves. Off: no driver call is made, every allocation, layout,
+pointer table and kernel argument value is the old one.
+
+### Design
+- **API, no `-lcuda`.** `cuMemGetAllocationGranularity`, `cuMemAddressReserve/Free`, `cuMemCreate/Release`, `cuMemMap/
+  Unmap`, `cuMemSetAccess`, `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED)` are resolved
+  at run time through the runtime (`cudaGetDriverEntryPointByVersion(..., 12000, ...)` from CUDA 12.5,
+  `cudaGetDriverEntryPoint` before); only the driver TYPES come from `<cuda.h>`. Reason: the compile-only CI jobs
+  (sm_70/89/90 on 12.6, sm_120 on 12.8) run the built binary in a container without a driver; a hard `-lcuda` would
+  need the stub library at link time and leave a binary that does not load where `libcuda.so.1` is missing. The link
+  line is unchanged (`-lcublas` + the runtime nvcc adds). Checked with clang `-x cuda` against the 12.4 and 12.6
+  runtime headers (host + sm_89); not compiled with nvcc here.
+- **Probe once, at model load** (`mynah_backend_kv_vmm_probe`): entry points present, VMM attribute set, granularity
+  (`CU_MEM_ALLOC_GRANULARITY_MINIMUM`, 2 MiB on the L4). Physical memory is `CU_MEM_ALLOCATION_TYPE_PINNED` at
+  `CU_MEM_LOCATION_TYPE_DEVICE` (VRAM; never host memory), read-write access for the device. Start-up line:
+  `mynah-tts: MYNAH_CUDA_KV_VMM=1: backbone KV rows of the prefill tile path are position-major VMM ranges that grow in
+  place (granularity 2048 KiB, growth chunk 256 positions, reservation in units of 1024 positions)`. Otherwise one line
+  `mynah-tts: warning: MYNAH_CUDA_KV_VMM=1 ignored (<reason>); backbone KV growth keeps cudaMalloc + copy`, also when
+  `MYNAH_CUDA_RESIDENT`, `MYNAH_CUDA_KV_GROW` or `MYNAH_CUDA_PREFILL_TILE` is off.
+- **Which rows.** `pocket_cuda_kv_vmm_planned`: the probe passed and `pocket_cuda_kv_grow_expected(ctx)` (the
+  prefill-tile, device-owned rows that MYNAH_CUDA_KV_GROW already makes growable). Everything else keeps the plain
+  cache. A VMM allocation that fails for any reason logs once and leaves that context on the plain cache
+  (`cuda_kv_vmm_refused`).
+- **Layout (position-major).** Row bytes `[stored position][layer][K|V][attn]`: stored position s is absolute s + S
+  (S = `cuda_backbone_kv_skip`, the shared-voice strip). One position = layers x 2 x attn elements = 24 x 2 x 1024 x 2 B
+  = 96 KiB (BF16), 21.3 positions per 2 MiB page; mapping per K/V plane instead would have wasted up to a page per plane
+  (48 per row). Expressed with the existing parameters: position stride = `pocket_cuda_kv_stride(ctx)` = layers x 2 x
+  attn (= 49152 elements; attn for plain rows), layer plane base = row + (l x 2 + plane) x attn
+  (`pocket_cuda_kv_plane`), position-addressed base = plane - S x stride (`pocket_cuda_kv_position_base`, integer
+  arithmetic, never dereferenced below S, exactly the phase-2 contract with the stride in place of attn). Alignment
+  for the fast/split kernels holds (base 2 MiB aligned, plane offsets multiples of 2 KiB, stride % 8 == 0).
+- **Reservation.** Per row `round_up(max_seq_len, 1024)` positions x position bytes, `max_seq_len` being the host
+  ceiling that `pocket_cuda_backbone_reserve` never passes (voice + text capacity + max_steps + 1, ~1700 with the
+  default budget -> 2048 positions = 192 MiB of addresses, no memory). A long-form text that raises the ceiling goes
+  through `mynah_engine_pocket_reserve_text`, which releases and re-allocates the cache (new reservation).
+- **Allocation** maps `kv_bytes` (the same stored-positions x position-bytes as the plain cache) rounded up to pages;
+  the row's capacity is then everything the mapped pages hold (`mapped / position_bytes + S`, capped at the ceiling),
+  i.e. the page rounding is headroom, not waste.
+- **Growth** (`pocket_cuda_backbone_reserve`, VMM branch): target = old capacity + whole chunks of
+  `MYNAH_CUDA_KV_VMM_CHUNK` positions (default 256, the old growth cadence) covering `needed`, mapped size rounded up
+  to pages, one `cuMemCreate + cuMemMap + cuMemSetAccess` per growth (one chunk, unmappable on its own later). No
+  copy, no `mynah_backend_sync`, no free. `MYNAH_CUDA_KV_GROW_LOG=1` prints "grew A -> B positions in place (VMM, ...)".
+- **Release** (`pocket_cuda_backbone_release`, slot destroy): unmap + release every chunk, free the reservation, after
+  the existing drain. `mynah_backend_dev_free` on a VMM pointer is routed to the same release (a lookup only while a
+  range is live), so no path can `cudaFree` a VMM address.
+- **Slot pool** (decision: keep the mappings, trim on reuse). A parked VMM row keeps its mapped pages, like a parked
+  grown plain cache. `pocket_cuda_slot_acquire(..., vmm, reserve)`: a VMM request takes only a VMM set whose
+  reservation covers its ceiling (tightest mapped size at or above its start, else the largest), a plain request never
+  takes a VMM set. `pocket_cuda_backbone_alloc` then resizes in place to [start size, 2 x start size]: maps more if
+  short, unmaps whole trailing chunks if above twice the need (the bound the plain path enforces by free +
+  reallocate). `cuMemUnmap` is documented as possibly synchronous: only on this admission-time trim of an idle set
+  and on release, where the plain path did a `cudaFree` anyway.
+- **Graph capture.** No map/unmap inside a capture: every growth caller runs before `batch_begin`/`graph_begin`
+  (batched step pre-check `pocket_cuda_backbone_step_batch_impl`, step pre-flight in `pocket_step_batch`, single-row
+  step, prefill tile before its staging, upload); the one-sync chain queues the condition projection before the
+  backbone pre-check, uncaptured. Growth adds pages after the ones in use, so work already queued on the row is
+  unaffected, and the base never moves, so graph-replayed host tables stay valid trivially.
+
+### Every reader/writer of a VMM row
+| site | change |
+|---|---|
+| `k_self_attention_bf16_batch_fast`, `_split`, legacy `k_self_attention_bf16_batch<SHARED>`, f32 `k_self_attention_batch` | none: per-row `cache_strides[i]` already used for the K/V write and every read; the engine now passes `pocket_cuda_kv_stride` (batched step tables, pad rows keep attn) |
+| single-row `k_self_attention_bf16<SHARED>`, f32 `k_self_attention` | none in the kernels; `pocket_cuda_backbone_step` passes `kv_stride` instead of `attn_dim` and mirrors the new slot from `position * kv_stride` |
+| `k_gather_kv_bf16_batch` / `k_gather_kv_batch` (host mirror) | none: indexes `positions * cache_strides` |
+| RoPE (`k_rope_qk_batch`, `k_rope_qk_bias_batch`) | none: touches only qkv; the attention kernels store K/V |
+| `k_tile_rope_store`, `k_tile_attention`, `k_tile_attention_grouped` | new nullable `strides` table, per row (pitch, V offset): K slot at `kv + slot * pitch`, V at `kv + voff + slot * pitch`; NULL = (dim, ring x dim), the old arithmetic; `mynah_backend_tile_desc.kv_strides`, staged after the skips only when non-NULL (the plain staging layout is unchanged); validated on the host (no K/V overlap) |
+| prefill tile voice copy (`pocket_cuda_prefill_tile`, S = 0 rows) | one `cudaMemcpy2DAsync` per layer and plane (`mynah_backend_copy_dev_bytes_2d`): the voice plane `[P][attn]` lands strided; 48 copies as before |
+| prefill tile kv/ring tables | kv = `pocket_cuda_kv_plane`, ring = stored capacity (never wraps), `kv_strides` only if a VMM row is in the call; plain rows in the same call get their plane-major pair |
+| shared-voice prefix reads (`MYNAH_CUDA_SHARED_VOICE`, strip) | unchanged: prefix planes come from the device voice cache; a stripped VMM row is biased by S x stride |
+| `pocket_cuda_backbone_upload` | refuses a VMM row (device-owned only; unreachable) |
+| `pocket_seed_backbone` non-tile path | a VMM row with S = 0 is swapped for a plain cache (`cuda_kv_vmm_refused`) and continues as before; S > 0 keeps the phase-2 behaviour (CPU). Not expected: the plan mirrors the tile's test |
+| `pocket_cuda_backbone_reserve` | VMM branch above |
+| slot park/acquire/free, release | VMM flags and reservation carried; free by kind |
+| padding rows (`cuda_pad_kv`) | unchanged (own plain one-position cache, stride attn); mixed batches of plain and VMM rows share graphs (strides are per-row replayed tables; the fast-kernel eligibility, stride % 8 and 16-byte alignment, is the same for both) |
+
+### Memory accounting
+- `device_memory_free_bytes` (`cudaMemGetInfo`) already counts mapped VMM pages as used; the reservation is not memory.
+- New backend metrics (appended to `mynah_tts_backend_metrics`, exported on `/metrics`): `mynah_backend_kv_vmm_rows`
+  (live + parked VMM rows), `mynah_backend_kv_vmm_mapped_bytes`, `mynah_backend_kv_vmm_reserved_bytes` (gauges),
+  `mynah_backend_kv_vmm_maps_total`, `mynah_backend_kv_vmm_unmaps_total` (counters). The `/metrics` buffer went from
+  16 KiB to 24 KiB (it was at ~15 KiB).
+- `cuda_backbone_kv_bytes` of a VMM row is its mapped size, `cuda_backbone_kv_reserved` its reservation. First VMM row:
+  "pocket: first CUDA backbone KV row in a VMM range: N positions mapped (B bytes), R bytes reserved".
+- Start-up reservations (slot-pool prefill, width-bucket warm-up, +17.5 GB at 288) are unchanged: a prefilled VMM set
+  maps the same start size a plain set allocates. What goes is the growth transient and the stream stalls.
+
+### Self-test (`--gpu-self-test`, always run when the device supports VMM; skipped otherwise)
+`cuda_kv_vmm_self_test`: (1) a range keeps its bytes and base across a growth in place (1 -> 3 pages) and a trim back
+to 1 page, refuses a resize past its reservation, and is released by `mynah_backend_dev_free`; (2) the fast, split
+and legacy decode attention (with shared prefix tables) and the K/V gather give bit-identical results on a
+plane-major cache and on the same values position-major in a VMM range (3 layers, layers 0 and 2, positions 5/130/300,
+one row stripped by 3 positions and biased below the start of the range, so a stray read below the skip faults).
+
+### To test on the L4 (same build for every A/B)
+1. `make cuda cuda-server CUDA_ARCH=sm_89`; `./build/cuda/mynah-tts --gpu-self-test cuda` PASS (with
+   `MYNAH_CUDA_KV_VMM=1` a "KV VMM self-test skipped" line would mean the probe failed). Server start with the flag:
+   the start-up line, no warning.
+2. Pedantic: `MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0 MYNAH_CUDA_KV_VMM=1 --pocket-self-check` PASS; again with
+   `MYNAH_CUDA_SHARED_VOICE=1` (strip: biased VMM rows) and with `MYNAH_CUDA_KV_GROW_INITIAL_STEPS=8`.
+3. Temperature-0 md5 identity, 24 seeded requests (4 voices, SEANet fp32), flag off vs on, same build and the same
+   concurrency (gang-history caveat: compare off vs off first). The layout must not change a value. Repeat with
+   `MYNAH_CUDA_KV_GROW_INITIAL_STEPS=8 MYNAH_CUDA_KV_GROW_LOG=1` (growth in place mid-request: the log must say
+   "in place (VMM"), with `MYNAH_CUDA_SHARED_VOICE=1`, `MYNAH_CUDA_ATTN_SPLIT=1`, `MYNAH_CUDA_BACKBONE_ATTN=legacy`,
+   `MYNAH_CUDA_TILE_ATTN_GROUPED=0`, a single request alone (single-row step) and a multi-segment / appended text.
+4. `compute-sanitizer --tool memcheck` on a short C4 run with `MYNAH_CUDA_KV_VMM=1 MYNAH_CUDA_SHARED_VOICE=1
+   MYNAH_CUDA_KV_GROW_INITIAL_STEPS=8`.
+5. Knee with `--max-batch 288`, best flag set, C256/C272/C288, flag off vs on (and `MYNAH_CUDA_KV_VMM_CHUNK=64`):
+   failures, stream RTF p95, stalls, `nvidia-smi` peak, `mynah_backend_kv_vmm_mapped_bytes` and maps/unmaps over the
+   run. Expect C272 without "the CUDA backbone step failed for a device-owned request".
+6. Performance of the layout: nsys `--cuda-graph-trace=node` at C208, attention kernel time per step off vs on, and
+   the CUDA API trace of `cuMemCreate/cuMemMap/cuMemSetAccess` (cost of one growth; whether it stalls the stream).
+
+### Risks
+- **TLB reach.** Plane-major: one layer's K plane of a row spans n x 2 KiB (one or two 2 MiB pages); position-major:
+  the same reads are 96 KiB apart, so one layer's attention touches every page of the row (~15 pages at n ~ 300),
+  ~10x more distinct pages per kernel at C208+. DRAM efficiency per access is the same (each read is a full 128-byte
+  head row either way), but TLB misses could slow the decode attention. Step 6 decides. If it costs, the alternative is
+  a block-major page ([layer][K|V][21 positions][attn] per 2 MiB page), which needs a page-indexed kernel, not strides.
+- The driver documents `cuMemMap`/`cuMemSetAccess`/`cuMemUnmap` as possibly synchronous: a growth may still stall the
+  device (without the copy, the second allocation and the peak). Measure in step 6; the chunk knob trades growth count
+  against mapped headroom.
+- f32 KV VMM rows (192 KiB per position) are supported by the same code but untested; the default KV is BF16.
+- A VMM row that unexpectedly leaves the tile path is re-allocated plain (S = 0) or goes to the CPU (S > 0), as the
+  phase-2 rows already did.
