@@ -738,11 +738,32 @@ __device__ __forceinline__ static float decoder_elu_value(float x, float alpha) 
     return x > 0.0f ? x : alpha * (expf(x) - 1.0f);
 }
 
+/* One input value of a fused decoder op, resolved on the fly.  The producer
+ * may have left work for its reader (MYNAH_CUDA_DECODER_FUSE):
+ *   bias_on: the producing GEMM ran with beta = 0, so `input` holds the bare
+ *            accumulator and the bias is added here, (acc + bias) in fp32,
+ *            the one rounding the beta = 1 epilogue on a bias-filled C did
+ *            (alpha = beta = 1, so every epilogue form is round(acc + C)).
+ *            A null bias adds +0.0f, as k_decoder_bias_batch wrote 0.0f.
+ *   resid:   the residual-block sum was not written: the value is
+ *            resid + (acc + bias), the order k_decoder_residual_batch used
+ *            (base += add, with add the finished 1x1 output).
+ *   elu:     the reader's pre-activation, last, as before. */
+__device__ __forceinline__ static float decoder_lazy_value(
+    float *const *inputs, float *const *resid, const float *bias, int bias_on,
+    int request, int channel, size_t offset, int elu, float alpha) {
+    float value = inputs[request][offset];
+    if (bias_on) value = value + (bias == nullptr ? 0.0f : bias[channel]);
+    if (resid != nullptr) value = resid[request][offset] + value;
+    return elu ? decoder_elu_value(value, alpha) : value;
+}
+
 template <typename T>
 __global__ static void k_decoder_causal_columns_fused(
     float *const *previous, float *const *inputs, T *const *columns,
     int batch, int channels, int length, int kernel, int dilation, int tail,
-    int elu, float alpha) {
+    int elu, float alpha, float *const *resid, const float *bias,
+    int bias_on) {
     const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     const int per_request = channels * kernel * length;
     const int total = batch * per_request;
@@ -758,9 +779,10 @@ __global__ static void k_decoder_causal_columns_fused(
     if (source < tail) {
         value = previous[request][(size_t)channel * (size_t)tail + (size_t)source];
     } else if (source < tail + length) {
-        value = inputs[request][(size_t)channel * (size_t)length +
-                                (size_t)(source - tail)];
-        if (elu) value = decoder_elu_value(value, alpha);
+        value = decoder_lazy_value(
+            inputs, resid, bias, bias_on, request, channel,
+            (size_t)channel * (size_t)length + (size_t)(source - tail), elu,
+            alpha);
     }
     decoder_put(columns[request], (size_t)local, value);
 }
@@ -772,7 +794,10 @@ __global__ static void k_decoder_copy_tail_fused(float *const *inputs,
                                                  float *const *previous,
                                                  int batch, int channels,
                                                  int length, int tail, int elu,
-                                                 float alpha) {
+                                                 float alpha,
+                                                 float *const *resid,
+                                                 const float *bias,
+                                                 int bias_on) {
     const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     const int per_request = channels * tail;
     const int total = batch * per_request;
@@ -781,9 +806,29 @@ __global__ static void k_decoder_copy_tail_fused(float *const *inputs,
     const int local = index - request * per_request;
     const int channel = local / tail;
     const int pos = local - channel * tail;
-    const float value = inputs[request][(size_t)channel * (size_t)length +
-                                        (size_t)(length - tail + pos)];
-    previous[request][local] = elu ? decoder_elu_value(value, alpha) : value;
+    previous[request][local] = decoder_lazy_value(
+        inputs, resid, bias, bias_on, request, channel,
+        (size_t)channel * (size_t)length + (size_t)(length - tail + pos), elu,
+        alpha);
+}
+
+/* MYNAH_CUDA_DECODER_FUSE: k_decoder_residual_batch for a 1x1 output whose
+ * GEMM ran with beta = 0: base = base + (add + bias), the same two fp32
+ * additions in the same order as the bias-filled GEMM plus the residual. */
+__global__ static void k_decoder_residual_bias_batch(float *const *base,
+                                                     float *const *add,
+                                                     const float *bias,
+                                                     int batch, int channels,
+                                                     int length) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int offset = index - request * per_request;
+    const float value =
+        add[request][offset] + (bias == nullptr ? 0.0f : bias[offset / length]);
+    base[request][offset] = base[request][offset] + value;
 }
 
 __global__ static void k_decoder_convtr_batch(
@@ -826,7 +871,10 @@ template <typename T>
 __global__ static void k_decoder_convtr_gather(float *const *inputs, T *x,
                                                int batch, int channels,
                                                int length, int elu = 0,
-                                               float alpha = 0.0f) {
+                                               float alpha = 0.0f,
+                                               float *const *resid = nullptr,
+                                               const float *bias = nullptr,
+                                               int bias_on = 0) {
     const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     const int n = batch * length;
     if (index >= channels * n) return;
@@ -834,8 +882,10 @@ __global__ static void k_decoder_convtr_gather(float *const *inputs, T *x,
     const int j = index - channel * n;
     const int request = j / length;
     const int t = j - request * length;
-    const float value = inputs[request][(size_t)channel * length + t];
-    decoder_put(x, (size_t)index, elu ? decoder_elu_value(value, alpha) : value);
+    decoder_put(x, (size_t)index,
+                decoder_lazy_value(inputs, resid, bias, bias_on, request,
+                                   channel, (size_t)channel * length + t, elu,
+                                   alpha));
 }
 
 __global__ static void k_decoder_convtr_overlap(const float *y, float *const *full,
@@ -858,6 +908,52 @@ __global__ static void k_decoder_convtr_overlap(const float *y, float *const *fu
         value += y[(size_t)oc * kernel + k + (size_t)(request * length + i) * m];
     }
     full[request][local] = value;
+}
+
+/* MYNAH_CUDA_DECODER_FUSE: k_decoder_convtr_overlap, k_decoder_convtr_fold_batch
+ * and k_decoder_copy_prefix_batch in one pass that never writes `full`.  The
+ * thread of output sample t sums its taps exactly as the overlap kernel does
+ * (bias first, taps in the same order); for t < tail it also adds the carried
+ * partial (the fold's `row[pos] += partial`) and, being the only reader and
+ * writer of partial[t], sums the tail sample output_len + t the same way and
+ * stores it minus the bias as the next partial (the fold's second line).
+ * Needs tail <= output_len, so no fold write lands on a sample the fold reads
+ * (true for every SEANet transposed conv: tail = stride <= length * stride). */
+__device__ __forceinline__ static float decoder_convtr_tap_sum(
+    const float *y, const float *bias, int request, int oc, int t,
+    int out_channels, int length, int kernel, int stride) {
+    const size_t m = (size_t)out_channels * kernel;
+    float value = bias == nullptr ? 0.0f : bias[oc];
+    for (int k = t % stride; k < kernel && k <= t; k += stride) {
+        const int i = (t - k) / stride;
+        if (i >= length) continue;
+        value += y[(size_t)oc * kernel + k + (size_t)(request * length + i) * m];
+    }
+    return value;
+}
+
+__global__ static void k_decoder_convtr_overlap_out(
+    const float *y, float *const *outputs, float *const *partial,
+    const float *bias, int batch, int out_channels, int length, int output_len,
+    int kernel, int stride, int tail) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = out_channels * output_len;
+    if (index >= batch * per_request) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int oc = local / output_len;
+    const int t = local - oc * output_len;
+    float value = decoder_convtr_tap_sum(y, bias, request, oc, t, out_channels,
+                                         length, kernel, stride);
+    if (t < tail) {
+        float *state = partial[request] + (size_t)oc * (size_t)tail;
+        value += state[t];
+        const float next = decoder_convtr_tap_sum(
+            y, bias, request, oc, output_len + t, out_channels, length, kernel,
+            stride);
+        state[t] = next - (bias == nullptr ? 0.0f : bias[oc]);
+    }
+    outputs[request][local] = value;
 }
 
 /* Single-request form of k_decoder_convtr_overlap (batch == 1, no pointer
@@ -4913,10 +5009,29 @@ static bool decoder_convtr_gemm_enabled(void) {
 }
 
 /* MYNAH_CUDA_DECODER_FUSE: in the cross-request decoder, ELU and the causal
- * window are folded into the im2col / gather kernels that read them (same
- * float operations, so the audio is bit-identical). */
+ * window are folded into the im2col / gather kernels that read them, the
+ * residual add and (see below) the conv bias into the next reader, and the
+ * transposed conv's overlap, fold and prefix copy into one pass (same float
+ * operations in the same order, so the audio is bit-identical). */
 static bool decoder_fuse_enabled(void) {
     static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_FUSE", false);
+    return on;
+}
+
+/* Part of MYNAH_CUDA_DECODER_FUSE (default on with it): a conv1d whose output
+ * is read by a fused kernel runs its GEMM with beta = 0 and leaves the bias to
+ * that reader instead of k_decoder_bias_batch + beta = 1.  The only part of
+ * the fusion that leans on cuBLAS: the same algorithm must be picked for both
+ * beta values (no serial split-K that folds C in before the last partial), so
+ * it can be switched off alone (MYNAH_CUDA_DECODER_FUSE_BIAS=0). */
+static bool decoder_fuse_bias_enabled(void) {
+    static const bool on = decoder_fuse_enabled() &&
+        cuda_env_enabled("MYNAH_CUDA_DECODER_FUSE_BIAS", true);
+    return on;
+}
+
+static bool decoder_one_gemm_enabled(void) {
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false);
     return on;
 }
 
@@ -5180,8 +5295,12 @@ static bool cuda_decoder_graph_reuse_enabled(void) {
 
 static size_t decoder_conv1d_upload_count(const cuda_decoder_op *op) {
     /* causal-window pointers, columns pointers, output/weight pointers and
-     * the tail copy pointers; the tail-free case has no window or tail copy. */
-    return op != nullptr && op->tail > 0u ? 9u : 4u;
+     * the tail copy pointers; the tail-free case has no window or tail copy.
+     * The fused path (MYNAH_CUDA_DECODER_FUSE) uploads state, columns, input,
+     * residual, output and weight tables: 6, which the tail-free count must
+     * cover as well. */
+    if (op == nullptr) return 0u;
+    return op->tail > 0u ? 9u : decoder_fuse_enabled() ? 6u : 4u;
 }
 
 static size_t decoder_convtr_upload_count(const cuda_decoder_op *op) {
@@ -5444,19 +5563,32 @@ static int decoder_elu_batch(cuda_backend_state *backend,
     return ce(cudaGetLastError(), e, ec);
 }
 
+/* add_bias: `add` is a bare GEMM accumulator (beta = 0, fused bias); the
+ * bias of the op that produced it is added first, as its epilogue would have
+ * (MYNAH_CUDA_DECODER_FUSE). */
 static int decoder_residual_batch(cuda_backend_state *backend,
                                   float *const *base, float *const *add,
-                                  size_t batch, size_t elements, char *e,
+                                  size_t batch, size_t channels, size_t length,
+                                  int add_bias, const float *bias, char *e,
                                   size_t ec) {
+    size_t elements = 0u;
     size_t total = 0u;
     int blocks = 0;
-    if (!decoder_mul(batch, elements, &total) ||
+    if (!decoder_mul(channels, length, &elements) ||
+        !decoder_mul(batch, elements, &total) ||
         !decoder_batch_launch_range(total, &blocks) ||
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, base, batch,
                             e, ec) != 0 ||
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, add, batch,
                             e, ec) != 0)
         return -1;
+    if (add_bias) {
+        k_decoder_residual_bias_batch<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr0),
+            decoder_current_table(backend, backend->dev_decoder_ptr1), bias,
+            (int)batch, (int)channels, (int)length);
+        return ce(cudaGetLastError(), e, ec);
+    }
     k_decoder_residual_batch<<<blocks, 256, 0, backend->stream>>>(
         decoder_current_table(backend, backend->dev_decoder_ptr0),
         decoder_current_table(backend, backend->dev_decoder_ptr1),
@@ -5465,15 +5597,56 @@ static int decoder_residual_batch(cuda_backend_state *backend,
     return ce(cudaGetLastError(), e, ec);
 }
 
+/* Whether a decoder op of the gang reads its input through the fused
+ * kernels (MYNAH_CUDA_DECODER_FUSE), so a deferred bias or residual sum can
+ * be resolved there.  Must match the path decoder_conv1d_batch and
+ * decoder_convtr_batch take for the same arguments. */
+static bool decoder_conv_fused_path(const cuda_decoder_op *op, size_t batch,
+                                    size_t length) {
+    return op != nullptr && op->kind == CUDA_DECODER_CONV &&
+           decoder_fuse_enabled() && !(decoder_one_gemm_enabled() && batch > 1u) &&
+           op->tail <= length;
+}
+
+static bool decoder_convtr_gemm_path(const cuda_backend_state *backend,
+                                     const cuda_decoder_op *op, size_t batch,
+                                     size_t length) {
+    const size_t n = batch * length;
+    return op != nullptr && op->kind == CUDA_DECODER_CONVTR &&
+           decoder_convtr_gemm_enabled() && op->groups == 1 &&
+           (size_t)op->in_channels * n <= backend->dec_tr_x_cap &&
+           (size_t)op->out_channels * (size_t)op->kernel * n <=
+               backend->dec_tr_y_cap;
+}
+
+static bool decoder_lazy_reader(const cuda_backend_state *backend,
+                                const cuda_decoder_op *op, size_t batch,
+                                size_t length) {
+    if (op == nullptr || !decoder_fuse_enabled()) return false;
+    if (op->kind == CUDA_DECODER_CONV)
+        return decoder_conv_fused_path(op, batch, length);
+    if (op->kind == CUDA_DECODER_CONVTR)
+        return decoder_convtr_gemm_path(backend, op, batch, length) &&
+               op->tail <= length * (size_t)op->stride;
+    return false;
+}
+
 /* elu_input: the op reads ELU(input). Fused, the ELU happens inside the
  * column kernel; otherwise ELU(input) is first written to elu_out (which may
- * be `inputs` itself for an in-place ELU) exactly as before the fusion. */
+ * be `inputs` itself for an in-place ELU) exactly as before the fusion.
+ * MYNAH_CUDA_DECODER_FUSE only (fused path, else the call is refused):
+ *   resid / in_bias_on / in_bias: the input is resolved on the fly as
+ *     resid + (input + in_bias) before the ELU (decoder_lazy_value);
+ *   defer_bias: the GEMM runs with beta = 0 and this op's bias is left to the
+ *     reader of `outputs`, which must then be told (in_bias_on). */
 static int decoder_conv1d_batch(cuda_backend_state *backend,
                                 mynah_backend_decoder *const *decoders,
                                 cuda_decoder_op *const *ops,
                                 float *const *inputs, float *const *outputs,
                                 size_t batch, size_t length, int elu_input,
-                                float alpha, float *const *elu_out, char *e,
+                                float alpha, float *const *elu_out,
+                                float *const *resid, int in_bias_on,
+                                const float *in_bias, int defer_bias, char *e,
                                 size_t ec) {
     if (backend == nullptr || decoders == nullptr || ops == nullptr ||
         inputs == nullptr ||
@@ -5505,9 +5678,13 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         output_elements > (size_t)INT_MAX)
         return -1;
 
-    static const bool one_gemm = cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false);
-    const bool fused = decoder_fuse_enabled() && !(one_gemm && batch > 1u) &&
-                       op->tail <= length;
+    const bool one_gemm = decoder_one_gemm_enabled();
+    const bool fused = decoder_conv_fused_path(op, batch, length);
+    if (((resid != nullptr || in_bias_on) && !fused) ||
+        (defer_bias && (one_gemm && batch > 1u))) {
+        set_error(e, ec, "resident decoder fused input on an unfused conv");
+        return -1;
+    }
     if (elu_input && !fused) {
         size_t elu_elements = 0u;
         if (elu_out == nullptr ||
@@ -5662,6 +5839,15 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, pin, batch,
                                 e, ec) != 0)
             return -1;
+        /* The residual table rides on channel 3 until the weight table
+         * replaces it below; both kernels that read it are launched first. */
+        float *const *resid_table = nullptr;
+        if (resid != nullptr) {
+            if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr3, resid,
+                                    batch, e, ec) != 0)
+                return -1;
+            resid_table = decoder_current_table(backend, backend->dev_decoder_ptr3);
+        }
         if (bf16) {
             k_decoder_causal_columns_fused<<<blocks, 256, 0, backend->stream>>>(
                 decoder_current_table(backend, backend->dev_decoder_ptr0),
@@ -5669,14 +5855,16 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
                 reinterpret_cast<uint16_t *const *>(
                     decoder_current_table(backend, backend->dev_decoder_ptr1)),
                 (int)batch, op->in_channels, (int)out_len, op->kernel,
-                op->dilation, (int)op->tail, elu_input, alpha);
+                op->dilation, (int)op->tail, elu_input, alpha, resid_table,
+                in_bias, in_bias_on);
         } else {
             k_decoder_causal_columns_fused<<<blocks, 256, 0, backend->stream>>>(
                 decoder_current_table(backend, backend->dev_decoder_ptr0),
                 decoder_current_table(backend, backend->dev_decoder_ptr2),
                 decoder_current_table(backend, backend->dev_decoder_ptr1),
                 (int)batch, op->in_channels, (int)out_len, op->kernel,
-                op->dilation, (int)op->tail, elu_input, alpha);
+                op->dilation, (int)op->tail, elu_input, alpha, resid_table,
+                in_bias, in_bias_on);
         }
         if (ce(cudaGetLastError(), e, ec) != 0) return -1;
         /* The carried state moves now, before the bias and the GEMM write
@@ -5692,7 +5880,7 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
                 decoder_current_table(backend, backend->dev_decoder_ptr2),
                 decoder_current_table(backend, backend->dev_decoder_ptr0),
                 (int)batch, op->in_channels, (int)length, (int)op->tail,
-                elu_input, alpha);
+                elu_input, alpha, resid_table, in_bias, in_bias_on);
             if (ce(cudaGetLastError(), e, ec) != 0) return -1;
         }
     } else if (bf16) {
@@ -5715,18 +5903,22 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, p2, batch, e,
                             ec) != 0)
         return -1;
-    if (!decoder_batch_launch_range(output_elements, &blocks)) return -1;
-    k_decoder_bias_batch<<<blocks, 256, 0, backend->stream>>>(
-        decoder_current_table(backend, backend->dev_decoder_ptr2), op->bias,
-        (int)batch, op->out_channels,
-        (int)out_len);
-    if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    if (!defer_bias) {
+        if (!decoder_batch_launch_range(output_elements, &blocks)) return -1;
+        k_decoder_bias_batch<<<blocks, 256, 0, backend->stream>>>(
+            decoder_current_table(backend, backend->dev_decoder_ptr2), op->bias,
+            (int)batch, op->out_channels,
+            (int)out_len);
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+    }
     if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr3, p3, batch, e,
                             ec) != 0 ||
         cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
         return -1;
     const float alpha = 1.0f;
-    const float beta = 1.0f;
+    /* beta = 0 with a deferred bias: the bare accumulator, the bias is added
+     * by the reader (decoder_lazy_value / k_decoder_residual_bias_batch). */
+    const float beta = defer_bias ? 0.0f : 1.0f;
     if (bf16) {
         /* Same batched GEMM, BF16 operands on tensor cores, FP32 accumulate,
          * FP32 output on top of the bias written above (beta = 1). */
@@ -5786,12 +5978,17 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
 }
 
 /* elu_input: the op reads ELU(input), applied in place first unless the
- * GEMM gather can apply it on the fly (MYNAH_CUDA_DECODER_FUSE). */
+ * GEMM gather can apply it on the fly (MYNAH_CUDA_DECODER_FUSE).  With the
+ * fusion on the GEMM path the gather also resolves a deferred residual / bias
+ * of the producer (resid, in_bias_on, in_bias; refused elsewhere), and one
+ * kernel writes `outputs` and folds the carried partial without `full`. */
 static int decoder_convtr_batch(cuda_backend_state *backend,
                                 cuda_decoder_op *const *ops,
                                 float *const *inputs, float *const *outputs,
                                 size_t batch, size_t length, int elu_input,
-                                float alpha, char *e, size_t ec) {
+                                float alpha, float *const *resid,
+                                int in_bias_on, const float *in_bias, char *e,
+                                size_t ec) {
     if (backend == nullptr || ops == nullptr || inputs == nullptr ||
         outputs == nullptr || batch == 0u || batch > backend->batch_meta_cap ||
         ops[0] == nullptr || length == 0u || length > ops[0]->max_in_len)
@@ -5810,12 +6007,16 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
         full_elements > (size_t)INT_MAX)
         return -1;
     const size_t gemm_n = batch * length;
-    const bool gemm_path =
-        decoder_convtr_gemm_enabled() && op->groups == 1 &&
-        (size_t)op->in_channels * gemm_n <= backend->dec_tr_x_cap &&
-        (size_t)op->out_channels * (size_t)op->kernel * gemm_n <=
-            backend->dec_tr_y_cap;
-    const int gather_elu = elu_input && gemm_path && decoder_fuse_enabled();
+    const bool gemm_path = decoder_convtr_gemm_path(backend, op, batch, length);
+    const bool fused = gemm_path && decoder_fuse_enabled();
+    /* One pass for overlap + fold + prefix copy (see
+     * k_decoder_convtr_overlap_out); needs tail <= output_len. */
+    const bool fused_out = fused && op->tail <= output_len;
+    if ((resid != nullptr || in_bias_on) && !fused_out) {
+        set_error(e, ec, "resident decoder fused input on an unfused transpose");
+        return -1;
+    }
+    const int gather_elu = elu_input && fused;
     if (elu_input && !gather_elu) {
         size_t elu_elements = 0u;
         if (!decoder_mul((size_t)op->in_channels, length, &elu_elements) ||
@@ -5826,6 +6027,86 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
     }
     float *p0[CUDA_BATCH_META_CAP];
     float *p1[CUDA_BATCH_META_CAP];
+    if (fused_out) {
+        /* No `full`: gather input (+ residual), GEMM, then one kernel writes
+         * the destination and carries the partial tail. */
+        size_t out_elements = 0u;
+        int out_blocks = 0;
+        for (size_t i = 0; i < batch; ++i) {
+            if (ops[i] == nullptr || (op->tail > 0u && ops[i]->partial == nullptr))
+                return -1;
+            p0[i] = inputs[i];
+            p1[i] = outputs[i];
+        }
+        if (!decoder_mul(batch, (size_t)op->out_channels, &out_elements) ||
+            !decoder_mul(out_elements, output_len, &out_elements) ||
+            out_elements > (size_t)INT_MAX ||
+            !decoder_batch_launch_range(out_elements, &out_blocks) ||
+            decoder_upload_ptrs(backend, backend->dev_decoder_ptr0, p0, batch, e,
+                                ec) != 0)
+            return -1;
+        float *const *resid_table = nullptr;
+        if (resid != nullptr) {
+            if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr3, resid,
+                                    batch, e, ec) != 0)
+                return -1;
+            resid_table = decoder_current_table(backend, backend->dev_decoder_ptr3);
+        }
+        const int m = op->out_channels * op->kernel;
+        const int n = (int)gemm_n;
+        const int x_total = op->in_channels * n;
+        uint16_t *x_bf16 = op->weight_bf16 != nullptr
+            ? reinterpret_cast<uint16_t *>(backend->dec_tr_x) : nullptr;
+        if (x_bf16 != nullptr) {
+            k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                x_bf16, (int)batch, op->in_channels, (int)length, gather_elu,
+                alpha, resid_table, in_bias, in_bias_on);
+        } else {
+            k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                backend->dec_tr_x, (int)batch, op->in_channels, (int)length,
+                gather_elu, alpha, resid_table, in_bias, in_bias_on);
+        }
+        if (ce(cudaGetLastError(), e, ec) != 0 ||
+            cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
+            return -1;
+        const float one = 1.0f, zero = 0.0f;
+        if (x_bf16 != nullptr) {
+            cuda_bf16_math_scope math(backend->cublas);
+            if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m,
+                                 n, op->in_channels, &one, op->weight_bf16,
+                                 CUDA_R_16BF, m, x_bf16, CUDA_R_16BF, n, &zero,
+                                 backend->dec_tr_y, CUDA_R_32F, m,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                    e, ec) != 0)
+                return -1;
+        } else if (cbe(cublasGemmEx(backend->cublas, CUBLAS_OP_N, CUBLAS_OP_T, m, n,
+                             op->in_channels, &one, op->weight, CUDA_R_32F, m,
+                             backend->dec_tr_x, CUDA_R_32F, n, &zero,
+                             backend->dec_tr_y, CUDA_R_32F, m,
+                             cuda_compute_type(backend), cuda_gemm_algo(backend)),
+                e, ec) != 0)
+            return -1;
+        float *const *partial_table = nullptr;
+        if (op->tail > 0u) {
+            float *pp[CUDA_BATCH_META_CAP];
+            for (size_t i = 0; i < batch; ++i) pp[i] = ops[i]->partial;
+            if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, pp,
+                                    batch, e, ec) != 0)
+                return -1;
+            partial_table = decoder_current_table(backend, backend->dev_decoder_ptr2);
+        }
+        if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
+                                ec) != 0)
+            return -1;
+        k_decoder_convtr_overlap_out<<<out_blocks, 256, 0, backend->stream>>>(
+            backend->dec_tr_y,
+            decoder_current_table(backend, backend->dev_decoder_ptr1),
+            partial_table, op->bias, (int)batch, op->out_channels, (int)length,
+            (int)output_len, op->kernel, op->stride, (int)op->tail);
+        return ce(cudaGetLastError(), e, ec);
+    }
     for (size_t i = 0; i < batch; ++i) {
         if (ops[i] == nullptr || ops[i]->full == nullptr) return -1;
         p0[i] = inputs[i];
@@ -6043,9 +6324,24 @@ static int decoder_step_batch_impl(
     float *other[CUDA_BATCH_META_CAP];
     float *scratch[CUDA_BATCH_META_CAP];
     float *destination[CUDA_BATCH_META_CAP];
+    float *source[CUDA_BATCH_META_CAP];
+    float *pending_resid[CUDA_BATCH_META_CAP];
     cuda_decoder_op *op_rows[CUDA_BATCH_META_CAP];
     for (size_t i = 0; i < batch; ++i)
         current[i] = const_cast<float *>(inputs[i]);
+
+    /* MYNAH_CUDA_DECODER_FUSE: work the producer of `current` left to its
+     * reader.  pending_bias_on: `current` is a bare GEMM accumulator and
+     * pending_bias (possibly null: +0.0f) is still to be added.  has_resid:
+     * the residual-block sum was not written; the reader takes
+     * pending_resid (the block input x) + (source + bias), where `source`
+     * holds the 1x1 output and `current` still names x (so the destination
+     * choice below is unchanged).  Only set when the next op reads through a
+     * fused kernel (decoder_lazy_reader). */
+    int pending_bias_on = 0;
+    const float *pending_bias = nullptr;
+    bool has_resid = false;
+    const bool fuse_bias = decoder_fuse_bias_enabled();
 
     size_t length = encoder_frames;
     size_t channels = first->dimension;
@@ -6056,8 +6352,15 @@ static int decoder_step_batch_impl(
                 set_error(e, ec, "resident decoder residual topology is truncated");
                 return -1;
             }
+            if (has_resid || pending_bias_on) {
+                set_error(e, ec, "resident decoder residual input is unresolved");
+                return -1;
+            }
             index += 2u;
             const cuda_decoder_op *rb1 = &first->ops[index - 2u];
+            const cuda_decoder_op *rb2 = &first->ops[index - 1u];
+            const cuda_decoder_op *next = index < op_count ? &first->ops[index]
+                                                           : nullptr;
             for (size_t i = 0; i < batch; ++i) {
                 op_rows[i] = &decoders[i]->ops[index - 2u];
                 if (current[i] == decoders[i]->work_a)
@@ -6070,6 +6373,12 @@ static int decoder_step_batch_impl(
             }
             size_t elements = 0u;
             size_t hidden_elements = 0u;
+            /* conv1's bias goes to conv2's column kernel, conv2's to the
+             * residual add (wherever that runs). */
+            const int defer1 =
+                fuse_bias && decoder_conv_fused_path(rb2, batch, length);
+            const int defer2 =
+                fuse_bias && decoder_conv_fused_path(rb2, batch, length);
             if (!decoder_mul(channels, length, &elements) ||
                 !decoder_mul((size_t)rb1->out_channels, length,
                              &hidden_elements) ||
@@ -6077,7 +6386,8 @@ static int decoder_step_batch_impl(
                 hidden_elements > (size_t)INT_MAX ||
                 decoder_conv1d_batch(backend, decoders, op_rows, current, other,
                                      batch, length, 1, first->elu_alpha,
-                                     scratch, e, ec) != 0)
+                                     scratch, nullptr, 0, nullptr, defer1, e,
+                                     ec) != 0)
                 return -1;
             for (size_t i = 0; i < batch; ++i) {
                 op_rows[i] = &decoders[i]->ops[index - 1u];
@@ -6085,16 +6395,32 @@ static int decoder_step_batch_impl(
             }
             if (decoder_conv1d_batch(backend, decoders, op_rows, other, scratch,
                                      batch, length, 1, first->elu_alpha, other,
-                                     e, ec) != 0 ||
-                decoder_residual_batch(backend, current, scratch, batch,
-                                       elements, e, ec) != 0)
+                                     nullptr, defer1, rb1->bias, defer2, e,
+                                     ec) != 0)
                 return -1;
+            if (decoder_fuse_enabled() &&
+                decoder_lazy_reader(backend, next, batch, length)) {
+                /* The next op reads x + (y + b) on the fly; nothing written. */
+                for (size_t i = 0; i < batch; ++i) {
+                    pending_resid[i] = current[i];
+                    source[i] = scratch[i];
+                }
+                has_resid = true;
+                pending_bias_on = defer2;
+                pending_bias = rb2->bias;
+            } else if (decoder_residual_batch(backend, current, scratch, batch,
+                                              channels, length, defer2,
+                                              rb2->bias, e, ec) != 0) {
+                return -1;
+            }
             continue;
         }
 
         for (size_t i = 0; i < batch; ++i) {
             op_rows[i] = &decoders[i]->ops[index - 1u];
+            if (!has_resid) source[i] = current[i];
         }
+        float *const *resid = has_resid ? pending_resid : nullptr;
         /* pre_elu: applied in place on `current` by the op (or fused into
          * the kernel that reads it, MYNAH_CUDA_DECODER_FUSE). */
         const bool last = index == op_count;
@@ -6107,16 +6433,29 @@ static int decoder_step_batch_impl(
                 destination[i] = decoders[i]->work_a;
         }
         if (op->kind == CUDA_DECODER_CONV) {
-            if (decoder_conv1d_batch(backend, decoders, op_rows, current,
+            /* Defer this conv's bias when the next op reads through a fused
+             * kernel (never into a residual block, never for the last op). */
+            const cuda_decoder_op *next = last ? nullptr : &first->ops[index];
+            const int defer = fuse_bias &&
+                              !(decoder_one_gemm_enabled() && batch > 1u) &&
+                              decoder_lazy_reader(backend, next, batch, length);
+            if (decoder_conv1d_batch(backend, decoders, op_rows, source,
                                      destination, batch, length, op->pre_elu,
-                                     first->elu_alpha, current, e, ec) != 0)
+                                     first->elu_alpha, current, resid,
+                                     pending_bias_on, pending_bias, defer, e,
+                                     ec) != 0)
                 return -1;
+            pending_bias_on = defer;
+            pending_bias = op->bias;
             channels = (size_t)op->out_channels;
         } else if (op->kind == CUDA_DECODER_CONVTR) {
-            if (decoder_convtr_batch(backend, op_rows, current, destination,
+            if (decoder_convtr_batch(backend, op_rows, source, destination,
                                      batch, length, op->pre_elu,
-                                     first->elu_alpha, e, ec) != 0)
+                                     first->elu_alpha, resid, pending_bias_on,
+                                     pending_bias, e, ec) != 0)
                 return -1;
+            pending_bias_on = 0;
+            pending_bias = nullptr;
             channels = (size_t)op->out_channels;
             if (!decoder_mul(length, (size_t)op->stride, &length))
                 return -1;
@@ -6124,7 +6463,12 @@ static int decoder_step_batch_impl(
             set_error(e, ec, "resident decoder operation kind is invalid");
             return -1;
         }
+        has_resid = false;
         for (size_t i = 0; i < batch; ++i) current[i] = destination[i];
+    }
+    if (has_resid || pending_bias_on) {
+        set_error(e, ec, "resident decoder output is unresolved");
+        return -1;
     }
     return 0;
 }
@@ -6176,9 +6520,13 @@ extern "C" int mynah_cuda_decoder_open(
         static std::atomic<bool> announced_fuse{false};
         if (!announced_fuse.exchange(true))
             std::fprintf(stderr,
-                         "mynah-tts: CUDA decoder ELU and causal window fused "
-                         "into the im2col/gather kernels "
-                         "(MYNAH_CUDA_DECODER_FUSE=1)\n");
+                         "mynah-tts: CUDA decoder ELU, causal window, residual "
+                         "and transposed-conv fold fused into the "
+                         "im2col/gather/overlap kernels, conv bias %s "
+                         "(MYNAH_CUDA_DECODER_FUSE=1)\n",
+                         decoder_fuse_bias_enabled()
+                             ? "deferred to the reader (beta = 0)"
+                             : "kept in the GEMM (MYNAH_CUDA_DECODER_FUSE_BIAS=0)");
     }
     *out = decoder;
     return 0;
