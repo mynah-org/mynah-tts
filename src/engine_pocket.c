@@ -1316,6 +1316,14 @@ struct mynah_engine_ctx {
     uint64_t rng;
     int have_spare;
     float spare;
+    /* MYNAH_CUDA_ONE_SYNC: this step's noise was drawn ahead, in step_batch,
+     * from the RNG state saved here.  emit keeps the draw when the row takes
+     * a latent and puts the RNG back when it does not, so the sequence of
+     * draws is the one emit would have made itself. */
+    int onesync_noise_drawn;
+    uint64_t onesync_rng;
+    int onesync_have_spare;
+    float onesync_spare;
 
     mynah_pocket_noise_fn noise_fn;
     void *noise_user;
@@ -1449,6 +1457,23 @@ struct mynah_engine_scratch {
     int cuda_flow_enabled;
     int cuda_flow_graph_enabled;
     int cuda_flow_graph_ready;
+
+    /* MYNAH_CUDA_ONE_SYNC (default 0): one stream sync for condition,
+     * backbone, EOS and flow head.  Allocated only with the flag on. */
+    float *cuda_onesync_host_latent_in; /* pinned [batch][latent] condition input */
+    float *cuda_onesync_host_eos;       /* pinned [batch] EOS logits */
+    float *cuda_onesync_host_latent;    /* pinned [batch][latent] noise + flow */
+    float *cuda_onesync_latent;         /* device [batch][latent] */
+    float **cuda_onesync_cond_rows;     /* pinned [batch] row table, flow cond */
+    int cuda_onesync_enabled;
+    int cuda_onesync_graph_ready;
+    /* Set by a step that ran the one-sync chain, consumed by the next emit of
+     * the same rows: EOS logits are in each ctx, the flow outputs and latents
+     * of rows [0, count) in the pinned buffers. */
+    int cuda_onesync_ready;
+    int cuda_onesync_flow_finite;
+    size_t cuda_onesync_count;
+    mynah_engine_ctx *cuda_onesync_rows[POCKET_MAX_BATCH];
 };
 
 /* --------------------------------------------------------------- the dump
@@ -6971,15 +6996,93 @@ static int pocket_cuda_backbone_layer_bf16_fused(
  * 1 means "not eligible" and leaves all host state untouched; -1 means a CUDA
  * failure after submission and invalidates the resident caches so the caller
  * can retry the same rows through the CPU implementation. */
-static int pocket_cuda_backbone_step_batch(
+/* The host half of a batched backbone step, after the stream sync: the finite
+ * gate, the hidden rows, the host K/V mirror and the offsets.  Returns 1 when
+ * an output row is non-finite (nothing has been touched yet), -1 when an
+ * offset cannot advance (the earlier rows are put back), 0 when committed.
+ * Shared by the ordinary step (sync then commit) and MYNAH_CUDA_ONE_SYNC
+ * (one sync for the whole frame, then commit). */
+static int pocket_cuda_backbone_step_commit(mynah_engine_ctx *const *ctxs,
+                                            size_t count,
+                                            mynah_engine_scratch *scratch,
+                                            float *const *output_rows,
+                                            int mirror_host, int prefill,
+                                            char *local, size_t local_capacity) {
+    const mynah_engine_state *state = ctxs[0]->state;
+    const pocket_config *cfg = &state->cfg;
+    const size_t attn_dim = cfg->heads * cfg->head_dim;
+    const size_t shadow_row = 2u * attn_dim;
+    const size_t exec = pocket_cuda_exec_width(count, scratch->cuda_batch_capacity);
+    if (!prefill || output_rows != NULL) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!pocket_all_finite(
+                    scratch->cuda_host_output + i * cfg->hidden_dim,
+                    cfg->hidden_dim)) return 1;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            float *output = output_rows != NULL ? output_rows[i] : ctxs[i]->hidden;
+            if (output == NULL) return -1;
+            memcpy(output, scratch->cuda_host_output + i * cfg->hidden_dim,
+                   cfg->hidden_dim * sizeof(float));
+        }
+    }
+    /* The graph and the ordinary path both gather only the newly appended
+     * slot.  Commit it to the host shadow after the one stream sync; the large
+     * prefix remains device-resident. */
+    if (mirror_host) {
+        for (size_t l = 0; l < cfg->layers; ++l) {
+            for (size_t i = 0; i < count; ++i) {
+                mynah_engine_ctx *ctx = ctxs[i];
+                float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
+                const size_t host_half =
+                    mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
+                const size_t host_slot = scratch->cuda_positions[i] * attn_dim;
+                const float *shadow = scratch->cuda_host_kv +
+                    l * exec * shadow_row + i * shadow_row;
+                if (host_kv == NULL) return -1;
+                memcpy(host_kv + host_slot, shadow, attn_dim * sizeof(float));
+                memcpy(host_kv + host_half + host_slot, shadow + attn_dim,
+                       attn_dim * sizeof(float));
+            }
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (mynah_transformer_ar_state_set_offset(
+                ctxs[i]->backbone, scratch->cuda_positions[i] + 1u, local,
+                local_capacity) != 0) {
+            for (size_t j = 0; j < i; ++j) {
+                (void)mynah_transformer_ar_state_set_offset(
+                    ctxs[j]->backbone, scratch->cuda_positions[j], NULL, 0u);
+            }
+            return -1;
+        }
+    }
+    /* The upload above establishes the device prefix for every row.  Mark it
+     * valid only after the complete step, so the next batch neither reuploads
+     * the whole voice/text prefix nor suppresses graph capture forever. */
+    for (size_t i = 0; i < count; ++i) ctxs[i]->cuda_backbone_valid = 1;
+    scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = (!prefill || output_rows != NULL) ? 1 : 0;
+    if (scratch->cuda_graph_enabled) scratch->cuda_graph_ready = 1;
+    return 0;
+}
+
+/* `defer` (MYNAH_CUDA_ONE_SYNC only): queue the step on the stream and return
+ * 0 without the stream sync and without committing anything on the host; the
+ * caller syncs once for the whole frame and then runs
+ * pocket_cuda_backbone_step_commit.  Requires a device-resident condition
+ * input (`cuda_condition_ready`) and a decode step (no input_rows). */
+static int pocket_cuda_backbone_step_batch_impl(
     mynah_engine_ctx *const *ctxs, size_t count, mynah_engine_scratch *scratch,
     const float *const *input_rows, float *const *output_rows, int mirror_host,
-    char *error, size_t capacity) {
+    int defer, char *error, size_t capacity) {
     if (ctxs == NULL || scratch == NULL || count < 2u ||
         !scratch->cuda_batch_enabled || scratch->backend == NULL ||
         count > scratch->cuda_batch_capacity || count > POCKET_MAX_BATCH) {
         return 1;
     }
+    if (defer && (input_rows != NULL || !scratch->cuda_condition_ready))
+        return 1;
     const int prefill = input_rows != NULL;
     if (prefill) scratch->cuda_condition_ready = 0;
     scratch->cuda_backbone_output_ready = 0;
@@ -7051,8 +7154,11 @@ static int pocket_cuda_backbone_step_batch(
         if (!ctx->cuda_backbone_valid) all_kv_valid = 0;
         const float *input = input_rows != NULL ? input_rows[i] : ctx->step_input;
         if (input == NULL) return 1;
-        memcpy(scratch->cuda_host_input + i * cfg->hidden_dim, input,
-               cfg->hidden_dim * sizeof(float));
+        /* Deferred: the input is already on the device (cuda_x) and the
+         * host step input is not computed, so there is nothing to stage. */
+        if (!defer)
+            memcpy(scratch->cuda_host_input + i * cfg->hidden_dim, input,
+                   cfg->hidden_dim * sizeof(float));
     }
     if (exec > count) {
         /* Inert padding rows: position 0 of a private one-position KV (the
@@ -7074,8 +7180,9 @@ static int pocket_cuda_backbone_step_batch(
         for (size_t i = count; i < exec; ++i) {
             scratch->cuda_positions[i] = 0u;
             scratch->cuda_cache_strides[i] = attn_dim;
-            memcpy(scratch->cuda_host_input + i * cfg->hidden_dim, row0,
-                   cfg->hidden_dim * sizeof(float));
+            if (!defer)
+                memcpy(scratch->cuda_host_input + i * cfg->hidden_dim, row0,
+                       cfg->hidden_dim * sizeof(float));
         }
     }
     /* The shared voice prefix rides on the same graph-replayed table copies;
@@ -7355,58 +7462,15 @@ static int pocket_cuda_backbone_step_batch(
                                             local, sizeof(local)) != 0) goto fail;
         }
     }
+    if (defer) {
+        /* MYNAH_CUDA_ONE_SYNC: queued, not synced, nothing committed. */
+        if (error != NULL && capacity > 0u) error[0] = '\0';
+        return 0;
+    }
     if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) goto fail;
-    if (!prefill || output_rows != NULL) {
-        for (size_t i = 0; i < count; ++i) {
-            if (!pocket_all_finite(
-                    scratch->cuda_host_output + i * cfg->hidden_dim,
-                    cfg->hidden_dim)) goto fail;
-        }
-        for (size_t i = 0; i < count; ++i) {
-            float *output = output_rows != NULL ? output_rows[i] : ctxs[i]->hidden;
-            if (output == NULL) goto fail;
-            memcpy(output, scratch->cuda_host_output + i * cfg->hidden_dim,
-                   cfg->hidden_dim * sizeof(float));
-        }
-    }
-    /* The graph and the ordinary path both gather only the newly appended
-     * slot.  Commit it to the host shadow after the one stream sync; the large
-     * prefix remains device-resident. */
-    if (mirror_host) {
-        for (size_t l = 0; l < cfg->layers; ++l) {
-            for (size_t i = 0; i < count; ++i) {
-                mynah_engine_ctx *ctx = ctxs[i];
-                float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
-                const size_t host_half =
-                    mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
-                const size_t host_slot = scratch->cuda_positions[i] * attn_dim;
-                const float *shadow = scratch->cuda_host_kv +
-                    l * exec * shadow_row + i * shadow_row;
-                if (host_kv == NULL) goto fail;
-                memcpy(host_kv + host_slot, shadow, attn_dim * sizeof(float));
-                memcpy(host_kv + host_half + host_slot, shadow + attn_dim,
-                       attn_dim * sizeof(float));
-            }
-        }
-    }
-    for (size_t i = 0; i < count; ++i) {
-        if (mynah_transformer_ar_state_set_offset(
-                ctxs[i]->backbone, scratch->cuda_positions[i] + 1u, local,
-                sizeof(local)) != 0) {
-            for (size_t j = 0; j < i; ++j) {
-                (void)mynah_transformer_ar_state_set_offset(
-                    ctxs[j]->backbone, scratch->cuda_positions[j], NULL, 0u);
-            }
-            goto fail;
-        }
-    }
-    /* The upload above establishes the device prefix for every row.  Mark it
-     * valid only after the complete step, so the next batch neither reuploads
-     * the whole voice/text prefix nor suppresses graph capture forever. */
-    for (size_t i = 0; i < count; ++i) ctxs[i]->cuda_backbone_valid = 1;
-    scratch->cuda_condition_ready = 0;
-    scratch->cuda_backbone_output_ready = (!prefill || output_rows != NULL) ? 1 : 0;
-    if (scratch->cuda_graph_enabled) scratch->cuda_graph_ready = 1;
+    if (pocket_cuda_backbone_step_commit(ctxs, count, scratch, output_rows,
+                                         mirror_host, prefill, local,
+                                         sizeof(local)) != 0) goto fail;
     if (error != NULL && capacity > 0u) error[0] = '\0';
     return 0;
 
@@ -7428,6 +7492,16 @@ fail:
     pocket_error(error, capacity, "%s",
                  local[0] != '\0' ? local : "CUDA resident backbone batch failed");
     return -1;
+}
+
+static int pocket_cuda_backbone_step_batch(
+    mynah_engine_ctx *const *ctxs, size_t count, mynah_engine_scratch *scratch,
+    const float *const *input_rows, float *const *output_rows, int mirror_host,
+    char *error, size_t capacity) {
+    return pocket_cuda_backbone_step_batch_impl(ctxs, count, scratch,
+                                                input_rows, output_rows,
+                                                mirror_host, 0, error,
+                                                capacity);
 }
 
 #define POCKET_CUDA_FLOW_GRAPH_BASE ((size_t)0x100000u)
@@ -7623,6 +7697,440 @@ static int pocket_cuda_flow_step_batch(const mynah_engine_state *state,
     }
     if (error != NULL && capacity > 0u) error[0] = '\0';
     return 0;
+}
+
+/* ------------------------------------------------- MYNAH_CUDA_ONE_SYNC
+ *
+ * The batched decode frame as one queued device chain with one stream sync:
+ *
+ *   H2D previous latents -> input_linear (condition)  -> backbone graph
+ *   -> EOS linear + D2H logits -> flow graph (cond gathered from the
+ *   backbone output on the device, noise H2D, flow head, latent = noise +
+ *   flow, D2H flow output and latent) -> ONE mynah_backend_sync.
+ *
+ * The ordinary path syncs after each of the four stages and moves the hidden
+ * rows through the host between the backbone and the flow head.
+ *
+ * Sampling is unchanged: the noise is drawn on the host from each request's
+ * own RNG, with the same loop emit uses, only earlier (before the chain is
+ * queued instead of after the EOS logit is known).  The RNG state before the
+ * draw is saved; emit keeps the draw for a row that takes a latent and puts
+ * the RNG back for a row whose step turns out to be terminal, which is the
+ * one case where the ordinary emit draws nothing.  The flow head sees the same
+ * cond floats (the backbone output, copied on the device instead of through
+ * the host), the same noise floats and the same execution width as the
+ * ordinary call when every row takes a latent; in a step where some row ends,
+ * emit discards the chained flow result and reruns the ordinary flow call on
+ * the subset, so that step is also the ordinary one.
+ *
+ * Anything unexpected (a launch error, a non-finite hidden or flow row)
+ * leaves the host state untouched and the step reruns on the ordinary path,
+ * which reports it the way it always has. */
+#define POCKET_CUDA_ONESYNC_FLOW_GRAPH_BASE ((size_t)0x500000u)
+
+static int pocket_host_alloc_bytes(const mynah_backend *backend, size_t bytes,
+                                   void **out, char *error, size_t capacity);
+static void pocket_host_free_bytes(const mynah_backend *backend, void *ptr);
+
+static int pocket_cuda_one_sync_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_CUDA_ONE_SYNC");
+        cached = setting != NULL && setting[0] != '\0' &&
+                 strcmp(setting, "0") != 0;
+    }
+    return cached;
+}
+
+/* Undo an early noise draw that no emit consumed. */
+static void pocket_onesync_rng_restore(mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->onesync_noise_drawn) return;
+    ctx->rng = ctx->onesync_rng;
+    ctx->have_spare = ctx->onesync_have_spare;
+    ctx->spare = ctx->onesync_spare;
+    ctx->onesync_noise_drawn = 0;
+}
+
+static void pocket_onesync_rng_restore_all(mynah_engine_ctx *const *ctxs,
+                                           size_t count) {
+    for (size_t i = 0; i < count; ++i) pocket_onesync_rng_restore(ctxs[i]);
+}
+
+/* The noise emit would draw for this row at this step: the same expression,
+ * the same RNG, the same order. */
+static void pocket_onesync_draw_noise(mynah_engine_ctx *ctx) {
+    const pocket_config *cfg = &ctx->state->cfg;
+    ctx->onesync_rng = ctx->rng;
+    ctx->onesync_have_spare = ctx->have_spare;
+    ctx->onesync_spare = ctx->spare;
+    for (size_t d = 0; d < cfg->latent_dim; ++d) {
+        ctx->noise[d] = ctx->noise_std * pocket_rng_normal(ctx);
+    }
+    ctx->onesync_noise_drawn = 1;
+}
+
+static void pocket_cuda_onesync_release(mynah_engine_scratch *scratch) {
+    if (scratch == NULL || scratch->backend == NULL) return;
+    mynah_backend_host_free(scratch->backend, scratch->cuda_onesync_host_latent_in);
+    mynah_backend_host_free(scratch->backend, scratch->cuda_onesync_host_eos);
+    mynah_backend_host_free(scratch->backend, scratch->cuda_onesync_host_latent);
+    mynah_backend_dev_free(scratch->backend, scratch->cuda_onesync_latent);
+    pocket_host_free_bytes(scratch->backend, scratch->cuda_onesync_cond_rows);
+    scratch->cuda_onesync_host_latent_in = NULL;
+    scratch->cuda_onesync_host_eos = NULL;
+    scratch->cuda_onesync_host_latent = NULL;
+    scratch->cuda_onesync_latent = NULL;
+    scratch->cuda_onesync_cond_rows = NULL;
+    scratch->cuda_onesync_enabled = 0;
+    scratch->cuda_onesync_ready = 0;
+}
+
+/* Called once the backbone and flow workspaces exist (same `batch`). */
+static void pocket_cuda_onesync_reserve(const mynah_engine_state *state,
+                                        mynah_engine_scratch *scratch,
+                                        size_t batch) {
+    if (!pocket_cuda_one_sync_enabled() || scratch == NULL ||
+        scratch->backend == NULL || !scratch->cuda_batch_enabled ||
+        !scratch->cuda_flow_enabled || scratch->cuda_condition_input == NULL ||
+        batch == 0u || batch > POCKET_MAX_BATCH)
+        return;
+    const pocket_config *cfg = &state->cfg;
+    size_t latent_rows = 0u;
+    char ignored[256];
+    ignored[0] = '\0';
+    if (pocket_mul(batch, cfg->latent_dim, &latent_rows) != 0 ||
+        mynah_backend_host_alloc(scratch->backend, latent_rows,
+                                 &scratch->cuda_onesync_host_latent_in, ignored,
+                                 sizeof(ignored)) != 0 ||
+        mynah_backend_host_alloc(scratch->backend, batch,
+                                 &scratch->cuda_onesync_host_eos, ignored,
+                                 sizeof(ignored)) != 0 ||
+        mynah_backend_host_alloc(scratch->backend, latent_rows,
+                                 &scratch->cuda_onesync_host_latent, ignored,
+                                 sizeof(ignored)) != 0 ||
+        mynah_backend_dev_alloc(scratch->backend, latent_rows,
+                                &scratch->cuda_onesync_latent, ignored,
+                                sizeof(ignored)) != 0 ||
+        pocket_host_alloc_bytes(scratch->backend,
+                                batch * sizeof(*scratch->cuda_onesync_cond_rows),
+                                (void **)&scratch->cuda_onesync_cond_rows,
+                                ignored, sizeof(ignored)) != 0) {
+        fprintf(stderr, "mynah-tts: MYNAH_CUDA_ONE_SYNC unavailable: %s\n",
+                ignored[0] != '\0' ? ignored : "staging allocation failed");
+        pocket_cuda_onesync_release(scratch);
+        return;
+    }
+    scratch->cuda_onesync_enabled = 1;
+    scratch->cuda_onesync_graph_ready = 0;
+    fprintf(stderr,
+            "mynah-tts: MYNAH_CUDA_ONE_SYNC: condition, backbone, EOS and flow "
+            "head share one stream sync per batched frame\n");
+}
+
+/* Queue the flow head on the backbone output that is still in `cuda_norm`,
+ * plus latent = noise + flow and the two D2H copies.  No sync.  Captured as
+ * its own graph per execution width (the cond row table and the noise are
+ * pinned host buffers that the graph's copy nodes read at launch, so they are
+ * filled before every launch, exactly like the ordinary flow graph). */
+static int pocket_cuda_onesync_flow_queue(mynah_engine_ctx *const *ctxs,
+                                          size_t count,
+                                          mynah_engine_scratch *scratch,
+                                          char *local, size_t local_capacity) {
+    const mynah_engine_state *state = ctxs[0]->state;
+    if (scratch->cuda_flow_host_noise == NULL ||
+        scratch->cuda_flow_host_time == NULL ||
+        scratch->cuda_flow_host_output == NULL ||
+        scratch->cuda_flow_cond == NULL || scratch->cuda_flow_noise == NULL ||
+        scratch->cuda_flow_time_embed == NULL ||
+        scratch->cuda_flow_output == NULL || scratch->cuda_flow_y == NULL ||
+        scratch->cuda_flow_silu == NULL || scratch->cuda_flow_x == NULL ||
+        scratch->cuda_flow_norm == NULL || scratch->cuda_flow_hidden == NULL ||
+        scratch->cuda_flow_scratch == NULL || scratch->cuda_flow_mod == NULL ||
+        scratch->cuda_flow_final_mod == NULL ||
+        scratch->cuda_flow_time_hidden == NULL ||
+        scratch->cuda_flow_time_output == NULL ||
+        scratch->cuda_flow_time_sum == NULL ||
+        scratch->cuda_flow_time_mlp_in == NULL ||
+        scratch->cuda_flow_time_mlp_out == NULL ||
+        scratch->cuda_flow_time_alpha == NULL || scratch->cuda_flow_blocks == NULL ||
+        count == 0u || count > scratch->cuda_flow_batch_capacity)
+        return 1;
+    const pocket_config *cfg = &state->cfg;
+    size_t flow_freq_width = 0u;
+    size_t rows_latent = 0u;
+    size_t time_rows = 0u;
+    const size_t exec =
+        pocket_cuda_exec_width(count, scratch->cuda_flow_batch_capacity);
+    if (exec > scratch->cuda_batch_capacity ||
+        pocket_mul(cfg->flow_freqs, 2u, &flow_freq_width) != 0 ||
+        pocket_mul(exec, cfg->latent_dim, &rows_latent) != 0 ||
+        pocket_mul(cfg->flow_time_conds, flow_freq_width, &time_rows) != 0 ||
+        flow_freq_width == 0u || cfg->flow_time_conds == 0u) return 1;
+
+    /* Rows [count, exec) repeat row 0, as in the ordinary flow call. */
+    for (size_t i = 0; i < exec; ++i) {
+        const size_t src = i < count ? i : 0u;
+        scratch->cuda_onesync_cond_rows[i] =
+            scratch->cuda_norm + src * cfg->hidden_dim;
+        memcpy(scratch->cuda_flow_host_noise + i * cfg->latent_dim,
+               ctxs[src]->noise, cfg->latent_dim * sizeof(float));
+    }
+
+    int replay = 0;
+    int capturing = 0;
+    const size_t graph_key = POCKET_CUDA_ONESYNC_FLOW_GRAPH_BASE + exec;
+    if (scratch->cuda_flow_graph_enabled && scratch->cuda_onesync_graph_ready) {
+        const int graph_rc = mynah_backend_graph_begin(
+            scratch->backend, graph_key, scratch, &replay, local,
+            local_capacity);
+        if (graph_rc < 0) return -1;
+        if (graph_rc == 0) capturing = !replay;
+    }
+    if (replay)
+        return mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
+                                          local, local_capacity) != 0 ? -1 : 0;
+
+    mynah_backend_flow_batch flow;
+    memset(&flow, 0, sizeof(flow));
+    flow.batch = exec;
+    flow.latent_dim = cfg->latent_dim;
+    flow.cond_dim = cfg->hidden_dim;
+    flow.hidden_dim = cfg->flow_dim;
+    flow.depth = cfg->flow_depth;
+    flow.num_time_conds = cfg->flow_time_conds;
+    flow.freq_embed_dim = flow_freq_width;
+    flow.layernorm_eps = cfg->flow_layernorm_eps;
+    flow.rmsnorm_eps = 1.0e-5f;
+    flow.dev_cond = scratch->cuda_flow_cond;
+    flow.dev_noise = scratch->cuda_flow_noise;
+    flow.dev_time_embed = scratch->cuda_flow_time_embed;
+    flow.dev_y = scratch->cuda_flow_y;
+    flow.dev_silu = scratch->cuda_flow_silu;
+    flow.dev_x = scratch->cuda_flow_x;
+    flow.dev_norm = scratch->cuda_flow_norm;
+    flow.dev_hidden = scratch->cuda_flow_hidden;
+    flow.dev_scratch = scratch->cuda_flow_scratch;
+    flow.dev_mod = scratch->cuda_flow_mod;
+    flow.dev_final_mod = scratch->cuda_flow_final_mod;
+    flow.dev_time_hidden = scratch->cuda_flow_time_hidden;
+    flow.dev_time_output = scratch->cuda_flow_time_output;
+    flow.dev_time_sum = scratch->cuda_flow_time_sum;
+    flow.dev_out = scratch->cuda_flow_output;
+    flow.time_mlp_in = scratch->cuda_flow_time_mlp_in;
+    flow.time_mlp_out = scratch->cuda_flow_time_mlp_out;
+    flow.time_alpha = scratch->cuda_flow_time_alpha;
+    flow.cond_embed = &scratch->cuda_flow_cond_embed;
+    flow.input_proj = &scratch->cuda_flow_input_proj;
+    flow.blocks = scratch->cuda_flow_blocks;
+    flow.final_adaln = &scratch->cuda_flow_final_adaln;
+    flow.final_linear = &scratch->cuda_flow_final_linear;
+
+    /* latent = noise + flow_out: k_residual_add computes out[i] += in[i]
+     * with out = noise, the same single fp32 addition as emit's
+     * `noise[d] + flow_out[d]` (addition is commutative bit for bit). */
+    const int failed =
+        mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_noise,
+                          scratch->cuda_flow_noise, rows_latent, local,
+                          local_capacity) != 0 ||
+        mynah_backend_h2d(scratch->backend, scratch->cuda_flow_host_time,
+                          scratch->cuda_flow_time_embed, time_rows, local,
+                          local_capacity) != 0 ||
+        mynah_backend_gather_rows_to_batch_dev(
+            scratch->backend, scratch->cuda_onesync_cond_rows,
+            scratch->cuda_flow_cond, exec, cfg->hidden_dim, local,
+            local_capacity) != 0 ||
+        mynah_backend_flow_batch_dev(scratch->backend, &flow, local,
+                                     local_capacity) != 0 ||
+        mynah_backend_copy_dev(scratch->backend, scratch->cuda_onesync_latent,
+                               scratch->cuda_flow_noise, rows_latent, local,
+                               local_capacity) != 0 ||
+        mynah_backend_residual_add_dev(scratch->backend,
+                                       scratch->cuda_onesync_latent,
+                                       scratch->cuda_flow_output, rows_latent,
+                                       local, local_capacity) != 0 ||
+        mynah_backend_d2h(scratch->backend, scratch->cuda_flow_output,
+                          scratch->cuda_flow_host_output, rows_latent, local,
+                          local_capacity) != 0 ||
+        mynah_backend_d2h(scratch->backend, scratch->cuda_onesync_latent,
+                          scratch->cuda_onesync_host_latent, rows_latent, local,
+                          local_capacity) != 0;
+    if (failed) {
+        if (capturing)
+            mynah_backend_graph_abort(scratch->backend, graph_key, scratch);
+        return -1;
+    }
+    if (capturing) {
+        if (mynah_backend_graph_end(scratch->backend, graph_key, scratch, local,
+                                    local_capacity) != 0) {
+            /* Nothing ran: the captured work was discarded. */
+            scratch->cuda_onesync_graph_ready = 0;
+            return -1;
+        }
+        if (mynah_backend_graph_launch(scratch->backend, graph_key, scratch,
+                                       local, local_capacity) != 0)
+            return -1;
+    } else if (scratch->cuda_flow_graph_enabled) {
+        /* The warm-up submission: weight caches exist from now on. */
+        scratch->cuda_onesync_graph_ready = 1;
+    }
+    return 0;
+}
+
+/* The whole batched frame with one sync.  Returns 0 when the step is done
+ * and committed exactly as pocket_step_batch's CUDA batch path commits it
+ * (hidden rows, offsets, valid flags), with the EOS logits in each context
+ * and the flow results staged for emit; 1 when it did not run or must be
+ * redone on the ordinary path, with no host state changed (the early noise
+ * draws are put back). */
+static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
+                               const int *will_step, int can_gather,
+                               mynah_engine_scratch *scratch) {
+    if (ctxs == NULL || scratch == NULL || !scratch->cuda_onesync_enabled ||
+        !can_gather || count < 2u || count > POCKET_MAX_BATCH ||
+        count > scratch->cuda_batch_capacity ||
+        count > scratch->cuda_flow_batch_capacity ||
+        !scratch->cuda_batch_enabled || !scratch->cuda_flow_enabled ||
+        scratch->backend == NULL || scratch->cuda_condition_input == NULL ||
+        scratch->cuda_x == NULL || scratch->cuda_norm == NULL ||
+        scratch->cuda_proj == NULL ||
+        strcmp(mynah_backend_name(scratch->backend), "cuda") != 0)
+        return 1;
+    const mynah_engine_state *state = ctxs[0] == NULL ? NULL : ctxs[0]->state;
+    if (state == NULL || state->input_linear == NULL ||
+        state->out_eos_weight == NULL ||
+        !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_IN) ||
+        !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_EOS))
+        return 1;
+    const pocket_config *cfg = &state->cfg;
+    if (cfg->latent_dim > cfg->hidden_dim || count > (size_t)INT_MAX ||
+        cfg->hidden_dim > (size_t)INT_MAX)
+        return 1;
+    int all_device_owned = 1;
+    for (size_t i = 0; i < count; ++i) {
+        const mynah_engine_ctx *ctx = ctxs[i];
+        if (!will_step[i] || ctx == NULL || ctx->state != state ||
+            ctx->noise_fn != NULL || ctx->budget_exhausted ||
+            ctx->noise == NULL || ctx->hidden == NULL)
+            return 1;
+        if (!ctx->cuda_backbone_device_owned) all_device_owned = 0;
+    }
+    /* A draw left over from a step whose emit never ran is not consumed. */
+    pocket_onesync_rng_restore_all(ctxs, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = ctxs[i];
+        const float *previous = ctx->frames > ctx->seg_frame0
+            ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
+            : state->bos_emb;
+        memcpy(scratch->cuda_onesync_host_latent_in + i * cfg->latent_dim,
+               previous, cfg->latent_dim * sizeof(float));
+        pocket_onesync_draw_noise(ctx);
+    }
+
+    char local[256];
+    char drain[256];
+    local[0] = '\0';
+    drain[0] = '\0';
+    /* 1. condition: the same resolved projection as pocket_cuda_condition_batch,
+     * left in cuda_x for the backbone (no D2H, no host finite scan: a
+     * non-finite input reaches the hidden rows, which are checked below). */
+    const int cond_qtype = pocket_cuda_control_qtype(
+        state, POCKET_QG_COND_IN, state->cond_in_qtype);
+    if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0 ||
+        mynah_backend_h2d(scratch->backend, scratch->cuda_onesync_host_latent_in,
+                          scratch->cuda_condition_input,
+                          count * cfg->latent_dim, local, sizeof(local)) != 0 ||
+        pocket_cuda_linear_d2d(state, scratch->cuda_condition_input,
+                               scratch->cuda_x, count, cfg->latent_dim,
+                               cfg->hidden_dim, state->input_linear, NULL,
+                               cond_qtype, local, sizeof(local)) != 0)
+        goto fallback_drain;
+    scratch->cuda_condition_ready = 1;
+
+    /* 2. backbone, queued (graph per width as before). */
+    {
+        char backbone_error[256];
+        backbone_error[0] = '\0';
+        const int rc = pocket_cuda_backbone_step_batch_impl(
+            ctxs, count, scratch, NULL, NULL, all_device_owned ? 0 : 1, 1,
+            backbone_error, sizeof(backbone_error));
+        /* rc > 0: not eligible this step (the queued projection is simply
+         * redone by the ordinary path on the same stream).  rc < 0: it has
+         * already drained and taken the rows off the device, which is what
+         * the ordinary path would have done with this failure. */
+        if (rc != 0) goto fallback;
+    }
+
+    /* 3. EOS logits, the same resolved projection as pocket_cuda_eos_batch. */
+    {
+        const int eos_qtype = pocket_cuda_control_qtype(
+            state, POCKET_QG_COND_EOS, state->cond_eos_qtype);
+        if (pocket_cuda_linear_d2d(state, scratch->cuda_norm, scratch->cuda_proj,
+                                   count, cfg->hidden_dim, 1u,
+                                   state->out_eos_weight, state->out_eos_bias,
+                                   eos_qtype, local, sizeof(local)) != 0 ||
+            mynah_backend_d2h(scratch->backend, scratch->cuda_proj,
+                              scratch->cuda_onesync_host_eos, count, local,
+                              sizeof(local)) != 0)
+            goto fallback_drain;
+    }
+
+    /* 4. flow head + latent on the device. */
+    if (pocket_cuda_onesync_flow_queue(ctxs, count, scratch, local,
+                                       sizeof(local)) != 0)
+        goto fallback_drain;
+
+    /* 5. the one sync of the frame. */
+    if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0)
+        goto fallback_drain;
+
+    {
+        const int commit = pocket_cuda_backbone_step_commit(
+            ctxs, count, scratch, NULL, all_device_owned ? 0 : 1, 0, local,
+            sizeof(local));
+        /* 1: a non-finite hidden row, nothing committed; -1: an offset could
+         * not advance and the commit put the others back.  Either way the
+         * ordinary path redoes the frame and reports it. */
+        if (commit != 0) goto fallback;
+    }
+    for (size_t i = 0; i < count; ++i)
+        ctxs[i]->eos_logit = scratch->cuda_onesync_host_eos[i];
+    int flow_finite = 1;
+    for (size_t i = 0; i < count && flow_finite; ++i) {
+        if (!pocket_all_finite(scratch->cuda_flow_host_output + i * cfg->latent_dim,
+                               cfg->latent_dim) ||
+            !pocket_all_finite(scratch->cuda_onesync_host_latent +
+                                   i * cfg->latent_dim,
+                               cfg->latent_dim))
+            flow_finite = 0;
+    }
+    scratch->cuda_backbone_output_ready = 0; /* EOS already done */
+    scratch->cuda_onesync_flow_finite = flow_finite;
+    scratch->cuda_onesync_count = count;
+    for (size_t i = 0; i < count; ++i) scratch->cuda_onesync_rows[i] = ctxs[i];
+    scratch->cuda_onesync_ready = 1;
+    (void)mynah_backend_note_backbone_batch(scratch->backend, count);
+    return 0;
+
+fallback_drain:
+    /* A launch or sync error: drain, forget this scratch's graphs (as the
+     * ordinary stages do on failure) and stop using the chain. */
+    (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+    fprintf(stderr,
+            "mynah-tts: MYNAH_CUDA_ONE_SYNC disabled after a failure (%s); "
+            "continuing on the per-stage path\n",
+            local[0] != '\0' ? local : "not eligible");
+    scratch->cuda_onesync_enabled = 0;
+    if (scratch->cuda_graph_enabled) {
+        scratch->cuda_graph_ready = 0;
+        mynah_backend_graph_forget(scratch->backend, scratch);
+    }
+fallback:
+    scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = 0;
+    scratch->cuda_onesync_ready = 0;
+    pocket_onesync_rng_restore_all(ctxs, count);
+    return 1;
 }
 
 static void pocket_ctx_free(mynah_engine_ctx *ctx) {
@@ -8805,6 +9313,7 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
     ctx->spare = 0.0f;
+    ctx->onesync_noise_drawn = 0;
     if (ctx->dump != NULL) {
         ctx->dump->steps = 0;
         ctx->dump->frames = 0;
@@ -9352,6 +9861,31 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     const int can_gather = scratch != NULL && scratch->backbone_batch != NULL &&
                            scratch->states != NULL && count <= batch_capacity;
     if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
+    if (scratch != NULL) scratch->cuda_onesync_ready = 0;
+
+    /* MYNAH_CUDA_ONE_SYNC: the whole frame (condition, backbone, EOS, flow
+     * head) with one stream sync.  It commits exactly what the CUDA batch
+     * path below commits, or nothing, in which case that path runs as usual. */
+    if (scratch != NULL && scratch->cuda_onesync_enabled) {
+        mynah_region_begin(MYNAH_RGN_STEP);
+        mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
+        const int onesync_rc =
+            pocket_onesync_step(ctxs, count, will_step, can_gather, scratch);
+        mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
+        mynah_region_end(MYNAH_RGN_STEP);
+        if (onesync_rc == 0) {
+            /* Section 4 below, for a batch in which every row stepped. */
+            for (size_t i = 0; i < count; ++i) {
+                mynah_engine_ctx *ctx = ctxs[i];
+                if (ctx->dump == NULL) continue;
+                if (ctx->dump->steps < ctx->dump->capacity) {
+                    memcpy(ctx->dump->hidden + ctx->dump->steps * cfg->hidden_dim,
+                           ctx->hidden, cfg->hidden_dim * sizeof(float));
+                }
+            }
+            return 0;
+        }
+    }
 
     /* ---- 2. the fallible mutation, before anything advances --------------- */
     mynah_region_begin(MYNAH_RGN_STEP);
@@ -9576,8 +10110,22 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     size_t gathered = 0;
     const size_t flow_capacity =
         (scratch == NULL) ? 0u : mynah_flow_head_batch_capacity(scratch->flow_batch);
+    /* MYNAH_CUDA_ONE_SYNC: the step already produced the EOS logits and, for
+     * the same rows, the flow head output and the latents. */
+    int onesync = scratch != NULL && scratch->cuda_onesync_ready &&
+                  scratch->cuda_onesync_count == count;
+    for (size_t i = 0; i < count && onesync; ++i)
+        if (scratch->cuda_onesync_rows[i] != ctxs[i]) onesync = 0;
+    if (scratch != NULL) scratch->cuda_onesync_ready = 0;
+    if (!onesync) {
+        /* Not the rows the chain ran for: no early draw is consumed. */
+        for (size_t i = 0; i < count; ++i) pocket_onesync_rng_restore(ctxs[i]);
+    }
     int cuda_eos_used = 0;
-    if (scratch != NULL && scratch->cuda_backbone_output_ready && count > 1u) {
+    if (onesync) {
+        cuda_eos_used = 1;
+    } else if (scratch != NULL && scratch->cuda_backbone_output_ready &&
+               count > 1u) {
         int eligible = 1;
         for (size_t i = 0; i < count; ++i) {
             if (ctxs[i] == NULL || ctxs[i]->budget_exhausted) {
@@ -9602,6 +10150,7 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             /* No step ran for this request, so `hidden` is last step's and must
              * not be read.  The budget is a length cap, not a failure: the
              * frames already generated are the answer. */
+            pocket_onesync_rng_restore(ctx);
             ctx->eos = 1;
             results[i].eos = 1;
             results[i].eos_frame = 0u;
@@ -9639,6 +10188,8 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
          * single frame is invalid, hence eos_frame 0 and nothing appended. */
         if (ctx->eos_step != SIZE_MAX &&
             ctx->step >= ctx->eos_step + ctx->frames_after_eos) {
+            /* The terminal step draws no noise: an early draw is undone. */
+            pocket_onesync_rng_restore(ctx);
             ++ctx->step;
             if (ctx->seg_index + 1u < ctx->seg_count) {
                 /* End of a segment, not of the request: the next segment's
@@ -9661,7 +10212,10 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             continue;
         }
 
-        if (ctx->noise_fn != NULL) {
+        if (ctx->onesync_noise_drawn) {
+            /* Drawn by the one-sync step from this RNG, in this order. */
+            ctx->onesync_noise_drawn = 0;
+        } else if (ctx->noise_fn != NULL) {
             if (ctx->noise_fn(ctx->noise_user, ctx->noise, cfg->latent_dim,
                               ctx->step) != 0) {
                 ctx->broken = 1;
@@ -9694,8 +10248,20 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     mynah_region_begin(MYNAH_RGN_FLOW);
     int flow_failed = 0;
     int cuda_flow_used = 0;
+    /* The chained flow ran on every row of the step; it is the ordinary
+     * result only when every row takes a latent (same rows, same order, same
+     * width).  Otherwise the ordinary call below runs on the subset. */
+    const int onesync_flow = onesync && gathered == count &&
+                             scratch->cuda_onesync_flow_finite;
     if (gathered > 0) {
-        if (scratch != NULL && scratch->cuda_flow_enabled) {
+        if (onesync_flow) {
+            const size_t latent_dim = ctxs[0]->state->cfg.latent_dim;
+            for (size_t i = 0; i < count; ++i)
+                memcpy(ctxs[i]->flow_out,
+                       scratch->cuda_flow_host_output + i * latent_dim,
+                       latent_dim * sizeof(float));
+            cuda_flow_used = 1;
+        } else if (scratch != NULL && scratch->cuda_flow_enabled) {
             char cuda_error[256];
             cuda_error[0] = '\0';
             if (pocket_cuda_flow_step_batch(ctxs[0]->state, gathered, scratch,
@@ -9737,8 +10303,15 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
         }
         /* One LSD step from s = 0 to t = 1: the integration is the addition. */
         float *latent = ctx->latents + ctx->frames * cfg->latent_dim;
-        for (size_t d = 0; d < cfg->latent_dim; ++d) {
-            latent[d] = ctx->noise[d] + ctx->flow_out[d];
+        if (onesync_flow) {
+            /* noise + flow_out, added on the device (same fp32 addition). */
+            memcpy(latent,
+                   scratch->cuda_onesync_host_latent + i * cfg->latent_dim,
+                   cfg->latent_dim * sizeof(float));
+        } else {
+            for (size_t d = 0; d < cfg->latent_dim; ++d) {
+                latent[d] = ctx->noise[d] + ctx->flow_out[d];
+            }
         }
         if (ctx->dump != NULL && ctx->dump->frames < ctx->dump->capacity) {
             const size_t off = ctx->dump->frames * cfg->latent_dim;
@@ -11355,6 +11928,7 @@ static void pocket_scratch_free(mynah_engine_scratch *scratch) {
     pocket_cuda_codec_scratch_release(scratch);
     if (scratch->backend != NULL) {
         mynah_backend_graph_forget(scratch->backend, scratch);
+        pocket_cuda_onesync_release(scratch);
         pocket_cuda_flow_release(scratch);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_x);
         mynah_backend_dev_free(scratch->backend, scratch->cuda_norm);
@@ -11928,6 +12502,7 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                     strcmp(getenv("MYNAH_CUDA_GRAPHS"), "0") != 0;
                 scratch->cuda_graph_ready = 0;
                 scratch->cuda_kv_shadow_floats = kv_shadow_floats;
+                pocket_cuda_onesync_reserve(state, scratch, batch);
             }
         }
     }
