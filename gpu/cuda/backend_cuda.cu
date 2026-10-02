@@ -1230,7 +1230,8 @@ struct cuda_tile_workspace {
     size_t splitk_cap = 0u; /* floats */
     /* The tile's activation rounded to bf16 for a cuBLAS bf16 GEMM when the
      * order need not be fixed (MYNAH_CUDA_QUANT=bf16 with
-     * MYNAH_CUDA_PREFILL_FIXED=0); sized here, never inside a capture. */
+     * MYNAH_CUDA_PREFILL_FIXED=0, or a per-stage bf16 switch that leaves
+     * st->quant_weights unset); sized here, never inside a capture. */
     uint16_t *a16 = nullptr;
     size_t a16_cap = 0u; /* elements */
     int sms = 0;
@@ -8166,7 +8167,7 @@ static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
         w.splitk_cap = need;
     }
     const size_t a16_need = rows * (ffn > dim ? ffn : dim);
-    if (st->quant_weights && st->tile_cublas && a16_need > w.a16_cap) {
+    if (st->tile_cublas && a16_need > w.a16_cap) {
         cudaFree(w.a16);
         w.a16 = nullptr;
         w.a16_cap = 0u;
