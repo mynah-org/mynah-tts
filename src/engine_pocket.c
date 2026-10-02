@@ -1107,6 +1107,12 @@ struct mynah_engine_ctx {
      * then holds nothing valid, so nothing may upload it or step on the CPU. */
     int cuda_backbone_device_owned;
     int cuda_voice_pending;
+    /* MYNAH_CUDA_SHARED_VOICE: the model-owned device voice cache entry this
+     * request's prefix was copied from (bf16 only), so the decode attention
+     * can read positions [0, cuda_voice_shared_positions) from that one copy.
+     * NULL when the prefix came any other way. */
+    const void *cuda_voice_shared;
+    size_t cuda_voice_shared_positions;
 
     /* Optional resident CUDA Mimi decoder transformer. The host transformer
      * remains the correctness/fallback state; the device owns a compact KV
@@ -1248,6 +1254,11 @@ struct mynah_engine_scratch {
     float **cuda_vcache;
     size_t *cuda_positions;
     size_t *cuda_cache_strides;
+    /* MYNAH_CUDA_SHARED_VOICE tables: per layer and row like cuda_kcache, and
+     * the prefix length per row (0 = read the row only). */
+    void **cuda_kprefix;
+    void **cuda_vprefix;
+    size_t *cuda_prefix_len;
     float *cuda_x;
     float *cuda_norm;
     float *cuda_qkv;
@@ -4281,6 +4292,20 @@ static int pocket_cuda_kv_bf16_requested(const mynah_engine_state *state) {
            (strcmp(setting, "bf16") == 0 || strcmp(setting, "bfloat16") == 0);
 }
 
+/* MYNAH_CUDA_SHARED_VOICE (default 0): the batched decode attention reads
+ * each row's voice prefix from the model-owned device voice cache instead of
+ * the row's copy. Same bf16 values, so the audio is bit-identical; the rows of
+ * one voice share one copy in L2 instead of streaming it from DRAM per row. */
+static int pocket_cuda_shared_voice_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_CUDA_SHARED_VOICE");
+        cached = setting != NULL && strcmp(setting, "0") != 0 &&
+                 setting[0] != '\0';
+    }
+    return cached;
+}
+
 static void *pocket_cuda_kv_offset(float *base, size_t elements,
                                    int bf16) {
     if (base == NULL) return NULL;
@@ -6664,6 +6689,11 @@ static int pocket_cuda_backbone_step_batch(
                    cfg->hidden_dim * sizeof(float));
         }
     }
+    /* The shared voice prefix rides on the same graph-replayed table copies;
+     * the kernel variant is fixed per process, so a captured graph never
+     * changes kernels. */
+    const int shared_voice = kv_bf16 && pocket_cuda_shared_voice_enabled() &&
+        mynah_backend_has_self_attention_bf16_prefix_batch(scratch->backend);
     /* Graph replay reads one persistent host pointer table per transformer
      * layer.  The table cannot be a stack array and it cannot be shared by all
      * layers: each layer owns a different KV allocation, while the captured
@@ -6685,6 +6715,17 @@ static int pocket_cuda_backbone_step_batch(
                 ctxs[i]->cuda_backbone_kv, layer_offset, kv_bf16);
             scratch->cuda_vcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
                 ctxs[i]->cuda_backbone_kv, layer_offset + layer_half, kv_bf16);
+            if (shared_voice) {
+                /* Device voice cache layout: [layer][K|V][positions][attn]. */
+                const size_t p = ctxs[i]->cuda_voice_shared != NULL
+                                     ? ctxs[i]->cuda_voice_shared_positions : 0u;
+                const uint16_t *voice = (const uint16_t *)ctxs[i]->cuda_voice_shared;
+                scratch->cuda_kprefix[metadata_offset] =
+                    p != 0u ? (void *)(voice + l * 2u * p * attn_dim) : NULL;
+                scratch->cuda_vprefix[metadata_offset] =
+                    p != 0u ? (void *)(voice + (l * 2u + 1u) * p * attn_dim) : NULL;
+                if (l == 0u) scratch->cuda_prefix_len[i] = p;
+            }
         }
         for (size_t i = count; i < exec; ++i) {
             const size_t metadata_offset = l * scratch->cuda_batch_capacity + i;
@@ -6692,6 +6733,11 @@ static int pocket_cuda_backbone_step_batch(
                 scratch->cuda_pad_kv, l * shadow_row, kv_bf16);
             scratch->cuda_vcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
                 scratch->cuda_pad_kv, l * shadow_row + attn_dim, kv_bf16);
+            if (shared_voice) {
+                scratch->cuda_kprefix[metadata_offset] = NULL;
+                scratch->cuda_vprefix[metadata_offset] = NULL;
+                if (l == 0u) scratch->cuda_prefix_len[i] = 0u;
+            }
         }
     }
 
@@ -6747,7 +6793,20 @@ static int pocket_cuda_backbone_step_batch(
                     scratch->cuda_positions, exec, cfg->heads, cfg->head_dim,
                     first_config->max_period, local, sizeof(local)) != 0)
                 goto fail;
-            const int attention_failed = kv_bf16
+            const int attention_failed = shared_voice
+                ? mynah_backend_self_attention_bf16_prefix_batch_dev(
+                      scratch->backend, scratch->cuda_qkv,
+                      (void *const *)(scratch->cuda_kcache +
+                                      l * scratch->cuda_batch_capacity),
+                      (void *const *)(scratch->cuda_vcache +
+                                      l * scratch->cuda_batch_capacity),
+                      scratch->cuda_kprefix + l * scratch->cuda_batch_capacity,
+                      scratch->cuda_vprefix + l * scratch->cuda_batch_capacity,
+                      scratch->cuda_prefix_len, scratch->cuda_positions,
+                      scratch->cuda_cache_strides, exec, cfg->heads,
+                      cfg->head_dim, 1.0f / sqrtf((float)cfg->head_dim),
+                      scratch->cuda_attn, local, sizeof(local))
+                : kv_bf16
                 ? mynah_backend_self_attention_bf16_batch_dev(
                       scratch->backend, scratch->cuda_qkv,
                       (void *const *)(scratch->cuda_kcache +
@@ -8039,6 +8098,8 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                 return -1;
             }
         }
+        ctx->cuda_voice_shared = ctx->cuda_backbone_kv_bf16 ? voice : NULL;
+        ctx->cuda_voice_shared_positions = ctx->voice_positions;
     }
     if (total > 0u) {
         /* Text embeddings: one packed device buffer, owned by the model and
@@ -8190,6 +8251,8 @@ static int pocket_segment_prologue(mynah_engine_ctx *ctx, char *error,
     ctx->cuda_backbone_valid = 0;
     ctx->cuda_backbone_device_owned = 0;
     ctx->cuda_voice_pending = 0;
+    ctx->cuda_voice_shared = NULL;
+    ctx->cuda_voice_shared_positions = 0u;
     return pocket_seed_backbone(ctx, error, capacity);
 }
 
@@ -8232,6 +8295,8 @@ static int pocket_seed_prologue(mynah_engine_ctx *ctx, char *error, size_t capac
     ctx->cuda_mimi_tile_owned = 0;
     ctx->cuda_backbone_device_owned = 0;
     ctx->cuda_voice_pending = 0;
+    ctx->cuda_voice_shared = NULL;
+    ctx->cuda_voice_shared_positions = 0u;
     ctx->rng = ctx->seed;
     ctx->have_spare = 0;
     ctx->spare = 0.0f;
@@ -10802,11 +10867,17 @@ static void pocket_scratch_free(mynah_engine_scratch *scratch) {
         pocket_host_free_bytes(scratch->backend, scratch->cuda_vcache);
         pocket_host_free_bytes(scratch->backend, scratch->cuda_positions);
         pocket_host_free_bytes(scratch->backend, scratch->cuda_cache_strides);
+        pocket_host_free_bytes(scratch->backend, scratch->cuda_kprefix);
+        pocket_host_free_bytes(scratch->backend, scratch->cuda_vprefix);
+        pocket_host_free_bytes(scratch->backend, scratch->cuda_prefix_len);
     } else {
         free(scratch->cuda_kcache);
         free(scratch->cuda_vcache);
         free(scratch->cuda_positions);
         free(scratch->cuda_cache_strides);
+        free(scratch->cuda_kprefix);
+        free(scratch->cuda_vprefix);
+        free(scratch->cuda_prefix_len);
     }
     mynah_transformer_ar_batch_free(scratch->backbone_batch);
     mynah_flow_head_batch_free(scratch->flow_batch);
@@ -10979,6 +11050,21 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                         state->backend,
                         batch * sizeof(*scratch->cuda_cache_strides),
                         (void **)&scratch->cuda_cache_strides, ignored,
+                        sizeof(ignored)) != 0 ||
+                    pocket_host_alloc_bytes(
+                        state->backend,
+                        kv_metadata * sizeof(*scratch->cuda_kprefix),
+                        (void **)&scratch->cuda_kprefix, ignored,
+                        sizeof(ignored)) != 0 ||
+                    pocket_host_alloc_bytes(
+                        state->backend,
+                        kv_metadata * sizeof(*scratch->cuda_vprefix),
+                        (void **)&scratch->cuda_vprefix, ignored,
+                        sizeof(ignored)) != 0 ||
+                    pocket_host_alloc_bytes(
+                        state->backend,
+                        batch * sizeof(*scratch->cuda_prefix_len),
+                        (void **)&scratch->cuda_prefix_len, ignored,
                         sizeof(ignored)) != 0;
             }
             if (!device_failed && pocket_cuda_codec_requested(state)) {
@@ -11309,10 +11395,16 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                 pocket_host_free_bytes(state->backend, scratch->cuda_vcache);
                 pocket_host_free_bytes(state->backend, scratch->cuda_positions);
                 pocket_host_free_bytes(state->backend, scratch->cuda_cache_strides);
+                pocket_host_free_bytes(state->backend, scratch->cuda_kprefix);
+                pocket_host_free_bytes(state->backend, scratch->cuda_vprefix);
+                pocket_host_free_bytes(state->backend, scratch->cuda_prefix_len);
                 scratch->cuda_kcache = NULL;
                 scratch->cuda_vcache = NULL;
                 scratch->cuda_positions = NULL;
                 scratch->cuda_cache_strides = NULL;
+                scratch->cuda_kprefix = NULL;
+                scratch->cuda_vprefix = NULL;
+                scratch->cuda_prefix_len = NULL;
             } else {
                 scratch->cuda_batch_capacity = batch;
                 scratch->cuda_batch_enabled = 1;

@@ -4,6 +4,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <nvtx3/nvToolsExt.h>
 
@@ -639,6 +640,63 @@ __global__ static void k_decoder_copy_tail_batch(float *const *windows,
         (size_t)channel * (size_t)window_len + (size_t)(window_len - tail + pos)];
 }
 
+/* MYNAH_CUDA_DECODER_FUSE: the same values as k_decoder_elu_batch followed
+ * by k_decoder_causal_window_batch and k_decoder_causal_columns_batch, read
+ * straight from the carried state and the input (ELU applied on the fly to
+ * input values only; the carried state already holds post-ELU values), so the
+ * ELU output and the window buffer are never written. Stride 1 only. */
+__device__ __forceinline__ static float decoder_elu_value(float x, float alpha) {
+    return x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+}
+
+template <typename T>
+__global__ static void k_decoder_causal_columns_fused(
+    float *const *previous, float *const *inputs, T *const *columns,
+    int batch, int channels, int length, int kernel, int dilation, int tail,
+    int elu, float alpha) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * kernel * length;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int out_pos = local % length;
+    const int tap_channel = local / length;
+    const int tap = tap_channel % kernel;
+    const int channel = tap_channel / kernel;
+    const int source = out_pos + tap * dilation;
+    float value = 0.0f;
+    if (source < tail) {
+        value = previous[request][(size_t)channel * (size_t)tail + (size_t)source];
+    } else if (source < tail + length) {
+        value = inputs[request][(size_t)channel * (size_t)length +
+                                (size_t)(source - tail)];
+        if (elu) value = decoder_elu_value(value, alpha);
+    }
+    decoder_put(columns[request], (size_t)local, value);
+}
+
+/* The new carried state when tail <= length: the last `tail` input values of
+ * each channel (post-ELU), the same numbers k_decoder_copy_tail_batch takes
+ * from the window. Runs after the columns kernel has read the old state. */
+__global__ static void k_decoder_copy_tail_fused(float *const *inputs,
+                                                 float *const *previous,
+                                                 int batch, int channels,
+                                                 int length, int tail, int elu,
+                                                 float alpha) {
+    const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int per_request = channels * tail;
+    const int total = batch * per_request;
+    if (index >= total) return;
+    const int request = index / per_request;
+    const int local = index - request * per_request;
+    const int channel = local / tail;
+    const int pos = local - channel * tail;
+    const float value = inputs[request][(size_t)channel * (size_t)length +
+                                        (size_t)(length - tail + pos)];
+    previous[request][local] = elu ? decoder_elu_value(value, alpha) : value;
+}
+
 __global__ static void k_decoder_convtr_batch(
     float *const *inputs, float *const *full, const float *weight,
     const float *bias, int batch, int in_channels, int out_channels,
@@ -678,7 +736,8 @@ __global__ static void k_decoder_convtr_batch(
 template <typename T>
 __global__ static void k_decoder_convtr_gather(float *const *inputs, T *x,
                                                int batch, int channels,
-                                               int length) {
+                                               int length, int elu = 0,
+                                               float alpha = 0.0f) {
     const int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     const int n = batch * length;
     if (index >= channels * n) return;
@@ -686,7 +745,8 @@ __global__ static void k_decoder_convtr_gather(float *const *inputs, T *x,
     const int j = index - channel * n;
     const int request = j / length;
     const int t = j - request * length;
-    decoder_put(x, (size_t)index, inputs[request][(size_t)channel * length + t]);
+    const float value = inputs[request][(size_t)channel * length + t];
+    decoder_put(x, (size_t)index, elu ? decoder_elu_value(value, alpha) : value);
 }
 
 __global__ static void k_decoder_convtr_overlap(const float *y, float *const *full,
@@ -1040,6 +1100,11 @@ struct cuda_backend_state {
     float **dev_batch_v_cache;
     size_t *dev_batch_positions;
     size_t *dev_batch_cache_strides;
+    /* MYNAH_CUDA_SHARED_VOICE: per-row voice-prefix K/V planes of the layer
+     * being run (the model-owned device voice cache) and their length. */
+    void **dev_batch_k_prefix;
+    void **dev_batch_v_prefix;
+    size_t *dev_batch_prefix_len;
     /* Pointer tables for the cross-request causal decoder.  Each table is
      * reused for one topology operation at a time; decoder state itself stays
      * in the per-request objects. */
@@ -2807,6 +2872,9 @@ static void cuda_close(void *opaque) {
     if (st->dev_batch_v_cache) cudaFree(st->dev_batch_v_cache);
     if (st->dev_batch_positions) cudaFree(st->dev_batch_positions);
     if (st->dev_batch_cache_strides) cudaFree(st->dev_batch_cache_strides);
+    if (st->dev_batch_k_prefix) cudaFree(st->dev_batch_k_prefix);
+    if (st->dev_batch_v_prefix) cudaFree(st->dev_batch_v_prefix);
+    if (st->dev_batch_prefix_len) cudaFree(st->dev_batch_prefix_len);
     if (st->dev_decoder_ptr0) cudaFree(st->dev_decoder_ptr0);
     if (st->dev_decoder_ptr1) cudaFree(st->dev_decoder_ptr1);
     if (st->dev_decoder_ptr2) cudaFree(st->dev_decoder_ptr2);
@@ -2868,6 +2936,9 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->dev_batch_v_cache = nullptr;
     st->dev_batch_positions = nullptr;
     st->dev_batch_cache_strides = nullptr;
+    st->dev_batch_k_prefix = nullptr;
+    st->dev_batch_v_prefix = nullptr;
+    st->dev_batch_prefix_len = nullptr;
     st->dev_decoder_ptr0 = nullptr;
     st->dev_decoder_ptr1 = nullptr;
     st->dev_decoder_ptr2 = nullptr;
@@ -2937,6 +3008,12 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
                       CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_positions)), e, ec) ||
         ce(cudaMalloc(&st->dev_batch_cache_strides,
                       CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_cache_strides)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_k_prefix,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_k_prefix)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_v_prefix,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_v_prefix)), e, ec) ||
+        ce(cudaMalloc(&st->dev_batch_prefix_len,
+                      CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_prefix_len)), e, ec) ||
         ce(cudaMalloc(&st->dev_decoder_ptr0,
                       CUDA_BATCH_META_CAP * sizeof(*st->dev_decoder_ptr0)), e, ec) ||
         ce(cudaMalloc(&st->dev_decoder_ptr1,
@@ -4642,6 +4719,14 @@ static bool decoder_convtr_gemm_enabled(void) {
     return on;
 }
 
+/* MYNAH_CUDA_DECODER_FUSE: in the cross-request decoder, ELU and the causal
+ * window are folded into the im2col / gather kernels that read them (same
+ * float operations, so the audio is bit-identical). */
+static bool decoder_fuse_enabled(void) {
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_FUSE", false);
+    return on;
+}
+
 static int decoder_reserve_one_gemm(cuda_backend_state *st,
                                     const mynah_backend_decoder *decoder,
                                     char *e, size_t ec) {
@@ -5187,11 +5272,15 @@ static int decoder_residual_batch(cuda_backend_state *backend,
     return ce(cudaGetLastError(), e, ec);
 }
 
+/* elu_input: the op reads ELU(input). Fused, the ELU happens inside the
+ * column kernel; otherwise ELU(input) is first written to elu_out (which may
+ * be `inputs` itself for an in-place ELU) exactly as before the fusion. */
 static int decoder_conv1d_batch(cuda_backend_state *backend,
                                 mynah_backend_decoder *const *decoders,
                                 cuda_decoder_op *const *ops,
                                 float *const *inputs, float *const *outputs,
-                                size_t batch, size_t length, char *e,
+                                size_t batch, size_t length, int elu_input,
+                                float alpha, float *const *elu_out, char *e,
                                 size_t ec) {
     if (backend == nullptr || decoders == nullptr || ops == nullptr ||
         inputs == nullptr ||
@@ -5223,11 +5312,32 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         output_elements > (size_t)INT_MAX)
         return -1;
 
+    static const bool one_gemm = cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false);
+    const bool fused = decoder_fuse_enabled() && !(one_gemm && batch > 1u) &&
+                       op->tail <= length;
+    if (elu_input && !fused) {
+        size_t elu_elements = 0u;
+        if (elu_out == nullptr ||
+            !decoder_mul((size_t)op->in_channels, length, &elu_elements) ||
+            elu_elements > (size_t)INT_MAX ||
+            decoder_elu_batch(backend, inputs, elu_out, batch, elu_elements,
+                              alpha, e, ec) != 0)
+            return -1;
+        inputs = elu_out;
+        elu_input = 0;
+    }
+
     float *p0[CUDA_BATCH_META_CAP];
     float *p1[CUDA_BATCH_META_CAP];
     float *p2[CUDA_BATCH_META_CAP];
     float *p3[CUDA_BATCH_META_CAP];
-    if (op->tail > 0u) {
+    if (fused) {
+        for (size_t i = 0; i < batch; ++i) {
+            if (ops[i] == nullptr || (op->tail > 0u && ops[i]->previous == nullptr))
+                return -1;
+            p0[i] = op->tail > 0u ? ops[i]->previous : inputs[i];
+        }
+    } else if (op->tail > 0u) {
         for (size_t i = 0; i < batch; ++i) {
             if (ops[i] == nullptr || ops[i]->window == nullptr ||
                 ops[i]->previous == nullptr)
@@ -5256,7 +5366,6 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
     } else {
         for (size_t i = 0; i < batch; ++i) p0[i] = inputs[i];
     }
-    static const bool one_gemm = cuda_env_enabled("MYNAH_CUDA_DECODER_ONEGEMM", false);
     if (one_gemm && batch > 1u) {
         size_t cols_need = 0u, out_need = 0u;
         if (!decoder_mul(inner, batch * out_len, &cols_need) ||
@@ -5354,7 +5463,46 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
                             ec) != 0)
         return -1;
-    if (bf16) {
+    if (fused) {
+        float *pin[CUDA_BATCH_META_CAP];
+        for (size_t i = 0; i < batch; ++i) pin[i] = inputs[i];
+        if (decoder_upload_ptrs(backend, backend->dev_decoder_ptr2, pin, batch,
+                                e, ec) != 0)
+            return -1;
+        if (bf16) {
+            k_decoder_causal_columns_fused<<<blocks, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                decoder_current_table(backend, backend->dev_decoder_ptr2),
+                reinterpret_cast<uint16_t *const *>(
+                    decoder_current_table(backend, backend->dev_decoder_ptr1)),
+                (int)batch, op->in_channels, (int)out_len, op->kernel,
+                op->dilation, (int)op->tail, elu_input, alpha);
+        } else {
+            k_decoder_causal_columns_fused<<<blocks, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                decoder_current_table(backend, backend->dev_decoder_ptr2),
+                decoder_current_table(backend, backend->dev_decoder_ptr1),
+                (int)batch, op->in_channels, (int)out_len, op->kernel,
+                op->dilation, (int)op->tail, elu_input, alpha);
+        }
+        if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+        /* The carried state moves now, before the bias and the GEMM write
+         * the output, which may be the input buffer itself. */
+        if (op->tail > 0u) {
+            size_t tail_elements = 0u;
+            int tail_blocks = 0;
+            if (!decoder_mul(batch, (size_t)op->in_channels, &tail_elements) ||
+                !decoder_mul(tail_elements, op->tail, &tail_elements) ||
+                !decoder_batch_launch_range(tail_elements, &tail_blocks))
+                return -1;
+            k_decoder_copy_tail_fused<<<tail_blocks, 256, 0, backend->stream>>>(
+                decoder_current_table(backend, backend->dev_decoder_ptr2),
+                decoder_current_table(backend, backend->dev_decoder_ptr0),
+                (int)batch, op->in_channels, (int)length, (int)op->tail,
+                elu_input, alpha);
+            if (ce(cudaGetLastError(), e, ec) != 0) return -1;
+        }
+    } else if (bf16) {
         k_decoder_causal_columns_batch<<<blocks, 256, 0, backend->stream>>>(
             decoder_current_table(backend, backend->dev_decoder_ptr0),
             reinterpret_cast<uint16_t *const *>(
@@ -5418,7 +5566,7 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
             e, ec) != 0)
         return -1;
     }
-    if (op->tail > 0u) {
+    if (op->tail > 0u && !fused) {
         int blocks = 0;
         for (size_t i = 0; i < batch; ++i) {
             p0[i] = ops[i]->window;
@@ -5444,11 +5592,13 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
     return 0;
 }
 
+/* elu_input: the op reads ELU(input), applied in place first unless the
+ * GEMM gather can apply it on the fly (MYNAH_CUDA_DECODER_FUSE). */
 static int decoder_convtr_batch(cuda_backend_state *backend,
                                 cuda_decoder_op *const *ops,
                                 float *const *inputs, float *const *outputs,
-                                size_t batch, size_t length, char *e,
-                                size_t ec) {
+                                size_t batch, size_t length, int elu_input,
+                                float alpha, char *e, size_t ec) {
     if (backend == nullptr || ops == nullptr || inputs == nullptr ||
         outputs == nullptr || batch == 0u || batch > backend->batch_meta_cap ||
         ops[0] == nullptr || length == 0u || length > ops[0]->max_in_len)
@@ -5466,6 +5616,21 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
         !decoder_mul(batch, full_elements, &full_elements) ||
         full_elements > (size_t)INT_MAX)
         return -1;
+    const size_t gemm_n = batch * length;
+    const bool gemm_path =
+        decoder_convtr_gemm_enabled() && op->groups == 1 &&
+        (size_t)op->in_channels * gemm_n <= backend->dec_tr_x_cap &&
+        (size_t)op->out_channels * (size_t)op->kernel * gemm_n <=
+            backend->dec_tr_y_cap;
+    const int gather_elu = elu_input && gemm_path && decoder_fuse_enabled();
+    if (elu_input && !gather_elu) {
+        size_t elu_elements = 0u;
+        if (!decoder_mul((size_t)op->in_channels, length, &elu_elements) ||
+            elu_elements > (size_t)INT_MAX ||
+            decoder_elu_batch(backend, inputs, inputs, batch, elu_elements,
+                              alpha, e, ec) != 0)
+            return -1;
+    }
     float *p0[CUDA_BATCH_META_CAP];
     float *p1[CUDA_BATCH_META_CAP];
     for (size_t i = 0; i < batch; ++i) {
@@ -5480,11 +5645,7 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
         decoder_upload_ptrs(backend, backend->dev_decoder_ptr1, p1, batch, e,
                             ec) != 0)
         return -1;
-    const size_t gemm_n = batch * length;
-    if (decoder_convtr_gemm_enabled() && op->groups == 1 &&
-        (size_t)op->in_channels * gemm_n <= backend->dec_tr_x_cap &&
-        (size_t)op->out_channels * (size_t)op->kernel * gemm_n <=
-            backend->dec_tr_y_cap) {
+    if (gemm_path) {
         const int m = op->out_channels * op->kernel;
         const int n = (int)gemm_n;
         const int x_total = op->in_channels * n;
@@ -5495,11 +5656,13 @@ static int decoder_convtr_batch(cuda_backend_state *backend,
         if (x_bf16 != nullptr) {
             k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
                 decoder_current_table(backend, backend->dev_decoder_ptr0),
-                x_bf16, (int)batch, op->in_channels, (int)length);
+                x_bf16, (int)batch, op->in_channels, (int)length, gather_elu,
+                alpha);
         } else {
             k_decoder_convtr_gather<<<(x_total + 255) / 256, 256, 0, backend->stream>>>(
                 decoder_current_table(backend, backend->dev_decoder_ptr0),
-                backend->dec_tr_x, (int)batch, op->in_channels, (int)length);
+                backend->dec_tr_x, (int)batch, op->in_channels, (int)length,
+                gather_elu, alpha);
         }
         if (ce(cudaGetLastError(), e, ec) != 0 ||
             cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
@@ -5719,20 +5882,17 @@ static int decoder_step_batch_impl(
                              &hidden_elements) ||
                 elements > (size_t)INT_MAX ||
                 hidden_elements > (size_t)INT_MAX ||
-                decoder_elu_batch(backend, current, scratch, batch, elements,
-                                  first->elu_alpha, e, ec) != 0 ||
-                decoder_conv1d_batch(backend, decoders, op_rows, scratch, other,
-                                     batch, length, e, ec) != 0)
+                decoder_conv1d_batch(backend, decoders, op_rows, current, other,
+                                     batch, length, 1, first->elu_alpha,
+                                     scratch, e, ec) != 0)
                 return -1;
             for (size_t i = 0; i < batch; ++i) {
                 op_rows[i] = &decoders[i]->ops[index - 1u];
                 scratch[i] = other[i];
             }
-            if (decoder_elu_batch(backend, other, other, batch,
-                                  hidden_elements,
-                                  first->elu_alpha, e, ec) != 0 ||
-                decoder_conv1d_batch(backend, decoders, op_rows, other, scratch,
-                                     batch, length, e, ec) != 0 ||
+            if (decoder_conv1d_batch(backend, decoders, op_rows, other, scratch,
+                                     batch, length, 1, first->elu_alpha, other,
+                                     e, ec) != 0 ||
                 decoder_residual_batch(backend, current, scratch, batch,
                                        elements, e, ec) != 0)
                 return -1;
@@ -5742,14 +5902,8 @@ static int decoder_step_batch_impl(
         for (size_t i = 0; i < batch; ++i) {
             op_rows[i] = &decoders[i]->ops[index - 1u];
         }
-        if (op->pre_elu) {
-            size_t elements = 0u;
-            if (!decoder_mul(channels, length, &elements) ||
-                elements > (size_t)INT_MAX ||
-                decoder_elu_batch(backend, current, current, batch, elements,
-                                  first->elu_alpha, e, ec) != 0)
-                return -1;
-        }
+        /* pre_elu: applied in place on `current` by the op (or fused into
+         * the kernel that reads it, MYNAH_CUDA_DECODER_FUSE). */
         const bool last = index == op_count;
         for (size_t i = 0; i < batch; ++i) {
             if (last)
@@ -5761,12 +5915,14 @@ static int decoder_step_batch_impl(
         }
         if (op->kind == CUDA_DECODER_CONV) {
             if (decoder_conv1d_batch(backend, decoders, op_rows, current,
-                                     destination, batch, length, e, ec) != 0)
+                                     destination, batch, length, op->pre_elu,
+                                     first->elu_alpha, current, e, ec) != 0)
                 return -1;
             channels = (size_t)op->out_channels;
         } else if (op->kind == CUDA_DECODER_CONVTR) {
             if (decoder_convtr_batch(backend, op_rows, current, destination,
-                                     batch, length, e, ec) != 0)
+                                     batch, length, op->pre_elu,
+                                     first->elu_alpha, e, ec) != 0)
                 return -1;
             channels = (size_t)op->out_channels;
             if (!decoder_mul(length, (size_t)op->stride, &length))
@@ -5822,6 +5978,14 @@ extern "C" int mynah_cuda_decoder_open(
                          "mynah-tts: CUDA SEANet decoder convolutions in bf16 "
                          "(MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states "
                          "and audio)\n");
+    }
+    if (decoder_fuse_enabled()) {
+        static std::atomic<bool> announced_fuse{false};
+        if (!announced_fuse.exchange(true))
+            std::fprintf(stderr,
+                         "mynah-tts: CUDA decoder ELU and causal window fused "
+                         "into the im2col/gather kernels "
+                         "(MYNAH_CUDA_DECODER_FUSE=1)\n");
     }
     *out = decoder;
     return 0;
@@ -7425,6 +7589,135 @@ k_tile_gemm_tc2(const float *A, const float *W, const float *bias, float *C,
 #endif
 }
 
+/* MYNAH_CUDA_PREFILL_BF16TC: the fixed-order prefill tile on BF16 tensor
+ * cores. The resident BF16 weight copy halves the weight traffic that bounds
+ * the prefill (all 24 layers' weights are read once per tile call), the
+ * activations are rounded to BF16 as they are staged, and the MMAs accumulate
+ * in fp32. The order is fixed exactly as in k_tile_gemm_tc: split-K ranges
+ * that depend on N and K only, 32-wide K slabs ascending, 16-wide MMA steps
+ * ascending, partials added in split order. A row's result therefore does not
+ * depend on how many rows share the call, so a text sent in pieces still gives
+ * the same audio as the same text sent whole. 64x128 outputs per block, 8
+ * warps of 32x32, the next slab prefetched into registers. */
+static constexpr int TB_BM = 64, TB_BN = 128, TB_BK = 32, TB_LD = TB_BK + 8;
+static constexpr int TB_THREADS = 256;
+static constexpr int TB_SLD = 20; /* per-warp 16x16 fp32 staging, padded */
+
+__global__ static void __launch_bounds__(TB_THREADS)
+k_tile_gemm_bf16tc(const float *A, const uint16_t *W, const float *bias,
+                   float *C, int M, int N, int K, int KC, float *P) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    __shared__ __align__(32) uint16_t As[TB_BM * TB_LD];
+    __shared__ __align__(32) uint16_t Ws[TB_BN * TB_LD];
+    __shared__ __align__(32) float St[8 * 16 * TB_SLD];
+    const int m0 = (int)blockIdx.y * TB_BM;
+    const int n0 = (int)blockIdx.x * TB_BN;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int wm = warp >> 2, wn = warp & 3; /* 2 x 4 warps of 32 x 32 */
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+    const int kbeg = (int)blockIdx.z * KC;
+    const int kend = kbeg + KC < K ? kbeg + KC : K;
+    /* A slab: 64 x 32 floats = 512 float4, 2 per thread.
+     * W slab: 128 x 32 bf16 = 512 uint4 (8 bf16 each), 2 per thread. */
+    float4 ra[2];
+    uint4 rw[2];
+    auto fetch = [&](int k0) {
+        for (int i = 0; i < 2; ++i) {
+            const int idx = tid + TB_THREADS * i;
+            const int ar = idx >> 3, ac = (idx & 7) * 4;
+            const int gm = m0 + ar, ak = k0 + ac;
+            ra[i] = gm < M && ak < kend
+                ? *reinterpret_cast<const float4 *>(A + (size_t)gm * (size_t)K + (size_t)ak)
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const int wr = idx >> 2, wc = (idx & 3) * 8;
+            const int gn = n0 + wr, wk = k0 + wc;
+            rw[i] = gn < N && wk < kend
+                ? *reinterpret_cast<const uint4 *>(W + (size_t)gn * (size_t)K + (size_t)wk)
+                : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    auto stash = [&]() {
+        for (int i = 0; i < 2; ++i) {
+            const int idx = tid + TB_THREADS * i;
+            const int ar = idx >> 3, ac = (idx & 7) * 4;
+            uint2 packed;
+            packed.x = (uint32_t)cuda_bf16_from_float(ra[i].x) |
+                       ((uint32_t)cuda_bf16_from_float(ra[i].y) << 16);
+            packed.y = (uint32_t)cuda_bf16_from_float(ra[i].z) |
+                       ((uint32_t)cuda_bf16_from_float(ra[i].w) << 16);
+            *reinterpret_cast<uint2 *>(As + ar * TB_LD + ac) = packed;
+            const int wr = idx >> 2, wc = (idx & 3) * 8;
+            *reinterpret_cast<uint4 *>(Ws + wr * TB_LD + wc) = rw[i];
+        }
+    };
+    if (kbeg < kend) fetch(kbeg);
+    for (int k0 = kbeg; k0 < kend; k0 += TB_BK) {
+        stash();
+        __syncthreads();
+        if (k0 + TB_BK < kend) fetch(k0 + TB_BK); /* overlaps the MMAs below */
+        for (int kk = 0; kk < TB_BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                           wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                           wmma::col_major> b[2];
+            for (int i = 0; i < 2; ++i)
+                wmma::load_matrix_sync(
+                    a[i], reinterpret_cast<const __nv_bfloat16 *>(
+                              As + (wm * 32 + i * 16) * TB_LD + kk), TB_LD);
+            for (int j = 0; j < 2; ++j)
+                wmma::load_matrix_sync(
+                    b[j], reinterpret_cast<const __nv_bfloat16 *>(
+                              Ws + (wn * 32 + j * 16) * TB_LD + kk), TB_LD);
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j)
+                    wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float *st = St + warp * 16 * TB_SLD;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            wmma::store_matrix_sync(st, acc[i][j], TB_SLD, wmma::mem_row_major);
+            __syncwarp();
+            const int rb = m0 + wm * 32 + i * 16, cb = n0 + wn * 32 + j * 16;
+            for (int e = lane; e < 256; e += 32) {
+                const int r = e >> 4, c = e & 15;
+                const int gm = rb + r, gn = cb + c;
+                if (gm >= M || gn >= N) continue;
+                const size_t o = (size_t)gm * (size_t)N + (size_t)gn;
+                const float v = st[r * TB_SLD + c];
+                if (P != nullptr)
+                    P[(size_t)blockIdx.z * (size_t)M * (size_t)N + o] = v;
+                else
+                    C[o] = v + (bias != nullptr ? bias[gn] : 0.0f);
+            }
+            __syncwarp();
+        }
+    }
+#endif
+}
+
+static bool cuda_prefill_bf16tc_usable(void) {
+    static const bool on = [] {
+        if (!cuda_env_enabled("MYNAH_CUDA_PREFILL_BF16TC", false)) return false;
+        int dev = 0, major = 0;
+        const bool ok = cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                   dev) == cudaSuccess && major >= 8;
+        if (ok)
+            std::fprintf(stderr,
+                         "mynah-tts: CUDA fixed-order prefill tile on bf16 "
+                         "tensor cores (MYNAH_CUDA_PREFILL_BF16TC=1; fp32 "
+                         "accumulate, batch-invariant)\n");
+        return ok;
+    }();
+    return on;
+}
+
 static int cuda_tile_tc_level(void) {
     static const int level = [] {
         const char *v = std::getenv("MYNAH_CUDA_TILE_TC");
@@ -7450,6 +7743,34 @@ static bool cuda_tile_tc_usable(void) {
     return on;
 }
 
+/* The BF16 tensor-core tile (k_tile_gemm_bf16tc) for one tile GEMM, when
+ * MYNAH_CUDA_PREFILL_BF16TC is on and the shape fits; returns 1 when the shape
+ * does not fit (the caller takes another path), 0 on success, -1 on error. */
+static int tile_gemm_bf16tc(cuda_backend_state *st, const float *A,
+                            const float *hw, const float *db, float *C,
+                            size_t M, size_t N, size_t K, char *e, size_t ec) {
+    if (K % (size_t)TB_BK != 0u || ((uintptr_t)A & 15u) != 0u ||
+        !cuda_prefill_bf16tc_usable())
+        return 1;
+    cuda_tile_workspace &w = st->tile;
+    uint16_t *dw16 = nullptr;
+    if (cached_weight_bf16(st, hw, N * K, &dw16, e, ec)) return -1;
+    int S = tile_gemm_splits(w.sms > 0 ? w.sms : 40, (int)N, (int)K);
+    if (w.splitk == nullptr || (size_t)S * M * N > w.splitk_cap) S = 1;
+    int KC = (int)((K + (size_t)S - 1u) / (size_t)S);
+    KC = (KC + TB_BK - 1) / TB_BK * TB_BK;
+    const dim3 tgrid((unsigned)((N + TB_BN - 1) / TB_BN),
+                     (unsigned)((M + TB_BM - 1) / TB_BM), (unsigned)S);
+    k_tile_gemm_bf16tc<<<tgrid, TB_THREADS, 0, st->stream>>>(
+        A, dw16, db, C, (int)M, (int)N, (int)K, KC, S > 1 ? w.splitk : nullptr);
+    if (ce(cudaGetLastError(), e, ec)) return -1;
+    if (S == 1) return 0;
+    const dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
+    k_tile_gemm_reduce<<<g2, 256, 0, st->stream>>>(w.splitk, S, (int)M,
+                                                   (int)N, db, C);
+    return ce(cudaGetLastError(), e, ec) ? -1 : 0;
+}
+
 static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
                      const float *hb, float *C, size_t M, size_t N, size_t K,
                      int bf16, char *e, size_t ec) {
@@ -7465,12 +7786,19 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
          * path runs.  A cuBLAS BF16 tile was measured on the L4: its
          * M-dependent rounding put the Mimi solo-vs-gang gap at 1.1e-3,
          * outside the tensor-core parity band the self-check allows; this
-         * kernel keeps the tile batch-invariant at bf16 weight traffic. */
+         * kernel keeps the tile batch-invariant at bf16 weight traffic.
+         * MYNAH_CUDA_PREFILL_BF16TC: the same invariance on tensor cores. */
+        const int tc = tile_gemm_bf16tc(st, A, hw, db, C, M, N, K, e, ec);
+        if (tc <= 0) return tc;
         uint16_t *dw16 = nullptr;
         if (cached_weight_bf16(st, hw, N * K, &dw16, e, ec)) return -1;
         k_tile_gemm<true><<<grid, 256, 0, st->stream>>>(A, dw16, db, C, (int)M,
                                                           (int)N, (int)K);
         return ce(cudaGetLastError(), e, ec);
+    }
+    if (w.fixed_order) {
+        const int tc = tile_gemm_bf16tc(st, A, hw, db, C, M, N, K, e, ec);
+        if (tc <= 0) return tc;
     }
     float *dw = nullptr;
     if (cached_weight(st, hw, N * K * sizeof(float), &dw, e, ec)) return -1;
@@ -7967,12 +8295,19 @@ __device__ static float cuda_warp_sum(float v) {
     return v;
 }
 
+/* SHARED: positions [0, prefix_len[request]) are read from the request's
+ * voice-prefix planes (kprefix/vprefix, stride `width`) instead of its own
+ * cache. The values are the same bf16 numbers the prefill copies into the
+ * row, so the result is bit-identical; rows of one voice read one copy, which
+ * stays in L2 instead of streaming once per row from DRAM. */
+template <bool SHARED>
 __global__ static void __launch_bounds__(CUDA_ATTN_FAST_THREADS)
 k_self_attention_bf16_batch_fast(
     const float *qkv, const uint16_t *const *kcache,
     const uint16_t *const *vcache, const size_t *positions,
     const size_t *cache_strides, int batch, int heads, int head_width,
-    float scale, float *out) {
+    float scale, float *out, const uint16_t *const *kprefix,
+    const uint16_t *const *vprefix, const size_t *prefix_len) {
     const int head = (int)blockIdx.x;
     const int request = (int)blockIdx.y;
     if (head >= heads || request >= batch) return;
@@ -7985,6 +8320,9 @@ k_self_attention_bf16_batch_fast(
     const size_t stride = cache_strides[request];
     uint16_t *request_k = const_cast<uint16_t *>(kcache[request]);
     uint16_t *request_v = const_cast<uint16_t *>(vcache[request]);
+    const size_t shared_len = SHARED ? prefix_len[request] : 0u;
+    const uint16_t *shared_k = SHARED ? kprefix[request] : nullptr;
+    const uint16_t *shared_v = SHARED ? vprefix[request] : nullptr;
     const float *request_qkv = qkv + (size_t)request * width * 3u;
     __shared__ float qs[CUDA_ATTN_FAST_THREADS];
     __shared__ float probs[CUDA_ATTN_FAST_THREADS];
@@ -8009,7 +8347,8 @@ k_self_attention_bf16_batch_fast(
         float score = -1.0e30f;
         if (s < n) {
             const uint4 *kr = reinterpret_cast<const uint4 *>(
-                request_k + s * stride + hbase);
+                SHARED && s < shared_len ? shared_k + s * width + hbase
+                                         : request_k + s * stride + hbase);
             float dot = 0.0f;
             for (int i = 0; i < head_width / 8; ++i) {
                 const uint4 w = kr[i];
@@ -8045,9 +8384,19 @@ k_self_attention_bf16_batch_fast(
         const size_t left = n - c0;
         const int count = left < (size_t)CUDA_ATTN_FAST_THREADS
                               ? (int)left : CUDA_ATTN_FAST_THREADS;
-        const uint16_t *vbase = request_v + c0 * stride + hbase + (size_t)d;
-        for (int j = g; j < count; j += groups)
-            acc += probs[j] * cuda_bf16_to_float(vbase[(size_t)j * stride]);
+        if (SHARED && c0 < shared_len) {
+            for (int j = g; j < count; j += groups) {
+                const size_t s = c0 + (size_t)j;
+                const uint16_t *v = s < shared_len
+                    ? shared_v + s * width + hbase + (size_t)d
+                    : request_v + s * stride + hbase + (size_t)d;
+                acc += probs[j] * cuda_bf16_to_float(*v);
+            }
+        } else {
+            const uint16_t *vbase = request_v + c0 * stride + hbase + (size_t)d;
+            for (int j = g; j < count; j += groups)
+                acc += probs[j] * cuda_bf16_to_float(vbase[(size_t)j * stride]);
+        }
         __syncthreads();
     }
     probs[tid] = acc;
@@ -8121,12 +8470,12 @@ extern "C" int mynah_cuda_self_attention_batch_dev(
     return ce(cudaGetLastError(), e, ec);
 }
 
-extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
-    void *opaque, const float *qkv, void *const *kcache,
-    void *const *vcache, const size_t *positions,
+static int cuda_self_attention_bf16_batch(
+    cuda_backend_state *st, const float *qkv, void *const *kcache,
+    void *const *vcache, void *const *kprefix, void *const *vprefix,
+    const size_t *prefix_len, const size_t *positions,
     const size_t *cache_strides, size_t batch, size_t heads,
     size_t head_width, float scale, float *out, char *e, size_t ec) {
-    auto *st = static_cast<cuda_backend_state *>(opaque);
     if (qkv == nullptr || kcache == nullptr || vcache == nullptr ||
         positions == nullptr || cache_strides == nullptr || out == nullptr ||
         batch == 0u || batch > st->batch_meta_cap || heads == 0u ||
@@ -8147,6 +8496,12 @@ extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
             positions[i] == SIZE_MAX || cache_strides[i] < width ||
             positions[i] > (SIZE_MAX - (width - 1u)) / cache_strides[i]) {
             set_error(e, ec, "invalid CUDA BF16 batched self-attention cache");
+            return -1;
+        }
+        if (prefix_len != nullptr && prefix_len[i] != 0u &&
+            (prefix_len[i] > positions[i] || kprefix[i] == nullptr ||
+             vprefix[i] == nullptr)) {
+            set_error(e, ec, "invalid CUDA BF16 shared voice prefix");
             return -1;
         }
     }
@@ -8170,14 +8525,51 @@ extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
         fast = cache_strides[i] % 8u == 0u &&
                ((uintptr_t)kcache[i] & 15u) == 0u &&
                ((uintptr_t)vcache[i] & 15u) == 0u;
-    if (fast) {
-        k_self_attention_bf16_batch_fast<<<grid, CUDA_ATTN_FAST_THREADS, 0,
-                                           st->stream>>>(
+    /* The shared prefix is a read-side shortcut: the row still holds its own
+     * copy, so any configuration the fast kernel cannot take simply reads
+     * the row as before. */
+    bool shared = fast && prefix_len != nullptr && width % 8u == 0u;
+    for (size_t i = 0; shared && i < batch; ++i)
+        shared = ((uintptr_t)kprefix[i] & 15u) == 0u &&
+                 ((uintptr_t)vprefix[i] & 15u) == 0u;
+    if (shared &&
+        (ce(cudaMemcpyAsync(st->dev_batch_k_prefix, kprefix,
+                            batch * sizeof(*kprefix), cudaMemcpyHostToDevice,
+                            st->stream), e, ec) ||
+         ce(cudaMemcpyAsync(st->dev_batch_v_prefix, vprefix,
+                            batch * sizeof(*vprefix), cudaMemcpyHostToDevice,
+                            st->stream), e, ec) ||
+         ce(cudaMemcpyAsync(st->dev_batch_prefix_len, prefix_len,
+                            batch * sizeof(*prefix_len), cudaMemcpyHostToDevice,
+                            st->stream), e, ec))) return -1;
+    if (shared) {
+        /* One line per process, the first time the shared path really runs. */
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true))
+            std::fprintf(stderr,
+                         "mynah-tts: CUDA decode attention reads voice prefixes "
+                         "from the shared device voice cache "
+                         "(MYNAH_CUDA_SHARED_VOICE=1)\n");
+        k_self_attention_bf16_batch_fast<true><<<grid, CUDA_ATTN_FAST_THREADS, 0,
+                                                 st->stream>>>(
             qkv,
             reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
             reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
             st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
-            (int)heads, (int)head_width, scale, out);
+            (int)heads, (int)head_width, scale, out,
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_prefix),
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_prefix),
+            st->dev_batch_prefix_len);
+        return ce(cudaGetLastError(), e, ec);
+    }
+    if (fast) {
+        k_self_attention_bf16_batch_fast<false><<<grid, CUDA_ATTN_FAST_THREADS, 0,
+                                                  st->stream>>>(
+            qkv,
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache),
+            reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache),
+            st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
+            (int)heads, (int)head_width, scale, out, nullptr, nullptr, nullptr);
         return ce(cudaGetLastError(), e, ec);
     }
     k_self_attention_bf16_batch<<<grid, attention_threads(head_width), 0,
@@ -8188,6 +8580,33 @@ extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
         st->dev_batch_positions, st->dev_batch_cache_strides, (int)batch,
         (int)heads, (int)head_width, scale, out);
     return ce(cudaGetLastError(), e, ec);
+}
+
+extern "C" int mynah_cuda_self_attention_bf16_batch_dev(
+    void *opaque, const float *qkv, void *const *kcache,
+    void *const *vcache, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    return cuda_self_attention_bf16_batch(
+        static_cast<cuda_backend_state *>(opaque), qkv, kcache, vcache,
+        nullptr, nullptr, nullptr, positions, cache_strides, batch, heads,
+        head_width, scale, out, e, ec);
+}
+
+extern "C" int mynah_cuda_self_attention_bf16_prefix_batch_dev(
+    void *opaque, const float *qkv, void *const *kcache,
+    void *const *vcache, void *const *kprefix, void *const *vprefix,
+    const size_t *prefix_len, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale, float *out, char *e, size_t ec) {
+    if (kprefix == nullptr || vprefix == nullptr || prefix_len == nullptr) {
+        set_error(e, ec, "invalid CUDA BF16 shared voice prefix tables");
+        return -1;
+    }
+    return cuda_self_attention_bf16_batch(
+        static_cast<cuda_backend_state *>(opaque), qkv, kcache, vcache,
+        kprefix, vprefix, prefix_len, positions, cache_strides, batch, heads,
+        head_width, scale, out, e, ec);
 }
 
 __global__ static void k_gather_kv_batch(

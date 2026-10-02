@@ -494,6 +494,19 @@ int mynah_backend_self_attention_bf16_batch_dev(
     const size_t *positions, const size_t *cache_strides, size_t batch,
     size_t heads, size_t head_width, float scale, float *dev_out,
     char *error, size_t error_capacity);
+/* As above, with positions [0, prefix_len[i]) of row i read from the shared
+ * voice-prefix planes dev_k_prefix[i] / dev_v_prefix[i] (stride heads *
+ * head_width), which must hold the same values as the row's own cache
+ * (MYNAH_CUDA_SHARED_VOICE). A row with prefix_len 0 reads only its cache. */
+int mynah_backend_has_self_attention_bf16_prefix_batch(const mynah_backend *backend);
+int mynah_backend_self_attention_bf16_prefix_batch_dev(
+    const mynah_backend *backend, const float *dev_qkv,
+    void *const *dev_k_cache, void *const *dev_v_cache,
+    void *const *dev_k_prefix, void *const *dev_v_prefix,
+    const size_t *prefix_len, const size_t *positions,
+    const size_t *cache_strides, size_t batch, size_t heads,
+    size_t head_width, float scale, float *dev_out, char *error,
+    size_t error_capacity);
 /* Gather the newly-written K/V slot of each independent request into one
  * fixed device buffer.  The pointer/position metadata is copied by the
  * backend, so the operation remains graph-capturable while requests rotate
