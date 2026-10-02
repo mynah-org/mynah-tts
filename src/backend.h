@@ -57,7 +57,10 @@ typedef int (*mynah_backend_sgemm_fn)(void *, int trans_a, int trans_b,
  * transformer BF16 weight copies on tensor cores; int8 turns on the Q8
  * policy, the int8 qmat cache and the resident-compatible int8 groups.  The
  * low-level variables (MYNAH_CUDA_Q8, MYNAH_QUANT, MYNAH_QUANT_GROUPS) remain
- * expert overrides and win when set.  It never changes a CPU backend. */
+ * expert overrides and win when set.  It never changes a CPU backend.
+ * MYNAH_CUDA_QUANT_STAGES (Pocket: backbone, flow, mimi; default all) narrows
+ * the stages bf16 applies to, e.g. `backbone` for bf16 FlowLM Linears with an
+ * fp32 flow head and codec. */
 typedef enum {
     MYNAH_CUDA_QUANT_INVALID = -1,
     MYNAH_CUDA_QUANT_F32 = 0,
@@ -167,6 +170,59 @@ int mynah_backend_q8_reserve(const mynah_backend *, size_t activation_count,
 int mynah_backend_matmul_bf16_d2d(const mynah_backend *, const float *, float *, size_t, size_t, size_t, const float *, const float *, char *, size_t);
 int mynah_backend_bf16_reserve(const mynah_backend *, size_t activation_count,
                                char *, size_t);
+/* Fused BF16 decode linears (MYNAH_CUDA_BF16_FUSE, CUDA only).  The backend
+ * owns one STAGED BF16 activation: the buffer mynah_backend_matmul_bf16_d2d
+ * casts its input into, reserved by mynah_backend_bf16_reserve before any
+ * graph capture.  The producers below write the RNE BF16 rounding of the
+ * same FP32 value the unfused path computes straight into it, and
+ * mynah_backend_matmul_bf16_staged_d2d runs the very same cuBLAS call as
+ * mynah_backend_matmul_bf16_d2d on it, without the bias epilogue.  The bias
+ * is then folded into the elementwise kernel that consumes the GEMM output
+ * (RoPE, residual add, GELU), with the same FP32 add.  Stream-ordered: a
+ * staged value must be consumed by the next staged GEMM before another
+ * producer or a BF16 matmul overwrites it.  `bias` arguments are host
+ * model-pack views, cached by the backend like the GEMM bias. */
+int mynah_backend_has_bf16_fused(const mynah_backend *);
+/* LayerNorm of `rows` x `width` into the staged activation. */
+int mynah_backend_layer_norm_bf16_stage_dev(const mynah_backend *,
+                                            const float *in, const float *gain,
+                                            const float *bias, size_t rows,
+                                            size_t width, char *, size_t);
+/* GELU(in + bias) of `rows` x `cols` into the staged activation; `in` is not
+ * written. */
+int mynah_backend_bias_gelu_bf16_stage_dev(const mynah_backend *,
+                                           const float *in, const float *bias,
+                                           size_t rows, size_t cols, char *,
+                                           size_t);
+/* out[rows][ow] = staged[rows][iw] x W^T, BF16 weight copy, FP32 output, no
+ * bias. */
+int mynah_backend_matmul_bf16_staged_d2d(const mynah_backend *, float *out,
+                                         size_t rows, size_t iw, size_t ow,
+                                         const float *weight, char *, size_t);
+/* mynah_backend_rope_batch_dev with the fused-QKV bias added first to all
+ * three of q, k and v. */
+int mynah_backend_rope_bias_batch_dev(const mynah_backend *, float *dev_qkv,
+                                      const float *bias,
+                                      const size_t *positions, size_t batch,
+                                      size_t heads, size_t head_width,
+                                      float max_period, char *, size_t);
+/* out[r][c] += in[r][c] + bias[c] (bias may be NULL: a plain residual). */
+int mynah_backend_residual_bias_add_dev(const mynah_backend *, float *out,
+                                        const float *in, const float *bias,
+                                        size_t rows, size_t cols, char *,
+                                        size_t);
+/* mynah_backend_self_attention_bf16_prefix_batch_dev (prefix tables may be
+ * NULL: no shared prefix) whose output goes to the staged activation.
+ * `dev_scratch` ([batch][heads*head_width] FP32) is used only when the fast
+ * kernel cannot take the call: the legacy kernel writes it and a cast stages
+ * it, so the staged values are the same either way. */
+int mynah_backend_self_attention_bf16_stage_batch_dev(
+    const mynah_backend *, const float *dev_qkv, void *const *dev_k_cache,
+    void *const *dev_v_cache, void *const *dev_k_prefix,
+    void *const *dev_v_prefix, const size_t *prefix_len,
+    const size_t *positions, const size_t *cache_strides, size_t batch,
+    size_t heads, size_t head_width, float scale, float *dev_scratch, char *,
+    size_t);
 int mynah_backend_im2col(const mynah_backend *, const float *, float *, int, int, int, int, char *, size_t);
 int mynah_backend_conv1d(const mynah_backend *, const float *, float *, int, int, int, int, int, const float *, const float *, char *, size_t);
 /* Device-resident causal conv1d.  `input` and `output` are backend-owned
