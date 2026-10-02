@@ -164,6 +164,70 @@ kernel, so they are not bit-equal anyway). Bit identity of part 2 has to be show
 with the same gang history, once with `MYNAH_CUDA_DECODER_FUSE_BIAS=0` (pure elementwise fusion, should match by
 construction) and once with the default (also tests the cuBLAS beta = 0 assumption).
 
+### Decode attention, split kernel (`MYNAH_CUDA_ATTN_SPLIT=1`, default 0 while measured)
+`k_self_attention_bf16_batch_split<SHARED, BF16OUT>` (`gpu/cuda/backend_cuda.cu`) is a flash-decoding layout of the
+batched BF16-KV decode attention. Same signature, tables and semantics as `k_self_attention_bf16_batch_fast`: it
+writes the new K/V at `position` first (then `__syncthreads`), reads positions `< prefix_len` from the shared voice
+planes (stride `width`) and never dereferences a (possibly stripped/biased) row below the prefix, and `BF16OUT`
+stores the RNE BF16 of the FP32 result into the staged activation. The wrapper picks it wherever the fast kernel
+would run (same alignment/stride checks, same fallbacks to the legacy kernel) and `head_width == 64`; otherwise the
+old kernels run unchanged. One start-up line: "CUDA decode attention uses the split (flash-decoding) kernel".
+
+Design (one 128-thread block per (head, row), 4 warps, grid unchanged `heads x rows`):
+- Lane group g = lane / 8 (4 per warp) owns one position, lane sub = lane % 8 owns dims [8 sub, 8 sub + 8). One
+  `uint4` load per lane reads the full 128-byte K (or V) head row of a position, so one warp load instruction
+  fetches 4 positions' rows, fully coalesced per 128-byte line.
+- Warp w walks positions [16 w + 64 k, 16 w + 64 k + 16): per step each lane issues 4 K and 4 V 16-byte loads
+  before any math (8 x 16 B in flight per lane, ~4 KB per warp), then the dot (8 FMA + 3 xor-shuffles inside the
+  8-lane group), one running-max update per 4 positions (1 + 4 `expf`) and V accumulation into 8 FP32 registers.
+  No block barrier inside the loop; the prefix/row choice is per position, so a prefix boundary inside a step is
+  handled, and lanes past `n` load nothing.
+- Merge: the 4 groups of a warp by xor-shuffle (8, then 16), then the 4 warps in shared memory in warp order
+  (threads 0..63, one output dim each). Warp 0 always holds position 0; an empty warp has weight 0.
+- Determinism: the partition and merge order depend only on the row's own length, no atomics, so the result is
+  deterministic and independent of the batch composition. It differs from the fast kernel in the last bits
+  (different summation order); FP32 math throughout (`expf`, no fast-math intrinsics).
+
+Expected bandwidth. Bytes per step = rows x 24 layers x 16 heads x n x 256 B (K + V, 128 B each per position and
+head) = rows x n x 96 KiB. At C160 with mean n ~300: ~4.7 GB, i.e. ~15.7 ms at the L4's ~300 GB/s, which is what
+the fast kernel already took before the shared voice: without the shared voice the old kernel is at the DRAM
+roofline and the split kernel cannot win much. The case it targets is `MYNAH_CUDA_SHARED_VOICE=1`: the ~126-position
+prefix (~2 GB per step at C160) comes from L2, the DRAM part is the suffix only (~160 x 174 x 96 KiB = ~2.7 GB,
+~9-10 ms at ~280 GB/s achievable), and there the old kernel (one position per thread, 2-byte V loads, 3 barriers
+per 128 positions) is latency/issue bound rather than DRAM bound. Floor at C160 with shared voice: ~10 ms DRAM +
+~1 ms L2. Going below needs fewer bytes (8-bit suffix KV, shorter segments), not a better kernel. Occupancy: ~80
+registers per thread expected, ~6 blocks (24 warps) per SM, ~100 KB of loads in flight per SM, far above the
+~3 KB per SM Little's law needs at 300 GB/s.
+
+Self-test (`--gpu-self-test`, always run, flag-independent): `cuda_attn_split_self_test`, 8 rows x 4 heads x 64,
+positions {0, 1, 15, 64, 127, 300, 701, 2049}, strides width and width + 64, prefix lengths {0, 0, 0, 40, 126, 126,
+126, 0}, SHARED off and on. Checks: split vs fast FP32 within 1e-3 relative (max(1, |ref|)); BF16OUT within 1e-2;
+each row launched alone bit-identical to the same row in the batch; with SHARED the row's own positions below the
+prefix are filled with NaN, so a read there fails. With `MYNAH_CUDA_ATTN_SPLIT` set it also prints the max
+relative diff. The algorithm was checked on the CPU by a lane-level emulation against a float64 softmax for n in
+1..2050 and prefix lengths 0/40/126 (max rel error 4e-7); the CUDA code itself was syntax-checked with clang
+(host and sm_89 device) but not compiled with nvcc here.
+
+How to A/B on the L4:
+1. Build, `nvcc -Xptxas -v` (or `cuobjdump --dump-resource-usage`) on `k_self_attention_bf16_batch_split*`: no
+   spills, registers <= ~96.
+2. `MYNAH_CUDA_ATTN_SPLIT=1 ./mynah-tts --gpu-self-test` PASS and the printed max rel diff ~1e-6..1e-5.
+3. Kernel time: nsys `--cuda-graph-trace=node` at C160, `MYNAH_CUDA_SHARED_VOICE=1` with and without
+   `MYNAH_CUDA_ATTN_SPLIT=1`: `k_self_attention_bf16_batch_split` vs `k_self_attention_bf16_batch_fast` total per
+   step. `ncu --kernel-name regex:k_self_attention_bf16_batch_ --metrics
+   dram__bytes_read.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,gpu__time_duration.sum`
+   on one replay for both: same DRAM bytes expected, higher DRAM throughput % for split.
+4. Knee A/B (C160/C192/C208, interleaved): arm A `MYNAH_CUDA_SHARED_VOICE=1`, arm B A + `MYNAH_CUDA_ATTN_SPLIT=1`;
+   also with `MYNAH_CUDA_BF16_FUSE=1` (BF16OUT path).
+5. Audio: not bit-identical to the fast kernel (summation order). Seeded runs must be bit-identical between two
+   runs of arm B and across batch compositions (same request alone vs inside C24), which is the determinism claim.
+
+Risks: (a) register pressure/spills from the 8 `uint4` in flight (fallback: UNROLL 2); (b) short rows (n < 48)
+leave warps idle, harmless at the 130-700 positions of the server; (c) four warps per (row, head) cap the
+parallelism of a single long row (n in the thousands, one row) at ~1 block per head: fine for batched decode, the
+single-row step does not use this kernel; (d) TF32-class numerics: the change is in the last bits only, but it is
+a different reduction order from the fast kernel, so any golden-md5 test must be run with the flag off.
+
 ## Measurements
 (filled in as the runs land)
 

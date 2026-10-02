@@ -3002,6 +3002,8 @@ static int cuda_codec_gang_self_test(cuda_backend_state *st, char *e,
                                      size_t ec);
 static int cuda_bf16_fuse_self_test(cuda_backend_state *st, char *e,
                                     size_t ec);
+static int cuda_attn_split_self_test(cuda_backend_state *st, char *e,
+                                     size_t ec);
 
 static int cuda_self_test(void *opaque, char *e, size_t ec) {
     const float in[6]={1,2,3,-1,0.5f,2};
@@ -3023,6 +3025,9 @@ static int cuda_self_test(void *opaque, char *e, size_t ec) {
         return -1;
     if (cuda_bf16_fuse_self_test(static_cast<cuda_backend_state *>(opaque),
                                  e, ec) != 0)
+        return -1;
+    if (cuda_attn_split_self_test(static_cast<cuda_backend_state *>(opaque),
+                                  e, ec) != 0)
         return -1;
     return cuda_q8_self_test(opaque, e, ec);
 }
@@ -9163,6 +9168,199 @@ k_self_attention_bf16_batch_fast(
     }
 }
 
+/* MYNAH_CUDA_ATTN_SPLIT=1: flash-decoding layout of the same decode attention
+ * (same inputs, tables, SHARED/BF16OUT behaviour and K/V write as
+ * k_self_attention_bf16_batch_fast), for head_width 64 only.  One 128-thread
+ * block per (head, row), 4 warps.  Inside a warp, lane group g = lane / 8
+ * (4 groups) owns one position and lane sub = lane % 8 owns dims
+ * [8 sub, 8 sub + 8): one uint4 load per lane reads a whole 128-byte K (or V)
+ * head row per group, so a warp load instruction fetches 4 positions' rows,
+ * and each lane keeps UNROLL K plus UNROLL V loads in flight per step.  The
+ * dot product is reduced inside the 8-lane group (3 shuffles); each lane keeps
+ * its own running max / denominator / 8 accumulators (online softmax, no
+ * block barrier in the loop).  Warp w walks positions
+ * [w * 16 + k * 64, w * 16 + k * 64 + 16), k = 0, 1, ...; at the end the 4
+ * groups of a warp merge by xor-shuffle (8, then 16) and the 4 warps merge in
+ * shared memory in warp order.  The partition and the merge order depend only
+ * on the row's own length, so the result is deterministic and independent of
+ * the batch; it differs from the fast kernel in the last bits (different
+ * summation order), all math FP32. */
+static constexpr int CUDA_ATTN_SPLIT_THREADS = 128;
+static constexpr int CUDA_ATTN_SPLIT_WARPS = CUDA_ATTN_SPLIT_THREADS / 32;
+static constexpr int CUDA_ATTN_SPLIT_UNROLL = 4;
+static constexpr int CUDA_ATTN_SPLIT_WARP_TILE = 4 * CUDA_ATTN_SPLIT_UNROLL;
+static constexpr int CUDA_ATTN_SPLIT_TILE =
+    CUDA_ATTN_SPLIT_WARPS * CUDA_ATTN_SPLIT_WARP_TILE;
+static constexpr int CUDA_ATTN_SPLIT_HEAD_WIDTH = 64;
+
+__device__ static inline void cuda_bf16x8_unpack(const uint4 w, float f[8]) {
+    f[0] = __uint_as_float(w.x << 16);
+    f[1] = __uint_as_float(w.x & 0xffff0000u);
+    f[2] = __uint_as_float(w.y << 16);
+    f[3] = __uint_as_float(w.y & 0xffff0000u);
+    f[4] = __uint_as_float(w.z << 16);
+    f[5] = __uint_as_float(w.z & 0xffff0000u);
+    f[6] = __uint_as_float(w.w << 16);
+    f[7] = __uint_as_float(w.w & 0xffff0000u);
+}
+
+template <bool SHARED, bool BF16OUT>
+__global__ static void __launch_bounds__(CUDA_ATTN_SPLIT_THREADS)
+k_self_attention_bf16_batch_split(
+    const float *qkv, const uint16_t *const *kcache,
+    const uint16_t *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, int heads, int head_width,
+    float scale, float *out, const uint16_t *const *kprefix,
+    const uint16_t *const *vprefix, const size_t *prefix_len,
+    uint16_t *out_bf16) {
+    constexpr int HW = CUDA_ATTN_SPLIT_HEAD_WIDTH;
+    constexpr int U = CUDA_ATTN_SPLIT_UNROLL;
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch || head_width != HW) return;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int group = lane >> 3;
+    const int sub = lane & 7;
+    const size_t width = (size_t)heads * (size_t)HW;
+    const size_t hbase = (size_t)head * (size_t)HW;
+    const size_t position = positions[request];
+    const size_t stride = cache_strides[request];
+    uint16_t *request_k = const_cast<uint16_t *>(kcache[request]);
+    uint16_t *request_v = const_cast<uint16_t *>(vcache[request]);
+    const size_t shared_len = SHARED ? prefix_len[request] : 0u;
+    const uint16_t *shared_k = SHARED ? kprefix[request] : nullptr;
+    const uint16_t *shared_v = SHARED ? vprefix[request] : nullptr;
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    __shared__ float part_m[CUDA_ATTN_SPLIT_WARPS];
+    __shared__ float part_l[CUDA_ATTN_SPLIT_WARPS];
+    __shared__ float part_acc[CUDA_ATTN_SPLIT_WARPS][HW];
+    /* The new K/V first, exactly as the fast kernel (position >= the shared
+     * prefix length, so a stripped row is written only where it stores). */
+    if (tid < HW) {
+        const size_t at = position * stride + hbase + (size_t)tid;
+        request_k[at] = cuda_bf16_from_float(request_qkv[width + hbase + (size_t)tid]);
+        request_v[at] = cuda_bf16_from_float(request_qkv[width * 2u + hbase + (size_t)tid]);
+    }
+    float q[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) q[i] = request_qkv[hbase + (size_t)(sub * 8 + i)];
+    /* Makes the K/V store above visible to the whole block before any load. */
+    __syncthreads();
+    const size_t n = position + 1u;
+    float m = -1.0e30f;
+    float l = 0.0f;
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+    for (size_t base = (size_t)warp * CUDA_ATTN_SPLIT_WARP_TILE; base < n;
+         base += CUDA_ATTN_SPLIT_TILE) {
+        uint4 kw[U];
+        uint4 vw[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const size_t s = base + (size_t)(u * 4 + group);
+            kw[u] = make_uint4(0u, 0u, 0u, 0u);
+            vw[u] = make_uint4(0u, 0u, 0u, 0u);
+            if (s < n) {
+                const bool pre = SHARED && s < shared_len;
+                const uint16_t *kr = pre ? shared_k + s * width + hbase
+                                         : request_k + s * stride + hbase;
+                const uint16_t *vr = pre ? shared_v + s * width + hbase
+                                         : request_v + s * stride + hbase;
+                kw[u] = reinterpret_cast<const uint4 *>(kr)[sub];
+                vw[u] = reinterpret_cast<const uint4 *>(vr)[sub];
+            }
+        }
+        float sc[U];
+        float next = m;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            float kf[8];
+            cuda_bf16x8_unpack(kw[u], kf);
+            float dot = q[0] * kf[0] + q[1] * kf[1] + q[2] * kf[2] +
+                        q[3] * kf[3] + q[4] * kf[4] + q[5] * kf[5] +
+                        q[6] * kf[6] + q[7] * kf[7];
+            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 4);
+            const bool valid = base + (size_t)(u * 4 + group) < n;
+            sc[u] = valid ? dot * scale : -1.0e30f;
+            next = fmaxf(next, sc[u]);
+        }
+        const float correction = expf(m - next);
+        l *= correction;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] *= correction;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const bool valid = base + (size_t)(u * 4 + group) < n;
+            const float p = valid ? expf(sc[u] - next) : 0.0f;
+            l += p;
+            float vf[8];
+            cuda_bf16x8_unpack(vw[u], vf);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] += p * vf[i];
+        }
+        m = next;
+    }
+    /* Merge the 4 position groups of the warp (fixed xor order). */
+#pragma unroll
+    for (int off = 8; off < 32; off <<= 1) {
+        const float mo = __shfl_xor_sync(0xffffffffu, m, off);
+        const float lo = __shfl_xor_sync(0xffffffffu, l, off);
+        const float mm = fmaxf(m, mo);
+        const float c1 = expf(m - mm);
+        const float c2 = expf(mo - mm);
+        l = l * c1 + lo * c2;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float ao = __shfl_xor_sync(0xffffffffu, acc[i], off);
+            acc[i] = acc[i] * c1 + ao * c2;
+        }
+        m = mm;
+    }
+    if (lane < 8) {
+        if (lane == 0) {
+            part_m[warp] = m;
+            part_l[warp] = l;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) part_acc[warp][sub * 8 + i] = acc[i];
+    }
+    __syncthreads();
+    /* Merge the warps in warp order. A warp with no position has m = -1e30
+     * and l = 0, so its weight is 0 (warp 0 always holds position 0). */
+    if (tid < HW) {
+        float mm = part_m[0];
+#pragma unroll
+        for (int w = 1; w < CUDA_ATTN_SPLIT_WARPS; ++w) mm = fmaxf(mm, part_m[w]);
+        float den = 0.0f;
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < CUDA_ATTN_SPLIT_WARPS; ++w) {
+            const float c = expf(part_m[w] - mm);
+            den += part_l[w] * c;
+            total += part_acc[w][tid] * c;
+        }
+        const float value = den > 0.0f ? total / den : 0.0f;
+        const size_t at = (size_t)request * width + hbase + (size_t)tid;
+        if (BF16OUT)
+            out_bf16[at] = cuda_bf16_from_float(value);
+        else
+            out[at] = value;
+    }
+}
+
+static bool cuda_backbone_attn_split_enabled(void) {
+    static const bool on = [] {
+        const char *s = getenv("MYNAH_CUDA_ATTN_SPLIT");
+        return s != nullptr && strcmp(s, "1") == 0;
+    }();
+    return on;
+}
+
 static bool cuda_backbone_attn_fast_enabled(void) {
     static const bool on = [] {
         const char *s = getenv("MYNAH_CUDA_BACKBONE_ATTN");
@@ -9222,6 +9420,37 @@ extern "C" int mynah_cuda_self_attention_batch_dev(
         (int)batch, (int)heads,
         (int)head_width, scale, out);
     return ce(cudaGetLastError(), e, ec);
+}
+
+/* Launches the split decode attention on the tables already uploaded to
+ * st->dev_batch_* (prefix tables only for SHARED); `staged` != NULL selects
+ * the BF16OUT store. */
+template <bool SHARED>
+static void cuda_launch_attn_split(cuda_backend_state *st, dim3 grid,
+                                   const float *qkv, size_t batch,
+                                   size_t heads, size_t head_width,
+                                   float scale, float *out, uint16_t *staged) {
+    const uint16_t *const *kp = SHARED
+        ? reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_prefix)
+        : nullptr;
+    const uint16_t *const *vp = SHARED
+        ? reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_prefix)
+        : nullptr;
+    const size_t *pl = SHARED ? st->dev_batch_prefix_len : nullptr;
+    const auto *kc = reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_cache);
+    const auto *vc = reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_cache);
+    if (staged != nullptr)
+        k_self_attention_bf16_batch_split<SHARED, true>
+            <<<grid, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+            qkv, kc, vc, st->dev_batch_positions, st->dev_batch_cache_strides,
+            (int)batch, (int)heads, (int)head_width, scale, out, kp, vp, pl,
+            staged);
+    else
+        k_self_attention_bf16_batch_split<SHARED, false>
+            <<<grid, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+            qkv, kc, vc, st->dev_batch_positions, st->dev_batch_cache_strides,
+            (int)batch, (int)heads, (int)head_width, scale, out, kp, vp, pl,
+            nullptr);
 }
 
 /* `stage` (MYNAH_CUDA_BF16_FUSE): the result goes to the staged BF16
@@ -9303,6 +9532,17 @@ static int cuda_self_attention_bf16_batch(
     for (size_t i = 0; shared && i < batch; ++i)
         shared = ((uintptr_t)kprefix[i] & 15u) == 0u &&
                  ((uintptr_t)vprefix[i] & 15u) == 0u;
+    /* MYNAH_CUDA_ATTN_SPLIT=1: the flash-decoding kernel wherever the fast
+     * kernel would run and the head is 64 wide; same tables, same fallbacks. */
+    const bool split = fast && head_width == (size_t)CUDA_ATTN_SPLIT_HEAD_WIDTH &&
+                       cuda_backbone_attn_split_enabled();
+    if (split) {
+        static std::atomic<bool> split_announced{false};
+        if (!split_announced.exchange(true))
+            std::fprintf(stderr,
+                         "mynah-tts: CUDA decode attention uses the split "
+                         "(flash-decoding) kernel (MYNAH_CUDA_ATTN_SPLIT=1)\n");
+    }
     if (prefixed &&
         (ce(cudaMemcpyAsync(st->dev_batch_k_prefix, kprefix,
                             batch * sizeof(*kprefix), cudaMemcpyHostToDevice,
@@ -9340,6 +9580,11 @@ static int cuda_self_attention_bf16_batch(
             }
             return 0;
         }
+        if (split) {
+            cuda_launch_attn_split<true>(st, grid, qkv, batch, heads, head_width,
+                                         scale, out, stage ? staged : nullptr);
+            return ce(cudaGetLastError(), e, ec);
+        }
         if (stage) {
             k_self_attention_bf16_batch_fast<true, true>
                 <<<grid, CUDA_ATTN_FAST_THREADS, 0, st->stream>>>(
@@ -9366,6 +9611,11 @@ static int cuda_self_attention_bf16_batch(
         return ce(cudaGetLastError(), e, ec);
     }
     if (fast) {
+        if (split) {
+            cuda_launch_attn_split<false>(st, grid, qkv, batch, heads, head_width,
+                                          scale, out, stage ? staged : nullptr);
+            return ce(cudaGetLastError(), e, ec);
+        }
         if (stage) {
             k_self_attention_bf16_batch_fast<false, true>
                 <<<grid, CUDA_ATTN_FAST_THREADS, 0, st->stream>>>(
@@ -9449,6 +9699,181 @@ extern "C" int mynah_cuda_self_attention_bf16_stage_batch_dev(
         with_prefix ? kprefix : nullptr, with_prefix ? vprefix : nullptr,
         with_prefix ? prefix_len : nullptr, positions, cache_strides, batch,
         heads, head_width, scale, scratch, e, ec, true);
+}
+
+/* MYNAH_CUDA_ATTN_SPLIT: the split decode attention against the fast kernel
+ * on random data, with and without shared prefix tables, always run by
+ * --gpu-self-test (independent of the flag).  Checks: FP32 output within
+ * 1e-3 relative (summation order differs), BF16OUT within one BF16 rounding,
+ * every row computed alone bit-identical to the same row inside the batch
+ * (determinism, batch independence), and with prefix tables the row's own
+ * positions below the prefix are NaN, so any read there fails the test. */
+template <bool SHARED>
+static int cuda_attn_split_case(cuda_backend_state *st, char *e, size_t ec) {
+    constexpr int heads = 4, hw = CUDA_ATTN_SPLIT_HEAD_WIDTH;
+    constexpr size_t width = (size_t)heads * hw;
+    constexpr int rows = 8;
+    const size_t positions[rows] = {0u, 1u, 15u, 64u, 127u, 300u, 701u, 2049u};
+    const size_t strides[rows] = {width, width + 64u, width, width + 64u,
+                                  width, width + 64u, width, width};
+    const size_t plen_all[rows] = {0u, 0u, 0u, 40u, 126u, 126u, 126u, 0u};
+    const size_t prefix_positions = 126u;
+    const float scale = 0.125f;
+    uint32_t seed = 0x2545f491u ^ (SHARED ? 0x5bd1e995u : 0u);
+    auto uniform = [&](float span) {
+        seed = seed * 1664525u + 1013904223u;
+        return ((float)(seed >> 8) / 16777216.0f - 0.5f) * 2.0f * span;
+    };
+    auto bf16 = [](float v) {
+        uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return (uint16_t)(bits >> 16);
+    };
+    /* One device slab: rows K then V, the prefix K/V planes, qkv, outputs. */
+    size_t row_elems[rows], offset[rows], total = 0u;
+    for (int r = 0; r < rows; ++r) {
+        row_elems[r] = (positions[r] + 1u) * strides[r];
+        offset[r] = total;
+        total += 2u * row_elems[r];
+    }
+    const size_t prefix_off = total;
+    total += 2u * prefix_positions * width;
+    std::vector<uint16_t> kv(total);
+    for (auto &x : kv) x = bf16(uniform(2.0f));
+    if (SHARED)
+        for (int r = 0; r < rows; ++r)
+            for (size_t i = 0; i < plen_all[r] * strides[r]; ++i) {
+                kv[offset[r] + i] = 0x7fc0u;                /* K NaN */
+                kv[offset[r] + row_elems[r] + i] = 0x7fc0u; /* V NaN */
+            }
+    std::vector<float> qkv((size_t)rows * 3u * width);
+    for (auto &x : qkv) x = uniform(3.0f);
+    const size_t out_n = (size_t)rows * width;
+    uint16_t *d_kv = nullptr;
+    float *d_f = nullptr; /* qkv | ref | split | single */
+    uint16_t *d_bf = nullptr;
+    void *d_tab = nullptr;
+    int result = -1;
+    do {
+        if (ce(cudaMalloc((void **)&d_kv, total * sizeof(uint16_t)), e, ec) ||
+            ce(cudaMalloc((void **)&d_f, (qkv.size() + 3u * out_n) * sizeof(float)), e, ec) ||
+            ce(cudaMalloc((void **)&d_bf, out_n * sizeof(uint16_t)), e, ec) ||
+            ce(cudaMalloc(&d_tab, (size_t)rows * 7u * sizeof(void *)), e, ec))
+            break;
+        const uint16_t *hk[rows], *hv[rows], *hkp[rows], *hvp[rows];
+        size_t hplen[rows];
+        for (int r = 0; r < rows; ++r) {
+            hk[r] = d_kv + offset[r];
+            hv[r] = d_kv + offset[r] + row_elems[r];
+            hkp[r] = d_kv + prefix_off;
+            hvp[r] = d_kv + prefix_off + prefix_positions * width;
+            hplen[r] = SHARED ? plen_all[r] : 0u;
+        }
+        auto **t_k = static_cast<const uint16_t **>(d_tab);
+        auto **t_v = t_k + rows;
+        auto **t_kp = t_k + 2 * rows;
+        auto **t_vp = t_k + 3 * rows;
+        auto *t_pos = reinterpret_cast<size_t *>(t_k + 4 * rows);
+        auto *t_str = reinterpret_cast<size_t *>(t_k + 5 * rows);
+        auto *t_pl = reinterpret_cast<size_t *>(t_k + 6 * rows);
+        static_assert(sizeof(size_t) == sizeof(void *), "table layout");
+        float *d_qkv = d_f, *d_ref = d_f + qkv.size(), *d_split = d_ref + out_n,
+              *d_single = d_split + out_n;
+        if (ce(cudaMemcpy(d_kv, kv.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(d_qkv, qkv.data(), qkv.size() * sizeof(float), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(t_k, hk, sizeof(hk), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(t_v, hv, sizeof(hv), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(t_kp, hkp, sizeof(hkp), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(t_vp, hvp, sizeof(hvp), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(t_pos, positions, sizeof(positions), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(t_str, strides, sizeof(strides), cudaMemcpyHostToDevice), e, ec) ||
+            ce(cudaMemcpy(t_pl, hplen, sizeof(hplen), cudaMemcpyHostToDevice), e, ec))
+            break;
+        const uint16_t *const *kp = SHARED ? t_kp : nullptr;
+        const uint16_t *const *vp = SHARED ? t_vp : nullptr;
+        const size_t *pl = SHARED ? t_pl : nullptr;
+        dim3 grid((unsigned)heads, (unsigned)rows, 1u);
+        k_self_attention_bf16_batch_fast<SHARED, false>
+            <<<grid, CUDA_ATTN_FAST_THREADS, 0, st->stream>>>(
+            d_qkv, t_k, t_v, t_pos, t_str, rows, heads, hw, scale, d_ref, kp,
+            vp, pl, nullptr);
+        k_self_attention_bf16_batch_split<SHARED, false>
+            <<<grid, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+            d_qkv, t_k, t_v, t_pos, t_str, rows, heads, hw, scale, d_split, kp,
+            vp, pl, nullptr);
+        k_self_attention_bf16_batch_split<SHARED, true>
+            <<<grid, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+            d_qkv, t_k, t_v, t_pos, t_str, rows, heads, hw, scale, nullptr, kp,
+            vp, pl, d_bf);
+        /* Each row alone, tables shifted: must equal the batched row bitwise. */
+        dim3 one((unsigned)heads, 1u, 1u);
+        for (int r = 0; r < rows; ++r)
+            k_self_attention_bf16_batch_split<SHARED, false>
+                <<<one, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+                d_qkv + (size_t)r * 3u * width, t_k + r, t_v + r, t_pos + r,
+                t_str + r, 1, heads, hw, scale, d_single + (size_t)r * width,
+                SHARED ? t_kp + r : nullptr, SHARED ? t_vp + r : nullptr,
+                SHARED ? t_pl + r : nullptr, nullptr);
+        if (ce(cudaGetLastError(), e, ec) || ce(cudaStreamSynchronize(st->stream), e, ec))
+            break;
+        std::vector<float> ref(out_n), split(out_n), single(out_n);
+        std::vector<uint16_t> sbf(out_n);
+        if (ce(cudaMemcpy(ref.data(), d_ref, out_n * sizeof(float), cudaMemcpyDeviceToHost), e, ec) ||
+            ce(cudaMemcpy(split.data(), d_split, out_n * sizeof(float), cudaMemcpyDeviceToHost), e, ec) ||
+            ce(cudaMemcpy(single.data(), d_single, out_n * sizeof(float), cudaMemcpyDeviceToHost), e, ec) ||
+            ce(cudaMemcpy(sbf.data(), d_bf, out_n * sizeof(uint16_t), cudaMemcpyDeviceToHost), e, ec))
+            break;
+        result = 0;
+        float worst = 0.0f;
+        for (size_t i = 0; i < out_n && result == 0; ++i) {
+            const float tol = std::fmax(1.0f, std::fabs(ref[i]));
+            const float diff = std::fabs(split[i] - ref[i]);
+            uint32_t bits = (uint32_t)sbf[i] << 16;
+            float as_bf;
+            std::memcpy(&as_bf, &bits, sizeof(as_bf));
+            if (!std::isfinite(split[i]) || !std::isfinite(ref[i]) ||
+                !(diff <= 1e-3f * tol)) {
+                std::snprintf(e, ec,
+                              "split attention (shared=%d) row %zu dim %zu: "
+                              "%.7g vs fast %.7g",
+                              SHARED ? 1 : 0, i / width, i % width,
+                              (double)split[i], (double)ref[i]);
+                result = -1;
+            } else if (!(std::fabs(as_bf - ref[i]) <= 1e-2f * tol)) {
+                std::snprintf(e, ec,
+                              "split attention BF16 out (shared=%d) row %zu "
+                              "dim %zu: %.7g vs fast %.7g",
+                              SHARED ? 1 : 0, i / width, i % width,
+                              (double)as_bf, (double)ref[i]);
+                result = -1;
+            }
+            worst = std::fmax(worst, diff / tol);
+        }
+        if (result == 0 &&
+            std::memcmp(split.data(), single.data(), out_n * sizeof(float)) != 0) {
+            std::snprintf(e, ec,
+                          "split attention (shared=%d) depends on the batch",
+                          SHARED ? 1 : 0);
+            result = -1;
+        }
+        if (result == 0 && getenv("MYNAH_CUDA_ATTN_SPLIT") != nullptr)
+            std::fprintf(stderr,
+                         "mynah-tts: split attention self-test shared=%d max "
+                         "rel diff vs fast %.3g\n",
+                         SHARED ? 1 : 0, (double)worst);
+    } while (false);
+    cudaFree(d_kv);
+    cudaFree(d_f);
+    cudaFree(d_bf);
+    cudaFree(d_tab);
+    return result;
+}
+
+static int cuda_attn_split_self_test(cuda_backend_state *st, char *e,
+                                     size_t ec) {
+    if (st == nullptr) return -1;
+    if (cuda_attn_split_case<false>(st, e, ec) != 0) return -1;
+    return cuda_attn_split_case<true>(st, e, ec);
 }
 
 __global__ static void k_gather_kv_batch(
