@@ -17,6 +17,15 @@ serving profiles in [`configs/perf/`](../configs/perf/README.md).
 | GPU memory at that load | ~8.5 GB | ~14.4 GB |
 | Profile | `l4-24g-pocket-en-6l-cuda` | `l4-24g-pocket-en-24l-cuda` |
 
+The qualified points above were measured on 2026-09-28 defaults. With the
+2026-10-02 defaults (shared voice prefix, split decode attention, bf16 backbone
+Linears, fused decoder, one sync per frame; section 7) the large model screens
+at **C256 per L4** with `--max-batch 256 --max-inflight 256`: 60-s closed-loop
+knees read stream RTF p95 0.594-0.607 at C208 and 0.710-0.714 at C256, ~303-306
+audio-s/s, TTFA p95 ~102-104 ms at C208, 0 stalls (the 2026-09-28 defaults read
+1.03 with stalls at C208). That is the new screening level; the 2 x 30-min soak
+qualification is pending, so C160 stays the qualified figure until it lands.
+
 A 4-vCPU host (AWS g6.xlarge class) is enough: the server needs about 1.3-1.4
 cores, and pinning it to four cores cost 1.5%.
 
@@ -70,6 +79,11 @@ MYNAH_CUDA_KV_DTYPE=bf16 ./build/cuda/mynah-tts --pocket-self-check models/pocke
 # pocket batching self-check: PASS
 ```
 
+With the defaults (TF32, bf16 weights and SEANet operands) the backend is not
+batch-invariant, so the self-check compares within a tolerance. The pedantic,
+batch-invariant setup makes it compare bit for bit (a text pushed in pieces vs
+the same text whole); see "Pedantic mode" in section 7.
+
 ## 4. Start the server
 
 Let the profile write the command, so nothing is forgotten:
@@ -78,13 +92,17 @@ Let the profile write the command, so nothing is forgotten:
 python3 tools/perf_profile.py command l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l --port 8080
 ```
 
-which prints the qualified configuration:
+which prints the profile's configuration:
 
 ```bash
 MYNAH_THREADS=1 MYNAH_CUDA_KV_DTYPE=bf16 MYNAH_QUANT_GROUPS=none \
   ./build/cuda/mynah-tts-server --device cuda -w 8 \
-  --max-batch 160 --max-inflight 160 -p 8080 -m models/pocket-english-24l
+  --max-batch 256 --max-inflight 256 -p 8080 -m models/pocket-english-24l
 ```
+
+(256 is the screening level of the 2026-10-02 defaults; the soak-qualified
+level is still C160, so `--max-batch 160 --max-inflight 160` is the
+conservative choice until the C256 soaks land.)
 
 (`MYNAH_SERVE_PROFILE=1`, which the profile also prints, only adds a
 scheduler report at shutdown.) For the small model use its profile, or the same
@@ -101,11 +119,14 @@ line with `--max-batch 256 --max-inflight 256` and `models/pocket-english-6l`.
 A healthy start prints lines like:
 
 ```
-mynah-tts: CUDA quant=f32 backbone=f32 flow=f32 mimi=f32 kv=bf16
+mynah-tts: CUDA quant=bf16 backbone=bf16 flow=f32 mimi=f32 kv=bf16 bf16_stages=backbone bf16_fuse=on
 mynah-tts: pocket backend=cuda resident=on ... resident{backbone=on flow=on codec_transformer=on}
 ```
 
-`kv=bf16` and `resident=on` are the two things to look for.
+`kv=bf16` and `resident=on` are the two things to look for. Each default-on
+feature of section 7 also prints one line when it is active (shared voice
+prefix, split decode attention, one sync per frame, fused decoder, cuBLASLt
+bf16 Linears, bf16 tensor-core prefill), so the log shows what ran.
 
 ## 5. Send requests
 
@@ -153,7 +174,11 @@ large one.
 
 ## 7. Feature flags (environment variables)
 
-The defaults are the tuned configuration. **Set only the two required
+The defaults are the tuned configuration. Together, the 2026-10-02 rows of the
+table below (shared voice through one sync) read on the L4 24L 60-s knees:
+stream RTF p95 0.594-0.607 at C208 and 0.710-0.714 at C256, ~303-306 audio-s/s,
+TTFA p95 ~102-104 ms at C208, against 1.03 with stalls at C208 for the
+2026-09-28 defaults. **Set only the two required
 variables**; everything else exists to roll a change back while debugging, or
 to opt into something that is not a production default. A profile run refuses
 to start if a "must be absent" variable is set.
@@ -166,7 +191,13 @@ to start if a "must be absent" variable is set.
 | `MYNAH_THREADS` | `1` | The GPU does the work; one CPU thread avoids a 128-thread pool on a big host |
 
 `MYNAH_QUANT_GROUPS=none` is what the qualified runs set; a CUDA build now
-resolves the default to the same thing, so it is harmless and optional.
+resolves the default to the same thing, so it is harmless and optional. It does
+not turn the bf16 backbone off: the groups select int8 encodings, and the f32
+groups (`none` = all of them) are what `MYNAH_CUDA_QUANT` upgrades to bf16.
+`MYNAH_CUDA_QUANT=f32` is the switch for fp32 weights. The bf16 default is the
+Pocket CUDA engine's own (unset `MYNAH_CUDA_QUANT`); an explicit
+`MYNAH_CUDA_Q8` (the expert int8 recipe) keeps the f32 base, and CPU builds
+never read it.
 
 ### On by default (leave unset; the value shown turns the feature off)
 
@@ -194,19 +225,48 @@ resolves the default to the same thing, so it is harmless and optional.
 | `MYNAH_CUDA_SEANET_BF16` | `0` | SEANet decoder convolution GEMMs with bf16 operands on tensor cores; fp32 accumulation, causal states and audio | L4 24L: stream RTF p95 -3 to -4 %, +3-4 % audio-s/s; SNR 47.5-49 dB vs fp32 at temperature 0 (`tests/codec_int8_quality.py --mode seanet-bf16`) |
 | `MYNAH_CUDA_SLOT_POOL_PREFILL` | `0` | the slot pool is filled at start-up (all `--max-batch` sets) instead of on the first burst | a fresh server's first burst runs like a warm one |
 | `MYNAH_CUDA_WIDTH_BUCKETS` | `0` | gang widths rounded up to a few buckets, their graphs captured at start-up | no graph capture during traffic; longer start-up |
+| `MYNAH_CUDA_SHARED_VOICE` | `0` | decode attention reads each stream's voice prefix from one shared device copy (stays in L2); with `MYNAH_CUDA_SHARED_VOICE_STRIP` (default on, `0` keeps the per-row copy) the rows no longer store the prefix (~12 MB less per stream on 24L) | L4 24L: stream RTF p95 -10/11 % at C160-C208, +13 % audio-s/s at C208; bit-identical audio |
+| `MYNAH_CUDA_ATTN_SPLIT` | `0` | split (flash-decoding) layout of the batched bf16 decode attention | C208 0.705 -> 0.674, C240 0.787 -> 0.749, +7 % audio-s/s; deterministic and batch-invariant, last-bit differences vs the old kernel |
+| `MYNAH_CUDA_QUANT` | `f32` | bf16 weight copies for the backbone Linears (fp32 accumulate; residual stream, norms, flow head, EOS head and codec stay fp32); `MYNAH_CUDA_QUANT_STAGES` defaults to `backbone` | with the two rows below, C208 0.676 -> 0.607, C256 0.788 -> 0.714, 266 -> 303 audio-s/s, TTFA p95 115 -> 104 ms |
+| `MYNAH_CUDA_BF16_FUSE` | `0` | bf16 decode layers fused: LayerNorm, GELU and attention write the bf16 GEMM operand, biases folded into the consumers | 456 -> 264 graph nodes per step; bit-identical to the unfused bf16 path |
+| `MYNAH_CUDA_BF16_LT` | `0` | bf16 Linears through cuBLASLt with a per-shape heuristic algorithm (created only when bf16 weights are in use) | without it bf16 was 10 % slower than TF32 |
+| `MYNAH_CUDA_PREFILL_BF16TC` | `0` | fixed-order text prefill on bf16 tensor cores (bf16 weights only; `=1` explicitly also covers f32 weights) | keeps "text in pieces == text whole" bit for bit at bf16 weight traffic |
+| `MYNAH_CUDA_DECODER_FUSE` | `0` | SEANet gang decoder: ELU, causal window, residual add, conv bias and the transposed-conv fold folded into the kernels that read them; `MYNAH_CUDA_DECODER_FUSE_BIAS=0` keeps only the bias on the old path | 36 -> 20 elementwise launches per step; bit-identical audio |
+| `MYNAH_CUDA_ONE_SYNC` | `0` | condition, backbone, EOS and flow head share one stream sync per batched frame | 3 fewer syncs per frame; same audio |
 | `MYNAH_POCKET_VOICE_CACHE` | `0` (or `all` / `startup` to preload) | voice prompts cached on first use | |
 
 ### Opt-in (off by default; not production settings)
 
 | variable | effect | why it is off |
 |---|---|---|
-| `MYNAH_CUDA_PREFILL_FIXED=0` | text prefill through cuBLAS: +4-9% throughput | a text sent in pieces no longer gives bit-identical audio to the same text sent whole; a product decision |
+| `MYNAH_CUDA_PREFILL_FIXED=0` | text prefill through cuBLAS (bf16 or TF32 by the weights): on f32 weights it measured -7 % RTF p95 | a text sent in pieces no longer gives bit-identical audio to the same text sent whole; a product decision |
+| `MYNAH_CUDA_KV_VMM=1` | backbone KV rows are VMM ranges that grow in place (no copy, no second allocation, no sync) | measured for C272+ (`--max-batch 288`); not a default yet |
+| `MYNAH_CUDA_QUANT_STAGES=all` | bf16 weights for the flow head and the Mimi transformer too | no measurable gain over `backbone` (C256 0.714 -> 0.712) |
 | `MYNAH_CUDA_SYNC=blocking` | host thread sleeps while the GPU works: server CPU 117% -> 43% | -9% throughput (each wake-up idles the GPU) |
-| `MYNAH_CUDA_TILE_TC=1` | own tensor-core fixed-order GEMM for the prefill | +1-2% only |
-| `MYNAH_CUDA_QUANT=bf16\|int8` | bfloat16 / int8 resident weights | bf16 -4%, int8 diagnostic only |
+| `MYNAH_CUDA_TILE_TC=1` | own tensor-core fixed-order GEMM for the f32 prefill | +1-2% only |
+| `MYNAH_CUDA_QUANT=int8` | int8 resident weights | diagnostic only |
 | `MYNAH_CUDA_FAST_MATH=1` | FP16 GEMMs | not qualified |
 | `MYNAH_CUDA_CODEC_BATCH=1` | older multi-row codec path | fails the waveform parity gate |
 | `MYNAH_CUDA_ALLOW_CPU_STAGES=1` | lets hot stages run on the CPU | 20-30x slower while reporting CUDA: never in production |
+
+### Pedantic mode (rollback to fp32, batch-invariant)
+
+Every default above that changes numerics can be switched off. The fp32,
+batch-invariant setup (what the bitwise self-checks and golden comparisons
+assume) is:
+
+```bash
+MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0 MYNAH_CUDA_QUANT=f32 MYNAH_CUDA_ATTN_SPLIT=0 \
+  ./build/cuda/mynah-tts --pocket-self-check models/pocket-english-24l --device cuda
+```
+
+`MYNAH_CUDA_QUANT=f32` restores fp32 weights everywhere (prefill included);
+`MYNAH_CUDA_ATTN_SPLIT=0` restores the summation order of the old decode
+attention (the split kernel is batch-invariant too, but its last bits differ).
+The other 2026-10-02 defaults (shared voice, decoder fusion, one sync, bf16
+fusion) give bit-identical audio and need no switch. Without
+`MYNAH_CUDA_QUANT=f32` the bf16 backbone makes the self-check fall back to its
+tolerance comparison.
 
 ### Diagnostics and tests
 

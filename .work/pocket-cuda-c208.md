@@ -635,3 +635,65 @@ All arms: SHARED_VOICE (stripped rows) + PREFILL_FIXED=0 + DECODER_FUSE + ATTN_S
 - bf16 flow head + Mimi transformer add nothing measurable on top of the backbone.
 - Open: `--pocket-self-check` long-form (text in pieces vs whole) fails on the C config and on B + KV_VMM; being
   isolated (suspect ONE_SYNC, which earlier passing builds did not have).
+
+## Defaults (branch `pocket-cuda-defaults`, 2026-10-02)
+
+The measured wins of this branch are the default for the Pocket CUDA path; every variable is kept and `=0` (or
+`MYNAH_CUDA_QUANT=f32`) is the rollback, the same pattern as d9b9c89 (SEANet BF16, slot-pool prefill, width buckets).
+Empty values read as unset (default), like the earlier defaults.
+
+| variable | new default | where |
+|---|---|---|
+| `MYNAH_CUDA_SHARED_VOICE` | on (`_STRIP` stays on) | `pocket_cuda_shared_voice_enabled`, `src/engine_pocket.c` |
+| `MYNAH_CUDA_DECODER_FUSE` | on (`_FUSE_BIAS` stays on under it) | `decoder_fuse_enabled`, `gpu/cuda/backend_cuda.cu` |
+| `MYNAH_CUDA_ATTN_SPLIT` | on | `cuda_backbone_attn_split_enabled`, `gpu/cuda/backend_cuda.cu` |
+| `MYNAH_CUDA_ONE_SYNC` | on | `pocket_cuda_one_sync_enabled`, `src/engine_pocket.c` |
+| `MYNAH_CUDA_QUANT` | bf16 (Pocket CUDA engine only) | `pocket_cuda_quant_default`, `src/engine_pocket.c` |
+| `MYNAH_CUDA_QUANT_STAGES` | `backbone` (was all) | `pocket_cuda_quant_stages_parse`, `src/engine_pocket.c` |
+| `MYNAH_CUDA_BF16_FUSE` | on | `pocket_cuda_bf16_fuse_enabled`, `src/engine_pocket.c` |
+| `MYNAH_CUDA_BF16_LT` | on | `cuda_lt_init`, `gpu/cuda/backend_cuda.cu` |
+| `MYNAH_CUDA_PREFILL_BF16TC` | on for bf16-weight tiles | `cuda_prefill_bf16tc_level`, `gpu/cuda/backend_cuda.cu` |
+| `MYNAH_CUDA_PREFILL_FIXED` | 1 (unchanged; one-line switch `POCKET_CUDA_PREFILL_FIXED_DEFAULT`) | `src/engine_pocket.c` |
+| `MYNAH_CUDA_KV_VMM`, `MYNAH_CUDA_TILE_TC` | 0 (unchanged) | |
+
+Semantics decided here:
+- `MYNAH_CUDA_QUANT` unset (or empty) means bf16 only in the Pocket engine's CUDA state. The shared
+  `mynah_cuda_quant_from_env` still reads unset as f32 (its other caller, the int8 qmat request in `src/mynah_tts.c`,
+  only tests for int8), so no other model or backend changes. An explicit `MYNAH_CUDA_Q8` (expert int8 recipe) keeps
+  the f32 base. `MYNAH_CUDA_QUANT=f32` restores fp32/TF32 weights everywhere, prefill included (see BF16TC below).
+  An explicit `MYNAH_CUDA_QUANT=bf16` keeps its meaning except the stages default (`MYNAH_CUDA_QUANT_STAGES=all` for
+  every stage).
+- `MYNAH_QUANT_GROUPS=none` (the serving profile) does not turn the bf16 default off: groups select int8, and the f32
+  groups (`none` = all) are exactly what bf16 upgrades. Nothing changed there; checked in `pocket_cuda_tar_qtype`.
+- `MYNAH_CUDA_BF16_LT`: the cuBLASLt handle and its 32 MiB workspace are created by the first bf16 workspace reserve
+  (`mynah_cuda_bf16_reserve`, before any capture) instead of at backend open, so an f32 run or another model on a
+  CUDA backend never allocates it or prints its line.
+- `MYNAH_CUDA_PREFILL_BF16TC`: unset = the bf16 tensor-core tile for tiles whose weights are bf16 and that ask for a
+  fixed order (or have no cuBLAS bf16 path); an explicit non-zero value also covers the fixed-order f32-weight prefill
+  (the opt-in measured in the first knee); `=0` never. A bf16 tile that does not ask for a fixed order (Mimi tile with
+  `QUANT_STAGES=all`, or `MYNAH_CUDA_PREFILL_FIXED=0`) now takes cuBLAS bf16 even with BF16TC on, so
+  `MYNAH_CUDA_PREFILL_FIXED=0` really selects the cuBLAS prefill. Switching the default to the cuBLAS prefill is the
+  one line `#define POCKET_CUDA_PREFILL_FIXED_DEFAULT 1` -> `0` in `src/engine_pocket.c`.
+- Batch invariance: the backend reads `MYNAH_CUDA_QUANT` itself and only knows an explicit bf16, so the self-check now
+  asks `pocket_batch_invariant` (backend invariant and no bf16 backbone weights). Pedantic, bitwise setup:
+  `MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0 MYNAH_CUDA_QUANT=f32` (+ `MYNAH_CUDA_ATTN_SPLIT=0` for the old
+  attention summation order, i.e. the numerics of the earlier goldens). Shared voice, decoder fusion, one sync and the
+  bf16 fusion are bit-identical and need no switch.
+
+Start-up lines (unchanged text, now printed by default): "decode attention reads voice prefixes ...", "backbone KV rows
+do not store the N-position voice prefix", "split (flash-decoding) kernel", "MYNAH_CUDA_ONE_SYNC: ... one stream sync
+per batched frame", the decoder fusion line, "bf16 Linears through cuBLASLt", "fixed-order prefill tile on bf16 tensor
+cores" (now on first use), and `CUDA quant=bf16 backbone=bf16 flow=f32 mimi=f32 kv=bf16 bf16_stages=backbone
+bf16_fuse=on`.
+
+Docs and profile: `docs/cuda-serving.md` (defaults/opt-in tables, pedantic mode, C256 screening level, start-up
+lines), `configs/perf/l4-24g-pocket-en-24l-cuda.json` (max-batch/inflight 256, new nulls, C208/C256 screens in
+`ceiling` as INCONCLUSIVE until the soaks), 6L profile `MYNAH_CUDA_QUANT` note, `tests/test_perf_profile.py`.
+
+To verify on the L4 before merging (not compiled here, no nvcc):
+1. `--gpu-self-test` PASS; server start shows every line above and no "unavailable"/"disabled" line.
+2. `--pocket-self-check` with defaults (tolerance mode) and pedantic (bitwise) PASS. The long-form failure noted at
+   14:35 on the C config is still open and would now fail the default self-check (and `tools/gpu/provision.sh`).
+3. One knee with no flag exported (defaults only) at C208/C256 must reproduce the C arm (0.607 / 0.714); the 14:35
+   C arm ran `PREFILL_FIXED=0` (cuBLAS prefill), the defaults run the bf16 tensor-core fixed-order prefill.
+4. With every flag `=0` and `MYNAH_CUDA_QUANT=f32`, md5-identical to main 5ae4fd2 defaults (same seeded requests).

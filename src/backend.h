@@ -52,15 +52,16 @@ typedef int (*mynah_backend_sgemm_fn)(void *, int trans_a, int trans_b,
                                       char *, size_t);
 
 /* MYNAH_CUDA_QUANT: the one operator-facing weight-precision switch of the
- * resident CUDA path.  f32 (default) keeps the raw f32 GEMMs; bf16 keeps the
- * CPU representation f32 and gives the resident backbone, flow net and Mimi
- * transformer BF16 weight copies on tensor cores; int8 turns on the Q8
- * policy, the int8 qmat cache and the resident-compatible int8 groups.  The
- * low-level variables (MYNAH_CUDA_Q8, MYNAH_QUANT, MYNAH_QUANT_GROUPS) remain
- * expert overrides and win when set.  It never changes a CPU backend.
- * MYNAH_CUDA_QUANT_STAGES (Pocket: backbone, flow, mimi; default all) narrows
- * the stages bf16 applies to, e.g. `backbone` for bf16 FlowLM Linears with an
- * fp32 flow head and codec. */
+ * resident CUDA path.  f32 keeps the raw f32 GEMMs; bf16 keeps the CPU
+ * representation f32 and gives resident stages BF16 weight copies on tensor
+ * cores; int8 turns on the Q8 policy, the int8 qmat cache and the
+ * resident-compatible int8 groups.  The low-level variables (MYNAH_CUDA_Q8,
+ * MYNAH_QUANT, MYNAH_QUANT_GROUPS) remain expert overrides and win when set.
+ * It never changes a CPU backend.  mynah_cuda_quant_from_env reads unset as
+ * f32; the Pocket CUDA engine alone defaults to bf16 when it is unset
+ * (pocket_cuda_quant_default in src/engine_pocket.c).
+ * MYNAH_CUDA_QUANT_STAGES (Pocket: backbone, flow, mimi; default backbone)
+ * names the stages bf16 applies to; `all` adds the flow head and Mimi. */
 typedef enum {
     MYNAH_CUDA_QUANT_INVALID = -1,
     MYNAH_CUDA_QUANT_F32 = 0,
