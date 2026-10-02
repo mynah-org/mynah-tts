@@ -2,6 +2,7 @@
 #include "costmap.h"
 
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -1310,6 +1311,14 @@ struct cuda_backend_state {
      * the GEMMs reduced-precision weights, whose tensor-core paths are not
      * batch-invariant. */
     bool quant_weights;
+    /* MYNAH_CUDA_BF16_LT: the bf16 Linears through cuBLASLt with a per-shape
+     * heuristic algorithm (what a PyTorch bf16 F.linear does), instead of
+     * cublasGemmEx with CUBLAS_GEMM_DEFAULT. Null handle = off. */
+    cublasLtHandle_t lt = nullptr;
+    void *lt_ws = nullptr;
+    size_t lt_ws_cap = 0u;
+    struct lt_algo_entry { int m, n, k; bool ok; cublasLtMatmulAlgo_t algo; };
+    std::vector<lt_algo_entry> lt_algos;
     bool graphs_enabled;
     std::vector<cuda_graph_entry> graph_cache;
     std::vector<cuda_pipeline_graph_entry> pipeline_graphs;
@@ -3079,6 +3088,8 @@ static void cuda_close(void *opaque) {
     if (st->dev_decoder_ptr1) cudaFree(st->dev_decoder_ptr1);
     if (st->dev_decoder_ptr2) cudaFree(st->dev_decoder_ptr2);
     if (st->dev_decoder_ptr3) cudaFree(st->dev_decoder_ptr3);
+    if (st->lt_ws) cudaFree(st->lt_ws);
+    if (st->lt) cublasLtDestroy(st->lt);
     cublasDestroy(st->cublas);
     cudaStreamDestroy(st->stream);
     delete st;
@@ -3200,6 +3211,24 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     if (ce(cudaStreamCreate(&st->stream), e, ec)) { delete st; return -1; }
     if (cublasCreate(&st->cublas) != CUBLAS_STATUS_SUCCESS) {
         set_error(e,ec,"cuBLAS init"); cudaStreamDestroy(st->stream); delete st; return -1; }
+    if (cuda_env_enabled("MYNAH_CUDA_BF16_LT", false)) {
+        /* 32 MiB of workspace, allocated once, so no algorithm the heuristic
+         * picks ever needs an allocation inside a graph capture. */
+        const size_t ws = (size_t)32 << 20;
+        if (cublasLtCreate(&st->lt) != CUBLAS_STATUS_SUCCESS ||
+            cudaMalloc(&st->lt_ws, ws) != cudaSuccess) {
+            if (st->lt) cublasLtDestroy(st->lt);
+            st->lt = nullptr;
+            st->lt_ws = nullptr;
+            std::fprintf(stderr, "mynah-tts: MYNAH_CUDA_BF16_LT unavailable, "
+                                 "bf16 Linears stay on cublasGemmEx\n");
+        } else {
+            st->lt_ws_cap = ws;
+            std::fprintf(stderr, "mynah-tts: CUDA bf16 Linears through cuBLASLt "
+                                 "with per-shape heuristic algorithms "
+                                 "(MYNAH_CUDA_BF16_LT=1)\n");
+        }
+    }
     if (ce(cudaMalloc(&st->dev_batch_k_cache,
                       CUDA_BATCH_META_CAP * sizeof(*st->dev_batch_k_cache)), e, ec) ||
         ce(cudaMalloc(&st->dev_batch_v_cache,
@@ -3656,6 +3685,69 @@ extern "C" int mynah_cuda_matmul_q8_d2d(void *opaque, const float *d_in,
  * GEMM with FP32 accumulation and FP32 output runs on the tensor cores.  The
  * cached weight is half the bytes of the f32 view, which is the point: the
  * decode step is bound by weight traffic, not arithmetic. */
+/* Y[rows][ow] (fp32) = X[rows][iw] (bf16) * W[ow][iw]^T (bf16), fp32
+ * accumulate, through cuBLASLt (MYNAH_CUDA_BF16_LT). The algorithm comes from
+ * cublasLtMatmulAlgoGetHeuristic once per (m, n, k) and is cached, so a graph
+ * replay always runs the same kernel. Returns 1 when cuBLASLt is off or has
+ * no algorithm for the shape (the caller then uses cublasGemmEx), 0 on
+ * success, -1 on a launch error. */
+static int cuda_lt_bf16_gemm(cuda_backend_state *st, const uint16_t *w,
+                             const uint16_t *x, float *y, size_t rows,
+                             size_t iw, size_t ow, char *e, size_t ec) {
+    if (st->lt == nullptr) return 1;
+    const int m = (int)ow, n = (int)rows, k = (int)iw;
+    cuda_backend_state::lt_algo_entry *hit = nullptr;
+    for (auto &a : st->lt_algos)
+        if (a.m == m && a.n == n && a.k == k) { hit = &a; break; }
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+    const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+    int rc = 1;
+    if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+            CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
+                                       sizeof(ta)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
+                                       sizeof(tb)) != CUBLAS_STATUS_SUCCESS ||
+        /* Column-major view: A is W stored k x m (ld k), B is X k x n, C m x n. */
+        cublasLtMatrixLayoutCreate(&la, CUDA_R_16BF, k, m, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&lb, CUDA_R_16BF, k, n, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&lc, CUDA_R_32F, m, n, m) != CUBLAS_STATUS_SUCCESS)
+        goto done;
+    if (hit == nullptr) {
+        cuda_backend_state::lt_algo_entry entry{m, n, k, false, {}};
+        cublasLtMatmulPreference_t pref = nullptr;
+        cublasLtMatmulHeuristicResult_t result{};
+        int found = 0;
+        if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS &&
+            cublasLtMatmulPreferenceSetAttribute(
+                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &st->lt_ws_cap,
+                sizeof(st->lt_ws_cap)) == CUBLAS_STATUS_SUCCESS &&
+            cublasLtMatmulAlgoGetHeuristic(st->lt, op, la, lb, lc, lc, pref, 1,
+                                           &result, &found) == CUBLAS_STATUS_SUCCESS &&
+            found > 0) {
+            entry.ok = true;
+            entry.algo = result.algo;
+        }
+        if (pref != nullptr) cublasLtMatmulPreferenceDestroy(pref);
+        try { st->lt_algos.push_back(entry); } catch (...) { goto done; }
+        hit = &st->lt_algos.back();
+    }
+    if (!hit->ok) goto done;
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        rc = cbe(cublasLtMatmul(st->lt, op, &alpha, w, la, x, lb, &beta, y, lc,
+                                y, lc, &hit->algo, st->lt_ws, st->lt_ws_cap,
+                                st->stream), e, ec) != 0 ? -1 : 0;
+    }
+done:
+    if (lc) cublasLtMatrixLayoutDestroy(lc);
+    if (lb) cublasLtMatrixLayoutDestroy(lb);
+    if (la) cublasLtMatrixLayoutDestroy(la);
+    if (op) cublasLtMatmulDescDestroy(op);
+    return rc;
+}
+
 extern "C" int mynah_cuda_matmul_bf16_d2d(void *opaque, const float *d_in,
                                            float *d_out, size_t rows,
                                            size_t iw, size_t ow,
@@ -3679,9 +3771,13 @@ extern "C" int mynah_cuda_matmul_bf16_d2d(void *opaque, const float *d_in,
     k_f32_to_bf16<<<((int)in_n + 255) / 256, 256, 0, st->stream>>>(
         d_in, st->dev_bf16_activation, (int)in_n);
     if (ce(cudaGetLastError(), e, ec)) return -1;
+    const int lt = cuda_lt_bf16_gemm(st, dw, st->dev_bf16_activation, d_out,
+                                     rows, iw, ow, e, ec);
+    if (lt < 0) return -1;
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
-    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+    if (lt > 0 &&
+        cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                          (int)ow, (int)rows, (int)iw,
                          &a1, dw, CUDA_R_16BF, (int)iw,
                          st->dev_bf16_activation, CUDA_R_16BF, (int)iw,
@@ -3763,9 +3859,13 @@ extern "C" int mynah_cuda_matmul_bf16_staged_d2d(void *opaque, float *d_out,
     }
     uint16_t *dw = nullptr;
     if (cached_weight_bf16(st, weight, w_n, &dw, e, ec)) return -1;
+    const int lt = cuda_lt_bf16_gemm(st, dw, st->dev_bf16_activation, d_out,
+                                     rows, iw, ow, e, ec);
+    if (lt < 0) return -1;
     cublasSetStream(st->cublas, st->stream);
     const float a1 = 1.0f, b0 = 0.0f;
-    if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+    if (lt > 0 &&
+        cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                          (int)ow, (int)rows, (int)iw,
                          &a1, dw, CUDA_R_16BF, (int)iw,
                          st->dev_bf16_activation, CUDA_R_16BF, (int)iw,

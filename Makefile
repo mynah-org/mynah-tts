@@ -891,7 +891,7 @@ $(CUDA_ARCH_STAMP): cuda-arch-stamp-force
 # compile-only CI job found it on its first run.
 $(CUDA_TARGET): $(CUDA_CORE_OBJECTS) $(CUDA_CLI_OBJECT) $(CUDA_HOST_OBJECT) | $(INGOT_LIB)
 	@mkdir -p $(@D)
-	nvcc $(CUDA_ARCH_FLAGS) $(filter %.o,$^) $(LDLIBS) -lcublas -o $@
+	nvcc $(CUDA_ARCH_FLAGS) $(filter %.o,$^) $(LDLIBS) -lcublas -lcublasLt -o $@
 
 cuda: $(CUDA_TARGET)
 	@echo "CUDA build ready: $(CUDA_TARGET)"
@@ -904,7 +904,7 @@ cuda: $(CUDA_TARGET)
 # server/main.c/prefork.c enforce that at runtime.
 $(CUDA_SERVER_TARGET): $(CUDA_CORE_OBJECTS) $(CUDA_SERVER_OBJECTS) $(CUDA_HOST_OBJECT) | $(INGOT_LIB)
 	@mkdir -p $(@D)
-	nvcc $(CUDA_ARCH_FLAGS) $(filter %.o,$^) $(LDLIBS) -lcublas -o $@
+	nvcc $(CUDA_ARCH_FLAGS) $(filter %.o,$^) $(LDLIBS) -lcublas -lcublasLt -o $@
 
 cuda-server: $(CUDA_SERVER_TARGET)
 	@echo "CUDA server build ready: $(CUDA_SERVER_TARGET)"
