@@ -2,14 +2,14 @@
   "schema_version": 1,
   "profile": {
     "id": "l4-24g-pocket-en-24l-cuda",
-    "description": "One NVIDIA L4 (24 GB, sm_89), PocketTTS English 24L (english_2026-04_24l) streaming on the CUDA server. C160 is the qualified operating point: two independent 30-minute soaks on the v2 corpus, 184.5 audio-s/s, RTF p95 0.855-0.857, TTFA p95 154-155 ms, 0 stalls, 0 failures, WER 2.02/1.94% against 1.87% for an unloaded C8 control. Since 2026-10-02 the CUDA defaults include the shared voice prefix, split decode attention, bf16 backbone Linears (cuBLASLt, fused), the fused decoder and one sync per frame; with them the server runs at --max-batch 256 (60-s screens: RTF p95 0.594-0.607 at C208, 0.710-0.714 at C256, ~303-306 audio-s/s), C256 soak qualification pending, so C160 below is still the qualified point (measured on the 2026-09-28 defaults). NOT the shipped default: BF16 KV and one host thread are exported. Host-scoped: another GPU is another profile.",
+    "description": "One NVIDIA L4 (24 GB, sm_89), PocketTTS English 24L (english_2026-04_24l) streaming on the CUDA server. C160 is the qualified operating point: two independent 30-minute soaks on the v2 corpus, 184.5 audio-s/s, RTF p95 0.855-0.857, TTFA p95 154-155 ms, 0 stalls, 0 failures, WER 2.02/1.94% against 1.87% for an unloaded C8 control. Since 2026-10-02 the CUDA defaults include the shared voice prefix, split decode attention, bf16 backbone Linears (cuBLASLt, fused), the fused decoder and one sync per frame; with them, plus the per-request device memory diet, the server runs at --max-batch 288 (60-s screens with the shipped defaults: RTF p95 0.620 at C208, 0.739 at C256, 0.819 at C288, ~290 audio-s/s, 0 stalls), soak qualification pending, so C160 below is still the qualified point (measured on the 2026-09-28 defaults). NOT the shipped default: BF16 KV and one host thread are exported. Host-scoped: another GPU is another profile.",
     "engine": "pocket",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
       "concurrency_range": [
         1,
-        256
+        288
       ],
       "preferred_concurrency": 160,
       "quality_changes_allowed": false
@@ -45,9 +45,9 @@
   "server": {
     "device": "cuda",
     "http_workers": 8,
-    "max_batch": 256,
-    "max_inflight": 256,
-    "why": "One process, --max-batch = --max-inflight = C so every admitted stream is in the batch and the GPU runs one gang per step. 256 is the screening level of the 2026-10-02 defaults (60-s closed-loop knees, v2 corpus, 4 voices: RTF p95 0.710-0.714 at C256, ~303-306 audio-s/s, 0 stalls, peak VRAM ~21.5 GB); the 2 x 30-min soak qualification at C256 is pending. The qualified C160 point below was measured with --max-batch 160 on the 2026-09-28 defaults, where the knee ladder (25 s per level) was flat at ~138 audio-s/s from C128 with RTF p95 linear in C (0.71/0.78/0.86/0.93/0.99 at C128/144/160/176/192). 8 HTTP workers is the harness default (tools/gpu/serve.sh); the server needs ~1.1-1.25 host cores."
+    "max_batch": 288,
+    "max_inflight": 288,
+    "why": "One process, --max-batch = --max-inflight = C so every admitted stream is in the batch and the GPU runs one gang per step. 288 is the screening ceiling of the 2026-10-02 defaults (60-s closed-loop knees, v2 corpus, 4 voices: RTF p95 0.620 at C208, 0.739 at C256, 0.819 at C288, ~290 audio-s/s, 0 stalls; peak VRAM 20.3 GB at C288 with MYNAH_CUDA_ROW_MEM_DIET; without the diet C288 fails for VRAM). C320 needs MYNAH_CUDA_KV_VMM (memory fits, RTF p95 0.926: compute-bound). Soak qualification pending. The qualified C160 point below was measured with --max-batch 160 on the 2026-09-28 defaults, where the knee ladder (25 s per level) was flat at ~138 audio-s/s from C128 with RTF p95 linear in C (0.71/0.78/0.86/0.93/0.99 at C128/144/160/176/192). 8 HTTP workers is the harness default (tools/gpu/serve.sh); the server needs ~1.1-1.25 host cores."
   },
   "runtime": {
     "matches_shipped_default": false,

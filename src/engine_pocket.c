@@ -1108,14 +1108,15 @@ static int pocket_cuda_codec_requested(const mynah_engine_state *state);
 static int pocket_cuda_mimi_tile_enabled(void);
 static int pocket_cuda_codec_device_handoff_enabled(void);
 
-/* MYNAH_CUDA_ROW_MEM_DIET (default 0): per-request device memory that is not
- * request state is shared or right-sized (the SEANet decoder scratch in the
- * CUDA backend, the Mimi transformer KV here). Only placement changes. */
+/* MYNAH_CUDA_ROW_MEM_DIET (default 1, =0 off): per-request device memory that
+ * is not request state is shared or right-sized (the SEANet decoder scratch in
+ * the CUDA backend, the Mimi transformer KV here). Only placement changes; it
+ * is what lets one L4 hold C288. */
 static int pocket_cuda_row_mem_diet(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *value = getenv("MYNAH_CUDA_ROW_MEM_DIET");
-        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+        cached = value == NULL || value[0] == '\0' || strcmp(value, "0") != 0;
     }
     return cached;
 }

@@ -5692,7 +5692,7 @@ static bool decoder_one_gemm_enabled(void) {
  * buffers and the im2col columns, at BF16 size when every conv is BF16).
  * Only placement changes, never an operation or its order. */
 static bool cuda_row_mem_diet_enabled(void) {
-    static const bool on = cuda_env_enabled("MYNAH_CUDA_ROW_MEM_DIET", false);
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_ROW_MEM_DIET", true);
     return on;
 }
 

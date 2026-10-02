@@ -188,8 +188,8 @@ def main():
 
     rc, out, _ = capture(["command", cuda_id, "--model", "models/pocket-english-24l",
                           "--port", "8090"])
-    want = ("build/cuda/mynah-tts-server --device cuda -w 8 --max-batch 256 "
-            "--max-inflight 256 -p 8090 -m models/pocket-english-24l")
+    want = ("build/cuda/mynah-tts-server --device cuda -w 8 --max-batch 288 "
+            "--max-inflight 288 -p 8090 -m models/pocket-english-24l")
     check("cuda command runs the CUDA server with the profile's topology",
           rc == 0 and out.strip().endswith(want))
     check("cuda command exports every non-null variable and nothing declared absent",

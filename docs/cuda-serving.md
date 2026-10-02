@@ -226,6 +226,7 @@ never read it.
 | `MYNAH_CUDA_SLOT_POOL_PREFILL` | `0` | the slot pool is filled at start-up (all `--max-batch` sets) instead of on the first burst | a fresh server's first burst runs like a warm one |
 | `MYNAH_CUDA_WIDTH_BUCKETS` | `0` | gang widths rounded up to a few buckets, their graphs captured at start-up | no graph capture during traffic; longer start-up |
 | `MYNAH_CUDA_SHARED_VOICE` | `0` | decode attention reads each stream's voice prefix from one shared device copy (stays in L2); with `MYNAH_CUDA_SHARED_VOICE_STRIP` (default on, `0` keeps the per-row copy) the rows no longer store the prefix (~12 MB less per stream on 24L) | L4 24L: stream RTF p95 -10/11 % at C160-C208, +13 % audio-s/s at C208; bit-identical audio |
+| `MYNAH_CUDA_ROW_MEM_DIET` | `1` | per-request device memory that is not request state is shared across the decoder gang or right-sized (SEANet scratch 5.1 -> 1.7 MB, Mimi transformer KV 500 -> 265 positions; only placement changes) | L4 24L: start-up -1.3 GB at 256 rows; C288 RTF p95 0.819 with 0 stalls, where it fails for VRAM without it |
 | `MYNAH_CUDA_ATTN_SPLIT` | `0` | split (flash-decoding) layout of the batched bf16 decode attention | C208 0.705 -> 0.674, C240 0.787 -> 0.749, +7 % audio-s/s; deterministic and batch-invariant, last-bit differences vs the old kernel |
 | `MYNAH_CUDA_QUANT` | `f32` | bf16 weight copies for the backbone Linears (fp32 accumulate; residual stream, norms, flow head, EOS head and codec stay fp32); `MYNAH_CUDA_QUANT_STAGES` defaults to `backbone` | with the two rows below, C208 0.676 -> 0.607, C256 0.788 -> 0.714, 266 -> 303 audio-s/s, TTFA p95 115 -> 104 ms |
 | `MYNAH_CUDA_BF16_FUSE` | `0` | bf16 decode layers fused: LayerNorm, GELU and attention write the bf16 GEMM operand, biases folded into the consumers | 456 -> 264 graph nodes per step; bit-identical to the unfused bf16 path |
@@ -240,7 +241,7 @@ never read it.
 | variable | effect | why it is off |
 |---|---|---|
 | `MYNAH_CUDA_PREFILL_FIXED=0` | text prefill through cuBLAS (bf16 or TF32 by the weights): on f32 weights it measured -7 % RTF p95 | a text sent in pieces no longer gives bit-identical audio to the same text sent whole; a product decision |
-| `MYNAH_CUDA_KV_VMM=1` | backbone KV rows are VMM ranges that grow in place (no copy, no second allocation, no sync) | measured for C272+ (`--max-batch 288`); not a default yet |
+| `MYNAH_CUDA_KV_VMM=1` | backbone KV rows are VMM ranges that grow in place (no copy, no second allocation, no sync); with `MYNAH_CUDA_KV_VMM_CHUNK=64 MYNAH_CUDA_KV_GROW_INITIAL_STEPS=64` rows start small | L4, `--max-batch 320`, with the diet: start-up 9.6 GB (was 16.0), C320 runs with 0 failures at peak 14.4 GB, but the position-major layout costs ~4 % (C288 0.851 vs 0.819) and C320 is compute-bound (0.926): off on the L4; for GPUs with more compute than memory headroom |
 | `MYNAH_CUDA_QUANT_STAGES=all` | bf16 weights for the flow head and the Mimi transformer too | no measurable gain over `backbone` (C256 0.714 -> 0.712) |
 | `MYNAH_CUDA_SYNC=blocking` | host thread sleeps while the GPU works: server CPU 117% -> 43% | -9% throughput (each wake-up idles the GPU) |
 | `MYNAH_CUDA_TILE_TC=1` | own tensor-core fixed-order GEMM for the f32 prefill | +1-2% only |
