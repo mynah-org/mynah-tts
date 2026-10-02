@@ -1,5 +1,9 @@
 # Voices and languages
 
+This page covers the Magpie pack. For the Pocket TTS packs (26 cloned voices,
+with measured quality and licences) see **[pocket-voices.md](pocket-voices.md)**;
+the short answer is: use `alba`.
+
 ## Speaker IDs
 
 `--speaker N` takes a number, and the names live in `speakers.json` inside the

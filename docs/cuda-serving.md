@@ -239,6 +239,9 @@ resolves the default to the same thing, so it is harmless and optional.
 | stalls or RTF p95 above 0.9 | too many streams for this GPU: lower `--max-batch/--max-inflight` or re-screen (section 6) |
 | slow first request per voice | the voice prompt is loaded on first use; `MYNAH_POCKET_VOICE_CACHE=startup` preloads |
 | the first seconds after start are slower | CUDA graphs are captured per batch width on first use |
+| a voice sounds rough or noisy on every clip | the built-in voice's own timbre (Pocket clones its reference clip, noise included): marius and javert are the roughest, alba the cleanest ([pocket-voices.md](pocket-voices.md)); use a clean reference clip for custom voices |
+| speech starts ~1 s after the first audio | javert (and less so jean) open with silence copied from the reference clip; TTFA counts that silence |
+| metallic timbre on short sentences | model behaviour of the rougher voices (marius, javert) on one-liners, worst on the 24-layer model; not load-related. Prefer alba; count it with `tools/pocket_audio_noise.py` |
 
 ## 10. Qualifying a new GPU box
 
@@ -261,9 +264,14 @@ throughput only from 30-minute soaks: short screens under-count long
 utterances. Report ASR quality per voice and per length class, against the
 unloaded control.
 
+WER does not hear timbre: a metallic clip that reads correctly scores 0%.
+After listening, run `tools/pocket_audio_noise.py` on the unzipped listening
+sets to count noisy/metallic outliers per voice, sentence kind and length.
+
 ## Related
 
 - [server.md](server.md): the HTTP API and the CPU server.
+- [pocket-voices.md](pocket-voices.md): which voice to serve (alba), measured quality and licences.
 - [performance.md](performance.md): the measured results, CPU and GPU.
 - [`configs/perf/`](../configs/perf/README.md): serving profiles and their validator.
 - [`.work/pocket-cuda-g6-host-cpu.md`](../.work/pocket-cuda-g6-host-cpu.md) and
