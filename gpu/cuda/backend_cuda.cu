@@ -1227,6 +1227,11 @@ struct cuda_tile_workspace {
     cudaEvent_t meta_event = nullptr;
     float *splitk = nullptr;
     size_t splitk_cap = 0u; /* floats */
+    /* The tile's activation rounded to bf16 for a cuBLAS bf16 GEMM when the
+     * order need not be fixed (MYNAH_CUDA_QUANT=bf16 with
+     * MYNAH_CUDA_PREFILL_FIXED=0); sized here, never inside a capture. */
+    uint16_t *a16 = nullptr;
+    size_t a16_cap = 0u; /* elements */
     int sms = 0;
     bool fixed_order = false; /* the current call asked for invariant GEMMs */
 };
@@ -8060,6 +8065,15 @@ static int tile_reserve(cuda_backend_state *st, size_t rows, size_t dim,
         if (ce(cudaMalloc(&w.splitk, need * sizeof(float)), e, ec)) return -1;
         w.splitk_cap = need;
     }
+    const size_t a16_need = rows * (ffn > dim ? ffn : dim);
+    if (st->quant_weights && st->tile_cublas && a16_need > w.a16_cap) {
+        cudaFree(w.a16);
+        w.a16 = nullptr;
+        w.a16_cap = 0u;
+        if (ce(cudaMalloc((void **)&w.a16, a16_need * sizeof(uint16_t)), e, ec))
+            return -1;
+        w.a16_cap = a16_need;
+    }
     return 0;
 }
 
@@ -8069,6 +8083,7 @@ static void tile_release(cuda_backend_state *st) {
     cudaFree(w.att); cudaFree(w.proj); cudaFree(w.ffn_buf);
     cudaFree(w.meta_dev);
     cudaFree(w.splitk);
+    cudaFree(w.a16);
     if (w.meta_host != nullptr) cudaFreeHost(w.meta_host);
     if (w.meta_event != nullptr) cudaEventDestroy(w.meta_event);
     w = cuda_tile_workspace();
@@ -8453,6 +8468,29 @@ static int tile_gemm(cuda_backend_state *st, const float *A, const float *hw,
         if (tc <= 0) return tc;
         uint16_t *dw16 = nullptr;
         if (cached_weight_bf16(st, hw, N * K, &dw16, e, ec)) return -1;
+        if (st->tile_cublas && !w.fixed_order && w.a16 != nullptr &&
+            M * K <= w.a16_cap) {
+            /* Order not fixed: the same bf16 tensor-core GEMM as the decode
+             * step's bf16 Linears (activation rounded to bf16, fp32
+             * accumulate), instead of the SIMT kernel. */
+            k_f32_to_bf16<<<((int)(M * K) + 255) / 256, 256, 0, st->stream>>>(
+                A, w.a16, (int)(M * K));
+            if (ce(cudaGetLastError(), e, ec) ||
+                cbe(cublasSetStream(st->cublas, st->stream), e, ec))
+                return -1;
+            const float alpha = 1.0f, beta = 0.0f;
+            if (cbe(cublasGemmEx(st->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)N,
+                                 (int)M, (int)K, &alpha, dw16, CUDA_R_16BF,
+                                 (int)K, w.a16, CUDA_R_16BF, (int)K, &beta, C,
+                                 CUDA_R_32F, (int)N, CUBLAS_COMPUTE_32F,
+                                 CUBLAS_GEMM_DEFAULT), e, ec))
+                return -1;
+            if (db == nullptr) return 0;
+            const int total = (int)(M * N);
+            k_bias_rows<<<(total + 255) / 256, 256, 0, st->stream>>>(C, db, (int)M,
+                                                                     (int)N);
+            return ce(cudaGetLastError(), e, ec);
+        }
         k_tile_gemm<true><<<grid, 256, 0, st->stream>>>(A, dw16, db, C, (int)M,
                                                           (int)N, (int)K);
         return ce(cudaGetLastError(), e, ec);
