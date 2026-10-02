@@ -130,6 +130,12 @@ int mynah_backend_decoder_note_step(const mynah_backend *backend,
  * increment this counter. */
 int mynah_backend_decoder_note_batch(const mynah_backend *backend,
                                      size_t items, size_t frames);
+/* Device bytes a resident decoder owns now (`owned`) and would own without
+ * MYNAH_CUDA_ROW_MEM_DIET (`legacy`). -1 when the backend has no such
+ * decoder (CPU/Metal). */
+int mynah_backend_decoder_device_bytes(const mynah_backend *backend,
+                                       const mynah_backend_decoder *decoder,
+                                       size_t *owned, size_t *legacy);
 /* Record one successful cross-request Pocket backbone batch. CPU/Metal are
  * intentionally no-ops; CUDA exposes the counters for server observability. */
 int mynah_backend_note_backbone_batch(const mynah_backend *backend,

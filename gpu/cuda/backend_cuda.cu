@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <new>
@@ -1441,6 +1442,17 @@ struct cuda_backend_state {
     size_t dec_cols_cap = 0u, dec_out_cap = 0u; /* floats */
     float *dec_tr_x = nullptr, *dec_tr_y = nullptr; /* convtr GEMM buffers */
     size_t dec_tr_x_cap = 0u, dec_tr_y_cap = 0u;
+    /* MYNAH_CUDA_ROW_MEM_DIET: the single-request decoder scratch shared by
+     * every lean decoder (see mynah_backend_decoder::lean).  Allocated by the
+     * first lean decoder open, never moved or freed before cuda_close, so a
+     * captured single-request decoder graph may bake these pointers.  All
+     * decoder work is ordered on the one backend stream, and every buffer is
+     * fully written before it is read within one decoder step. */
+    float *solo_work_a = nullptr, *solo_work_b = nullptr, *solo_work_c = nullptr;
+    float *solo_columns = nullptr, *solo_window = nullptr, *solo_full = nullptr;
+    size_t solo_work_cap = 0u, solo_columns_cap = 0u, solo_window_cap = 0u,
+           solo_full_cap = 0u; /* floats */
+    std::vector<float *> solo_retired; /* replaced smaller sets */
     cuda_codec_gang_workspace codec_gang;
     std::atomic<unsigned long long> codec_gang_calls[2];
     std::atomic<unsigned long long> codec_gang_rows[2];
@@ -1502,6 +1514,27 @@ struct mynah_backend_decoder {
     float *work_c;
     float *columns;
     std::vector<cuda_decoder_op> ops;
+    /* MYNAH_CUDA_ROW_MEM_DIET (`lean`): the single-request path's scratch
+     * (work_a/b/c, columns above, and the causal window / transposed-conv
+     * `full` of every op, which stay null in the ops) is the backend's one
+     * shared set (cuda_backend_state::solo_*), not owned here.  The
+     * cross-request gang, which needs a private set per row, uses gang_a,
+     * gang_b and gang_columns instead; its fused path needs neither work_c,
+     * nor a window, nor `full`.  Off: every field below stays zero and the
+     * decoder owns exactly the buffers it always did. */
+    bool lean;
+    float *solo_window;   /* shared, max over ops; lean only */
+    float *solo_full;     /* shared, max over ops; lean only */
+    float *gang_a;        /* owned, work_floats; lean only */
+    float *gang_b;        /* owned, work_floats; lean only */
+    void *gang_columns;   /* owned, gang_columns_bytes; lean only */
+    size_t gang_columns_bytes;
+    /* Topology sizes in floats, filled by decoder_build. */
+    size_t max_window_floats;
+    size_t max_full_floats;
+    size_t sum_window_floats;
+    size_t sum_full_floats;
+    size_t state_floats;  /* previous + partial of every op */
 };
 
 static constexpr size_t CUDA_BATCH_META_CAP = 384u;
@@ -3537,6 +3570,14 @@ static void cuda_close(void *opaque) {
     cudaFree(st->dec_out);
     cudaFree(st->dec_tr_x);
     cudaFree(st->dec_tr_y);
+    cudaFree(st->solo_work_a);
+    cudaFree(st->solo_work_b);
+    cudaFree(st->solo_work_c);
+    cudaFree(st->solo_columns);
+    cudaFree(st->solo_window);
+    cudaFree(st->solo_full);
+    for (float *q : st->solo_retired) cudaFree(q);
+    st->solo_retired.clear();
     codec_gang_release(st);
     for (auto &c : st->weights) cudaFree(c.device_pointer);
     for (auto &c : st->weights_fp16) cudaFree(c.device_ptr);
@@ -5258,10 +5299,20 @@ static void decoder_free_op(cuda_decoder_op *op) {
 static void decoder_destroy(mynah_backend_decoder *decoder) {
     if (decoder == nullptr) return;
     for (auto &op : decoder->ops) decoder_free_op(&op);
-    if (decoder->work_a != nullptr) cudaFree(decoder->work_a);
-    if (decoder->work_b != nullptr) cudaFree(decoder->work_b);
-    if (decoder->work_c != nullptr) cudaFree(decoder->work_c);
-    if (decoder->columns != nullptr) cudaFree(decoder->columns);
+    if (decoder->lean) {
+        /* The solo scratch is the backend's shared set: not ours to free. */
+        if (decoder->gang_a != nullptr) cudaFree(decoder->gang_a);
+        if (decoder->gang_b != nullptr) cudaFree(decoder->gang_b);
+        if (decoder->gang_columns != nullptr) cudaFree(decoder->gang_columns);
+        decoder->gang_a = nullptr;
+        decoder->gang_b = nullptr;
+        decoder->gang_columns = nullptr;
+    } else {
+        if (decoder->work_a != nullptr) cudaFree(decoder->work_a);
+        if (decoder->work_b != nullptr) cudaFree(decoder->work_b);
+        if (decoder->work_c != nullptr) cudaFree(decoder->work_c);
+        if (decoder->columns != nullptr) cudaFree(decoder->columns);
+    }
     decoder->work_a = nullptr;
     decoder->work_b = nullptr;
     decoder->work_c = nullptr;
@@ -5401,27 +5452,43 @@ static bool decoder_add_op(mynah_backend_decoder *decoder,
                 return false;
             }
         }
-        if (!decoder_mul(out_channels, op.max_full_len, &n) ||
+        /* MYNAH_CUDA_ROW_MEM_DIET: a lean decoder takes `full` from the
+         * shared solo scratch (sized from max_full_floats). */
+        size_t state_n = 0u;
+        if (!decoder_mul(out_channels, op.tail, &state_n) ||
+            !decoder_add(decoder->state_floats, state_n,
+                         &decoder->state_floats) ||
+            !decoder_mul(out_channels, op.max_full_len, &n) ||
+            !decoder_add(decoder->sum_full_floats, n,
+                         &decoder->sum_full_floats) ||
             !decoder_mul(n, sizeof(float), &bytes) ||
-            ce(cudaMalloc(&op.full, bytes), e, ec) ||
-            ce(cudaMemset(op.full, 0, bytes), e, ec)) {
+            (!decoder->lean &&
+             (ce(cudaMalloc(&op.full, bytes), e, ec) ||
+              ce(cudaMemset(op.full, 0, bytes), e, ec)))) {
             decoder_free_op(&op);
             return false;
         }
+        if (n > decoder->max_full_floats) decoder->max_full_floats = n;
     } else if (op.tail > 0u) {
         size_t window_len = 0u;
         if (!decoder_mul(in_channels, op.tail, &n) ||
+            !decoder_add(decoder->state_floats, n, &decoder->state_floats) ||
             !decoder_mul(n, sizeof(float), &bytes) ||
             ce(cudaMalloc(&op.previous, bytes), e, ec) ||
             ce(cudaMemset(op.previous, 0, bytes), e, ec) ||
             !decoder_add(op.tail, max_in_len, &window_len) ||
             !decoder_mul(in_channels, window_len, &n) ||
+            !decoder_add(decoder->sum_window_floats, n,
+                         &decoder->sum_window_floats) ||
             !decoder_mul(n, sizeof(float), &bytes) ||
-            ce(cudaMalloc(&op.window, bytes), e, ec) ||
-            ce(cudaMemset(op.window, 0, bytes), e, ec)) {
+            /* Lean: the causal window comes from the shared solo scratch. */
+            (!decoder->lean &&
+             (ce(cudaMalloc(&op.window, bytes), e, ec) ||
+              ce(cudaMemset(op.window, 0, bytes), e, ec)))) {
             decoder_free_op(&op);
             return false;
         }
+        if (n > decoder->max_window_floats) decoder->max_window_floats = n;
     }
     try {
         decoder->ops.push_back(op);
@@ -5617,6 +5684,202 @@ static bool decoder_one_gemm_enabled(void) {
     return on;
 }
 
+/* MYNAH_CUDA_ROW_MEM_DIET (default 0): per-request device memory that is not
+ * request state moves out of the request.  For the SEANet decoder that is
+ * everything but the carried causal state (`previous`, `partial`): the
+ * single-request scratch becomes one backend-wide set, and the per-row gang
+ * scratch keeps only what the fused gang reads and writes (two activation
+ * buffers and the im2col columns, at BF16 size when every conv is BF16).
+ * Only placement changes, never an operation or its order. */
+static bool cuda_row_mem_diet_enabled(void) {
+    static const bool on = cuda_env_enabled("MYNAH_CUDA_ROW_MEM_DIET", false);
+    return on;
+}
+
+/* A lean decoder relies on the gang taking the fused path everywhere (no
+ * per-row window, `full` or ELU scratch); decoder_gang_lean_ok re-checks it
+ * per call before anything is queued. */
+static bool decoder_lean_planned(void) {
+    return cuda_row_mem_diet_enabled() && decoder_fuse_enabled() &&
+           decoder_convtr_gemm_enabled() && !decoder_one_gemm_enabled();
+}
+
+/* Device bytes a decoder of this topology owns without the diet (the old
+ * layout): three work buffers, FP32 columns, every op's window and `full`,
+ * and the carried state. */
+static size_t decoder_legacy_bytes(const mynah_backend_decoder *d) {
+    return (3u * d->work_floats + d->columns_floats + d->sum_window_floats +
+            d->sum_full_floats + d->state_floats) * sizeof(float);
+}
+
+static size_t decoder_owned_bytes(const mynah_backend_decoder *d) {
+    if (!d->lean) return decoder_legacy_bytes(d);
+    return (2u * d->work_floats + d->state_floats) * sizeof(float) +
+           d->gang_columns_bytes;
+}
+
+/* Whether the gang of this topology takes the fused path at its own frame
+ * count (the shapes the engine submits): every conv1d with a carried tail
+ * no longer than its input, the resblock's first conv included, and every
+ * transposed conv in the GEMM form with tail <= output length.  The tiny
+ * self-test topology (one encoder frame, tail 2) fails this and keeps the
+ * private layout.  decoder_gang_lean_ok re-checks per call with the real
+ * width, length and buffer caps. */
+static bool decoder_topology_lean_ok(const mynah_backend_decoder *d) {
+    size_t length = d->max_encoder_frames;
+    for (const auto &op : d->ops) {
+        if (op.kind == CUDA_DECODER_CONV) {
+            if (op.tail > length) return false;
+        } else if (op.kind == CUDA_DECODER_CONVTR) {
+            size_t output_len = 0u;
+            if (op.groups != 1 ||
+                !decoder_mul(length, (size_t)op.stride, &output_len) ||
+                op.tail > output_len)
+                return false;
+            length = output_len;
+        }
+    }
+    return true;
+}
+
+/* A planned lean decoder whose topology cannot use it (see above): give its
+ * ops the private window and `full` decoder_add_op skipped, exactly as
+ * without the diet. */
+static int decoder_alloc_private_op_scratch(mynah_backend_decoder *decoder,
+                                            char *e, size_t ec) {
+    for (auto &op : decoder->ops) {
+        size_t n = 0u;
+        if (op.kind == CUDA_DECODER_CONVTR && op.full == nullptr) {
+            n = (size_t)op.out_channels * op.max_full_len;
+        } else if (op.kind == CUDA_DECODER_CONV && op.tail > 0u &&
+                   op.window == nullptr) {
+            n = (size_t)op.in_channels * (op.tail + op.max_in_len);
+        } else {
+            continue;
+        }
+        float **dst = op.kind == CUDA_DECODER_CONVTR ? &op.full : &op.window;
+        if (ce(cudaMalloc(dst, n * sizeof(float)), e, ec) ||
+            ce(cudaMemset(*dst, 0, n * sizeof(float)), e, ec))
+            return -1;
+    }
+    return 0;
+}
+
+/* Bind a lean decoder's single-request scratch to the backend's shared set,
+ * creating it on first use.  A set too small for this topology (e.g. one
+ * made by the tiny self-test decoder) is never resized in place, because
+ * captured single-request graphs and the decoders bound to it hold its
+ * addresses: a larger set replaces it for new decoders and the old one is
+ * retired (kept until cuda_close). */
+static int decoder_bind_solo_scratch(mynah_backend_decoder *decoder, char *e,
+                                     size_t ec) {
+    cuda_backend_state *st = decoder->backend;
+    if (st->solo_work_a == nullptr ||
+        decoder->work_floats > st->solo_work_cap ||
+        decoder->columns_floats > st->solo_columns_cap ||
+        decoder->max_window_floats > st->solo_window_cap ||
+        decoder->max_full_floats > st->solo_full_cap) {
+        const size_t work = std::max(decoder->work_floats, st->solo_work_cap);
+        const size_t cols = std::max(decoder->columns_floats, st->solo_columns_cap);
+        const size_t win = std::max(decoder->max_window_floats, st->solo_window_cap);
+        const size_t full = std::max(decoder->max_full_floats, st->solo_full_cap);
+        float *p[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+        const size_t n[6] = {work, work, work, cols, win, full};
+        bool ok = true;
+        for (size_t i = 0; i < 6u && ok; ++i) {
+            if (n[i] == 0u) continue;
+            ok = ce(cudaMalloc(&p[i], n[i] * sizeof(float)), e, ec) == 0 &&
+                 ce(cudaMemset(p[i], 0, n[i] * sizeof(float)), e, ec) == 0;
+        }
+        if (ok) {
+            try {
+                float *old[6] = {st->solo_work_a, st->solo_work_b, st->solo_work_c,
+                                 st->solo_columns, st->solo_window, st->solo_full};
+                for (float *q : old)
+                    if (q != nullptr) st->solo_retired.push_back(q);
+            } catch (const std::bad_alloc &) {
+                set_error(e, ec, "out of memory retiring the decoder scratch");
+                ok = false;
+            }
+        }
+        if (!ok) {
+            for (float *q : p) cudaFree(q);
+            return -1;
+        }
+        st->solo_work_a = p[0];
+        st->solo_work_b = p[1];
+        st->solo_work_c = p[2];
+        st->solo_columns = p[3];
+        st->solo_window = p[4];
+        st->solo_full = p[5];
+        st->solo_work_cap = work;
+        st->solo_columns_cap = cols;
+        st->solo_window_cap = win;
+        st->solo_full_cap = full;
+    }
+    decoder->work_a = st->solo_work_a;
+    decoder->work_b = st->solo_work_b;
+    decoder->work_c = st->solo_work_c;
+    decoder->columns = st->solo_columns;
+    decoder->solo_window = st->solo_window;
+    decoder->solo_full = st->solo_full;
+    return 0;
+}
+
+/* Workspace of a lean decoder: the shared solo set plus the private gang set
+ * (gang_a, gang_b, gang_columns).  The columns are stored BF16 by every
+ * conv whose weight has a BF16 copy, so when all of them do the private
+ * columns are allocated at BF16 size (the old buffer was sized in floats and
+ * half of it used).  A topology whose gang cannot be fully fused falls back
+ * to the private layout (lean = false). */
+static int decoder_alloc_lean(mynah_backend_decoder *decoder, char *e,
+                              size_t ec) {
+    if (decoder->work_floats == 0u || decoder->columns_floats == 0u) {
+        set_error(e, ec, "resident decoder workspace is empty");
+        return -1;
+    }
+    if (!decoder_topology_lean_ok(decoder)) {
+        decoder->lean = false;
+        if (decoder_alloc_private_op_scratch(decoder, e, ec) != 0) return -1;
+        return decoder_alloc_workspace(decoder, e, ec);
+    }
+    if (decoder_bind_solo_scratch(decoder, e, ec) != 0) return -1;
+    bool all_bf16 = true;
+    for (const auto &op : decoder->ops)
+        if (op.kind == CUDA_DECODER_CONV && op.weight_bf16 == nullptr)
+            all_bf16 = false;
+    decoder->gang_columns_bytes =
+        decoder->columns_floats * (all_bf16 ? sizeof(uint16_t) : sizeof(float));
+    const size_t work = decoder->work_floats * sizeof(float);
+    if (ce(cudaMalloc(&decoder->gang_a, work), e, ec) ||
+        ce(cudaMalloc(&decoder->gang_b, work), e, ec) ||
+        ce(cudaMalloc(&decoder->gang_columns, decoder->gang_columns_bytes), e,
+           ec))
+        return -1;
+    return 0;
+}
+
+/* The per-row buffers of the cross-request gang (the work/columns entries
+ * of the pointer tables).  Without the diet they are the decoder's own
+ * work/columns buffers, as always. */
+static float *decoder_gang_a(const mynah_backend_decoder *d) {
+    return d->lean ? d->gang_a : d->work_a;
+}
+
+static float *decoder_gang_b(const mynah_backend_decoder *d) {
+    return d->lean ? d->gang_b : d->work_b;
+}
+
+static float *decoder_gang_c(const mynah_backend_decoder *d) {
+    /* Lean: none; only the unfused paths read it, and those are refused
+     * for a lean gang by decoder_gang_lean_ok before anything is queued. */
+    return d->lean ? nullptr : d->work_c;
+}
+
+static float *decoder_gang_columns(const mynah_backend_decoder *d) {
+    return d->lean ? static_cast<float *>(d->gang_columns) : d->columns;
+}
+
 static int decoder_reserve_one_gemm(cuda_backend_state *st,
                                     const mynah_backend_decoder *decoder,
                                     char *e, size_t ec) {
@@ -5678,14 +5941,16 @@ static int decoder_conv1d(mynah_backend_decoder *decoder, cuda_decoder_op *op,
     const size_t out_len = length / (size_t)op->stride;
     const size_t window_len = op->tail + length;
     const float *source = input;
+    /* MYNAH_CUDA_ROW_MEM_DIET: a lean decoder's window is the shared one. */
+    float *window = op->window != nullptr ? op->window : decoder->solo_window;
     if (op->tail > 0u) {
         const size_t total = (size_t)op->in_channels * window_len;
         k_decoder_causal_window<<<((int)total + 255) / 256, 256,
                                   0, decoder->backend->stream>>>(
-            op->previous, input, op->window, op->in_channels, (int)length,
+            op->previous, input, window, op->in_channels, (int)length,
             (int)op->tail);
         if (ce(cudaGetLastError(), e, ec)) return -1;
-        source = op->window;
+        source = window;
     }
     const size_t inner = (size_t)op->in_channels * (size_t)op->kernel;
     const size_t columns = inner * out_len;
@@ -5735,7 +6000,7 @@ static int decoder_conv1d(mynah_backend_decoder *decoder, cuda_decoder_op *op,
         const size_t total = (size_t)op->in_channels * op->tail;
         k_decoder_copy_tail<<<((int)total + 255) / 256, 256,
                               0, decoder->backend->stream>>>(
-            op->window, op->previous, op->in_channels, (int)length,
+            window, op->previous, op->in_channels, (int)length,
             (int)op->tail);
         if (ce(cudaGetLastError(), e, ec)) return -1;
     }
@@ -5750,6 +6015,8 @@ static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
     const size_t full_len = output_len + op->tail;
     const size_t total = (size_t)op->out_channels * full_len;
     cuda_backend_state *backend = decoder->backend;
+    /* MYNAH_CUDA_ROW_MEM_DIET: a lean decoder's `full` is the shared one. */
+    float *full = op->full != nullptr ? op->full : decoder->solo_full;
     if (op->weight_bf16 != nullptr && decoder_convtr_gemm_enabled() &&
         op->groups == 1 &&
         (size_t)op->in_channels * length <= backend->dec_tr_x_cap &&
@@ -5778,11 +6045,11 @@ static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
         }
         k_decoder_convtr_overlap_one<<<((int)total + 255) / 256, 256, 0,
                                        backend->stream>>>(
-            backend->dec_tr_y, op->full, op->bias, op->out_channels,
+            backend->dec_tr_y, full, op->bias, op->out_channels,
             (int)length, (int)full_len, op->kernel, op->stride);
     } else {
         k_conv_transpose<<<((int)total + 255) / 256, 256, 0, decoder->backend->stream>>>(
-            input, op->weight, op->bias, op->full, op->in_channels,
+            input, op->weight, op->bias, full, op->in_channels,
             op->out_channels, (int)length, (int)full_len, op->kernel, op->stride,
             op->groups);
     }
@@ -5791,13 +6058,13 @@ static int decoder_convtr(mynah_backend_decoder *decoder, cuda_decoder_op *op,
         const size_t state = (size_t)op->out_channels * op->tail;
         k_decoder_convtr_fold_save<<<((int)state + 255) / 256, 256,
                                      0, decoder->backend->stream>>>(
-            op->full, op->partial, op->bias, op->out_channels, (int)full_len,
+            full, op->partial, op->bias, op->out_channels, (int)full_len,
             (int)op->tail);
         if (ce(cudaGetLastError(), e, ec)) return -1;
     }
     k_decoder_copy_prefix<<<((int)((size_t)op->out_channels * output_len) + 255) / 256,
                             256, 0, decoder->backend->stream>>>(
-        op->full, output, op->out_channels, (int)full_len, (int)output_len);
+        full, output, op->out_channels, (int)full_len, (int)output_len);
     return ce(cudaGetLastError(), e, ec);
 }
 
@@ -6398,10 +6665,10 @@ static int decoder_conv1d_batch(cuda_backend_state *backend,
         if (ce(cudaGetLastError(), e, ec) != 0) return -1;
     } else {
     for (size_t i = 0; i < batch; ++i) {
-        if (decoders[i] == nullptr || decoders[i]->columns == nullptr ||
+        if (decoders[i] == nullptr || decoder_gang_columns(decoders[i]) == nullptr ||
             ops[i] == nullptr)
             return -1;
-        p1[i] = decoders[i]->columns;
+        p1[i] = decoder_gang_columns(decoders[i]);
         p2[i] = outputs[i];
         /* The pointer tables are float * on the device; with BF16 SEANet the
          * columns and weight entries point at BF16 data (the per-decoder
@@ -6865,6 +7132,48 @@ static int decoder_step_impl(mynah_backend_decoder *decoder,
     return 0;
 }
 
+/* MYNAH_CUDA_ROW_MEM_DIET: a lean decoder has no private causal window,
+ * `full` or ELU scratch for the gang, so a gang with a lean row may only run
+ * if every op takes the fused path: each conv1d fused or tail-free, the
+ * resblock's first conv fused (its unfused ELU would go to the scratch), and
+ * every transposed conv in the fused GEMM form that writes the output and
+ * the carried partial directly.  Mirrors the choices decoder_step_batch_impl
+ * makes for the same width and lengths; false means "refuse the gang before
+ * queuing anything" (the caller then decodes the rows one by one). */
+static bool decoder_gang_lean_ok(const cuda_backend_state *backend,
+                                 const mynah_backend_decoder *first,
+                                 size_t batch, size_t encoder_frames) {
+    if (!decoder_fuse_enabled()) return false;
+    size_t length = encoder_frames;
+    const size_t op_count = first->ops.size();
+    for (size_t index = 0u; index < op_count;) {
+        const cuda_decoder_op *op = &first->ops[index++];
+        if (op->kind == CUDA_DECODER_RESBLOCK) {
+            if (index + 1u >= op_count) return false;
+            const cuda_decoder_op *rb1 = &first->ops[index++];
+            const cuda_decoder_op *rb2 = &first->ops[index++];
+            if (!decoder_conv_fused_path(rb1, batch, length) ||
+                !(decoder_conv_fused_path(rb2, batch, length) || rb2->tail == 0u))
+                return false;
+            continue;
+        }
+        if (op->kind == CUDA_DECODER_CONV) {
+            if (!(decoder_conv_fused_path(op, batch, length) || op->tail == 0u))
+                return false;
+        } else if (op->kind == CUDA_DECODER_CONVTR) {
+            size_t output_len = 0u;
+            if (!decoder_mul(length, (size_t)op->stride, &output_len) ||
+                !decoder_convtr_gemm_path(backend, op, batch, length) ||
+                op->tail > output_len)
+                return false;
+            length = output_len;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* One causal decoder topology, many independent request states.  The
  * per-request work/tail buffers remain owned by each decoder object, while
  * elementwise kernels and the conv1d GEMM use one launch/batched cuBLAS call
@@ -6899,6 +7208,10 @@ static int decoder_step_batch_impl(
                 return 1;
         }
     }
+    bool any_lean = false;
+    for (size_t i = 0; i < batch; ++i) any_lean = any_lean || decoders[i]->lean;
+    if (any_lean && !decoder_gang_lean_ok(backend, first, batch, encoder_frames))
+        return 1;
     if (cbe(cublasSetStream(backend->cublas, backend->stream), e, ec) != 0)
         return -1;
 
@@ -6945,13 +7258,13 @@ static int decoder_step_batch_impl(
                                                            : nullptr;
             for (size_t i = 0; i < batch; ++i) {
                 op_rows[i] = &decoders[i]->ops[index - 2u];
-                if (current[i] == decoders[i]->work_a)
-                    other[i] = decoders[i]->work_b;
-                else if (current[i] == decoders[i]->work_b)
-                    other[i] = decoders[i]->work_a;
+                if (current[i] == decoder_gang_a(decoders[i]))
+                    other[i] = decoder_gang_b(decoders[i]);
+                else if (current[i] == decoder_gang_b(decoders[i]))
+                    other[i] = decoder_gang_a(decoders[i]);
                 else
-                    other[i] = decoders[i]->work_a;
-                scratch[i] = decoders[i]->work_c;
+                    other[i] = decoder_gang_a(decoders[i]);
+                scratch[i] = decoder_gang_c(decoders[i]);
             }
             size_t elements = 0u;
             size_t hidden_elements = 0u;
@@ -7009,10 +7322,10 @@ static int decoder_step_batch_impl(
         for (size_t i = 0; i < batch; ++i) {
             if (last)
                 destination[i] = outputs[i];
-            else if (current[i] == decoders[i]->work_a)
-                destination[i] = decoders[i]->work_b;
+            else if (current[i] == decoder_gang_a(decoders[i]))
+                destination[i] = decoder_gang_b(decoders[i]);
             else
-                destination[i] = decoders[i]->work_a;
+                destination[i] = decoder_gang_a(decoders[i]);
         }
         if (op->kind == CUDA_DECODER_CONV) {
             /* Defer this conv's bias when the next op reads through a fused
@@ -7077,9 +7390,15 @@ extern "C" int mynah_cuda_decoder_open(
     decoder->n_filters = desc->n_filters;
     decoder->max_encoder_frames = max_encoder_frames;
     decoder->elu_alpha = desc->elu_alpha;
+    /* MYNAH_CUDA_ROW_MEM_DIET: decided before the build, which then skips
+     * the per-op window and `full` (the solo path takes them from the shared
+     * set; decoder_alloc_lean gives them back if the topology cannot be
+     * lean). Off: false, the old allocations in the old order. */
+    decoder->lean = decoder_lean_planned();
     try {
         if (decoder_build(decoder, desc, e, ec) != 0 ||
-            decoder_alloc_workspace(decoder, e, ec) != 0 ||
+            (decoder->lean ? decoder_alloc_lean(decoder, e, ec)
+                           : decoder_alloc_workspace(decoder, e, ec)) != 0 ||
             decoder_reserve_one_gemm(backend, decoder, e, ec) != 0) {
             decoder_destroy(decoder);
             return -1;
@@ -7097,6 +7416,32 @@ extern "C" int mynah_cuda_decoder_open(
                          "mynah-tts: CUDA SEANet decoder convolutions in bf16 "
                          "(MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states "
                          "and audio)\n");
+    }
+    /* A planned lean decoder that fell back for its topology (the tiny
+     * self-test decoder) does not take the announcement. */
+    if (cuda_row_mem_diet_enabled() &&
+        (decoder->lean || !decoder_lean_planned())) {
+        static std::atomic<bool> announced_diet{false};
+        if (!announced_diet.exchange(true)) {
+            if (decoder->lean)
+                std::fprintf(stderr,
+                             "mynah-tts: MYNAH_CUDA_ROW_MEM_DIET=1: SEANet "
+                             "decoder device memory per request %zu KiB (was "
+                             "%zu KiB); single-request scratch is one shared "
+                             "set of %zu KiB\n",
+                             decoder_owned_bytes(decoder) / 1024u,
+                             decoder_legacy_bytes(decoder) / 1024u,
+                             ((3u * backend->solo_work_cap +
+                               backend->solo_columns_cap +
+                               backend->solo_window_cap +
+                               backend->solo_full_cap) * sizeof(float)) / 1024u);
+            else
+                std::fprintf(stderr,
+                             "mynah-tts: warning: MYNAH_CUDA_ROW_MEM_DIET=1 "
+                             "leaves the SEANet decoder buffers per request "
+                             "(needs MYNAH_CUDA_DECODER_FUSE=1, the transposed-"
+                             "conv GEMM and no MYNAH_CUDA_DECODER_ONEGEMM)\n");
+        }
     }
     if (decoder_fuse_enabled()) {
         static std::atomic<bool> announced_fuse{false};
@@ -7122,6 +7467,18 @@ extern "C" void mynah_cuda_decoder_close(void *opaque,
         destroy_decoder_batch_graphs_for(backend, decoder);
     }
     decoder_destroy(decoder);
+}
+
+/* Device bytes this decoder owns now and would own without
+ * MYNAH_CUDA_ROW_MEM_DIET (equal when the diet is off or did not apply). */
+extern "C" int mynah_cuda_decoder_device_bytes(void *opaque,
+                                               const mynah_backend_decoder *decoder,
+                                               size_t *owned, size_t *legacy) {
+    (void)opaque;
+    if (decoder == nullptr || owned == nullptr || legacy == nullptr) return -1;
+    *owned = decoder_owned_bytes(decoder);
+    *legacy = decoder_legacy_bytes(decoder);
+    return 0;
 }
 
 extern "C" int mynah_cuda_decoder_reset(void *opaque,
@@ -7185,6 +7542,17 @@ extern "C" int mynah_cuda_decoder_step_batch(
         dev_outputs == nullptr || batch < 2u ||
         batch > backend->batch_meta_cap || encoder_frames == 0u)
         return 1;
+    /* MYNAH_CUDA_ROW_MEM_DIET: refuse a gang a lean row cannot run in before
+     * any graph bookkeeping (decoder_step_batch_impl checks it again). */
+    for (size_t i = 0; i < batch; ++i) {
+        if (decoders[i] != nullptr && decoders[i]->lean) {
+            if (decoders[0] == nullptr ||
+                !decoder_gang_lean_ok(backend, decoders[0], batch,
+                                      encoder_frames))
+                return 1;
+            break;
+        }
+    }
     auto eager = [&]() -> int {
         const int result = decoder_step_batch_impl(
             backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs,

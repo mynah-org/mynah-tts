@@ -707,3 +707,153 @@ To verify on the L4 before merging (not compiled here, no nvcc):
   KV_VMM alone does not move the ceiling. Next lever: per-request device memory (branch pocket-cuda-rowmem).
 - Robustness item: after an OOM the server degrades (stream RTF p95 30+, ONE_SYNC disabled, rows failing) instead
   of refusing work. Admission should account for free device memory and answer 503 before a step can fail.
+
+## Per-request device memory (`MYNAH_CUDA_ROW_MEM_DIET`, default 0)
+
+Branch `pocket-cuda-rowmem` from `pocket-cuda-c208` (ae151ab). Trigger: the server start-up line
+"width-bucket graph warm-up: 256/256 concurrent requests ... device memory +17850 MiB" (~70 MiB per concurrent
+request; 288: +17946 MiB) against a backbone KV of ~27-38 MiB per row, and concurrency past ~C256 failing for VRAM.
+
+### Breakdown from the code (24L English, CUDA serving path)
+Model dims used below (model.json / tensors): backbone 24 layers, d 1024, 16 heads x 64, FFN 4096; Mimi decoder
+transformer 2 layers, d 512, FFN 2048, context 250; SEANet n_filters 64, ratios [6,5,4], kernel 7, residual
+kernel 3, last kernel 3, compress 2, 1 residual layer, upsample stride 16 (so the decoder runs 16 encoder frames per
+80-ms step and `max_in_len` of the first op is 16). Flags: c208 defaults plus SHARED_VOICE (strip), DECODER_FUSE,
+ATTN_SPLIT, ONE_SYNC, bf16 backbone, SEANet bf16, KV bf16, Mimi tile, slot pool.
+
+SEANet decoder topology (`decoder_build`, floats; tail = (k-1)*dilation - stride + 1 for convs, k - stride for
+transposed convs):
+
+| op | in -> out ch, k, stride | in len | tail | work (out x len) | im2col columns (in x k x len) | window (in x (tail+len)) | `full` (out x (len*s + k - s)) | state |
+|---|---|---|---|---|---|---|---|---|
+| conv first | 512 -> 512, 7 | 16 | 6 | 8 192 | 57 344 | 11 264 | | previous 3 072 |
+| convtr 1 | 512 -> 256, 12, s6 | 16 | 6 | 24 576 | | | 26 112 | partial 1 536 |
+| res conv1 | 256 -> 128, 3 | 96 | 2 | 12 288 | 73 728 | 25 088 | | previous 512 |
+| res conv2 | 128 -> 256, 1 | 96 | 0 | 24 576 | 12 288 | | | |
+| convtr 2 | 256 -> 128, 10, s5 | 96 | 5 | 61 440 | | | 62 080 | partial 640 |
+| res conv1 | 128 -> 64, 3 | 480 | 2 | 30 720 | 184 320 | 61 696 | | previous 256 |
+| res conv2 | 64 -> 128, 1 | 480 | 0 | 61 440 | 30 720 | | | |
+| convtr 3 | 128 -> 64, 8, s4 | 480 | 4 | 122 880 | | | 123 136 | partial 256 |
+| res conv1 | 64 -> 32, 3 | 1920 | 2 | 61 440 | 368 640 | 123 008 | | previous 128 |
+| res conv2 | 32 -> 64, 1 | 1920 | 0 | 122 880 | 61 440 | | | |
+| conv last | 64 -> 1, 3 | 1920 | 2 | 1 920 | 368 640 | 123 008 | | previous 128 |
+
+Per decoder before: work_a/b/c 3 x max work (122 880 floats = 480 KiB) = 1 440 KiB, columns max (368 640 floats,
+allocated FP32 although BF16 SEANet uses half) = 1 440 KiB, every op's window = 1 344 KiB, every transposed conv's
+`full` = 825.5 KiB, carried state 25.5 KiB: **5 075 KiB**.
+
+Per request, device (KiB), old -> with the diet:
+
+| item | where | old | diet | arithmetic |
+|---|---|---|---|---|
+| backbone KV | `pocket_cuda_backbone_alloc` | 96 KiB x stored positions | same | 24 layers x [K,V] x 1024 x 2 B per position; stored = text + max(256, 3 text + 64) rounded to 256, capped by max_steps + 1 (+126 voice positions without the strip) |
+| SEANet work_a/b/c | `decoder_alloc_workspace` | 1 440 | 960 (gang_a/b) | work_c is never read by the fused gang; the solo path's three buffers are shared |
+| SEANet columns | same | 1 440 | 720 | gang columns at BF16 size when every conv has a BF16 weight (FP32 size otherwise) |
+| SEANet windows | `decoder_add_op` | 1 344 | 0 | the fused gang reads `previous` + input directly; the solo path uses one shared window (max 123 008 floats) |
+| SEANet `full` | same | 825.5 | 0 | the fused gang's `k_decoder_convtr_overlap_out` writes the output and the partial directly; solo uses one shared `full` |
+| SEANet previous + partial | same | 25.5 | 25.5 | request state |
+| decoder input/output | `pocket_cuda_decoder_alloc` | 39.5 | 39.5 | 16 x 512 + 1920 floats |
+| Mimi transformer KV | `pocket_cuda_codec_alloc` | 4 000 | 2 120 | 2 layers x [K,V] x positions x 512 x 4 B; host window = context + max(context, 16) = 500 positions; the tile only needs context + 16 - 1 = 265 |
+| Mimi scratch | same | 22 | 22 | 7 x 512 + 2048 floats |
+| quantizer + upsample | same | 66 | 66 | 32 + 512 + 16 x 512 + tail 16 x 512 floats |
+| backbone single-row scratch | `pocket_cuda_backbone_alloc` | 44 | 44 | 3 x 1024 + 4 x 1024 + 4096 floats |
+| **total besides KV** | | **9 247 (9.0 MiB)** | **3 997 (3.9 MiB)** | **-5 250 KiB (-5.1 MiB) per request** |
+
+Shared or width-scaled memory (not per request; listed because it shows up in the warm-up delta):
+
+| item | size | note |
+|---|---|---|
+| `dec_tr_x` / `dec_tr_y` (transposed-conv GEMM operands) | 90 + 360 MiB | sized for `batch_meta_cap` = 384 rows whatever `--max-batch` is: x = 384 x 128 x 480 floats, y = 384 x 64 x 8 x 480 floats; x is BF16 (half used) with SEANet bf16. Allocated at the first decoder open, i.e. before the walk |
+| decoder gang graph tables | 3 424 B x width per graph, device + pinned host | upload bound 107 slots x 4 channels x 8 B; one graph per exact width 2..max: sum ~113 MB at 256, ~175 MB at 320 (~0.44-0.55 MiB per request of max width) |
+| prefill tile workspace | ~225 MiB at 256 rows x 16-token slices | 4096 tile rows x (11 264 floats + BF16 copy 4 096 + prefill input 1 024); grows to the largest call, never shrinks |
+| engine batch scratch | ~50 MiB at 256 | dominated by the host-mirror shadow `cuda_kv_shadow` (24 x 2 x 1024 floats = 192 KiB per row) |
+| shared solo decoder scratch (diet only) | 3.75 MiB once | work x3 + FP32 columns + one window + one `full` |
+| backbone/flow/one-sync graphs | per width bucket | graph exec memory, not visible from the code |
+
+What the +17 850 MiB at 256 is made of: the walk's rows carry the walk text (193 tokens) and stop after 4 + 2i
+steps, so row i stores 193 + min(768, 5 + 2i) positions (+126 without the strip): 453 positions on average =
+42.5 MiB stripped, 54.3 MiB unstripped (+~1 MiB of 2-MiB allocation rounding). With the 9.0 MiB non-KV, the tile
+workspace, the graph tables and the shadow that is ~16.9 GiB unstripped or ~13.5 GiB stripped; the rest is graph
+exec memory and allocator granularity, to be measured. The 288 point (+96 MiB for 32 more rows) looks saturated
+(rows past the VRAM ceiling falling back), not linear. So the warm-up number is mostly KV, and KV sized for the walk,
+not for real first segments; the non-KV part is ~9 MiB per row, ~13 % of the 70.
+
+### What changed with the flag on
+1. SEANet decoder (`gpu/cuda/backend_cuda.cu`, "lean" decoder). Planned when `MYNAH_CUDA_DECODER_FUSE=1`, the
+   transposed-conv GEMM is on and `MYNAH_CUDA_DECODER_ONEGEMM` is off, and the topology's gang is fully fused at
+   its own frame count (every conv tail <= its input, every transposed conv in GEMM form with tail <= output).
+   - `decoder_add_op` skips the per-op window and `full`; `decoder_alloc_lean` binds the solo path's work_a/b/c,
+     columns, window and `full` to one backend-wide set (`cuda_backend_state::solo_*`) and allocates per row only
+     `gang_a`, `gang_b` and `gang_columns` (BF16 size when every conv is BF16).
+   - Solo path (`decoder_step_impl`, `decoder_conv1d`, `decoder_convtr`): unchanged code on the shared pointers
+     (`op->window ? op->window : decoder->solo_window`, same for `full`). Safe because all decoder work is ordered on
+     the one backend stream and every scratch buffer is fully written before it is read within a step (the same
+     assumption `dec_tr_x/y`, which the solo transposed conv already shares, rests on).
+   - Gang path (`decoder_step_batch_impl`): the ping-pong and columns entries of the pointer tables come from
+     `decoder_gang_a/b/c/columns` (the old `work_a/b/c/columns` when the decoder is not lean). work_c is null for a
+     lean row: only the unfused ELU would write it.
+   - `decoder_gang_lean_ok` re-checks, per call and before any graph bookkeeping or launch, that the gang takes the
+     fused path for every op at the real width, length and buffer caps; otherwise the call returns 1 (unavailable,
+     nothing queued) and the engine decodes the rows one by one.
+   - Graph safety: gang graphs keep using the per-replay pointer tables, whose entries are the row's own
+     gang buffers (lifetime = the decoder, as before). Solo graphs bake the shared set: it is never resized or freed
+     before `cuda_close`; a larger topology than the current set gets a new set and the old one is retired (kept
+     until close), so a set made by the tiny self-test decoder cannot shrink later decoders.
+2. Mimi transformer KV (`src/engine_pocket.c`). A row that will run in the Mimi tile (tile on, upsample on the
+   device, decoder handoff, tile backend) allocates the tile's ring only: context + upsample_stride - 1 = 265
+   positions instead of the host window's 500. The tile writes slot p % ring and reads every query's window by
+   absolute position, so any ring >= 265 gives the same values in the same order (the backend refuses a smaller one).
+   Such a row (`cuda_codec_ring_only`) has no device mirror of the host window, so `pocket_cuda_codec_prepare_window`
+   returns 1 for it (the non-tile resident path is unavailable; the row runs on the tile, or on the CPU codec if it
+   was never adopted by the tile) and `pocket_cuda_codec_sync_host_window` refuses it. Rows of different rings in one
+   tile call get per-row rings (`mynah_backend_tile_desc.rings`) instead of the old refusal.
+3. Start-up lines: from the backend at the first lean decoder, "MYNAH_CUDA_ROW_MEM_DIET=1: SEANet decoder device
+   memory per request 1705 KiB (was 5075 KiB); single-request scratch is one shared set of 3841 KiB", and from the
+   engine at the first full context, "pocket: MYNAH_CUDA_ROW_MEM_DIET=1: device memory per request besides the
+   backbone KV 3997 KiB (was 9247 KiB): SEANet decoder ..., Mimi transformer KV 2120 KiB (was 4000; 265 positions
+   instead of 500), other ..." (numbers expected for the 24L pack with SEANet bf16; from the real allocations).
+   New backend call `mynah_backend_decoder_device_bytes` (owned vs legacy bytes of a decoder).
+4. Flag off: `lean` is false and `cuda_codec_ring_only` 0 everywhere; the same cudaMalloc calls in the same order
+   with the same sizes (the size bookkeeping added to `decoder_add_op` is arithmetic only), the same pointers in every
+   table and kernel argument, and the Mimi tile's mixed-ring refusal unchanged.
+
+Numerics with the flag on: no operation, operand value or order changes; only where scratch lives. Two path
+differences remain, both outside the default serving shape: (a) a gang whose rows are lean but whose shapes are not
+fully fused (not reachable with the 24L topology at 16 frames) is refused and decoded per row instead of taking the
+unfused gang kernels; (b) a request with `max_steps` < 31 (host Mimi window below 500 positions) next to default
+requests: flag off the tile refuses the mixed rings and those rows run the per-request resident Mimi path for life;
+with the diet every adopted row has the 265 ring and the tile serves the call. Use default `max_steps` in the md5
+comparisons.
+
+Expected effect: -5.1 MiB per request (-56 % of the non-KV part; ~-1.3 GiB at C256, ~-1.6 GiB at C320). On top of a
+first-segment row of ~27-38 MiB KV that is +11-15 % rows at the same VRAM, i.e. roughly C256 -> C285-C295 if VRAM was
+the only limit; the warm-up line at 256 should drop by ~1.3 GiB.
+
+### Tests to run on the L4 (same build for every arm)
+1. `make cuda cuda-server CUDA_ARCH=sm_89`; `./build/cuda/mynah-tts --gpu-self-test cuda` PASS with and without
+   `MYNAH_CUDA_ROW_MEM_DIET=1 MYNAH_CUDA_DECODER_FUSE=1` (the self-test decoder has tail 2 > 1 frame, so it keeps the
+   private layout; no diet start-up line is consumed by it).
+2. Pedantic: `MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0 MYNAH_CUDA_QUANT=f32 MYNAH_CUDA_DECODER_FUSE=1
+   MYNAH_CUDA_ROW_MEM_DIET=1 ./build/cuda/mynah-tts --pocket-self-check models/pocket-english-24l --device cuda`
+   PASS, with both diet start-up lines (decoder line: FP32 columns, so 2 425 KiB instead of 1 705). Again with
+   `MYNAH_CUDA_SHARED_VOICE=1`.
+3. Temperature 0, SEANet fp32 and bf16, 24 seeded requests (4 voices, default max_steps) sent at once to a fresh
+   server: md5 per request flag off / off again / on (`MYNAH_CUDA_DECODER_FUSE=1` in all arms); the gang-history
+   caveat of the correctness section applies, so compare off vs off first. Also a single request alone (solo decoder
+   path on the shared scratch, solo graph replay) and one with `MYNAH_CUDA_GRAPHS=0`.
+4. `compute-sanitizer --tool memcheck` on a short C4 run with the flag on (shared solo scratch, ring-only Mimi rows).
+5. Knee with `--max-batch 320`, best flag set, flag off vs on: the start-up "device memory +X MiB" of the width
+   walk (expect ~-1.3 GiB at 256 rows, ~-1.6 GiB at 320) and `nvidia-smi` after start-up, then C256 / C288 / C320
+   60-s closed loops: failures, stream RTF p95, stalls, peak VRAM.
+
+### Further levers found (not in this change)
+- KV of parked slot sets: the width walk parks caches sized for its 193-token text and up to 515 steps (up to
+  66 MiB), and the pool reuses a parked cache up to 2x a request's need, so a real first segment (~286 positions,
+  27 MiB) can carry up to ~54 MiB. A tighter reuse bound, or the VMM trim, is a KV-policy change worth ~10+ MiB per
+  pooled request.
+- Initial KV floor: at least 256 steps (24 MiB) per row whatever the text; `MYNAH_CUDA_KV_VMM` with a 64-position
+  chunk cuts the floor to what is used.
+- `dec_tr_x/y` sized for 384 rows instead of `--max-batch` (450 MiB fixed; 150 MiB less at 256, and x at BF16 size
+  saves 45 MiB more), but growing them later invalidates captured graphs that bake the pointers.
+- Decoder gang graphs per exact width (tables grow with the sum of widths); bucketing the gang width like the
+  backbone would cap them.

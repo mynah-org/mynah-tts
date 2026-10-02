@@ -45,6 +45,8 @@ struct mynah_backend {
                               float *const *, char *, size_t);
     int (*decoder_note_step)(void *, mynah_backend_decoder *);
     int (*decoder_note_batch)(void *, size_t, size_t);
+    int (*decoder_device_bytes)(void *, const mynah_backend_decoder *, size_t *,
+                                size_t *);
     int (*backbone_note_batch)(void *, size_t);
     int (*codec_transformer_note_batch)(void *, size_t, size_t);
     void (*codec_upsample_note)(void *, int);
@@ -266,6 +268,8 @@ extern int mynah_cuda_decoder_step_batch(
     float *const *, char *, size_t);
 extern int mynah_cuda_decoder_note_step(void *, mynah_backend_decoder *);
 extern int mynah_cuda_decoder_note_batch(void *, size_t, size_t);
+extern int mynah_cuda_decoder_device_bytes(void *, const mynah_backend_decoder *,
+                                           size_t *, size_t *);
 extern int mynah_cuda_note_backbone_batch(void *, size_t);
 extern int mynah_cuda_note_codec_transformer_batch(void *, size_t, size_t);
 extern void mynah_cuda_note_codec_upsample(void *, int);
@@ -789,6 +793,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->decoder_step_batch = mynah_cuda_decoder_step_batch;
         backend->decoder_note_step = mynah_cuda_decoder_note_step;
         backend->decoder_note_batch = mynah_cuda_decoder_note_batch;
+        backend->decoder_device_bytes = mynah_cuda_decoder_device_bytes;
         backend->backbone_note_batch = mynah_cuda_note_backbone_batch;
         backend->codec_transformer_note_batch = mynah_cuda_note_codec_transformer_batch;
         backend->codec_upsample_note = mynah_cuda_note_codec_upsample;
@@ -944,6 +949,17 @@ int mynah_backend_decoder_note_batch(const mynah_backend *backend,
     if (backend == NULL || items == 0u || frames == 0u ||
         backend->decoder_note_batch == NULL) return 0;
     return backend->decoder_note_batch(backend->state, items, frames);
+}
+
+int mynah_backend_decoder_device_bytes(const mynah_backend *backend,
+                                       const mynah_backend_decoder *decoder,
+                                       size_t *owned, size_t *legacy) {
+    if (owned != NULL) *owned = 0u;
+    if (legacy != NULL) *legacy = 0u;
+    if (backend == NULL || decoder == NULL || owned == NULL || legacy == NULL ||
+        backend->decoder_device_bytes == NULL)
+        return -1;
+    return backend->decoder_device_bytes(backend->state, decoder, owned, legacy);
 }
 
 int mynah_backend_note_backbone_batch(const mynah_backend *backend,
