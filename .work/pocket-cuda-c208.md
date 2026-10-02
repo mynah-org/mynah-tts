@@ -185,9 +185,11 @@ cuBLAS number and keep the invariance.
 
 ### 2026-10-02 correctness
 - Pedantic self-checks (`MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0`: the backend reports batch-invariant, so
-  `--pocket-self-check` compares bits, gang decoder vs solo decoder and a text pushed in pieces vs whole): PASS with
-  `DECODER_FUSE`, with `SHARED_VOICE`, with `PREFILL_BF16TC`, and with all three. Each flag's start-up line appears, so
-  the new paths really ran. The fused decoder is exact; the BF16 prefill tile is batch-invariant.
+  `--pocket-self-check` compares a text pushed in pieces vs whole bit for bit (memcmp), and the gang decoder vs the
+  solo decoder within 1e-4 — the gang transposed conv is a GEMM, the solo one SIMT, so that pair was never
+  bit-equal): PASS with `DECODER_FUSE`, with `SHARED_VOICE`, with `PREFILL_BF16TC`, and with all three. Each flag's
+  start-up line appears, so the new paths really ran. The BF16 prefill tile is batch-invariant (bitwise). The fused
+  decoder's exactness comes from the temperature-0 runs: off vs fuse, same build, 24 requests all 99 dB (identical).
 - Under concurrent serving load the default configuration is not batch-invariant (TF32 cuBLAS decode GEMMs pick
   their algorithm by width): the same 24 seeded requests at concurrency 24 and 3 differ in all 24 md5s, flags off.
   So md5 comparisons between two server runs only hold when the gang history is the same; at temperature 0 two runs
