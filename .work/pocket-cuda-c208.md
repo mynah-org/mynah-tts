@@ -467,3 +467,21 @@ rest is admission/prefill/growth).
   possible for the default config, but it changes the driver/engine contract (step, emit and decode in one call) and
   the delivery logic in `src/inference.c` (`stream_gang`).
 - PCM in int16 on the device, the hidden D2H, and the EOS/latent/flow/hidden copies packed into one D2H.
+
+### 2026-10-02 13:20 CEST — merged build (all branches), knee screen, max-batch 240
+Stream RTF p95 (60 s closed loop, 4 voices, one round; 0 stalls, 0 failures everywhere):
+
+| arm | C208 | C224 | C240 | audio-s/s @C240 | peak VRAM |
+|---|---|---|---|---|---|
+| A: SHARED_VOICE (rows stripped) + PREFILL_FIXED=0 + DECODER_FUSE (parts 1+2) | 0.705 | 0.745 | 0.787 | 250 | 20.8 GB |
+| B: A + ATTN_SPLIT | 0.674 | 0.711 | 0.749 | 267 | 20.5 GB |
+| C: B + QUANT=bf16 QUANT_STAGES=backbone BF16_FUSE | 0.768 | 0.811 | 0.854 | 235 | 19.6 GB |
+
+- Same day, before the strip and fusion part 2, SHARED_VOICE + PREFILL_FIXED=0 + DECODER_FUSE (part 1) read 0.835 at
+  C208 and C224 failed (OOM during KV growth). The strip removes the per-row prefix (start-up line "backbone KV rows
+  do not store the 126-position voice prefix") and C224/C240 now run.
+- C was slower because with bf16 weights every bf16 tile GEMM took the SIMT kernel, losing the cuBLAS prefill:
+  fixed in d79971c (cuBLAS bf16 for tiles that do not ask for a fixed order); re-test queued.
+- Temperature-0 identity (same build, SEANet fp32, 24 requests): strip and fusion part 2 median 99 dB (identical;
+  a few requests diverge from gang timing alone); ATTN_SPLIT changes the summation order (self-test max rel diff
+  5e-7 vs the fast kernel), so trajectories diverge at temperature 0 (median 24 dB), the same class as TF32 vs fp32.
