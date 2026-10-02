@@ -618,3 +618,20 @@ one row stripped by 3 positions and biased below the start of the range, so a st
 - f32 KV VMM rows (192 KiB per position) are supported by the same code but untested; the default KV is BF16.
 - A VMM row that unexpectedly leaves the tile path is re-allocated plain (S = 0) or goes to the CPU (S > 0), as the
   phase-2 rows already did.
+
+### 2026-10-02 14:35 CEST — bf16 backbone through cuBLASLt (60 s knee, max-batch 256, one round)
+All arms: SHARED_VOICE (stripped rows) + PREFILL_FIXED=0 + DECODER_FUSE + ATTN_SPLIT + ONE_SYNC.
+
+| arm | C208 | C240 | C256 | audio-s/s @C256 | TTFA p95 @C208 | peak VRAM |
+|---|---|---|---|---|---|---|
+| B: fp32 weights (TF32) | 0.676 | 0.748 | 0.788 | 266 | 115 ms | 22.1 GB |
+| C: + QUANT=bf16 QUANT_STAGES=backbone BF16_FUSE BF16_LT | 0.607 | 0.679 | 0.714 | 303 | 104 ms | 21.5 GB |
+| ALL: + bf16 flow head and Mimi (QUANT_STAGES all) | 0.603 | 0.676 | 0.712 | 305 | 104 ms | 21.4 GB |
+
+- Before BF16_LT the bf16 backbone was 10 % SLOWER than TF32: cublasGemmEx with CUBLAS_GEMM_DEFAULT picked small
+  bf16 tiles, and the bf16 prefill tile fell back to the SIMT kernel (nsys: 31 % of GPU time, ~15 ms/step; fixed in
+  the tile buffer commit). cuBLASLt with a per-shape heuristic (what PyTorch's bf16 F.linear does) makes bf16 the
+  expected win: -10 % RTF p95, +14 % audio-s/s against TF32.
+- bf16 flow head + Mimi transformer add nothing measurable on top of the backbone.
+- Open: `--pocket-self-check` long-form (text in pieces vs whole) fails on the C config and on B + KV_VMM; being
+  isolated (suspect ONE_SYNC, which earlier passing builds did not have).
