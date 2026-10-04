@@ -85,6 +85,7 @@ struct mynah_backend {
     int (*copy_dev_bytes)(void *, void *, const void *, size_t, char *, size_t);
     int (*copy_dev_bytes_2d)(void *, void *, size_t, const void *, size_t, size_t, size_t, char *, size_t);
     int (*kv_vmm_probe)(void *, size_t *, char *, size_t);
+    int (*set_kv_int8)(void *, int);
     int (*kv_vmm_alloc)(void *, size_t, size_t, void **, size_t *, char *, size_t);
     int (*kv_vmm_resize)(void *, void *, size_t, size_t *, char *, size_t);
     void (*kv_vmm_free)(void *, void *);
@@ -232,6 +233,7 @@ extern int mynah_cuda_copy_dev(void *, float *, const float *, size_t, char *, s
 extern int mynah_cuda_copy_dev_bytes(void *, void *, const void *, size_t, char *, size_t);
 extern int mynah_cuda_copy_dev_bytes_2d(void *, void *, size_t, const void *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_kv_vmm_probe(void *, size_t *, char *, size_t);
+extern int mynah_cuda_set_kv_int8(void *, int);
 extern int mynah_cuda_kv_vmm_alloc(void *, size_t, size_t, void **, size_t *, char *, size_t);
 extern int mynah_cuda_kv_vmm_resize(void *, void *, size_t, size_t *, char *, size_t);
 extern void mynah_cuda_kv_vmm_free(void *, void *);
@@ -739,6 +741,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->copy_dev_bytes = mynah_cuda_copy_dev_bytes;
         backend->copy_dev_bytes_2d = mynah_cuda_copy_dev_bytes_2d;
         backend->kv_vmm_probe = mynah_cuda_kv_vmm_probe;
+        backend->set_kv_int8 = mynah_cuda_set_kv_int8;
         backend->kv_vmm_alloc = mynah_cuda_kv_vmm_alloc;
         backend->kv_vmm_resize = mynah_cuda_kv_vmm_resize;
         backend->kv_vmm_free = mynah_cuda_kv_vmm_free;
@@ -1580,6 +1583,11 @@ int mynah_backend_copy_dev_bytes_2d(const mynah_backend *backend,
     return backend->copy_dev_bytes_2d(backend->state, dev_dst, dst_pitch,
                                       dev_src, src_pitch, width, rows, error,
                                       error_capacity);
+}
+
+int mynah_backend_set_kv_int8(const mynah_backend *backend, int on) {
+    if (backend == NULL || backend->set_kv_int8 == NULL) return -1;
+    return backend->set_kv_int8(backend->state, on);
 }
 
 int mynah_backend_kv_vmm_probe(const mynah_backend *backend,

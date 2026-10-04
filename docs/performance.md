@@ -962,7 +962,7 @@ experiments: `.work/pocket-tts-24l-cpu-serving-axion.md`; profiles
 
 Build f873125 (sources hashed in the bundle), `mynah-tts-server --device cuda`,
 max-batch/inflight 160, BF16 backbone KV grown on demand, resident f32 weights
-with TF32, every CUDA default of `.work/pocket-cuda-g6-host-cpu.md`. Pack
+with TF32, every CUDA default of `.work/pocket-cuda-l4-host-cpu.md`. Pack
 `english_2026-04_24l` converted to BF16 (Kyutai's own `switch_to_bf16.py`
 choice; the F32 checkpoint measured equal). Host: vast.ai, EPYC 7702, load
 generator on the same host. Corpus v2 (`tools/corpus/pocket_v2_en.jsonl`, 300
@@ -1008,3 +1008,30 @@ voice spread is narrower. No separate unloaded control: the serving path is the
 code measured on the 24L, where load did not change the audio. The evidence
 bundles (per-request records, logs, captured audio) are kept privately and are
 not published.
+
+## 2026-10-04 · PocketTTS 24L on CUDA — int8 backbone KV, C320 screen on one L4
+
+One NVIDIA L4 (24 GB, sm_89) on Vast.ai, 24L pack, every CUDA default of
+[cuda-serving.md](cuda-serving.md) section 7 (shared voice prefix, split
+decode attention, bf16 backbone Linears through cuBLASLt, fused decoder, one
+sync per frame, per-request memory diet). 2-minute closed-loop knees
+(`tools/pocket_ladder.py`), v2 corpus, four voices, seed 1234, `--max-batch` =
+top level, 8 HTTP workers, `MYNAH_THREADS=1`. Only the backbone KV dtype
+changes between the arms.
+
+| KV | C | stream RTF p95 | audio-s/s | TTFA p95 | stalls 250/500 ms | failed | peak VRAM |
+|---|---:|---:|---:|---:|---|---:|---|
+| bf16 | 256 | 0.745 | 314.6 | 129 ms | 0 / 0 | 0 | |
+| bf16 | 288 | 0.827 | 315.9 | 143 ms | 0 / 0 | 0 | 21.3 GB (max-batch 288) |
+| int8 | 256 | **0.681** | **345.4** | 118 ms | 0 / 0 | 0 | |
+| int8 | 288 | **0.782** | 334.8 | 134 ms | 0 / 0 | 0 | |
+| int8 | 320 | **0.855** | 338.4 | 146 ms | 0 / 0 | 0 | 16.3 GB (max-batch 320) |
+
+int8 KV stores each position of a K or V plane as `heads * head_dim` int8
+values plus one float scale per head (1088 instead of 2048 bytes on 24L); the
+shared voice prefix stays bf16. Audio seconds per request are equal between
+the arms (no EOS drift). It is the default since this date
+(`MYNAH_CUDA_KV_DTYPE=bf16` rolls back) and the L4 24L profile runs at
+`--max-batch 320`. Screens only: the 30-minute soak qualification with WER is
+pending, so C160 remains the qualified point. Detail:
+`.work/pocket-cuda-kv-int8.md`.

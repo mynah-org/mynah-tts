@@ -1087,6 +1087,11 @@ struct mynah_engine_state {
      * `cuda_kv_vmm_granularity` is the physical page size in bytes. */
     int cuda_kv_vmm;
     size_t cuda_kv_vmm_granularity;
+    /* int8 backbone KV (default; MYNAH_CUDA_KV_DTYPE), resolved once at model load: backbone KV
+     * rows store int8 records (pocket_cuda_kv_record) on top of the BF16 KV
+     * path (cuda_backbone_kv_bf16 stays 1; the shared voice cache stays
+     * BF16). Only rows that skip their voice prefix use the device path. */
+    int cuda_kv_int8;
 
     mynah_sp *tokenizer;
 };
@@ -1124,6 +1129,9 @@ static const char *pocket_cuda_stage_encoding(const mynah_engine_state *state,
                                               unsigned groups);
 static int pocket_cuda_kv_grow_enabled(void);
 static int pocket_cuda_prefill_tile_enabled(void);
+static int pocket_cuda_shared_voice_enabled(void);
+static int pocket_cuda_shared_voice_strip_enabled(void);
+static int pocket_cuda_kv_int8_requested(void);
 static int pocket_cuda_kv_vmm_requested(void);
 static size_t pocket_cuda_kv_vmm_chunk(void);
 /* Virtual reservation per MYNAH_CUDA_KV_VMM row, in positions: the host
@@ -4236,6 +4244,44 @@ static int pocket_model_init(const mynah_tts_model *model,
         const int resident_on = resident == NULL || strcmp(resident, "0") != 0;
         const int decoder_raw = state->codec_conv_qtype != 1 &&
                                 state->codec_convtr_qtype != 1;
+        if (pocket_cuda_kv_int8_requested()) {
+            /* int8 backbone KV (the default; MYNAH_CUDA_KV_DTYPE=bf16 or f32
+             * rolls it back): resolved once here. The records are written by
+             * the prefill tile and the batched decode kernel only, and read
+             * through the shared voice prefix, so all of those must be on;
+             * otherwise the rows stay BF16. */
+            const char *kv_setting = getenv("MYNAH_CUDA_KV_DTYPE");
+            const int explicit_int8 = kv_setting != NULL && kv_setting[0] != '\0';
+            const size_t attn = state->cfg.heads * state->cfg.head_dim;
+            const char *why = NULL;
+            if (!resident_on || !pocket_cuda_prefill_tile_enabled() ||
+                !pocket_cuda_shared_voice_enabled() ||
+                !pocket_cuda_shared_voice_strip_enabled())
+                why = "it needs MYNAH_CUDA_RESIDENT, MYNAH_CUDA_PREFILL_TILE, "
+                      "MYNAH_CUDA_SHARED_VOICE and MYNAH_CUDA_SHARED_VOICE_STRIP on";
+            else if (state->cfg.head_dim != 64u || state->cfg.heads % 4u != 0u ||
+                     state->cfg.heads > 32u || attn % 16u != 0u)
+                why = "it needs 64-wide heads (at most 32, a multiple of 4)";
+            else if (mynah_backend_set_kv_int8(state->backend, 1) != 0)
+                why = "the backend has no int8 KV path";
+            if (why == NULL) {
+                state->cuda_kv_int8 = 1;
+                fprintf(stderr,
+                        "mynah-tts: backbone KV int8 with one float scale per "
+                        "position and head (%zu of %zu bytes per position and "
+                        "plane); rows without a shared model-voice KV run "
+                        "their backbone on the CPU (MYNAH_CUDA_KV_DTYPE=bf16 "
+                        "keeps them on the GPU)\n",
+                        attn + 4u * state->cfg.heads, attn * 2u);
+            } else {
+                fprintf(stderr,
+                        "mynah-tts: %sbackbone KV int8 not used (%s); it "
+                        "stays bf16\n",
+                        explicit_int8 ? "warning: MYNAH_CUDA_KV_DTYPE=int8 "
+                                        "ignored, " : "",
+                        why);
+            }
+        }
         {
             /* The one line an operator reads: what each hot stage REALLY
              * runs, resolved from the same predicates the dispatch uses. */
@@ -4292,7 +4338,9 @@ static int pocket_model_init(const mynah_tts_model *model,
                     "mynah-tts: CUDA quant=%s backbone=%s flow=%s mimi=%s "
                     "kv=%s%s%s%s\n",
                     requested, bb, flow, mimi,
-                    pocket_cuda_kv_bf16_requested(state) ? "bf16" : "f32",
+                    pocket_cuda_kv_bf16_requested(state)
+                        ? (state->cuda_kv_int8 ? "int8" : "bf16")
+                        : "f32",
                     stages_note,
                     strcmp(bb, "bf16") == 0 && pocket_cuda_bf16_fuse_enabled() &&
                             mynah_backend_has_bf16_fused(state->backend)
@@ -4302,7 +4350,12 @@ static int pocket_model_init(const mynah_tts_model *model,
                                  "MYNAH_CUDA_Q8 or a per-stage switch)"
                                : "");
         }
-        if (pocket_cuda_kv_vmm_requested()) {
+        if (pocket_cuda_kv_vmm_requested() && state->cuda_kv_int8) {
+            fprintf(stderr,
+                    "mynah-tts: warning: MYNAH_CUDA_KV_VMM=1 ignored with "
+                    "int8 backbone KV (plane-major records only; set "
+                    "MYNAH_CUDA_KV_DTYPE=bf16 to use it)\n");
+        } else if (pocket_cuda_kv_vmm_requested()) {
             /* MYNAH_CUDA_KV_VMM: resolved once here; contexts only read
              * state->cuda_kv_vmm. It extends the growable cache of the
              * prefill tile path, so it needs both of those on. */
@@ -4544,16 +4597,39 @@ static int pocket_cuda_q8_requested(void) {
     return setting != NULL && strcmp(setting, "0") != 0;
 }
 
-/* Persistent backbone K/V is FP32 by default because it is the CPU/GPU
- * parity oracle.  BF16 is an explicit capacity experiment: QKV projections,
- * attention accumulation, host shadow and all CPU state remain FP32, while
- * the device cache stores two-byte values.  This is deliberately independent
- * of model-weight Q8 so either reduction can be measured in isolation. */
+/* Persistent backbone K/V on the device: MYNAH_CUDA_KV_DTYPE unset (or
+ * "int8") is int8 records on top of the BF16 KV path when the model and the
+ * switches allow it (decided in pocket_model_init, else BF16); "bf16" (or
+ * "bfloat16") is BF16; "f32" (any other value) is FP32, the CPU/GPU parity
+ * oracle. QKV projections, attention accumulation and all CPU state remain
+ * FP32 in every mode. This is deliberately independent of model-weight Q8 so
+ * either reduction can be measured in isolation. */
 static int pocket_cuda_kv_bf16_requested(const mynah_engine_state *state) {
     if (!pocket_cuda_resident_requested(state)) return 0;
     const char *setting = getenv("MYNAH_CUDA_KV_DTYPE");
-    return setting != NULL &&
-           (strcmp(setting, "bf16") == 0 || strcmp(setting, "bfloat16") == 0);
+    return setting == NULL || setting[0] == '\0' ||
+           strcmp(setting, "bf16") == 0 || strcmp(setting, "bfloat16") == 0 ||
+           strcmp(setting, "int8") == 0;
+}
+
+static int pocket_cuda_kv_int8_requested(void) {
+    const char *setting = getenv("MYNAH_CUDA_KV_DTYPE");
+    return setting == NULL || setting[0] == '\0' || strcmp(setting, "int8") == 0;
+}
+
+/* Bytes of one backbone KV element: f32, BF16, or int8 (records). */
+static size_t pocket_cuda_kv_elem(const mynah_engine_state *state, int kv_bf16) {
+    if (!kv_bf16) return sizeof(float);
+    return state != NULL && state->cuda_kv_int8 ? 1u : sizeof(uint16_t);
+}
+
+/* Elements of one stored position of one K or V plane: attn, or for int8
+ * the record of attn int8 values followed by `heads` float scales (a
+ * multiple of 16 bytes for every Pocket model: heads * head_dim % 16 == 0 and
+ * heads % 4 == 0 are checked at load). */
+static size_t pocket_cuda_kv_record(const mynah_engine_state *state, int kv_bf16) {
+    const size_t attn = state->cfg.heads * state->cfg.head_dim;
+    return kv_bf16 && state->cuda_kv_int8 ? attn + 4u * state->cfg.heads : attn;
 }
 
 /* MYNAH_CUDA_SHARED_VOICE (default on; =0 is the rollback): the batched decode attention reads
@@ -4569,10 +4645,10 @@ static int pocket_cuda_shared_voice_enabled(void) {
     return cached;
 }
 
-static void *pocket_cuda_kv_offset(float *base, size_t elements,
-                                   int bf16) {
+static void *pocket_cuda_kv_offset(const mynah_engine_state *state,
+                                   float *base, size_t elements, int bf16) {
     if (base == NULL) return NULL;
-    const size_t width = bf16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t width = pocket_cuda_kv_elem(state, bf16);
     return (void *)((unsigned char *)base + elements * width);
 }
 
@@ -4601,7 +4677,9 @@ static size_t pocket_cuda_kv_stored(const mynah_engine_ctx *ctx) {
  * `cache_stride` every decode kernel and the K/V gather take per row. */
 static size_t pocket_cuda_kv_stride(const mynah_engine_ctx *ctx) {
     const size_t attn = ctx->state->cfg.heads * ctx->state->cfg.head_dim;
-    return ctx->cuda_backbone_kv_vmm ? ctx->state->cfg.layers * 2u * attn : attn;
+    return ctx->cuda_backbone_kv_vmm
+        ? ctx->state->cfg.layers * 2u * attn
+        : pocket_cuda_kv_record(ctx->state, ctx->cuda_backbone_kv_bf16);
 }
 
 /* Start of layer `layer`'s K (`plane` 0) or V (`plane` 1) plane in the
@@ -4616,10 +4694,14 @@ static void *pocket_cuda_kv_plane(const mynah_engine_ctx *ctx, size_t layer,
     const size_t attn = ctx->state->cfg.heads * ctx->state->cfg.head_dim;
     const size_t plane_index = layer * 2u + (plane ? 1u : 0u);
     if (ctx->cuda_backbone_kv_vmm)
-        return pocket_cuda_kv_offset(ctx->cuda_backbone_kv, plane_index * attn,
+        return pocket_cuda_kv_offset(ctx->state, ctx->cuda_backbone_kv,
+                                     plane_index * attn,
                                      ctx->cuda_backbone_kv_bf16);
-    const size_t stored = pocket_cuda_kv_stored(ctx) * attn;
-    return pocket_cuda_kv_offset(ctx->cuda_backbone_kv, plane_index * stored,
+    const size_t stored = pocket_cuda_kv_stored(ctx) *
+                          pocket_cuda_kv_record(ctx->state,
+                                                ctx->cuda_backbone_kv_bf16);
+    return pocket_cuda_kv_offset(ctx->state, ctx->cuda_backbone_kv,
+                                 plane_index * stored,
                                  ctx->cuda_backbone_kv_bf16);
 }
 
@@ -4636,7 +4718,7 @@ static void *pocket_cuda_kv_position_base(const mynah_engine_ctx *ctx,
                                           size_t layer, int plane) {
     unsigned char *start = (unsigned char *)pocket_cuda_kv_plane(ctx, layer, plane);
     if (start == NULL || ctx->cuda_backbone_kv_skip == 0u) return start;
-    const size_t width = ctx->cuda_backbone_kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t width = pocket_cuda_kv_elem(ctx->state, ctx->cuda_backbone_kv_bf16);
     const size_t bias = ctx->cuda_backbone_kv_skip * pocket_cuda_kv_stride(ctx) *
                         width;
     return (void *)((uintptr_t)start - (uintptr_t)bias);
@@ -6604,7 +6686,8 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
     size_t qkv = 0;
     size_t position_bytes = 0;
     const int kv_bf16 = pocket_cuda_kv_bf16_requested(ctx->state);
-    const size_t kv_element = kv_bf16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t kv_element = pocket_cuda_kv_elem(ctx->state, kv_bf16);
+    const size_t kv_record = pocket_cuda_kv_record(ctx->state, kv_bf16);
     /* MYNAH_CUDA_KV_GROW: the device cache may start below the host state's
      * `max_seq_len`; with it off (or a non-tile context) this is exactly the
      * full capacity and every line below is what it was. */
@@ -6614,13 +6697,28 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
      * every size below counts stored positions (capacity - skip). With no
      * skip every line is what it was. */
     const size_t kv_skip = pocket_cuda_kv_skip_planned(ctx, kv_capacity, kv_bf16);
+    if (ctx->state->cuda_kv_int8 && kv_skip == 0u) {
+        /* int8 rows are only ever written by the prefill tile and read
+         * through the shared voice prefix; a row without a shared
+         * model-voice KV (no voice prefix to skip) runs on the CPU. */
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "pocket: int8 backbone KV: a row without a shared "
+                    "model-voice KV runs its backbone on the CPU "
+                    "(MYNAH_CUDA_KV_DTYPE=bf16 keeps it on the GPU)\n");
+        }
+        ctx->cuda_backbone_enabled = 0;
+        return 0;
+    }
     if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
-        pocket_mul(kv_capacity - kv_skip, attn_dim, &layer_half) != 0 ||
+        pocket_mul(kv_capacity - kv_skip, kv_record, &layer_half) != 0 ||
         pocket_mul(layer_half, 2u, &layer_span) != 0 ||
         pocket_mul(cfg->layers, layer_span, &kv_floats) != 0 ||
         pocket_mul(attn_dim, 3u, &qkv) != 0 ||
         pocket_mul(kv_floats, kv_element, &kv_bytes) != 0 ||
-        pocket_mul(cfg->layers, 2u * attn_dim, &position_bytes) != 0 ||
+        pocket_mul(cfg->layers, 2u * kv_record, &position_bytes) != 0 ||
         pocket_mul(position_bytes, kv_element, &position_bytes) != 0 ||
         position_bytes == 0u) {
         ctx->cuda_backbone_enabled = 0;
@@ -6910,14 +7008,14 @@ static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
     size_t new_capacity = bc->max_seq_len;
     if (chunks <= (bc->max_seq_len - old_capacity) / POCKET_CUDA_KV_GROW_CHUNK)
         new_capacity = old_capacity + chunks * POCKET_CUDA_KV_GROW_CHUNK;
-    const size_t element = ctx->cuda_backbone_kv_bf16 ? sizeof(uint16_t)
-                                                      : sizeof(float);
+    const size_t element = pocket_cuda_kv_elem(state, ctx->cuda_backbone_kv_bf16);
+    const size_t record = pocket_cuda_kv_record(state, ctx->cuda_backbone_kv_bf16);
     const size_t skip = ctx->cuda_backbone_kv_skip; /* < old_capacity */
     size_t attn_dim = 0u, old_half = 0u, new_half = 0u, new_floats = 0u;
     size_t new_bytes = 0u, valid = 0u, valid_bytes = 0u;
     if (pocket_mul(cfg->heads, cfg->head_dim, &attn_dim) != 0 ||
-        pocket_mul(old_capacity - skip, attn_dim, &old_half) != 0 ||
-        pocket_mul(new_capacity - skip, attn_dim, &new_half) != 0 ||
+        pocket_mul(old_capacity - skip, record, &old_half) != 0 ||
+        pocket_mul(new_capacity - skip, record, &new_half) != 0 ||
         pocket_mul(new_half, 2u * cfg->layers, &new_floats) != 0 ||
         pocket_mul(new_floats, element, &new_bytes) != 0) {
         pocket_error(error, capacity, "pocket: CUDA KV growth size overflow");
@@ -6927,7 +7025,7 @@ static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
     valid = mynah_transformer_ar_state_offset(ctx->backbone);
     if (valid > old_capacity) valid = old_capacity;
     valid = valid > skip ? valid - skip : 0u;
-    valid_bytes = valid * attn_dim * element;
+    valid_bytes = valid * record * element;
 
     char local[256];
     local[0] = '\0';
@@ -7002,6 +7100,14 @@ static int pocket_cuda_backbone_upload(mynah_engine_ctx *ctx, char *error,
         pocket_error(error, capacity,
                      "pocket: refusing to upload a host cache into a device "
                      "cache that does not store the voice prefix");
+        return -1;
+    }
+    if (ctx->state->cuda_kv_int8) {
+        /* int8 rows always skip the voice prefix (checked above); kept as
+         * its own refusal so the layout below never sees a record. */
+        pocket_error(error, capacity,
+                     "pocket: refusing to upload a host cache into an int8 "
+                     "device cache");
         return -1;
     }
     if (ctx->cuda_backbone_kv_vmm) {
@@ -7207,7 +7313,20 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
         void *layer_v = pocket_cuda_kv_position_base(ctx, l, 1);
         /* Device voice cache layout: [layer][K|V][kv_skip][attn]. */
         const uint16_t *voice = (const uint16_t *)ctx->cuda_voice_shared;
-        const int attention_failed = kv_skip != 0u
+        /* int8 rows (always prefix-skipping): the batched int8 kernel with
+         * one row; its tables are copied from these host arrays. */
+        void *i8_k[1] = {layer_kv}, *i8_v[1] = {layer_v};
+        void *i8_kp[1] = {(void *)(voice + l * 2u * kv_skip * attn_dim)};
+        void *i8_vp[1] = {(void *)(voice + (l * 2u + 1u) * kv_skip * attn_dim)};
+        const size_t i8_len[1] = {kv_skip}, i8_pos[1] = {position},
+                     i8_stride[1] = {kv_stride};
+        const int attention_failed = ctx->state->cuda_kv_int8
+            ? mynah_backend_self_attention_bf16_prefix_batch_dev(
+                  backend, ctx->cuda_qkv, i8_k, i8_v, i8_kp, i8_vp, i8_len,
+                  i8_pos, i8_stride, 1u, cfg->heads, cfg->head_dim,
+                  1.0f / sqrtf((float)cfg->head_dim), ctx->cuda_attn, local,
+                  sizeof(local))
+            : kv_skip != 0u
             ? mynah_backend_self_attention_bf16_prefix_dev(
                   backend, ctx->cuda_qkv, layer_kv, layer_v,
                   voice + l * 2u * kv_skip * attn_dim,
@@ -7272,15 +7391,17 @@ static int pocket_cuda_backbone_step(mynah_engine_ctx *ctx, char *error,
         mynah_transformer_ar_state_kv_half_floats(ctx->backbone);
     const size_t host_slot = position * attn_dim;
     const size_t device_slot = position * kv_stride;
-    for (size_t l = 0; l < cfg->layers; ++l) {
+    /* An int8 row is device-owned (no CPU retry), and its records are not
+     * the host layout: nothing to shadow. */
+    for (size_t l = 0; l < cfg->layers && !ctx->state->cuda_kv_int8; ++l) {
         float *host_kv = mynah_transformer_ar_state_kv(ctx->backbone, l);
         /* position >= kv_skip: always a stored slot. */
         void *device_k = pocket_cuda_kv_offset(
-            (float *)pocket_cuda_kv_position_base(ctx, l, 0), device_slot,
-            ctx->cuda_backbone_kv_bf16);
+            ctx->state, (float *)pocket_cuda_kv_position_base(ctx, l, 0),
+            device_slot, ctx->cuda_backbone_kv_bf16);
         void *device_v = pocket_cuda_kv_offset(
-            (float *)pocket_cuda_kv_position_base(ctx, l, 1), device_slot,
-            ctx->cuda_backbone_kv_bf16);
+            ctx->state, (float *)pocket_cuda_kv_position_base(ctx, l, 1),
+            device_slot, ctx->cuda_backbone_kv_bf16);
         if (host_kv == NULL ||
             (ctx->cuda_backbone_kv_bf16
                  ? mynah_backend_d2h_bf16(backend, device_k,
@@ -7514,6 +7635,9 @@ static int pocket_cuda_backbone_step_batch_impl(
         mynah_transformer_ar_state_config(first->backbone);
     if (first_config == NULL) return 1;
     const int kv_bf16 = first->cuda_backbone_kv_bf16;
+    /* int8 records have no host mirror; such rows are device-owned. */
+    if (mirror_host && state->cuda_kv_int8) return 1;
+    const size_t kv_record = pocket_cuda_kv_record(state, kv_bf16);
 
     if (scratch->cuda_kcache == NULL || scratch->cuda_vcache == NULL ||
         scratch->cuda_positions == NULL || scratch->cuda_cache_strides == NULL ||
@@ -7601,7 +7725,7 @@ static int pocket_cuda_backbone_step_batch_impl(
         const float *row0 = input_rows != NULL ? input_rows[0] : first->step_input;
         for (size_t i = count; i < exec; ++i) {
             scratch->cuda_positions[i] = 0u;
-            scratch->cuda_cache_strides[i] = attn_dim;
+            scratch->cuda_cache_strides[i] = kv_record;
             if (!defer)
                 memcpy(scratch->cuda_host_input + i * cfg->hidden_dim, row0,
                        cfg->hidden_dim * sizeof(float));
@@ -7666,10 +7790,14 @@ static int pocket_cuda_backbone_step_batch_impl(
         }
         for (size_t i = count; i < exec; ++i) {
             const size_t metadata_offset = l * scratch->cuda_batch_capacity + i;
+            /* One K and one V position per layer; an int8 record is wider
+             * than attn bytes but 2 records fit in the 2 * attn floats. */
+            const size_t pad_layer = state->cuda_kv_int8 ? 2u * kv_record
+                                                         : shadow_row;
             scratch->cuda_kcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
-                scratch->cuda_pad_kv, l * shadow_row, kv_bf16);
+                state, scratch->cuda_pad_kv, l * pad_layer, kv_bf16);
             scratch->cuda_vcache[metadata_offset] = (float *)pocket_cuda_kv_offset(
-                scratch->cuda_pad_kv, l * shadow_row + attn_dim, kv_bf16);
+                state, scratch->cuda_pad_kv, l * pad_layer + kv_record, kv_bf16);
             if (shared_voice) {
                 scratch->cuda_kprefix[metadata_offset] = NULL;
                 scratch->cuda_vprefix[metadata_offset] = NULL;
@@ -8756,9 +8884,10 @@ static int pocket_ctx_pinned(mynah_engine_ctx *ctx, const pocket_ctx_sizes *z,
         const size_t bb_positions =
             pocket_cuda_kv_initial_capacity(ctx, z->backbone_capacity);
         size_t bb_kv_bytes = 0u;
-        if (pocket_mul(bb_positions, z->attn_dim, &bb_kv_bytes) != 0 ||
+        if (pocket_mul(bb_positions, pocket_cuda_kv_record(state, kv_bf16),
+                       &bb_kv_bytes) != 0 ||
             pocket_mul(bb_kv_bytes, 2u * cfg->layers, &bb_kv_bytes) != 0 ||
-            pocket_mul(bb_kv_bytes, kv_bf16 ? sizeof(uint16_t) : sizeof(float),
+            pocket_mul(bb_kv_bytes, pocket_cuda_kv_elem(state, kv_bf16),
                        &bb_kv_bytes) != 0)
             bb_kv_bytes = SIZE_MAX;
         /* MYNAH_CUDA_KV_VMM: the allocation will want a VMM cache reserving
@@ -9666,7 +9795,7 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             row_skip[rows] = skip;
             row_strides[2u * rows] = pocket_cuda_kv_stride(ctx);
             row_strides[2u * rows + 1u] = ctx->cuda_backbone_kv_vmm
-                ? attn_dim : row_ring[rows] * attn_dim;
+                ? attn_dim : row_ring[rows] * pocket_cuda_kv_stride(ctx);
             for (size_t l = 0; l < layers; ++l) {
                 kv[rows * layers + l] = pocket_cuda_kv_plane(ctx, l, 0);
                 /* Device voice cache layout: [layer][K|V][skip][attn]. */
@@ -9729,7 +9858,9 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             .skip = any_skip ? row_skip : NULL,
             .prefix = any_skip ? prefix : NULL,
             /* NULL unless a row is position-major (MYNAH_CUDA_KV_VMM). */
-            .kv_strides = any_vmm ? row_strides : NULL,
+            .kv_strides = any_vmm || state->cuda_kv_int8 ? row_strides : NULL,
+            /* int8 records: strides above are in bytes (element = 1). */
+            .kv_int8 = state->cuda_kv_int8,
         };
         mynah_region_begin(MYNAH_RGN_PREFILL);
         const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,

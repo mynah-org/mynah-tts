@@ -2,14 +2,14 @@
   "schema_version": 1,
   "profile": {
     "id": "l4-24g-pocket-en-24l-cuda",
-    "description": "One NVIDIA L4 (24 GB, sm_89), PocketTTS English 24L (english_2026-04_24l) streaming on the CUDA server. C160 is the qualified operating point: two independent 30-minute soaks on the v2 corpus, 184.5 audio-s/s, RTF p95 0.855-0.857, TTFA p95 154-155 ms, 0 stalls, 0 failures, WER 2.02/1.94% against 1.87% for an unloaded C8 control. Since 2026-10-02 the CUDA defaults include the shared voice prefix, split decode attention, bf16 backbone Linears (cuBLASLt, fused), the fused decoder and one sync per frame; with them, plus the per-request device memory diet, the server runs at --max-batch 288 (60-s screens with the shipped defaults: RTF p95 0.620 at C208, 0.739 at C256, 0.819 at C288, ~290 audio-s/s, 0 stalls), soak qualification pending, so C160 below is still the qualified point (measured on the 2026-09-28 defaults). NOT the shipped default: BF16 KV and one host thread are exported. Host-scoped: another GPU is another profile.",
+    "description": "One NVIDIA L4 (24 GB, sm_89) on Vast.ai, PocketTTS English 24L (english_2026-04_24l) streaming on the CUDA server. C160 is the qualified operating point: two independent 30-minute soaks on the v2 corpus, 184.5 audio-s/s, RTF p95 0.855-0.857, TTFA p95 154-155 ms, 0 stalls, 0 failures, WER 2.02/1.94% against 1.87% for an unloaded C8 control (2026-09-28 defaults, bf16 KV). The CUDA defaults now add the shared voice prefix, split decode attention, bf16 backbone Linears (cuBLASLt, fused), the fused decoder, one sync per frame, the per-request device memory diet and (since 2026-10-04) int8 backbone KV; with them the server runs at --max-batch 320 (2-min closed-loop screens, v2 corpus, 4 voices: RTF p95 0.681 at C256, 0.782 at C288, 0.855 at C320, 335-345 audio-s/s, 0 stalls, peak VRAM 16.3 GB). Soak qualification of those defaults is pending, so C160 below is still the qualified point. NOT the shipped default: one host thread is exported. Host-scoped: another GPU is another profile.",
     "engine": "pocket",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
       "concurrency_range": [
         1,
-        288
+        320
       ],
       "preferred_concurrency": 160,
       "quality_changes_allowed": false
@@ -21,7 +21,7 @@
     "logical_cpus": 128,
     "ram_gib": 126,
     "canonical_topology": "one process: 8 HTTP workers in front of one CUDA scheduler thread; no prefork",
-    "notes": "vast.ai instance, load generator on the same host. The host is not the limit: pinned to 4 cores (taskset -c 0-3, a g6.xlarge-class host) the server lost 1.5% at C64 (123.5 -> 121.7 audio-s/s) using 110% of 400% CPU. The server's CPU is ~110-125% of one core, mostly one scheduler thread spinning in cudaStreamSynchronize, so 4 vCPUs are enough for one L4.",
+    "notes": "Vast.ai instance, load generator on the same host. The host is not the limit: pinned to 4 cores (taskset -c 0-3, a 4-vCPU host) the server lost 1.5% at C64 (123.5 -> 121.7 audio-s/s) using 110% of 400% CPU. The server's CPU is ~110-125% of one core, mostly one scheduler thread spinning in cudaStreamSynchronize, so 4 vCPUs are enough for one L4.",
     "gpu": {
       "name": "NVIDIA L4",
       "memory_gib": 22.5,
@@ -45,9 +45,9 @@
   "server": {
     "device": "cuda",
     "http_workers": 8,
-    "max_batch": 288,
-    "max_inflight": 288,
-    "why": "One process, --max-batch = --max-inflight = C so every admitted stream is in the batch and the GPU runs one gang per step. 288 is the screening ceiling of the 2026-10-02 defaults (60-s closed-loop knees, v2 corpus, 4 voices: RTF p95 0.620 at C208, 0.739 at C256, 0.819 at C288, ~290 audio-s/s, 0 stalls; peak VRAM 20.3 GB at C288 with MYNAH_CUDA_ROW_MEM_DIET; without the diet C288 fails for VRAM). C320 needs MYNAH_CUDA_KV_VMM (memory fits, RTF p95 0.926: compute-bound). Soak qualification pending. The qualified C160 point below was measured with --max-batch 160 on the 2026-09-28 defaults, where the knee ladder (25 s per level) was flat at ~138 audio-s/s from C128 with RTF p95 linear in C (0.71/0.78/0.86/0.93/0.99 at C128/144/160/176/192). 8 HTTP workers is the harness default (tools/gpu/serve.sh); the server needs ~1.1-1.25 host cores."
+    "max_batch": 320,
+    "max_inflight": 320,
+    "why": "One process, --max-batch = --max-inflight = C so every admitted stream is in the batch and the GPU runs one gang per step. 320 is the screening ceiling of the 2026-10-04 defaults (int8 backbone KV). 2-min closed-loop knees, v2 corpus, 4 voices (alba, marius, javert, jean), seed 1234, --max-batch = the top level, same build, KV the only change: bf16 KV C256 RTF p95 0.745, 314.6 audio-s/s, TTFA p95 129 ms; C288 0.827, 315.9 audio-s/s, TTFA p95 143 ms; peak VRAM 21.3 GB at --max-batch 288. int8 KV C256 0.681, 345.4 audio-s/s, TTFA p95 118 ms; C288 0.782, 334.8 audio-s/s, TTFA p95 134 ms; C320 0.855, 338.4 audio-s/s, TTFA p95 146 ms; peak VRAM 16.3 GB at --max-batch 320, ready in 52 s. 0 stalls@250/500 and 0 failures at every level; audio seconds per request equal between the two modes (no EOS drift). Soak qualification pending. The qualified C160 point below was measured with --max-batch 160 on the 2026-09-28 defaults, where the knee ladder (25 s per level) was flat at ~138 audio-s/s from C128 with RTF p95 linear in C (0.71/0.78/0.86/0.93/0.99 at C128/144/160/176/192). 8 HTTP workers is the harness default (tools/gpu/serve.sh); the server needs ~1.1-1.25 host cores."
   },
   "runtime": {
     "matches_shipped_default": false,
@@ -65,8 +65,8 @@
         "why": "Required: NOT the default (the pool otherwise sizes itself to every allowed CPU, 128 on this host). On CUDA the hot stages are resident on the device and the host pool has nothing hot to run; every point below was measured with 1 (tools/gpu/serve.sh)."
       },
       "MYNAH_CUDA_KV_DTYPE": {
-        "value": "bf16",
-        "why": "Required: NOT the default. Without it the device backbone KV is FP32 (the parity oracle, pocket_cuda_kv_bf16_requested in src/engine_pocket.c) at twice the VRAM per stream; every point below, and the BF16-KV WER gate of .work/pocket-cuda-c60-l4.md, was measured with bf16."
+        "value": null,
+        "why": "Must be ABSENT (default int8 since 2026-10-04, when the resident backbone, the prefill tile and the shared voice prefix with strip are on and heads are 64 wide). Backbone KV rows store int8 values with one float scale per position and head (1088 instead of 2048 bytes per position and plane on 24L); the shared voice prefix stays bf16. L4 2-min knees vs bf16 KV (same build): C256 RTF p95 0.745 -> 0.681, 314.6 -> 345.4 audio-s/s; C288 0.827 -> 0.782; peak VRAM 21.3 GB (max-batch 288) -> 16.3 GB (max-batch 320); audio seconds per request unchanged. No WER run on this change; the soak qualification will carry it. =bf16 is the rollback (and keeps rows without a shared model-voice KV, i.e. a voice that is not an entry of the pack, on the GPU: with int8 they run their backbone on the CPU); =f32 is the CPU/GPU parity oracle. The qualified C160 point below was measured with bf16."
       },
       "MYNAH_QUANT_GROUPS": {
         "value": "none",
@@ -194,7 +194,7 @@
       },
       "MYNAH_CUDA_KV_VMM": {
         "value": null,
-        "why": "Must be ABSENT (default off). KV rows as VMM ranges that grow in place, aimed at C272+ with --max-batch 288; not measured as a default."
+        "why": "Must be ABSENT (default off). KV rows as VMM ranges that grow in place; ignored with int8 KV (it needs MYNAH_CUDA_KV_DTYPE=bf16). With bf16 KV and the diet it fit C320 in 14.4 GB but its position-major layout cost ~4 % and C320 was compute-bound (RTF p95 0.926); int8 KV reaches C320 at 0.855 without it."
       }
     }
   },
@@ -261,7 +261,7 @@
         "stalls_250ms": 0,
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 138.9,
-        "evidence": ".work/pocket-cuda-g6-host-cpu.md (knee ladder, 25 s per level)",
+        "evidence": ".work/pocket-cuda-l4-host-cpu.md (knee ladder, 25 s per level)",
         "why_not_promoted": "RTF p95 0.926 fails the 0.90 preferred gate. Throughput is flat at ~138 audio-s/s from C128 up (GPU saturated) and RTF p95 grows linearly in C, so a higher level only buys latency."
       },
       {
@@ -276,7 +276,7 @@
         "stalls_250ms": 0,
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 138.4,
-        "evidence": ".work/pocket-cuda-g6-host-cpu.md (knee ladder, 25 s per level)",
+        "evidence": ".work/pocket-cuda-l4-host-cpu.md (knee ladder, 25 s per level)",
         "why_not_promoted": "RTF p95 0.992: still below 1.0 but with no margin at all; realtime is about to break."
       },
       {
@@ -308,6 +308,36 @@
         "throughput_audio_s_per_s": 303,
         "evidence": ".work/pocket-cuda-c208.md (2026-10-02 14:35 knee)",
         "why_not_promoted": "60-s screen only: the new screening level of the 2026-10-02 defaults; the 2 x 30-min soak qualification is pending."
+      },
+      {
+        "date": "2026-10-04",
+        "version": "int8 backbone KV (now the default), max-batch 320, 2-min closed-loop screen",
+        "concurrency": 288,
+        "verdict": "INCONCLUSIVE",
+        "configuration": "environment-override",
+        "soak_seconds": 120,
+        "ttfa_p95_ms": 134,
+        "rtf_p95": 0.782,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 334.8,
+        "evidence": ".work/pocket-cuda-kv-int8.md",
+        "why_not_promoted": "2-min screen only: the 2 x 30-min soak qualification with captured audio and WER is pending."
+      },
+      {
+        "date": "2026-10-04",
+        "version": "int8 backbone KV (now the default), max-batch 320, 2-min closed-loop screen",
+        "concurrency": 320,
+        "verdict": "INCONCLUSIVE",
+        "configuration": "environment-override",
+        "soak_seconds": 120,
+        "ttfa_p95_ms": 146,
+        "rtf_p95": 0.855,
+        "stalls_250ms": 0,
+        "stalls_500ms": 0,
+        "throughput_audio_s_per_s": 338.4,
+        "evidence": ".work/pocket-cuda-kv-int8.md",
+        "why_not_promoted": "2-min screen only: the new screening ceiling of the 2026-10-04 defaults; the 2 x 30-min soak qualification is pending."
       }
     ],
     "history": [
@@ -342,7 +372,7 @@
         "stalls_250ms": 0,
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 176.8,
-        "evidence": ".work/pocket-cuda-g6-host-cpu.md (30-min closed-loop soak C96)"
+        "evidence": ".work/pocket-cuda-l4-host-cpu.md (30-min closed-loop soak C96)"
       },
       {
         "date": "2026-09-28",
@@ -358,7 +388,7 @@
         "stalls_250ms": 0,
         "stalls_500ms": 0,
         "throughput_audio_s_per_s": 186.7,
-        "evidence": ".work/pocket-cuda-g6-host-cpu.md (30-min closed-loop soak C128)"
+        "evidence": ".work/pocket-cuda-l4-host-cpu.md (30-min closed-loop soak C128)"
       },
       {
         "date": "2026-09-28",
@@ -393,6 +423,6 @@
         "evidence": "l4:/root/evidence/bundles/pocket-24l-c160-final (private evidence bundle, not published), soak B"
       }
     ],
-    "notes": "C60-C64 on 2026-09-27 (all CUDA defaults, one 250 ms hiccup in 30 minutes) -> backbone attention rewrite +22-30%, slot pool, decoder graph reuse, tile workspace grow-only -> C96 GOOD 176.8 audio-s/s -> KV grow (-48% VRAM) -> C128 GOOD 186.7 -> 256-wide cap -> C160 qualified by two soaks with captured audio (WER A 2.02%, B 1.94%; unloaded C8 control on soak A's request ids 1.87%, same per-voice profile: alba ~0.4%, marius ~4.7%). The load does not degrade the audio; the voice spread is the model/voice pair. The C96/C128 soaks used the built-in text mix, the C160 soaks the v2 corpus. Detail: .work/pocket-cuda-g6-host-cpu.md and docs/performance.md (2026-09-28). The 6L on the same box is l4-24g-pocket-en-6l-cuda.json."
+    "notes": "C60-C64 on 2026-09-27 (all CUDA defaults, one 250 ms hiccup in 30 minutes) -> backbone attention rewrite +22-30%, slot pool, decoder graph reuse, tile workspace grow-only -> C96 GOOD 176.8 audio-s/s -> KV grow (-48% VRAM) -> C128 GOOD 186.7 -> 256-wide cap -> C160 qualified by two soaks with captured audio (WER A 2.02%, B 1.94%; unloaded C8 control on soak A's request ids 1.87%, same per-voice profile: alba ~0.4%, marius ~4.7%). The load does not degrade the audio; the voice spread is the model/voice pair. The C96/C128 soaks used the built-in text mix, the C160 soaks the v2 corpus. Detail: .work/pocket-cuda-l4-host-cpu.md and docs/performance.md (2026-09-28). The 6L on the same box is l4-24g-pocket-en-6l-cuda.json."
   }
 }

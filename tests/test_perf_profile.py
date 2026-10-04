@@ -188,8 +188,8 @@ def main():
 
     rc, out, _ = capture(["command", cuda_id, "--model", "models/pocket-english-24l",
                           "--port", "8090"])
-    want = ("build/cuda/mynah-tts-server --device cuda -w 8 --max-batch 288 "
-            "--max-inflight 288 -p 8090 -m models/pocket-english-24l")
+    want = ("build/cuda/mynah-tts-server --device cuda -w 8 --max-batch 320 "
+            "--max-inflight 320 -p 8090 -m models/pocket-english-24l")
     check("cuda command runs the CUDA server with the profile's topology",
           rc == 0 and out.strip().endswith(want))
     check("cuda command exports every non-null variable and nothing declared absent",
@@ -205,10 +205,16 @@ def main():
           "MYNAH_GPU_CORPUS=tools/corpus/pocket_v2_en.jsonl" in out
           and "MYNAH_GPU_VOICES=alba,marius,javert,jean" in out
           and "MYNAH_Q_SECONDS=1800" in out)
-    check("the committed L4 profiles export exactly what tools/gpu/serve.sh exports",
+    check("the committed L4 profiles run what tools/gpu/serve.sh exports plus the "
+          "pairs the soak lines pass to it",
           PP.l4_serve_env() is None or all(
-              PP.l4_serve_env() == PP.environ(PP.load(n)[0])
+              dict(PP.l4_serve_env(), **PP.l4_overrides(PP.load(n)[0]))
+              == PP.environ(PP.load(n)[0])
               for n in (cuda_id, "l4-24g-pocket-en-6l-cuda")))
+    over = PP.l4_overrides(c)
+    check("the soak lines carry the profile's serve.sh overrides",
+          all(("%s=%s" % kv) in out for kv in over.items())
+          and (not over or "MYNAH_Q_SERVER_ENV=" in out))
     check("and the soak line raises no warning about it", "WARNING" not in err)
 
     c = load_cuda(); c["server"]["prefork_workers"] = 4

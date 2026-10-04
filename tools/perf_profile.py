@@ -360,7 +360,7 @@ def cmd_forbidden_env(a):
     return 0
 
 
-L4_SERVE = os.path.join(ROOT, "tools", "l4", "serve.sh")
+L4_SERVE = os.path.join(ROOT, "tools", "gpu", "serve.sh")
 
 
 def l4_serve_env(path=L4_SERVE):
@@ -383,13 +383,23 @@ def l4_serve_env(path=L4_SERVE):
     return out
 
 
+def l4_overrides(prof):
+    """The profile's variables that tools/gpu/serve.sh does not export with the same value.
+
+    serve.sh takes VAR=value pairs on top of its export line, so a profile may differ from
+    it only by adding or changing variables; the soak lines below pass these pairs."""
+    serve = l4_serve_env() or {}
+    return {k: v for k, v in environ(prof).items() if serve.get(k) != v}
+
+
 def soak_cuda(prof, model, c):
     """The GPU boxes qualify with tools/gpu/qualify.sh (two soaks, captured audio, WER,
     bundle), not with serving_profile.py: print that run instead of starting the CPU
     harness against a CUDA server."""
     pid, srv, s = prof["profile"]["id"], prof["server"], prof["gates"]["soak"]
     serve = l4_serve_env()
-    if serve is not None and serve != environ(prof):
+    over = l4_overrides(prof)
+    if serve is not None and dict(serve, **over) != environ(prof):
         print("WARNING: tools/gpu/serve.sh exports %s but the profile pins %s; the run "
               "would not measure this profile"
               % (" ".join("%s=%s" % kv for kv in sorted(serve.items())) or "nothing",
@@ -403,6 +413,9 @@ def soak_cuda(prof, model, c):
     knobs.append(("MYNAH_GPU_CORPUS", s["bank"]))
     if s.get("voices"):
         knobs.append(("MYNAH_GPU_VOICES", ",".join(s["voices"])))
+    pairs = " ".join("%s=%s" % kv for kv in sorted(over.items()))
+    if pairs:
+        knobs.append(("MYNAH_Q_SERVER_ENV", pairs))
     one = " ".join("%s=%s" % (k, shlex.quote(v)) for k, v in knobs)
     print("# qualification (two %ds soaks, WER on the captures, evidence bundle); run on "
           "the GPU box from the checkout, detached so it survives the ssh session:"
@@ -410,8 +423,9 @@ def soak_cuda(prof, model, c):
     print("tools/gpu/detach.sh %s-q env MYNAH_Q_SECONDS=%d %s tools/gpu/qualify.sh %s %s %d"
           % (pid, s["seconds"], one, pid, shlex.quote(model), c))
     print("# one soak only (a screen, not a qualification):")
-    print("MYNAH_GPU_MODEL=%s MYNAH_GPU_BATCH=%d %s tools/gpu/soak.sh %s %d %d"
-          % (shlex.quote(model), c, one, pid, c, s["seconds"]))
+    print("MYNAH_GPU_MODEL=%s MYNAH_GPU_BATCH=%d %s tools/gpu/soak.sh %s %d %d%s"
+          % (shlex.quote(model), c, one, pid, c, s["seconds"],
+             ' "" ' + pairs if pairs else ""))
     return 0
 
 

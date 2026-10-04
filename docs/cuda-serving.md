@@ -1,9 +1,10 @@
 # Serving PocketTTS on an NVIDIA GPU (CUDA)
 
 How to run the mynah-tts streaming server on one NVIDIA GPU for PocketTTS, the
-most tested engine of this runtime: build, model, start, stream, size, tune,
-monitor and qualify. Everything here was measured on an NVIDIA L4 on
-2026-09-28; the evidence is in [performance.md](performance.md) and the
+reference, production-quality engine of this runtime (it also serves on the
+CPU): build, model, start, stream, size, tune, monitor and qualify. Everything
+here was measured on one NVIDIA L4 (24 GB) on Vast.ai between 2026-09-28 and
+2026-10-04; the evidence is in [performance.md](performance.md) and the
 serving profiles in [`configs/perf/`](../configs/perf/README.md).
 
 ## At a glance
@@ -17,17 +18,27 @@ serving profiles in [`configs/perf/`](../configs/perf/README.md).
 | GPU memory at that load | ~8.5 GB | ~14.4 GB |
 | Profile | `l4-24g-pocket-en-6l-cuda` | `l4-24g-pocket-en-24l-cuda` |
 
-The qualified points above were measured on 2026-09-28 defaults. With the
-2026-10-02 defaults (shared voice prefix, split decode attention, bf16 backbone
-Linears, fused decoder, one sync per frame; section 7) the large model screens
-at **C256 per L4** with `--max-batch 256 --max-inflight 256`: 60-s closed-loop
-knees read stream RTF p95 0.594-0.607 at C208 and 0.710-0.714 at C256, ~303-306
-audio-s/s, TTFA p95 ~102-104 ms at C208, 0 stalls (the 2026-09-28 defaults read
-1.03 with stalls at C208). That is the new screening level; the 2 x 30-min soak
-qualification is pending, so C160 stays the qualified figure until it lands.
+The qualified points above were measured on 2026-09-28 defaults (bf16 KV).
+The current defaults add the shared voice prefix, split decode attention, bf16
+backbone Linears through cuBLASLt (fused), the fused decoder, one sync per
+frame, the per-request memory diet and int8 backbone KV (section 7). With them
+the large model screens at **C320 per L4** with `--max-batch 320
+--max-inflight 320` (2-min closed-loop knees, v2 corpus, 4 voices, 0 stalls,
+0 failures):
 
-A 4-vCPU host (AWS g6.xlarge class) is enough: the server needs about 1.3-1.4
-cores, and pinning it to four cores cost 1.5%.
+| large model, current defaults | C256 | C288 | C320 |
+|---|---:|---:|---:|
+| stream RTF p95, bf16 KV | 0.745 | 0.827 | |
+| stream RTF p95, int8 KV (default) | **0.681** | **0.782** | **0.855** |
+| audio-s/s, int8 KV | 345 | 335 | 338 |
+| TTFA p95, int8 KV | 118 ms | 134 ms | 146 ms |
+
+Peak GPU memory: 16.3 GB at `--max-batch 320` with int8 KV, 21.3 GB at
+`--max-batch 288` with bf16 KV. The 2 x 30-min soak qualification of these
+defaults is pending, so C160 stays the qualified figure until it lands.
+
+A 4-vCPU host is enough: the server needs about 1.3-1.4 cores, and pinning it
+to four cores cost 1.5%.
 
 ## 1. What you need
 
@@ -77,6 +88,7 @@ Check the GPU path before serving:
 ```bash
 MYNAH_CUDA_KV_DTYPE=bf16 ./build/cuda/mynah-tts --pocket-self-check models/pocket-english-24l --device cuda
 # pocket batching self-check: PASS
+./build/cuda/mynah-tts --gpu-self-test cuda     # model-free kernel self-tests
 ```
 
 With the defaults (TF32, bf16 weights and SEANet operands) the backend is not
@@ -95,18 +107,19 @@ python3 tools/perf_profile.py command l4-24g-pocket-en-24l-cuda --model models/p
 which prints the profile's configuration:
 
 ```bash
-MYNAH_THREADS=1 MYNAH_CUDA_KV_DTYPE=bf16 MYNAH_QUANT_GROUPS=none \
+MYNAH_QUANT_GROUPS=none MYNAH_SERVE_PROFILE=1 MYNAH_THREADS=1 \
   ./build/cuda/mynah-tts-server --device cuda -w 8 \
-  --max-batch 256 --max-inflight 256 -p 8080 -m models/pocket-english-24l
+  --max-batch 320 --max-inflight 320 -p 8080 -m models/pocket-english-24l
 ```
 
-(256 is the screening level of the 2026-10-02 defaults; the soak-qualified
+(320 is the screening level of the current defaults; the soak-qualified
 level is still C160, so `--max-batch 160 --max-inflight 160` is the
-conservative choice until the C256 soaks land.)
+conservative choice until the C320 soaks land.)
 
 (`MYNAH_SERVE_PROFILE=1`, which the profile also prints, only adds a
 scheduler report at shutdown.) For the small model use its profile, or the same
-line with `--max-batch 256 --max-inflight 256` and `models/pocket-english-6l`.
+line with `--max-batch 256 --max-inflight 256` and `models/pocket-english-6l`
+(its profile pins `MYNAH_CUDA_KV_DTYPE=bf16`, what it was qualified with).
 
 | flag | meaning |
 |---|---|
@@ -119,11 +132,13 @@ line with `--max-batch 256 --max-inflight 256` and `models/pocket-english-6l`.
 A healthy start prints lines like:
 
 ```
-mynah-tts: CUDA quant=bf16 backbone=bf16 flow=f32 mimi=f32 kv=bf16 bf16_stages=backbone bf16_fuse=on
+mynah-tts: backbone KV int8 with one float scale per position and head (1088 of 2048 bytes per position and plane); ...
+mynah-tts: CUDA quant=bf16 backbone=bf16 flow=f32 mimi=f32 kv=int8 bf16_stages=backbone bf16_fuse=on
 mynah-tts: pocket backend=cuda resident=on ... resident{backbone=on flow=on codec_transformer=on}
 ```
 
-`kv=bf16` and `resident=on` are the two things to look for. Each default-on
+`kv=int8` (or `kv=bf16` when rolled back) and `resident=on` are the two things
+to look for. Each default-on
 feature of section 7 also prints one line when it is active (shared voice
 prefix, split decode attention, one sync per frame, fused decoder, cuBLASLt
 bf16 Linears, bf16 tensor-core prefill), so the log shows what ran.
@@ -164,7 +179,9 @@ number of streams (large model on the L4: 0.71 at 128, 0.86 at 160, 0.99 at
 192). Pick the highest concurrency whose **stream RTF p95 stays below 0.90**
 with zero stalls; beyond ~1.0 streams fall behind playback.
 
-- Large model: ~75 MB of GPU memory per stream plus ~1.8 GB fixed.
+- Large model: ~75 MB of GPU memory per stream plus ~1.8 GB fixed with the
+  2026-09-28 defaults; with the current ones (memory diet, int8 KV) C320 peaks
+  at 16.3 GB.
 - Small model: ~30 MB per stream plus ~1 GB fixed.
 - A different GPU needs its own screen: `tools/gpu/knee.sh <tag> <model> 128,160,192,224,256`
   prints the top level under the gate (section 10).
@@ -178,8 +195,8 @@ The defaults are the tuned configuration. Together, the 2026-10-02 rows of the
 table below (shared voice through one sync) read on the L4 24L 60-s knees:
 stream RTF p95 0.594-0.607 at C208 and 0.710-0.714 at C256, ~303-306 audio-s/s,
 TTFA p95 ~102-104 ms at C208, against 1.03 with stalls at C208 for the
-2026-09-28 defaults. **Set only the two required
-variables**; everything else exists to roll a change back while debugging, or
+2026-09-28 defaults. **Set only the required
+variable**; everything else exists to roll a change back while debugging, or
 to opt into something that is not a production default. A profile run refuses
 to start if a "must be absent" variable is set.
 
@@ -187,7 +204,6 @@ to start if a "must be absent" variable is set.
 
 | variable | value | why |
 |---|---|---|
-| `MYNAH_CUDA_KV_DTYPE` | `bf16` | Stores the attention cache in 16 bits: twice the streams in memory. The default is FP32 (the parity reference). Quality-checked: different but equally valid samples, WER equal or better |
 | `MYNAH_THREADS` | `1` | The GPU does the work; one CPU thread avoids a 128-thread pool on a big host |
 
 `MYNAH_QUANT_GROUPS=none` is what the qualified runs set; a CUDA build now
@@ -227,6 +243,7 @@ never read it.
 | `MYNAH_CUDA_WIDTH_BUCKETS` | `0` | gang widths rounded up to a few buckets, their graphs captured at start-up | no graph capture during traffic; longer start-up |
 | `MYNAH_CUDA_SHARED_VOICE` | `0` | decode attention reads each stream's voice prefix from one shared device copy (stays in L2); with `MYNAH_CUDA_SHARED_VOICE_STRIP` (default on, `0` keeps the per-row copy) the rows no longer store the prefix (~12 MB less per stream on 24L) | L4 24L: stream RTF p95 -10/11 % at C160-C208, +13 % audio-s/s at C208; bit-identical audio |
 | `MYNAH_CUDA_ROW_MEM_DIET` | `1` | per-request device memory that is not request state is shared across the decoder gang or right-sized (SEANet scratch 5.1 -> 1.7 MB, Mimi transformer KV 500 -> 265 positions; only placement changes) | L4 24L: start-up -1.3 GB at 256 rows; C288 RTF p95 0.819 with 0 stalls, where it fails for VRAM without it |
+| `MYNAH_CUDA_KV_DTYPE` | `bf16` (or `f32`, the parity oracle) | backbone attention cache stored as int8 with one float scale per position and head (1088 instead of 2048 bytes per position and plane on 24L); the shared voice prefix stays bf16. Needs the prefill tile and the shared voice prefix with strip, else bf16. Rows without a shared model-voice KV (a voice that is not an entry of the pack, so there is no voice prefix to skip) run their backbone on the CPU: set `bf16` for such workloads. Built-in voices and voices cloned into the pack are model voices and use int8 | L4 24L: C256 RTF p95 0.745 -> 0.681, 315 -> 345 audio-s/s; C320 0.855 with 0 stalls; peak memory 21.3 GB (C288) -> 16.3 GB (C320); same audio length per request. WER pending (soak) |
 | `MYNAH_CUDA_ATTN_SPLIT` | `0` | split (flash-decoding) layout of the batched bf16 decode attention | C208 0.705 -> 0.674, C240 0.787 -> 0.749, +7 % audio-s/s; deterministic and batch-invariant, last-bit differences vs the old kernel |
 | `MYNAH_CUDA_QUANT` | `f32` | bf16 weight copies for the backbone Linears (fp32 accumulate; residual stream, norms, flow head, EOS head and codec stay fp32); `MYNAH_CUDA_QUANT_STAGES` defaults to `backbone` | with the two rows below, C208 0.676 -> 0.607, C256 0.788 -> 0.714, 266 -> 303 audio-s/s, TTFA p95 115 -> 104 ms |
 | `MYNAH_CUDA_BF16_FUSE` | `0` | bf16 decode layers fused: LayerNorm, GELU and attention write the bf16 GEMM operand, biases folded into the consumers | 456 -> 264 graph nodes per step; bit-identical to the unfused bf16 path |
@@ -241,7 +258,7 @@ never read it.
 | variable | effect | why it is off |
 |---|---|---|
 | `MYNAH_CUDA_PREFILL_FIXED=0` | text prefill through cuBLAS (bf16 or TF32 by the weights): on f32 weights it measured -7 % RTF p95 | a text sent in pieces no longer gives bit-identical audio to the same text sent whole; a product decision |
-| `MYNAH_CUDA_KV_VMM=1` | backbone KV rows are VMM ranges that grow in place (no copy, no second allocation, no sync); with `MYNAH_CUDA_KV_VMM_CHUNK=64 MYNAH_CUDA_KV_GROW_INITIAL_STEPS=64` rows start small | L4, `--max-batch 320`, with the diet: start-up 9.6 GB (was 16.0), C320 runs with 0 failures at peak 14.4 GB, but the position-major layout costs ~4 % (C288 0.851 vs 0.819) and C320 is compute-bound (0.926): off on the L4; for GPUs with more compute than memory headroom |
+| `MYNAH_CUDA_KV_VMM=1` (with `MYNAH_CUDA_KV_DTYPE=bf16`; ignored with int8 KV) | backbone KV rows are VMM ranges that grow in place (no copy, no second allocation, no sync); with `MYNAH_CUDA_KV_VMM_CHUNK=64 MYNAH_CUDA_KV_GROW_INITIAL_STEPS=64` rows start small | L4, `--max-batch 320`, with the diet: start-up 9.6 GB (was 16.0), C320 runs with 0 failures at peak 14.4 GB, but the position-major layout costs ~4 % (C288 0.851 vs 0.819) and C320 is compute-bound (0.926): off on the L4; for GPUs with more compute than memory headroom |
 | `MYNAH_CUDA_QUANT_STAGES=all` | bf16 weights for the flow head and the Mimi transformer too | no measurable gain over `backbone` (C256 0.714 -> 0.712) |
 | `MYNAH_CUDA_SYNC=blocking` | host thread sleeps while the GPU works: server CPU 117% -> 43% | -9% throughput (each wake-up idles the GPU) |
 | `MYNAH_CUDA_TILE_TC=1` | own tensor-core fixed-order GEMM for the f32 prefill | +1-2% only |
@@ -258,10 +275,11 @@ assume) is:
 
 ```bash
 MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0 MYNAH_CUDA_QUANT=f32 MYNAH_CUDA_ATTN_SPLIT=0 \
-  ./build/cuda/mynah-tts --pocket-self-check models/pocket-english-24l --device cuda
+  MYNAH_CUDA_KV_DTYPE=f32 ./build/cuda/mynah-tts --pocket-self-check models/pocket-english-24l --device cuda
 ```
 
 `MYNAH_CUDA_QUANT=f32` restores fp32 weights everywhere (prefill included);
+`MYNAH_CUDA_KV_DTYPE=f32` the fp32 attention cache (the CPU/GPU parity oracle);
 `MYNAH_CUDA_ATTN_SPLIT=0` restores the summation order of the old decode
 attention (the split kernel is batch-invariant too, but its last bits differ).
 The other 2026-10-02 defaults (shared voice, decoder fusion, one sync, bf16
@@ -296,7 +314,8 @@ tolerance comparison.
 | symptom | cause and fix |
 |---|---|
 | server refuses to start mentioning CPU stages | a configuration would put a hot stage on the CPU; remove `MYNAH_QUANT_GROUPS`/`MYNAH_CUDA_QUANT` overrides |
-| out of GPU memory | concurrency too high for the card, or `MYNAH_CUDA_KV_GROW=0` / FP32 cache set; check `kv=bf16` at start-up |
+| out of GPU memory | concurrency too high for the card, or `MYNAH_CUDA_KV_GROW=0` / FP32 cache set; check `kv=int8` (or `kv=bf16`) at start-up |
+| some requests are much slower than the rest | with int8 KV (the default) a row without a shared model-voice KV (a voice that is not an entry of the pack) runs its backbone on the CPU, logged once at the first such row; set `MYNAH_CUDA_KV_DTYPE=bf16` |
 | stalls or RTF p95 above 0.9 | too many streams for this GPU: lower `--max-batch/--max-inflight` or re-screen (section 6) |
 | slow first request per voice | the voice prompt is loaded on first use; `MYNAH_POCKET_VOICE_CACHE=startup` preloads |
 | the first seconds after start are slower | CUDA graphs are captured per batch width on first use |
@@ -335,5 +354,5 @@ sets to count noisy/metallic outliers per voice, sentence kind and length.
 - [pocket-voices.md](pocket-voices.md): which voice to serve (alba), measured quality and licences.
 - [performance.md](performance.md): the measured results, CPU and GPU.
 - [`configs/perf/`](../configs/perf/README.md): serving profiles and their validator.
-- [`.work/pocket-cuda-g6-host-cpu.md`](../.work/pocket-cuda-g6-host-cpu.md) and
+- [`.work/pocket-cuda-l4-host-cpu.md`](../.work/pocket-cuda-l4-host-cpu.md) and
   [`.work/pocket-cuda-c60-l4.md`](../.work/pocket-cuda-c60-l4.md): how each change was measured.

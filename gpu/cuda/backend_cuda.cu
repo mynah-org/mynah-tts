@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -1467,6 +1468,9 @@ struct cuda_backend_state {
     bool q8_enabled;
     bool decoder_batch_enabled;
     cuda_kv_vmm kv_vmm;
+    /* int8 backbone KV (default; mynah_backend_set_kv_int8): the BF16-KV
+     * batched decode attention reads/writes int8 records. */
+    bool kv_int8;
 };
 
 enum cuda_decoder_op_kind {
@@ -8676,6 +8680,33 @@ __device__ static inline void tile_kv_store(uint16_t *p, float v) {
     *p = cuda_bf16_from_float(v);
 }
 
+/* int8 backbone KV (default, MYNAH_CUDA_KV_DTYPE): a stored position of a K or V plane is one
+ * record of `dim` int8 values followed by `heads` float scales; value d of
+ * head h is rec[h * hw + d] * scale[h], scale = max|x| / 127 over the head.
+ * The shared prefix planes stay BF16, so the prefix element type differs
+ * from the row's only for int8. */
+template <typename KV> struct tile_prefix_type { typedef KV type; };
+template <> struct tile_prefix_type<int8_t> { typedef uint16_t type; };
+
+template <typename KV>
+__device__ static inline float tile_row_load(const KV *rec, int dim, int h,
+                                             int hw, int d) {
+    (void)dim;
+    return tile_kv_load(rec + (size_t)h * hw + d);
+}
+template <>
+__device__ inline float tile_row_load<int8_t>(const int8_t *rec, int dim,
+                                              int h, int hw, int d) {
+    const float scale = *reinterpret_cast<const float *>(rec + dim + 4 * h);
+    return (float)rec[(size_t)h * hw + d] * scale;
+}
+
+__device__ static inline int8_t cuda_kv_q8(float x, float inv) {
+    float q = rintf(x * inv);
+    q = fminf(fmaxf(q, -127.0f), 127.0f);
+    return (int8_t)q;
+}
+
 /* RoPE on q and k at each row's absolute position (the formula of k_rope_qk),
  * then k and v into the request's cache at slot (absolute % ring), layout
  * [K ring][V ring] per layer. One block per row.
@@ -8732,6 +8763,78 @@ __global__ static void k_tile_rope_store(float *qkv, void *const *kv,
     }
 }
 
+/* The int8 form of k_tile_rope_store (int8 backbone KV): one warp
+ * per head (blockDim = heads * 32), the same RoPE formula; the rotated k is
+ * written back into qkv (nothing reads qkv's k after this) so the second pass
+ * quantizes what the first one rotated. `strides` is required: (pitch, voff)
+ * in bytes. */
+template <bool PREFIX>
+__global__ static void k_tile_rope_store_i8(float *qkv, void *const *kv,
+                                            const long long *start,
+                                            const int2 *rowmap, int layer,
+                                            int layers, int heads,
+                                            int head_width,
+                                            const long long *rings,
+                                            float max_period,
+                                            const long long *skips,
+                                            const long long *strides) {
+    const int m = (int)blockIdx.x;
+    const int head = (int)threadIdx.x >> 5;
+    const int lane = (int)threadIdx.x & 31;
+    if (head >= heads) return;
+    const int2 rt = rowmap[m];
+    const long long ring = rings[rt.x];
+    const long long absolute = start[rt.x] + rt.y;
+    const long long skip = PREFIX ? skips[rt.x] : 0;
+    const long long slot = (absolute - skip) % ring;
+    const int half = head_width / 2;
+    const int dim = heads * head_width;
+    float *row = qkv + (size_t)m * 3u * (size_t)dim;
+    int8_t *kbase = static_cast<int8_t *>(kv[(size_t)rt.x * layers + layer]);
+    const size_t pitch = (size_t)strides[2 * rt.x];
+    const size_t voff = (size_t)strides[2 * rt.x + 1];
+    int8_t *kslot = kbase + (size_t)slot * pitch;
+    int8_t *vslot = kbase + voff + (size_t)slot * pitch;
+    const float slope = (float)(-log((double)max_period) * 2.0 /
+                                (double)head_width);
+    float kmax = 0.0f, vmax = 0.0f;
+    for (int i = lane; i < half; i += 32) {
+        const size_t qi = (size_t)head * head_width + (size_t)(2 * i);
+        const float frequency = expf((float)i * slope);
+        const float angle = (float)absolute * frequency;
+        float sine = 0.0f, cosine = 0.0f;
+        sincosf(angle, &sine, &cosine);
+        const float q0 = row[qi], q1 = row[qi + 1u];
+        row[qi] = q0 * cosine - q1 * sine;
+        row[qi + 1u] = q0 * sine + q1 * cosine;
+        const float k0 = row[dim + qi], k1 = row[dim + qi + 1u];
+        const float r0 = k0 * cosine - k1 * sine;
+        const float r1 = k0 * sine + k1 * cosine;
+        row[dim + qi] = r0;
+        row[dim + qi + 1u] = r1;
+        kmax = fmaxf(kmax, fmaxf(fabsf(r0), fabsf(r1)));
+        vmax = fmaxf(vmax, fmaxf(fabsf(row[2 * dim + qi]),
+                                 fabsf(row[2 * dim + qi + 1u])));
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        kmax = fmaxf(kmax, __shfl_xor_sync(0xffffffffu, kmax, off));
+        vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, off));
+    }
+    const float kinv = kmax > 0.0f ? 127.0f / kmax : 0.0f;
+    const float vinv = vmax > 0.0f ? 127.0f / vmax : 0.0f;
+    for (int i = lane; i < half; i += 32) {
+        const size_t qi = (size_t)head * head_width + (size_t)(2 * i);
+        kslot[qi] = cuda_kv_q8(row[dim + qi], kinv);
+        kslot[qi + 1u] = cuda_kv_q8(row[dim + qi + 1u], kinv);
+        vslot[qi] = cuda_kv_q8(row[2 * dim + qi], vinv);
+        vslot[qi + 1u] = cuda_kv_q8(row[2 * dim + qi + 1u], vinv);
+    }
+    if (lane == 0) {
+        reinterpret_cast<float *>(kslot + dim)[head] = kmax / 127.0f;
+        reinterpret_cast<float *>(vslot + dim)[head] = vmax / 127.0f;
+    }
+}
+
 /* One warp per (row, head): scores over the causal window in shared memory,
  * a two-pass softmax, then each lane owns output dims. Every reduction order
  * depends only on the window length, never on the batch. `context` 0 means
@@ -8768,23 +8871,28 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
     const int dim = heads * head_width;
     float *scores = tile_scores + (size_t)warp * window_cap;
     const float *q = qkv + (size_t)m * 3u * dim + (size_t)h * head_width;
+    typedef typename tile_prefix_type<KV>::type PKV;
     const KV *kbase = static_cast<const KV *>(kv[(size_t)rt.x * layers + layer]);
     const size_t pitch = strides != nullptr ? (size_t)strides[2 * rt.x] : (size_t)dim;
     const KV *vbase = kbase + (strides != nullptr ? (size_t)strides[2 * rt.x + 1]
                                                   : (size_t)ring * dim);
     const long long skip = PREFIX ? skips[rt.x] : 0;
-    const KV *pkbase = PREFIX && skip > 0
-        ? static_cast<const KV *>(prefix[(size_t)rt.x * layers + layer]) : nullptr;
-    const KV *pvbase = PREFIX && skip > 0 ? pkbase + (size_t)skip * dim : nullptr;
+    const PKV *pkbase = PREFIX && skip > 0
+        ? static_cast<const PKV *>(prefix[(size_t)rt.x * layers + layer]) : nullptr;
+    const PKV *pvbase = PREFIX && skip > 0 ? pkbase + (size_t)skip * dim : nullptr;
     float local_max = -INFINITY;
     for (int s = lane; s < n; s += 32) {
         const long long p = first + s;
-        const KV *k = (PREFIX && p < skip)
-            ? pkbase + (size_t)p * dim + (size_t)h * head_width
-            : kbase + (size_t)((p - skip) % ring) * pitch + (size_t)h * head_width;
         float dot = 0.0f;
-        for (int d = 0; d < head_width; ++d)
-            dot = fmaf(q[d], tile_kv_load(k + d), dot);
+        if (PREFIX && p < skip) {
+            const PKV *k = pkbase + (size_t)p * dim + (size_t)h * head_width;
+            for (int d = 0; d < head_width; ++d)
+                dot = fmaf(q[d], tile_kv_load(k + d), dot);
+        } else {
+            const KV *rec = kbase + (size_t)((p - skip) % ring) * pitch;
+            for (int d = 0; d < head_width; ++d)
+                dot = fmaf(q[d], tile_row_load(rec, dim, h, head_width, d), dot);
+        }
         const float score = dot * scale;
         scores[s] = score;
         local_max = fmaxf(local_max, score);
@@ -8805,10 +8913,11 @@ __global__ static void k_tile_attention(const float *qkv, void *const *kv,
         float acc = 0.0f;
         for (int s = 0; s < n; ++s) {
             const long long p = first + s;
-            const KV *v = (PREFIX && p < skip)
-                ? pvbase + (size_t)p * dim + (size_t)h * head_width
-                : vbase + (size_t)((p - skip) % ring) * pitch + (size_t)h * head_width;
-            acc = fmaf(scores[s], tile_kv_load(v + d), acc);
+            const float value = (PREFIX && p < skip)
+                ? tile_kv_load(pvbase + (size_t)p * dim + (size_t)h * head_width + d)
+                : tile_row_load(vbase + (size_t)((p - skip) % ring) * pitch, dim,
+                                h, head_width, d);
+            acc = fmaf(scores[s], value, acc);
         }
         out[(size_t)m * dim + (size_t)h * head_width + d] = acc * inv;
     }
@@ -8846,14 +8955,15 @@ __global__ static void k_tile_attention_grouped(
     const long long abs0 = start[r] + rt0.y;
     const long long abs_last = abs0 + group.y - 1;
     const long long lo = (context > 0 && abs0 + 1 > context) ? abs0 + 1 - context : 0;
+    typedef typename tile_prefix_type<KV>::type PKV;
     const KV *kbase = static_cast<const KV *>(kv[(size_t)r * layers + layer]);
     const size_t pitch = strides != nullptr ? (size_t)strides[2 * r] : (size_t)dim;
     const KV *vbase = kbase + (strides != nullptr ? (size_t)strides[2 * r + 1]
                                                   : (size_t)ring * dim);
     const long long skip = PREFIX ? skips[r] : 0;
-    const KV *pkbase = PREFIX && skip > 0
-        ? static_cast<const KV *>(prefix[(size_t)r * layers + layer]) : nullptr;
-    const KV *pvbase = PREFIX && skip > 0 ? pkbase + (size_t)skip * dim : nullptr;
+    const PKV *pkbase = PREFIX && skip > 0
+        ? static_cast<const PKV *>(prefix[(size_t)r * layers + layer]) : nullptr;
+    const PKV *pvbase = PREFIX && skip > 0 ? pkbase + (size_t)skip * dim : nullptr;
     for (int i = (int)threadIdx.x; i < group.y * head_width; i += (int)blockDim.x) {
         const int q = i / head_width, d = i % head_width;
         qs[q][d] = qkv[(size_t)(group.x + q) * 3u * dim + (size_t)h * head_width + d];
@@ -8877,10 +8987,9 @@ __global__ static void k_tile_attention_grouped(
                 kval = tile_kv_load(pkbase + at);
                 vval = tile_kv_load(pvbase + at);
             } else if (p <= abs_last) {
-                const size_t slot = (size_t)((p - skip) % ring) * pitch +
-                                    (size_t)h * head_width + d;
-                kval = tile_kv_load(kbase + slot);
-                vval = tile_kv_load(vbase + slot);
+                const size_t slot = (size_t)((p - skip) % ring) * pitch;
+                kval = tile_row_load(kbase + slot, dim, h, head_width, d);
+                vval = tile_row_load(vbase + slot, dim, h, head_width, d);
             }
             ks[j][d] = kval;
             vs[j][d] = vval;
@@ -8925,6 +9034,45 @@ __global__ static void k_tile_attention_grouped(
     }
 }
 
+/* The RoPE + K/V store launch: the element-wise kernel for f32/bf16, the
+ * warp-per-head quantizing kernel for int8 records. */
+template <typename KV, bool PREFIX>
+struct tile_rope_store_launcher {
+    static void run(cuda_backend_state *st, float *qkv, void *const *kv,
+                    const long long *start, const int2 *rowmap, int layer,
+                    int layers, int heads, int head_width,
+                    const long long *rings, float max_period, size_t M,
+                    const long long *skips, const long long *strides) {
+        k_tile_rope_store<KV, PREFIX><<<(int)M, 256, 0, st->stream>>>(
+            qkv, kv, start, rowmap, layer, layers, heads, head_width, rings,
+            max_period, skips, strides);
+    }
+};
+template <bool PREFIX>
+struct tile_rope_store_launcher<int8_t, PREFIX> {
+    static void run(cuda_backend_state *st, float *qkv, void *const *kv,
+                    const long long *start, const int2 *rowmap, int layer,
+                    int layers, int heads, int head_width,
+                    const long long *rings, float max_period, size_t M,
+                    const long long *skips, const long long *strides) {
+        k_tile_rope_store_i8<PREFIX><<<(int)M, heads * 32, 0, st->stream>>>(
+            qkv, kv, start, rowmap, layer, layers, heads, head_width, rings,
+            max_period, skips, strides);
+    }
+};
+template <typename KV, bool PREFIX>
+static void tile_rope_store_launch(cuda_backend_state *st, float *qkv,
+                                   void *const *kv, const long long *start,
+                                   const int2 *rowmap, int layer, int layers,
+                                   int heads, int head_width,
+                                   const long long *rings, float max_period,
+                                   size_t M, const long long *skips,
+                                   const long long *strides) {
+    tile_rope_store_launcher<KV, PREFIX>::run(st, qkv, kv, start, rowmap, layer,
+                                              layers, heads, head_width, rings,
+                                              max_period, M, skips, strides);
+}
+
 /* One layer's RoPE + K/V store + attention of the tile, the launches the
  * driver below always made, with the PREFIX variants selected by template. */
 template <typename KV, bool PREFIX>
@@ -8940,9 +9088,9 @@ static void tile_attention_layer(cuda_backend_state *st, float *qkv,
                                  float *att, const long long *skips,
                                  void *const *prefix,
                                  const long long *strides) {
-    k_tile_rope_store<KV, PREFIX><<<(int)M, 256, 0, st->stream>>>(
-        qkv, kv, start, rowmap, layer, layers, heads, head_width, rings,
-        max_period, skips, strides);
+    tile_rope_store_launch<KV, PREFIX>(st, qkv, kv, start, rowmap, layer,
+                                       layers, heads, head_width, rings,
+                                       max_period, M, skips, strides);
     if (use_grouped)
         k_tile_attention_grouped<KV, PREFIX><<<group_grid, TILE_ATTN_Q * 32, 0,
                                                st->stream>>>(
@@ -9633,6 +9781,14 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
             set_error(e, ec, "CUDA tile position exceeds the cache");
             return -1;
         }
+        if (d->kv_int8 &&
+            (d->kv_strides == nullptr || d->heads > 32u ||
+             d->kv_strides[2u * r] < d->dim + 4u * d->heads ||
+             d->kv_strides[2u * r] % 4u != 0u ||
+             d->kv_strides[2u * r + 1u] % 4u != 0u)) {
+            set_error(e, ec, "invalid CUDA tile int8 KV layout");
+            return -1;
+        }
         if (d->kv_strides != nullptr) {
             /* MYNAH_CUDA_KV_VMM: slot s of K at s * pitch, of V at voff +
              * s * pitch; the two must not overlap within one slot. */
@@ -9771,7 +9927,22 @@ extern "C" int mynah_cuda_tile_transformer_dev(void *opaque,
             return -1;
         const unsigned blocks = (unsigned)((work + warps_per_block - 1) /
                                            warps_per_block);
-        if (d->kv_bf16) {
+        if (d->kv_int8) {
+            if (prefixed)
+                tile_attention_layer<int8_t, true>(
+                    st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
+                    (int)d->layers, heads, head_width, (long long)d->context,
+                    d_ring, d->max_period, M, use_grouped, group_grid, blocks,
+                    warps_per_block, smem, (int)window, scale, w.att, d_skip,
+                    d_prefix, d_stride);
+            else
+                tile_attention_layer<int8_t, false>(
+                    st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
+                    (int)d->layers, heads, head_width, (long long)d->context,
+                    d_ring, d->max_period, M, use_grouped, group_grid, blocks,
+                    warps_per_block, smem, (int)window, scale, w.att, nullptr,
+                    nullptr, d_stride);
+        } else if (d->kv_bf16) {
             if (prefixed)
                 tile_attention_layer<uint16_t, true>(
                     st, w.qkv, d_kv, d_start, d_map, d_groups, (int)l,
@@ -9835,6 +10006,11 @@ extern "C" int mynah_cuda_self_attention_bf16_dev(
     size_t position, size_t cache_stride, size_t valid, size_t heads,
     size_t head_width, float scale, float *out, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st->kv_int8) {
+        set_error(e, ec, "CUDA int8 KV: single-row attention goes through the "
+                         "batched entry point");
+        return -1;
+    }
     if (qkv == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
         heads == 0u || head_width == 0u || valid == 0u || heads > (size_t)INT_MAX ||
         head_width > (size_t)INT_MAX || cache_stride == 0u || position >= valid ||
@@ -9862,6 +10038,11 @@ extern "C" int mynah_cuda_self_attention_bf16_prefix_dev(
     size_t position, size_t cache_stride, size_t valid, size_t heads,
     size_t head_width, float scale, float *out, char *e, size_t ec) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st->kv_int8) {
+        set_error(e, ec, "CUDA int8 KV: single-row attention goes through the "
+                         "batched entry point");
+        return -1;
+    }
     if (qkv == nullptr || kcache == nullptr || vcache == nullptr || out == nullptr ||
         heads == 0u || head_width == 0u || valid == 0u || heads > (size_t)INT_MAX ||
         head_width > (size_t)INT_MAX || cache_stride == 0u || position >= valid ||
@@ -10492,6 +10673,233 @@ static void cuda_launch_attn_split(cuda_backend_state *st, dim3 grid,
             nullptr);
 }
 
+/* int8 backbone KV (default, MYNAH_CUDA_KV_DTYPE): k_self_attention_bf16_batch_split over int8 row
+ * records (see tile_row_load: `width` int8 values then `heads` float scales
+ * per position, `cache_strides` in bytes). Same partition, online softmax and
+ * merge order; the new K/V is quantized per head (scale = max|x| / 127) before
+ * the block reads it, so the current position is read back exactly as later
+ * steps will read it. The shared voice prefix stays BF16. */
+__device__ static inline void cuda_i8x8_unpack(const uint4 w, float f[8]) {
+    const float s = __uint_as_float(w.z);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        f[i] = (float)(signed char)(w.x >> (8 * i)) * s;
+        f[4 + i] = (float)(signed char)(w.y >> (8 * i)) * s;
+    }
+}
+
+template <bool SHARED, bool BF16OUT>
+__global__ static void __launch_bounds__(CUDA_ATTN_SPLIT_THREADS)
+k_self_attention_i8_batch_split(
+    const float *qkv, const int8_t *const *kcache,
+    const int8_t *const *vcache, const size_t *positions,
+    const size_t *cache_strides, int batch, int heads, int head_width,
+    float scale, float *out, const uint16_t *const *kprefix,
+    const uint16_t *const *vprefix, const size_t *prefix_len,
+    uint16_t *out_bf16) {
+    constexpr int HW = CUDA_ATTN_SPLIT_HEAD_WIDTH;
+    constexpr int U = CUDA_ATTN_SPLIT_UNROLL;
+    const int head = (int)blockIdx.x;
+    const int request = (int)blockIdx.y;
+    if (head >= heads || request >= batch || head_width != HW) return;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int group = lane >> 3;
+    const int sub = lane & 7;
+    const size_t width = (size_t)heads * (size_t)HW;
+    const size_t hbase = (size_t)head * (size_t)HW;
+    const size_t position = positions[request];
+    const size_t stride = cache_strides[request];
+    int8_t *request_k = const_cast<int8_t *>(kcache[request]);
+    int8_t *request_v = const_cast<int8_t *>(vcache[request]);
+    const size_t shared_len = SHARED ? prefix_len[request] : 0u;
+    const uint16_t *shared_k = SHARED ? kprefix[request] : nullptr;
+    const uint16_t *shared_v = SHARED ? vprefix[request] : nullptr;
+    const float *request_qkv = qkv + (size_t)request * width * 3u;
+    __shared__ float part_m[CUDA_ATTN_SPLIT_WARPS];
+    __shared__ float part_l[CUDA_ATTN_SPLIT_WARPS];
+    __shared__ float part_acc[CUDA_ATTN_SPLIT_WARPS][HW];
+    __shared__ float amax[2][2];
+    float kx = 0.0f, vx = 0.0f;
+    if (tid < HW) {
+        kx = request_qkv[width + hbase + (size_t)tid];
+        vx = request_qkv[width * 2u + hbase + (size_t)tid];
+        const float km = cuda_warp_max(fabsf(kx));
+        const float vm = cuda_warp_max(fabsf(vx));
+        if (lane == 0) {
+            amax[0][warp] = km;
+            amax[1][warp] = vm;
+        }
+    }
+    __syncthreads();
+    if (tid < HW) {
+        const float km = fmaxf(amax[0][0], amax[0][1]);
+        const float vm = fmaxf(amax[1][0], amax[1][1]);
+        int8_t *krec = request_k + position * stride;
+        int8_t *vrec = request_v + position * stride;
+        krec[hbase + (size_t)tid] = cuda_kv_q8(kx, km > 0.0f ? 127.0f / km : 0.0f);
+        vrec[hbase + (size_t)tid] = cuda_kv_q8(vx, vm > 0.0f ? 127.0f / vm : 0.0f);
+        if (tid == 0) {
+            reinterpret_cast<float *>(krec + width)[head] = km / 127.0f;
+            reinterpret_cast<float *>(vrec + width)[head] = vm / 127.0f;
+        }
+    }
+    float q[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) q[i] = request_qkv[hbase + (size_t)(sub * 8 + i)];
+    __syncthreads();
+    const size_t n = position + 1u;
+    float m = -1.0e30f;
+    float l = 0.0f;
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+    for (size_t base = (size_t)warp * CUDA_ATTN_SPLIT_WARP_TILE; base < n;
+         base += CUDA_ATTN_SPLIT_TILE) {
+        /* Raw words in flight: a BF16 prefix row (uint4) or an int8 row as
+         * (8 bytes, scale bits, 0); `pre` says which. */
+        uint4 kw[U];
+        uint4 vw[U];
+        bool pre[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const size_t s = base + (size_t)(u * 4 + group);
+            kw[u] = make_uint4(0u, 0u, 0u, 0u);
+            vw[u] = make_uint4(0u, 0u, 0u, 0u);
+            pre[u] = SHARED && s < shared_len;
+            if (s < n) {
+                if (pre[u]) {
+                    kw[u] = reinterpret_cast<const uint4 *>(
+                        shared_k + s * width + hbase)[sub];
+                    vw[u] = reinterpret_cast<const uint4 *>(
+                        shared_v + s * width + hbase)[sub];
+                } else {
+                    const int8_t *kr = request_k + s * stride;
+                    const int8_t *vr = request_v + s * stride;
+                    const uint2 kq = reinterpret_cast<const uint2 *>(kr + hbase)[sub];
+                    const uint2 vq = reinterpret_cast<const uint2 *>(vr + hbase)[sub];
+                    kw[u] = make_uint4(kq.x, kq.y,
+                        __float_as_uint(reinterpret_cast<const float *>(kr + width)[head]), 0u);
+                    vw[u] = make_uint4(vq.x, vq.y,
+                        __float_as_uint(reinterpret_cast<const float *>(vr + width)[head]), 0u);
+                }
+            }
+        }
+        float sc[U];
+        float next = m;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            float kf[8];
+            if (pre[u]) cuda_bf16x8_unpack(kw[u], kf);
+            else cuda_i8x8_unpack(kw[u], kf);
+            float dot = q[0] * kf[0] + q[1] * kf[1] + q[2] * kf[2] +
+                        q[3] * kf[3] + q[4] * kf[4] + q[5] * kf[5] +
+                        q[6] * kf[6] + q[7] * kf[7];
+            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 4);
+            const bool valid = base + (size_t)(u * 4 + group) < n;
+            sc[u] = valid ? dot * scale : -1.0e30f;
+            next = fmaxf(next, sc[u]);
+        }
+        const float correction = expf(m - next);
+        l *= correction;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] *= correction;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const bool valid = base + (size_t)(u * 4 + group) < n;
+            const float p = valid ? expf(sc[u] - next) : 0.0f;
+            l += p;
+            float vf[8];
+            if (pre[u]) cuda_bf16x8_unpack(vw[u], vf);
+            else cuda_i8x8_unpack(vw[u], vf);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] += p * vf[i];
+        }
+        m = next;
+    }
+#pragma unroll
+    for (int off = 8; off < 32; off <<= 1) {
+        const float mo = __shfl_xor_sync(0xffffffffu, m, off);
+        const float lo = __shfl_xor_sync(0xffffffffu, l, off);
+        const float mm = fmaxf(m, mo);
+        const float c1 = expf(m - mm);
+        const float c2 = expf(mo - mm);
+        l = l * c1 + lo * c2;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float ao = __shfl_xor_sync(0xffffffffu, acc[i], off);
+            acc[i] = acc[i] * c1 + ao * c2;
+        }
+        m = mm;
+    }
+    if (lane < 8) {
+        if (lane == 0) {
+            part_m[warp] = m;
+            part_l[warp] = l;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) part_acc[warp][sub * 8 + i] = acc[i];
+    }
+    __syncthreads();
+    if (tid < HW) {
+        float mm = part_m[0];
+#pragma unroll
+        for (int w = 1; w < CUDA_ATTN_SPLIT_WARPS; ++w) mm = fmaxf(mm, part_m[w]);
+        float den = 0.0f;
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < CUDA_ATTN_SPLIT_WARPS; ++w) {
+            const float c = expf(part_m[w] - mm);
+            den += part_l[w] * c;
+            total += part_acc[w][tid] * c;
+        }
+        const float value = den > 0.0f ? total / den : 0.0f;
+        const size_t at = (size_t)request * width + hbase + (size_t)tid;
+        if (BF16OUT)
+            out_bf16[at] = cuda_bf16_from_float(value);
+        else
+            out[at] = value;
+    }
+}
+
+template <bool SHARED>
+static void cuda_launch_attn_i8(cuda_backend_state *st, dim3 grid,
+                                const float *qkv, size_t batch, size_t heads,
+                                size_t head_width, float scale, float *out,
+                                uint16_t *staged) {
+    const uint16_t *const *kp = SHARED
+        ? reinterpret_cast<const uint16_t *const *>(st->dev_batch_k_prefix)
+        : nullptr;
+    const uint16_t *const *vp = SHARED
+        ? reinterpret_cast<const uint16_t *const *>(st->dev_batch_v_prefix)
+        : nullptr;
+    const size_t *pl = SHARED ? st->dev_batch_prefix_len : nullptr;
+    const auto *kc = reinterpret_cast<const int8_t *const *>(st->dev_batch_k_cache);
+    const auto *vc = reinterpret_cast<const int8_t *const *>(st->dev_batch_v_cache);
+    if (staged != nullptr)
+        k_self_attention_i8_batch_split<SHARED, true>
+            <<<grid, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+            qkv, kc, vc, st->dev_batch_positions, st->dev_batch_cache_strides,
+            (int)batch, (int)heads, (int)head_width, scale, out, kp, vp, pl,
+            staged);
+    else
+        k_self_attention_i8_batch_split<SHARED, false>
+            <<<grid, CUDA_ATTN_SPLIT_THREADS, 0, st->stream>>>(
+            qkv, kc, vc, st->dev_batch_positions, st->dev_batch_cache_strides,
+            (int)batch, (int)heads, (int)head_width, scale, out, kp, vp, pl,
+            nullptr);
+}
+
+extern "C" int mynah_cuda_set_kv_int8(void *opaque, int on) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) return -1;
+    st->kv_int8 = on != 0;
+    return 0;
+}
+
 /* `stage` (MYNAH_CUDA_BF16_FUSE): the result goes to the staged BF16
  * activation instead of `out`; the legacy kernel still writes `out` and a
  * cast stages it, so the staged values do not depend on the kernel. */
@@ -10553,6 +10961,49 @@ static int cuda_self_attention_bf16_batch(
                            batch * sizeof(*cache_strides), cudaMemcpyHostToDevice,
                            st->stream), e, ec)) return -1;
     dim3 grid((unsigned)heads, (unsigned)batch, 1u);
+    if (st->kv_int8) {
+        /* int8 records: the split layout only (head width 64, 16-byte
+         * aligned records and BF16 prefix rows). */
+        const bool with_prefix = prefix_len != nullptr;
+        bool ok = head_width == (size_t)CUDA_ATTN_SPLIT_HEAD_WIDTH &&
+                  width % 8u == 0u;
+        for (size_t i = 0; ok && i < batch; ++i)
+            ok = cache_strides[i] % 16u == 0u &&
+                 cache_strides[i] >= width + 4u * heads &&
+                 ((uintptr_t)kcache[i] & 15u) == 0u &&
+                 ((uintptr_t)vcache[i] & 15u) == 0u &&
+                 (!with_prefix || prefix_len[i] == 0u ||
+                  (((uintptr_t)kprefix[i] & 15u) == 0u &&
+                   ((uintptr_t)vprefix[i] & 15u) == 0u));
+        if (!ok) {
+            set_error(e, ec, "CUDA int8 KV attention needs head width 64 and "
+                             "16-byte aligned records");
+            return -1;
+        }
+        if (with_prefix &&
+            (ce(cudaMemcpyAsync(st->dev_batch_k_prefix, kprefix,
+                                batch * sizeof(*kprefix), cudaMemcpyHostToDevice,
+                                st->stream), e, ec) ||
+             ce(cudaMemcpyAsync(st->dev_batch_v_prefix, vprefix,
+                                batch * sizeof(*vprefix), cudaMemcpyHostToDevice,
+                                st->stream), e, ec) ||
+             ce(cudaMemcpyAsync(st->dev_batch_prefix_len, prefix_len,
+                                batch * sizeof(*prefix_len),
+                                cudaMemcpyHostToDevice, st->stream), e, ec)))
+            return -1;
+        static std::atomic<bool> i8_announced{false};
+        if (!i8_announced.exchange(true))
+            std::fprintf(stderr,
+                         "mynah-tts: CUDA decode attention reads int8 KV rows "
+                         "(int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)\n");
+        if (with_prefix)
+            cuda_launch_attn_i8<true>(st, grid, qkv, batch, heads, head_width,
+                                      scale, out, stage ? staged : nullptr);
+        else
+            cuda_launch_attn_i8<false>(st, grid, qkv, batch, heads, head_width,
+                                       scale, out, stage ? staged : nullptr);
+        return ce(cudaGetLastError(), e, ec);
+    }
     bool fast = cuda_backbone_attn_fast_enabled() && head_width % 8u == 0u &&
                 head_width <= (size_t)CUDA_ATTN_FAST_THREADS &&
                 (size_t)CUDA_ATTN_FAST_THREADS % head_width == 0u;
