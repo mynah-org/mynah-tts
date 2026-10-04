@@ -7,9 +7,9 @@ framework, no dependencies — plain sockets in C, one binary.
 make server
 ./build/cpu/mynah-tts-server -m models/magpie-v2607-pack -p 8080
 
-# PocketTTS on an NVIDIA GPU: see docs/cuda-serving.md (qualified on an L4)
-MYNAH_THREADS=1 MYNAH_CUDA_KV_DTYPE=bf16 ./build/cuda/mynah-tts-server \
-  -m models/pocket-english-24l --device cuda -w 8 --max-batch 160 --max-inflight 160 -p 8080
+# PocketTTS on an NVIDIA GPU: see docs/cuda-serving.md (L4 profile)
+MYNAH_THREADS=1 MYNAH_QUANT_GROUPS=none ./build/cuda/mynah-tts-server \
+  -m models/pocket-english-24l --device cuda -w 8 --max-batch 320 --max-inflight 320 -p 8080
 ```
 
 The CPU and CUDA servers are separate artifacts. The CPU binary is never
@@ -24,8 +24,9 @@ make cuda-server CUDA_ARCH=sm_89
 
 `cuda-server` builds without a GPU; running it needs one. **PocketTTS on CUDA
 has its own guide, [cuda-serving.md](cuda-serving.md)**: qualified operating
-points (L4: 160 streams of the 24-layer model, 256 of the 6-layer one), the two
-required variables, every `MYNAH_CUDA_*` switch with its default, measured
+points (L4: 160 streams of the 24-layer model, 256 of the 6-layer one, soak
+qualified; the 24-layer model screens at 320 with the current defaults), the
+required variable, every `MYNAH_CUDA_*` switch with its default, measured
 effect and rollback value, monitoring and troubleshooting. A requested CUDA
 backend that cannot open is reported, and a configuration that would run a hot
 Pocket stage on the CPU refuses to start rather than serve slowly under a CUDA

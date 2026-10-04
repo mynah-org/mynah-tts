@@ -13,10 +13,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Fast native C11 inference engine for text-to-speech — llama.cpp-style, no Python
-at runtime. Today it runs NVIDIA MagpieTTS v2607 with NanoCodec; the engine seam
-is built to host more models tomorrow.
+at runtime. It runs two engines behind one seam:
 
-**Faster than real time on a 2020 M1, CPU only** — RTF 0.36 at int8, no GPU
+- **Kyutai Pocket TTS (English, 6-layer and 24-layer)** — the reference,
+  production-quality model, served in real time on both CPU and CUDA. One
+  NVIDIA L4 streams 288-320 concurrent 24-layer requests faster than real time
+  in screens (160 qualified by 30-minute soaks;
+  [CUDA serving guide](docs/cuda-serving.md)); a 32-core Arm server streams 164
+  (6-layer) or 88 (24-layer) on the CPU alone.
+- **NVIDIA MagpieTTS v2607** with NanoCodec — 12 languages, 5 voices.
+
+**Faster than real time on a 2020 M1, CPU only** — Magpie RTF 0.36 at int8, no GPU
 needed.
 
 ## Features
@@ -42,6 +49,29 @@ needed.
 
 RTF = synthesis time ÷ audio duration; **below 1.0 is faster than real time**.
 
+### Pocket TTS — concurrent streaming
+
+Closed-loop saturated load on the v2 English corpus, four voices; "streams" is
+how many requests stream at once with every one faster than real time.
+
+| Model | Hardware | Backend | Streams | Stream RTF p95 | Audio-s per s | First audio p95 | Status |
+|---|---|---|---:|---:|---:|---:|---|
+| Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | **320** | 0.855 | 338 | 146 ms | 2-min screen, current defaults |
+| Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 288 | 0.782 | 335 | 134 ms | 2-min screen, current defaults |
+| Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 160 | 0.855 | 184.5 | 155 ms | qualified, 2 x 30 min, WER checked |
+| Pocket 6L | 1x NVIDIA L4 (24 GB) | CUDA | 256 | 0.794 | 316 | 145 ms | qualified, 2 x 30 min, WER checked |
+| Pocket 6L | GCP Axion c4a, 32 cores | CPU | 164 | 0.881 | 193 | 179 ms | qualified, 30 min |
+| Pocket 24L | GCP Axion c4a, 32 cores | CPU | 88 | 0.756 | 121 | 278 ms | qualified, 30 min |
+
+The CUDA path keeps weights, KV and codec state resident and runs one batched
+step for all streams. On by default: shared voice-prefix KV, split
+(flash-decoding) decode attention, bf16 backbone Linears through cuBLASLt with
+fused layers, a fused SEANet decoder, one host sync per frame, a per-request
+device-memory diet and int8 backbone KV. Profiles with every setting and its
+measured effect: [`configs/perf/`](configs/perf/README.md).
+
+### Magpie — single request
+
 | Model | Device | Backend | Precision | RTF |
 |---|---|---|---|---|
 | Magpie 357M v2607 | NVIDIA RTX 4060-class (~270 GB/s) | CUDA + cuBLAS | f32 / FP16 weights | **0.257** |
@@ -53,9 +83,8 @@ RTF = synthesis time ÷ audio duration; **below 1.0 is faster than real time**.
 | Magpie 357M v2607 | AMD EPYC 9555P (Zen 5), 4 vCPU | CPU (OpenBLAS, AVX2) | f32 | 0.806 |
 
 "Magpie 357M v2607" is `nvidia/magpie_tts_multilingual_357m` at revision v2607
-with `nemo-nano-codec-22khz`, the one model shipping today — the column is there
-because RTF means nothing without it, and the next engine will not match these
-numbers.
+with `nemo-nano-codec-22khz` — the column is there because RTF means nothing
+without it.
 
 ARM64 is covered by the M1 rows above, x86-64 by the EPYC rows — a 4 vCPU
 cloud slice where the int8 lane is a **1.9×** speedup over f32 and self-test
@@ -201,19 +230,23 @@ Requests accept `seed`, `temperature`, `top_k`, `max_steps`, `language` and
 `"stream": true` for chunked PCM as it is generated, sample-identical to the
 batch response.
 
-**PocketTTS on an NVIDIA GPU** is qualified for streaming: one L4 serves 160
-concurrent streams of the 24-layer model and 256 of the 6-layer one (two
-30-minute saturated soaks each, zero stalls, first audio p95 ~150 ms). Build
-with `make cuda-server CUDA_ARCH=sm_89` and start it from the serving profile:
+**PocketTTS on an NVIDIA GPU**: one L4 is qualified at 160 concurrent streams
+of the 24-layer model and 256 of the 6-layer one (two 30-minute saturated
+soaks each, zero stalls, first audio p95 ~150 ms), and with the current
+defaults the 24-layer model screens at 320 streams (RTF p95 0.855, 338
+audio-s/s, 16.3 GB). Convert the model with `tools/convert_pocket.py`, build
+with `make cuda-server cuda CUDA_ARCH=sm_89` and start it from the serving
+profile:
 
 ```bash
-python3 tools/perf_profile.py command l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l
-# MYNAH_THREADS=1 MYNAH_CUDA_KV_DTYPE=bf16 MYNAH_QUANT_GROUPS=none \
-#   build/cuda/mynah-tts-server --device cuda -w 8 --max-batch 160 --max-inflight 160 -p 8080 -m models/pocket-english-24l
+python3 tools/perf_profile.py command l4-24g-pocket-en-24l-cuda --model models/pocket-english-24l --port 8080
+# MYNAH_QUANT_GROUPS=none MYNAH_SERVE_PROFILE=1 MYNAH_THREADS=1 \
+#   build/cuda/mynah-tts-server --device cuda -w 8 --max-batch 320 --max-inflight 320 -p 8080 -m models/pocket-english-24l
 ```
 
 Every CUDA optimisation is on by default; the environment only needs
-`MYNAH_CUDA_KV_DTYPE=bf16` and `MYNAH_THREADS=1`. The full guide (models,
+`MYNAH_THREADS=1` (`MYNAH_CUDA_KV_DTYPE=bf16` is the rollback for workloads
+whose rows have no shared model-voice KV, see the guide). The full guide (models,
 streaming requests, sizing another GPU, every `MYNAH_CUDA_*` switch with its
 measured effect, monitoring, troubleshooting and the qualification procedure)
 is **[docs/cuda-serving.md](docs/cuda-serving.md)**.

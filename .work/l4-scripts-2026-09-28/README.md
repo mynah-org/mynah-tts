@@ -1,7 +1,7 @@
 # L4 orchestration scripts, 2026-09-28 (archive)
 
 Copied verbatim from `/root/evidence/` on the vast.ai L4 used for
-`.work/pocket-cuda-g6-host-cpu.md`. They chain the day's runs through tmux
+`.work/pocket-cuda-l4-host-cpu.md`. They chain the day's runs through tmux
 sessions and DONE markers (so work finishes without an ssh session) and call
 the harness then at `tools/l4/` (now `tools/gpu/`, generic for any CUDA GPU; the
 old `MYNAH_L4_*` variables are still accepted). Kept as the record of exactly what ran;

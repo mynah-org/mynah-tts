@@ -10,6 +10,8 @@
 #   MYNAH_Q_ASR_EVERY transcribe every Nth capture (1; 4 halves the wait on a small model)
 #   MYNAH_Q_ASR_WORKERS recogniser processes (default nproc/2, one core each)
 #   MYNAH_GPU_SAVE_EVERY capture every Nth request (10)   MYNAH_GPU_LISTEN_MB  ZIP cap per soak (100)
+#   MYNAH_Q_SERVER_ENV  "VAR=value ..." passed to serve.sh on top of its exports (the
+#                       profile's differences from them, printed by perf_profile.py soak)
 # Run it under tools/gpu/detach.sh so it finishes without the ssh session.
 set -u
 name=$1; model=$2; C=$3
@@ -28,7 +30,7 @@ for i in "${!seeds[@]}"; do
   t="$name-$(printf "\\x$(printf %x $((65 + i)))")"   # <name>-A, <name>-B, ...
   tags+=("$t")
   "$root/tools/gpu/vram_log.sh" "$ev/$t-vram.log" 30 & mon=$!
-  MYNAH_GPU_SEED="${seeds[$i]}" MYNAH_GPU_SAVE_AUDIO="$ev/$t/audio" "$root/tools/gpu/soak.sh" "$t" "$C" "$secs"
+  MYNAH_GPU_SEED="${seeds[$i]}" MYNAH_GPU_SAVE_AUDIO="$ev/$t/audio" "$root/tools/gpu/soak.sh" "$t" "$C" "$secs" "" ${MYNAH_Q_SERVER_ENV:-}
   kill "$mon" 2>/dev/null
   echo "$t-SOAK-DONE"
 done
@@ -58,7 +60,7 @@ for t in "${tags[@]}"; do asr "$ev/$t/$t-c$C.jsonl" "$ev/$t/quality"; done
 if [ "${MYNAH_Q_CONTROL:-0}" = 1 ]; then
   ct="$name-ctrl"
   MYNAH_GPU_BATCH=8 MYNAH_GPU_SEED="${seeds[0]}" MYNAH_GPU_SAVE_AUDIO="$ev/$ct/audio" \
-    "$root/tools/gpu/soak.sh" "$ct" 8 900
+    "$root/tools/gpu/soak.sh" "$ct" 8 900 "" ${MYNAH_Q_SERVER_ENV:-}
   asr "$ev/$ct/$ct-c8.jsonl" "$ev/$ct/quality"
   tags+=("$ct")
 fi

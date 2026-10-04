@@ -87,7 +87,8 @@ that owns the GPU — and carries `hardware.gpu`; `hardware.architecture`/`logic
 then describe the host. `recommended.json` stays the CPU recommendation.
 
 ```
-configs/perf/l4-24g-pocket-en-24l-cuda.json  one NVIDIA L4 (sm_89), Pocket 24L: C160 qualified, 184.5 audio-s/s
+configs/perf/l4-24g-pocket-en-24l-cuda.json  one NVIDIA L4 (sm_89), Pocket 24L: C160 qualified, 184.5 audio-s/s;
+                                             --max-batch 320 (C320 screen: RTF p95 0.855, 338 audio-s/s)
 configs/perf/l4-24g-pocket-en-6l-cuda.json   one NVIDIA L4 (sm_89), Pocket 6L:  C256 qualified, 316 audio-s/s
 ```
 
@@ -103,11 +104,16 @@ tools/perf_profile.py soak    l4-24g-pocket-en-24l-cuda --model models/pocket-en
 profile (and `tools/serving_profile.py --profile` refuses one): it prints the
 `tools/gpu/qualify.sh` run — two 30-minute soaks on fresh servers, audio captured from
 the live streams, WER, evidence bundle — under `tools/gpu/detach.sh`, plus the single
-`tools/gpu/soak.sh` screen. The harness starts the server through `tools/gpu/serve.sh`,
-and `tests/test_perf_profile.py` checks that its exports are exactly the profile's.
+`tools/gpu/soak.sh` screen. The harness starts the server through `tools/gpu/serve.sh`;
+a profile variable that script does not export with the same value is passed to it as a
+`VAR=value` pair (`MYNAH_Q_SERVER_ENV` for `qualify.sh`), and `tests/test_perf_profile.py`
+checks that its exports plus those pairs are exactly the profile's.
 
-Neither L4 profile is the shipped default: `MYNAH_CUDA_KV_DTYPE=bf16` and
-`MYNAH_THREADS=1` are required. Every `MYNAH_CUDA_*` switch that is on by default is
+Neither L4 profile is the shipped default: `MYNAH_THREADS=1` is required. Backbone KV
+is int8 by default since 2026-10-04 (`MYNAH_CUDA_KV_DTYPE` unset; `=bf16` and `=f32`
+are the rollbacks): the 24L profile runs that default, with screens to C320 and soak
+qualification pending, while the 6L profile pins `MYNAH_CUDA_KV_DTYPE=bf16`, what its
+qualified points were measured with. Every `MYNAH_CUDA_*` switch that is on by default is
 declared `null` with its measured win and what `=0` rolls back to, and so are the
 opt-ins that must stay off (`MYNAH_CUDA_PREFILL_FIXED=0` is +4-9% but loses
 piecewise-prefill identity).
