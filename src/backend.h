@@ -507,6 +507,12 @@ typedef struct {
      * l] + s * pitch and of its V at kv[...] + voff + s * pitch. NULL = the
      * plain layout above, (dim, ring_r * dim) for every row. CUDA only. */
     const size_t *kv_strides;   /* [rows * 2] or NULL                     */
+    /* int8 backbone KV (default; MYNAH_CUDA_KV_DTYPE; CUDA only, requires kv_bf16, kv_strides and
+     * head width 64): each stored position of a K or V plane is one record of
+     * `dim` int8 values followed by `heads` float scales (value = q * scale,
+     * scale = max|x| / 127 per position and head); pitch and voff in
+     * kv_strides are then in bytes. The shared prefix planes stay BF16. */
+    int kv_int8;
 } mynah_backend_tile_desc;
 /* 1 when a row's result cannot depend on the other rows of a batched call
  * (every kernel reduces in a fixed order). 0 when the backend runs cuBLAS
@@ -686,6 +692,12 @@ int mynah_backend_copy_dev_bytes_2d(const mynah_backend *backend,
  * a stream capture, and shrinking (like `free`) requires that no queued work
  * still uses the pages.  mynah_backend_dev_free also releases such a buffer
  * correctly. */
+/* int8 backbone KV (default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back): the BF16-KV batched decode attention entry
+ * points (plain, prefix and staged) read and write int8 records (see
+ * mynah_backend_tile_desc.kv_int8) instead of BF16 rows; cache strides are
+ * then in bytes. Process-wide; set once at model load, before any step. 0 on
+ * success, -1 when the backend has no int8 path. */
+int mynah_backend_set_kv_int8(const mynah_backend *backend, int on);
 int mynah_backend_kv_vmm_probe(const mynah_backend *backend,
                                size_t *granularity, char *error,
                                size_t error_capacity);
