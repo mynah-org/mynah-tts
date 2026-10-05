@@ -16,11 +16,16 @@ Fast native C11 inference engine for text-to-speech — llama.cpp-style, no Pyth
 at runtime. It runs two engines behind one seam:
 
 - **Kyutai Pocket TTS (English, 6-layer and 24-layer)** — the reference,
-  production-quality model, served in real time on both CPU and CUDA. One
-  NVIDIA L4 streams 288-320 concurrent 24-layer requests faster than real time
-  in screens (160 qualified by 30-minute soaks;
-  [CUDA serving guide](docs/cuda-serving.md)); a 32-core Arm server streams 164
-  (6-layer) or 88 (24-layer) on the CPU alone.
+  production-quality model, streamed in real time on both CPU and CUDA:
+  - **CPU only:** a 32-core Arm server streams 164 concurrent 6-layer requests,
+    or 88 of the 24-layer model (30-minute soaks, zero stalls);
+  - **one NVIDIA L4:** the 24-layer model streams 288-320 concurrent requests in
+    screens with the current defaults, and 160 are qualified by 30-minute soaks;
+  - **one NVIDIA L40S:** 384 concurrent 24-layer streams at stream RTF p95 0.49
+    in a screen.
+
+  See the [CUDA serving guide](docs/cuda-serving.md) and
+  [performance](docs/performance.md).
 - **NVIDIA MagpieTTS v2607** with NanoCodec — 12 languages, 5 voices.
 
 **Faster than real time on a 2020 M1, CPU only** — Magpie RTF 0.36 at int8, no GPU
@@ -30,12 +35,17 @@ needed.
 
 - **Pure C11, zero runtime dependencies.** One binary. Python is offline tooling
   only — conversion, tokenizer export, oracle parity.
-- **CPU-first.** Tuned for Apple Silicon and x86; Metal and CUDA are optional,
-  opt-in builds that fall back to CPU safely.
-- **Quantized decode.** `f16`, `int8` and `int4` weights, converted at load.
-  f32 stays the bit-exact default.
-- **Faster than real time.** RTF 0.257 on a mainstream NVIDIA GPU, 0.361 on an
-  M1 CPU. See [performance](docs/performance.md).
+- **CPU-first.** Own kernels for Arm (NEON dot, I8MM, BFMMLA) and x86 (AVX2,
+  AVX-512, VNNI, AVX512-BF16), picked at run time from what the CPU reports.
+  No BLAS needed (`BLAS=none` is the Linux default). Metal and CUDA are
+  optional, opt-in builds that fall back to the CPU safely.
+- **Quantized decode.** `f16`, `int8`, `int4` and `bf16` weights, converted at
+  load. For Magpie, f32 stays the bit-exact default. Pocket TTS ships a measured
+  per-tensor mix on the CPU: codec int8, backbone bf16 (int8 on the 24-layer
+  model), flow head f16.
+- **Faster than real time.** Pocket TTS serves hundreds of concurrent streams
+  per GPU and 164 per 32-core CPU. Magpie runs at RTF 0.257 on a mainstream
+  NVIDIA GPU and 0.361 on an M1 CPU. See [performance](docs/performance.md).
 - **Offline, streaming and an OpenAI-compatible server** over one autoregressive
   state machine — the streamed audio is sample-identical to the batch output.
 - **Continuous request batching** in the server, vLLM-style: concurrent requests
@@ -56,6 +66,7 @@ how many requests stream at once with every one faster than real time.
 
 | Model | Hardware | Backend | Streams | Stream RTF p95 | Audio-s per s | First audio p95 | Status |
 |---|---|---|---:|---:|---:|---:|---|
+| Pocket 24L | 1x NVIDIA L40S (48 GB) | CUDA | **384** | 0.488 | 740 | 87 ms | 2-min screen, current defaults; 384 is the build's row cap |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | **320** | 0.855 | 338 | 146 ms | 2-min screen, current defaults |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 288 | 0.782 | 335 | 134 ms | 2-min screen, current defaults |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 160 | 0.855 | 184.5 | 155 ms | qualified, 2 x 30 min, WER checked |
@@ -69,6 +80,40 @@ step for all streams. On by default: shared voice-prefix KV, split
 fused layers, a fused SEANet decoder, one host sync per frame, a per-request
 device-memory diet and int8 backbone KV. Profiles with every setting and its
 measured effect: [`configs/perf/`](configs/perf/README.md).
+
+On the L40S, throughput stays at ~720-740 audio-s/s from C384 upwards, with
+the GPU at ~60% SM. One engine issues one batched step at a time, and on a GPU
+this large one step does not fill the SMs, so a bigger GPU raises per-stream
+headroom more than total throughput (see
+[performance](docs/performance.md#2026-10-04--pockettts-24l-on-cuda--one-nvidia-l40s-screen)).
+
+### Pocket TTS on the CPU — what got it there
+
+Same host (GCP Axion c4a, 32 Neoverse-V2 cores, `BLAS=none`), same mixed v2
+bank, 30-minute soaks, highest level with every gate passed (zero stalls at
+250 and 500 ms). From C96 on, every row is the shipped default of its day
+with nothing exported; C90 was measured with the codec int8 setting exported,
+which became the default the next morning.
+
+| Date | 6L qualified | Audio-s per s | What changed |
+|---|---:|---:|---|
+| before 2026-09-18 | none | — | the 30-minute soaks at C96-C99 all stalled |
+| 2026-09-18 | C90 | 128.9 | resumable prefill in 32-token slices with a per-step prefill budget; 16 workers x 2 threads |
+| 2026-09-19 | C96 | 130.2 | codec ConvTranspose in int8 by default (1.86x on the per-slot term); prefill budget set from the measured step slack |
+| 2026-09-19 | C110 | 152.7 | bf16 backbone through a tiled BFMMLA kernel |
+| 2026-09-19 | C120 | 155.3 | prefill budget re-measured for the new kernel (40 ms) |
+| 2026-09-21 | C126 | 157.4 | same build, the frontier re-measured (C128 fails by 3 stalls in 65,295) |
+| 2026-09-27 | **C164** | **193.3** | wide I8MM kernel (int8 weights read once per eight activations), attention heads on the thread pool, text segmentation (TTFA p95 246 -> 143 ms at C120), `--max-batch 12` |
+
+The 24-layer pack went from ~C40-48 to **C88** (121 audio-s/s) on the same
+host. The gains came from an int8 backbone (on 24L the per-step weight pass is
+big enough to pay: -39% step time at one row), the same segmentation and
+16-token prefill slices. On x86 the kernels now dispatch at run time: AVX2,
+AVX-512BW, AVX-512 VNNI (int8 2.27x over AVX2) and AVX512-BF16 `VDPBF16PS`
+(bf16 2.98x over the widening kernel). Each tier is proven against the scalar
+reference on first use before it is selected. These are kernel benchmarks on
+a Zen 4 host; no x86 serving figure is published yet. Detail:
+[performance](docs/performance.md).
 
 ### Magpie — single request
 
@@ -105,7 +150,38 @@ is the big lever and why, on Apple Silicon's unified memory, the GPU is *slower*
 than four CPU threads. The full analysis, the measured improvements and how to
 benchmark your own box are in **[docs/performance.md](docs/performance.md)**.
 
-## Quick start
+## Quick start — Pocket TTS
+
+From a clean checkout to a WAV on the CPU. `kyutai/pocket-tts` is a gated
+Hugging Face repository: accept its terms there and export a read token once.
+Python is needed only for the one-time conversion.
+
+```bash
+make && make self-test
+export HF_TOKEN=hf_...
+uv run --with huggingface_hub python -c \
+  "from huggingface_hub import snapshot_download as d; d('kyutai/pocket-tts')"
+make convert-pocket POCKET_LANG=english_2026-04     POCKET_OUT=models/pocket-en      # 6 layers
+make convert-pocket POCKET_LANG=english_2026-04_24l POCKET_OUT=models/pocket-en-24l  # 24 layers
+
+./build/cpu/mynah-tts --synthesize models/pocket-en \
+  --text "Hello from the CPU." --lang en --speaker 0 --output build/pocket.wav
+```
+
+Speaker 0 is `alba`, the recommended voice
+([docs/pocket-voices.md](docs/pocket-voices.md)). To serve it, the
+qualified 32-core profile prints its own command:
+
+```bash
+make server
+python3 tools/perf_profile.py command axion-c4a-32c-pocket-en --model models/pocket-en --port 8080
+# ./build/cpu/mynah-tts-server -m models/pocket-en -p 8080 --prefork 16 --prefork-threads 2 --max-batch 12
+```
+
+On a different host, re-screen the worker shape (`configs/perf/README.md`). On
+an NVIDIA GPU, follow [docs/cuda-serving.md](docs/cuda-serving.md).
+
+## Quick start — Magpie
 
 Four steps from a clean checkout to a WAV. No HuggingFace account, no token, no
 Python at runtime.
@@ -170,25 +246,12 @@ make metal && build/metal/mynah-tts --gpu-self-test metal   # macOS
 make cuda  && build/cuda/mynah-tts  --gpu-self-test cuda    # Linux/NVIDIA
 ```
 
-Pocket-TTS support is currently an experimental engine path: official 6-layer
-and 24-layer packs run on CPU, with the CPU server using model-aware text
-segmentation and the same depth-driven runtime for both packs. The Linux CUDA
-server path has been exercised on Blackwell (`sm_120`) and Ada (`sm_89`). CUDA has resident implementations for
-the backbone, flow head, Mimi decoder-transformer, quantizer/causal upsample and
-causal SEANet decoder, but each stage is capability- and precision-gated. The
-default Pocket CPU quantization profile intentionally keeps several groups
-quantized. Resident CUDA now has an explicit Q8 linear path for batched
-backbone/flow/Mimi and latent/EOS control projections (device activation
-quantization, INT8 GEMM, cached per-row weight scales and f32 epilogue);
-convolution groups still use the CPU oracle until their own CUDA Q8 kernel
-passes parity. The resident SEANet decoder is now cross-request batched in
-raw-F32 mode, with causal tails/workspaces kept per request. A raw-F32 resident bring-up therefore uses
-`MYNAH_QUANT_GROUPS=none`, shown below. The current path still keeps generation
-control (EOS thresholding/sampling/RNG) and the final PCM boundary on the host;
-the EOS projection itself is batched on the resident stream, and its
-decoder counters distinguish true cross-request SEANet arithmetic batches from
-ordinary single-request/fallback steps. CUDA remains opt-in and model-specific;
-it is qualified for streaming on an NVIDIA L4 (C160 large, C256 small), see
+Pocket TTS runs the official 6-layer and 24-layer packs on the CPU and, with
+`make cuda`, fully resident on an NVIDIA GPU of compute capability 8.0 or newer:
+backbone, flow head, Mimi transformer and SEANet decoder, batched across
+streams. It is measured on an L4 and an L40S (`sm_89`) and was exercised
+earlier on Blackwell (`sm_120`). A CUDA server refuses to start rather than run
+a hot stage on the CPU under a CUDA label. The serving guide is
 [docs/cuda-serving.md](docs/cuda-serving.md).
 
 A model pack carries `model.json`, the tts/codec safetensors, tokenizer assets,
@@ -294,8 +357,13 @@ diverge from the streaming one.
 
 ## Docs
 
-- **[Performance](docs/performance.md)** — RTF tables, the bandwidth analysis,
-  threading, the Metal verdict, benchmarking your own machine
+- **[Performance](docs/performance.md)** — Pocket TTS serving results on CPU
+  and CUDA, how each was reached, RTF tables, the bandwidth analysis, threading,
+  the Metal verdict, benchmarking your own machine
+- **[Serving Pocket TTS on a GPU](docs/cuda-serving.md)** — build, start,
+  size, tune, monitor and qualify the CUDA server
+- **[Serving profiles](configs/perf/README.md)** — the measured server
+  configuration per host and engine, and the validator that enforces it
 - **[Quantization](docs/quantization.md)** — f16/int8/int4 trade-offs and how to
   judge quantized audio
 - **[Server](docs/server.md)** — the OpenAI-compatible HTTP API, streaming,

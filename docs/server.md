@@ -41,10 +41,41 @@ label.
 | `--max-batch N` | engine/CUDA microbatch width (Pocket default 8 at the server layer, capped by model metadata) |
 | `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`; maximum 128 on CPU, 384 for Pocket on CUDA); does not widen one engine call |
 | `--device cpu\|metal\|cuda` | backend, same rules as the CLI |
+| `--prefork W` | serve from W worker processes that share the loaded pack (pinned to their own core slice on Linux); the parent routes each connection to the least loaded worker. Several `-m` packs (one per language) imply it |
+| `--prefork-threads T` | thread-pool width per worker (default: allowed CPUs / W) |
+| `--prefork-plan` | print this machine's topology and how to choose W, then exit |
+| `--warmup N` | synthetic requests run through the normal queue before accepting traffic (default 1) |
 
 It binds to loopback by default. Exposing it means `--host 0.0.0.0`, which is a
 deliberate act: **there is no authentication, no TLS and no rate limiting**. Put
 it behind a reverse proxy if it faces anything but localhost.
+
+## Pocket TTS on the CPU
+
+On a CPU server Pocket TTS is served by several worker processes, each one
+batching its own streams. The worker shape is measured, not guessed: on a
+32-core Arm host 16 workers x 2 threads beat 8 x 4 decisively. The qualified
+profile prints its command:
+
+```bash
+python3 tools/perf_profile.py command axion-c4a-32c-pocket-en --model models/pocket-en --port 8080
+# ./build/cpu/mynah-tts-server -m models/pocket-en -p 8080 --prefork 16 --prefork-threads 2 --max-batch 12
+```
+
+That shape serves 164 concurrent 6-layer streams on that host (88 for the
+24-layer pack with `--max-batch 8`), with zero stalls over 30 minutes. All of
+the following are shipped defaults, so nothing needs exporting:
+
+- **Mixed precision per tensor:** codec int8; backbone bf16, or int8 on 24L;
+  flow head f16.
+- **Prefill:** resumable 32-token slices (16 on 24L) under a 40 ms per-step
+  budget.
+- **Text segmentation:** first chunk 24 tokens, then 50.
+
+The profiles and the measurement history are in
+[`configs/perf/`](../configs/perf/README.md) and
+[performance.md](performance.md). On another machine, re-screen the worker
+shape: `--prefork-plan` prints the procedure.
 
 ## POST /v1/audio/speech
 

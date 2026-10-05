@@ -4,7 +4,8 @@ How to run the mynah-tts streaming server on one NVIDIA GPU for PocketTTS, the
 reference, production-quality engine of this runtime (it also serves on the
 CPU): build, model, start, stream, size, tune, monitor and qualify. Everything
 here was measured on one NVIDIA L4 (24 GB) on Vast.ai between 2026-09-28 and
-2026-10-04; the evidence is in [performance.md](performance.md) and the
+2026-10-04, plus a 2-minute screen on one NVIDIA L40S (48 GB) on 2026-10-04
+(section 6). The evidence is in [performance.md](performance.md) and the
 serving profiles in [`configs/perf/`](../configs/perf/README.md).
 
 ## At a glance
@@ -189,6 +190,23 @@ with zero stalls; beyond ~1.0 streams fall behind playback.
 For 1,000 concurrent listeners on L4s: 4 GPUs for the small model, 7 for the
 large one.
 
+**A larger GPU (L40S).** The same `sm_89` build with the current defaults runs
+the large model at **C384 with stream RTF p95 0.49**, 740 audio-s/s and TTFA
+p95 87 ms. That was a 2-minute screen with 0 stalls and 0 failures, where the
+L4 needs 0.86 at C320. The ceiling there is not the GPU:
+
+- **384 is the build's row cap.** `--max-batch` and `--max-inflight` stop at
+  384, and requests beyond it queue.
+- **Raising the caps does not raise throughput.** An experimental build with
+  the compile-time caps raised to 768 holds C640 at 0.83, but throughput stays
+  at ~720 audio-s/s with the GPU at ~60% SM. One engine runs one batched step
+  at a time, and on a GPU this size one step does not fill the SMs.
+
+So on an L40S, plan with C384 per GPU today. Expect more from a second engine
+per GPU rather than from more rows; that is not built yet. Detail:
+[performance.md](performance.md), section "2026-10-04 · PocketTTS 24L on CUDA —
+one NVIDIA L40S screen".
+
 ## 7. Feature flags (environment variables)
 
 The defaults are the tuned configuration. Together, the 2026-10-02 rows of the
@@ -305,7 +323,8 @@ tolerance comparison.
   `mynah_backend_decoder_graph_*`, the batch-width histograms, `..._sync_calls_total`,
   H2D/D2H bytes. Polling it does not synchronise the GPU.
 - `nvidia-smi`: memory should reach a plateau and stay there; utilisation
-  85-95% at the qualified levels.
+  85-95% at the qualified levels on an L4 (an L40S runs at ~60% SM, see
+  section 6).
 - The server process using 100-125% of a CPU core is normal: the scheduler
   thread spins while it waits for the GPU (that spin is faster than sleeping).
 
