@@ -190,7 +190,7 @@ above.
 | attention launch | grid heads x rows, 128 threads | | scales with rows; nothing to change |
 | VRAM | ~75 MB/stream + 1.8 GB fixed (24L, before strip) | C208-C224 | ~600+ streams fit in 48 GB |
 | slot-pool prefill + bucket walk at start-up | all `--max-batch` sets + one capture per bucket | ~33 s at 208 | grows with max-batch (minutes at 600): cap the walk or prefill lazily above C384 |
-| host | 1 spinning scheduler thread, 1 writer thread per stream | 4 vCPU fine | 4-8 vCPU (g6e.xlarge/2xlarge) |
+| host | 1 spinning scheduler thread, 1 writer thread per stream | 4 vCPU fine | 4-8 vCPU |
 
 ### 4.2 Expected new bottleneck (HYPOTHESIS)
 - Bandwidth (2.9x) and bf16 compute (3.0x) scale alike, so the GPU-side step should shrink ~2.5-2.9x at equal rows,
@@ -216,9 +216,37 @@ above.
 | 15-20 | `--gpu-self-test`, `--pocket-self-check` with the best flag set | PASS |
 | 20-45 | knee, `--max-batch 384`, C256/C320/C384, 60 s per level, 4 voices | if C384 passes with margin, the ceiling is the limit |
 | 45-70 | 768-ceiling build, buckets `...,384,448,512,576,640`, `--max-batch 640`: knee C448/C512/C576/C640 | the real knee; GPU util, SM clock, scheduler CPU % |
-| 70-80 | top passing level pinned to 4 cores (`taskset -c 0-3`) vs 8 | does a g6e.xlarge suffice? |
+| 70-80 | top passing level pinned to 4 cores (`taskset -c 0-3`) vs 8 | does a 4-vCPU host suffice? |
 | 80-95 | nsys 10 s at the top level (`--cuda-graph-trace=node`) | step split, GPU idle per step (the action-1 target) |
 | 95-110 | optional: `MYNAH_CUDA_PREFILL_FIXED=0` and `MYNAH_CUDA_SYNC=blocking` arms at the top level | prefill and spin cost at high C |
 
 Decision rule: the L40S is worth it per stream if its passing C divided by the L4's C208 exceeds the price ratio
 of the two instances; record audio-s/s per dollar, not only C.
+
+### 4.5 Measured on 2026-10-04 (2-minute screens, one L40S, 4-vCPU host with the client on it)
+
+main at the int8-KV default, every section-7 default of `docs/cuda-serving.md`, the L4 `sm_89` build:
+- C384: stream RTF p95 0.488, 740 audio-s/s, TTFA p95 87 ms, 0 stalls.
+- C512 and C640: the same RTF and throughput; the extra requests queue behind the 384 ceilings.
+
+Box-only build, not committed: the four 384 ceilings of 4.1, plus `CUDA_DECODER_GRAPH_CAP` and
+`CUDA_PIPELINE_GRAPH_CAP` (which 4.1 missed), raised to 768:
+- C512: 0.667, 715 audio-s/s, TTFA 118 ms.
+- C640: 0.826, 718 audio-s/s, TTFA 147 ms.
+- C768: 0.970, 726 audio-s/s, TTFA 175 ms.
+- 0 stalls and 0 failures at every level.
+
+GPU: 238-241 W average of 350 W (peaks 322-331 W), SM ~60-62 % (`nvidia-smi dmon`).
+
+Reading against 4.2:
+- **Confirmed:** the knee moved past C450 (C640 under the 0.90 gate).
+- **Refuted:** "the GPU-side step should shrink ~2.5-2.9x". Throughput is ~2.2x the L4 and flat from C384 to C768
+  with the SMs ~40 % idle.
+- **What it means:** one engine issues one batched step at a time, so the step pipeline is serial. On 142 SMs one
+  step does not fill the GPU, and more rows only lengthen the step.
+- **Next levers:**
+  - a second step pipeline: two row groups on two CUDA streams, alternating ticks, or two engines per GPU;
+  - the 4.3 runtime ceiling knob.
+
+  Host-side cuts (action 1 / 4) still help, but they cannot lift the serial-pipeline ceiling.
+- **Not run yet:** the nsys and 4-vs-8-core arms of 4.4.

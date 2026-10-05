@@ -1,16 +1,50 @@
 # Performance
 
 RTF = synthesis time ÷ audio duration; **below 1.0 is faster than real time**.
-All figures are synthesis-only, median of five serial runs after two warmups,
-on the standard bench prompt (`make bench`, 20 steps, speaker 4, seed 42).
 
-Every number below is for **`nvidia/magpie_tts_multilingual_357m` revision
-v2607** paired with `nemo-nano-codec-22khz-1.89kbps-21.5fps` — 357M parameters,
-22050 Hz, 21.5 frames/s. That is the only model shipping today, but RTF is a
-property of the model as much as of the machine: quote the pair, never the
-number alone, and do not carry these figures over to a future engine.
+This page has two kinds of numbers, and they are not comparable:
 
-## Reference numbers
+- **Pocket TTS serving** (the dated sections from "First production-hardware
+  capacity screen" on): many concurrent streams, closed-loop saturated load,
+  judged on stream RTF, first audio and stalls.
+- **Magpie single-request RTF** (from "Magpie reference numbers" through the
+  codec and argmax sections, and `make bench`): one request at a time on the
+  standard bench prompt.
+
+The serving measurement protocol between the two applies to every serving
+number.
+
+## At a glance — Pocket TTS
+
+Concurrent streams with every gate passed (stream RTF p95 below ~0.9, zero
+stalls), English packs, mixed v2 corpus:
+
+| Pack | Hardware | Backend | Streams | Audio-s per s | Status | Section |
+|---|---|---|---:|---:|---|---|
+| 6L | GCP Axion c4a, 32 cores | CPU | 164 | 193 | qualified, 30 min | 2026-09-27 |
+| 24L | GCP Axion c4a, 32 cores | CPU | 88 | 121 | qualified, 30 min | 2026-09-27 |
+| 6L | 1x NVIDIA L4 | CUDA | 256 | 316 | qualified, 2 x 30 min, WER | 2026-09-28 |
+| 24L | 1x NVIDIA L4 | CUDA | 160 | 184.5 | qualified, 2 x 30 min, WER | 2026-09-28 |
+| 24L | 1x NVIDIA L4 | CUDA | 288 | 341 | 10-min soak, 2026-10-02 defaults (bf16 KV) | 2026-10-02 |
+| 24L | 1x NVIDIA L4 | CUDA | 320 | 338 | 2-min screen, int8 KV | 2026-10-04 |
+| 24L | 1x NVIDIA L40S | CUDA | 384 (row cap) | 740 | 2-min screen, current defaults | 2026-10-04 |
+
+How the CPU numbers were reached, one change at a time:
+2026-09-18 (C90) -> 2026-09-19 (C96, C110, C120) -> 2026-09-21 (C126) ->
+2026-09-27 (C164 for 6L, C88 for 24L). The CUDA defaults and the measured
+effect of each are in [cuda-serving.md](cuda-serving.md) section 7.
+
+## Magpie reference numbers
+
+All figures in this part are synthesis-only, median of five serial runs after
+two warmups, on the standard bench prompt (`make bench`, 20 steps, speaker 4,
+seed 42).
+
+Every number in this part is for **`nvidia/magpie_tts_multilingual_357m`
+revision v2607** paired with `nemo-nano-codec-22khz-1.89kbps-21.5fps` — 357M
+parameters, 22050 Hz, 21.5 frames/s. RTF is a property of the model as much as
+of the machine: quote the pair, never the number alone, and do not carry these
+figures over to another engine.
 
 | Model | Device | ISA / backend | Precision | RTF | Measured |
 |---|---|---|---|---|---|
@@ -376,12 +410,13 @@ decode quantum, or pacing them, would need a capped or paced writer span in
 
 ### Running the campaign on Linux
 
-No serving numbers are recorded here yet. **Every number this protocol produces
-on macOS is a development signal, not a production claim** — Accelerate and the
-P-core thread-pool default do not exist on Linux, and `SIMD=auto` on Linux x86
-compiles plain AVX2 with no runtime dispatch. Production is Linux x86-64 and
-ARM64, and the campaign belongs there. The harness prints the platform caveat on
-every report.
+The serving numbers recorded below were all taken on Linux this way.
+**Every number this protocol produces on macOS is a development signal, not a
+production claim**: Accelerate and the P-core thread-pool default do not exist
+on Linux. Production is Linux x86-64 and ARM64, and the campaign belongs there.
+The harness prints the platform caveat on every report. (On x86 the kernels
+have been selected at run time since 2026-09-22, so a portable build reaches
+AVX2, AVX-512, VNNI and AVX512-BF16 without build flags.)
 
 Note that the quantization default changed at `d1ffd01`: per-tensor groups,
 codec in int8 and backbone/flow in f16. Any earlier serving number in this repo
@@ -1009,6 +1044,33 @@ code measured on the 24L, where load did not change the audio. The evidence
 bundles (per-request records, logs, captured audio) are kept privately and are
 not published.
 
+## 2026-10-02 · PocketTTS 24L on CUDA — new defaults, C288 on one L4
+
+One NVIDIA L4 on Vast.ai, 24L pack, same corpus, voices and client as the
+2026-09-28 sections. Seven changes became defaults that day, each measured
+alone first:
+
+- shared voice-prefix KV with the per-row copy stripped;
+- split (flash-decoding) decode attention;
+- bf16 backbone Linears through cuBLASLt, fused;
+- fixed-order bf16 text prefill;
+- the fused SEANet decoder;
+- one host sync per frame;
+- the per-request device-memory diet.
+
+The effect of each is in [cuda-serving.md](cuda-serving.md) section 7. Before
+these, C208 stalled (stream RTF p95 1.03). Shipped defaults, nothing exported,
+`--max-batch 288`, backbone KV still bf16:
+
+| soak | requests | failed | stalls 250/500 ms | stream RTF p95 | TTFA p95 | audio-s/s |
+|---|---:|---:|---|---:|---:|---:|
+| 10 min C208 | 25,382 | 0 | 0 / 0 | 0.628 | 108 ms | 323 |
+| 10 min C288 | 26,870 | 0 | 0 / 0 | 0.821 (windows 0.818-0.823) | 141 ms | 341 |
+
+One lesson from this step: bf16 weights through `cublasGemmEx` with the
+default algorithm were 10% *slower* than TF32. Per-shape cuBLASLt heuristics,
+the same route PyTorch takes, fixed it. Detail: `.work/pocket-cuda-c208.md`.
+
 ## 2026-10-04 · PocketTTS 24L on CUDA — int8 backbone KV, C320 screen on one L4
 
 One NVIDIA L4 (24 GB, sm_89) on Vast.ai, 24L pack, every CUDA default of
@@ -1035,3 +1097,47 @@ the arms (no EOS drift). It is the default since this date
 `--max-batch 320`. Screens only: the 30-minute soak qualification with WER is
 pending, so C160 remains the qualified point. Detail:
 `.work/pocket-cuda-kv-int8.md`.
+
+## 2026-10-04 · PocketTTS 24L on CUDA — one NVIDIA L40S screen
+
+One NVIDIA L40S (48 GB, `sm_89`, 142 SMs, 350 W cap). The same `sm_89` build
+and every default of [cuda-serving.md](cuda-serving.md) section 7, int8
+backbone KV included. 2-minute closed-loop knees with `tools/pocket_ladder.py`,
+v2 corpus, four voices, seed 1234. The load generator ran on the same 4-vCPU
+host (two physical cores with SMT).
+
+| build | C | stream RTF p95 | audio-s/s | TTFA p95 | stalls 250/500 ms | failed |
+|---|---:|---:|---:|---:|---|---:|
+| main | 384 | **0.488** | **740** | 87 ms | 0 / 0 | 0 |
+| main | 512 | 0.492 | 732 | 1495 ms (queued) | 0 / 0 | 0 |
+| main | 640 | 0.493 | 726 | 2871 ms (queued) | 0 / 0 | 0 |
+| row caps raised to 768 | 512 | 0.667 | 715 | 118 ms | 0 / 0 | 0 |
+| row caps raised to 768 | 640 | 0.826 | 718 | 147 ms | 0 / 0 | 0 |
+| row caps raised to 768 | 768 | 0.970 | 726 | 175 ms | 0 / 0 | 0 |
+
+- **main stops at 384 streams by construction.** `POCKET_MAX_BATCH`,
+  `MYNAH_GRAPH_MAX_JOBS/ACTIVE` and the CUDA batch-metadata, decoder-graph and
+  pipeline-graph caps are all 384 at compile time. Above C384 the extra requests wait in the queue, which
+  is why TTFA grows while stream RTF does not.
+- **The experimental build** raises those six constants to 768 and changes
+  nothing else; it is not on main. Under the 0.90 gate it holds C640 (0.826).
+- **Throughput is flat at ~715-740 audio-s/s from C384 to C768.** The GPU
+  averaged 238-241 W of 350 W (peaks 322-331 W) with SM activity at ~60-62%
+  (`nvidia-smi dmon`). More rows make each step longer, but they do not add
+  throughput.
+
+How to read it: one engine issues one batched step at a time, and on a GPU
+this size the kernels of one step do not fill 142 SMs. On the L4 the same
+engine keeps the GPU busy (85-95% utilisation at the qualified levels, ~340
+audio-s/s at best). So the L40S gives about 2.2x an L4 in throughput and much
+lower per-stream RTF at equal concurrency (0.49 at C384 against 0.86 at C320).
+The rest of the card would need a second step pipeline: two engines per GPU,
+or two row groups on two CUDA streams. Neither is built or measured yet.
+
+Open items:
+- make the row caps a runtime setting instead of compile-time constants;
+- extend the width-bucket list past 384;
+- run a 30-minute qualification on this GPU.
+
+The analysis written before this session is in
+`.work/pocket-cuda-inefficiencies-and-l40s.md`.
