@@ -1417,6 +1417,33 @@ artifact and a resident Pocket graph. Do not call a host-round-trip matmul path
 - [ ] E15-29 First-burst and first-chunk latency on CUDA: a fresh server pays per-width graph capture and cold slot allocation on its first burst (TTFA p95 1.18 s vs 0.65 s warm), and steady-state TTFA p50 is one step behind a single-graph continuous-batching server (137 vs 81 ms at C160). Flags `MYNAH_CUDA_SLOT_POOL_PREFILL` and `MYNAH_CUDA_WIDTH_BUCKETS`, then the first-chunk pipeline/prefill/sync items → [`.work/pocket-cuda-cold-burst.md`](.work/pocket-cuda-cold-burst.md) · 2026-09-30 part 4: per-iteration admission cap and TF32 tile v2 measured and not adopted; serial admission ~3.7 ms per request (context host state + stream start) is the next lever (async admission)
 - [ ] E15-30 Hierarchical KV (VRAM → pinned RAM → local NVMe) analysed on paper: NO-GO for capacity on L4 24L, because at C176–C192 RTF fails with ~5 GB of VRAM still free and request-scoped KV leaves nothing to park; cheaper bets are shared voice-prefix KV with prefix-shared attention and INT8 KV as a bandwidth lever → [`.work/pocket-cuda-kv-tiering.md`](.work/pocket-cuda-kv-tiering.md)
 - [x] E15-31 int8 backbone KV records (int8 values + one float scale per position and head) are the CUDA Pocket default (2026-10-04): L4 24L 2-min knees C256 RTF p95 0.745 -> 0.681, 315 -> 345 audio-s/s, C320 0.855 with 0 stalls, peak VRAM 21.3 -> 16.3 GB; profile at --max-batch 320, soak qualification and WER pending; rows without a shared model-voice KV run on the CPU unless MYNAH_CUDA_KV_DTYPE=bf16 → [`.work/pocket-cuda-kv-int8.md`](.work/pocket-cuda-kv-int8.md)
+- [~] E15-32 L40S plateau = the serial host loop, not the GPU: 24L throughput stops at ~830-880 audio-s/s with the GPU idle ~40 % of the time (`dmon sm` is a time share); the client and host CPU are ruled out as the main cause; the profile shows 44.7 % device wait vs 55.1 % host (31.7 ms per iteration) and two real GPU waits per iteration (AR step ~10.8 ms, gang decode ~11.7 ms); the decoder graph is re-recorded on almost every step and a second flow pass runs whenever a row ends. Work items L1-L25 (host diet flags, decoder table patch, survivor flow reuse, deferred release, dispatch-ahead, two engines per GPU), each an A/B flag → [`.work/pocket-l40s-plateau.md`](.work/pocket-l40s-plateau.md) · 2026-10-05 evening: the coded package (11 flags, bit-identical) moves the L40S 0.88 gate from C640 to C768 (RTF p95 0.911 → 0.856, +6 % audio-s/s), C896 borderline (0 stalls vs 46,640 base, RTF 0.84-0.96); per-flag attribution, the C832 10-min soak, L13 and the L4 check are next (`.work/pocket-l40s-plateau.md` 3d/3e)
+  - [x] E15-32 L1 `pocket_ladder.py --client-procs N` + `client_cpu_pct`: the client is not the limit (1 vs 4 procs: 827 vs 808 audio-s/s)
+  - [x] E15-32 L2 `tools/gpu/stub_stream_server.py`: a paced stand-in server to measure a load generator's ceiling
+  - [x] E15-32 L3 `MYNAH_SERVE_PROFILE` device wait vs host share + per-call-site sync table (reset at loop start)
+  - [x] E15-32 L4 `ROW_CAP` build constant (`src/row_cap.h`): 768-row build holds C640 at RTF p95 0.68 on the L40S; default stays 384
+  - [x] E15-32 L5 single-context decoder syncs are one-time slot-pool warm-up (47,381 calls ≈ 640 contexts x 74, identical in two runs, ~10 s once), not per-step traffic
+  - [ ] E15-32 L6 `MYNAH_CUDA_DEFERRED_RELEASE`: park a retired context behind an event, no drain (prerequisite for L13)
+  - [~] E15-32 L7 `MYNAH_CANCEL_CHECK_EVERY=N`: cancellation poll every N iterations (CPU server: 45/45 WAVs identical)
+  - [~] E15-32 L8 `MYNAH_STREAM_OUT_WRITEV=1`: one writev per HTTP chunk (CPU server: 45/45 WAVs identical)
+  - [~] E15-32 L9 FIFO prefill selection stops after an empty scan (was O(rows²) per step; pure fix)
+  - [~] E15-32 L10 `MYNAH_DUP_CHECK_EPOCH`: per-context epoch instead of O(rows²) duplicate checks
+  - [~] E15-32 L11 `MYNAH_CUDA_DECODER_TABLE_PATCH`: patch the decoder graph's tables instead of re-recording it every step
+  - [~] E15-32 L12 `MYNAH_CUDA_ONESYNC_SUBSET`: reuse the one-sync flow rows for survivors instead of a second flow pass
+  - [~] E15-32 L13 `MYNAH_CUDA_STEP_OVERLAP`: dispatch-ahead depth 1. The AR step k+1 is queued (new optional `step_launch` engine hook, the queue half of the one-sync frame) right after step k's delivery and the prefill pass, so retire k plus the next admission and cancellation run while the GPU steps; an admission joins one step later. Coded, untested on GPU. CPU: driver test passes (same steps, rows and order as the serial loop for a burst; solo-identical audio under continuous admission) and the CLI `--batch 4` WAVs are identical. The decode-k overlap (L13b) is a follow-up. Design in `.work/pocket-l40s-plateau.md` § L13 design
+  - [x] E15-32 L14 two engines per GPU (2 x 320): 913 audio-s/s total, GPU 93 % busy (one engine at 640: 799-877, 62 %); with MPS 908, no gain -> the gaps are idle time between steps, not SM underfill
+  - [-] E15-32 L15 decode of frame k on a second stream: dropped, MPS showed no concurrency headroom (L14)
+  - [-] E15-32 L16 two row groups on two streams in one engine: dropped, same reason as L15
+  - [-] E15-32 L17 CUDA workers under `--prefork`: deprioritised, the target is one engine without gaps (larger batches, one copy of weights, one queue); kept only as a last resort
+  - [-] E15-32 L18 no drain at all on park: unsafe (host rewrites pinned staging on re-take); implemented as L6 (fence) instead
+  - [~] E15-32 L19 `MYNAH_STREAM_DELIVER_THREADS=N`: PCM convert + enqueue + wake off the scheduler thread
+  - [~] E15-32 L20 `MYNAH_CUDA_PCM_DIRECT`: borrowed pointers into pinned gang PCM, no per-row memcpy/calloc
+  - [~] E15-32 L21 `MYNAH_CUDA_HIDDEN_LAZY`: no hidden-state D2H + scan each step; check on device
+  - [~] E15-32 L22 `MYNAH_CUDA_KV_TABLE_CACHE`: rewrite KV metadata rows only when a context changed
+  - [ ] E15-32 L23 `MYNAH_CUDA_NOISE_AHEAD`: draw step N+1 noise while blocked in the AR sync
+  - [~] E15-32 L24 `MYNAH_CUDA_DECODER_VALIDATE_ONCE`: decoder op checks once per decoder, not every step
+  - [ ] E15-32 L25 `MYNAH_CUDA_DECODER_WIDTH_BUCKETS`: decoder graphs per width bucket with inert pad decoders
+  - [ ] E15-32 close-out: for every KO flag decide remove-from-code (never used, extra branches) vs keep-for-later (written down why); for every WIN that is bit-identical, safe on both the L4 and the L40S and gains on at least one without regressing the other, turn it on by default and remove the flag (or keep only a rollback switch, as the 2026-10-02 defaults did), then update `docs/cuda-serving.md` section 7 and the serving profiles
 
 ### E6 — Licensing and voice policy → [`.work/licensing-and-voice-policy.md`](.work/licensing-and-voice-policy.md)
 

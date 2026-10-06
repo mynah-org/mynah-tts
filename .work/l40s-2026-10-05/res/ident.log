@@ -1,0 +1,3 @@
+base  wavs 240 common-with-base 240 identical 240 | done 240 fail 0
+base2 wavs 240 common-with-base 240 identical 164 | done 240 fail 0
+L7L8  wavs 240 common-with-base 240 identical 72 | done 240 fail 0

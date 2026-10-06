@@ -1,0 +1,37 @@
+== chain3 start 17:00:00
+== e4-reset [] procs=4 ready in 27 s, VRAM 30506 MiB
+  C640 aps 799 rtf95 0.803 ttfa95 133ms gap95 130ms st250 0 fail 0 | srv_cpu -1% cli_cpu 102% | gpu 254W sm 62%
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B640  n=1191     mean   46.9 ms  worst   410.0 ms  late  0.08%  per-slot   0.1 ms
+[SERVE] loop 170.3 s: step 70.1%  prefill-first 0.1% (2 slices, 1 done, 55.3 ms/slice)  prefill-cont 0.2% (612 slices, 306 done, 0.4 ms/slice)  other 29.7% (blocked 0.2%)
+[SERVE] device wait 46.5% of loop (73319 syncs, 1.08 ms mean, 23.61 per iteration); host 53.2% (29.19 ms per iteration); blocked 0.2%
+[SERVE]   sync src/engine_pocket.c:7428  calls 111 (0.04 per iteration)  wait 95.9 ms total, 0.864 ms mean
+[SERVE]   sync src/engine_pocket.c:8233  calls 2794 (0.90 per iteration)  wait 1138.0 ms total, 0.407 ms mean
+[SERVE]   sync src/engine_pocket.c:6638  calls 47381 (15.25 per iteration)  wait 9660.6 ms total, 0.204 ms mean
+[SERVE]   sync src/engine_pocket.c:4964  calls 17032 (5.48 per iteration)  wait 73.5 ms total, 0.004 ms mean
+[SERVE]   sync src/engine_pocket.c:8642  calls 2994 (0.96 per iteration)  wait 33209.9 ms total, 11.092 ms mean
+[SERVE]   sync src/engine_pocket.c:12409  calls 3007 (0.97 per iteration)  wait 35037.0 ms total, 11.652 ms mean
+== e5-two two servers x 320 rows ready, VRAM 33540 MiB
+  p18080 C320 aps 465 rtf95 0.682 ttfa95 117ms st250 0 fail 0 cli_cpu 57%
+  p18081 C320 aps 448 rtf95 0.695 ttfa95 121ms st250 0 fail 0 cli_cpu 55%
+  TOTAL aps 913 | gpu 300W sm 93%
+[SERVE] device wait 55.0% of loop (117656 syncs, 1.07 ms mean, 31.36 per iteration); host 26.0% (15.84 ms per iteration); blocked 19.0%
+[SERVE] device wait 65.6% of loop (116958 syncs, 1.05 ms mean, 32.44 per iteration); host 33.1% (17.14 ms per iteration); blocked 1.4%
+MPS on
+== e6-two-mps two servers x 320 rows ready, VRAM 33540 MiB
+  p18080 C320 aps 444 rtf95 0.693 ttfa95 121ms st250 0 fail 0 cli_cpu 56%
+  p18081 C320 aps 464 rtf95 0.679 ttfa95 118ms st250 0 fail 0 cli_cpu 58%
+  TOTAL aps 908 | gpu 294W sm 93%
+[SERVE] device wait 53.3% of loop (116834 syncs, 1.05 ms mean, 32.30 per iteration); host 27.8% (17.61 ms per iteration); blocked 19.0%
+[SERVE] device wait 66.7% of loop (117721 syncs, 1.06 ms mean, 31.44 per iteration); host 32.4% (16.19 ms per iteration); blocked 1.0%
+MPS off
+== e7-1024 [] procs=4 ready in 129 s, VRAM 27410 MiB
+  C896 aps 781 rtf95 1.040 ttfa95 170ms gap95 157ms st250 1691 fail 0 | srv_cpu -1% cli_cpu 110% | gpu 266W sm 67%
+Traceback (most recent call last):
+  File "<stdin>", line 11, in <module>
+TypeError: unsupported operand type(s) for *: 'float' and 'NoneType'
+can't find pane: srv
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE] loop 216.0 s: step 34.7%  prefill-first 1.2% (2054 slices, 3 done, 1.2 ms/slice)  prefill-cont 0.1% (376 slices, 188 done, 0.5 ms/slice)  other 64.0% (blocked 0.2%)
+[SERVE] device wait 28.7% of loop (94539 syncs, 0.66 ms mean, 32.27 per iteration); host 71.0% (52.37 ms per iteration); blocked 0.2%
+== chain3 done 17:16:05

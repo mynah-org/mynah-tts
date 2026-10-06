@@ -1,0 +1,92 @@
+== base [] 17:21:00
+  cli  base  files 32 common 32 identical 32
+  srv  base  files 169 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== base2 [] 17:21:52
+  cli  base2 files 32 common 32 identical 32
+  srv  base2 files 167 common 167 identical 167
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== ALL [MYNAH_CANCEL_CHECK_EVERY=4 MYNAH_STREAM_OUT_WRITEV=1 MYNAH_DUP_CHECK_EPOCH=1 MYNAH_CUDA_DECODER_TABLE_PATCH=1 MYNAH_CUDA_ONESYNC_SUBSET=1 MYNAH_CUDA_DEFERRED_RELEASE=1 MYNAH_STREAM_DELIVER_THREADS=4 MYNAH_CUDA_PCM_DIRECT=1 MYNAH_CUDA_HIDDEN_LAZY=1 MYNAH_CUDA_KV_TABLE_CACHE=1 MYNAH_CUDA_DECODER_VALIDATE_ONCE=1] 17:22:45
+  cli  ALL   files 32 common 32 identical 32
+  srv  ALL   files 170 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L6 [MYNAH_CUDA_DEFERRED_RELEASE=1] 17:23:37
+  cli  L6    files 32 common 32 identical 32
+  srv  L6    files 170 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L7L8 [MYNAH_CANCEL_CHECK_EVERY=4 MYNAH_STREAM_OUT_WRITEV=1] 17:24:30
+  cli  L7L8  files 32 common 32 identical 32
+  srv  L7L8  files 168 common 168 identical 168
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L10 [MYNAH_DUP_CHECK_EPOCH=1] 17:25:22
+  cli  L10   files 32 common 32 identical 32
+  srv  L10   files 166 common 166 identical 166
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L11 [MYNAH_CUDA_DECODER_TABLE_PATCH=1] 17:26:15
+  cli  L11   files 32 common 32 identical 32
+  srv  L11   files 170 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L12 [MYNAH_CUDA_ONESYNC_SUBSET=1] 17:27:08
+  cli  L12   files 32 common 32 identical 32
+  srv  L12   files 169 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L19 [MYNAH_STREAM_DELIVER_THREADS=4] 17:28:00
+  cli  L19   files 32 common 32 identical 32
+  srv  L19   files 167 common 167 identical 167
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L20 [MYNAH_CUDA_PCM_DIRECT=1] 17:28:53
+  cli  L20   files 32 common 32 identical 32
+  srv  L20   files 171 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L21 [MYNAH_CUDA_HIDDEN_LAZY=1] 17:29:45
+  cli  L21   files 32 common 32 identical 32
+  srv  L21   files 170 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L22 [MYNAH_CUDA_KV_TABLE_CACHE=1] 17:30:37
+  cli  L22   files 32 common 32 identical 32
+  srv  L22   files 167 common 167 identical 167
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+== L24 [MYNAH_CUDA_DECODER_VALIDATE_ONCE=1] 17:31:30
+  cli  L24   files 32 common 32 identical 32
+  srv  L24   files 169 common 169 identical 169
+    mynah-tts: CUDA SEANet decoder convolutions in bf16 (MYNAH_CUDA_SEANET_BF16=1; fp32 accumulate, states and audio)
+    mynah-tts: CUDA bf16 Linears through cuBLASLt with per-shape heuristic algorithms (MYNAH_CUDA_BF16_LT=1)
+    mynah-tts: CUDA decode attention reads int8 KV rows (int8 KV, the default; MYNAH_CUDA_KV_DTYPE=bf16 rolls back)
+    mynah-tts: CUDA decoder ELU, causal window, residual and transposed-conv fold fused into the im2col/gather/overlap kernels, conv bias deferred to the reader (beta = 0) (MYNAH_CUDA_DECODER_FUSE=1)
+IDENT2-DONE

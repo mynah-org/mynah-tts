@@ -1,0 +1,14 @@
+== start 15:55:11
+BUILD 384 OK
+BUILD 768 OK
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+snapshot: /workspace/.hf_home/hub/models--kyutai--pocket-tts/snapshots/3e82814a68665eec246ff649b14c71331f955c06
+english_2026-04_24l
+  verified   : 72 declared dimensions cross-checked against tensors
+  verified   : tokenizer: 4000 pieces == text_vocab_size
+  verified   : 27 voice files match [2, 1, T, 16, 64] float16
+pocket batching self-check: PASS
+cuda backend self-test: PASS
+pocket batching self-check: PASS
+cuda backend self-test: PASS
+== PROV-DONE 15:56:05
