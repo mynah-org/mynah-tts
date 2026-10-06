@@ -1588,6 +1588,9 @@ struct mynah_engine_scratch {
     mynah_engine_ctx *cuda_ahead_rows[POCKET_MAX_BATCH];
     int cuda_ahead_hidden_lazy;
     int cuda_ahead_all_owned;
+    /* MYNAH_CUDA_DECODE_OVERLAP: the gang submitted by pocket_decode_submit
+     * and not yet collected. NULL until the first submission. */
+    struct pocket_gang_inflight *dec_inflight;
 };
 
 /* --------------------------------------------------------------- the dump
@@ -9240,6 +9243,9 @@ fallback:
  * nothing reads it, and is overwritten with the same values.  The serving
  * loop never needs this; every entry that could otherwise read or overwrite
  * the queued frame's buffers calls it first, as a safety net. */
+/* MYNAH_CUDA_DECODE_OVERLAP safety net (defined with the decode split). */
+static void pocket_decode_inflight_settle(mynah_engine_scratch *scratch);
+
 static unsigned long pocket_ahead_discarded;
 
 static void pocket_cuda_ahead_discard(mynah_engine_scratch *scratch,
@@ -11129,6 +11135,8 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                      POCKET_MAX_BATCH);
         return -1;
     }
+    /* MYNAH_CUDA_DECODE_OVERLAP safety net (a no-op unless a gang is queued). */
+    pocket_decode_inflight_settle(scratch);
 
     /* ---- 1. pre-flight: decided for every context, mutating none of them --- */
     size_t offset_before[POCKET_MAX_BATCH];
@@ -11496,6 +11504,8 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     if (count == 0u) return 0;
     /* MYNAH_CUDA_STEP_OVERLAP safety net: emit reads the staged outputs. */
     pocket_cuda_ahead_discard(scratch, "an emit");
+    /* MYNAH_CUDA_DECODE_OVERLAP safety net (a no-op unless a gang is queued). */
+    pocket_decode_inflight_settle(scratch);
 
     /* s and t, pinned at the endpoints; the manifest check at load time is what
      * makes this array the right length. */
@@ -12849,12 +12859,151 @@ fail:
     return 1;
 }
 
-static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
-                                     const size_t *first_frame,
-                                     const size_t *frame_count, float **out_samples,
-                                     size_t *out_count, int *failed,
-                                     mynah_engine_scratch *scratch, char *error,
-                                     size_t capacity) {
+/* ---- the decode split (MYNAH_CUDA_DECODE_OVERLAP) ------------------------
+ *
+ * pocket_decode_gang below is the gang decode, cut at its one stream drain.
+ * Called by pocket_decode_audio_batch it runs through, exactly as before.
+ * Called by pocket_decode_submit with `defer` it stops at the drain of a
+ * single-frame CUDA gang -- everything before it queued, nothing after it
+ * done -- records a fence, and leaves the rest here; pocket_decode_collect
+ * waits for the fence and runs the same landing code (pocket_decode_gang_land)
+ * the through path runs after its drain. Any other gang (a multi-frame range,
+ * the CPU schedule, nothing left on the device) completes inside the
+ * submission and the collect only hands its results over.
+ *
+ * Between the two only the PCM of this gang is in flight: the backend's
+ * pinned gather block, the rows' decoder outputs and `ctx->pcm`. The step the
+ * driver queues meanwhile (pocket_step_launch) reads and writes none of them,
+ * and the next gang is submitted only after this one was collected, so the
+ * L11 table patch, the gather meta and the upsample meta events all refer to
+ * completed work by then. */
+typedef struct pocket_gang_inflight {
+    int active;          /* submitted and not yet collected */
+    int queued;          /* device work queued; the landing is still to run */
+    int rc;              /* the gang call's own result */
+    int reported;
+    void *fence;
+    size_t count;
+    int lend;
+    const mynah_backend *backend;
+    const float *gang_pcm;
+    size_t gang_pcm_rows;
+    size_t gang_pcm_floats;
+    size_t submitted_count;
+    char error[256];
+    mynah_engine_ctx *ctxs[POCKET_MAX_BATCH];
+    size_t frame_count[POCKET_MAX_BATCH];
+    float *out_samples[POCKET_MAX_BATCH];
+    size_t out_count[POCKET_MAX_BATCH];
+    int failed[POCKET_MAX_BATCH];
+    int submitted[POCKET_MAX_BATCH];
+    size_t gang_pcm_index[POCKET_MAX_BATCH];
+} pocket_gang_inflight;
+
+/* After the drain: place every submitted row's PCM, check it, finish the
+ * frame; then copy the rows that were not placed. Frame `f` of the gang. */
+static void pocket_decode_gang_land(
+    mynah_engine_ctx *const *ctxs, size_t count, const size_t *frame_count,
+    float **out_samples, size_t *out_count, int *failed, int *reported,
+    char *error, size_t capacity, const mynah_backend *batch_backend,
+    const int *submitted, size_t submitted_count, const float *gang_pcm,
+    size_t gang_pcm_rows, size_t gang_pcm_floats, const size_t *gang_pcm_index,
+    int lend, size_t f, int sync_failed, const char *sync_error) {
+    /* MYNAH_CUDA_PCM_DIRECT: this frame went from the pinned gang rows
+     * straight into the range, so `ctx->pcm` was skipped both ways. */
+    int placed[POCKET_MAX_BATCH];
+    memset(placed, 0, sizeof(placed));
+    char one_error[256];
+    if (submitted_count > 0u) {
+                if (sync_failed) {
+                    for (size_t i = 0; i < count; ++i) {
+                        if (submitted[i] && !failed[i])
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, reported,
+                                                     sync_error, error, capacity);
+                    }
+                } else {
+                    if (gang_pcm != NULL) {
+                        for (size_t r = 0; r < gang_pcm_rows; ++r) {
+                            const size_t i = gang_pcm_index[r];
+                            mynah_engine_ctx *ctx = ctxs[i];
+                            const size_t frame_samples =
+                                ctx->state->cfg.samples_per_frame;
+                            /* Only when the row IS one frame of the range and
+                             * nobody reads `ctx->pcm` afterwards: the debug
+                             * dump copies it in decode_frame_finish. Anything
+                             * else takes the two-copy route below. */
+                            if (lend && ctx->dump == NULL &&
+                                gang_pcm_floats == frame_samples &&
+                                out_samples[i] != NULL && f < frame_count[i]) {
+                                memcpy(out_samples[i] + f * frame_samples,
+                                       gang_pcm + r * gang_pcm_floats,
+                                       gang_pcm_floats * sizeof(float));
+                                placed[i] = 1;
+                                continue;
+                            }
+                            memcpy(ctx->pcm, gang_pcm + r * gang_pcm_floats,
+                                   gang_pcm_floats * sizeof(float));
+                        }
+                        mynah_backend_note_codec_gang(batch_backend, 1,
+                                                      gang_pcm_rows);
+                    }
+                    for (size_t i = 0; i < count; ++i) {
+                        if (!submitted[i] || failed[i]) continue;
+                        size_t input_floats = 0u;
+                        size_t output_floats = 0u;
+                        one_error[0] = '\0';
+                        /* The same scan over the same floats, wherever they
+                         * landed: a placed row's slice is exactly the row. */
+                        const float *frame_pcm =
+                            placed[i] ? out_samples[i] +
+                                            f * ctxs[i]->state->cfg.samples_per_frame
+                                      : ctxs[i]->pcm;
+                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
+                                                      &output_floats) != 0 ||
+                            !pocket_all_finite(frame_pcm, output_floats)) {
+                            snprintf(one_error, sizeof(one_error),
+                                     "CUDA decoder produced non-finite PCM");
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, reported,
+                                                     one_error, error, capacity);
+                            continue;
+                        }
+                        if (pocket_decode_frame_finish(ctxs[i], 0, one_error,
+                                                       sizeof(one_error)) != 0)
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, reported,
+                                                     one_error, error, capacity);
+                    }
+                }
+    }
+
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                if (placed[i]) continue;
+                const size_t frame_samples = ctxs[i]->state->cfg.samples_per_frame;
+                memcpy(out_samples[i] + f * frame_samples, ctxs[i]->pcm,
+                       frame_samples * sizeof(float));
+            }
+}
+
+/* The codec position of every row whose range was decoded in full. */
+static void pocket_decode_gang_advance(mynah_engine_ctx *const *ctxs,
+                                       size_t count, const size_t *frame_count,
+                                       float *const *out_samples,
+                                       const int *failed) {
+    for (size_t i = 0; i < count; ++i) {
+        if (failed[i] || out_samples[i] == NULL) continue;
+        ctxs[i]->decoded_frames += frame_count[i];
+    }
+}
+
+static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
+                              const size_t *first_frame,
+                              const size_t *frame_count, float **out_samples,
+                              size_t *out_count, int *failed,
+                              mynah_engine_scratch *scratch, char *error,
+                              size_t capacity, pocket_gang_inflight *defer) {
     /* The driver owns the arrays and pre-clears them; scratch is shared only
      * for the resident CUDA codec gang and never retains request ownership. */
     if (ctxs == NULL || first_frame == NULL || frame_count == NULL ||
@@ -12865,6 +13014,8 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
     if (count == 0u) return 0;
     /* MYNAH_CUDA_STEP_OVERLAP safety net. */
     pocket_cuda_ahead_discard(scratch, "a gang decode");
+    /* MYNAH_CUDA_DECODE_OVERLAP safety net: land a gang still in flight. */
+    pocket_decode_inflight_settle(scratch);
     if (count > POCKET_MAX_BATCH) {
         /* Not a buffer bound -- this function stages nothing and the loop below
          * would serve any width. It is refused because a gang wider than the
@@ -12966,15 +13117,20 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
          * though their launches share this backend stream. */
         int prepared[POCKET_MAX_BATCH];
         int submitted[POCKET_MAX_BATCH];
-        /* MYNAH_CUDA_PCM_DIRECT: this frame went from the pinned gang rows
-         * straight into the range, so `ctx->pcm` was skipped both ways. */
-        int placed[POCKET_MAX_BATCH];
         for (size_t f = 0; f < longest; ++f) {
             memset(prepared, 0, sizeof(prepared));
             memset(submitted, 0, sizeof(submitted));
-            memset(placed, 0, sizeof(placed));
             size_t submitted_count = 0u;
             int decoder_batch_used = 0;
+            /* Declared outside the drain's block so a gang that queued nothing
+             * still lands (pocket_decode_gang_land copies its CPU rows). */
+            const float *gang_pcm = NULL;
+            size_t gang_pcm_rows = 0u;
+            size_t gang_pcm_floats = 0u;
+            size_t gang_pcm_index[POCKET_MAX_BATCH];
+            int sync_failed = 0;
+            char sync_error[256];
+            sync_error[0] = '\0';
 
             /* Queue every request's quantizer + upsample for this frame in
              * one submission before the per-request host preparation. */
@@ -13169,10 +13325,6 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                 /* One gather + one D2H for the whole gang's PCM.  Any
                  * refusal leaves nothing queued and falls back to the
                  * per-request copies below. */
-                const float *gang_pcm = NULL;
-                size_t gang_pcm_rows = 0u;
-                size_t gang_pcm_floats = 0u;
-                size_t gang_pcm_index[POCKET_MAX_BATCH];
                 if (pocket_cuda_codec_gang_enabled() && submitted_count > 1u) {
                     const float *sources[POCKET_MAX_BATCH];
                     int uniform = 1;
@@ -13210,89 +13362,205 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                                                  one_error, error, capacity);
                 }
 
-                char sync_error[256];
-                sync_error[0] = '\0';
-                const int sync_failed = mynah_backend_sync(
-                    batch_backend, sync_error, sizeof(sync_error)) != 0;
-                if (sync_failed) {
-                    for (size_t i = 0; i < count; ++i) {
-                        if (submitted[i] && !failed[i])
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, &reported,
-                                                     sync_error, error, capacity);
-                    }
-                } else {
-                    if (gang_pcm != NULL) {
-                        for (size_t r = 0; r < gang_pcm_rows; ++r) {
-                            const size_t i = gang_pcm_index[r];
-                            mynah_engine_ctx *ctx = ctxs[i];
-                            const size_t frame_samples =
-                                ctx->state->cfg.samples_per_frame;
-                            /* Only when the row IS one frame of the range and
-                             * nobody reads `ctx->pcm` afterwards: the debug
-                             * dump copies it in decode_frame_finish. Anything
-                             * else takes the two-copy route below. */
-                            if (lend && ctx->dump == NULL &&
-                                gang_pcm_floats == frame_samples &&
-                                out_samples[i] != NULL && f < frame_count[i]) {
-                                memcpy(out_samples[i] + f * frame_samples,
-                                       gang_pcm + r * gang_pcm_floats,
-                                       gang_pcm_floats * sizeof(float));
-                                placed[i] = 1;
-                                continue;
-                            }
-                            memcpy(ctx->pcm, gang_pcm + r * gang_pcm_floats,
-                                   gang_pcm_floats * sizeof(float));
-                        }
-                        mynah_backend_note_codec_gang(batch_backend, 1,
-                                                      gang_pcm_rows);
-                    }
-                    for (size_t i = 0; i < count; ++i) {
-                        if (!submitted[i] || failed[i]) continue;
-                        size_t input_floats = 0u;
-                        size_t output_floats = 0u;
-                        one_error[0] = '\0';
-                        /* The same scan over the same floats, wherever they
-                         * landed: a placed row's slice is exactly the row. */
-                        const float *frame_pcm =
-                            placed[i] ? out_samples[i] +
-                                            f * ctxs[i]->state->cfg.samples_per_frame
-                                      : ctxs[i]->pcm;
-                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
-                                                      &output_floats) != 0 ||
-                            !pocket_all_finite(frame_pcm, output_floats)) {
-                            snprintf(one_error, sizeof(one_error),
-                                     "CUDA decoder produced non-finite PCM");
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, &reported,
-                                                     one_error, error, capacity);
-                            continue;
-                        }
-                        if (pocket_decode_frame_finish(ctxs[i], 0, one_error,
-                                                       sizeof(one_error)) != 0)
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, &reported,
-                                                     one_error, error, capacity);
-                    }
+                /* MYNAH_CUDA_DECODE_OVERLAP: everything up to the drain is
+                 * queued; the drain and the landing run in the collect. */
+                if (defer != NULL && longest == 1u) {
+                    defer->reported = reported;
+                    defer->lend = lend;
+                    defer->backend = batch_backend;
+                    defer->gang_pcm = gang_pcm;
+                    defer->gang_pcm_rows = gang_pcm_rows;
+                    defer->gang_pcm_floats = gang_pcm_floats;
+                    defer->submitted_count = submitted_count;
+                    for (size_t i = 0; i < count; ++i)
+                        defer->submitted[i] = submitted[i];
+                    for (size_t r = 0; r < gang_pcm_rows; ++r)
+                        defer->gang_pcm_index[r] = gang_pcm_index[r];
+                    defer->fence = mynah_backend_fence_record(batch_backend);
+                    defer->queued = 1;
+                    mynah_region_end(MYNAH_RGN_CODEC);
+                    return 0;
                 }
+                sync_failed = mynah_backend_sync(
+                    batch_backend, sync_error, sizeof(sync_error)) != 0;
             }
-
-            for (size_t i = 0; i < count; ++i) {
-                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
-                if (placed[i]) continue;
-                const size_t frame_samples = ctxs[i]->state->cfg.samples_per_frame;
-                memcpy(out_samples[i] + f * frame_samples, ctxs[i]->pcm,
-                       frame_samples * sizeof(float));
-            }
+            pocket_decode_gang_land(ctxs, count, frame_count, out_samples,
+                                    out_count, failed, &reported, error,
+                                    capacity, batch_backend, submitted,
+                                    submitted_count, gang_pcm, gang_pcm_rows,
+                                    gang_pcm_floats, gang_pcm_index, lend, f,
+                                    sync_failed, sync_error);
         }
     }
     mynah_region_end(MYNAH_RGN_CODEC);
 
-    for (size_t i = 0; i < count; ++i) {
-        if (failed[i] || out_samples[i] == NULL) continue;
-        ctxs[i]->decoded_frames += frame_count[i];
-    }
+    pocket_decode_gang_advance(ctxs, count, frame_count, out_samples, failed);
     return 0;
+}
+
+static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                                     const size_t *first_frame,
+                                     const size_t *frame_count, float **out_samples,
+                                     size_t *out_count, int *failed,
+                                     mynah_engine_scratch *scratch, char *error,
+                                     size_t capacity) {
+    return pocket_decode_gang(ctxs, count, first_frame, frame_count, out_samples,
+                              out_count, failed, scratch, error, capacity, NULL);
+}
+
+/* Wait for the gang's fence and run what pocket_decode_gang would have run
+ * after its drain. The results stay in `g` until the collect hands them on. */
+static void pocket_decode_inflight_land(pocket_gang_inflight *g) {
+    char sync_error[256];
+    sync_error[0] = '\0';
+    const int sync_failed = mynah_backend_fence_sync(g->backend, g->fence,
+                                                     sync_error,
+                                                     sizeof(sync_error)) != 0;
+    g->fence = NULL;
+    mynah_region_begin(MYNAH_RGN_CODEC);
+    pocket_decode_gang_land(g->ctxs, g->count, g->frame_count, g->out_samples,
+                            g->out_count, g->failed, &g->reported, g->error,
+                            sizeof(g->error), g->backend, g->submitted,
+                            g->submitted_count, g->gang_pcm, g->gang_pcm_rows,
+                            g->gang_pcm_floats, g->gang_pcm_index, g->lend, 0u,
+                            sync_failed, sync_error);
+    mynah_region_end(MYNAH_RGN_CODEC);
+    pocket_decode_gang_advance(g->ctxs, g->count, g->frame_count, g->out_samples,
+                               g->failed);
+    g->queued = 0;
+}
+
+/* Safety net, like pocket_cuda_ahead_discard: an engine call that could read
+ * or overwrite a queued gang's buffers lands it first. Its results are kept
+ * for the collect, so nothing is lost; the driver never needs this. */
+static void pocket_decode_inflight_settle(mynah_engine_scratch *scratch) {
+    if (scratch == NULL || scratch->dec_inflight == NULL ||
+        !scratch->dec_inflight->active || !scratch->dec_inflight->queued)
+        return;
+    pocket_decode_inflight_land(scratch->dec_inflight);
+}
+
+/* Scratch teardown: never leave a fence or queued copies behind. A gang that
+ * was never collected is not landed -- its contexts may be gone already. */
+static void pocket_decode_inflight_release(mynah_engine_scratch *scratch) {
+    if (scratch == NULL || scratch->dec_inflight == NULL) return;
+    pocket_gang_inflight *g = scratch->dec_inflight;
+    if (g->queued) {
+        char drain[256];
+        drain[0] = '\0';
+        (void)mynah_backend_fence_sync(g->backend, g->fence, drain, sizeof(drain));
+    }
+    free(g);
+    scratch->dec_inflight = NULL;
+}
+
+static unsigned long pocket_decode_sync_submits;
+
+/* tts_engine.h `decode_submit` (MYNAH_CUDA_DECODE_OVERLAP). */
+static int pocket_decode_submit(mynah_engine_ctx *const *ctxs, size_t count,
+                                const size_t *first_frame,
+                                const size_t *frame_count,
+                                mynah_engine_scratch *scratch, char *error,
+                                size_t capacity) {
+    if (ctxs == NULL || first_frame == NULL || frame_count == NULL ||
+        scratch == NULL || count == 0u || count > POCKET_MAX_BATCH) {
+        pocket_error(error, capacity, "pocket: invalid decode gang submission");
+        return -1;
+    }
+    if (scratch->dec_inflight == NULL) {
+        scratch->dec_inflight =
+            (pocket_gang_inflight *)calloc(1, sizeof(*scratch->dec_inflight));
+        if (scratch->dec_inflight == NULL) {
+            pocket_error(error, capacity,
+                         "pocket: out of memory for the decode gang record");
+            return -1;
+        }
+    }
+    pocket_gang_inflight *g = scratch->dec_inflight;
+    if (g->active) {
+        pocket_error(error, capacity,
+                     "pocket: a decode gang is already in flight on this scratch");
+        return -1;
+    }
+    g->queued = 0;
+    g->fence = NULL;
+    g->reported = 0;
+    g->error[0] = '\0';
+    g->count = count;
+    g->backend = NULL;
+    g->gang_pcm = NULL;
+    g->gang_pcm_rows = 0u;
+    g->gang_pcm_floats = 0u;
+    g->submitted_count = 0u;
+    for (size_t i = 0; i < count; ++i) {
+        g->ctxs[i] = ctxs[i];
+        g->frame_count[i] = frame_count[i];
+        g->out_samples[i] = NULL;
+        g->out_count[i] = 0u;
+        g->failed[i] = 0;
+    }
+    /* The codec-batch opt-in drains inside its transformer and shares the
+     * scratch's codec arrays: it runs through, synchronously. */
+    const int can_queue = !pocket_cuda_codec_batch_enabled();
+    g->rc = pocket_decode_gang(ctxs, count, first_frame, g->frame_count,
+                               g->out_samples, g->out_count, g->failed, scratch,
+                               g->error, sizeof(g->error), can_queue ? g : NULL);
+    g->active = 1;
+    /* MYNAH_CUDA_DECODE_CHECK=1 (debug): land the gang right here, so nothing
+     * the driver does before the collect can overlap it. The audio must be
+     * byte-identical to a run without it; a difference is a race on a buffer
+     * the gang and the work queued after it share. */
+    static int decode_check = -1;
+    if (decode_check < 0) {
+        const char *value = getenv("MYNAH_CUDA_DECODE_CHECK");
+        decode_check = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    if (decode_check && g->queued) {
+        pocket_decode_inflight_land(g);
+        return 0;
+    }
+    if (!g->queued && pocket_decode_sync_submits++ == 0ul)
+        fprintf(stderr,
+                "mynah-tts: MYNAH_CUDA_DECODE_OVERLAP: a decode gang completed "
+                "inside its submission (%s); correct, not overlapped; further "
+                "ones are not reported\n",
+                !can_queue ? "MYNAH_CUDA_CODEC_BATCH is on"
+                           : "not a single-frame gang on the CUDA decoder");
+    return 0;
+}
+
+/* tts_engine.h `decode_collect` (MYNAH_CUDA_DECODE_OVERLAP). */
+static int pocket_decode_collect(mynah_engine_ctx *const *ctxs, size_t count,
+                                 int wait, float **out_samples, size_t *out_count,
+                                 int *failed, mynah_engine_scratch *scratch,
+                                 char *error, size_t capacity) {
+    pocket_gang_inflight *g = scratch != NULL ? scratch->dec_inflight : NULL;
+    if (g == NULL || !g->active || ctxs == NULL || out_samples == NULL ||
+        out_count == NULL || failed == NULL || count != g->count) {
+        pocket_error(error, capacity, "pocket: no such decode gang in flight");
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i] != g->ctxs[i]) {
+            pocket_error(error, capacity,
+                         "pocket: decode collect for other rows than submitted");
+            return -1;
+        }
+    }
+    if (g->queued) {
+        /* Not ready is not an error: the driver polls between admissions. */
+        if (!wait && mynah_backend_fence_query(g->backend, g->fence) == 0)
+            return 1;
+        pocket_decode_inflight_land(g);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        out_samples[i] = g->out_samples[i];
+        out_count[i] = g->out_count[i];
+        failed[i] = g->failed[i];
+    }
+    if (g->error[0] != '\0') pocket_error(error, capacity, "%s", g->error);
+    g->active = 0;
+    return g->rc;
 }
 
 /* ---------------------------------------------------------------- scratch */
@@ -13441,6 +13709,7 @@ static void pocket_cuda_flow_release(mynah_engine_scratch *scratch) {
 static void pocket_scratch_free(mynah_engine_scratch *scratch) {
     if (scratch == NULL) return;
     pocket_cuda_ahead_discard(scratch, "scratch freed");
+    pocket_decode_inflight_release(scratch);
     /* MYNAH_CUDA_HIDDEN_LAZY: the rows' host copies before cuda_norm goes. */
     (void)pocket_cuda_hidden_materialize(scratch);
     free(scratch->cuda_kv_table_keys);
@@ -14140,6 +14409,8 @@ static const mynah_tts_engine pocket_engine = {
     pocket_ctx_new_host,       /* APPENDED: MYNAH_ASYNC_ADMIT, first phase */
     pocket_ctx_attach,         /* APPENDED: MYNAH_ASYNC_ADMIT, second phase */
     pocket_step_launch,        /* APPENDED: MYNAH_CUDA_STEP_OVERLAP */
+    pocket_decode_submit,      /* APPENDED: MYNAH_CUDA_DECODE_OVERLAP */
+    pocket_decode_collect,     /* APPENDED: MYNAH_CUDA_DECODE_OVERLAP */
 };
 
 const mynah_tts_engine *mynah_engine_pocket(void) { return &pocket_engine; }
@@ -14904,9 +15175,15 @@ static int pocket_check_gang(mynah_engine_state *state,
         float *got[POCKET_CHECK_MAX];
         size_t got_n[POCKET_CHECK_MAX];
         int failed[POCKET_CHECK_MAX];
+        /* MYNAH_CUDA_DECODE_OVERLAP: every other round goes through the
+         * decode split instead, with one frame per row, which is the shape
+         * it queues (multi-frame ranges complete inside the submission). */
+        const char *split_env = getenv("MYNAH_CUDA_DECODE_OVERLAP");
+        const int split = split_env != NULL && split_env[0] != '\0' &&
+                          strcmp(split_env, "0") != 0 && (round % 2u) == 1u;
         for (size_t i = 0; i < count; ++i) {
             const size_t available = b.ctx[i]->frames - done_frames[i];
-            size_t quantum = (i % 3u) + 1u;
+            size_t quantum = split ? 1u : (i % 3u) + 1u;
             if (quantum > available) quantum = available;
             first[i] = done_frames[i];
             want[i] = quantum;
@@ -14915,8 +15192,15 @@ static int pocket_check_gang(mynah_engine_state *state,
             failed[i] = 0;
         }
         mynah_engine_ctx *const *bctxs = b.ctx;
-        if (pocket_decode_audio_batch(bctxs, count, first, want, got, got_n, failed,
-                                      scratch, error, capacity) != 0) {
+        if (split) {
+            if (pocket_decode_submit(bctxs, count, first, want, scratch, error,
+                                     capacity) != 0 ||
+                pocket_decode_collect(bctxs, count, 1, got, got_n, failed,
+                                      scratch, error, capacity) != 0)
+                goto done;
+        } else if (pocket_decode_audio_batch(bctxs, count, first, want, got,
+                                             got_n, failed, scratch, error,
+                                             capacity) != 0) {
             goto done;
         }
         for (size_t i = 0; i < count; ++i) {

@@ -12296,6 +12296,30 @@ extern "C" void mynah_cuda_fence_wait(void *opaque, void *fence) {
     cudaEventDestroy(event);
 }
 
+/* MYNAH_CUDA_DECODE_OVERLAP: poll a fence without waiting or releasing it. */
+extern "C" int mynah_cuda_fence_query(void *opaque, void *fence) {
+    (void)opaque;
+    if (fence == nullptr) return 1;
+    const cudaError_t status = cudaEventQuery(static_cast<cudaEvent_t>(fence));
+    if (status == cudaSuccess) return 1;
+    if (status == cudaErrorNotReady) {
+        (void)cudaGetLastError();   /* not an error; do not leave it pending */
+        return 0;
+    }
+    return -1;
+}
+
+/* Wait for a fence and release it, reporting a device error. */
+extern "C" int mynah_cuda_fence_sync(void *opaque, void *fence, char *e,
+                                     size_t ec) {
+    (void)opaque;
+    if (fence == nullptr) return 0;
+    cudaEvent_t event = static_cast<cudaEvent_t>(fence);
+    const cudaError_t status = cudaEventSynchronize(event);
+    cudaEventDestroy(event);
+    return ce(status, e, ec);
+}
+
 static cuda_graph_entry *find_graph(cuda_backend_state *st, size_t rows,
                                     size_t iw, size_t ow,
                                     const void *weight, const void *bias) {
