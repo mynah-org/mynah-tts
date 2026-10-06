@@ -71,6 +71,7 @@ struct mynah_backend {
     void (*fence_wait)(void *, void *);
     int (*fence_query)(void *, void *);
     int (*fence_sync)(void *, void *, char *, size_t);
+    void (*set_lane)(void *, int);
     int (*flow_batch_dev)(void *, const mynah_backend_flow_batch *, char *, size_t);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
@@ -199,6 +200,7 @@ extern void *mynah_cuda_fence_record(void *);
 extern void mynah_cuda_fence_wait(void *, void *);
 extern int mynah_cuda_fence_query(void *, void *);
 extern int mynah_cuda_fence_sync(void *, void *, char *, size_t);
+extern void mynah_cuda_set_lane(void *, int);
 extern int mynah_cuda_flow_batch_dev(void *, const mynah_backend_flow_batch *, char *, size_t);
 extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
@@ -735,6 +737,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->fence_wait = mynah_cuda_fence_wait;
         backend->fence_query = mynah_cuda_fence_query;
         backend->fence_sync = mynah_cuda_fence_sync;
+        backend->set_lane = mynah_cuda_set_lane;
         backend->flow_batch_dev = mynah_cuda_flow_batch_dev;
         backend->snake_dev = mynah_cuda_snake_dev;
         backend->gelu_dev = mynah_cuda_gelu_dev;
@@ -1085,6 +1088,7 @@ static _Atomic int g_sync_site_count;
  * those calls are counted per site. Profile runs only. */
 static _Atomic int g_sync_queued;
 static _Atomic unsigned long long g_sync_queued_calls;
+static _Atomic unsigned long long g_stream_sync_queued_calls;
 
 static void sync_site_note(const char *file, int line, unsigned long long ns) {
     const unsigned long long queued =
@@ -1116,6 +1120,10 @@ unsigned long long mynah_backend_sync_queued_calls(void) {
     return atomic_load_explicit(&g_sync_queued_calls, memory_order_relaxed);
 }
 
+unsigned long long mynah_backend_stream_sync_queued_calls(void) {
+    return atomic_load_explicit(&g_stream_sync_queued_calls, memory_order_relaxed);
+}
+
 int mynah_backend_sync_at(const mynah_backend *backend, char *error,
                           size_t error_capacity, const char *file, int line) {
     if (backend == NULL) return -1;
@@ -1132,6 +1140,9 @@ int mynah_backend_sync_at(const mynah_backend *backend, char *error,
     const unsigned long long ns = (unsigned long long)(waited > 0.0 ? waited * 1e9 : 0.0);
     atomic_fetch_add_explicit(&g_sync_wait_ns, ns, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_sync_calls, 1ull, memory_order_relaxed);
+    if (atomic_load_explicit(&g_sync_queued, memory_order_relaxed))
+        atomic_fetch_add_explicit(&g_stream_sync_queued_calls, 1ull,
+                                  memory_order_relaxed);
     sync_site_note(file, line, ns);
     return result;
 }
@@ -1152,6 +1163,7 @@ void mynah_backend_sync_profile_reset(void) {
     atomic_store_explicit(&g_sync_wait_ns, 0ull, memory_order_relaxed);
     atomic_store_explicit(&g_sync_calls, 0ull, memory_order_relaxed);
     atomic_store_explicit(&g_sync_queued_calls, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_stream_sync_queued_calls, 0ull, memory_order_relaxed);
 }
 
 void mynah_backend_sync_profile_print(FILE *out, unsigned long long iterations) {
@@ -1253,6 +1265,11 @@ void mynah_backend_fence_wait(const mynah_backend *backend, void *fence) {
 int mynah_backend_fence_query(const mynah_backend *backend, void *fence) {
     if (backend == NULL || fence == NULL || backend->fence_query == NULL) return 1;
     return backend->fence_query(backend->state, fence);
+}
+
+void mynah_backend_set_lane(const mynah_backend *backend, int lane) {
+    if (backend != NULL && backend->set_lane != NULL)
+        backend->set_lane(backend->state, lane);
 }
 
 int mynah_backend_fence_sync_at(const mynah_backend *backend, void *fence,

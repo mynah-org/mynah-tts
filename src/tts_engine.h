@@ -370,6 +370,25 @@ typedef struct {
                            float **out_samples, size_t *out_count, int *failed,
                            mynah_engine_scratch *scratch,
                            char *error, size_t error_capacity);
+
+    /* ---- ping-pong groups (APPENDED; MYNAH_CUDA_PINGPONG) ------------------
+     *
+     * OPTIONAL. The driver serves two disjoint groups of contexts, each with
+     * its own scratch (`lane` 0 and 1), and keeps one group's work queued
+     * (`decode_submit`, then `step_launch`) while it finishes, emits, admits
+     * and prefills the other group's. Called once per scratch, before its
+     * first use. From then on:
+     *  - a step queued on a scratch must be finishable without waiting for
+     *    work queued for the other scratch after it (its finish waits on its
+     *    own fence, not on the whole device);
+     *  - nothing the host writes for one scratch may be read by work still
+     *    queued for the other (staging shared by the whole engine or backend
+     *    is selected per lane).
+     * The rules of `step_launch` and `decode_submit` hold per scratch: while
+     * one scratch has a step or a gang queued, the driver calls anything on
+     * the OTHER scratch and on contexts that are not in that step or gang.
+     * Each group's audio must be what its rows would produce served alone. */
+    void (*scratch_set_lane)(mynah_engine_scratch *scratch, int lane);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

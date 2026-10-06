@@ -1591,6 +1591,16 @@ struct mynah_engine_scratch {
     /* MYNAH_CUDA_DECODE_OVERLAP: the gang submitted by pocket_decode_submit
      * and not yet collected. NULL until the first submission. */
     struct pocket_gang_inflight *dec_inflight;
+    /* MYNAH_CUDA_PINGPONG (pocket_scratch_set_lane): this scratch serves one
+     * of two groups whose work is queued on the one stream at the same time.
+     * `lane` selects the group's copy of the backend's pinned codec-gang
+     * staging and decoder graphs; a frame queued ahead records a fence
+     * (`cuda_ahead_fence`) and its finish waits on that fence instead of
+     * draining the stream, which would also wait for the other group's work.
+     * All zero, and never read, unless the driver set a lane. */
+    int pingpong;
+    int lane;
+    void *cuda_ahead_fence;
 };
 
 /* --------------------------------------------------------------- the dump
@@ -9164,13 +9174,25 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
             scratch->cuda_ahead_rows[i] = ctxs[i];
             ctxs[i]->cuda_ahead_scratch = scratch;
         }
+        /* MYNAH_CUDA_PINGPONG: the end of this frame's work on the stream.
+         * NULL (no fence) falls back to the stream drain below. */
+        if (scratch->pingpong)
+            scratch->cuda_ahead_fence = mynah_backend_fence_record(scratch->backend);
         return 0;
     }
 
 frame_sync:
-    /* 5. the one sync of the frame. */
-    if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0)
+    /* 5. the one sync of the frame.  MYNAH_CUDA_PINGPONG: the frame's own
+     * fence, so the other group's work queued behind it is not waited for. */
+    if (scratch->cuda_ahead_fence != NULL) {
+        void *fence = scratch->cuda_ahead_fence;
+        scratch->cuda_ahead_fence = NULL;
+        if (mynah_backend_fence_sync(scratch->backend, fence, local,
+                                     sizeof(local)) != 0)
+            goto fallback_drain;
+    } else if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) {
         goto fallback_drain;
+    }
 
     for (size_t i = 0; i < count && hidden_lazy; ++i) {
         /* `!(x == 0)` is also true for NaN.  The same outcome as the commit's
@@ -9254,6 +9276,10 @@ static void pocket_cuda_ahead_discard(mynah_engine_scratch *scratch,
     char drain[256];
     drain[0] = '\0';
     (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+    if (scratch->cuda_ahead_fence != NULL) {   /* MYNAH_CUDA_PINGPONG */
+        mynah_backend_fence_wait(scratch->backend, scratch->cuda_ahead_fence);
+        scratch->cuda_ahead_fence = NULL;
+    }
     for (size_t i = 0; i < scratch->cuda_ahead_count; ++i) {
         mynah_engine_ctx *ctx = scratch->cuda_ahead_rows[i];
         if (ctx == NULL) continue;
@@ -13012,6 +13038,9 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
         return -1;
     }
     if (count == 0u) return 0;
+    /* MYNAH_CUDA_PINGPONG: this group's pinned PCM block and decoder graphs. */
+    if (scratch != NULL && scratch->pingpong)
+        mynah_backend_set_lane(scratch->backend, scratch->lane);
     /* MYNAH_CUDA_STEP_OVERLAP safety net. */
     pocket_cuda_ahead_discard(scratch, "a gang decode");
     /* MYNAH_CUDA_DECODE_OVERLAP safety net: land a gang still in flight. */
@@ -13561,6 +13590,13 @@ static int pocket_decode_collect(mynah_engine_ctx *const *ctxs, size_t count,
     if (g->error[0] != '\0') pocket_error(error, capacity, "%s", g->error);
     g->active = 0;
     return g->rc;
+}
+
+/* tts_engine.h `scratch_set_lane` (MYNAH_CUDA_PINGPONG). */
+static void pocket_scratch_set_lane(mynah_engine_scratch *scratch, int lane) {
+    if (scratch == NULL) return;
+    scratch->pingpong = 1;
+    scratch->lane = lane == 1 ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------- scratch */
@@ -14411,6 +14447,7 @@ static const mynah_tts_engine pocket_engine = {
     pocket_step_launch,        /* APPENDED: MYNAH_CUDA_STEP_OVERLAP */
     pocket_decode_submit,      /* APPENDED: MYNAH_CUDA_DECODE_OVERLAP */
     pocket_decode_collect,     /* APPENDED: MYNAH_CUDA_DECODE_OVERLAP */
+    pocket_scratch_set_lane,   /* APPENDED: MYNAH_CUDA_PINGPONG */
 };
 
 const mynah_tts_engine *mynah_engine_pocket(void) { return &pocket_engine; }

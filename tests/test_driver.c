@@ -57,6 +57,13 @@ typedef struct {
     size_t dec_not_ready;         /* polls answered "not yet" */
     size_t dec_first_gangs;       /* gangs made only of first frames */
     size_t dec_violations;        /* calls the decode split forbids meanwhile */
+    /* MYNAH_CUDA_PINGPONG: each lane's steps, as step_rows above, so a group
+     * can be compared with a run of its rows alone. */
+    uint64_t lane_rows[2][LOG_MAX];
+    size_t lane_steps[2];
+    size_t lanes_set;             /* scratch_set_lane calls */
+    size_t pp_overlapped;         /* launches while the other lane had work queued */
+    size_t pp_violations;         /* calls the per-scratch seam forbids */
 } observation;
 
 static observation g_obs;
@@ -87,7 +94,7 @@ static void observe_decode(uint64_t seed, size_t frames) {
 /* ---- the synthetic engine ----------------------------------------------- */
 
 struct mynah_engine_state { int live; };
-struct mynah_engine_scratch { size_t batch; };
+struct mynah_engine_scratch { size_t batch; int lane; };
 
 struct mynah_engine_ctx {
     uint64_t seed;
@@ -255,6 +262,16 @@ static int fake_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
 /* Atomic over the batch, as tts_engine.h requires: every context is checked
  * before any of them is advanced, so a refusal leaves the batch exactly as it
  * found it and the driver's isolation pass is re-stepping, not double-stepping. */
+static int fake_step_core(mynah_engine_ctx *const *ctxs, size_t count,
+                          char *error, size_t capacity);
+
+static uint64_t fake_step_hash(mynah_engine_ctx *const *ctxs, size_t count) {
+    uint64_t rows = 0x84222325cbf29ce4ull ^ (uint64_t)count;
+    for (size_t i = 0; i < count; ++i)
+        rows = (rows ^ ctxs[i]->seed) * 0x100000001b3ull;
+    return rows;
+}
+
 static int fake_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                            mynah_engine_scratch *scratch, char *error,
                            size_t capacity) {
@@ -268,12 +285,12 @@ static int fake_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         else ++g_obs.overlap_violations;
         g_pending_count = 0u;
     }
-    if (g_obs.steps < LOG_MAX) {
-        uint64_t rows = 0x84222325cbf29ce4ull ^ (uint64_t)count;
-        for (size_t i = 0; i < count; ++i)
-            rows = (rows ^ ctxs[i]->seed) * 0x100000001b3ull;
-        g_obs.step_rows[g_obs.steps++] = rows;
-    }
+    if (g_obs.steps < LOG_MAX) g_obs.step_rows[g_obs.steps++] = fake_step_hash(ctxs, count);
+    return fake_step_core(ctxs, count, error, capacity);
+}
+
+static int fake_step_core(mynah_engine_ctx *const *ctxs, size_t count,
+                          char *error, size_t capacity) {
     /* THE NO-WAIT LAW, checked from inside the engine at the only moment it can
      * be: the top of a step, when the previous step's delivery is complete. A
      * context still holding at least a full quantum of undelivered frames means
@@ -518,6 +535,173 @@ static int fake_decode_collect(mynah_engine_ctx *const *ctxs, size_t count,
     return 0;
 }
 
+/* ---- MYNAH_CUDA_PINGPONG: the same engine with per-scratch queues --------
+ *
+ * Two scratches (lanes), each with its own queued step and its own decode
+ * gang in flight. The seam (tts_engine.h, `scratch_set_lane`) is the rules of
+ * `step_launch` and `decode_submit` applied per scratch: while a lane has
+ * work queued, nothing may step, emit or decode on that lane or touch its
+ * queued contexts -- and anything may happen on the other lane, which is the
+ * overlap ping-pong exists for. */
+typedef struct {
+    mynah_engine_ctx *pending[FAKE_MAX_BATCH];
+    size_t pending_count;
+    mynah_engine_ctx *dec[FAKE_MAX_BATCH];
+    float *dec_pcm[FAKE_MAX_BATCH];
+    size_t dec_count_out[FAKE_MAX_BATCH];
+    int dec_failed[FAKE_MAX_BATCH];
+    size_t dec_count;
+    int dec_inflight;
+    char dec_error[256];
+} pp_lane;
+
+static pp_lane g_lane[2];
+
+static void pp_reset(void) {
+    memset(g_lane, 0, sizeof(g_lane));
+}
+
+/* In a queued step, or (with `decode`) in a gang in flight. */
+static int pp_is_queued(const mynah_engine_ctx *ctx, int decode) {
+    for (int l = 0; l < 2; ++l) {
+        for (size_t i = 0; i < g_lane[l].pending_count; ++i)
+            if (g_lane[l].pending[i] == ctx) return 1;
+        for (size_t i = 0; decode && g_lane[l].dec_inflight && i < g_lane[l].dec_count; ++i)
+            if (g_lane[l].dec[i] == ctx) return 1;
+    }
+    return 0;
+}
+
+static void pp_scratch_set_lane(mynah_engine_scratch *scratch, int lane) {
+    scratch->lane = lane == 1 ? 1 : 0;
+    ++g_obs.lanes_set;
+}
+
+static void pp_ctx_free(mynah_engine_ctx *ctx) {
+    if (pp_is_queued(ctx, 1)) ++g_obs.pp_violations;
+    fake_ctx_free(ctx);
+}
+
+static int pp_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
+                            char *error, size_t capacity) {
+    /* A row back from a segment boundary is prefilled while its last frames
+     * are still being decoded, as with decode-ahead: the prefill and the
+     * codec share no state. Never while its step is queued. */
+    if (pp_is_queued(ctx, 0)) ++g_obs.pp_violations;
+    return fake_prepare_slice(ctx, budget, done, error, capacity);
+}
+
+static int pp_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                         mynah_engine_scratch *scratch, char *error,
+                         size_t capacity) {
+    pp_lane *L = &g_lane[scratch->lane];
+    const pp_lane *other = &g_lane[1 - scratch->lane];
+    if (L->dec_inflight) ++g_obs.pp_violations;
+    if (L->pending_count != 0u) {
+        int same = L->pending_count == count;
+        for (size_t i = 0; i < count && same; ++i) same = L->pending[i] == ctxs[i];
+        if (same) ++g_obs.finishes;
+        else ++g_obs.pp_violations;
+        L->pending_count = 0u;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        for (size_t j = 0; j < other->pending_count; ++j)
+            if (other->pending[j] == ctxs[i]) ++g_obs.pp_violations;
+    }
+    const int lane = scratch->lane;
+    if (g_obs.lane_steps[lane] < LOG_MAX)
+        g_obs.lane_rows[lane][g_obs.lane_steps[lane]++] = fake_step_hash(ctxs, count);
+    return fake_step_core(ctxs, count, error, capacity);
+}
+
+static int pp_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                         mynah_engine_step_result *results,
+                         mynah_engine_scratch *scratch, char *error,
+                         size_t capacity) {
+    const pp_lane *L = &g_lane[scratch->lane];
+    if (L->pending_count != 0u || L->dec_inflight) ++g_obs.pp_violations;
+    return fake_emit_batch(ctxs, count, results, scratch, error, capacity);
+}
+
+static int pp_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                                 const size_t *first, const size_t *frames,
+                                 float **out_samples, size_t *out_count,
+                                 int *failed, mynah_engine_scratch *scratch,
+                                 char *error, size_t capacity) {
+    if (g_lane[scratch->lane].dec_inflight) ++g_obs.pp_violations;
+    return fake_decode_audio_batch(ctxs, count, first, frames, out_samples,
+                                   out_count, failed, scratch, error, capacity);
+}
+
+static int pp_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
+                          mynah_engine_scratch *scratch) {
+    pp_lane *L = &g_lane[scratch->lane];
+    const pp_lane *other = &g_lane[1 - scratch->lane];
+    if (L->pending_count != 0u) ++g_obs.pp_violations;
+    if (count < 2u || count > FAKE_MAX_BATCH) return 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!ctxs[i]->prepared) return 1;
+        if (ctxs[i]->refuse_step >= 0 && ctxs[i]->step == (size_t)ctxs[i]->refuse_step)
+            return 1;
+    }
+    if (other->pending_count != 0u || other->dec_inflight) ++g_obs.pp_overlapped;
+    for (size_t i = 0; i < count; ++i) L->pending[i] = ctxs[i];
+    L->pending_count = count;
+    ++g_obs.launches;
+    return 0;
+}
+
+static int pp_decode_submit(mynah_engine_ctx *const *ctxs, size_t count,
+                            const size_t *first, const size_t *frames,
+                            mynah_engine_scratch *scratch, char *error,
+                            size_t capacity) {
+    pp_lane *L = &g_lane[scratch->lane];
+    /* One gang per scratch, submitted ahead of that scratch's next launch. */
+    if (L->dec_inflight || L->pending_count != 0u) ++g_obs.pp_violations;
+    if (count == 0u || count > FAKE_MAX_BATCH) {
+        fake_err(error, capacity, "fake: bad decode gang");
+        return -1;
+    }
+    ++g_obs.dec_submits;
+    for (size_t i = 0; i < count; ++i) {
+        L->dec[i] = ctxs[i];
+        L->dec_pcm[i] = NULL;
+        L->dec_count_out[i] = 0u;
+        L->dec_failed[i] = 0;
+    }
+    L->dec_error[0] = '\0';
+    const int rc = fake_decode_audio_batch(ctxs, count, first, frames, L->dec_pcm,
+                                           L->dec_count_out, L->dec_failed, scratch,
+                                           L->dec_error, sizeof(L->dec_error));
+    L->dec_count = count;
+    L->dec_inflight = 1;
+    return rc == 0 ? 0 : -1;
+}
+
+static int pp_decode_collect(mynah_engine_ctx *const *ctxs, size_t count, int wait,
+                             float **out_samples, size_t *out_count, int *failed,
+                             mynah_engine_scratch *scratch, char *error,
+                             size_t capacity) {
+    (void)wait;
+    pp_lane *L = &g_lane[scratch->lane];
+    if (!L->dec_inflight || count != L->dec_count) {
+        ++g_obs.pp_violations;
+        fake_err(error, capacity, "fake: no such gang in flight");
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i)
+        if (ctxs[i] != L->dec[i]) ++g_obs.pp_violations;
+    for (size_t i = 0; i < count; ++i) {
+        out_samples[i] = L->dec_pcm[i];
+        out_count[i] = L->dec_count_out[i];
+        failed[i] = L->dec_failed[i];
+    }
+    if (L->dec_error[0] != '\0') fake_err(error, capacity, L->dec_error);
+    L->dec_inflight = 0;
+    ++g_obs.dec_collects;
+    return 0;
+}
+
 static const mynah_tts_engine fake_engine_loop = {
     "driver-test",
     fake_model_init, fake_model_free, fake_caps,
@@ -586,6 +770,25 @@ static const mynah_tts_engine fake_engine_decode_overlap = {
     NULL, NULL,               /* ctx_new_host, ctx_attach */
     fake_step_launch,
     fake_decode_submit, fake_decode_collect,
+};
+
+/* Two lanes, each with its own queued step and decode (MYNAH_CUDA_PINGPONG).
+ * Off, it is a serial engine on lane 0: the reference runs use it too. */
+static const mynah_tts_engine fake_engine_pingpong = {
+    "fake-pingpong",
+    fake_model_init, fake_model_free, fake_caps,
+    fake_ctx_new, fake_prepare, fake_reset, pp_ctx_free,
+    pp_step_batch, pp_emit_batch,
+    fake_frame_count, fake_truncate, fake_decode_audio,
+    fake_scratch_new, fake_scratch_free,
+    NULL,
+    pp_decode_audio_batch,
+    pp_prepare_slice,
+    NULL,                     /* prepare_slice_batch */
+    NULL, NULL,               /* ctx_new_host, ctx_attach */
+    pp_step_launch,
+    pp_decode_submit, pp_decode_collect,
+    pp_scratch_set_lane,
 };
 
 /* ---- sinks -------------------------------------------------------------- */
@@ -1216,6 +1419,187 @@ int main(void) {
         if (bad == 11) return fail("decode overlap: continuous admission changed a request's audio");
         if (bad == 12) return fail("decode overlap: the failing request did not fail");
         if (bad == 13) return fail("decode overlap: one request's failure hurt a sibling");
+    }
+
+    /* ---- 9. ping-pong groups (MYNAH_CUDA_PINGPONG=2) --------------------- *
+     * (a) The split: the segmented burst of eight with the groups formed
+     *     from two rows on is cut into requests 0-3 (group A, lane 0) and 4-7
+     *     (group B, lane 1). Each lane's steps -- rows and order -- and every
+     *     request's audio must be those of a flag-off run of that half alone,
+     *     while the two lanes alternate with one lane's work queued during
+     *     the other's host work.
+     * (b) Below the threshold (default 128 rows) everything is group A and
+     *     steps serially: the same steps as the flag-off loop, nothing queued.
+     * (c) Continuous admission (four slots for eight requests): solo audio.
+     * (d) One request's codec fails at the collect, or one refuses a step:
+     *     it fails alone.
+     * Throughout: nothing on a lane while that lane has work queued, no
+     * queued context freed or prefilled, every queued step finished and
+     * every gang collected. */
+    {
+        const scenario even[REQUESTS] = {
+            {24u, 0u}, {12u, 0u}, {30u, 0u}, {6u, 0u},
+            {18u, 0u}, {9u, 0u},  {21u, 0u}, {15u, 0u},
+        };
+        const size_t segs[REQUESTS] = {3u, 2u, 3u, 1u, 3u, 1u, 3u, 3u};
+        size_t lens[REQUESTS][3];
+        mynah_tts_request split[REQUESTS];
+        build_requests(split, even, REQUESTS);
+        for (size_t i = 0; i < REQUESTS; ++i) {
+            if (segs[i] < 2u) continue;
+            for (size_t k = 0; k < segs[i]; ++k) lens[i][k] = 1u;
+            lens[i][segs[i] - 1u] = split[i].text_length - (segs[i] - 1u);
+            split[i].segment_lengths = lens[i];
+            split[i].segment_count = segs[i];
+        }
+        const size_t half = REQUESTS / 2u;
+        static observation half_obs[2];
+        capture ref[REQUESTS];
+        unsetenv("MYNAH_CUDA_PINGPONG");
+        unsetenv("MYNAH_CUDA_PINGPONG_MIN");
+        int bad = 0;
+        for (size_t h = 0; h < 2u && !bad; ++h) {
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (run(&fake_engine_pingpong, split + h * half, half, half,
+                    ref + h * half, results, errors) != 0)
+                bad = 1;
+            half_obs[h] = g_obs;
+            if (!bad && (g_obs.launches != 0u || g_obs.lanes_set != 0u)) bad = 2;
+        }
+        if (!bad) {
+            capture got[REQUESTS];
+            setenv("MYNAH_CUDA_PINGPONG", "2", 1);
+            setenv("MYNAH_CUDA_PINGPONG_MIN", "2", 1);
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (run(&fake_engine_pingpong, split, REQUESTS, REQUESTS, got, results,
+                    errors) != 0)
+                bad = 3;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (results[i] != MYNAH_GRAPH_OK) bad = 3;
+                else if (!same_audio(&got[i], &ref[i])) bad = 4;
+            }
+            for (size_t h = 0; h < 2u && !bad; ++h) {
+                if (g_obs.lane_steps[h] != half_obs[h].lane_steps[0] ||
+                    memcmp(g_obs.lane_rows[h], half_obs[h].lane_rows[0],
+                           g_obs.lane_steps[h] * sizeof(g_obs.lane_rows[h][0])) != 0)
+                    bad = 5;
+            }
+            if (!bad && (g_obs.lanes_set != 2u || g_obs.launches == 0u ||
+                         g_obs.finishes != g_obs.launches || g_obs.pp_overlapped == 0u))
+                bad = 6;
+            if (!bad && (g_obs.dec_submits == 0u || g_obs.dec_collects != g_obs.dec_submits))
+                bad = 7;
+            if (!bad && (g_obs.pp_violations != 0u || g_obs.withheld != 0u ||
+                         g_obs.stepped_unprepared != 0u))
+                bad = 8;
+            if (!bad)
+                printf("  ping-pong split: lanes %zu + %zu steps, %zu queued (%zu while "
+                       "the other lane had work queued), %zu gangs, each half as when "
+                       "served alone\n", g_obs.lane_steps[0], g_obs.lane_steps[1],
+                       g_obs.launches, g_obs.pp_overlapped, g_obs.dec_submits);
+            release(got, REQUESTS);
+        }
+        release(ref, REQUESTS);
+
+        if (!bad) {
+            static observation serial_obs;
+            capture serial[REQUESTS], got[REQUESTS];
+            unsetenv("MYNAH_CUDA_PINGPONG");
+            unsetenv("MYNAH_CUDA_PINGPONG_MIN");
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (run(&fake_engine_pingpong, split, REQUESTS, REQUESTS, serial, results,
+                    errors) != 0)
+                bad = 1;
+            serial_obs = g_obs;
+            setenv("MYNAH_CUDA_PINGPONG", "2", 1);
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (!bad && run(&fake_engine_pingpong, split, REQUESTS, REQUESTS, got,
+                            results, errors) != 0)
+                bad = 9;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (results[i] != MYNAH_GRAPH_OK || !same_audio(&got[i], &serial[i]))
+                    bad = 9;
+            }
+            if (!bad && (g_obs.lanes_set != 2u || g_obs.launches != 0u ||
+                         g_obs.dec_submits != 0u || g_obs.lane_steps[1] != 0u ||
+                         g_obs.lane_steps[0] != serial_obs.lane_steps[0] ||
+                         memcmp(g_obs.lane_rows[0], serial_obs.lane_rows[0],
+                                g_obs.lane_steps[0] * sizeof(g_obs.lane_rows[0][0])) != 0))
+                bad = 10;
+            if (!bad)
+                printf("  ping-pong below the threshold: %zu steps, all serial on group "
+                       "A, the same rows as the flag-off loop\n", g_obs.lane_steps[0]);
+            release(serial, REQUESTS);
+            release(got, REQUESTS);
+        }
+
+        if (!bad) {
+            capture got[REQUESTS];
+            setenv("MYNAH_CUDA_PINGPONG_MIN", "2", 1);
+            build_requests(requests, healthy, REQUESTS);
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (run(&fake_engine_pingpong, requests, REQUESTS, BATCH_WIDTH, got,
+                    results, errors) != 0)
+                bad = 11;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (results[i] != MYNAH_GRAPH_OK) bad = 11;
+                else if (!same_audio(&got[i], &solo[i])) bad = 12;
+            }
+            if (!bad && (g_obs.launches == 0u || g_obs.finishes != g_obs.launches ||
+                         g_obs.dec_collects != g_obs.dec_submits ||
+                         g_obs.lane_steps[1] == 0u))
+                bad = 6;
+            if (!bad && (g_obs.pp_violations != 0u || g_obs.withheld != 0u)) bad = 8;
+            release(got, REQUESTS);
+        }
+
+        for (int which = 0; which < 2 && !bad; ++which) {
+            scenario poisoned[REQUESTS];
+            mynah_tts_request victims[REQUESTS];
+            capture got[REQUESTS];
+            const size_t victim = which ? 2u : 5u;
+            for (size_t i = 0; i < REQUESTS; ++i) poisoned[i] = healthy[i];
+            if (which) poisoned[victim].refuse = 4u;
+            build_requests(victims, poisoned, REQUESTS);
+            if (!which) victims[victim].temperature = 3.0f;   /* codec fails at frame 3 */
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (run(&fake_engine_pingpong, victims, REQUESTS, REQUESTS, got, results,
+                    errors) == 0)
+                bad = 13;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (i == victim) {
+                    if (results[i] != MYNAH_GRAPH_FAILED) bad = 13;
+                } else if (results[i] != MYNAH_GRAPH_OK ||
+                           !same_audio(&got[i], &solo[i])) {
+                    bad = 14;
+                }
+            }
+            if (!bad && g_obs.pp_violations != 0u) bad = 8;
+            release(got, REQUESTS);
+        }
+        unsetenv("MYNAH_CUDA_PINGPONG");
+        unsetenv("MYNAH_CUDA_PINGPONG_MIN");
+        pp_reset();
+        if (bad == 1) return fail("ping-pong: a reference half run failed");
+        if (bad == 2) return fail("ping-pong: work was queued or a lane set with the flag off");
+        if (bad == 3) return fail("ping-pong: a split request failed");
+        if (bad == 4) return fail("ping-pong: a group's audio differs from its half served alone");
+        if (bad == 5) return fail("ping-pong: a group's steps differ from its half served alone");
+        if (bad == 6) return fail("ping-pong: nothing was queued, a queued step was not finished, or the lanes never overlapped");
+        if (bad == 7) return fail("ping-pong: no gang was split, or one was not collected");
+        if (bad == 8) return fail("ping-pong: the engine was called against the per-lane seam, or ready work was withheld");
+        if (bad == 9) return fail("ping-pong: below the threshold the audio changed");
+        if (bad == 10) return fail("ping-pong: below the threshold the steps changed or work was queued");
+        if (bad == 11) return fail("ping-pong: a continuously admitted request failed");
+        if (bad == 12) return fail("ping-pong: continuous admission changed a request's audio");
+        if (bad == 13) return fail("ping-pong: the failing request did not fail");
+        if (bad == 14) return fail("ping-pong: one request's failure hurt a sibling");
     }
 
     /* Restore the healthy requests for anything added after this point. */

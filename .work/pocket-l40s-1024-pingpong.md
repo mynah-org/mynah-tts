@@ -1,7 +1,8 @@
 # Pocket 24L on one L40S toward C1024: ping-pong half-batches inside one engine
 
 Board: `PLAN.md` E15-32 (follow-up of `.work/pocket-l40s-plateau.md`). Branch `pocket-l40s-plateau`. Written
-2026-10-06. Design only: nothing here is coded yet.
+2026-10-06. **Status:** Stage 2 (the two-group loop) is coded on branch `pocket-pingpong` (on top of L13/L13b),
+CPU-verified, untested on GPU: see section 13.
 
 **Goal.** One engine reaching C1024 at stream RTF p95 ≤ 0.88 on one L40S, with one admission queue, one copy of
 the weights, one KV slot pool, and no extra host threads. The design has to work on a 4-vCPU host too.
@@ -665,3 +666,100 @@ alternated):
 - Any `serial phases{refused}` rate above ~1 % of phases points to KV growth or a decode-launch refusal.
 - A rising "fence wait" with GPU busy < 85 % means the host per half exceeds the item: host-bound. Compare it with
   the phase timers.
+
+---
+
+## 13. Implementation status (2026-10-06, branch `pocket-pingpong`)
+
+Coded, CPU-verified, **untested on GPU**. `MYNAH_CUDA_PINGPONG=2` (default off, read once when the serving loop
+starts). Off or unset, the loop runs the same code as before (section 13.3).
+
+### 13.1 What was built (Stage 2, on top of the L13b decode split = Stage 1)
+
+| part | content | where |
+|---|---|---|
+| groups | `pp_group`: own slot array (A: the loop's array; B: a heap array of the same capacity), own scratch (B: a second `scratch_new` at `max_batch`), own rotation and prefill cursors, own admission/prefill contexts over its rows, own `step_ahead` (AR in flight) and `decode_ahead` (gang in flight). Group-local order is the stand-alone order by construction: append at admission, swap-remove at retire, the loop's own rotation | `src/inference.c` |
+| phase | one pass = one phase of group X: (1) finish X's queued step (fence), emit, submit its decode (queued behind Y's item); (2) retire X (rows of the step just finished are `held` until their PCM is out); (3) admission for both groups; (4) cancellation of X's rows (cadence counts X's phases); (5) X's prefill pass + late admission into X; (6) select and `step_launch` X's next step (the L13 retire simulation, without its prefill), or a serial step when Y has no rows, the launch is refused or fewer than 2 rows step (X's decode is collected and its held rows retired first); (7) collect and deliver Y's decode. Switch to Y when Y has rows, else stay on X | `src/inference.c` |
+| admission | `pp_admit`: pull what the sink has (block only with nothing resident), then assign: below `MYNAH_CUDA_PINGPONG_MIN` resident rows (default **128**, counting the new ones) all to group A; otherwise the first `clamp(ceil((n + |Y| - |X|) / 2), 0, n)` to the current group X and the rest to Y, each capped at half the slot capacity. A burst into empty groups is split into contiguous halves; rows never migrate | `src/inference.c` |
+| fence finish | `scratch_set_lane` (new appended engine hook) marks a scratch as a ping-pong lane; a step queued on it records a fence and its finish waits on that fence (`mynah_backend_fence_sync`) instead of a stream drain, which would also wait for the other group's queued item | `src/tts_engine.h`, `src/engine_pocket.c` |
+| lanes (the two hazards of 5.2) | `mynah_backend_set_lane` (new): the CUDA backend's codec-gang staging (`codec_gang[2]`: PCM gather block, pinned meta blocks and their events) is per lane, so DEC_Y's queued D2H never lands in the block deliver_X reads (the silent-corruption race); decoder batch-graph entries carry the lane that created them and both lookups (exact and same-shape re-record / L11 patch) match it, so a group never re-records or patches the other group's graph while its decode is queued. Pocket selects the lane at the top of every gang decode. Lane 0 is the only lane unless the flag is on | `gpu/cuda/backend_cuda.cu`, `src/backend.{h,c}`, `src/engine_pocket.c` |
+| refusals | start-up line and the flag off when: not `=2`; the engine lacks `step_launch` / `decode_submit` / `decode_collect` / `scratch_set_lane`; decoder lane; parity dump; `MYNAH_PREFILL_SLICE=0`; `MYNAH_ASYNC_ADMIT`; the second scratch cannot be created. With the flag on, L13 and L13b are ignored (start-up line). A start-up note when `MYNAH_CUDA_DEFERRED_RELEASE` or `MYNAH_CUDA_KV_VMM` is unset | `src/inference.c` |
+| profile | `[SERVE] pingpong`: cycles (A→B→A turns), rows admitted to A / B, overlap ratio (host time spent while the other group had an item queued, over all host time; an upper bound, that item may end first), stream syncs while an item was queued (`mynah_backend_stream_sync_queued_calls`, new; fence waits excluded; must be ~0). Per group: phases, steps pipelined / serial (other group empty, launch refused or < 2 rows), step width mean/max, member rows mean/max, fence wait per phase (step finish, decode collect), host ms per phase and its share under the other group's item. Fence waits are profiled sync sites, so they are in the `device wait` line | `src/inference.c`, `src/backend.c` |
+
+### 13.2 Differences from the design
+
+- Group B's scratch is sized `max_batch`, not `ceil(max_batch / 2)`: group A must hold every row below the
+  threshold, and the same size for B keeps the code symmetric. Cost: one more full-width scratch (~45 KB/row of
+  backbone slabs, ~46 MB at 1024) plus B's graphs. A group executes at `min(bucket, max_batch)`, so the box job uses
+  the explicit half-width bucket list of section 12 for every arm.
+- The prefill of a row back from a segment boundary may run while its last frames are still in its group's
+  decode gang, exactly as with L13b (the prefill and the codec share no state). The fake engine of the driver test
+  allows it and forbids it for a row in a queued step.
+- Late admission (`MYNAH_CUDA_FAST_FIRST_CHUNK`) admits into the group whose phase it is, within the room both
+  groups leave, without the balancing.
+- No poll of the other group's decode between admissions (the collect in step 7 waits; it is normally done).
+
+### 13.3 Why flag off is the same code path
+
+- Driver: `pp == NULL`. The ping-pong loop's condition is false and today's loop is `while (pp == NULL)`, the old
+  `for (;;)` with the same body. `admit_pass` calls `admit_start`, the old loop body moved verbatim;
+  `step_ahead_launch` is `prefill_pass` then `step_ahead_select_launch`, its old body. The L13/L13b refusal chains
+  test `pp != NULL` first.
+- Engine: `scratch->pingpong == 0` (calloc, only `scratch_set_lane` sets it): no fence recorded, the finish takes
+  the old stream drain, the discard has no fence to release, no lane selection.
+- Backend: `lane` is always 0, so `codec_gang[0]` is the old workspace and every decoder graph entry is lane 0.
+  The new stream-sync counter is only read by the ping-pong profile line.
+
+**Threshold.** Below `MYNAH_CUDA_PINGPONG_MIN` (default 128) resident rows every request is group A and, with B
+empty, A steps serially in today's order (retire → admission → cancellation → prefill → select → step), so C1 and
+CLI `--batch 32` are bit-identical with the flag on.
+
+### 13.4 Local verification (CPU, macOS)
+
+- `make`, `make server`, `make test-c`: PASS. GCC 16 and Clang `-fsyntax-only -Wall -Wextra -Wpedantic` with
+  `-DMYNAH_ENABLE_CUDA -DMYNAH_ROW_CAP=1024u` on `inference.c`, `engine_pocket.c`, `backend.c`, `test_driver.c`: no
+  warnings. `backend_cuda.cu` is not compiled locally (no nvcc): the change is the `codec_gang[2]` array, a lane
+  field and its setter, and the lane test in the two graph lookups.
+- `tests/test_driver.c` section 9: a two-lane fake engine (per-scratch queued step and gang; it counts any call the
+  per-lane seam forbids). (a) The split burst with segments (`MIN=2`, 8 requests): each lane's steps (rows and order)
+  and every request's audio equal a flag-off run of that half alone; 44 steps queued, 40 of them while the other lane
+  had work queued; every queued step finished, every gang collected. (b) Below the threshold: the flag-off steps,
+  nothing queued, lane B unused. (c) Continuous admission (4 slots, 8 requests): solo audio. (d) A codec failure at
+  the collect and a refused step each fail one request. Mutation checks: an interleaved group assignment breaks
+  (a)'s steps; not holding the finished rows breaks the audio. Sections 1-8 unchanged and passing.
+- Real Pocket pack on the CPU (launches refused there, so each group steps serially; this exercises the groups, the
+  second scratch, the assignment and the per-group order, not the overlap): CLI `--batch 8` and `--batch 8 --stream`,
+  flag on (default `MIN`) vs off 8/8 identical; split (`MIN=2`) vs two `--batch 4` runs (seeds 1000 and 1004) 8/8
+  identical, offline and streaming. `make server-concurrency-test` (Pocket, `--max-batch 8`, 113 byte comparisons)
+  PASS with `MYNAH_CUDA_PINGPONG=2 MYNAH_CUDA_PINGPONG_MIN=2`.
+
+### 13.5 Not built (later stages)
+
+- Stage 0a/0b (the zero-code split-cost A/B and the per-phase host timers): not run; the box job reads the split cost
+  only indirectly.
+- Stage 3: KV pre-grow in the phase (with VMM a growth needs no sync, but a refused launch still steps serially),
+  warm-up pre-capture of the second lane's graphs, `MYNAH_CUDA_PINGPONG_CHECK` (drain at every phase boundary; for
+  the decode, `MYNAH_CUDA_DECODE_CHECK=1` already lands every gang inside its submission), group scratch at
+  `ceil(max_batch / 2)`, a poll of the other group's decode during admission.
+- Known serializations, not races (each shows in the "stream syncs while an item was queued" count or as a host
+  stall): the backend's tile workspace (`meta_host` + event, used by the Mimi tile in every decode) is shared, so
+  group X's decode submission can wait for the meta upload of Y's queued decode; emit's
+  `pocket_cuda_hidden_materialize` when a row ends without the L12 subset path; KV growth without VMM; context
+  release without L6; prefill slices (their syncs wait for the other group's item; run last, before the launch).
+- The four-item variant (risk 5), group-size hysteresis, `PINGPONG=3+`.
+
+### 13.6 Box (first GPU run)
+
+`.work/l40s-2026-10-06/jobs/pingpong.sh` (tree `/root/mpp`, tarball `/root/mpp.tgz`, ROW_CAP 1024, the 11 flags as
+ALL plus `MYNAH_CUDA_KV_VMM=1` and the explicit half-width bucket list for every arm):
+
+1. Identity, CLI offline and `--stream`: `--batch 32 --seed 1000` ALL vs ALL+PP (expect 32/32, group B 0 phases);
+   split ALL+PP+`MIN=2` vs ALL `--batch 16` seeds 1000 and 1016 (expect 32/32, pipelined steps > 0, no "discarded" or
+   "inside its submission" line, stream syncs while queued ≈ 0); the split with `MYNAH_CUDA_DECODE_CHECK=1` (identical
+   to the split); server C1 ladder ALL vs ALL+PP (all identical).
+2. Speed, one repetition, knee C768 / C896 / C1024, arm B = ALL+L13+L13b vs arm PP = ALL+PINGPONG. Read: audio-s/s,
+   RTF p95, TTFA p95, gap p95, stalls, `sm`; from `server.log` the `device wait` line, the `pingpong` lines (overlap
+   ratio, fence wait per phase, host per phase, rows per group) and any `while queued` sync site.
+
+Pass for this first run: identity as above; at C1024 PP above B in audio-s/s and `sm`, with no failures. The C1024
+gate (RTF p95 ≤ 0.88, `sm` ≥ 88 %) and the TTFA bound (ALL + 40 ms) are the section 12 criteria.
