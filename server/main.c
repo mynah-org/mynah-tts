@@ -90,6 +90,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -2659,6 +2660,35 @@ static void *worker_main(void *arg) {
  * handler, so the call simply resumes. The loop below therefore waits in
  * poll() with a timeout and re-reads the flag, which needs nothing from the
  * handler beyond an async-signal-safe store. */
+/* Every client stream holds one descriptor for its whole life, so a server
+ * sized for N concurrent streams needs a little more than N. The usual soft
+ * limit is 1024: past roughly 1000 streams accept() fails with EMFILE. Raise
+ * the soft limit to the hard one at start-up (no privilege needed), and say
+ * what was granted so an operator can see a low hard limit in the log. */
+static void raise_fd_limit(size_t streams) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return;
+    const rlim_t before = rl.rlim_cur;
+    if (rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            /* macOS refuses RLIM_INFINITY above OPEN_MAX: ask for what the
+             * streams need instead. */
+            rl.rlim_cur = (rlim_t)streams + 128u;
+            if (setrlimit(RLIMIT_NOFILE, &rl) != 0) rl.rlim_cur = before;
+        }
+    }
+    const rlim_t want = (rlim_t)streams + 128u;
+    if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < want)
+        fprintf(stderr, "warning: open-file limit %llu is below the ~%llu descriptors "
+                        "%zu concurrent streams need; raise the hard limit (ulimit -Hn, "
+                        "LimitNOFILE, --ulimit nofile) or accept() will fail with EMFILE\n",
+                (unsigned long long)rl.rlim_cur, (unsigned long long)want, streams);
+    else if (rl.rlim_cur != before)
+        fprintf(stderr, "open-file limit raised from %llu to %llu\n",
+                (unsigned long long)before, (unsigned long long)rl.rlim_cur);
+}
+
 static volatile sig_atomic_t g_shutdown = 0;
 
 static void on_signal(int sig) {
@@ -3152,6 +3182,7 @@ int main(int argc, char **argv) {
 
     g_prof = getenv("MYNAH_SERVE_PROFILE") != NULL;
     g_cuda_serving = device == MYNAH_TTS_DEVICE_CUDA;
+    raise_fd_limit(g.max_active + g.max_pending);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_usr1_dump);
@@ -3506,6 +3537,7 @@ int main(int argc, char **argv) {
             const int ready = poll(&pfd, 1, 200);
             if (ready < 0) {
                 if (errno == EINTR) continue;
+                perror("poll on the listening socket; shutting down");
                 break;
             }
             if (ready == 0) continue;   /* nothing yet: re-read the shutdown flag */
@@ -3514,6 +3546,25 @@ int main(int argc, char **argv) {
             if (fd < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
                     errno == ECONNABORTED) continue;
+                /* Out of descriptors or kernel memory is a capacity condition,
+                 * not a reason to stop serving: the streams in flight will
+                 * close theirs. Say so (at most once a second), back off
+                 * briefly and keep accepting. Leaving the loop here used to
+                 * shut the whole server down without a word. */
+                if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+                    errno == ENOMEM) {
+                    static double last_note_ms;
+                    const double t = now_ms();
+                    if (t - last_note_ms >= 1000.0) {
+                        last_note_ms = t;
+                        fprintf(stderr, "accept: %s; backing off (raise the open-file "
+                                        "limit if this repeats)\n", strerror(errno));
+                    }
+                    const struct timespec pause = {0, 20 * 1000 * 1000};
+                    nanosleep(&pause, NULL);
+                    continue;
+                }
+                perror("accept; shutting down");
                 break;
             }
         }
