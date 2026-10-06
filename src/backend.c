@@ -4,12 +4,14 @@
 #include "kernels.h"
 #include "sgemm.h"
 #include "threads.h"
+#include "mynah_util.h"
 
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -64,6 +66,9 @@ struct mynah_backend {
     int (*graph_launch)(void *, size_t, const void *, char *, size_t);
     void (*graph_abort)(void *, size_t, const void *);
     void (*graph_forget)(void *, const void *);
+    void (*graph_forget_parked)(void *, const void *);
+    void *(*fence_record)(void *);
+    void (*fence_wait)(void *, void *);
     int (*flow_batch_dev)(void *, const mynah_backend_flow_batch *, char *, size_t);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
@@ -187,6 +192,9 @@ extern int mynah_cuda_graph_end(void *, size_t, const void *, char *, size_t);
 extern int mynah_cuda_graph_launch(void *, size_t, const void *, char *, size_t);
 extern void mynah_cuda_graph_abort(void *, size_t, const void *);
 extern void mynah_cuda_graph_forget(void *, const void *);
+extern void mynah_cuda_graph_forget_parked(void *, const void *);
+extern void *mynah_cuda_fence_record(void *);
+extern void mynah_cuda_fence_wait(void *, void *);
 extern int mynah_cuda_flow_batch_dev(void *, const mynah_backend_flow_batch *, char *, size_t);
 extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
@@ -718,6 +726,9 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->graph_launch = mynah_cuda_graph_launch;
         backend->graph_abort = mynah_cuda_graph_abort;
         backend->graph_forget = mynah_cuda_graph_forget;
+        backend->graph_forget_parked = mynah_cuda_graph_forget_parked;
+        backend->fence_record = mynah_cuda_fence_record;
+        backend->fence_wait = mynah_cuda_fence_wait;
         backend->flow_batch_dev = mynah_cuda_flow_batch_dev;
         backend->snake_dev = mynah_cuda_snake_dev;
         backend->gelu_dev = mynah_cuda_gelu_dev;
@@ -1045,12 +1056,95 @@ int mynah_backend_download(const mynah_backend *backend, const float *dev_ptr,
     return 0;
 }
 
+/* Counters for mynah_backend_sync_profile(). Written only by the thread that
+ * syncs (the scheduler), read once at the end of a run; atomics keep a stray
+ * reader on another thread defined rather than torn. */
+static _Atomic unsigned long long g_sync_wait_ns;
+static _Atomic unsigned long long g_sync_calls;
+static _Atomic int g_sync_profile = -1; /* -1 = MYNAH_SERVE_PROFILE not read yet */
+
+/* Per-site table. Sites are string literals (__FILE__) plus a line, so a
+ * pointer compare is enough; a site that does not fit is counted in the
+ * totals only. Written by the syncing thread; a second syncing thread would
+ * at worst lose a row of the report, never corrupt the totals. */
+#define SYNC_SITES_MAX 64
+static struct { const char *file; int line; unsigned long long calls, ns; }
+    g_sync_sites[SYNC_SITES_MAX];
+static _Atomic int g_sync_site_count;
+
+static void sync_site_note(const char *file, int line, unsigned long long ns) {
+    const int n = atomic_load_explicit(&g_sync_site_count, memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_sync_sites[i].line == line && g_sync_sites[i].file == file) {
+            g_sync_sites[i].calls++;
+            g_sync_sites[i].ns += ns;
+            return;
+        }
+    }
+    if (n >= SYNC_SITES_MAX) return;
+    g_sync_sites[n].file = file;
+    g_sync_sites[n].line = line;
+    g_sync_sites[n].calls = 1ull;
+    g_sync_sites[n].ns = ns;
+    atomic_store_explicit(&g_sync_site_count, n + 1, memory_order_release);
+}
+
+int mynah_backend_sync_at(const mynah_backend *backend, char *error,
+                          size_t error_capacity, const char *file, int line) {
+    if (backend == NULL) return -1;
+    if (backend->sync == NULL) return 0; /* CPU: nothing to sync */
+    int profile = atomic_load_explicit(&g_sync_profile, memory_order_relaxed);
+    if (profile < 0) {
+        profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
+        atomic_store_explicit(&g_sync_profile, profile, memory_order_relaxed);
+    }
+    if (!profile) return backend->sync(backend->state, error, error_capacity);
+    const double t0 = mynah_phase_seconds();
+    const int result = backend->sync(backend->state, error, error_capacity);
+    const double waited = mynah_phase_seconds() - t0;
+    const unsigned long long ns = (unsigned long long)(waited > 0.0 ? waited * 1e9 : 0.0);
+    atomic_fetch_add_explicit(&g_sync_wait_ns, ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_sync_calls, 1ull, memory_order_relaxed);
+    sync_site_note(file, line, ns);
+    return result;
+}
+
+#undef mynah_backend_sync
 int mynah_backend_sync(const mynah_backend *backend,
                        char *error, size_t error_capacity) {
-    if (backend == NULL) return -1;
-    if (backend->sync != NULL)
-        return backend->sync(backend->state, error, error_capacity);
-    return 0; /* CPU: nothing to sync */
+    return mynah_backend_sync_at(backend, error, error_capacity, "unknown", 0);
+}
+
+void mynah_backend_sync_profile_reset(void) {
+    const int n = atomic_load_explicit(&g_sync_site_count, memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        g_sync_sites[i].calls = 0ull;
+        g_sync_sites[i].ns = 0ull;
+    }
+    atomic_store_explicit(&g_sync_wait_ns, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_sync_calls, 0ull, memory_order_relaxed);
+}
+
+void mynah_backend_sync_profile_print(FILE *out, unsigned long long iterations) {
+    const int n = atomic_load_explicit(&g_sync_site_count, memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_sync_sites[i].calls == 0ull) continue;
+        fprintf(out, "[SERVE]   sync %s:%d  calls %llu (%.2f per iteration)  wait %.1f ms "
+                     "total, %.3f ms mean\n",
+                g_sync_sites[i].file, g_sync_sites[i].line, g_sync_sites[i].calls,
+                iterations ? (double)g_sync_sites[i].calls / (double)iterations : 0.0,
+                1e-6 * (double)g_sync_sites[i].ns,
+                g_sync_sites[i].calls ? 1e-6 * (double)g_sync_sites[i].ns /
+                                            (double)g_sync_sites[i].calls : 0.0);
+    }
+}
+
+void mynah_backend_sync_profile(double *wait_seconds, unsigned long long *calls) {
+    if (wait_seconds != NULL)
+        *wait_seconds = 1e-9 * (double)atomic_load_explicit(&g_sync_wait_ns,
+                                                            memory_order_relaxed);
+    if (calls != NULL)
+        *calls = atomic_load_explicit(&g_sync_calls, memory_order_relaxed);
 }
 
 int mynah_backend_batch_begin(const mynah_backend *backend,
@@ -1101,6 +1195,25 @@ void mynah_backend_graph_forget(const mynah_backend *backend,
                                 const void *identity) {
     if (backend != NULL && backend->graph_forget != NULL && identity != NULL)
         backend->graph_forget(backend->state, identity);
+}
+
+void mynah_backend_graph_forget_parked(const mynah_backend *backend,
+                                       const void *identity) {
+    if (backend == NULL || identity == NULL) return;
+    if (backend->graph_forget_parked != NULL)
+        backend->graph_forget_parked(backend->state, identity);
+    else if (backend->graph_forget != NULL)
+        backend->graph_forget(backend->state, identity);
+}
+
+void *mynah_backend_fence_record(const mynah_backend *backend) {
+    if (backend == NULL || backend->fence_record == NULL) return NULL;
+    return backend->fence_record(backend->state);
+}
+
+void mynah_backend_fence_wait(const mynah_backend *backend, void *fence) {
+    if (backend != NULL && backend->fence_wait != NULL && fence != NULL)
+        backend->fence_wait(backend->state, fence);
 }
 
 int mynah_backend_flow_batch_dev(const mynah_backend *backend,

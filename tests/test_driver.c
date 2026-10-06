@@ -44,6 +44,13 @@ typedef struct {
     size_t quantum[LOG_MAX];      /* frames asked for, in call order */
     uint64_t quantum_seed[LOG_MAX];
     size_t quanta;
+    /* MYNAH_CUDA_STEP_OVERLAP: every step's rows, in order, folded into one
+     * value per step, so two runs can be compared step by step. */
+    uint64_t step_rows[LOG_MAX];
+    size_t steps;
+    size_t launches;              /* steps queued ahead */
+    size_t finishes;              /* steps that finished a queued one */
+    size_t overlap_violations;    /* engine calls the seam forbids meanwhile */
 } observation;
 
 static observation g_obs;
@@ -178,7 +185,21 @@ static int fake_reset(mynah_engine_ctx *ctx, char *error, size_t capacity) {
     return 0;
 }
 
-static void fake_ctx_free(mynah_engine_ctx *ctx) { free(ctx); }
+/* MYNAH_CUDA_STEP_OVERLAP: the step queued by fake_step_launch, if any. */
+static mynah_engine_ctx *g_pending[FAKE_MAX_BATCH];
+static size_t g_pending_count;
+
+/* tts_engine.h: while a step is queued the driver may create and free other
+ * contexts, and must call nothing else of this engine. */
+static void overlap_guard(void) {
+    if (g_pending_count != 0u) ++g_obs.overlap_violations;
+}
+
+static void fake_ctx_free(mynah_engine_ctx *ctx) {
+    for (size_t i = 0; i < g_pending_count; ++i)
+        if (g_pending[i] == ctx) ++g_obs.overlap_violations;
+    free(ctx);
+}
 
 /* Resumable prepare: a fresh context is ready after one call, a context back
  * from a segment boundary after two, so the driver has to keep slicing it
@@ -189,6 +210,7 @@ static int fake_prepare_slice(mynah_engine_ctx *ctx, size_t budget, int *done,
     (void)error;
     (void)capacity;
     if (ctx == NULL || done == NULL) return -1;
+    overlap_guard();
     ++g_obs.slices;
     *done = 0;
     if (ctx->prepared) { *done = 1; return 0; }
@@ -207,6 +229,20 @@ static int fake_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                            mynah_engine_scratch *scratch, char *error,
                            size_t capacity) {
     (void)scratch;
+    /* A queued step must be finished by a step on exactly its rows. */
+    if (g_pending_count != 0u) {
+        int same = g_pending_count == count;
+        for (size_t i = 0; i < count && same; ++i) same = g_pending[i] == ctxs[i];
+        if (same) ++g_obs.finishes;
+        else ++g_obs.overlap_violations;
+        g_pending_count = 0u;
+    }
+    if (g_obs.steps < LOG_MAX) {
+        uint64_t rows = 0x84222325cbf29ce4ull ^ (uint64_t)count;
+        for (size_t i = 0; i < count; ++i)
+            rows = (rows ^ ctxs[i]->seed) * 0x100000001b3ull;
+        g_obs.step_rows[g_obs.steps++] = rows;
+    }
     /* THE NO-WAIT LAW, checked from inside the engine at the only moment it can
      * be: the top of a step, when the previous step's delivery is complete. A
      * context still holding at least a full quantum of undelivered frames means
@@ -244,6 +280,7 @@ static int fake_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     (void)scratch;
     (void)error;
     (void)capacity;
+    overlap_guard();
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         memset(&results[i], 0, sizeof(results[i]));
@@ -279,6 +316,7 @@ static int fake_decode_audio(mynah_engine_ctx *ctx, size_t first, size_t frames,
                              size_t capacity) {
     *out_samples = NULL;
     *out_count = 0u;
+    overlap_guard();
     if (first != ctx->decoded) {
         fake_err(error, capacity, "fake: the driver asked for a non-contiguous range");
         return -1;
@@ -361,6 +399,27 @@ static int fake_scratch_new(const mynah_tts_model *model, mynah_engine_state *st
 
 static void fake_scratch_free(mynah_engine_scratch *scratch) { free(scratch); }
 
+/* Queue the step: here, only remember its rows. The step itself runs in the
+ * fake_step_batch that finishes it, which is equivalent for an engine whose
+ * step has no device half. Refuses what the real engine refuses: a width of
+ * one, and a step that would fail (the driver's isolation pass must see the
+ * failure on an ordinary step). */
+static int fake_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
+                            mynah_engine_scratch *scratch) {
+    (void)scratch;
+    overlap_guard();
+    if (count < 2u || count > FAKE_MAX_BATCH) return 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!ctxs[i]->prepared) return 1;
+        if (ctxs[i]->refuse_step >= 0 && ctxs[i]->step == (size_t)ctxs[i]->refuse_step)
+            return 1;
+    }
+    for (size_t i = 0; i < count; ++i) g_pending[i] = ctxs[i];
+    g_pending_count = count;
+    ++g_obs.launches;
+    return 0;
+}
+
 static const mynah_tts_engine fake_engine_loop = {
     "driver-test",
     fake_model_init, fake_model_free, fake_caps,
@@ -396,6 +455,22 @@ static const mynah_tts_engine fake_engine_segments = {
     NULL,
     fake_decode_audio_batch,
     fake_prepare_slice,
+};
+
+/* The segmenting engine plus dispatch-ahead (MYNAH_CUDA_STEP_OVERLAP). */
+static const mynah_tts_engine fake_engine_overlap = {
+    "fake-overlap",
+    fake_model_init, fake_model_free, fake_caps,
+    fake_ctx_new, fake_prepare, fake_reset, fake_ctx_free,
+    fake_step_batch, fake_emit_batch,
+    fake_frame_count, fake_truncate, fake_decode_audio,
+    fake_scratch_new, fake_scratch_free,
+    NULL,
+    fake_decode_audio_batch,
+    fake_prepare_slice,
+    NULL,                     /* prepare_slice_batch */
+    NULL, NULL,               /* ctx_new_host, ctx_attach */
+    fake_step_launch,
 };
 
 /* ---- sinks -------------------------------------------------------------- */
@@ -748,6 +823,128 @@ int main(void) {
         if (bad == 3) return fail("the driver stepped a context mid-reprepare");
         if (bad == 4) return fail("the engine's segment boundaries were not all reached");
         if (bad == 5) return fail("a boundary's prefill was not sliced again");
+    }
+
+    /* ---- 7. dispatch-ahead (MYNAH_CUDA_STEP_OVERLAP) ---------------------- *
+     * (a) A burst admitted at once, with segment boundaries: the overlapped
+     *     loop must run the same steps, the same rows in the same order, as
+     *     the serial loop, while actually queueing them ahead.
+     * (b) Continuous admission (more requests than slots): every request's
+     *     audio is its solo audio. An admission joins a step later, so the
+     *     steps differ from the serial loop's; the audio may not.
+     * (c) The blast radius with overlap on: still one request.
+     * In all three, nothing but context creation and release may reach the
+     * engine while a step is queued, and every queued step is finished by a
+     * step on exactly its rows. */
+    {
+        const scenario even[REQUESTS] = {
+            {24u, 0u}, {12u, 0u}, {30u, 0u}, {6u, 0u},
+            {18u, 0u}, {9u, 0u},  {21u, 0u}, {15u, 0u},
+        };
+        const size_t segs[REQUESTS] = {3u, 2u, 3u, 1u, 3u, 1u, 3u, 3u};
+        size_t lens[REQUESTS][3];
+        mynah_tts_request split[REQUESTS];
+        capture serial[REQUESTS], ahead[REQUESTS];
+        build_requests(split, even, REQUESTS);
+        for (size_t i = 0; i < REQUESTS; ++i) {
+            if (segs[i] < 2u) continue;
+            for (size_t k = 0; k < segs[i]; ++k) lens[i][k] = 1u;
+            lens[i][segs[i] - 1u] = split[i].text_length - (segs[i] - 1u);
+            split[i].segment_lengths = lens[i];
+            split[i].segment_count = segs[i];
+        }
+        static observation serial_obs;
+        unsetenv("MYNAH_CUDA_STEP_OVERLAP");
+        memset(&g_obs, 0, sizeof(g_obs));
+        g_pending_count = 0u;
+        if (run(&fake_engine_overlap, split, REQUESTS, REQUESTS, serial, results,
+                errors) != 0) {
+            release(serial, REQUESTS);
+            return fail("the serial burst reported a failure");
+        }
+        serial_obs = g_obs;
+        setenv("MYNAH_CUDA_STEP_OVERLAP", "1", 1);
+        memset(&g_obs, 0, sizeof(g_obs));
+        g_pending_count = 0u;
+        const int rc_ahead = run(&fake_engine_overlap, split, REQUESTS, REQUESTS,
+                                 ahead, results, errors);
+        int bad = rc_ahead != 0 ? 1 : 0;
+        for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+            if (results[i] != MYNAH_GRAPH_OK) bad = 1;
+            else if (!same_audio(&ahead[i], &serial[i])) bad = 2;
+        }
+        if (!bad && serial_obs.launches != 0u) bad = 3;
+        if (!bad && (g_obs.steps != serial_obs.steps ||
+                     memcmp(g_obs.step_rows, serial_obs.step_rows,
+                            g_obs.steps * sizeof(g_obs.step_rows[0])) != 0))
+            bad = 4;
+        if (!bad && (g_obs.launches == 0u || g_obs.finishes != g_obs.launches))
+            bad = 5;
+        if (!bad && g_obs.overlap_violations != 0u) bad = 6;
+        if (!bad && g_obs.stepped_unprepared != 0u) bad = 7;
+        if (!bad && g_obs.withheld != 0u) bad = 8;
+        if (!bad)
+            printf("  overlap burst: %zu steps, %zu queued ahead, same rows as "
+                   "the serial loop\n", g_obs.steps, g_obs.launches);
+        release(serial, REQUESTS);
+        release(ahead, REQUESTS);
+
+        if (!bad) {
+            capture got[REQUESTS];
+            build_requests(requests, healthy, REQUESTS);
+            memset(&g_obs, 0, sizeof(g_obs));
+            g_pending_count = 0u;
+            if (run(&fake_engine_overlap, requests, REQUESTS, BATCH_WIDTH, got,
+                    results, errors) != 0)
+                bad = 9;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (results[i] != MYNAH_GRAPH_OK) bad = 9;
+                else if (!same_audio(&got[i], &solo[i])) bad = 10;
+            }
+            if (!bad && (g_obs.launches == 0u || g_obs.finishes != g_obs.launches))
+                bad = 5;
+            if (!bad && g_obs.overlap_violations != 0u) bad = 6;
+            if (!bad && g_obs.withheld != 0u) bad = 8;
+            release(got, REQUESTS);
+        }
+
+        if (!bad) {
+            scenario poisoned[REQUESTS];
+            mynah_tts_request victims[REQUESTS];
+            capture got[REQUESTS];
+            for (size_t i = 0; i < REQUESTS; ++i) poisoned[i] = healthy[i];
+            poisoned[2].refuse = 4u;
+            build_requests(victims, poisoned, REQUESTS);
+            memset(&g_obs, 0, sizeof(g_obs));
+            g_pending_count = 0u;
+            if (run(&fake_engine_overlap, victims, REQUESTS, BATCH_WIDTH, got,
+                    results, errors) == 0)
+                bad = 11;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (i == 2u) {
+                    if (results[i] != MYNAH_GRAPH_FAILED) bad = 11;
+                } else if (results[i] != MYNAH_GRAPH_OK ||
+                           !same_audio(&got[i], &solo[i])) {
+                    bad = 12;
+                }
+            }
+            if (!bad && g_obs.overlap_violations != 0u) bad = 6;
+            release(got, REQUESTS);
+        }
+        unsetenv("MYNAH_CUDA_STEP_OVERLAP");
+        g_pending_count = 0u;
+        if (bad == 1) return fail("overlap: a burst request failed");
+        if (bad == 2) return fail("overlap: the burst audio differs from the serial loop");
+        if (bad == 3) return fail("overlap: a step was queued ahead with the flag off");
+        if (bad == 4) return fail("overlap: the burst's steps differ from the serial loop");
+        if (bad == 5) return fail("overlap: no step was queued ahead, or one was not finished");
+        if (bad == 6) return fail("overlap: the engine was called while a step was queued");
+        if (bad == 7) return fail("overlap: a context was stepped mid-reprepare");
+        if (bad == 8) return fail("overlap: ready work was withheld");
+        if (bad == 9) return fail("overlap: a continuously admitted request failed");
+        if (bad == 10) return fail("overlap: continuous admission changed a request's audio");
+        if (bad == 11) return fail("overlap: the failing request did not fail alone");
+        if (bad == 12) return fail("overlap: one request's failure hurt a sibling");
     }
 
     /* Restore the healthy requests for anything added after this point. */

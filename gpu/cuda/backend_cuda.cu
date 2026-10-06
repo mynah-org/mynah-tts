@@ -1,5 +1,6 @@
 #include "backend.h"
 #include "costmap.h"
+#include "row_cap.h"
 
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -1215,6 +1216,20 @@ struct cuda_decoder_batch_graph_entry {
     const float *sig_weight;
     cudaEvent_t done;
     bool valid;
+    /* MYNAH_CUDA_DECODER_TABLE_PATCH: the pointer-table channel each upload
+     * slot used at capture (null with the flag off).  The instantiated
+     * graph's memcpy node for slot s reads host table (s, slot_channels[s]),
+     * so those are the only cells a new gang has to rewrite.  layout_key
+     * hashes this sequence; a decoder's cached column is usable here only
+     * under the same key.  layout_drift: a later re-record used another
+     * channel for some slot (never expected), patching is off for good.
+     * patch_verified: a real recording of this graph reproduced, cell for
+     * cell, a column cached from another graph or another row. */
+    uint8_t *slot_channels;
+    unsigned long long layout_key;
+    bool layout_recording;
+    bool layout_drift;
+    bool patch_verified;
 };
 
 struct cuda_backend_state;
@@ -1429,6 +1444,12 @@ struct cuda_backend_state {
     std::atomic<unsigned long long> decoder_graph_captures;
     std::atomic<unsigned long long> decoder_graph_replays;
     std::atomic<unsigned long long> decoder_graph_fallbacks;
+    /* Same-width gang changes served by a host re-record of the decoder
+     * graph, and by MYNAH_CUDA_DECODER_TABLE_PATCH's column scatter. */
+    std::atomic<unsigned long long> decoder_graph_rerecords;
+    std::atomic<unsigned long long> decoder_graph_table_patches;
+    /* MYNAH_CUDA_DECODER_VALIDATE_ONCE: next compatibility class id. */
+    std::atomic<unsigned long long> decoder_compat_next;
     std::atomic<unsigned long long> decoder_failures;
     std::atomic<unsigned long long> resident_fallbacks;
     std::atomic<unsigned long long> matmul_calls;
@@ -1539,17 +1560,35 @@ struct mynah_backend_decoder {
     size_t sum_window_floats;
     size_t sum_full_floats;
     size_t state_floats;  /* previous + partial of every op */
+    /* MYNAH_CUDA_DECODER_VALIDATE_ONCE: nonzero once this decoder's topology
+     * was compared op by op with a gang's first row.  Every field
+     * decoder_ops_compatible reads is fixed at open, so two decoders with
+     * the same class are compatible without comparing again; ids come from a
+     * backend counter and are never reused, a re-opened decoder starts at 0. */
+    unsigned long long compat_class;
+    /* MYNAH_CUDA_DECODER_TABLE_PATCH: this decoder's row of every pointer
+     * table a decoder batch graph uploads (one entry per upload slot), as a
+     * real recording wrote it for (table_input, table_output) under graph
+     * layout table_layout (0 = none).  Its buffers do not change while it
+     * lives, pooled or not, so the column stays valid.  table_source and
+     * table_row say which graph and row it was read from (verification). */
+    std::vector<float *> table_column;
+    unsigned long long table_layout;
+    const float *table_input;
+    float *table_output;
+    const void *table_source;
+    size_t table_row;
 };
 
-static constexpr size_t CUDA_BATCH_META_CAP = 384u;
-static constexpr size_t CUDA_DECODER_GRAPH_CAP = 384u;
+static constexpr size_t CUDA_BATCH_META_CAP = MYNAH_ROW_CAP;
+static constexpr size_t CUDA_DECODER_GRAPH_CAP = MYNAH_ROW_CAP;
 /* A server can retain one decoder graph per live context in addition to the
  * width-bucketed backbone/flow graphs.  The condition-projection input graph
  * is a separate bucket because its input is already resident in `cuda_x` and
  * must not accidentally replay an H2D node from the ordinary bucket.  Keep
  * enough finite room for 128 request decoders plus the three 128-width bucket
  * families. */
-static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = 384u;
+static constexpr size_t CUDA_PIPELINE_GRAPH_CAP = MYNAH_ROW_CAP;
 
 static void set_error(char *e, size_t c, const char *m) {
     if (e && c > 0) std::snprintf(e, c, "%s", m);
@@ -3703,6 +3742,9 @@ extern "C" int mynah_backend_cuda_open(void **state_out, mynah_backend_matmul_fn
     st->decoder_graph_captures.store(0ull, std::memory_order_relaxed);
     st->decoder_graph_replays.store(0ull, std::memory_order_relaxed);
     st->decoder_graph_fallbacks.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_rerecords.store(0ull, std::memory_order_relaxed);
+    st->decoder_graph_table_patches.store(0ull, std::memory_order_relaxed);
+    st->decoder_compat_next.store(0ull, std::memory_order_relaxed);
     st->decoder_failures.store(0ull, std::memory_order_relaxed);
     st->resident_fallbacks.store(0ull, std::memory_order_relaxed);
     st->matmul_calls.store(0ull, std::memory_order_relaxed);
@@ -3837,6 +3879,10 @@ extern "C" int mynah_cuda_metrics_get(void *opaque,
         st->decoder_graph_replays.load(std::memory_order_relaxed);
     metrics->decoder_graph_fallbacks =
         st->decoder_graph_fallbacks.load(std::memory_order_relaxed);
+    metrics->decoder_graph_rerecords =
+        st->decoder_graph_rerecords.load(std::memory_order_relaxed);
+    metrics->decoder_graph_table_patches =
+        st->decoder_graph_table_patches.load(std::memory_order_relaxed);
     metrics->decoder_failures = st->decoder_failures.load(std::memory_order_relaxed);
     metrics->resident_fallbacks = st->resident_fallbacks.load(std::memory_order_relaxed);
     metrics->matmul_calls = st->matmul_calls.load(std::memory_order_relaxed);
@@ -6101,6 +6147,12 @@ static int decoder_upload_ptrs(cuda_backend_state *backend, float **device,
             return -1;
         }
         const size_t slot = backend->active_decoder_upload_slot++;
+        if (graph->slot_channels != nullptr) {
+            if (graph->layout_recording)
+                graph->slot_channels[slot] = (uint8_t)channel;
+            else if (graph->slot_channels[slot] != (uint8_t)channel)
+                graph->layout_drift = true;
+        }
         float **host_table = decoder_graph_host_table(graph, slot, channel);
         std::memcpy(host_table, host, batch * sizeof(*host));
         float **device_table = decoder_graph_table(graph, slot, channel);
@@ -6144,6 +6196,71 @@ static bool cuda_decoder_graphs_enabled(void) {
 static bool cuda_decoder_graph_reuse_enabled(void) {
     static const bool on = cuda_env_enabled("MYNAH_CUDA_DECODER_GRAPH_REUSE", true);
     return on;
+}
+
+/* MYNAH_CUDA_DECODER_TABLE_PATCH=1 (default off): a same-width gang change
+ * rewrites the reused graph's pinned pointer tables from per-decoder columns
+ * cached at an earlier real recording, instead of re-recording the whole
+ * decoder on the host to produce the same tables.  Needs graph reuse. */
+static bool cuda_decoder_table_patch_enabled(void) {
+    static const bool on =
+        cuda_env_enabled("MYNAH_CUDA_DECODER_TABLE_PATCH", false) &&
+        cuda_decoder_graph_reuse_enabled();
+    return on;
+}
+
+/* Set once if a real recording ever disagrees with a cached column: the
+ * "column depends only on the decoder" premise is then wrong for this
+ * build, and every later gang change re-records as before. */
+static std::atomic<bool> g_decoder_table_patch_broken{false};
+
+/* MYNAH_CUDA_DECODER_VALIDATE_ONCE=1 (default off): a gang row whose
+ * compatibility class matches the first row's skips the op-by-op
+ * decoder_ops_compatible scan (see mynah_backend_decoder::compat_class). */
+static bool cuda_decoder_validate_once_enabled(void) {
+    static const bool on =
+        cuda_env_enabled("MYNAH_CUDA_DECODER_VALIDATE_ONCE", false);
+    return on;
+}
+
+/* Every row of a cross-request gang must run the first row's topology on its
+ * own buffers: the batched kernels take shapes and weights from the first. */
+static bool decoder_gang_rows_ok(cuda_backend_state *backend,
+                                 mynah_backend_decoder *const *decoders,
+                                 const float *const *inputs,
+                                 float *const *outputs, size_t batch) {
+    mynah_backend_decoder *first = decoders[0];
+    const size_t op_count = first->ops.size();
+    const bool once = cuda_decoder_validate_once_enabled();
+    for (size_t i = 0; i < batch; ++i) {
+        mynah_backend_decoder *decoder = decoders[i];
+        if (decoder == nullptr || decoder->backend != backend ||
+            decoder->channels != first->channels ||
+            decoder->dimension != first->dimension ||
+            decoder->n_filters != first->n_filters ||
+            decoder->elu_alpha != first->elu_alpha ||
+            decoder->max_encoder_frames != first->max_encoder_frames ||
+            decoder->ops.size() != op_count || inputs[i] == nullptr ||
+            outputs[i] == nullptr)
+            return false;
+        if (once && decoder->compat_class != 0ull &&
+            decoder->compat_class == first->compat_class)
+            continue;
+        for (size_t op = 0; op < op_count; ++op) {
+            if (!decoder_ops_compatible(&first->ops[op], &decoder->ops[op]))
+                return false;
+        }
+        if (once) {
+            /* Field equality is an equivalence, so joining the first row's
+             * class keeps "same class => compatible" true. */
+            if (first->compat_class == 0ull)
+                first->compat_class =
+                    backend->decoder_compat_next.fetch_add(
+                        1ull, std::memory_order_relaxed) + 1ull;
+            decoder->compat_class = first->compat_class;
+        }
+    }
+    return true;
 }
 
 static size_t decoder_conv1d_upload_count(const cuda_decoder_op *op) {
@@ -6198,6 +6315,8 @@ static void decoder_batch_graph_free(cuda_decoder_batch_graph_entry *entry) {
     if (entry->device_tables != nullptr) cudaFree(entry->device_tables);
     if (entry->host_tables != nullptr) cudaFreeHost(entry->host_tables);
     if (entry->done != nullptr) cudaEventDestroy(entry->done);
+    delete[] entry->slot_channels;
+    entry->slot_channels = nullptr;
     entry->done = nullptr;
     entry->exec = nullptr;
     entry->graph = nullptr;
@@ -6337,6 +6456,11 @@ static cuda_decoder_batch_graph_entry *decoder_batch_graph_create(
     entry->sig_weight = decoders[0]->ops[0].weight;
     entry->done = nullptr;
     entry->valid = false;
+    entry->slot_channels = nullptr;
+    entry->layout_key = 0ull;
+    entry->layout_recording = false;
+    entry->layout_drift = false;
+    entry->patch_verified = false;
     try {
         entry->decoders.assign(decoders, decoders + batch);
         entry->inputs.assign(inputs, inputs + batch);
@@ -6353,6 +6477,9 @@ static cuda_decoder_batch_graph_entry *decoder_batch_graph_create(
         return nullptr;
     }
     std::memset(entry->host_tables, 0, table_bytes);
+    /* Without the channel record the graph simply never patches. */
+    if (cuda_decoder_table_patch_enabled())
+        entry->slot_channels = new (std::nothrow) uint8_t[upload_slots]();
     try {
         backend->decoder_batch_graphs.push_back(entry);
     } catch (const std::bad_alloc &) {
@@ -6383,6 +6510,146 @@ static size_t decoder_table_channel(const cuda_backend_state *backend,
     if (device == backend->dev_decoder_ptr2) return 2u;
     if (device == backend->dev_decoder_ptr3) return 3u;
     return SIZE_MAX;
+}
+
+/* MYNAH_CUDA_DECODER_TABLE_PATCH.  Every pointer a decoder batch graph uploads
+ * for row i is built from that row alone: decoders[i]'s own buffers (work,
+ * columns, causal rings, window, `full`), inputs[i], outputs[i], and weights
+ * that every compatible row shares.  So once the graph's upload sequence is
+ * fixed (slot_channels), row i of every table is a function of
+ * (decoder, input, output): that decoder's column.  A same-width gang change
+ * then only has to scatter the new rows' columns into the pinned tables the
+ * graph's memcpy nodes read; the executable graph is the one already
+ * instantiated, as on the re-record path. */
+static unsigned long long decoder_table_layout_key(
+    const cuda_decoder_batch_graph_entry *entry) {
+    unsigned long long h = 1469598103934665603ull; /* FNV-1a */
+    auto mix = [&h](unsigned long long v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (v >> (8 * b)) & 0xffull;
+            h *= 1099511628211ull;
+        }
+    };
+    mix((unsigned long long)entry->encoder_frames);
+    mix((unsigned long long)entry->used_slots);
+    for (size_t s = 0u; s < entry->used_slots; ++s)
+        mix((unsigned long long)entry->slot_channels[s]);
+    return h != 0ull ? h : 1ull;
+}
+
+static float *decoder_table_cell(const cuda_decoder_batch_graph_entry *entry,
+                                 size_t slot, size_t row) {
+    return entry->host_tables[(slot * 4u + entry->slot_channels[slot]) *
+                                  entry->batch + row];
+}
+
+static bool decoder_table_patch_usable(
+    const cuda_decoder_batch_graph_entry *entry) {
+    return cuda_decoder_table_patch_enabled() &&
+           !g_decoder_table_patch_broken.load(std::memory_order_relaxed) &&
+           entry != nullptr && entry->slot_channels != nullptr &&
+           entry->layout_key != 0ull && !entry->layout_drift;
+}
+
+static bool decoder_table_column_fits(const mynah_backend_decoder *decoder,
+                                      const cuda_decoder_batch_graph_entry *entry,
+                                      const float *input, const float *output) {
+    return decoder != nullptr && decoder->table_layout == entry->layout_key &&
+           decoder->table_column.size() == entry->used_slots &&
+           decoder->table_input == input && decoder->table_output == output;
+}
+
+/* After a real recording (first capture or re-record) of `entry` for this
+ * gang: compare the cells it wrote with every row's cached column, then cache
+ * the fresh columns.  A row whose column came from another graph or another
+ * row position and matches proves the premise for this graph; one mismatch
+ * anywhere disproves it and turns patching off for the process. */
+static void decoder_table_harvest(cuda_decoder_batch_graph_entry *entry,
+                                  mynah_backend_decoder *const *decoders,
+                                  const float *const *inputs,
+                                  float *const *outputs) {
+    if (!decoder_table_patch_usable(entry)) return;
+    const size_t slots = entry->used_slots;
+    bool informative = false;
+    for (size_t i = 0u; i < entry->batch; ++i) {
+        const mynah_backend_decoder *decoder = decoders[i];
+        if (!decoder_table_column_fits(decoder, entry, inputs[i], outputs[i]))
+            continue;
+        for (size_t s = 0u; s < slots; ++s) {
+            if (decoder->table_column[s] == decoder_table_cell(entry, s, i))
+                continue;
+            if (!g_decoder_table_patch_broken.exchange(true))
+                std::fprintf(stderr,
+                             "mynah-tts: warning: MYNAH_CUDA_DECODER_TABLE_PATCH "
+                             "disabled: a recorded decoder pointer table differs "
+                             "from the cached column (row %zu, slot %zu); gang "
+                             "changes re-record the graph as before\n",
+                             i, s);
+            return;
+        }
+        if (decoder->table_source != entry || decoder->table_row != i)
+            informative = true;
+    }
+    if (informative) entry->patch_verified = true;
+    for (size_t i = 0u; i < entry->batch; ++i) {
+        mynah_backend_decoder *decoder = decoders[i];
+        try {
+            decoder->table_column.resize(slots);
+        } catch (const std::bad_alloc &) {
+            decoder->table_layout = 0ull;
+            continue;
+        }
+        for (size_t s = 0u; s < slots; ++s)
+            decoder->table_column[s] = decoder_table_cell(entry, s, i);
+        decoder->table_layout = entry->layout_key;
+        decoder->table_input = inputs[i];
+        decoder->table_output = outputs[i];
+        decoder->table_source = entry;
+        decoder->table_row = i;
+    }
+}
+
+/* Whether `entry` can serve this gang by a table patch: verified, and every
+ * row that differs from the gang the tables currently hold has a column. */
+static bool decoder_table_patch_ready(
+    const cuda_decoder_batch_graph_entry *entry,
+    mynah_backend_decoder *const *decoders, const float *const *inputs,
+    float *const *outputs) {
+    if (!decoder_table_patch_usable(entry) || !entry->patch_verified)
+        return false;
+    const bool held = entry->decoders.size() == entry->batch &&
+                      entry->inputs.size() == entry->batch &&
+                      entry->outputs.size() == entry->batch;
+    for (size_t i = 0u; i < entry->batch; ++i) {
+        if (held && entry->decoders[i] == decoders[i] &&
+            entry->inputs[i] == inputs[i] && entry->outputs[i] == outputs[i])
+            continue;
+        if (!decoder_table_column_fits(decoders[i], entry, inputs[i],
+                                       outputs[i]))
+            return false;
+    }
+    return true;
+}
+
+/* Scatter the changed rows' columns.  The caller has waited for the graph's
+ * previous launch (entry->done): its memcpy nodes read these pinned cells. */
+static void decoder_table_patch(cuda_decoder_batch_graph_entry *entry,
+                                mynah_backend_decoder *const *decoders,
+                                const float *const *inputs,
+                                float *const *outputs) {
+    const size_t slots = entry->used_slots;
+    const bool held = entry->decoders.size() == entry->batch &&
+                      entry->inputs.size() == entry->batch &&
+                      entry->outputs.size() == entry->batch;
+    for (size_t i = 0u; i < entry->batch; ++i) {
+        if (held && entry->decoders[i] == decoders[i] &&
+            entry->inputs[i] == inputs[i] && entry->outputs[i] == outputs[i])
+            continue;
+        const mynah_backend_decoder *decoder = decoders[i];
+        for (size_t s = 0u; s < slots; ++s)
+            entry->host_tables[(s * 4u + entry->slot_channels[s]) * entry->batch +
+                               i] = decoder->table_column[s];
+    }
 }
 
 static float **decoder_current_table(const cuda_backend_state *backend,
@@ -7196,22 +7463,8 @@ static int decoder_step_batch_impl(
     mynah_backend_decoder *first = decoders[0];
     const size_t op_count = first->ops.size();
     if (op_count == 0u) return -1;
-    for (size_t i = 0; i < batch; ++i) {
-        mynah_backend_decoder *decoder = decoders[i];
-        if (decoder == nullptr || decoder->backend != backend ||
-            decoder->channels != first->channels ||
-            decoder->dimension != first->dimension ||
-            decoder->n_filters != first->n_filters ||
-            decoder->elu_alpha != first->elu_alpha ||
-            decoder->max_encoder_frames != first->max_encoder_frames ||
-            decoder->ops.size() != op_count || inputs[i] == nullptr ||
-            outputs[i] == nullptr)
-            return 1;
-        for (size_t op = 0; op < op_count; ++op) {
-            if (!decoder_ops_compatible(&first->ops[op], &decoder->ops[op]))
-                return 1;
-        }
-    }
+    if (!decoder_gang_rows_ok(backend, decoders, inputs, outputs, batch))
+        return 1;
     bool any_lean = false;
     for (size_t i = 0; i < batch; ++i) any_lean = any_lean || decoders[i]->lean;
     if (any_lean && !decoder_gang_lean_ok(backend, first, batch, encoder_frames))
@@ -7459,6 +7712,25 @@ extern "C" int mynah_cuda_decoder_open(
                              ? "deferred to the reader (beta = 0)"
                              : "kept in the GEMM (MYNAH_CUDA_DECODER_FUSE_BIAS=0)");
     }
+    if (cuda_env_enabled("MYNAH_CUDA_DECODER_TABLE_PATCH", false)) {
+        static std::atomic<bool> announced_patch{false};
+        if (!announced_patch.exchange(true))
+            std::fprintf(stderr,
+                         cuda_decoder_table_patch_enabled()
+                             ? "mynah-tts: CUDA decoder batch graph gang changes "
+                               "patch per-decoder pointer-table columns instead "
+                               "of re-recording (MYNAH_CUDA_DECODER_TABLE_PATCH=1)\n"
+                             : "mynah-tts: warning: MYNAH_CUDA_DECODER_TABLE_PATCH=1 "
+                               "needs MYNAH_CUDA_DECODER_GRAPH_REUSE; ignored\n");
+    }
+    if (cuda_decoder_validate_once_enabled()) {
+        static std::atomic<bool> announced_once{false};
+        if (!announced_once.exchange(true))
+            std::fprintf(stderr,
+                         "mynah-tts: CUDA decoder gang topology checked once per "
+                         "decoder, then by compatibility class "
+                         "(MYNAH_CUDA_DECODER_VALIDATE_ONCE=1)\n");
+    }
     *out = decoder;
     return 0;
 }
@@ -7614,6 +7886,46 @@ extern "C" int mynah_cuda_decoder_step_batch(
          * pointer tables that the instantiated graph's memcpy nodes read at
          * launch, then drop the recording.  No instantiate on this path. */
         if (ce(cudaEventSynchronize(entry->done), e, ec) != 0) return -1;
+        /* MYNAH_CUDA_DECODER_TABLE_PATCH: the same tables without the
+         * re-record, from columns a real recording wrote.  The checks are the
+         * ones decoder_step_batch_impl would refuse the gang with; anything
+         * not ready takes the re-record below. */
+        if (decoder_table_patch_ready(entry, decoders, dev_inputs,
+                                      dev_outputs) &&
+            backend->decoder_batch_enabled &&
+            decoders[0]->backend == backend &&
+            encoder_frames <= decoders[0]->max_encoder_frames &&
+            decoder_gang_rows_ok(backend, decoders, dev_inputs, dev_outputs,
+                                 batch)) {
+            decoder_table_patch(entry, decoders, dev_inputs, dev_outputs);
+            try {
+                entry->decoders.assign(decoders, decoders + batch);
+                entry->inputs.assign(dev_inputs, dev_inputs + batch);
+                entry->outputs.assign(dev_outputs, dev_outputs + batch);
+            } catch (const std::bad_alloc &) {
+                entry->decoders.clear();
+                entry->inputs.clear();
+                entry->outputs.clear();
+            }
+            if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
+                decoder_batch_graph_remove(backend, entry);
+                backend->decoder_graph_fallbacks.fetch_add(
+                    1ull, std::memory_order_relaxed);
+                backend->decoder_failures.fetch_add((unsigned long long)batch,
+                                                    std::memory_order_relaxed);
+                backend->resident_fallbacks.fetch_add((unsigned long long)batch,
+                                                       std::memory_order_relaxed);
+                return -1;
+            }
+            (void)cudaEventRecord(entry->done, backend->stream);
+            backend->decoder_graph_table_patches.fetch_add(
+                1ull, std::memory_order_relaxed);
+            backend->decoder_graph_replays.fetch_add(1ull,
+                                                     std::memory_order_relaxed);
+            backend->decoder_steps.fetch_add((unsigned long long)batch,
+                                             std::memory_order_relaxed);
+            return 0;
+        }
         cudaError_t begin = cudaStreamBeginCapture(backend->stream,
                                                     cudaStreamCaptureModeRelaxed);
         if (begin != cudaSuccess) {
@@ -7648,6 +7960,9 @@ extern "C" int mynah_cuda_decoder_step_batch(
             if (end != cudaSuccess) ce(end, e, ec);
             return eager();
         }
+        decoder_table_harvest(entry, decoders, dev_inputs, dev_outputs);
+        backend->decoder_graph_rerecords.fetch_add(1ull,
+                                                   std::memory_order_relaxed);
         try {
             entry->decoders.assign(decoders, decoders + batch);
             entry->inputs.assign(dev_inputs, dev_inputs + batch);
@@ -7724,9 +8039,11 @@ extern "C" int mynah_cuda_decoder_step_batch(
             : i == 1u ? backend->dev_decoder_ptr1
             : i == 2u ? backend->dev_decoder_ptr2
                       : backend->dev_decoder_ptr3;
+    entry->layout_recording = true;
     const int build = decoder_step_batch_impl(
         backend, decoders, dev_inputs, batch, encoder_frames, dev_outputs, e,
         ec);
+    entry->layout_recording = false;
     entry->used_slots = backend->active_decoder_upload_slot;
     backend->active_decoder_batch_graph = nullptr;
     for (size_t i = 0u; i < 4u; ++i) backend->active_decoder_tables[i] = nullptr;
@@ -7773,6 +8090,10 @@ extern "C" int mynah_cuda_decoder_step_batch(
     if (cuda_decoder_graph_reuse_enabled() &&
         cudaEventCreateWithFlags(&entry->done, cudaEventDisableTiming) != cudaSuccess)
         entry->done = nullptr;
+    if (entry->slot_channels != nullptr) {
+        entry->layout_key = decoder_table_layout_key(entry);
+        decoder_table_harvest(entry, decoders, dev_inputs, dev_outputs);
+    }
     backend->decoder_graph_captures.fetch_add(1ull,
                                              std::memory_order_relaxed);
     if (ce(cudaGraphLaunch(entry->exec, backend->stream), e, ec) != 0) {
@@ -11921,6 +12242,58 @@ extern "C" void mynah_cuda_graph_forget(void *opaque, const void *identity) {
      * arena) matches no decoder and this is a no-op. */
     destroy_decoder_batch_graphs_for(
         st, static_cast<const mynah_backend_decoder *>(identity));
+}
+
+/* MYNAH_CUDA_DEFERRED_RELEASE: graph_forget for a decoder being parked in the
+ * engine's slot pool while work queued earlier may still run.  The stream
+ * sync above exists for what forget destroys; when nothing is destroyed --
+ * no single-request graph under this identity, and every batch graph naming
+ * the decoder is kept for reuse with only its row list cleared (host
+ * vectors) -- there is nothing to wait for.  Otherwise this is graph_forget,
+ * sync included. */
+extern "C" void mynah_cuda_graph_forget_parked(void *opaque,
+                                                const void *identity) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr || identity == nullptr) return;
+    bool destroys = !cuda_decoder_graph_reuse_enabled();
+    for (const cuda_pipeline_graph_entry &entry : st->pipeline_graphs)
+        destroys = destroys || entry.identity == identity;
+    for (const cuda_decoder_batch_graph_entry *entry : st->decoder_batch_graphs) {
+        if (destroys) break;
+        if (entry->valid && entry->done != nullptr) continue;
+        for (const mynah_backend_decoder *row : entry->decoders)
+            destroys = destroys || row == identity;
+    }
+    if (destroys) {
+        mynah_cuda_graph_forget(opaque, identity);
+        return;
+    }
+    destroy_decoder_batch_graphs_for(
+        st, static_cast<const mynah_backend_decoder *>(identity));
+}
+
+/* MYNAH_CUDA_DEFERRED_RELEASE: a point in the stream (an event recorded
+ * after everything queued so far), waited on later instead of now.  Null if
+ * the event cannot be made; the caller then drains as before. */
+extern "C" void *mynah_cuda_fence_record(void *opaque) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st == nullptr) return nullptr;
+    cudaEvent_t event = nullptr;
+    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess)
+        return nullptr;
+    if (cudaEventRecord(event, st->stream) != cudaSuccess) {
+        cudaEventDestroy(event);
+        return nullptr;
+    }
+    return static_cast<void *>(event);
+}
+
+extern "C" void mynah_cuda_fence_wait(void *opaque, void *fence) {
+    (void)opaque;
+    if (fence == nullptr) return;
+    cudaEvent_t event = static_cast<cudaEvent_t>(fence);
+    (void)cudaEventSynchronize(event);
+    cudaEventDestroy(event);
 }
 
 static cuda_graph_entry *find_graph(cuda_backend_state *st, size_t rows,

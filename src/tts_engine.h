@@ -58,6 +58,13 @@ typedef struct {
      * for this model, which is why the engine and not the driver owns it.
      * Appended; see the vtable note. */
     unsigned prefill_slice_tokens;
+    /* Non-zero when `decode_audio_batch` LENDS its out_samples instead of
+     * handing over malloc'd buffers: each stays valid until the next batched
+     * decode of the same context or its ctx_free, and the driver must not free
+     * it. Spares the per-row allocation and free at serving widths. Says
+     * nothing about `decode_audio`, which always hands over ownership.
+     * Appended. */
+    unsigned decode_batch_lends_pcm;
 } mynah_engine_caps;
 
 typedef struct {
@@ -308,6 +315,24 @@ typedef struct {
                          uint64_t seed, mynah_engine_ctx **out_ctx,
                          char *error, size_t error_capacity);
     int  (*ctx_attach)(mynah_engine_ctx *ctx, char *error, size_t error_capacity);
+
+    /* ---- dispatch-ahead (APPENDED; MYNAH_CUDA_STEP_OVERLAP) ----------------
+     *
+     * OPTIONAL. Queue the next `step_batch` for these contexts on the device
+     * and return without waiting for it, so the driver's host work (retire,
+     * admission, cancellation) runs while the device steps. The next
+     * `step_batch` on exactly these contexts, in this order, finishes the
+     * queued step and must produce exactly what one `step_batch` would have.
+     * 0 means queued; any other value means nothing was queued and nothing
+     * changed, and the driver steps as usual.
+     *
+     * Between the two calls the driver may call `ctx_new`, `ctx_new_host`,
+     * `ctx_attach` and `ctx_free` (never on a queued context), and nothing
+     * else on this scratch. Any other engine call with a step still queued
+     * may discard it, which is legal because nothing was committed: the
+     * finishing `step_batch` then simply runs the whole step. */
+    int  (*step_launch)(mynah_engine_ctx *const *ctxs, size_t count,
+                        mynah_engine_scratch *scratch);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

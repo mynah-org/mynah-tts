@@ -211,6 +211,11 @@ typedef struct {
      * collected by `ticket`. */
     int starting;
     unsigned long long ticket;
+    /* MYNAH_CUDA_STEP_OVERLAP: this slot's context is row `ahead_pos` of the
+     * step queued ahead (`step_launch`). The step that finishes it is already
+     * decided, so retire leaves the slot alone until then. */
+    int ahead;
+    size_t ahead_pos;
 } synth_slot;
 
 static int slot_fail(synth_slot *slot, const char *message) {
@@ -500,7 +505,15 @@ static void slots_prefill_slice(const mynah_tts_engine *engine,
                 if (slots[candidate].in_use && slots[candidate].preparing)
                     selected = candidate;
             }
-            if (selected == resident_rows) continue;
+            if (selected == resident_rows) {
+                /* FIFO scanned every row and found nothing left to prefill,
+                 * and later passes would scan the same rows again: stop, or a
+                 * step with nothing prefilling pays resident_rows^2 checks
+                 * (~590k at 768 rows). Round-robin looks at one row per
+                 * pass, so it keeps going. */
+                if (fifo) break;
+                continue;
+            }
             batch_slots[batch_count] = selected;
             batch_ctxs[batch_count] = slots[selected].ctx;
             batch_done[batch_count] = 0;
@@ -852,16 +865,24 @@ static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps 
                                  sizeof(shared_error)) != 0;
     mynah_region_unwind(gang_depth);
     mynah_region_end(MYNAH_RGN_DECODE_GANG);
+    /* An engine that lends its gang PCM (MYNAH_CUDA_PCM_DIRECT) keeps it per
+     * context and reuses it next step, so the free below would be both a
+     * wasted allocator round trip per row and a double free. The default
+     * one-context-at-a-time gang always hands over ownership. Lending is safe
+     * here because delivery is synchronous: by the time slot_deliver returns
+     * the sink has converted or copied every sample. */
+    const int lent = caps->decode_batch_lends_pcm != 0u &&
+                     engine->decode_audio_batch != NULL;
     for (size_t g = 0; g < count; ++g) {
         synth_slot *slot = &slots[step_slot[member[g]]];
         if (gang_failed || decode_failed[g]) {
-            free(pcm[g]);
+            if (!lent) free(pcm[g]);
             slot_fail(slot, shared_error[0] != '\0' ? shared_error
                                                     : "decoding audio failed");
             continue;
         }
         slot_deliver(slot, pcm[g], produced[g], want[g]);
-        free(pcm[g]);
+        if (!lent) free(pcm[g]);
     }
 }
 
@@ -1375,6 +1396,120 @@ static void async_collect(const admit_ctx *a, int wait) {
     }
 }
 
+/* The prefill pass, then the optional late admission (`wait_arrival` in
+ * graph.h) and a second pass over what it admitted. Once per iteration: at the
+ * top of the loop, or with MYNAH_CUDA_STEP_OVERLAP right after the step, which
+ * is the same point in the sequence of steps (see step_ahead_launch). */
+typedef struct {
+    const admit_ctx *adm;
+    mynah_engine_scratch *scratch;
+    size_t max_batch;
+    size_t *prefill_rr;
+    prefill_acct *acct;   /* NULL unless MYNAH_SERVE_PROFILE */
+    int late_admit;
+    unsigned late_wait_us;
+} prefill_ctx;
+
+static void prefill_pass(const prefill_ctx *p, size_t retired_last) {
+    const admit_ctx *a = p->adm;
+    const mynah_tts_engine *engine = a->engine;
+    mynah_graph_sink *sink = a->sink;
+    if (engine->prepare_slice != NULL) {
+        const size_t prefill_rows = a->compact_rows ? *a->used : a->slot_capacity;
+        if (prefill_rows != 0u)
+            slots_prefill_slice(engine, a->caps, p->scratch, a->slots, prefill_rows,
+                                p->max_batch, a->dump_all, p->prefill_rr, p->acct);
+    }
+
+    if (p->late_admit && !*a->drained && *a->used < a->slot_capacity &&
+        (sink->running == NULL || sink->running(sink->ud) != 0) &&
+        sink->wait_arrival(sink->ud, retired_last ? p->late_wait_us : 0u) != 0) {
+        const size_t before = *a->used;
+        admit_pass(a);
+        if (*a->used > before && engine->prepare_slice != NULL) {
+            const size_t prefill_rows = a->compact_rows ? *a->used : a->slot_capacity;
+            slots_prefill_slice(engine, a->caps, p->scratch, a->slots, prefill_rows,
+                                p->max_batch, a->dump_all, p->prefill_rr, p->acct);
+        }
+    }
+}
+
+/* ---- dispatch-ahead (MYNAH_CUDA_STEP_OVERLAP) ---------------------------
+ *
+ * Today the device has nothing queued while the host retires, admits and
+ * checks for cancellations: on a fast GPU that host time is a third of the
+ * loop. With the flag the next step is queued (`step_launch`) BEFORE that
+ * work, and the following iteration's `step_batch` on the same rows only
+ * waits for it. Depth 1: one step in flight, never two.
+ *
+ * Membership changes take effect at a launch. Everything that decides the
+ * rows of step k+1 in the serial loop happens before its launch, in the same
+ * order -- emit k (EOS, budget, re-prepare), delivery k, the prefill pass --
+ * except what arrives while k+1 is in flight: an admission joins at k+2, and
+ * a cancellation rides along in k+1 (stepped, never decoded or delivered)
+ * and retires after it. The rows and their order are the serial loop's (see
+ * the retire simulation below), so a burst that is admitted at once gets the
+ * same steps, bit for bit; under concurrency an admission is one step late. */
+typedef struct {
+    const prefill_ctx *pre;
+    size_t max_batch;
+    size_t count;   /* rows of the step queued ahead; 0 = none */
+    size_t order[MYNAH_GRAPH_MAX_ACTIVE];
+    mynah_engine_ctx *ctxs[MYNAH_GRAPH_MAX_JOBS];
+    size_t slot[MYNAH_GRAPH_MAX_JOBS];
+    unsigned long long launched, finished, refused;
+} step_ahead;
+
+/* Run the prefill pass the next iteration would have run, pick the next
+ * step's rows and queue it. Called after the step, BEFORE retire: the rows are
+ * picked from the arrangement retire is about to leave, simulated on an index
+ * array with retire's own predicate and swap-remove, so the selection sees the
+ * same slots in the same places as the serial loop's selection after retire. */
+static void step_ahead_launch(step_ahead *ah, synth_slot *slots,
+                              size_t *step_rr, size_t retired_last) {
+    const admit_ctx *a = ah->pre->adm;
+    prefill_pass(ah->pre, retired_last);
+    if (!a->compact_rows) return;   /* the lane keeps sparse rows; not supported */
+    size_t n = *a->used;
+    for (size_t i = 0; i < n; ++i) ah->order[i] = i;
+    size_t i = 0u;
+    while (i < n) {
+        const synth_slot *s = &slots[ah->order[i]];
+        if (!s->in_use || s->active || s->preparing || s->starting || s->ahead) {
+            ++i;
+            continue;
+        }
+        --n;
+        ah->order[i] = ah->order[n];
+    }
+    if (n == 0u) return;
+    /* The rotation of the step selection in `serve`, over that arrangement. */
+    size_t live = 0u;
+    size_t next_rr = *step_rr;
+    for (size_t offset = 0; offset < n && live < ah->max_batch; ++offset) {
+        const size_t v = (*step_rr + offset) % n;
+        const synth_slot *s = &slots[ah->order[v]];
+        if (!s->in_use || !s->active) continue;
+        ah->slot[live] = ah->order[v];
+        ah->ctxs[live] = s->ctx;
+        ++live;
+        next_rr = (v + 1u) % n;
+    }
+    /* A single row is stepped serially anyway: nothing to queue it on. */
+    if (live < 2u) return;
+    if (a->engine->step_launch(ah->ctxs, live, ah->pre->scratch) != 0) {
+        ++ah->refused;
+        return;
+    }
+    for (size_t p = 0; p < live; ++p) {
+        slots[ah->slot[p]].ahead = 1;
+        slots[ah->slot[p]].ahead_pos = p;
+    }
+    ah->count = live;
+    *step_rr = next_rr;
+    ++ah->launched;
+}
+
 /* The one driver.
  *
  * `want_batch` is how wide the caller would like to run; `strict_batch` says
@@ -1527,6 +1662,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * variance. */
     const int serve_profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
     const double t_profile0 = serve_profile ? mynah_phase_seconds() : 0.0;
+    if (serve_profile) mynah_backend_sync_profile_reset();
     /* Phase boundaries for the sink (graph.h: `phase`), profile runs only. */
     const int report_phase = serve_profile && sink->phase != NULL;
     unsigned long long iteration = 0ull;
@@ -1621,6 +1757,22 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * next. `late_wait_us` optionally holds the step for an arrival that a
      * retirement in the previous iteration makes likely (closed-loop clients
      * send their next request as the previous one completes). */
+    /* MYNAH_CANCEL_CHECK_EVERY=N: ask the sink about cancellation every N
+     * iterations instead of every one (default 1). On the HTTP server each ask
+     * is a mutex plus a poll() per live stream, all on the scheduler thread
+     * while the GPU has nothing queued; at hundreds of streams that is a
+     * measurable share of each step. A disconnect is then noticed up to N-1
+     * frames later; a stream whose writer already saw the hangup still ends
+     * on its own, because it has nowhere to write. */
+    unsigned long long cancel_every = 1ull;
+    {
+        const char *e = getenv("MYNAH_CANCEL_CHECK_EVERY");
+        if (e != NULL && *e != '\0') {
+            char *end = NULL;
+            const unsigned long v = strtoul(e, &end, 10);
+            if (end != e && *end == '\0' && v >= 1ul && v <= 1000ul) cancel_every = v;
+        }
+    }
     const int late_admit = sink->wait_arrival != NULL;
     unsigned late_wait_us = 0u;
     if (late_admit) {
@@ -1632,6 +1784,53 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         }
     }
     size_t retired_last = 0u;
+
+    prefill_ctx pre;
+    memset(&pre, 0, sizeof(pre));
+    pre.adm = &adm;
+    pre.scratch = scratch;
+    pre.max_batch = max_batch;
+    pre.prefill_rr = &prefill_rr;
+    pre.acct = serve_profile ? &prefill_profile : NULL;
+    pre.late_admit = late_admit;
+    pre.late_wait_us = late_wait_us;
+
+    /* MYNAH_CUDA_STEP_OVERLAP (default 0 = off): dispatch-ahead, see
+     * step_ahead_launch. Needs the engine hook and the sliced prefill (a
+     * one-shot `prepare` at admission would run while a step is queued); not
+     * with the decoder lane (sparse rows) or the parity dump. */
+    int step_overlap = 0;
+    step_ahead *ahead = NULL;   /* NULL unless on */
+    {
+        const char *e = getenv("MYNAH_CUDA_STEP_OVERLAP");
+        if (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) {
+            const char *why =
+                engine->step_launch == NULL ? "the engine cannot queue a step ahead"
+                : lane_on ? "the decoder lane is on"
+                : dump_all ? "the parity dump is on"
+                : (engine->prepare_slice == NULL || prefill_slice_budget(&caps) == 0u)
+                    ? "the prefill is not sliced (MYNAH_PREFILL_SLICE=0)"
+                    : NULL;
+            if (why == NULL) {
+                ahead = (step_ahead *)calloc(1, sizeof(*ahead));
+                if (ahead == NULL) why = "out of memory";
+            }
+            if (why != NULL) {
+                fprintf(stderr, "driver: MYNAH_CUDA_STEP_OVERLAP ignored: %s\n", why);
+            } else {
+                step_overlap = 1;
+                ahead->pre = &pre;
+                ahead->max_batch = max_batch;
+                fprintf(stderr,
+                        "driver: step overlap ON (MYNAH_CUDA_STEP_OVERLAP): the next "
+                        "step is queued before retire, admission and cancellation, "
+                        "which run while the device steps; a request admitted "
+                        "meanwhile joins one step later\n");
+            }
+        }
+    }
+    /* The prefill pass of this iteration already ran after the last step. */
+    int prefilled_ahead = 0;
 
     for (;;) {
         /* ---- reap whatever the decoder lane finished --------------------
@@ -1679,7 +1878,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         if (report_phase) sink->phase(sink->ud, iteration, 1);
 
         /* ---- cancellation --------------------------------------------- */
-        if (sink->cancelled != NULL) {
+        if (sink->cancelled != NULL && iteration % cancel_every == 0ull) {
             for (size_t i = 0; i < slot_capacity; ++i) {
                 /* A slot still prefilling is cancellable too, and has to be:
                  * otherwise a client that disconnects during a long prefill
@@ -1695,27 +1894,11 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
 
         if (async_on) async_collect(&adm, 0);
 
-        /* ---- finish the prefills that are in flight -------------------- */
-        if (engine->prepare_slice != NULL) {
-            const size_t prefill_rows = compact_rows ? used : slot_capacity;
-            if (prefill_rows != 0u)
-                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
-                                    max_batch, dump_all, &prefill_rr,
-                                    serve_profile ? &prefill_profile : NULL);
-        }
-
-        if (late_admit && !drained && used < slot_capacity &&
-            (sink->running == NULL || sink->running(sink->ud) != 0) &&
-            sink->wait_arrival(sink->ud, retired_last ? late_wait_us : 0u) != 0) {
-            const size_t before = used;
-            admit_pass(&adm);
-            if (used > before && engine->prepare_slice != NULL) {
-                const size_t prefill_rows = compact_rows ? used : slot_capacity;
-                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
-                                    max_batch, dump_all, &prefill_rr,
-                                    serve_profile ? &prefill_profile : NULL);
-            }
-        }
+        /* ---- finish the prefills that are in flight -------------------- *
+         * Then the late admission. With MYNAH_CUDA_STEP_OVERLAP this already
+         * ran right after the last step, before the next one was queued. */
+        if (!prefilled_ahead) prefill_pass(&pre, retired_last);
+        prefilled_ahead = 0;
         if (report_phase) sink->phase(sink->ud, iteration, 2);
 
         /* ---- one bounded step over the live set -----------------------
@@ -1726,17 +1909,44 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         size_t live = 0;
         size_t next_step_rr = step_rr;
         const size_t resident_rows = compact_rows ? used : slot_capacity;
-        for (size_t offset = 0; offset < resident_rows && live < max_batch;
-             ++offset) {
-            const size_t i = (step_rr + offset) % resident_rows;
-            if (!slots[i].in_use || !slots[i].active) continue;
-            step_slot[live] = i;
-            step_ctxs[live] = slots[i].ctx;
-            ++live;
-            next_step_rr = (i + 1u) % resident_rows;
+        if (ahead != NULL && ahead->count > 0u) {
+            /* MYNAH_CUDA_STEP_OVERLAP: the rows of the step queued ahead, in
+             * their order. Retire and admission may have moved their slots,
+             * never dropped them. A row cancelled (or failed) meanwhile is in
+             * a step that is already running: it rides along, marked failed
+             * so that nothing else happens to it -- no decode, no delivery, no
+             * state change -- and it retires after the step, as cancelled. */
+            for (size_t p = 0; p < ahead->count; ++p) step_ctxs[p] = NULL;
+            for (size_t i = 0; i < resident_rows; ++i) {
+                synth_slot *s = &slots[i];
+                if (!s->ahead) continue;
+                s->ahead = 0;
+                if (!s->active) s->failed = 1;
+                if (s->ahead_pos >= ahead->count) continue;
+                step_slot[s->ahead_pos] = i;
+                step_ctxs[s->ahead_pos] = s->ctx;
+            }
+            for (size_t p = 0; p < ahead->count; ++p) {
+                if (step_ctxs[p] == NULL) continue;   /* cannot happen */
+                step_slot[live] = step_slot[p];
+                step_ctxs[live] = step_ctxs[p];
+                ++live;
+            }
+            ahead->count = 0u;
+            ++ahead->finished;
+        } else {
+            for (size_t offset = 0; offset < resident_rows && live < max_batch;
+                 ++offset) {
+                const size_t i = (step_rr + offset) % resident_rows;
+                if (!slots[i].in_use || !slots[i].active) continue;
+                step_slot[live] = i;
+                step_ctxs[live] = slots[i].ctx;
+                ++live;
+                next_step_rr = (i + 1u) % resident_rows;
+            }
+            if (live > 0u) step_rr = next_step_rr;
+            else step_rr = (step_rr + 1u) % resident_rows;
         }
-        if (live > 0u) step_rr = next_step_rr;
-        else step_rr = (step_rr + 1u) % resident_rows;
         if (serve_profile) {
             ++occ_frames;
             occ_hist[live <= max_batch ? live : max_batch] += 1u;
@@ -1757,6 +1967,13 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 if (took > occ_worst[b]) occ_worst[b] = took;
                 if (occ_deadline_s > 0.0 && took > occ_deadline_s) ++occ_late[b];
             }
+            /* MYNAH_CUDA_STEP_OVERLAP: the next iteration's prefill pass, then
+             * its step is queued; retire below and the next admission run
+             * while the device steps. */
+            if (step_overlap) {
+                step_ahead_launch(ahead, slots, &step_rr, retired_last);
+                prefilled_ahead = 1;
+            }
         }
 
         if (report_phase) sink->phase(sink->ud, iteration, 3);
@@ -1773,7 +1990,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             size_t i = 0u;
             while (i < used) {
                 if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
-                    slots[i].starting) {
+                    slots[i].starting || slots[i].ahead) {
                     ++i;
                     continue;
                 }
@@ -1790,7 +2007,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 /* `preparing` is the third state this loop has to know about:
                  * not active, and not finished either. */
                 if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
-                    slots[i].starting)
+                    slots[i].starting || slots[i].ahead)
                     continue;
                 /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates
                  * the frame history and frees the context; a unit still
@@ -1863,6 +2080,34 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 pre1 * pct, prefill_profile.slices[1], prefill_profile.completed[1],
                 prefill_profile.slices[1] ? 1e3 * pre1 / (double)prefill_profile.slices[1] : 0.0,
                 (loop_s - step_s - pre0 - pre1) * pct, occ_blocked_s * pct);
+        if (step_overlap) {
+            const size_t steps = occ_frames - occ_hist[0];
+            fprintf(stderr,
+                    "[SERVE] step overlap (MYNAH_CUDA_STEP_OVERLAP): %llu of %zu steps "
+                    "queued ahead (%llu launched), %llu launches refused by the engine "
+                    "(not eligible: it then steps serially)\n",
+                    ahead->finished, steps, ahead->launched, ahead->refused);
+        }
+        /* On a GPU this is the line that says whether the device or the host
+         * bounds the loop: the host waits inside mynah_backend_sync while queued
+         * device work runs, and everything else in the loop is host time during
+         * which the GPU has nothing queued (there is no overlap of step N+1
+         * with step N's host work unless MYNAH_CUDA_STEP_OVERLAP is on). CPU
+         * backends have no sync and print nothing. */
+        double sync_s = 0.0;
+        unsigned long long sync_calls = 0ull;
+        mynah_backend_sync_profile(&sync_s, &sync_calls);
+        if (sync_calls > 0ull) {
+            const double host_s = loop_s - sync_s - occ_blocked_s;
+            fprintf(stderr,
+                    "[SERVE] device wait %.1f%% of loop (%llu syncs, %.2f ms mean, %.2f per "
+                    "iteration); host %.1f%% (%.2f ms per iteration); blocked %.1f%%\n",
+                    sync_s * pct, sync_calls, 1e3 * sync_s / (double)sync_calls,
+                    iteration ? (double)sync_calls / (double)iteration : 0.0,
+                    host_s * pct, iteration ? 1e3 * host_s / (double)iteration : 0.0,
+                    occ_blocked_s * pct);
+            mynah_backend_sync_profile_print(stderr, iteration);
+        }
     }
     if (timing) {
         t_ar = mynah_phase_seconds();
@@ -1870,6 +2115,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 t_prep - t_start, t_ar - t_prep, admitted);
     }
     if (async_on) async_admit_stop(&async_q);
+    free(ahead);
     engine->scratch_free(scratch);
     engine->model_free(state);
     return result;

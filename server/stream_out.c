@@ -26,12 +26,26 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #define STREAM_OUT_DEFAULT_BYTES      (1u << 20)   /* 1 MiB */
 #define STREAM_OUT_MIN_BYTES          4096u
 #define STREAM_OUT_MAX_BYTES          (1u << 26)   /* 64 MiB; it is allocated up front */
 #define STREAM_OUT_DEFAULT_TIMEOUT_MS 5000
+
+/* One unit of work for a delivery helper (MYNAH_STREAM_DELIVER_THREADS): a
+ * chunk to enqueue, or the stream's close. Chunk items are recycled through
+ * the helper's free list, so after warm-up the producer never allocates; the
+ * close item is embedded in the stream_out, so closing cannot fail. */
+typedef struct deliver_item {
+    struct deliver_item *next;
+    stream_out *out;
+    float *pcm;
+    size_t count;
+    size_t cap;               /* floats `pcm` can hold; grown, never shrunk */
+    int close;
+} deliver_item;
 
 struct stream_out {
     /* Guarded by `mu` for READING from another thread; the writer thread is
@@ -40,6 +54,7 @@ struct stream_out {
      * and a peer-hangup poll from overlapping. */
     int fd;
     int send_timeout_ms;
+    int one_write;            /* MYNAH_STREAM_OUT_WRITEV, read at start */
 
     char *header;
     size_t header_len;
@@ -65,6 +80,15 @@ struct stream_out {
     int failure_errno;
 
     _Atomic int refs;         /* producer + detached writer */
+
+    /* MYNAH_STREAM_DELIVER_THREADS. `lane` is the helper this stream is
+     * pinned to for life; `dead` mirrors `failed` without the mutex, so the
+     * producer can stop copying chunks for a stream nobody will send. It is
+     * only ever set, so a stale zero costs one wasted copy, never a lost
+     * failure. */
+    unsigned lane;
+    _Atomic int dead;
+    deliver_item close_item;
 };
 
 /* ------------------------------------------------------------ configuration */
@@ -81,6 +105,16 @@ static size_t stream_out_capacity_bytes(void) {
     return (size_t)v;
 }
 
+/* MYNAH_STREAM_OUT_WRITEV=1: send each HTTP chunk (size line, PCM, CRLF) with
+ * one writev() instead of three send() calls. The bytes on the wire are the
+ * same; what changes is a third of the syscalls on the writer threads, which
+ * at hundreds of streams share the host's cores with the scheduler thread.
+ * Off by default until measured. */
+static int stream_out_one_write(void) {
+    const char *e = getenv("MYNAH_STREAM_OUT_WRITEV");
+    return e != NULL && strcmp(e, "1") == 0;
+}
+
 static int stream_out_timeout_ms(void) {
     const char *e = getenv("MYNAH_STREAM_OUT_SEND_TIMEOUT_MS");
     if (e == NULL || e[0] == '\0') return STREAM_OUT_DEFAULT_TIMEOUT_MS;
@@ -90,6 +124,30 @@ static int stream_out_timeout_ms(void) {
         return STREAM_OUT_DEFAULT_TIMEOUT_MS;
     }
     return (int)v;
+}
+
+/* The delivery pool (MYNAH_STREAM_DELIVER_THREADS); empty unless started. */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    deliver_item *head;       /* FIFO, guarded by mu */
+    deliver_item *tail;
+    deliver_item *spare;      /* recycled chunk items, guarded by mu */
+    int idle;                 /* the helper is parked on cv */
+    unsigned index;
+} deliver_lane;
+
+static deliver_lane *g_lanes;
+static unsigned g_lane_count;      /* written once, before any stream exists */
+static _Atomic unsigned g_next_lane;
+
+/* Round-robin rather than a hash of the pointer: streams are admitted one at
+ * a time, so this balances the helpers exactly, and a stream keeps the lane
+ * it was given for as long as it lives -- which is the ordering guarantee. */
+static unsigned stream_out_deliver_pick_lane(void) {
+    if (g_lane_count == 0u) return 0u;
+    return atomic_fetch_add_explicit(&g_next_lane, 1u, memory_order_relaxed) %
+           g_lane_count;
 }
 
 /* ------------------------------------------------------------------ socket */
@@ -114,11 +172,45 @@ static int write_all_or_gone(int fd, const void *data, size_t len) {
     return 0;
 }
 
+/* The same contract as write_all_or_gone, for a gather list: everything or
+ * the peer is gone. A short write advances through the vector in place. */
+static int writev_all_or_gone(int fd, struct iovec *iov, int count) {
+    while (count > 0) {
+        const ssize_t n = writev(fd, iov, count);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (n == 0) errno = EPIPE;
+            return -1;
+        }
+        size_t left = (size_t)n;
+        while (count > 0 && left >= iov->iov_len) {
+            left -= iov->iov_len;
+            ++iov;
+            --count;
+        }
+        if (count > 0) {
+            iov->iov_base = (char *)iov->iov_base + left;
+            iov->iov_len -= left;
+        }
+    }
+    return 0;
+}
+
 /* One HTTP chunk: size line, body, CRLF. */
-static int write_chunk(int fd, const unsigned char *data, size_t len) {
+static int write_chunk(int fd, const unsigned char *data, size_t len, int one_write) {
     char size_line[32];
     const int n = snprintf(size_line, sizeof(size_line), "%zx\r\n", len);
     if (n <= 0 || (size_t)n >= sizeof(size_line)) { errno = EINVAL; return -1; }
+    if (one_write) {
+        struct iovec iov[3];
+        iov[0].iov_base = size_line;
+        iov[0].iov_len = (size_t)n;
+        iov[1].iov_base = (void *)data;
+        iov[1].iov_len = len;
+        iov[2].iov_base = (void *)"\r\n";
+        iov[2].iov_len = 2u;
+        return writev_all_or_gone(fd, iov, 3);
+    }
     if (write_all_or_gone(fd, size_line, (size_t)n) != 0) return -1;
     if (write_all_or_gone(fd, data, len) != 0) return -1;
     return write_all_or_gone(fd, "\r\n", 2);
@@ -149,6 +241,7 @@ static void mark_failed_locked(stream_out *out, int err) {
         out->failed = 1;
         out->failure_errno = err;
     }
+    atomic_store_explicit(&out->dead, 1, memory_order_relaxed);
     out->producer_done = 1;
     pthread_cond_broadcast(&out->cv);
 }
@@ -188,7 +281,7 @@ static void *stream_out_writer_main(void *arg) {
         const size_t offset = out->head;
         pthread_mutex_unlock(&out->mu);
 
-        if (write_chunk(out->fd, out->ring + offset, span) != 0) {
+        if (write_chunk(out->fd, out->ring + offset, span, out->one_write) != 0) {
             const int err = errno;
             pthread_mutex_lock(&out->mu);
             mark_failed_locked(out, err);
@@ -256,6 +349,7 @@ stream_out *stream_out_start(int fd, const char *header) {
 
     out->fd = fd;
     out->send_timeout_ms = stream_out_timeout_ms();
+    out->one_write = stream_out_one_write();
     out->capacity = stream_out_capacity_bytes();
     out->ring = (unsigned char *)malloc(out->capacity);
     if (out->ring == NULL) { free(out); return NULL; }
@@ -277,6 +371,8 @@ stream_out *stream_out_start(int fd, const char *header) {
         return NULL;
     }
     atomic_init(&out->refs, 2);   /* producer + writer */
+    atomic_init(&out->dead, 0);
+    out->lane = stream_out_deliver_pick_lane();
 
     struct timeval tv;
     tv.tv_sec = out->send_timeout_ms / 1000;
@@ -463,4 +559,175 @@ void stream_out_get_stats(stream_out *out, stream_out_stats *stats) {
     stats->failed = out->failed;
     stats->failure_errno = out->failure_errno;
     pthread_mutex_unlock(&out->mu);
+}
+
+/* ------------------------------------------------- the delivery helpers */
+
+/* One helper. It takes the whole queue at once, so a step's worth of chunks
+ * costs it one lock rather than one per chunk, and runs each item exactly as
+ * the producer would have: stream_out_enqueue() for a chunk -- the only
+ * caller of it for this stream, which keeps `convert` single-owner -- and
+ * finish + release for a close. Nothing here touches the model, the driver or
+ * the request; the stream_out and this lane are all a helper ever sees. */
+static void *stream_out_deliver_main(void *arg) {
+    deliver_lane *lane = (deliver_lane *)arg;
+    {
+        char name[16];
+        snprintf(name, sizeof(name), "mynah-dlv%u", lane->index);
+        mynah_thread_set_name(name);
+    }
+    pthread_mutex_lock(&lane->mu);
+    for (;;) {
+        while (lane->head == NULL) {
+            lane->idle = 1;
+            pthread_cond_wait(&lane->cv, &lane->mu);
+            lane->idle = 0;
+        }
+        deliver_item *it = lane->head;
+        lane->head = NULL;
+        lane->tail = NULL;
+        pthread_mutex_unlock(&lane->mu);
+
+        deliver_item *spent = NULL;
+        deliver_item *spent_tail = NULL;
+        while (it != NULL) {
+            /* Read before the item can go away: a close item lives inside
+             * the stream it releases. */
+            deliver_item *next = it->next;
+            if (it->close) {
+                stream_out *out = it->out;
+                stream_out_finish(out);
+                stream_out_release(out);
+            } else {
+                /* A refusal marks the stream failed inside enqueue, exactly
+                 * as it did on the producer's thread; the producer learns it
+                 * from stream_out_failed() at its next step. */
+                (void)stream_out_enqueue(it->out, it->pcm, it->count);
+                it->out = NULL;
+                it->next = NULL;
+                if (spent_tail != NULL) spent_tail->next = it;
+                else spent = it;
+                spent_tail = it;
+            }
+            it = next;
+        }
+
+        pthread_mutex_lock(&lane->mu);
+        if (spent_tail != NULL) {
+            spent_tail->next = lane->spare;
+            lane->spare = spent;
+        }
+    }
+    return NULL;
+}
+
+int stream_out_deliver_init(unsigned threads) {
+    if (threads == 0u || g_lanes != NULL) return 0;
+    deliver_lane *lanes = (deliver_lane *)calloc(threads, sizeof(*lanes));
+    if (lanes == NULL) return -1;
+    for (unsigned i = 0; i < threads; ++i) {
+        lanes[i].index = i;
+        if (pthread_mutex_init(&lanes[i].mu, NULL) != 0 ||
+            pthread_cond_init(&lanes[i].cv, NULL) != 0) {
+            /* Nothing has started yet; the few primitives initialised so far
+             * are leaked rather than tracked, once, at start-up. */
+            free(lanes);
+            return -1;
+        }
+    }
+    for (unsigned i = 0; i < threads; ++i) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, stream_out_deliver_main, &lanes[i]) != 0) {
+            /* Helpers already running are parked on an empty queue and will
+             * never be handed work: g_lane_count stays 0, so every stream
+             * keeps synchronous delivery. They cost a stack each. */
+            return -1;
+        }
+        pthread_detach(thread);
+    }
+    g_lanes = lanes;
+    g_lane_count = threads;
+    return 0;
+}
+
+int stream_out_deliver_enabled(void) {
+    return g_lane_count > 0u;
+}
+
+int stream_out_deliver(stream_out *out, const float *samples, size_t count) {
+    if (out == NULL || samples == NULL || count == 0) return -1;
+    if (atomic_load_explicit(&out->dead, memory_order_relaxed)) {
+        /* What an enqueue on a failed stream answers, counted the same way. */
+        pthread_mutex_lock(&out->mu);
+        ++out->failed_enqueues;
+        pthread_mutex_unlock(&out->mu);
+        return -1;
+    }
+    deliver_lane *lane = &g_lanes[out->lane];
+
+    pthread_mutex_lock(&lane->mu);
+    deliver_item *it = lane->spare;
+    if (it != NULL) lane->spare = it->next;
+    pthread_mutex_unlock(&lane->mu);
+
+    if (it == NULL) it = (deliver_item *)calloc(1, sizeof(*it));
+    if (it != NULL && count > it->cap) {
+        float *grown = count <= SIZE_MAX / sizeof(float)
+            ? (float *)realloc(it->pcm, count * sizeof(float)) : NULL;
+        if (grown == NULL) {
+            pthread_mutex_lock(&lane->mu);
+            it->next = lane->spare;
+            lane->spare = it;
+            pthread_mutex_unlock(&lane->mu);
+            it = NULL;
+        } else {
+            it->pcm = grown;
+            it->cap = count;
+        }
+    }
+    if (it == NULL) {
+        pthread_mutex_lock(&out->mu);
+        ++out->failed_enqueues;
+        mark_failed_locked(out, ENOMEM);
+        pthread_mutex_unlock(&out->mu);
+        return -1;
+    }
+    /* The copy is what makes the caller's buffer free again on return. */
+    memcpy(it->pcm, samples, count * sizeof(float));
+    it->out = out;
+    it->count = count;
+    it->close = 0;
+    it->next = NULL;
+
+    pthread_mutex_lock(&lane->mu);
+    if (lane->tail != NULL) lane->tail->next = it;
+    else lane->head = it;
+    lane->tail = it;
+    /* Only a parked helper needs the futex: a busy one finds this item when
+     * it comes back for the next batch. That is most of the saving at width,
+     * one wake per step per helper instead of one per stream. */
+    if (lane->idle) pthread_cond_signal(&lane->cv);
+    pthread_mutex_unlock(&lane->mu);
+    return 0;
+}
+
+void stream_out_deliver_close(stream_out *out) {
+    if (out == NULL) return;
+    if (g_lane_count == 0u) {
+        stream_out_finish(out);
+        stream_out_release(out);
+        return;
+    }
+    deliver_lane *lane = &g_lanes[out->lane];
+    deliver_item *it = &out->close_item;
+    it->out = out;
+    it->count = 0;
+    it->close = 1;
+    it->next = NULL;
+    pthread_mutex_lock(&lane->mu);
+    if (lane->tail != NULL) lane->tail->next = it;
+    else lane->head = it;
+    lane->tail = it;
+    if (lane->idle) pthread_cond_signal(&lane->cv);
+    pthread_mutex_unlock(&lane->mu);
 }

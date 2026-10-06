@@ -249,6 +249,10 @@ static struct {
 } g_prof_stats;
 /* Scheduler thread only. */
 static unsigned long long g_iter_index;
+/* MYNAH_STREAM_DELIVER_THREADS=N: stream chunks are handed to N helper threads
+ * (stream_out.h) instead of being enqueued on the scheduler thread. Set once
+ * before the scheduler starts. */
+static int g_stream_deliver;
 static double g_iter_t[PH_COUNT];
 
 static void prof_hist_add(int h, double ms) {
@@ -578,7 +582,13 @@ static int stream_callback(const float *samples, size_t count, void *user_data) 
         return -1;
     }
     if (count == 0) return stream_out_failed(sink->out) ? -1 : 0;
-    const int rc = stream_out_enqueue(sink->out, samples, count);
+    /* MYNAH_STREAM_DELIVER_THREADS: one copy into the stream's helper queue
+     * instead of conversion, ring copy and writer wake here. The bookkeeping
+     * below stays on this thread, counted at hand-off, because the sink lives
+     * in the job and the job may be gone before the helper gets to it. */
+    const int rc = g_stream_deliver
+        ? stream_out_deliver(sink->out, samples, count)
+        : stream_out_enqueue(sink->out, samples, count);
     if (rc == 0) {
         if (!sink->first_audio_seen) {
             sink->first_audio_ms = now_ms();
@@ -738,7 +748,12 @@ static void sink_on_done(void *ud, void *tag, int result) {
 
     if (j->is_stream) {
         stream_out *out = j->sink.out;
-        stream_out_finish(out);
+        /* With delivery helpers the end of the stream must queue BEHIND this
+         * stream's pending chunks, or it would overtake them and they would be
+         * refused as late: finish and release travel together through the
+         * helper at the bottom. The snapshot below may then predate the last
+         * chunk or two, which only the log lines can see. */
+        if (!g_stream_deliver) stream_out_finish(out);
         atomic_fetch_sub(&g_stats.streams_active, 1ul);
         stream_out_stats stats;
         memset(&stats, 0, sizeof(stats));   /* the getter is a no-op on NULL */
@@ -777,7 +792,8 @@ static void sink_on_done(void *ud, void *tag, int result) {
                               ? (double)j->sink.audio_samples / g.info.sample_rate
                               : 0.0);
         j->sink.out = NULL;
-        stream_out_release(out);
+        if (g_stream_deliver) stream_out_deliver_close(out);
+        else stream_out_release(out);
         job_release(j);
         return;
     }
@@ -2188,6 +2204,14 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_decoder_graph_fallbacks_total counter\n"
            "mynah_backend_decoder_graph_fallbacks_total %llu\n",
            m.decoder_graph_fallbacks);
+    METRIC("# HELP mynah_backend_decoder_graph_rerecords_total Cross-request CUDA decoder graph gang changes served by a host re-record.\n"
+           "# TYPE mynah_backend_decoder_graph_rerecords_total counter\n"
+           "mynah_backend_decoder_graph_rerecords_total %llu\n",
+           m.decoder_graph_rerecords);
+    METRIC("# HELP mynah_backend_decoder_graph_table_patches_total Cross-request CUDA decoder graph gang changes served by a pointer-table patch.\n"
+           "# TYPE mynah_backend_decoder_graph_table_patches_total counter\n"
+           "mynah_backend_decoder_graph_table_patches_total %llu\n",
+           m.decoder_graph_table_patches);
     METRIC("# HELP mynah_backend_decoder_failures_total Decoder failures.\n"
            "# TYPE mynah_backend_decoder_failures_total counter\n"
            "mynah_backend_decoder_failures_total %llu\n",
@@ -3274,6 +3298,29 @@ int main(int argc, char **argv) {
      * process keeps its name and `sample` reports the main thread by its
      * dispatch-queue label, so the name is visible only to a debugger. */
     mynah_thread_set_name(chan_fd >= 0 ? "mynah-recv" : "mynah-accept");
+
+    /* Before the scheduler, so no stream exists yet that could be pinned to
+     * a helper that is not there. A failure to start is not fatal: delivery
+     * simply stays on the scheduler thread, which is today's behaviour. */
+    {
+        const char *e = getenv("MYNAH_STREAM_DELIVER_THREADS");
+        char *end = NULL;
+        const long n = (e != NULL && e[0] != '\0') ? strtol(e, &end, 10) : 0;
+        if (e != NULL && e[0] != '\0' && (end == e || *end != '\0' || n < 0 || n > 64)) {
+            fprintf(stderr, "ignoring MYNAH_STREAM_DELIVER_THREADS=%s "
+                            "(want 0..64)\n", e);
+        } else if (n > 0) {
+            if (stream_out_deliver_init((unsigned)n) == 0 &&
+                stream_out_deliver_enabled()) {
+                g_stream_deliver = 1;
+                fprintf(stderr, "stream delivery off the scheduler: on, %ld "
+                                "helper threads (MYNAH_STREAM_DELIVER_THREADS)\n", n);
+            } else {
+                fprintf(stderr, "cannot start stream delivery helpers; "
+                                "delivering on the scheduler thread\n");
+            }
+        }
+    }
 
     pthread_mutex_init(&g_batch.mu, NULL);
     pthread_cond_init(&g_batch.arrived, NULL);

@@ -90,6 +90,12 @@ typedef struct {
     unsigned long long kv_vmm_reserved_bytes;
     unsigned long long kv_vmm_maps;
     unsigned long long kv_vmm_unmaps;
+    /* Cross-request decoder graph, same width and a different gang: served
+     * by a host re-record of the graph (counted in decoder_graph_replays
+     * too), or by MYNAH_CUDA_DECODER_TABLE_PATCH's per-decoder column
+     * scatter (likewise).  Appended so older fields keep their offsets. */
+    unsigned long long decoder_graph_rerecords;
+    unsigned long long decoder_graph_table_patches;
 } mynah_tts_backend_metrics;
 
 typedef struct {

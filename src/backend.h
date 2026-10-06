@@ -5,6 +5,7 @@
 #include "seanet.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 typedef struct mynah_backend mynah_backend;
 typedef struct mynah_backend_decoder mynah_backend_decoder;
@@ -289,6 +290,28 @@ int mynah_backend_download(const mynah_backend *backend, const float *dev_ptr,
 int mynah_backend_sync(const mynah_backend *backend,
                        char *error, size_t error_capacity);
 
+/* MYNAH_SERVE_PROFILE only: wall seconds the calling process has spent inside
+ * mynah_backend_sync on a device backend, and how many such calls it made.
+ * On a GPU that is the time the host waited for queued device work, so
+ * (loop wall - this) is the host's own share of a serving loop: the time the
+ * GPU sat idle unless something else was queued. Both are zero when the
+ * profile is off or the backend has no sync. */
+void mynah_backend_sync_profile(double *wait_seconds, unsigned long long *calls);
+
+/* The same accounting per call site (file:line), printed by the serving
+ * loop's profile: which sync points a step actually runs, how often, and how
+ * long each one waits. Every mynah_backend_sync() call records its site
+ * through the macro below; the function itself is still a real symbol. */
+int mynah_backend_sync_at(const mynah_backend *backend, char *error,
+                          size_t error_capacity, const char *file, int line);
+void mynah_backend_sync_profile_print(FILE *out, unsigned long long iterations);
+/* Zero the totals and the per-site table: the serving loop calls it when it
+ * starts, so start-up work (slot pool fill, graph capture, warm-up) is not
+ * charged to the loop's shares. */
+void mynah_backend_sync_profile_reset(void);
+#define mynah_backend_sync(backend, error, error_capacity) \
+    mynah_backend_sync_at((backend), (error), (error_capacity), __FILE__, __LINE__)
+
 /* Begin a resident GPU command batch.  CPU backends are no-ops.  The batch is
  * submitted by mynah_backend_sync at the next CPU-visible boundary. */
 int mynah_backend_batch_begin(const mynah_backend *backend,
@@ -313,6 +336,15 @@ void mynah_backend_graph_abort(const mynah_backend *backend, size_t key,
                                const void *identity);
 void mynah_backend_graph_forget(const mynah_backend *backend,
                                 const void *identity);
+/* MYNAH_CUDA_DEFERRED_RELEASE.  graph_forget for an identity whose owner is
+ * parked, not freed: skips graph_forget's device sync when forgetting
+ * destroys nothing (falls back to graph_forget otherwise).  A fence is a
+ * point in the backend's stream recorded now and waited on (then released)
+ * later; NULL when the backend has none, in which case the caller syncs. */
+void mynah_backend_graph_forget_parked(const mynah_backend *backend,
+                                       const void *identity);
+void *mynah_backend_fence_record(const mynah_backend *backend);
+void mynah_backend_fence_wait(const mynah_backend *backend, void *fence);
 
 /* Pocket flow-head descriptor. The engine owns the host weights and device
  * scratch; CUDA owns cached weight copies and the chained kernels. No CUDA or
