@@ -1091,6 +1091,15 @@ struct mynah_engine_state {
     int cuda_slot_pool_mutex_ready;
     struct pocket_cuda_slot *cuda_slot_pool;
     size_t cuda_slot_pool_count;
+    /* Idle host halves of request contexts (MYNAH_CTX_HOST_POOL, default
+     * off): both transformer states, the flow head, the SEANet state and the
+     * three projection scratches of a retired context, renewed for the next
+     * one instead of freed and rebuilt.  `ctx_host_pool` is resolved once at
+     * model load: 0 off, 1 on, 2 on and every taken cache zeroed (leak A/B). */
+    int ctx_host_pool;
+    pthread_mutex_t ctx_host_pool_mutex;
+    struct pocket_host_set *ctx_host_pool_head;
+    size_t ctx_host_pool_count;
     /* MYNAH_CUDA_KV_VMM, resolved once at model load: 1 when the flag is on,
      * the KV growth and prefill tile paths it extends are on, and the
      * backend's virtual memory management probe passed. Then
@@ -1330,6 +1339,10 @@ struct mynah_engine_ctx {
      * alloc helpers take their parts from it; whatever this request did not
      * consume stays here and is parked again, with the rest, at ctx_free. */
     struct pocket_cuda_slot *cuda_slot;
+    /* MYNAH_CTX_HOST_POOL: the parked host set this context's host states
+     * came from, emptied as they were taken; the shell they go back into at
+     * ctx_free. NULL with the pool off. */
+    struct pocket_host_set *host_set;
     int cuda_decoder_enabled;
     int cuda_decoder_graph_enabled;
     int cuda_decoder_started;
@@ -3790,6 +3803,27 @@ static int pocket_resolve_singles(mynah_engine_state *state, char *error,
 /* -------------------------------------------------------------- model_init */
 
 static void pocket_cuda_slot_pool_drain(mynah_engine_state *state);
+static void pocket_host_pool_drain(mynah_engine_state *state);
+
+/* MYNAH_CTX_HOST_POOL (default off): 0/unset off, 1 on, 2 on and every cache
+ * a renewed state hands out zeroed (the leak A/B: the audio must be
+ * bit-identical either way).  One start-up line per process when on. */
+static int pocket_host_pool_setting(void) {
+    const char *value = getenv("MYNAH_CTX_HOST_POOL");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0) return 0;
+    const int mode = strcmp(value, "2") == 0 ? 2 : 1;
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr,
+                "mynah-tts: MYNAH_CTX_HOST_POOL=%d: a retired request's host "
+                "state (transformer states, flow head, SEANet state, projection "
+                "scratch) is parked and renewed for the next request instead of "
+                "freed and rebuilt%s\n",
+                mode, mode == 2 ? "; renewed KV caches are zeroed (leak A/B)" : "");
+    }
+    return mode;
+}
 
 static void pocket_model_free(mynah_engine_state *state) {
     if (state == NULL) return;
@@ -3797,6 +3831,11 @@ static void pocket_model_free(mynah_engine_state *state) {
     if (state->cuda_slot_pool_mutex_ready) {
         pthread_mutex_destroy(&state->cuda_slot_pool_mutex);
         state->cuda_slot_pool_mutex_ready = 0;
+    }
+    if (state->ctx_host_pool != 0) {
+        pocket_host_pool_drain(state);
+        pthread_mutex_destroy(&state->ctx_host_pool_mutex);
+        state->ctx_host_pool = 0;
     }
     if (state->cuda_voice_kv != NULL) {
         for (size_t v = 0; v < state->voice_count; ++v)
@@ -4139,6 +4178,11 @@ static int pocket_model_init(const mynah_tts_model *model,
     /* A failed init only disables the CUDA slot pool; `_enabled` checks it. */
     if (pthread_mutex_init(&state->cuda_slot_pool_mutex, NULL) == 0)
         state->cuda_slot_pool_mutex_ready = 1;
+    /* MYNAH_CTX_HOST_POOL, read once; a failed init leaves it off. */
+    state->ctx_host_pool = pocket_host_pool_setting();
+    if (state->ctx_host_pool != 0 &&
+        pthread_mutex_init(&state->ctx_host_pool_mutex, NULL) != 0)
+        state->ctx_host_pool = 0;
     state->model_dir = pocket_strdup(model->model_dir, strlen(model->model_dir));
     if (state->model_dir == NULL) {
         pocket_model_free(state);
@@ -9330,6 +9374,207 @@ static int pocket_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
     return rc == 0 ? 0 : 1;
 }
 
+/* ------------------------------------------- host halves pool
+ *
+ * MYNAH_CTX_HOST_POOL (default off; works on every backend).  Building a
+ * request context allocates and clears megabytes of host state: the backbone
+ * transformer state (KV cache sized for voice + text + step budget, a
+ * prefill-tile row scratch), the Mimi transformer state (its windowed KV), the
+ * SEANet state (ring buffers and work arena), the flow head and the three
+ * projection scratches.  At ~900 rows that is ~8 builds per iteration at
+ * 1-2 ms each on the scheduler thread, and as many teardowns with munmap.
+ *
+ * A retired context parks those parts here and the next context renews them
+ * instead (pocket_host_take_*).  The renew contract is "what a fresh build
+ * returns, for everything a request can read":
+ *   - transformer states: mynah_transformer_ar_state_renew -- offset, window
+ *     base, layout and RoPE tables exactly `_new`'s; row scratch and scores
+ *     zeroed if they were written; the KV cache left as `_reset` leaves it
+ *     (attention reads only positions this request wrote; =2 zeroes it);
+ *   - SEANet: mynah_seanet_state_renew -- ops rebuilt by `_create`'s code over
+ *     an arena that is all zero again;
+ *   - flow head: mynah_flow_head_renew -- scratch and memo zeroed;
+ *   - projection scratch: zeroed, like the calloc it replaces.
+ * A part that cannot be renewed for this request (a backbone cache too short,
+ * say) is freed and built new, so a take never fails where a build would not.
+ * Only host memory is involved: nothing here waits on the device, and the CUDA
+ * slot pool, its fences and MYNAH_CUDA_SLOT_POOL_PREFILL are unaffected. */
+#define POCKET_HOST_POOL_CAP POCKET_MAX_BATCH
+
+typedef struct pocket_host_set {
+    struct pocket_host_set *next;
+    mynah_transformer_ar_state *backbone;
+    mynah_transformer_ar_state *codec_transformer;
+    mynah_flow_head *flow;
+    mynah_seanet_state *codec;
+    pocket_call backbone_call, codec_call, flow_call;
+} pocket_host_set;
+
+/* Frees whatever the set still holds; the shell stays. */
+static void pocket_host_set_clear(pocket_host_set *set) {
+    mynah_transformer_ar_state_free(set->backbone);
+    mynah_transformer_ar_state_free(set->codec_transformer);
+    mynah_flow_head_destroy(set->flow);
+    mynah_seanet_state_destroy(set->codec);
+    set->backbone = set->codec_transformer = NULL;
+    set->flow = NULL;
+    set->codec = NULL;
+    pocket_call_release(&set->backbone_call);
+    pocket_call_release(&set->codec_call);
+    pocket_call_release(&set->flow_call);
+}
+
+static void pocket_host_set_destroy(pocket_host_set *set) {
+    if (set == NULL) return;
+    pocket_host_set_clear(set);
+    free(set);
+}
+
+/* The idle set whose backbone cache holds `backbone_positions` most tightly;
+ * failing that the largest (its backbone is then rebuilt).  NULL with the
+ * pool off or empty.  Any thread (MYNAH_ASYNC_ADMIT builds on helpers). */
+static pocket_host_set *pocket_host_pool_take(mynah_engine_state *state,
+                                              size_t backbone_positions) {
+    if (state == NULL || state->ctx_host_pool == 0) return NULL;
+    pthread_mutex_lock(&state->ctx_host_pool_mutex);
+    pocket_host_set **best = NULL, **largest = NULL;
+    size_t best_cap = 0u, largest_cap = 0u;
+    for (pocket_host_set **link = &state->ctx_host_pool_head; *link != NULL;
+         link = &(*link)->next) {
+        const size_t cap = mynah_transformer_ar_state_kv_capacity((*link)->backbone);
+        if (cap >= backbone_positions && (best == NULL || cap < best_cap)) {
+            best = link;
+            best_cap = cap;
+        }
+        if (largest == NULL || cap > largest_cap) {
+            largest = link;
+            largest_cap = cap;
+        }
+    }
+    pocket_host_set **pick = best != NULL ? best : largest;
+    pocket_host_set *set = NULL;
+    if (pick != NULL) {
+        set = *pick;
+        *pick = set->next;
+        set->next = NULL;
+        state->ctx_host_pool_count--;
+    }
+    pthread_mutex_unlock(&state->ctx_host_pool_mutex);
+    return set;
+}
+
+static mynah_transformer_ar_state *pocket_host_take_ar(
+    mynah_transformer_ar_state **pooled, const mynah_transformer_ar_config *config,
+    int zero_kv, char *error, size_t capacity) {
+    if (*pooled != NULL) {
+        mynah_transformer_ar_state *taken = *pooled;
+        *pooled = NULL;
+        if (mynah_transformer_ar_state_renew(taken, config, zero_kv) == 0)
+            return taken;
+        mynah_transformer_ar_state_free(taken);
+    }
+    return mynah_transformer_ar_state_new(config, error, capacity);
+}
+
+static mynah_flow_head *pocket_host_take_flow(mynah_flow_head **pooled,
+                                              const mynah_flow_head_config *config,
+                                              char *error, size_t capacity) {
+    if (*pooled != NULL) {
+        mynah_flow_head *taken = *pooled;
+        *pooled = NULL;
+        if (mynah_flow_head_renew(taken, config) == 0) return taken;
+        mynah_flow_head_destroy(taken);
+    }
+    return mynah_flow_head_create(config, error, capacity);
+}
+
+static mynah_seanet_state *pocket_host_take_seanet(
+    mynah_seanet_state **pooled, const mynah_seanet_config *config,
+    const mynah_resample_config *up, size_t max_latent_frames, char *error,
+    size_t capacity) {
+    if (*pooled != NULL) {
+        mynah_seanet_state *taken = *pooled;
+        *pooled = NULL;
+        if (mynah_seanet_state_renew(taken, config, up, max_latent_frames) == 0)
+            return taken;
+        mynah_seanet_state_destroy(taken);
+    }
+    return mynah_seanet_state_create(config, up, max_latent_frames, error,
+                                     capacity);
+}
+
+/* `pocket_call_init` from a pooled scratch of the same shape, zeroed. */
+static int pocket_host_take_call(pocket_call *call, pocket_call *pooled,
+                                 size_t rows, size_t k_max, char *error,
+                                 size_t capacity) {
+    if (rows == 0) rows = 1u;
+    if (pooled->qx != NULL && pooled->rows == rows && pooled->k_max == k_max) {
+        *call = *pooled;
+        memset(pooled, 0, sizeof(*pooled));
+        const size_t qbytes = rows * k_max; /* checked when it was built */
+        memset(call->qx, 0, qbytes ? qbytes : 1u);
+        memset(call->sx, 0, rows * sizeof(*call->sx));
+        memset(call->in_ptr, 0, rows * sizeof(*call->in_ptr));
+        memset(call->out_ptr, 0, rows * sizeof(*call->out_ptr));
+        return 0;
+    }
+    pocket_call_release(pooled);
+    return pocket_call_init(call, rows, k_max, error, capacity);
+}
+
+/* ctx_free: move the host parts into the context's shell (or a new one) and
+ * park it.  A context missing any part (a failed build) frees as before. */
+static void pocket_host_pool_park(mynah_engine_ctx *ctx) {
+    mynah_engine_state *state = ctx->state;
+    pocket_host_set *set = ctx->host_set;
+    ctx->host_set = NULL;
+    if (ctx->backbone == NULL || ctx->codec_transformer == NULL ||
+        ctx->flow == NULL || ctx->codec == NULL ||
+        ctx->backbone_call.call.qx == NULL || ctx->codec_call.call.qx == NULL ||
+        ctx->flow_call.call.qx == NULL) {
+        pocket_host_set_destroy(set);
+        return;
+    }
+    if (set == NULL) {
+        set = (pocket_host_set *)calloc(1, sizeof(*set));
+        if (set == NULL) return; /* the ordinary frees follow */
+    }
+    pocket_host_set_clear(set);
+    POCKET_SLOT_MOVE(set->backbone, ctx->backbone);
+    POCKET_SLOT_MOVE(set->codec_transformer, ctx->codec_transformer);
+    POCKET_SLOT_MOVE(set->flow, ctx->flow);
+    POCKET_SLOT_MOVE(set->codec, ctx->codec);
+    set->backbone_call = ctx->backbone_call.call;
+    set->codec_call = ctx->codec_call.call;
+    set->flow_call = ctx->flow_call.call;
+    memset(&ctx->backbone_call.call, 0, sizeof(ctx->backbone_call.call));
+    memset(&ctx->codec_call.call, 0, sizeof(ctx->codec_call.call));
+    memset(&ctx->flow_call.call, 0, sizeof(ctx->flow_call.call));
+    pthread_mutex_lock(&state->ctx_host_pool_mutex);
+    if (state->ctx_host_pool_count < POCKET_HOST_POOL_CAP) {
+        set->next = state->ctx_host_pool_head;
+        state->ctx_host_pool_head = set;
+        state->ctx_host_pool_count++;
+        set = NULL;
+    }
+    pthread_mutex_unlock(&state->ctx_host_pool_mutex);
+    pocket_host_set_destroy(set); /* pool full: free as before */
+}
+
+/* Model teardown: every context is gone. */
+static void pocket_host_pool_drain(mynah_engine_state *state) {
+    pthread_mutex_lock(&state->ctx_host_pool_mutex);
+    pocket_host_set *set = state->ctx_host_pool_head;
+    state->ctx_host_pool_head = NULL;
+    state->ctx_host_pool_count = 0u;
+    pthread_mutex_unlock(&state->ctx_host_pool_mutex);
+    while (set != NULL) {
+        pocket_host_set *next = set->next;
+        pocket_host_set_destroy(set);
+        set = next;
+    }
+}
+
 static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     if (ctx == NULL) return;
     /* MYNAH_CUDA_STEP_OVERLAP: never free a row of a queued frame. */
@@ -9371,6 +9616,10 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     pocket_cuda_backbone_release(ctx);
     pocket_cuda_codec_release(ctx);
     pocket_cuda_decoder_release(ctx);
+    /* MYNAH_CTX_HOST_POOL: the host parts go to the pool here; the frees
+     * below then see NULLs.  Off, as always. */
+    if (ctx->state != NULL && ctx->state->ctx_host_pool != 0)
+        pocket_host_pool_park(ctx);
     pocket_call_release(&ctx->backbone_call.call);
     pocket_call_release(&ctx->codec_call.call);
     pocket_call_release(&ctx->flow_call.call);
@@ -9491,6 +9740,18 @@ static void ctxp_mark(int section, double *t) {
     pthread_mutex_unlock(&g_ctxp_mu);
     *t = now;
 }
+/* MYNAH_CTX_HOST_POOL: host states built from a pooled set [1] or new [0],
+ * and their time (pool take through the projection scratch). Only ever
+ * counted with the pool on, so the line below gains its tail only then. */
+static unsigned long g_ctxp_pool_n[2];
+static double g_ctxp_pool_s[2];
+static void ctxp_host_pool(int pooled, double t0) {
+    const double dt = mynah_phase_seconds() - t0;
+    pthread_mutex_lock(&g_ctxp_mu);
+    g_ctxp_pool_n[pooled != 0]++;
+    g_ctxp_pool_s[pooled != 0] += dt;
+    pthread_mutex_unlock(&g_ctxp_mu);
+}
 static void ctxp_count(void) {
     if (!ctxp_on()) return;
     pthread_mutex_lock(&g_ctxp_mu);
@@ -9502,6 +9763,12 @@ static void ctxp_count(void) {
     fprintf(stderr, "[CTX] %lu contexts, mean %.3f ms:", g_ctxp_n, 1000.0 * total / (double)g_ctxp_n);
     for (int i = 0; i < CTXP_N; ++i)
         fprintf(stderr, " %s %.3f", name[i], 1000.0 * g_ctxp_s[i] / (double)g_ctxp_n);
+    if (g_ctxp_pool_n[0] + g_ctxp_pool_n[1] != 0u)
+        fprintf(stderr, " | host_pool: pooled %lu (%.3f ms) fresh %lu (%.3f ms)",
+                g_ctxp_pool_n[1],
+                g_ctxp_pool_n[1] ? 1000.0 * g_ctxp_pool_s[1] / (double)g_ctxp_pool_n[1] : 0.0,
+                g_ctxp_pool_n[0],
+                g_ctxp_pool_n[0] ? 1000.0 * g_ctxp_pool_s[0] / (double)g_ctxp_pool_n[0] : 0.0);
     fputc('\n', stderr);
     pthread_mutex_unlock(&g_ctxp_mu);
 }
@@ -9901,9 +10168,21 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     }
 
     ctxp_mark(CTXP_HOST, &ctxp_t);
+    /* MYNAH_CTX_HOST_POOL: a parked host set, whose parts the builds below
+     * renew instead of allocating; NULL with the pool off (every build is
+     * then the one it always was) or empty. */
+    const double host_t0 =
+        (state->ctx_host_pool != 0 && ctxp_on()) ? mynah_phase_seconds() : 0.0;
+    pocket_host_set *pooled = state->ctx_host_pool != 0
+                                  ? pocket_host_pool_take(state, backbone_capacity)
+                                  : NULL;
+    ctx->host_set = pooled;
+    const int zero_kv = state->ctx_host_pool == 2;
     mynah_transformer_ar_config backbone;
     pocket_backbone_config(ctx, backbone_capacity, &backbone);
-    ctx->backbone = mynah_transformer_ar_state_new(&backbone, error, capacity);
+    ctx->backbone = pooled != NULL
+        ? pocket_host_take_ar(&pooled->backbone, &backbone, zero_kv, error, capacity)
+        : mynah_transformer_ar_state_new(&backbone, error, capacity);
 
     mynah_transformer_ar_config codec;
     mynah_transformer_ar_config_defaults(&codec);
@@ -9915,7 +10194,10 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     codec.max_seq_len = codec_positions;
     codec.context = cfg->codec_tf_context;
     codec.layernorm_eps = cfg->layernorm_eps;
-    ctx->codec_transformer = mynah_transformer_ar_state_new(&codec, error, capacity);
+    ctx->codec_transformer = pooled != NULL
+        ? pocket_host_take_ar(&pooled->codec_transformer, &codec, zero_kv, error,
+                              capacity)
+        : mynah_transformer_ar_state_new(&codec, error, capacity);
 
     mynah_flow_head_config flow;
     mynah_flow_head_config_defaults(&flow);
@@ -9926,7 +10208,9 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     flow.num_time_conds = cfg->flow_time_conds;
     flow.freq_embed_dim = 2u * cfg->flow_freqs;
     flow.layernorm_eps = cfg->flow_layernorm_eps;
-    ctx->flow = mynah_flow_head_create(&flow, error, capacity);
+    ctx->flow = pooled != NULL
+        ? pocket_host_take_flow(&pooled->flow, &flow, error, capacity)
+        : mynah_flow_head_create(&flow, error, capacity);
 
     ctxp_mark(CTXP_STATES, &ctxp_t);
     mynah_seanet_config seanet;
@@ -9962,7 +10246,10 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     upsample.groups = cfg->codec_dim; /* depthwise: [512, 1, 32], not [512, 512, 32] */
     /* One latent frame per call: the streaming unit and the offline unit are
      * the same call, so there is no second code path to keep in step. */
-    ctx->codec = mynah_seanet_state_create(&seanet, &upsample, 1u, error, capacity);
+    ctx->codec = pooled != NULL
+        ? pocket_host_take_seanet(&pooled->codec, &seanet, &upsample, 1u, error,
+                                  capacity)
+        : mynah_seanet_state_create(&seanet, &upsample, 1u, error, capacity);
 
     if (ctx->backbone == NULL || ctx->codec_transformer == NULL || ctx->flow == NULL ||
         ctx->codec == NULL) {
@@ -9980,17 +10267,37 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     if (cfg->codec_tf_ffn > codec_k) codec_k = cfg->codec_tf_ffn;
     size_t flow_k = cfg->flow_dim;
     if (cfg->hidden_dim > flow_k) flow_k = cfg->hidden_dim;
-    if (pocket_tar_call_init(&ctx->backbone_call, &state->backbone_hook, tile,
-                             backbone_k, error, capacity) != 0 ||
-        pocket_tar_call_init(&ctx->codec_call, &state->codec_hook, tile, codec_k,
-                             error, capacity) != 0 ||
-        /* The flow head is evaluated one row at a time per request: a tile of
-         * one is all this scratch ever needs. */
-        pocket_flow_call_init(&ctx->flow_call, &state->flow_hook, 1u, flow_k, error,
-                              capacity) != 0) {
+    int calls_failed;
+    if (pooled != NULL) {
+        /* What the three `_call_init`s below set, over pooled scratch. */
+        ctx->backbone_call.hook = &state->backbone_hook;
+        ctx->backbone_call.in_prefill = 0;
+        ctx->codec_call.hook = &state->codec_hook;
+        ctx->codec_call.in_prefill = 0;
+        ctx->flow_call.hook = &state->flow_hook;
+        calls_failed =
+            pocket_host_take_call(&ctx->backbone_call.call, &pooled->backbone_call,
+                                  tile, backbone_k, error, capacity) != 0 ||
+            pocket_host_take_call(&ctx->codec_call.call, &pooled->codec_call, tile,
+                                  codec_k, error, capacity) != 0 ||
+            pocket_host_take_call(&ctx->flow_call.call, &pooled->flow_call, 1u,
+                                  flow_k, error, capacity) != 0;
+    } else {
+        calls_failed =
+            pocket_tar_call_init(&ctx->backbone_call, &state->backbone_hook, tile,
+                                 backbone_k, error, capacity) != 0 ||
+            pocket_tar_call_init(&ctx->codec_call, &state->codec_hook, tile, codec_k,
+                                 error, capacity) != 0 ||
+            /* The flow head is evaluated one row at a time per request: a tile
+             * of one is all this scratch ever needs. */
+            pocket_flow_call_init(&ctx->flow_call, &state->flow_hook, 1u, flow_k,
+                                  error, capacity) != 0;
+    }
+    if (calls_failed) {
         pocket_ctx_free(ctx);
         return -1;
     }
+    if (host_t0 != 0.0) ctxp_host_pool(pooled != NULL, host_t0);
     pocket_bind_hooks(&ctx->backbone_w, &state->backbone, &ctx->backbone_call);
     pocket_bind_hooks(&ctx->codec_w, &state->codec_transformer, &ctx->codec_call);
     pocket_bind_flow_hooks(&ctx->flow_w, &state->flow, &ctx->flow_call);

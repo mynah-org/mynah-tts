@@ -374,6 +374,127 @@ Each candidate is an A/B flag, default off until measured, under the 3c close-ou
 - **First confirm the term** with level 2 (`admit.ctx` ms per admission, and minor faults per iteration of the
   scheduler thread).
 
+#### A1a design: pool the host halves of the context (`MYNAH_CTX_HOST_POOL`, coded 2026-10-06, untested on GPU)
+
+**Flag.** `MYNAH_CTX_HOST_POOL` = unset/`0` off, `1` on, `2` on and every renewed KV cache zeroed (the leak A/B, as
+`MYNAH_CUDA_SLOT_POOL_ZERO_KV` is for the device KV). Read once at model load (`pocket_host_pool_setting`, one
+start-up line). Works on every backend: it is host memory only, so the CPU server and the CLI exercise it too.
+
+**What a cost is made of (per context, pocket-en, ~1100-position backbone).**
+
+| part | host bytes | what a fresh build pays |
+|---|---|---|
+| backbone `transformer_ar` state: KV `6 x 2 x cap x 1024` floats | ~53 MB | `calloc` above the mmap threshold: an `mmap` now, an `munmap` (+ TLB shootdown across ~1000 threads) at free; pages fault only if touched |
+| backbone row scratch (16-row prefill tile) + refs + scores | ~0.72 MB | heap `calloc` = memset |
+| Mimi `transformer_ar` state: windowed KV `2 x 2 x 500 x 512` + scratch | ~4.4 MB | heap `calloc` (the dynamic mmap threshold has risen past it after the first free) = 4 MB memset |
+| SEANet state: ops + arena (rings, upsample, 3 work buffers) | ~2 MB | heap `calloc` = memset, plus building the ops twice |
+| flow head, three projection scratches | ~0.1 MB | small `calloc`s |
+
+That is the `[CTX]` `ar_states` (0.45-0.97 ms) and `codec_setup` (0.53-0.87 ms) columns: memsets and page faults of
+memory a device-owned row then never reads.
+
+**What is pooled.** `pocket_host_set` = the two `transformer_ar` states, the flow head, the SEANet state and the three
+`pocket_call` scratches. `pocket_ctx_free` parks them (`pocket_host_pool_park`, before the host frees, which then see
+NULLs); `pocket_ctx_create` takes the set whose backbone cache fits the request most tightly, else the largest
+(`pocket_host_pool_take`, mutex, any thread), and each build line becomes "renew the pooled part, or build new if it
+cannot be renewed" (`pocket_host_take_ar/_flow/_seanet/_call`). The shell stays on the context (`ctx->host_set`) and
+carries the parts back at free. Cap `POCKET_MAX_BATCH` sets, as the slot pool; a full pool frees as before. Drained at
+model free.
+
+**Reset contract (byte-equivalent to a fresh build for everything a request can read).**
+
+| part | renew | why it equals fresh |
+|---|---|---|
+| `transformer_ar` state | `mynah_transformer_ar_state_renew(state, config, zero_kv)`: config must equal the state's except `max_seq_len`, and the allocation must hold the new layout. Sets offset 0, window base 0, `kv_positions`/`kv_half`/`kv_layer` by `_new`'s own window rule, RoPE = the shared table for the new length (what `_new` takes; an owned table only serves its own length). Row scratch, refs and scores are zeroed **only if written** (`scratch_dirty`, set by `_prefill`, `_step`, `_step_batch`) | offset/base/layout/RoPE are recomputed exactly as `_new`; scratch is zero as calloc left it. The KV is **not** zeroed: attention reads only `[kv_base, offset)`, positions the request itself wrote — the contract `_reset` (segments, rewinds) already relies on, and the one the CUDA slot pool relies on for the device KV. `=2` zeroes it to prove that on the box |
+| SEANet state | `mynah_seanet_state_renew`: arguments must equal the build's; arena memset **only if written** (`arena_dirty`, set by `_decode`, `_upsample`, `_set_upsample_tail`; `_reset` writes only zeros); ops and conv structs memset and rebuilt by `sea_state_carve`, the code `_create` now calls | `_create` = calloc'd arena + `sea_state_carve`; renew = zero arena + the same `sea_state_carve` |
+| flow head | `mynah_flow_head_renew`: same config; everything after `freqs` zeroed, time memo invalid | `freqs` is a pure function of the config |
+| projection scratch | same `rows`/`k_max`, all four arrays zeroed | calloc-equivalent; hook and `in_prefill` set as `_call_init` sets them |
+
+The prologue then resets offsets, rings, flow memo and EOS state exactly as it always did. Self-tests: a state built
+for a longer request, run to the end of its window on other input, renewed, is bit-identical to a fresh one
+(`transformer_ar` unwindowed and windowed, zero_kv 0/1; SEANet chunked decode; flow head), and renews with other
+arguments refuse without changing anything.
+
+**Host mirrors device-owned rows never read.** Not skipped, deliberately:
+- the backbone host KV of a device-owned row is seeded by `set_offset` only and, in an all-device-owned batch (the
+  ~1000-row steady state), never mirrored (`mirror_host = all_owned ? 0 : 1`); a mixed batch or the single-row
+  fallback writes just each step's own slot. So its pages are (almost) never faulted in, and a pooled one costs
+  virtual address space (~53 MB x parked sets), not RSS. Pooling already removes its only remaining cost
+  (`mmap`/`munmap`). Skipping it would need a lazy cache in
+  `transformer_ar.c` plus a story for the CPU fallback a context keeps until `prepare` decides it is device-owned;
+- the row scratch, scores and SEANet arena of such a row are never written, and the dirty flags make renew skip them;
+- the Mimi host window is still uploaded whole at the first frame without `MYNAH_CUDA_ROW_MEM_DIET`
+  (`pocket_cuda_codec_prepare_window`), so with the pool it uploads the previous owner's bytes in slots the device then
+  only reads after writing them (same argument as the KV); with the diet it is never touched.
+
+**Memory.** Parked sets ≤ peak concurrent contexts (a set exists only because a context needed it). RSS per parked
+set ≈ what its last owner touched: for device-owned rows the Mimi window (if uploaded) and the projection scratch,
+~0.1-4.5 MB; the backbone KV stays unfaulted. Versus today: the same bytes stay mapped instead of being returned and
+re-faulted, and no `munmap` per retirement.
+
+**Interactions.**
+- **L6 / slot pool / fences:** independent. The host set holds no pinned or device memory and nothing on the stream
+  refers to it (pageable copies complete or are staged before the call returns), so parking needs no fence. The CUDA
+  slot pool still takes/parks its set in `pocket_ctx_pinned` / `pocket_cuda_slot_park` unchanged.
+- **`MYNAH_CUDA_SLOT_POOL_PREFILL`:** its N concurrent warm-up requests leave N host sets parked too, sized for its
+  sentence; the first client admissions take them (best fit, else largest with the backbone rebuilt).
+- **L13 (step overlap):** `pocket_ctx_free` discards a queued frame first (unchanged), then parks; the queued step
+  only touches device memory and pinned staging.
+- **`MYNAH_ASYNC_ADMIT`:** helpers take sets under the pool mutex; park is on the scheduler thread.
+- **Cancellation / failure paths:** every failure in `ctx_create` goes through `pocket_ctx_free`. A context missing
+  any part (failed build) frees its parts and the shell as before; a part that cannot be renewed is freed and built
+  new; `reserve_text`'s rebuilt backbone is fresh and is simply parked later.
+- **Flag off:** `state->ctx_host_pool == 0` → no take, every build line is the original call, no park. The only
+  flag-off differences are bookkeeping stores (`scratch_dirty`, `arena_dirty`, capacity fields) and
+  `mynah_seanet_state_create` calling the extracted `sea_state_carve` (same statements, same order).
+
+**Profile.** With `MYNAH_SERVE_PROFILE` and the pool on, the `[CTX]` line gains
+`| host_pool: pooled N (x ms) fresh M (y ms)` (take through the projection scratch, mean per context). The
+`ar_states` and `codec_setup` columns are where the drop should show.
+
+**Verified locally (Mac, CPU).** CPU and server builds; `make test-c` (incl. the new self-tests); GCC 16 and Clang
+`-Wall -Wextra -O2 -DMYNAH_ENABLE_CUDA -DMYNAH_ROW_CAP=1024u` on the four touched files: no new warnings. CLI
+`--batch 4` WAVs identical at `MYNAH_CTX_HOST_POOL=0/1/2` (the CLI loads the model per run and its batch rows are
+concurrent, so it only proves the fresh path is unchanged with the flag on). CPU server, 8 requests (sequential,
+different voices/lengths/seeds, two repeats after other requests, a concurrent pair, one after the pair): 8/8 WAVs
+identical at `0/1/2`; a temporary trace confirmed the server's admissions after warm-up take pooled sets.
+
+**Box test (order).**
+1. Identity, flag off vs `1` vs `2`: CLI `--batch 32` WAVs (fresh path only); server C1 sequence (the 8 requests
+   above) on the CUDA server with all 11 flags; md5 equal across the three. The server run is the one that reuses.
+2. A/B at C768 / C896 / C1024 with all 11 flags on, `MYNAH_SERVE_PROFILE=1`, 2-minute levels, ABBA: watch `[CTX]`
+   mean and `ar_states` + `codec_setup` (expect ~1.5 → ≤0.3 ms), host ms per iteration (expect −8 to −13 ms at
+   ~900 rows), RTF p95, TTFA p50/p95, stalls, and RSS.
+
+#### Reading of the `MYNAH_ASYNC_ADMIT` OOM at 1024 rows (code only, not reproduced)
+
+- **The hypothesis "async-built contexts bypass parked slots" does not hold.** `ctx_new_host` (helpers) builds only
+  host state; `ctx_attach` → `pocket_ctx_pinned` → `pocket_cuda_slot_acquire` runs on the scheduler thread with the
+  same arguments as the synchronous path (`pocket_cuda_kv_initial_capacity` and `pocket_cuda_kv_vmm_planned` read
+  nothing the helper built), then `pocket_ctx_device` allocates exactly as `ctx_new` does. A `starting` slot counts in
+  `used`, so live sets stay ≤ slot capacity.
+- **Device memory outside the pool, per row:** (1) an empty pool → a whole new set; (2) a misfit take (KV larger than
+  2x need, or smaller) → the parked KV is freed and a new one `cudaMalloc`ed; (3) KV growth without VMM →
+  `cudaMalloc(new)` + copy + free (transient 2x). Per process: width/gang CUDA graphs, `ensure_scratch` growth (frees
+  and re-allocates the shared scratch in 32 MB steps), shared voice KV per speaker. Parked sets are never trimmed:
+  total sets = high-water of live + parked, up to `ROW_CAP` parked.
+- **Most likely mechanism for "out of memory" with 14 GB free: a stale runtime error.** The message is the
+  scheduler's per-row fallback print (`pocket: device-owned row %zu step rc=%d: %s`), i.e. the batched step had
+  already failed. Many allocations are treated as recoverable and their error is swallowed (`ignored` buffers in
+  `pocket_cuda_host_buffer`, the pcm pinned alloc, `POCKET_CUDA_ALLOC` in `pocket_cuda_backbone_alloc` → silent CPU
+  fallback, codec/decoder allocs), but `cudaMalloc`/`cudaHostAlloc` failures also set the runtime's per-thread last
+  error, and ~130 launch checks in `backend_cuda.cu` read `cudaGetLastError()`. So one recoverable allocation
+  failure (a transient peak, e.g. a non-VMM KV grow or a misfit re-allocation during a 1000-row burst, or a pinned
+  host allocation) is reported later by an unrelated kernel launch as "CUDA: out of memory", failing a batched step
+  that was fine. Async admission does not cause it but can make it likelier: a burst's attaches all land in one
+  `async_collect`, after retirements but before the next step, so more takes find the pool momentarily without a
+  fitting set.
+- **Not fixed here** (it is in `gpu/cuda/backend_cuda.cu`, which cannot be compiled on the Mac). Small and safe fix
+  for the next box: in `mynah_cuda_dev_alloc`, `_dev_alloc_bytes`, `_host_alloc` (and the VMM map path), call
+  `(void)cudaGetLastError()` after a failed allocation so a handled failure cannot poison the next launch check.
+  Discriminating run first: the same arm with `MYNAH_SERVE_PROFILE=1` and the device-free bytes printed at the first
+  failed allocation (one diagnostic line in `ce()` on `cudaErrorMemoryAllocation`, naming the call).
+
 **A2. Reaper for host frees** (est. −0.3 to −1 ms).
 - `pocket_ctx_free`'s host `free`s and `stream_out` teardown (1 MiB ring munmap, writer thread exit) go to a helper
   thread through a list. The device parts stay as they are (L6 fence).

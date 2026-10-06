@@ -278,6 +278,19 @@ void mynah_flow_head_reset(mynah_flow_head *head) {
     head->time_cache_valid = 0;
 }
 
+int mynah_flow_head_renew(mynah_flow_head *head,
+                          const mynah_flow_head_config *config) {
+    if (head == NULL || config == NULL ||
+        memcmp(config, &head->config, sizeof(*config)) != 0)
+        return -1;
+    /* `freqs` is a function of the config alone and stays; everything after
+     * it is scratch and memo, zero as `_create` left it. */
+    float *end = head->cached_times + config->num_time_conds;
+    memset(head->emb, 0, (size_t)(end - head->emb) * sizeof(float));
+    head->time_cache_valid = 0;
+    return 0;
+}
+
 static int flow_linear_ok(const mynah_flow_linear *linear, int needs_bias) {
     if (linear->weight == NULL) return 0;
     if (needs_bias && linear->bias == NULL) return 0;
@@ -1098,6 +1111,27 @@ int mynah_flow_head_self_test(char *error, size_t error_capacity) {
             mynah_flow_head_destroy(head);
             free(pool);
             return -1;
+        }
+        /* `_renew` (MYNAH_CTX_HOST_POOL): the used head, renewed, computes
+         * bit for bit what it computed when new; another config refuses.
+         * The first `latent` outputs are the ones written. */
+        {
+            float again[8];
+            mynah_flow_head_config other = config;
+            other.depth += 1u;
+            const int step = mynah_flow_head_renew(head, &other) == 0 ? 1
+                : mynah_flow_head_renew(head, &config) != 0 ? 2
+                : mynah_flow_head_forward(head, &weights, cond, times, noise,
+                                          again) != 0 ? 3
+                : memcmp(again, got, latent * sizeof(float)) != 0 ? 4 : 0;
+            if (step != 0) {
+                flow_set_error(error, error_capacity,
+                               "self test: a renewed flow head is not the new "
+                               "one (check %d)", step);
+                mynah_flow_head_destroy(head);
+                free(pool);
+                return -1;
+            }
         }
 
         /* Reference. */

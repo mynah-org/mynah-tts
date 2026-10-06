@@ -106,6 +106,7 @@ size_t mynah_transformer_ar_prefill_tile(void) { return TAR_PREFILL_TILE; }
  * and each `mynah_transformer_ar_batch` owns one (a cross-request step). */
 typedef struct {
     size_t rows_cap;
+    size_t floats; /* behind `block` */
     float *block; /* one owned allocation backing everything below */
     float *x;     /* [rows][d_model]    residual stream */
     float *norm;  /* [rows][d_model]    */
@@ -272,6 +273,17 @@ struct mynah_transformer_ar_state {
      * when it could not; either way immutable after construction. */
     const float *rope_cos;  /* [max_seq_len][half]  */
     const float *rope_sin;  /* [max_seq_len][half]  */
+
+    /* What `_renew` needs to reuse the allocations for another request
+     * (MYNAH_CTX_HOST_POOL): their real sizes, which a renew to a shorter
+     * request no longer reads off the layout, and whether the row scratch
+     * and the scores have been written since they were last all zero.  A
+     * state that only ever stepped on a device never sets the flag, so its
+     * renew touches none of those pages. */
+    size_t kv_capacity;     /* floats behind `kv`    */
+    size_t block_capacity;  /* floats behind `block` */
+    int rope_owned;         /* the RoPE tables live in `block` */
+    int scratch_dirty;
 };
 
 struct mynah_transformer_ar_batch {
@@ -319,6 +331,7 @@ static int tar_rows_reserve(tar_rows *rows,
         return -1;
     }
     rows->block = calloc(total ? total : 1u, sizeof(float));
+    rows->floats = total ? total : 1u;
     rows->in_ptr = calloc(count, sizeof(*rows->in_ptr));
     rows->out_ptr = calloc(count, sizeof(*rows->out_ptr));
     if (rows->block == NULL || rows->in_ptr == NULL || rows->out_ptr == NULL) {
@@ -439,6 +452,7 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
     }
     state->kv_half = kv_half;
     state->kv_layer = kv_layer;
+    state->kv_capacity = kv_total;
     /* calloc, not malloc: an unread region must still be finite, so that a
      * bug shows up as a wrong number rather than as a NaN avalanche. */
     state->kv = calloc(kv_total, sizeof(float));
@@ -498,6 +512,8 @@ mynah_transformer_ar_state *mynah_transformer_ar_state_new(
         free(state);
         return NULL;
     }
+    state->block_capacity = total ? total : 1u;
+    state->rope_owned = shared_rope == NULL;
 
     float *cursor = state->block;
     state->scores = cursor;
@@ -598,6 +614,88 @@ void mynah_transformer_ar_state_reset(mynah_transformer_ar_state *state) {
      * rewind the base with it, or the next step would compute a slot from a
      * base the cache no longer holds. */
     state->kv_base = 0;
+}
+
+static int tar_config_same(const mynah_transformer_ar_config *a,
+                           const mynah_transformer_ar_config *b);
+
+int mynah_transformer_ar_state_renew(mynah_transformer_ar_state *state,
+                                     const mynah_transformer_ar_config *config,
+                                     int zero_kv) {
+    if (state == NULL || config == NULL) return -1;
+    mynah_transformer_ar_config resolved = *config;
+    if (resolved.head_dim == 0 && resolved.num_heads != 0) {
+        resolved.head_dim = resolved.d_model / resolved.num_heads;
+    }
+    /* Everything but the capacity must be what the state was built for:
+     * then every check `_new` makes has already passed. */
+    if (resolved.max_seq_len == 0 || !tar_config_same(&state->config, &resolved))
+        return -1;
+    /* The same window rule as `_new`. */
+    size_t kv_positions = resolved.max_seq_len;
+    if (resolved.context > 0u && g_tar_kv_window_force != 0) {
+        size_t slack = resolved.context;
+        if (slack < TAR_PREFILL_TILE) slack = TAR_PREFILL_TILE;
+        size_t want = 0;
+        if (tar_add(resolved.context, slack, &want) == 0 &&
+            want < kv_positions) {
+            kv_positions = want;
+        }
+    }
+    size_t kv_half = 0, kv_layer = 0, kv_total = 0;
+    if (tar_mul(kv_positions, state->attn_dim, &kv_half) != 0 ||
+        tar_mul(kv_half, 2u, &kv_layer) != 0 ||
+        tar_mul(kv_layer, resolved.num_layers, &kv_total) != 0 ||
+        kv_total > state->kv_capacity || kv_positions > state->block_capacity)
+        return -1;
+    /* RoPE: the shared table for the new length, which is what `_new` would
+     * take.  An owned table was built for one length and serves only it. */
+    const float *shared_rope = NULL;
+    if (state->rope_owned) {
+        if (resolved.max_seq_len != state->config.max_seq_len ||
+            kv_positions != state->kv_positions)
+            return -1;
+    } else {
+        shared_rope = tar_rope_shared(resolved.max_seq_len, state->half,
+                                      resolved.max_period);
+        if (shared_rope == NULL) return -1;
+    }
+    /* Committed from here on. */
+    if (state->scratch_dirty) {
+        memset(state->rows.block, 0, state->rows.floats * sizeof(float));
+        memset(state->rows.in_ptr, 0,
+               state->rows.rows_cap * sizeof(*state->rows.in_ptr));
+        memset((void *)state->rows.out_ptr, 0,
+               state->rows.rows_cap * sizeof(*state->rows.out_ptr));
+        memset(state->refs, 0, state->rows.rows_cap * sizeof(*state->refs));
+        /* The scores; an owned RoPE table after them is read-only. */
+        memset(state->block, 0,
+               (state->rope_owned ? state->kv_positions : state->block_capacity) *
+                   sizeof(float));
+        state->scratch_dirty = 0;
+    }
+    /* The KV is left alone by default, as `_reset` leaves it: attention reads
+     * only the positions this request wrote. `zero_kv` is the leak A/B. */
+    if (zero_kv) memset(state->kv, 0, kv_total * sizeof(float));
+    state->config = resolved;
+    state->offset = 0;
+    state->kv_positions = kv_positions;
+    state->kv_base = 0;
+    state->kv_half = kv_half;
+    state->kv_layer = kv_layer;
+    if (!state->rope_owned) {
+        state->rope_cos = shared_rope;
+        state->rope_sin = shared_rope + resolved.max_seq_len * state->half;
+    }
+    return 0;
+}
+
+size_t mynah_transformer_ar_state_kv_capacity(
+    const mynah_transformer_ar_state *state) {
+    if (state == NULL || state->attn_dim == 0u ||
+        state->config.num_layers == 0u)
+        return 0u;
+    return state->kv_capacity / (2u * state->attn_dim * state->config.num_layers);
 }
 
 const mynah_transformer_ar_config *mynah_transformer_ar_state_config(
@@ -1179,6 +1277,7 @@ int mynah_transformer_ar_prefill(mynah_transformer_ar_state *state,
      * non-finite arriving here is a bug, not a sentinel. */
     if (!tar_finite(x, n_tokens * d_model)) return -1;
 
+    state->scratch_dirty = 1;
     for (size_t done = 0; done < n_tokens;) {
         size_t rows = n_tokens - done;
         if (rows > state->rows.rows_cap) rows = state->rows.rows_cap;
@@ -1214,6 +1313,7 @@ int mynah_transformer_ar_step(mynah_transformer_ar_state *state,
     const mynah_transformer_ar_config *config = &state->config;
     if (state->offset >= config->max_seq_len) return -1;
     if (!tar_finite(x, config->d_model)) return -1;
+    state->scratch_dirty = 1;
     state->refs[0].state = state;
     state->refs[0].position = state->offset;
     memcpy(state->rows.x, x, config->d_model * sizeof(float));
@@ -1264,6 +1364,7 @@ int mynah_transformer_ar_step_batch(mynah_transformer_ar_state *const *states,
         for (size_t c = 0; c < b; ++c) {
             if (states[c] == state) return -1;
         }
+        state->scratch_dirty = 1; /* its `scores` */
         batch->refs[b].state = state;
         batch->refs[b].position = state->offset;
         memcpy(batch->rows.x + b * d_model, x[b], d_model * sizeof(float));
@@ -2334,6 +2435,86 @@ int mynah_transformer_ar_self_test(char *error, size_t error_capacity) {
             }
         }
         store->weights.linear_rows = NULL;
+    }
+
+    /* 11. `_renew` (MYNAH_CTX_HOST_POOL): a state built for a longer request,
+     *     run to the end of its window on other input, then renewed, computes
+     *     bit for bit what a fresh state computes -- unwindowed and windowed,
+     *     with and without zeroing the cache.  A renew it cannot honour
+     *     refuses and changes nothing. */
+    for (size_t c = 0; c < 2u; ++c) {
+        for (int zero_kv = 0; zero_kv < 2; ++zero_kv) {
+            mynah_transformer_ar_config small, large;
+            tar_test_config(&small, contexts[c]);
+            tar_test_config(&large, contexts[c]);
+            large.max_seq_len = small.max_seq_len + 5u;
+            mynah_transformer_ar_state *fresh =
+                mynah_transformer_ar_state_new(&small, error, error_capacity);
+            mynah_transformer_ar_state *used =
+                mynah_transformer_ar_state_new(&large, error, error_capacity);
+            float other[TAR_T + 5u][TAR_D];
+            for (size_t t = 0; t < TAR_T + 5u; ++t)
+                for (size_t i = 0; i < TAR_D; ++i)
+                    other[t][i] = tar_fake(t * TAR_D + i, 11u) * 4.0f;
+            float want[TAR_T][TAR_D], again[TAR_T][TAR_D], sink[TAR_D];
+            int failed = fresh == NULL || used == NULL;
+            /* Dirty everything a request can dirty: prefill, then steps to
+             * the end of the larger capacity. */
+            if (!failed)
+                failed = mynah_transformer_ar_prefill(used, &store->weights,
+                                                      &other[0][0], 3u,
+                                                      NULL) != 0;
+            for (size_t t = 3u; t < TAR_T + 5u && !failed; ++t)
+                failed = mynah_transformer_ar_step(used, &store->weights,
+                                                   other[t], sink) != 0;
+            mynah_transformer_ar_config wider = small;
+            wider.max_seq_len = large.max_seq_len + 1000u;
+            mynah_transformer_ar_config other_shape = small;
+            other_shape.ffn_dim = TAR_F * 2u;
+            const size_t before = used == NULL ? 0u
+                                  : mynah_transformer_ar_state_offset(used);
+            const int refused_wide =
+                !failed && mynah_transformer_ar_state_renew(used, &wider, zero_kv) != 0 &&
+                mynah_transformer_ar_state_offset(used) == before;
+            const int refused_shape =
+                !failed &&
+                mynah_transformer_ar_state_renew(used, &other_shape, zero_kv) != 0 &&
+                mynah_transformer_ar_state_offset(used) == before;
+            const int renewed =
+                !failed && mynah_transformer_ar_state_renew(used, &small, zero_kv) == 0 &&
+                mynah_transformer_ar_state_offset(used) == 0u &&
+                mynah_transformer_ar_state_kv_base(used) == 0u &&
+                mynah_transformer_ar_state_kv_positions(used) ==
+                    mynah_transformer_ar_state_kv_positions(fresh) &&
+                mynah_transformer_ar_state_config(used)->max_seq_len ==
+                    small.max_seq_len;
+            /* The same sequence on both: a 2-token prefill, then steps. */
+            for (int pass = 0; pass < 2 && !failed && renewed; ++pass) {
+                mynah_transformer_ar_state *s = pass == 0 ? fresh : used;
+                float (*out)[TAR_D] = pass == 0 ? want : again;
+                failed = mynah_transformer_ar_prefill(s, &store->weights,
+                                                      &input[0][0], 2u,
+                                                      &out[0][0]) != 0;
+                for (size_t t = 2u; t < TAR_T && !failed; ++t)
+                    failed = mynah_transformer_ar_step(s, &store->weights,
+                                                       input[t], out[t]) != 0;
+            }
+            mynah_transformer_ar_state_free(fresh);
+            mynah_transformer_ar_state_free(used);
+            if (failed || !refused_wide || !refused_shape || !renewed) {
+                free(store);
+                TAR_FAIL("renew (context %zu, zero_kv %d): failed %d, refused "
+                         "wider %d, refused other shape %d, renewed %d",
+                         contexts[c], zero_kv, failed, refused_wide,
+                         refused_shape, renewed);
+            }
+            if (memcmp(want, again, sizeof(want)) != 0) {
+                free(store);
+                TAR_FAIL("renew (context %zu, zero_kv %d): a renewed state is "
+                         "not bit-identical to a fresh one",
+                         contexts[c], zero_kv);
+            }
+        }
     }
 
     free(store);

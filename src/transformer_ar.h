@@ -233,6 +233,23 @@ void mynah_transformer_ar_state_free(mynah_transformer_ar_state *state);
  * offset is ever read, and it is overwritten before it becomes readable. */
 void mynah_transformer_ar_state_reset(mynah_transformer_ar_state *state);
 
+/* Makes a used state what `_new(config)` returns, without allocating
+ * (MYNAH_CTX_HOST_POOL).  `config` may differ from the state's only in
+ * `max_seq_len`, and the cache must hold its positions; otherwise this returns
+ * -1, changes nothing, and the caller builds a new state.  The offset, the
+ * window base, the layout and the RoPE tables become exactly `_new`'s; the
+ * row scratch and the scores are zeroed if they were written.  The cache is
+ * left as `_reset` leaves it (only written positions are ever read) unless
+ * `zero_kv`, which zeroes it as a leak check. */
+int mynah_transformer_ar_state_renew(mynah_transformer_ar_state *state,
+                                     const mynah_transformer_ar_config *config,
+                                     int zero_kv);
+
+/* Positions the cache allocation can hold (unwindowed layout), whatever the
+ * current `max_seq_len`: what a renew can accept. */
+size_t mynah_transformer_ar_state_kv_capacity(
+    const mynah_transformer_ar_state *state);
+
 const mynah_transformer_ar_config *mynah_transformer_ar_state_config(
     const mynah_transformer_ar_state *state);
 
