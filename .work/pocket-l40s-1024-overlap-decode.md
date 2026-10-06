@@ -1,8 +1,12 @@
 # Pocket 24L on one L40S toward C1024: L13 + L13b, the AR step and the decode both queued
 
 Board: `PLAN.md` E15-32 (follow-up of `.work/pocket-l40s-plateau.md`, "L13 design"). Branch `pocket-l40s-plateau`.
-Written 2026-10-06 from a code read only. Nothing here is coded or measured. Every number marked "model" comes from the
-cost model in section 2 and must be replaced by Stage 0 measurements.
+Written 2026-10-06 from a code read only. Every number marked "model" comes from the cost model in section 2 and must
+be replaced by Stage 0 measurements.
+
+**Status (2026-10-06 evening, branch `pocket-l13b`): S0 (part), S1, S2 and S4 coded, untested on GPU; S3 (L13c) not
+coded.** See section 14 for what was built, where it departs from this design, and the local verification. Box job:
+`.work/l40s-2026-10-06/jobs/l13b.sh`.
 
 Sibling notes, same day: `.work/pocket-l40s-1024-pingpong.md` (two row groups in one engine, L26) and
 `.work/pocket-l40s-1024-host-profile.md` (where the ~28 ms of host time goes).
@@ -253,12 +257,14 @@ J. loop bookkeeping   requeue/prep_seq, profile; then back to A (the host waits 
     at the next D.
 - **Failure at collect.** A non-finite PCM or a decode error for row r makes `pocket_decode_batch_drop` mark it
   broken, and `slot_fail` follows. If r is also in AR k+1, it rides along as a failed row and retires at the next D.
-- **No retire simulation is needed.** In L13 retire ran after the launch, so `step_ahead_launch` simulated the
-  swap-remove. Here D runs before F, so F selects over the real arrangement, which is the one flag-off would select
-  over.
-  - Rows ending at k are excluded from F because they are not active. They retire at D of iteration j+1.
-  - In a burst (no admissions), the arrangement at D(j+1) is the one flag-off's retire produced at the end of
-    iteration k. Section 7 relies on this.
+- **The retire simulation is still needed** (corrected while coding, section 14). D retires the rows that ended at
+  k−1; the rows ending at k are still in the arrangement at F (they retire at D of iteration j+1). Excluding them
+  only because they are inactive changes the positions of the other rows and the rotation's modulus, so the step
+  order differs from flag-off's. F therefore keeps L13's simulation, which treats them as retired: it selects over
+  exactly the arrangement flag-off's retire produced at the end of iteration k.
+  - In a burst (no admissions), the real arrangement after D(j+1) is that same one. Section 7 relies on this.
+  - Every row of step k is held, not only the ones decoding: an offline row (no gang member) or a row failed at
+    the step must not retire at D(j) either, or the real swap-removes happen in a different order than flag-off's.
 - **Delivery order.** One gang in flight, collected before the next submit, so per-stream PCM order is trivially
   preserved. L19 pins a stream to one helper.
 
@@ -763,3 +769,62 @@ arms A, B, D, E. Poisson TTFA is the production-relevant number; the closed loop
    - `MYNAH_CUDA_SYNC` default vs `blocking`.
 3. **L4 knee** C256 / C288 / C320, arms A, B, D: the 3c close-out rule.
    - On the GPU-bound L4 expect a small gain, and TTFA back to A's level, where L13 alone cost +50-60 ms.
+
+---
+
+## 14. Implementation status (2026-10-06, branch `pocket-l13b`)
+
+Coded, CPU-verified, **untested on GPU**. All flags default off and are read once when the serving loop starts;
+off, the loop runs the same code as before (the new branches test a NULL pointer or a flag that is always 0).
+
+### 14.1 What was built
+
+| stage | content | where |
+|---|---|---|
+| S0 (part) | "syncs while queued": the loop flags when a step or a gang is queued (`mynah_backend_sync_note_queued`); every sync reached meanwhile is counted per site and printed as `while queued N` on its `[SERVE]   sync` row (profile runs only; other runs print the old rows) and as a total on the `step overlap` line. Fence waits are profiled sync sites (`mynah_backend_fence_sync`). **Not built:** event-timed spans (AR ms, decode ms, exposed `e`), the event pool (a fence is created per gang, as L6 does) | `src/backend.{h,c}`, `gpu/cuda/backend_cuda.cu` (`mynah_cuda_fence_query`, `mynah_cuda_fence_sync`) |
+| S1 | `decode_submit` / `decode_collect` (appended to the vtable). `pocket_decode_audio_batch` became `pocket_decode_gang(..., defer)`; the code after the drain moved verbatim into `pocket_decode_gang_land` + `pocket_decode_gang_advance`, which the through path calls right after its drain. With `defer`, a single-frame CUDA gang stops at the drain, records a fence and returns; the collect waits for (or polls) the fence and runs the same landing. Anything else completes inside the submission (one-time stderr line). Safety net: `pocket_decode_inflight_settle` in `step_batch`, `emit_batch` and the gang decode lands a queued gang early, keeping its results for the collect. `MYNAH_CUDA_DECODE_CHECK=1` lands every gang inside its submission. The Pocket gang self-check runs every other round through the split (one frame per row) when `MYNAH_CUDA_DECODE_OVERLAP` is set | `src/tts_engine.h`, `src/engine_pocket.c` |
+| S2 | `MYNAH_CUDA_DECODE_OVERLAP=1` (needs `MYNAH_CUDA_STEP_OVERLAP`, refused with a start-up line otherwise or when the engine has no split). Loop order of 3.1: finish + emit + submit (`dec_submit`, frames charged at submit) → late retire (`retire_pass`, `held` rows excluded) → prefill pass + late admission → select (L13 simulation) + launch → next pass: admission with a poll after every admitted request (`admit_ctx.poll`) → cancellation → collect (`dec_collect`, wait) → `held` cleared. When no step was launched the held rows retire right after the collect, before the serial selection. Profile line `[SERVE] decode overlap` | `src/inference.c` |
+| S4 (L13d) | `MYNAH_CUDA_FIRST_FRAME_FIRST=1`: the gang members with `first == 0` are submitted first as their own gang, **collected at once** (waited) and delivered, then the rest is submitted. Simpler than 5.2 item 5 (no two gangs in flight, so the fast gang's GPU time is exposed instead of overlapped with the main gang's host submission). Small widths use whatever decoder graph exists for that width (no buckets, no eager path) | `src/inference.c` |
+| gate | CLI `--synthesize ... --batch N --stream`: every request streams through a callback into a buffer; the WAVs are the streamed PCM (compare streamed with streamed) | `cli/main.c` |
+
+**Not built:** L13c (prefill-behind, event-based AR finish), the late-wait cap by the decode EWMA, the chain
+admission cap (`MYNAH_CUDA_PIPE_CHAIN_ADMITS`), host-profile A3 (O(n) gang dup check), decode-behind.
+
+### 14.2 Why flag off is the same code path
+
+- Engine: `pocket_decode_audio_batch` calls `pocket_decode_gang(..., NULL)`; with `defer == NULL` the new branch is
+  never taken and the landing runs right after the same drain, in the same order. `settle` is a NULL check
+  (`scratch->dec_inflight` is only allocated by a submission).
+- Driver: `dec == NULL`, `adm.poll == NULL`, `held` and `decoding` are always 0, so `retire_pass` (the old inline
+  retire, moved into a function) removes the same slots in the same order; the queued-sync notes are only issued in
+  L13/L13b paths and only with the profile on.
+- Checked on the CPU: driver test sections 1-7 unchanged and passing; flag-off CLI WAVs equal the L13b ones (below).
+
+### 14.3 Local verification (CPU, macOS)
+
+- `make`, `make server`, `make test-c`: PASS. GCC 16 and Clang `-fsyntax-only` with `-DMYNAH_ENABLE_CUDA
+  -DMYNAH_ROW_CAP=1024u` on the changed C files: no new warnings. `backend_cuda.cu` is not compiled locally (no
+  nvcc): the two new functions are 20 lines of `cudaEventQuery` / `cudaEventSynchronize`.
+- `tests/test_driver.c` section 8 (fake engine with submit/collect; the collect answers "not ready" to every other
+  poll): segmented burst, same steps / rows / order as the serial loop, with and without L13d; continuous admission
+  solo-identical, polls exercised; a codec failure at the collect and a refused step each fail one request; no
+  stepping, emitting, decoding or freeing of an in-flight context while a gang is in flight. Mutation checks: making
+  the launch simulation keep held rows breaks the step order; dropping `held`/`decoding` from retire breaks the
+  audio. Both caught.
+- Real Pocket pack on the CPU (launches and queueing refused there, so the driver's serial-step branch and the
+  synchronous submission are what runs): CLI `--batch 8 --stream` flag-off vs L13 vs L13b vs L13b+L13d 8/8
+  identical; offline `--batch 8` flag-off vs L13b 8/8 identical; `--pocket-self-check` PASS with the split;
+  `make server-concurrency-test` (C2/C4/C8, streaming + batch, 113 byte comparisons) PASS with L13 + L13b + L13d.
+
+### 14.4 Box (first GPU run)
+
+`.work/l40s-2026-10-06/jobs/l13b.sh`, ROW_CAP 1024 tree, the 11 flags as ALL:
+
+1. `--pocket-self-check` with `MYNAH_CUDA_DECODE_OVERLAP=1`: PASS (the split decodes like the gang).
+2. Identity vs ALL: arms ALL, ALL2, +L13, +L13b, +L13b+L13d, +L13b+`MYNAH_CUDA_DECODE_CHECK=1`; CLI offline
+   `--batch 32` (expect 32/32), CLI `--batch 32 --stream` (32/32, and vs L13), server C1 ladder (all identical).
+   The stream logs must show `decode overlap` gangs ≈ steps, no "inside its submission" line, no discard line.
+3. Speed: knee C768 / C896 / C1024, arms B = ALL+L13, C0 = +L13b, C = +L13b + late wait 3000 µs, E = C + L13d, order
+   B C0 C E / E C C0 B. Read: audio-s/s, RTF p95, TTFA p95, gap p95, stalls, `sm`; from `server.log` host ms per
+   iteration (`[SERVE] device wait`, whole run), the `decode overlap` line (collected on a poll vs at the wait, mean
+   wait) and any `while queued` sync site.

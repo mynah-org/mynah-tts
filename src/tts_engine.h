@@ -330,9 +330,46 @@ typedef struct {
      * `ctx_attach` and `ctx_free` (never on a queued context), and nothing
      * else on this scratch. Any other engine call with a step still queued
      * may discard it, which is legal because nothing was committed: the
-     * finishing `step_batch` then simply runs the whole step. */
+     * finishing `step_batch` then simply runs the whole step.
+     *
+     * With MYNAH_CUDA_DECODE_OVERLAP the driver also calls `decode_collect`
+     * (for the gang submitted before the launch) and `prepare_slice` /
+     * `prepare_slice_batch` on rows that are not queued while a step is
+     * queued. An engine may still discard the step there as its safety net,
+     * which is correct and only slower. */
     int  (*step_launch)(mynah_engine_ctx *const *ctxs, size_t count,
                         mynah_engine_scratch *scratch);
+
+    /* ---- decode split (APPENDED; MYNAH_CUDA_DECODE_OVERLAP) ---------------
+     *
+     * OPTIONAL, both or neither. `decode_submit` queues exactly what
+     * `decode_audio_batch` would compute for these ranges and returns without
+     * waiting for the device; `decode_collect` then hands back the same
+     * out_samples / out_count / failed (with the same ownership: lent per
+     * `caps.decode_batch_lends_pcm`) and the same return value that
+     * `decode_audio_batch` would have. Bit-identical per context to
+     * `decode_audio`, which is the `decode_audio_batch` contract.
+     *
+     *  - One gang in flight per scratch. `decode_submit` returns 0 when the
+     *    gang is in flight (queued, or completed inside the call when it
+     *    cannot be queued: a multi-frame range, a CPU fallback), and -1 when
+     *    nothing was submitted at all; the driver then fails the gang.
+     *  - `decode_collect` with `wait == 0` returns 1, with nothing changed,
+     *    while the device is still working; otherwise it waits. `ctxs` and
+     *    `count` are the submitted ones.
+     *  - Between the two the driver may call `step_launch`, `prepare_slice`,
+     *    `prepare_slice_batch`, `decode_audio`, `ctx_new*`, `ctx_attach` and
+     *    `ctx_free` on contexts NOT in the gang, and nothing else on this
+     *    scratch. A context in the gang may also be a row of the step
+     *    launched meanwhile: the step reads none of the decode's state. */
+    int  (*decode_submit)(mynah_engine_ctx *const *ctxs, size_t count,
+                          const size_t *first_frame, const size_t *frame_count,
+                          mynah_engine_scratch *scratch,
+                          char *error, size_t error_capacity);
+    int  (*decode_collect)(mynah_engine_ctx *const *ctxs, size_t count, int wait,
+                           float **out_samples, size_t *out_count, int *failed,
+                           mynah_engine_scratch *scratch,
+                           char *error, size_t error_capacity);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

@@ -51,6 +51,12 @@ typedef struct {
     size_t launches;              /* steps queued ahead */
     size_t finishes;              /* steps that finished a queued one */
     size_t overlap_violations;    /* engine calls the seam forbids meanwhile */
+    /* MYNAH_CUDA_DECODE_OVERLAP */
+    size_t dec_submits;           /* gangs submitted */
+    size_t dec_collects;          /* gangs collected */
+    size_t dec_not_ready;         /* polls answered "not yet" */
+    size_t dec_first_gangs;       /* gangs made only of first frames */
+    size_t dec_violations;        /* calls the decode split forbids meanwhile */
 } observation;
 
 static observation g_obs;
@@ -98,6 +104,9 @@ struct mynah_engine_ctx {
     size_t seg_frames;     /* frames appended in the current segment */
     int    prepared;
     int    slices_done;
+    /* Decoding this absolute frame fails (SIZE_MAX: never). From the
+     * request's `temperature`, which the fake has no other use for. */
+    size_t fail_decode_frame;
 };
 
 /* Pure in (seed, absolute frame, sample): independent of how the frames were
@@ -167,6 +176,8 @@ static int fake_ctx_new(const mynah_tts_model *model, mynah_engine_state *state,
     ctx->refuse_step = request->speaker == 0u ? -1 : (long)request->speaker - 1;
     ctx->segments = request->segment_count > 1u ? request->segment_count : 1u;
     ctx->prepared = 1;
+    ctx->fail_decode_frame = request->temperature > 0.0f
+        ? (size_t)request->temperature : (size_t)-1;
     *out_ctx = ctx;
     return 0;
 }
@@ -195,9 +206,28 @@ static void overlap_guard(void) {
     if (g_pending_count != 0u) ++g_obs.overlap_violations;
 }
 
+/* MYNAH_CUDA_DECODE_OVERLAP: the gang submitted by fake_decode_submit and
+ * not yet collected, with the results its collect will hand over. */
+static mynah_engine_ctx *g_dec[FAKE_MAX_BATCH];
+static float *g_dec_pcm[FAKE_MAX_BATCH];
+static size_t g_dec_count_out[FAKE_MAX_BATCH];
+static int g_dec_failed[FAKE_MAX_BATCH];
+static size_t g_dec_count;
+static int g_dec_inflight;
+static char g_dec_error[256];
+
+/* tts_engine.h: while a gang is in flight the driver may not step, emit or
+ * decode another gang on this scratch. */
+static void decode_guard(void) {
+    if (g_dec_inflight) ++g_obs.dec_violations;
+}
+
 static void fake_ctx_free(mynah_engine_ctx *ctx) {
     for (size_t i = 0; i < g_pending_count; ++i)
         if (g_pending[i] == ctx) ++g_obs.overlap_violations;
+    /* Never free a context whose PCM is still in flight. */
+    for (size_t i = 0; g_dec_inflight && i < g_dec_count; ++i)
+        if (g_dec[i] == ctx) ++g_obs.dec_violations;
     free(ctx);
 }
 
@@ -229,6 +259,7 @@ static int fake_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                            mynah_engine_scratch *scratch, char *error,
                            size_t capacity) {
     (void)scratch;
+    decode_guard();
     /* A queued step must be finished by a step on exactly its rows. */
     if (g_pending_count != 0u) {
         int same = g_pending_count == count;
@@ -281,6 +312,7 @@ static int fake_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     (void)error;
     (void)capacity;
     overlap_guard();
+    decode_guard();
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         memset(&results[i], 0, sizeof(results[i]));
@@ -325,6 +357,10 @@ static int fake_decode_audio(mynah_engine_ctx *ctx, size_t first, size_t frames,
         fake_err(error, capacity, "fake: the driver asked past the frame history");
         return -1;
     }
+    if (ctx->fail_decode_frame >= first && ctx->fail_decode_frame - first < frames) {
+        fake_err(error, capacity, "fake: this request's codec fails at this frame");
+        return -1;
+    }
     observe_decode(ctx->seed, frames);
     if (frames == 0u) return 0;
     const size_t count = frames * FAKE_SAMPLES_PER_FRAME;
@@ -354,6 +390,7 @@ static int fake_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
                                    int *failed, mynah_engine_scratch *scratch,
                                    char *error, size_t capacity) {
     (void)scratch;
+    decode_guard();
     ++g_obs.gang_calls;
     if (count > g_obs.max_gang) g_obs.max_gang = count;
     if (count > 1u) ++g_obs.multi_member_gangs;
@@ -420,6 +457,67 @@ static int fake_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
     return 0;
 }
 
+/* MYNAH_CUDA_DECODE_OVERLAP. The decode runs inside the submission (an engine
+ * with no device half can only complete there, which the seam allows) and is
+ * handed over by the collect; a poll is answered "not yet" every other time,
+ * so the driver's poll path runs too. */
+static int fake_decode_submit(mynah_engine_ctx *const *ctxs, size_t count,
+                              const size_t *first, const size_t *frames,
+                              mynah_engine_scratch *scratch, char *error,
+                              size_t capacity) {
+    decode_guard();
+    if (count == 0u || count > FAKE_MAX_BATCH) {
+        fake_err(error, capacity, "fake: bad decode gang");
+        return -1;
+    }
+    ++g_obs.dec_submits;
+    int all_first = 1;
+    for (size_t i = 0; i < count; ++i) all_first = all_first && first[i] == 0u;
+    if (all_first) ++g_obs.dec_first_gangs;
+    for (size_t i = 0; i < count; ++i) {
+        g_dec[i] = ctxs[i];
+        g_dec_pcm[i] = NULL;
+        g_dec_count_out[i] = 0u;
+        g_dec_failed[i] = 0;
+    }
+    g_dec_error[0] = '\0';
+    /* The batched hook, so the gang statistics stay comparable. */
+    const int rc = fake_decode_audio_batch(ctxs, count, first, frames, g_dec_pcm,
+                                           g_dec_count_out, g_dec_failed, scratch,
+                                           g_dec_error, sizeof(g_dec_error));
+    g_dec_count = count;
+    g_dec_inflight = 1;
+    return rc == 0 ? 0 : -1;
+}
+
+static int fake_decode_collect(mynah_engine_ctx *const *ctxs, size_t count,
+                               int wait, float **out_samples, size_t *out_count,
+                               int *failed, mynah_engine_scratch *scratch,
+                               char *error, size_t capacity) {
+    (void)scratch;
+    static unsigned polls;
+    if (!g_dec_inflight || count != g_dec_count) {
+        ++g_obs.dec_violations;
+        fake_err(error, capacity, "fake: no such gang in flight");
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i)
+        if (ctxs[i] != g_dec[i]) ++g_obs.dec_violations;
+    if (!wait && (polls++ & 1u) == 0u) {
+        ++g_obs.dec_not_ready;
+        return 1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        out_samples[i] = g_dec_pcm[i];
+        out_count[i] = g_dec_count_out[i];
+        failed[i] = g_dec_failed[i];
+    }
+    if (g_dec_error[0] != '\0') fake_err(error, capacity, g_dec_error);
+    g_dec_inflight = 0;
+    ++g_obs.dec_collects;
+    return 0;
+}
+
 static const mynah_tts_engine fake_engine_loop = {
     "driver-test",
     fake_model_init, fake_model_free, fake_caps,
@@ -471,6 +569,23 @@ static const mynah_tts_engine fake_engine_overlap = {
     NULL,                     /* prepare_slice_batch */
     NULL, NULL,               /* ctx_new_host, ctx_attach */
     fake_step_launch,
+};
+
+/* Dispatch-ahead plus the decode split (MYNAH_CUDA_DECODE_OVERLAP). */
+static const mynah_tts_engine fake_engine_decode_overlap = {
+    "fake-decode-overlap",
+    fake_model_init, fake_model_free, fake_caps,
+    fake_ctx_new, fake_prepare, fake_reset, fake_ctx_free,
+    fake_step_batch, fake_emit_batch,
+    fake_frame_count, fake_truncate, fake_decode_audio,
+    fake_scratch_new, fake_scratch_free,
+    NULL,
+    fake_decode_audio_batch,
+    fake_prepare_slice,
+    NULL,                     /* prepare_slice_batch */
+    NULL, NULL,               /* ctx_new_host, ctx_attach */
+    fake_step_launch,
+    fake_decode_submit, fake_decode_collect,
 };
 
 /* ---- sinks -------------------------------------------------------------- */
@@ -945,6 +1060,162 @@ int main(void) {
         if (bad == 10) return fail("overlap: continuous admission changed a request's audio");
         if (bad == 11) return fail("overlap: the failing request did not fail alone");
         if (bad == 12) return fail("overlap: one request's failure hurt a sibling");
+    }
+
+    /* ---- 8. decode-ahead (MYNAH_CUDA_DECODE_OVERLAP) ---------------------- *
+     * On top of dispatch-ahead, each step's decode is submitted before the
+     * next step's launch and collected (polled, or waited for) later in the
+     * same loop pass; the rows of a step retire one pass later.
+     * (a) The segmented burst: the same audio and the SAME STEPS, rows and
+     *     order, as the serial loop -- the late retire must leave the
+     *     arrangement the serial loop's retire leaves -- with and without
+     *     first-frame-first (MYNAH_CUDA_FIRST_FRAME_FIRST).
+     * (b) Continuous admission: every request's audio is its solo audio,
+     *     and the poll path ran.
+     * (c) One request's codec fails at the collect: it fails alone.
+     * (d) One request refuses a step: it fails alone.
+     * Throughout: nothing is stepped, emitted or decoded while a gang is in
+     * flight, no context in flight is freed, and every gang is collected. */
+    {
+        const scenario even[REQUESTS] = {
+            {24u, 0u}, {12u, 0u}, {30u, 0u}, {6u, 0u},
+            {18u, 0u}, {9u, 0u},  {21u, 0u}, {15u, 0u},
+        };
+        const size_t segs[REQUESTS] = {3u, 2u, 3u, 1u, 3u, 1u, 3u, 3u};
+        size_t lens[REQUESTS][3];
+        mynah_tts_request split[REQUESTS];
+        build_requests(split, even, REQUESTS);
+        for (size_t i = 0; i < REQUESTS; ++i) {
+            if (segs[i] < 2u) continue;
+            for (size_t k = 0; k < segs[i]; ++k) lens[i][k] = 1u;
+            lens[i][segs[i] - 1u] = split[i].text_length - (segs[i] - 1u);
+            split[i].segment_lengths = lens[i];
+            split[i].segment_count = segs[i];
+        }
+        static observation serial_obs;
+        capture serial[REQUESTS];
+        unsetenv("MYNAH_CUDA_STEP_OVERLAP");
+        unsetenv("MYNAH_CUDA_DECODE_OVERLAP");
+        unsetenv("MYNAH_CUDA_FIRST_FRAME_FIRST");
+        memset(&g_obs, 0, sizeof(g_obs));
+        g_pending_count = 0u;
+        g_dec_inflight = 0;
+        if (run(&fake_engine_decode_overlap, split, REQUESTS, REQUESTS, serial,
+                results, errors) != 0) {
+            release(serial, REQUESTS);
+            return fail("decode overlap: the serial burst reported a failure");
+        }
+        serial_obs = g_obs;
+        int bad = serial_obs.dec_submits != 0u ? 1 : 0;
+        for (int fff = 0; fff < 2 && !bad; ++fff) {
+            capture got[REQUESTS];
+            setenv("MYNAH_CUDA_STEP_OVERLAP", "1", 1);
+            setenv("MYNAH_CUDA_DECODE_OVERLAP", "1", 1);
+            if (fff) setenv("MYNAH_CUDA_FIRST_FRAME_FIRST", "1", 1);
+            memset(&g_obs, 0, sizeof(g_obs));
+            g_pending_count = 0u;
+            g_dec_inflight = 0;
+            const int rc_run = run(&fake_engine_decode_overlap, split, REQUESTS,
+                                   REQUESTS, got, results, errors);
+            if (rc_run != 0) bad = 2;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (results[i] != MYNAH_GRAPH_OK) bad = 2;
+                else if (!same_audio(&got[i], &serial[i])) bad = 3;
+            }
+            if (!bad && (g_obs.steps != serial_obs.steps ||
+                         memcmp(g_obs.step_rows, serial_obs.step_rows,
+                                g_obs.steps * sizeof(g_obs.step_rows[0])) != 0))
+                bad = 4;
+            if (!bad && (g_obs.launches == 0u || g_obs.finishes != g_obs.launches))
+                bad = 5;
+            if (!bad && (g_obs.dec_submits == 0u ||
+                         g_obs.dec_collects != g_obs.dec_submits))
+                bad = 6;
+            if (!bad && (g_obs.overlap_violations != 0u || g_obs.dec_violations != 0u))
+                bad = 7;
+            if (!bad && (g_obs.withheld != 0u || g_obs.stepped_unprepared != 0u))
+                bad = 8;
+            if (!bad && fff && g_obs.dec_first_gangs == 0u) bad = 9;
+            if (!bad)
+                printf("  decode overlap burst%s: %zu steps (%zu queued ahead), %zu "
+                       "gangs submitted, same rows as the serial loop\n",
+                       fff ? " + first frame first" : "", g_obs.steps,
+                       g_obs.launches, g_obs.dec_submits);
+            release(got, REQUESTS);
+            unsetenv("MYNAH_CUDA_FIRST_FRAME_FIRST");
+        }
+        release(serial, REQUESTS);
+
+        for (int fff = 0; fff < 2 && !bad; ++fff) {
+            capture got[REQUESTS];
+            if (fff) setenv("MYNAH_CUDA_FIRST_FRAME_FIRST", "1", 1);
+            build_requests(requests, healthy, REQUESTS);
+            memset(&g_obs, 0, sizeof(g_obs));
+            g_pending_count = 0u;
+            g_dec_inflight = 0;
+            if (run(&fake_engine_decode_overlap, requests, REQUESTS, BATCH_WIDTH,
+                    got, results, errors) != 0)
+                bad = 10;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (results[i] != MYNAH_GRAPH_OK) bad = 10;
+                else if (!same_audio(&got[i], &solo[i])) bad = 11;
+            }
+            if (!bad && (g_obs.dec_submits == 0u ||
+                         g_obs.dec_collects != g_obs.dec_submits ||
+                         g_obs.dec_not_ready == 0u))
+                bad = 6;
+            if (!bad && (g_obs.overlap_violations != 0u || g_obs.dec_violations != 0u))
+                bad = 7;
+            if (!bad && g_obs.withheld != 0u) bad = 8;
+            release(got, REQUESTS);
+            unsetenv("MYNAH_CUDA_FIRST_FRAME_FIRST");
+        }
+
+        for (int which = 0; which < 2 && !bad; ++which) {
+            scenario poisoned[REQUESTS];
+            mynah_tts_request victims[REQUESTS];
+            capture got[REQUESTS];
+            const size_t victim = which ? 2u : 5u;
+            for (size_t i = 0; i < REQUESTS; ++i) poisoned[i] = healthy[i];
+            if (which) poisoned[victim].refuse = 4u;
+            build_requests(victims, poisoned, REQUESTS);
+            if (!which) victims[victim].temperature = 3.0f;   /* codec fails at frame 3 */
+            memset(&g_obs, 0, sizeof(g_obs));
+            g_pending_count = 0u;
+            g_dec_inflight = 0;
+            if (run(&fake_engine_decode_overlap, victims, REQUESTS, BATCH_WIDTH, got,
+                    results, errors) == 0)
+                bad = 12;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (i == victim) {
+                    if (results[i] != MYNAH_GRAPH_FAILED) bad = 12;
+                } else if (results[i] != MYNAH_GRAPH_OK ||
+                           !same_audio(&got[i], &solo[i])) {
+                    bad = 13;
+                }
+            }
+            if (!bad && (g_obs.overlap_violations != 0u || g_obs.dec_violations != 0u))
+                bad = 7;
+            release(got, REQUESTS);
+        }
+        unsetenv("MYNAH_CUDA_STEP_OVERLAP");
+        unsetenv("MYNAH_CUDA_DECODE_OVERLAP");
+        unsetenv("MYNAH_CUDA_FIRST_FRAME_FIRST");
+        g_pending_count = 0u;
+        g_dec_inflight = 0;
+        if (bad == 1) return fail("decode overlap: a gang was submitted with the flag off");
+        if (bad == 2) return fail("decode overlap: a burst request failed");
+        if (bad == 3) return fail("decode overlap: the burst audio differs from the serial loop");
+        if (bad == 4) return fail("decode overlap: the burst's steps differ from the serial loop");
+        if (bad == 5) return fail("decode overlap: no step was queued ahead, or one was not finished");
+        if (bad == 6) return fail("decode overlap: no gang was split, one was not collected, or nothing was polled");
+        if (bad == 7) return fail("decode overlap: the engine was called against the seam meanwhile");
+        if (bad == 8) return fail("decode overlap: ready work was withheld or a context stepped mid-reprepare");
+        if (bad == 9) return fail("decode overlap: first frame first formed no first-frame gang");
+        if (bad == 10) return fail("decode overlap: a continuously admitted request failed");
+        if (bad == 11) return fail("decode overlap: continuous admission changed a request's audio");
+        if (bad == 12) return fail("decode overlap: the failing request did not fail");
+        if (bad == 13) return fail("decode overlap: one request's failure hurt a sibling");
     }
 
     /* Restore the healthy requests for anything added after this point. */

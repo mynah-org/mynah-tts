@@ -309,6 +309,12 @@ void mynah_backend_sync_profile_print(FILE *out, unsigned long long iterations);
  * starts, so start-up work (slot pool fill, graph capture, warm-up) is not
  * charged to the loop's shares. */
 void mynah_backend_sync_profile_reset(void);
+/* Profile runs only: the serving loop says when it has device work queued
+ * that it means to hide (MYNAH_CUDA_STEP_OVERLAP, MYNAH_CUDA_DECODE_OVERLAP).
+ * A sync reached meanwhile waits for that work as well; the per-site table
+ * counts those calls ("while queued") and this returns their total. */
+void mynah_backend_sync_note_queued(int queued);
+unsigned long long mynah_backend_sync_queued_calls(void);
 #define mynah_backend_sync(backend, error, error_capacity) \
     mynah_backend_sync_at((backend), (error), (error_capacity), __FILE__, __LINE__)
 
@@ -345,6 +351,20 @@ void mynah_backend_graph_forget_parked(const mynah_backend *backend,
                                        const void *identity);
 void *mynah_backend_fence_record(const mynah_backend *backend);
 void mynah_backend_fence_wait(const mynah_backend *backend, void *fence);
+/* MYNAH_CUDA_DECODE_OVERLAP.  fence_query: 1 when the work before the fence
+ * is complete (or the backend cannot tell, so the caller goes on to wait), 0
+ * while it is still running, -1 on a device error; the fence stays owned by
+ * the caller.  fence_sync waits for it and releases it like fence_wait, but
+ * reports a device error and is a profiled sync site (the same accounting as
+ * mynah_backend_sync, so "device wait" stays comparable).  Without a fence
+ * it falls back to a stream sync. */
+int mynah_backend_fence_query(const mynah_backend *backend, void *fence);
+int mynah_backend_fence_sync_at(const mynah_backend *backend, void *fence,
+                                char *error, size_t error_capacity,
+                                const char *file, int line);
+#define mynah_backend_fence_sync(backend, fence, error, error_capacity)          \
+    mynah_backend_fence_sync_at((backend), (fence), (error), (error_capacity), \
+                                __FILE__, __LINE__)
 
 /* Pocket flow-head descriptor. The engine owns the host weights and device
  * scratch; CUDA owns cached weight copies and the chained kernels. No CUDA or
