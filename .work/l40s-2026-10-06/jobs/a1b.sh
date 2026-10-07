@@ -1,9 +1,10 @@
 #!/bin/bash
 # A1b fixed-size device request sets (MYNAH_CUDA_SLOT_FIXED) on a single-NUMA
-# box (RTX 6000 Ada host or similar), ROW_CAP 1024 tree.
+# box (RTX 6000 Ada host or similar), ROW_CAP 1024 tree. Sizing v2: the cap is
+# re-planned after the start-up walk and prefill (two "re-planned" lines).
 # 1. build; 2. identity (CLI offline burst, CLI streaming burst, server C1)
 # flag off vs on, plus the leak A/B (ZERO_KV) and a tiny fixed size that forces
-# short takes and growth; 3. speed, knee at C768/C896, arms A (defaults + A1a)
+# short takes and growth; 3. speed, knee at C768/C896/C1024, arms A (defaults + A1a)
 # and B (A + A1b), order A B A, one repetition (time-boxed), [CTX] lines.
 # Design and pass criteria: .work/pocket-l40s-1024-host-profile.md, A1b design.
 exec >> /root/res/a1b.log 2>&1
@@ -45,7 +46,7 @@ for arm in "OFF|$A1A" "OFF2|$A1A" "FIX|$FIX" "FIXZ|$FIX MYNAH_CUDA_SLOT_POOL_ZER
       --corpus tools/corpus/pocket_v2_en.jsonl --voices alba,marius --seed 1234 --save-audio $R/srvwav --out $R --tag x > $R/ladder.log 2>&1
     tmux send-keys -t isrv C-c; sleep 4; pkill -f "[b]uild/cuda/mynah-tts-server"; tmux kill-session -t isrv 2>/dev/null
     cmp_py $R/srvwav $I/OFF/srvwav $L srv
-    grep -h "MYNAH_CUDA_SLOT_FIXED" $R/server.log | head -1 | sed "s/^/    /"
+    grep -h "MYNAH_CUDA_SLOT_FIXED" $R/server.log | head -3 | sed "s/^/    /"
     grep -h "^\[CTX\]" $R/server.log | tail -1 | sed "s/^/    /"
     grep -c "KV grew" $R/server.log | sed "s/^/    KV growths: /"
   else echo "  server did not start"; tail -5 $R/server.log; tmux kill-session -t isrv 2>/dev/null; fi
@@ -58,10 +59,11 @@ for r in 1; do
   for a in B A; do
     n=1; while [ -d /root/res/a1b-$a$r-$n ]; do n=$((n+1)); done
     TAG=a1b-$a$r-$n
-    TREE=$T TAG=$TAG LEVELS="768 896" PRE=640 PROCS=4 DUR=120 ENVS="${!a}" timeout 1500 $K
+    TREE=$T TAG=$TAG LEVELS="768 896 1024" PRE=640 PROCS=4 DUR=120 ENVS="${!a}" timeout 2100 $K
     S=/root/res/$TAG/server.log
-    grep -h "MYNAH_CUDA_SLOT_FIXED" $S | head -1 | sed "s/^/    /"
+    grep -h "MYNAH_CUDA_SLOT_FIXED" $S | head -3 | sed "s/^/    /"
     grep -h "^\[CTX\]" $S | tail -1 | sed "s/^/    /"
+    grep -h "width-bucket graph warm-up\|slot-pool prefill" $S | sed "s/^/    /"
     grep -h "\[SERVE\] device wait" $S | tail -1 | sed "s/^/    /"
     grep -h "out of memory" $S | head -3 | sed "s/^/    /"
   done

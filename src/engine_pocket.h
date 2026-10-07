@@ -359,6 +359,13 @@ const float *mynah_engine_pocket_latent(const mynah_engine_ctx *ctx,
 int mynah_engine_pocket_self_check(const mynah_tts_model *model, char *error,
                                    size_t error_capacity);
 
+/* MYNAH_CUDA_SLOT_FIXED bookkeeping on a model-less state, with no device
+ * call: where a parked-aside cache goes (a set without one, then the spare
+ * list, then refused), which spare or parked cache a take or a growth
+ * gets, the fixed-cache count, the oversized rule and the length
+ * percentiles. Returns 0, or -1 with a message in `error`. */
+int mynah_engine_pocket_slot_fixed_self_test(char *error, size_t error_capacity);
+
 #ifdef __cplusplus
 }
 #endif

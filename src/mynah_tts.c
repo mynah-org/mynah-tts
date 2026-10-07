@@ -461,6 +461,24 @@ int mynah_tts_model_get_info(const mynah_tts_model *model,
     return 0;
 }
 
+/* See mynah_tts.h. A generation counter, not a flag, so an engine notices
+ * every mark exactly once even if two arrive between its admissions. */
+static unsigned g_startup_generation;
+static int g_startup_serving;
+
+void mynah_tts_startup_mark(int serving) {
+    __atomic_store_n(&g_startup_serving, serving != 0, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_startup_generation, 1u, __ATOMIC_RELEASE);
+}
+
+unsigned mynah_tts_startup_generation(int *serving) {
+    const unsigned generation =
+        __atomic_load_n(&g_startup_generation, __ATOMIC_ACQUIRE);
+    if (serving != NULL)
+        *serving = __atomic_load_n(&g_startup_serving, __ATOMIC_RELAXED);
+    return generation;
+}
+
 int mynah_tts_model_get_backend_metrics(const mynah_tts_model *model,
                                         mynah_tts_backend_metrics *metrics) {
     if (model == NULL || metrics == NULL) return -1;

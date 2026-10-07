@@ -347,6 +347,35 @@ int mynah_backend_fixed_buffers_plan(size_t free_bytes, size_t total_bytes,
     return 0;
 }
 
+static size_t sat_add(size_t a, size_t b) {
+    return a > SIZE_MAX - b ? SIZE_MAX : a + b;
+}
+
+int mynah_backend_fixed_buffers_refit(size_t free_bytes, size_t total_bytes,
+                                      size_t rows, size_t spares,
+                                      size_t sets_made, size_t live,
+                                      size_t buffer_bytes,
+                                      size_t per_row_other_bytes,
+                                      size_t extra_bytes, size_t *margin_bytes,
+                                      size_t *cap) {
+    if (buffer_bytes == 0u || margin_bytes == NULL || cap == NULL) return -1;
+    size_t margin = total_bytes / 16u;
+    const size_t floor = (size_t)2u << 30;
+    if (margin < floor) margin = floor;
+    const size_t missing = rows > sets_made ? rows - sets_made : 0u;
+    const size_t other = per_row_other_bytes != 0u &&
+                                 missing > SIZE_MAX / per_row_other_bytes
+                             ? SIZE_MAX
+                             : missing * per_row_other_bytes;
+    margin = sat_add(sat_add(margin, other), extra_bytes);
+    const size_t budget = free_bytes > margin ? free_bytes - margin : 0u;
+    const size_t limit = sat_add(rows, spares);
+    const size_t fit = sat_add(live, budget / buffer_bytes);
+    *margin_bytes = margin;
+    *cap = fit < limit ? fit : limit;
+    return 0;
+}
+
 static int metal_cpu_path_enabled(const char *cpu_name, const char *gpu_name,
                                   int default_cpu) {
     const char *cpu = getenv(cpu_name);
@@ -992,6 +1021,42 @@ static int call_meter_self_test(const mynah_backend *backend, char *error,
          mynah_backend_fixed_buffers_plan(1u, 1u, 1u, 0u, 0u, &reserve,
                                           &fit) != -1)) {
         set_error(error, error_capacity, "fixed-buffer plan arithmetic is wrong");
+        return -1;
+    }
+    /* Re-plan after the warm-ups. 48 GiB card, 30 GiB free, 1024 rows + 32
+     * spares of 20 MiB, every set made: margin 3 GiB, 1382 fit -> 1056. */
+    size_t margin = 0u, cap = 0u;
+    if (sizeof(size_t) >= 8u &&
+        (mynah_backend_fixed_buffers_refit(30u * gib, 48u * gib, 1024u, 32u,
+                                           1024u, 0u, 20u * mib, 9u * mib, 0u,
+                                           &margin, &cap) != 0 ||
+         margin != 3u * gib || cap != 1056u ||
+         /* 22 GiB card at 768 rows: the 2 GiB floor wins, 409 fit */
+         mynah_backend_fixed_buffers_refit(10u * gib, 22u * gib, 768u, 24u,
+                                           768u, 0u, 20u * mib, 9u * mib, 0u,
+                                           &margin, &cap) != 0 ||
+         margin != 2u * gib || cap != (8u * gib) / (20u * mib) ||
+         /* sets not made yet and spare extra bytes widen the margin; the
+          * caches that already exist count on top of what fits */
+         mynah_backend_fixed_buffers_refit(10u * gib, 22u * gib, 384u, 12u, 1u,
+                                           40u, 20u * mib, 9u * mib, 150u * mib,
+                                           &margin, &cap) != 0 ||
+         margin != 2u * gib + 383u * 9u * mib + 150u * mib ||
+         cap != 40u + (10u * gib - margin) / (20u * mib) ||
+         /* nothing free: the existing caches are the cap */
+         mynah_backend_fixed_buffers_refit(gib, 48u * gib, 1024u, 32u, 1024u,
+                                           100u, 20u * mib, 9u * mib, 0u,
+                                           &margin, &cap) != 0 ||
+         cap != 100u ||
+         mynah_backend_fixed_buffers_refit(SIZE_MAX, SIZE_MAX, SIZE_MAX,
+                                           SIZE_MAX, 0u, SIZE_MAX, 1u,
+                                           SIZE_MAX, SIZE_MAX, &margin,
+                                           &cap) != 0 ||
+         margin != SIZE_MAX || cap != SIZE_MAX ||
+         mynah_backend_fixed_buffers_refit(1u, 1u, 1u, 0u, 0u, 0u, 0u, 0u, 0u,
+                                           &margin, &cap) != -1)) {
+        set_error(error, error_capacity,
+                  "fixed-buffer re-plan arithmetic is wrong");
         return -1;
     }
     return 0;

@@ -1103,6 +1103,26 @@ struct mynah_engine_state {
     size_t cuda_slot_fixed_cap;
     size_t cuda_slot_fixed_floor;
     size_t cuda_slot_fixed_live;
+    /* The plan's inputs and its start-up re-plan (pocket_cuda_slot_fixed_
+     * replan): the rows it sizes for, the bytes of one stored position, 1
+     * when MYNAH_CUDA_SLOT_FIXED_POSITIONS fixed the size (no adaptation),
+     * the last start-up mark re-planned, and whether it said serving (read
+     * from other threads: atomic). `cuda_slot_fixed_positions`/`_bytes`
+     * change once at most (pocket_cuda_slot_fixed_adapt): atomic too. */
+    size_t cuda_slot_fixed_rows;
+    size_t cuda_slot_fixed_position_bytes;
+    int cuda_slot_fixed_size_set;
+    int cuda_slot_fixed_adapted;
+    unsigned cuda_slot_fixed_mark;
+    int cuda_slot_fixed_serving;
+    /* Fixed caches parked outside any set (under cuda_slot_pool_mutex): the
+     * growth reserve made at the re-plan (`_spare_reserve` caches one growth
+     * chunk larger than the fixed size) and the caches a growth or a take
+     * left behind. At most `_spare_max`; every one counts in `_live`. */
+    struct pocket_cuda_spare *cuda_slot_spare;
+    size_t cuda_slot_spare_count;
+    size_t cuda_slot_spare_reserve;
+    size_t cuda_slot_spare_max;
     /* Idle host halves of request contexts (MYNAH_CTX_HOST_POOL, default
      * off): both transformer states, the flow head, the SEANet state and the
      * three projection scratches of a retired context, renewed for the next
@@ -5215,46 +5235,145 @@ static int pocket_cuda_slot_zero_kv_requested(void) {
  * 10-12 ms of the scheduler thread per admission.
  *
  * With the flag on, a tile-path (growable) row's backbone KV is allocated at
- * no less than a fixed size, `cuda_slot_fixed_positions` stored positions
- * (MYNAH_CUDA_SLOT_FIXED_POSITIONS, default 512: every request of the
- * reference corpus, text plus its frames, without growth), and such a cache
- * goes back to the pool whole. A take of one never calls the driver: the
- * cache is laid out over all its positions (the stride is the row's own
- * capacity, exactly as for any reused cache), and when the request's
- * starting estimate is larger, the row starts at the fixed size and grows
- * later only if it really gets there (the same growth every row already has;
- * the starting estimate is 3 frames per text token, the measured rate is
- * 2-2.6). The KV is not cleared: attention reads only the positions this
- * request wrote, the contract every reused or fresh cache relies on
- * (MYNAH_CUDA_SLOT_POOL_ZERO_KV=1 still clears it, with an async memset).
+ * no less than a fixed size F, `cuda_slot_fixed_positions` stored positions,
+ * and such a cache goes back to the pool whole. A take of one never calls
+ * the driver: the cache is laid out over all its positions (the stride is
+ * the row's own capacity, exactly as for any reused cache), and when the
+ * request's starting estimate is larger, the row starts at what the cache
+ * holds (at least its prefill and first step) and grows later only if it
+ * really gets there (the starting estimate is 3 frames per text token, the
+ * measured rate is 2-2.6). The KV is not cleared: attention reads only the
+ * positions this request wrote, the contract every reused or fresh cache
+ * relies on (MYNAH_CUDA_SLOT_POOL_ZERO_KV=1 still clears it, with an async
+ * memset).
+ *
+ * F (MYNAH_CUDA_SLOT_FIXED_POSITIONS overrides it, and then it never moves):
+ * 384 stored positions to start with, the text plus its frames (the voice
+ * prefix is shared, not stored): ~60 tokens + ~320 frames, ~26 s of audio
+ * at 12.5 Hz. On the v2 reference corpus (12-531 characters) that holds
+ * about 90 % of the requests without growth; the longest (~130 tokens,
+ * ~430 positions) grow once. 19.1 MiB per row with int8 records at 24
+ * layers, against 25.5 MiB at 512. Once serving, the engine keeps a
+ * histogram of the stored positions each request really reached (and of
+ * the admission's estimate, for the [CTX] line); after the first
+ * POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER requests it moves F, once, to the
+ * 95th percentile of the real lengths rounded up to 64, within
+ * [320, 768]. Caches made before keep their size: every one of them still
+ * serves any request it holds the prefill of.
  *
  * The full step budget is not what fixes the size: 1500 frames is ~1700
  * positions, 83.5 MiB per row with int8 records at 24 layers, which no GPU
- * holds at hundreds of rows. Requests past the fixed size keep the growth
- * path, and a cache that grew past twice the fixed size is freed at
- * retirement (with the drain that path always had) rather than parked.
+ * holds at hundreds of rows.
  *
- * VRAM: at most `cuda_slot_fixed_cap` fixed caches exist, the start-up plan
- * min(rows, (free - reserve) / bytes) with rows = MYNAH_CUDA_SLOT_FIXED_ROWS
- * (default the build's row cap) and the reserve of
- * mynah_backend_fixed_buffers_plan; and a new one is made only while the
- * device keeps max(1 GiB, total / 20) free after it. Anything else uses the
- * plain pool, as with the flag off. VMM rows (MYNAH_CUDA_KV_VMM, BF16 only)
- * and rows with a full-capacity cache are never fixed. */
-#define POCKET_CUDA_SLOT_FIXED_DEFAULT_POSITIONS ((size_t)512u)
+ * Growth of a fixed row never synchronises the device (pocket_cuda_fixed_
+ * grow): the new cache is a spare (below), else the cache of a parked set
+ * that holds the new size (the set keeps the old one in exchange), else a
+ * new allocation within the cap; the live prefix is copied on the stream,
+ * and the old cache is parked (in a set without one, else on the spare
+ * list) instead of freed. Everything is on the backend's one stream, so the
+ * next user of a parked cache is ordered after every queued read of its
+ * previous owner, and the host never reads or writes a KV cache. Only when
+ * none of that is possible does the old allocate + sync + free path run
+ * (`grow ... sync` in [CTX]).
+ *
+ * VRAM: at most `cuda_slot_fixed_cap` fixed caches exist. At model load the
+ * cap is the provisional min(rows, (free - reserve) / bytes) of
+ * mynah_backend_fixed_buffers_plan, rows = MYNAH_CUDA_SLOT_FIXED_ROWS
+ * (default the build's row cap). A server then marks its start-up
+ * (mynah_tts_startup_mark) after the width-bucket graph walk and again after
+ * the slot-pool prefill; at the next admission after each mark the plan is
+ * redone (pocket_cuda_slot_fixed_replan): the walk's parked caches, sized
+ * for its long text, are freed unless they are within one growth chunk
+ * above F, the free memory is measured, and the cap becomes
+ * mynah_backend_fixed_buffers_refit: min(rows + spares, live + (free -
+ * margin) / bytes) with a margin of max(2 GiB, total / 16) plus the other
+ * per-row buffers of the sets not made yet. The parked sets without a cache
+ * are then given one of F, and `_spare_reserve` spares of F + one growth
+ * chunk are made, both within the cap. A new cache is also only made while
+ * the device keeps max(1 GiB, total / 20) free after it. Anything past the
+ * cap uses the plain pool, as with the flag off, but never frees a parked
+ * cache on the admission path: a cache that does not fit is parked again.
+ * VMM rows (MYNAH_CUDA_KV_VMM, BF16 only) and rows with a full-capacity
+ * cache are never fixed. */
+#define POCKET_CUDA_SLOT_FIXED_DEFAULT_POSITIONS ((size_t)384u)
+#define POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER 1024ul
+#define POCKET_CUDA_SLOT_FIXED_ADAPT_LOW ((size_t)320u)
+#define POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH ((size_t)768u)
 /* Device bytes per row besides the backbone KV, without the row diet (the
  * conservative figure of .work/pocket-cuda-c208.md: 9.0 MiB at 24L). */
 #define POCKET_CUDA_SLOT_FIXED_OTHER_BYTES ((size_t)9u << 20)
 
+/* A fixed cache parked outside any set (`cuda_slot_spare`). */
+typedef struct pocket_cuda_spare {
+    struct pocket_cuda_spare *next;
+    float *kv;
+    size_t bytes;
+    int bf16;
+} pocket_cuda_spare;
+
 /* `[CTX]` counters of the fixed caches (MYNAH_SERVE_PROFILE): reused whole,
  * reused short of the starting estimate, made new, refused by the cap or the
- * free-memory floor, a fixed cache freed at a take (wrong element type or a
- * full-capacity row), and freed at retirement after growing past 2x. */
+ * free-memory floor, a fixed cache freed at a take (wrong element type, or
+ * no room to park it), freed at retirement after growing past 2x (no room on
+ * the spare list), parked instead of freed (a take's misfit, a growth's old
+ * cache, a retirement's oversized one), taken from the spare list by an
+ * admission, and growths by source: a spare, a parked set's cache, a new
+ * allocation, or the old allocate + sync + free path. */
 enum { FIXST_REUSED, FIXST_SHORT, FIXST_NEW, FIXST_OVER, FIXST_MISFIT,
-       FIXST_TRIM, FIXST_N };
+       FIXST_TRIM, FIXST_PARKED, FIXST_SPARE_TAKE, FIXST_GROW_SPARE,
+       FIXST_GROW_SLOT, FIXST_GROW_ALLOC, FIXST_GROW_SYNC, FIXST_N };
 static unsigned long g_fixst[FIXST_N];
 static void pocket_cuda_slot_fixed_note(int what) {
     __atomic_add_fetch(&g_fixst[what], 1ul, __ATOMIC_RELAXED);
+}
+
+/* Stored positions per request, 64-position buckets (the last one open):
+ * [0] the admission's starting estimate, [1] what the request really
+ * reached by retirement. Counted only once a server said it is serving, so
+ * the start-up's synthetic requests stay out. */
+#define POCKET_FIXLEN_BUCKETS 64u
+static unsigned long g_fixlen[2][POCKET_FIXLEN_BUCKETS];
+static unsigned long g_fixlen_n[2];
+static void pocket_cuda_fixlen_note(const mynah_engine_state *state, int kind,
+                                    size_t positions) {
+    if (!__atomic_load_n(&state->cuda_slot_fixed_serving, __ATOMIC_RELAXED))
+        return;
+    size_t bucket = positions / 64u;
+    if (bucket >= POCKET_FIXLEN_BUCKETS) bucket = POCKET_FIXLEN_BUCKETS - 1u;
+    __atomic_add_fetch(&g_fixlen[kind][bucket], 1ul, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_fixlen_n[kind], 1ul, __ATOMIC_RELAXED);
+}
+
+/* The upper edge of the bucket holding the `percent` percentile; 0 when
+ * nothing was counted. */
+static size_t pocket_fixlen_percentile_of(const unsigned long *buckets,
+                                          unsigned long n, unsigned percent) {
+    if (n == 0ul) return 0u;
+    const unsigned long want = (n * percent + 99ul) / 100ul;
+    unsigned long seen = 0ul;
+    for (size_t b = 0; b < POCKET_FIXLEN_BUCKETS; ++b) {
+        seen += __atomic_load_n(&buckets[b], __ATOMIC_RELAXED);
+        if (seen >= want) return (b + 1u) * 64u;
+    }
+    return POCKET_FIXLEN_BUCKETS * 64u;
+}
+
+static size_t pocket_cuda_fixlen_percentile(int kind, unsigned percent) {
+    return pocket_fixlen_percentile_of(
+        g_fixlen[kind], __atomic_load_n(&g_fixlen_n[kind], __ATOMIC_RELAXED),
+        percent);
+}
+
+static size_t pocket_cuda_slot_fixed_size(const mynah_engine_state *state) {
+    return __atomic_load_n(&state->cuda_slot_fixed_bytes, __ATOMIC_RELAXED);
+}
+
+/* Bytes of a cache one growth chunk larger than the fixed size: the spare
+ * reserve's size, and the upper edge of what the re-plan keeps. */
+static size_t pocket_cuda_slot_fixed_band(const mynah_engine_state *state) {
+    const size_t chunk = POCKET_CUDA_KV_GROW_CHUNK * state->cuda_slot_fixed_position_bytes;
+    const size_t fixed = pocket_cuda_slot_fixed_size(state);
+    return fixed > SIZE_MAX - chunk ? SIZE_MAX : fixed + chunk;
 }
 
 static size_t pocket_cuda_slot_fixed_env_size(const char *name, size_t fallback,
@@ -5288,20 +5407,24 @@ static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
                 "MYNAH_CUDA_PREFILL_TILE on\n");
         return;
     }
+    const char *size_setting = getenv("MYNAH_CUDA_SLOT_FIXED_POSITIONS");
     size_t positions = pocket_cuda_slot_fixed_env_size(
         "MYNAH_CUDA_SLOT_FIXED_POSITIONS", POCKET_CUDA_SLOT_FIXED_DEFAULT_POSITIONS,
         64u, 65536u);
+    const int size_set = size_setting != NULL && size_setting[0] != '\0';
     positions = (positions + 63u) / 64u * 64u;
     const size_t rows = pocket_cuda_slot_fixed_env_size(
         "MYNAH_CUDA_SLOT_FIXED_ROWS", POCKET_CUDA_SLOT_POOL_CAP, 1u,
         POCKET_CUDA_SLOT_POOL_CAP);
     const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
     const pocket_config *cfg = &state->cfg;
-    size_t bytes = 0u;
-    if (pocket_mul(positions, pocket_cuda_kv_record(state, kv_bf16), &bytes) != 0 ||
-        pocket_mul(bytes, 2u * cfg->layers, &bytes) != 0 ||
-        pocket_mul(bytes, pocket_cuda_kv_elem(state, kv_bf16), &bytes) != 0 ||
-        bytes == 0u) {
+    size_t position_bytes = 0u, bytes = 0u;
+    if (pocket_mul(pocket_cuda_kv_record(state, kv_bf16), 2u * cfg->layers,
+                   &position_bytes) != 0 ||
+        pocket_mul(position_bytes, pocket_cuda_kv_elem(state, kv_bf16),
+                   &position_bytes) != 0 ||
+        pocket_mul(positions, position_bytes, &bytes) != 0 || bytes == 0u ||
+        position_bytes > SIZE_MAX / POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH) {
         fprintf(stderr, "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED=1 ignored "
                         "(size overflow)\n");
         return;
@@ -5323,12 +5446,14 @@ static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
     const double mib = 1024.0 * 1024.0, gib = mib * 1024.0;
     fprintf(stderr,
             "mynah-tts: MYNAH_CUDA_SLOT_FIXED=1: pooled request sets keep a "
-            "backbone KV of >= %zu positions (%.2f MiB, %s), reused with no "
-            "driver call; %zu rows x %.2f MiB = %.2f GiB against %.2f GiB free "
-            "- %.2f GiB reserve (max(4 GiB, %.1f GiB / 5) + %zu x %zu MiB other "
-            "per-row buffers) = %.2f GiB: ",
+            "backbone KV of >= %zu positions (%.2f MiB, %s; %s), reused with "
+            "no driver call; %zu rows x %.2f MiB = %.2f GiB against %.2f GiB "
+            "free - %.2f GiB reserve (max(4 GiB, %.1f GiB / 5) + %zu x %zu MiB "
+            "other per-row buffers) = %.2f GiB: ",
             positions, (double)bytes / mib,
             kv_bf16 ? (state->cuda_kv_int8 ? "int8 records" : "bf16") : "f32",
+            size_set ? "MYNAH_CUDA_SLOT_FIXED_POSITIONS"
+                     : "default, moves once to the served p95",
             rows, (double)bytes / mib, (double)rows * (double)bytes / gib,
             (double)free_now / gib, (double)reserve / gib, (double)total / gib,
             rows, POCKET_CUDA_SLOT_FIXED_OTHER_BYTES >> 20,
@@ -5340,9 +5465,11 @@ static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
     }
     if (fit < rows)
         fprintf(stderr, "auto-capped to %zu fixed caches; rows past them use the "
-                        "plain slot pool\n", fit);
+                        "plain slot pool", fit);
     else
-        fprintf(stderr, "all %zu rows fit\n", rows);
+        fprintf(stderr, "all %zu rows fit", rows);
+    fprintf(stderr, " (provisional: a server re-plans after its start-up "
+                    "warm-ups)\n");
     state->cuda_slot_fixed = 1;
     state->cuda_slot_fixed_positions = positions;
     state->cuda_slot_fixed_bytes = bytes;
@@ -5351,17 +5478,32 @@ static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
     if (state->cuda_slot_fixed_floor < ((size_t)1u << 30))
         state->cuda_slot_fixed_floor = (size_t)1u << 30;
     state->cuda_slot_fixed_live = 0u;
+    state->cuda_slot_fixed_rows = rows;
+    state->cuda_slot_fixed_position_bytes = position_bytes;
+    state->cuda_slot_fixed_size_set = size_set;
+    state->cuda_slot_fixed_adapted = 0;
+    state->cuda_slot_fixed_mark = 0u;
+    state->cuda_slot_fixed_serving = 0;
+    state->cuda_slot_spare = NULL;
+    state->cuda_slot_spare_count = 0u;
+    /* A small growth reserve, 1 in 32 rows (32 caches, ~1 GiB, at 1024
+     * rows), and room for 1 in 8 rows of parked-aside caches. */
+    state->cuda_slot_spare_reserve = rows / 32u < 4u ? 4u : rows / 32u;
+    state->cuda_slot_spare_max = rows / 8u < 16u ? 16u : rows / 8u;
 }
 
-/* Count one more fixed cache if the cap and the free-memory floor allow it.
- * Only on the path that allocates anyway (no fixed cache came from the pool),
- * so the free-memory query adds nothing to a zero-call take. */
-static int pocket_cuda_slot_fixed_claim(mynah_engine_state *state) {
+/* Count one more fixed cache of `bytes` if the cap and the free-memory
+ * floor allow it. Only on paths that allocate anyway, so the free-memory
+ * query adds nothing to a zero-call take. `note`: count a refusal in
+ * [CTX] (the re-plan's own refills do not). */
+static int pocket_cuda_slot_fixed_claim(mynah_engine_state *state,
+                                        size_t bytes, int note) {
     if (state == NULL || !state->cuda_slot_fixed) return 0;
     size_t live = __atomic_load_n(&state->cuda_slot_fixed_live, __ATOMIC_RELAXED);
     do {
-        if (live >= state->cuda_slot_fixed_cap) {
-            pocket_cuda_slot_fixed_note(FIXST_OVER);
+        if (live >= __atomic_load_n(&state->cuda_slot_fixed_cap,
+                                    __ATOMIC_RELAXED)) {
+            if (note) pocket_cuda_slot_fixed_note(FIXST_OVER);
             return 0;
         }
     } while (!__atomic_compare_exchange_n(&state->cuda_slot_fixed_live, &live,
@@ -5371,10 +5513,11 @@ static int pocket_cuda_slot_fixed_claim(mynah_engine_state *state) {
     memset(&metrics, 0, sizeof(metrics));
     if (mynah_backend_metrics_get(state->backend, &metrics) == 0 &&
         metrics.device_memory_bytes != 0u &&
-        (size_t)metrics.device_memory_free_bytes <
-            state->cuda_slot_fixed_bytes + state->cuda_slot_fixed_floor) {
+        ((size_t)metrics.device_memory_free_bytes < bytes ||
+         (size_t)metrics.device_memory_free_bytes - bytes <
+             state->cuda_slot_fixed_floor)) {
         __atomic_sub_fetch(&state->cuda_slot_fixed_live, 1u, __ATOMIC_RELAXED);
-        pocket_cuda_slot_fixed_note(FIXST_OVER);
+        if (note) pocket_cuda_slot_fixed_note(FIXST_OVER);
         return 0;
     }
     return 1;
@@ -5386,15 +5529,407 @@ static void pocket_cuda_slot_fixed_gone(mynah_engine_state *state) {
         __atomic_sub_fetch(&state->cuda_slot_fixed_live, 1u, __ATOMIC_RELAXED);
 }
 
-/* Retirement: a fixed cache that grew past twice the fixed size is freed
- * instead of parked, so the pool does not keep long requests' caches. */
+/* An existing plain cache becomes a fixed one (it is parked aside instead
+ * of freed): counted, whatever the cap -- the memory is spent already. */
+static void pocket_cuda_slot_fixed_adopt(mynah_engine_state *state) {
+    __atomic_add_fetch(&state->cuda_slot_fixed_live, 1u, __ATOMIC_RELAXED);
+}
+
+/* Retirement: whether a fixed cache grew past twice the fixed size. Such a
+ * cache is parked aside as a growth spare when the spare list has room, and
+ * freed otherwise, so the pool does not keep long requests' caches. */
 static int pocket_cuda_slot_fixed_oversized(const mynah_engine_ctx *ctx) {
-    if (ctx == NULL || !ctx->cuda_backbone_kv_fixed || ctx->state == NULL ||
-        ctx->state->cuda_slot_fixed_bytes > SIZE_MAX / 2u ||
-        ctx->cuda_backbone_kv_bytes <= 2u * ctx->state->cuda_slot_fixed_bytes)
+    if (ctx == NULL || !ctx->cuda_backbone_kv_fixed || ctx->state == NULL)
         return 0;
-    pocket_cuda_slot_fixed_note(FIXST_TRIM);
-    return 1;
+    const size_t fixed = pocket_cuda_slot_fixed_size(ctx->state);
+    return fixed <= SIZE_MAX / 2u && ctx->cuda_backbone_kv_bytes > 2u * fixed;
+}
+
+/* Park a counted fixed cache without freeing it: into a parked set that has
+ * no backbone KV (its other backbone buffers wait there), else onto the
+ * spare list. 0 when placed; -1 when neither has room (the caller still
+ * owns the cache). Never a driver call: the next user of the cache is on
+ * the same stream, after every queued read of the previous owner. */
+static int pocket_cuda_fixed_stash(mynah_engine_state *state, float *kv,
+                                   size_t bytes, int bf16) {
+    pocket_cuda_spare *node = (pocket_cuda_spare *)malloc(sizeof(*node));
+    int placed = 0;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_slot *slot = state->cuda_slot_pool; slot != NULL;
+         slot = slot->next) {
+        if (slot->bb_kv == NULL) {
+            slot->bb_kv = kv;
+            slot->bb_kv_bytes = bytes;
+            slot->bb_kv_bf16 = bf16;
+            slot->bb_kv_vmm = 0;
+            slot->bb_kv_reserved = 0u;
+            slot->bb_kv_fixed = state;
+            placed = 1;
+            break;
+        }
+    }
+    if (!placed && node != NULL &&
+        state->cuda_slot_spare_count < state->cuda_slot_spare_max) {
+        node->kv = kv;
+        node->bytes = bytes;
+        node->bf16 = bf16;
+        node->next = state->cuda_slot_spare;
+        state->cuda_slot_spare = node;
+        state->cuda_slot_spare_count++;
+        node = NULL;
+        placed = 1;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    free(node);
+    if (placed) pocket_cuda_slot_fixed_note(FIXST_PARKED);
+    return placed ? 0 : -1;
+}
+
+/* Take the spare that holds `want` bytes most tightly, else the largest that
+ * holds `least`; NULL when there is none. The cache stays counted. */
+static float *pocket_cuda_fixed_spare_take(mynah_engine_state *state,
+                                           size_t least, size_t want, int bf16,
+                                           size_t *bytes) {
+    pocket_cuda_spare **best = NULL, **largest = NULL;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_spare **link = &state->cuda_slot_spare; *link != NULL;
+         link = &(*link)->next) {
+        const pocket_cuda_spare *spare = *link;
+        if (spare->bf16 != bf16 || spare->bytes < least) continue;
+        if (spare->bytes >= want &&
+            (best == NULL || spare->bytes < (*best)->bytes))
+            best = link;
+        if (largest == NULL || spare->bytes > (*largest)->bytes) largest = link;
+    }
+    pocket_cuda_spare **pick = best != NULL ? best : largest;
+    pocket_cuda_spare *node = NULL;
+    if (pick != NULL) {
+        node = *pick;
+        *pick = node->next;
+        state->cuda_slot_spare_count--;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    if (node == NULL) return NULL;
+    float *kv = node->kv;
+    *bytes = node->bytes;
+    free(node);
+    return kv;
+}
+
+/* Take the backbone KV of a parked set: the smallest fixed, plain cache of
+ * this element type with at least `least` bytes. The set stays parked
+ * without one (pocket_cuda_fixed_stash refills it); the cache stays
+ * counted. NULL when there is none. */
+static float *pocket_cuda_fixed_slot_kv_take(mynah_engine_state *state,
+                                             size_t least, int bf16,
+                                             size_t *bytes) {
+    pocket_cuda_slot *best = NULL;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_slot *slot = state->cuda_slot_pool; slot != NULL;
+         slot = slot->next) {
+        if (slot->bb_kv != NULL && slot->bb_kv_fixed != NULL &&
+            !slot->bb_kv_vmm && slot->bb_kv_bf16 == bf16 &&
+            slot->bb_kv_bytes >= least &&
+            (best == NULL || slot->bb_kv_bytes < best->bb_kv_bytes))
+            best = slot;
+    }
+    float *kv = NULL;
+    if (best != NULL) {
+        kv = best->bb_kv;
+        *bytes = best->bb_kv_bytes;
+        best->bb_kv = NULL;
+        best->bb_kv_bytes = 0u;
+        best->bb_kv_fixed = NULL;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    return kv;
+}
+
+/* Allocate one fixed cache of `bytes` under the cap and park it (a set
+ * without a cache first, else the spare list). 0 when made. Start-up only
+ * (the re-plan): an allocation, never a free, except of the cache just made
+ * when there is nowhere to park it. */
+static int pocket_cuda_fixed_make(mynah_engine_state *state, size_t bytes,
+                                  int bf16) {
+    if (!pocket_cuda_slot_fixed_claim(state, bytes, 0)) return -1;
+    void *kv = NULL;
+    char ignored[256];
+    ignored[0] = '\0';
+    if (mynah_backend_dev_alloc_bytes(state->backend, bytes, &kv, ignored,
+                                      sizeof(ignored)) != 0 || kv == NULL) {
+        pocket_cuda_slot_fixed_gone(state);
+        return -1;
+    }
+    if (pocket_cuda_fixed_stash(state, (float *)kv, bytes, bf16) != 0) {
+        mynah_backend_dev_free(state->backend, (float *)kv);
+        pocket_cuda_slot_fixed_gone(state);
+        return -1;
+    }
+    return 0;
+}
+
+/* The start-up re-plan, at the first admission after each
+ * mynah_tts_startup_mark (a server calls it after the width-bucket graph
+ * walk and after the slot-pool prefill; nothing else does, so a CLI run
+ * keeps the load-time plan). One drain (the device is idle at those points),
+ * then:
+ *   1. every parked plain cache within [F, F + one growth chunk] is adopted
+ *      as fixed; every other parked cache (the walk's, sized for its long
+ *      text, or a too-small one) is freed;
+ *   2. free memory is measured and the cap re-planned from it
+ *      (mynah_backend_fixed_buffers_refit);
+ *   3. parked sets without a cache get one of F, then the spare reserve is
+ *      made (F + one growth chunk), both while the cap allows.
+ * One log line per mark. */
+static void pocket_cuda_slot_fixed_replan(mynah_engine_state *state) {
+    int serving = 0;
+    const unsigned mark = mynah_tts_startup_generation(&serving);
+    unsigned seen = __atomic_load_n(&state->cuda_slot_fixed_mark, __ATOMIC_RELAXED);
+    if (mark == seen ||
+        !__atomic_compare_exchange_n(&state->cuda_slot_fixed_mark, &seen, mark,
+                                     0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    /* Lengths are counted from the serving mark on (the start-up's own
+     * requests are synthetic). */
+    __atomic_store_n(&state->cuda_slot_fixed_serving, serving, __ATOMIC_RELAXED);
+    const mynah_backend *backend = state->backend;
+    const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
+    const size_t fixed = pocket_cuda_slot_fixed_size(state);
+    const size_t band = pocket_cuda_slot_fixed_band(state);
+    pocket_cuda_drain_before_release(backend);
+    size_t sets = 0u, kept = 0u, freed = 0u, holes = 0u;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_slot *slot = state->cuda_slot_pool; slot != NULL;
+         slot = slot->next) {
+        ++sets;
+        if (slot->bb_kv != NULL && !slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16) {
+            if (slot->bb_kv_bytes >= fixed && slot->bb_kv_bytes <= band) {
+                if (slot->bb_kv_fixed == NULL) {
+                    slot->bb_kv_fixed = state;
+                    pocket_cuda_slot_fixed_adopt(state);
+                }
+                ++kept;
+            } else {
+                if (slot->bb_kv_fixed != NULL) pocket_cuda_slot_fixed_gone(state);
+                mynah_backend_dev_free(backend, slot->bb_kv);
+                slot->bb_kv = NULL;
+                slot->bb_kv_bytes = 0u;
+                slot->bb_kv_fixed = NULL;
+                ++freed;
+            }
+        }
+        if (slot->bb_kv == NULL) ++holes;
+    }
+    const size_t spares_have = state->cuda_slot_spare_count;
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    mynah_tts_backend_metrics metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    if (mynah_backend_metrics_get(backend, &metrics) != 0 ||
+        metrics.device_memory_bytes == 0u)
+        return; /* keep the load-time cap */
+    const size_t total = (size_t)metrics.device_memory_bytes;
+    const size_t free_now = (size_t)metrics.device_memory_free_bytes;
+    const size_t reserve = state->cuda_slot_spare_reserve;
+    const size_t to_make = reserve > spares_have ? reserve - spares_have : 0u;
+    const size_t extra = band - fixed > SIZE_MAX / (to_make + 1u)
+                             ? SIZE_MAX
+                             : to_make * (band - fixed);
+    size_t margin = 0u, cap = 0u;
+    (void)mynah_backend_fixed_buffers_refit(
+        free_now, total, state->cuda_slot_fixed_rows, reserve, sets,
+        __atomic_load_n(&state->cuda_slot_fixed_live, __ATOMIC_RELAXED), fixed,
+        POCKET_CUDA_SLOT_FIXED_OTHER_BYTES, extra, &margin, &cap);
+    __atomic_store_n(&state->cuda_slot_fixed_cap, cap, __ATOMIC_RELAXED);
+    size_t made = 0u, spares_made = 0u;
+    for (size_t i = 0; i < holes; ++i) {
+        if (pocket_cuda_fixed_make(state, fixed, kv_bf16) != 0) break;
+        ++made;
+    }
+    for (size_t i = 0; i < to_make; ++i) {
+        if (pocket_cuda_fixed_make(state, band, kv_bf16) != 0) break;
+        ++spares_made;
+    }
+    const double mib = 1024.0 * 1024.0, gib = mib * 1024.0;
+    fprintf(stderr,
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED=1 re-planned after the start-up "
+            "%s (mark %u): %.2f GiB free of %.2f GiB, margin %.2f GiB "
+            "(max(2 GiB, total / 16) + sets still to make + spare reserve); "
+            "cap %zu fixed caches of >= %zu positions (%.2f MiB) = %zu rows + "
+            "%zu spares at most; %zu parked sets: kept %zu caches, freed %zu, "
+            "made %zu, spares made %zu of %zu (%zu positions); %zu live\n",
+            serving ? "(serving next)" : "warm-ups", mark,
+            (double)free_now / gib, (double)total / gib, (double)margin / gib,
+            cap, fixed / state->cuda_slot_fixed_position_bytes,
+            (double)fixed / mib, state->cuda_slot_fixed_rows, reserve, sets, kept,
+            freed, made, spares_made, to_make,
+            band / state->cuda_slot_fixed_position_bytes,
+            __atomic_load_n(&state->cuda_slot_fixed_live, __ATOMIC_RELAXED));
+}
+
+/* Once serving, after POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER retirements: F
+ * moves, once, to the 95th percentile of the stored positions requests
+ * really reached, within [320, 768] (unless MYNAH_CUDA_SLOT_FIXED_POSITIONS
+ * set it). Only caches made from then on use it. */
+static void pocket_cuda_slot_fixed_adapt(mynah_engine_state *state) {
+    if (state->cuda_slot_fixed_size_set || state->cuda_slot_fixed_adapted ||
+        __atomic_load_n(&g_fixlen_n[1], __ATOMIC_RELAXED) <
+            POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER)
+        return;
+    state->cuda_slot_fixed_adapted = 1;
+    size_t positions = pocket_cuda_fixlen_percentile(1, 95u);
+    if (positions < POCKET_CUDA_SLOT_FIXED_ADAPT_LOW)
+        positions = POCKET_CUDA_SLOT_FIXED_ADAPT_LOW;
+    if (positions > POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH)
+        positions = POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH;
+    const size_t old = state->cuda_slot_fixed_positions;
+    fprintf(stderr,
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED=1: %lu served requests reached "
+            "p50/p95/p99 %zu/%zu/%zu stored positions (admission estimate p95 "
+            "%zu); new fixed caches: %zu -> %zu positions\n",
+            __atomic_load_n(&g_fixlen_n[1], __ATOMIC_RELAXED),
+            pocket_cuda_fixlen_percentile(1, 50u),
+            pocket_cuda_fixlen_percentile(1, 95u),
+            pocket_cuda_fixlen_percentile(1, 99u),
+            pocket_cuda_fixlen_percentile(0, 95u), old, positions);
+    if (positions == old) return;
+    state->cuda_slot_fixed_positions = positions;
+    __atomic_store_n(&state->cuda_slot_fixed_bytes,
+                     positions * state->cuda_slot_fixed_position_bytes,
+                     __ATOMIC_RELAXED);
+}
+
+/* See engine_pocket.h. The host-side bookkeeping of the fixed caches on a
+ * model-less state: no device call is made, the "caches" are host tokens. */
+int mynah_engine_pocket_slot_fixed_self_test(char *error, size_t capacity) {
+    mynah_engine_state *state = (mynah_engine_state *)calloc(1, sizeof(*state));
+    pocket_cuda_slot *a = (pocket_cuda_slot *)calloc(1, sizeof(*a));
+    pocket_cuda_slot *b = (pocket_cuda_slot *)calloc(1, sizeof(*b));
+    static float token[8];
+    const char *failed = NULL;
+    if (state == NULL || a == NULL || b == NULL ||
+        pthread_mutex_init(&state->cuda_slot_pool_mutex, NULL) != 0) {
+        free(state);
+        free(a);
+        free(b);
+        pocket_error(error, capacity, "slot-fixed self-test: out of memory");
+        return -1;
+    }
+    state->cuda_slot_fixed = 1;
+    state->cuda_slot_fixed_position_bytes = 1000u;
+    state->cuda_slot_fixed_positions = 384u;
+    state->cuda_slot_fixed_bytes = 384000u;
+    state->cuda_slot_fixed_cap = 8u;
+    state->cuda_slot_spare_max = 2u;
+    /* Pool: a (parked without a cache, its other buffers there), then b
+     * (a fixed cache of 500 positions). */
+    a->bb_x = &token[0];
+    b->bb_kv = &token[1];
+    b->bb_kv_bytes = 500000u;
+    b->bb_kv_fixed = state;
+    a->next = b;
+    state->cuda_slot_pool = a;
+    state->cuda_slot_pool_count = 2u;
+    size_t got = 0u;
+    if (pocket_cuda_slot_fixed_band(state) != 640000u)
+        failed = "the spare size is not one growth chunk above F";
+    /* A park fills the set without a cache first, then the spare list up to
+     * its room, then refuses (the caller keeps the cache). */
+    else if (pocket_cuda_fixed_stash(state, &token[2], 384000u, 0) != 0 ||
+             a->bb_kv != &token[2] || a->bb_kv_fixed != state ||
+             state->cuda_slot_spare_count != 0u)
+        failed = "a parked cache did not go to the set without one";
+    else if (pocket_cuda_fixed_stash(state, &token[3], 640000u, 0) != 0 ||
+             pocket_cuda_fixed_stash(state, &token[4], 384000u, 0) != 0 ||
+             state->cuda_slot_spare_count != 2u ||
+             pocket_cuda_fixed_stash(state, &token[5], 384000u, 0) != -1)
+        failed = "the spare list did not hold exactly its room";
+    /* Spares: the tightest at or above `want`, else the largest above
+     * `least`, else none; wrong element type never. */
+    else if (pocket_cuda_fixed_spare_take(state, 300000u, 400000u, 1, &got) != NULL)
+        failed = "a spare of the other element type was taken";
+    else if (pocket_cuda_fixed_spare_take(state, 300000u, 400000u, 0, &got) !=
+                 &token[3] || got != 640000u)
+        failed = "the tightest spare holding the estimate was not taken";
+    else if (pocket_cuda_fixed_spare_take(state, 300000u, 900000u, 0, &got) !=
+                 &token[4] || got != 384000u)
+        failed = "the largest spare holding the prefill was not taken";
+    else if (pocket_cuda_fixed_spare_take(state, 1u, 1u, 0, &got) != NULL ||
+             state->cuda_slot_spare_count != 0u)
+        failed = "an empty spare list gave a cache";
+    /* A growth takes the smallest parked fixed cache that holds the new
+     * size; the set stays parked without one. */
+    else if (pocket_cuda_fixed_slot_kv_take(state, 450000u, 0, &got) !=
+                 &token[1] || got != 500000u || b->bb_kv != NULL ||
+             b->bb_kv_fixed != NULL || state->cuda_slot_pool_count != 2u)
+        failed = "a growth did not take the parked cache that holds it";
+    else if (pocket_cuda_fixed_slot_kv_take(state, 450000u, 0, &got) != NULL)
+        failed = "a growth took a parked cache too small for it";
+    else if (pocket_cuda_fixed_stash(state, &token[1], 500000u, 0) != 0 ||
+             b->bb_kv != &token[1])
+        failed = "the set emptied by a growth did not get the old cache back";
+    else {
+        /* Count: claims stop at the cap, adoption does not, frees undo. */
+        state->cuda_slot_fixed_live = 7u;
+        pocket_cuda_slot_fixed_adopt(state);
+        pocket_cuda_slot_fixed_adopt(state);
+        if (state->cuda_slot_fixed_live != 9u ||
+            pocket_cuda_slot_fixed_claim(state, 384000u, 0) != 0 ||
+            state->cuda_slot_fixed_live != 9u)
+            failed = "the fixed-cache count is wrong";
+        pocket_cuda_slot_fixed_gone(state);
+        if (failed == NULL && state->cuda_slot_fixed_live != 8u)
+            failed = "a freed fixed cache was not uncounted";
+    }
+    if (failed == NULL) {
+        /* Oversized: a fixed cache past 2 F only. */
+        mynah_engine_ctx *ctx = (mynah_engine_ctx *)calloc(1, sizeof(*ctx));
+        if (ctx == NULL) {
+            failed = "out of memory";
+        } else {
+            ctx->state = state;
+            ctx->cuda_backbone_kv_fixed = 1;
+            ctx->cuda_backbone_kv_bytes = 768000u;
+            const int at_two = pocket_cuda_slot_fixed_oversized(ctx);
+            ctx->cuda_backbone_kv_bytes = 768001u;
+            const int past_two = pocket_cuda_slot_fixed_oversized(ctx);
+            ctx->cuda_backbone_kv_fixed = 0;
+            const int plain = pocket_cuda_slot_fixed_oversized(ctx);
+            if (at_two || !past_two || plain)
+                failed = "the oversized rule is not 'fixed and past 2 F'";
+            free(ctx);
+        }
+    }
+    if (failed == NULL) {
+        /* Percentiles: upper bucket edges, the last bucket open. */
+        unsigned long buckets[POCKET_FIXLEN_BUCKETS];
+        memset(buckets, 0, sizeof(buckets));
+        buckets[3] = 50u;  /* 192..255 */
+        buckets[5] = 45u;  /* 320..383 */
+        buckets[6] = 4u;   /* 384..447 */
+        buckets[POCKET_FIXLEN_BUCKETS - 1u] = 1u;
+        if (pocket_fixlen_percentile_of(buckets, 0u, 95u) != 0u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 50u) != 256u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 95u) != 384u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 99u) != 448u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 100u) !=
+                POCKET_FIXLEN_BUCKETS * 64u)
+            failed = "the length percentiles are wrong";
+    }
+    /* The pool and spares hold host tokens only: unlink, never free them. */
+    while (state->cuda_slot_spare != NULL) {
+        pocket_cuda_spare *next = state->cuda_slot_spare->next;
+        free(state->cuda_slot_spare);
+        state->cuda_slot_spare = next;
+    }
+    pthread_mutex_destroy(&state->cuda_slot_pool_mutex);
+    free(a);
+    free(b);
+    free(state);
+    if (failed != NULL) {
+        pocket_error(error, capacity, "slot-fixed self-test: %s", failed);
+        return -1;
+    }
+    return 0;
 }
 
 /* MYNAH_CUDA_DEFERRED_RELEASE (default on; =0 is the rollback; needs the slot
@@ -5560,6 +6095,12 @@ static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
                                                   int bb_kv_bf16, int bounded,
                                                   int vmm, size_t vmm_reserve) {
     if (!pocket_cuda_slot_pool_enabled(state)) return NULL;
+    if (state->cuda_slot_fixed) {
+        /* A start-up mark since the last admission: re-plan the cap; once
+         * serving, move F to the served lengths (both at most once each). */
+        pocket_cuda_slot_fixed_replan(state);
+        pocket_cuda_slot_fixed_adapt(state);
+    }
     const int fixed = state->cuda_slot_fixed && bounded && !vmm;
     pthread_mutex_lock(&state->cuda_slot_pool_mutex);
     pocket_cuda_slot **best = NULL;
@@ -5661,11 +6202,39 @@ static void pocket_cuda_slot_park(mynah_engine_ctx *ctx, int deferred) {
         slot = (pocket_cuda_slot *)calloc(1, sizeof(*slot));
         if (slot == NULL) return; /* the ordinary release frees everything */
     }
-    if (ctx->cuda_backbone_kv != NULL && ctx->cuda_x != NULL &&
+    /* MYNAH_CUDA_SLOT_FIXED: count how far the request really got, and a
+     * fixed cache that grew past twice the fixed size is parked aside (a
+     * growth spare) when there is room; otherwise it stays on the context
+     * and is freed below, as before. Off: none of this runs. */
+    int kv_aside = 0, kv_oversized = 0;
+    if (state->cuda_slot_fixed && ctx->cuda_backbone_kv != NULL &&
+        !ctx->cuda_backbone_kv_vmm) {
+        if (ctx->backbone != NULL) {
+            const size_t reached = mynah_transformer_ar_state_offset(ctx->backbone);
+            pocket_cuda_fixlen_note(state, 1,
+                                    reached > ctx->cuda_backbone_kv_skip
+                                        ? reached - ctx->cuda_backbone_kv_skip
+                                        : 0u);
+        }
+        if (pocket_cuda_slot_fixed_oversized(ctx)) {
+            if (pocket_cuda_fixed_stash(state, ctx->cuda_backbone_kv,
+                                        ctx->cuda_backbone_kv_bytes,
+                                        ctx->cuda_backbone_kv_bf16) == 0) {
+                ctx->cuda_backbone_kv = NULL;
+                ctx->cuda_backbone_kv_bytes = 0u;
+                ctx->cuda_backbone_kv_fixed = 0;
+                kv_aside = 1;
+            } else {
+                kv_oversized = 1;
+                pocket_cuda_slot_fixed_note(FIXST_TRIM);
+            }
+        }
+    }
+    if ((ctx->cuda_backbone_kv != NULL || kv_aside) && ctx->cuda_x != NULL &&
         ctx->cuda_norm != NULL && ctx->cuda_qkv != NULL &&
         ctx->cuda_attn != NULL && ctx->cuda_proj != NULL &&
-        ctx->cuda_ffn != NULL && ctx->cuda_backbone_kv_bytes != 0u &&
-        !pocket_cuda_slot_fixed_oversized(ctx)) {
+        ctx->cuda_ffn != NULL &&
+        (ctx->cuda_backbone_kv_bytes != 0u || kv_aside) && !kv_oversized) {
         pocket_cuda_slot_free_backbone(backend, slot);
         POCKET_SLOT_MOVE(slot->bb_kv, ctx->cuda_backbone_kv);
         slot->bb_kv_bytes = ctx->cuda_backbone_kv_bytes;
@@ -5782,8 +6351,19 @@ static void pocket_cuda_slot_pool_drain(mynah_engine_state *state) {
     pocket_cuda_slot *slot = state->cuda_slot_pool;
     state->cuda_slot_pool = NULL;
     state->cuda_slot_pool_count = 0u;
+    pocket_cuda_spare *spare = state->cuda_slot_spare;
+    state->cuda_slot_spare = NULL;
+    state->cuda_slot_spare_count = 0u;
     pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
-    if (slot != NULL) pocket_cuda_drain_before_release(state->backend);
+    if (slot != NULL || spare != NULL)
+        pocket_cuda_drain_before_release(state->backend);
+    while (spare != NULL) { /* MYNAH_CUDA_SLOT_FIXED spares */
+        pocket_cuda_spare *next = spare->next;
+        mynah_backend_dev_free(state->backend, spare->kv);
+        pocket_cuda_slot_fixed_gone(state);
+        free(spare);
+        spare = next;
+    }
     while (slot != NULL) {
         pocket_cuda_slot *next = slot->next;
         pocket_cuda_slot_destroy(state->backend, slot);
@@ -7198,6 +7778,10 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
         return 0;
     }
 
+    /* MYNAH_CUDA_SLOT_FIXED: the starting estimate, for the [CTX] line. */
+    if (ctx->state->cuda_slot_fixed && kv_growable)
+        pocket_cuda_fixlen_note(ctx->state, 0, kv_capacity - kv_skip);
+
     char ignored[256];
     /* MYNAH_CUDA_KV_VMM: a growable (tile-path) cache becomes a VMM range,
      * position-major, reserving `vmm_reserve` virtual bytes. Its byte size
@@ -7266,8 +7850,8 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
          * whatever the starting estimate; the row grows later only if it
          * really passes the end. Never set with the flag off. */
         int fixed_fit = 0;
-        if (slot->bb_kv_fixed != NULL && kv_growable && !slot->bb_kv_vmm &&
-            slot->bb_kv_bf16 == kv_bf16) {
+        if ((slot->bb_kv_fixed != NULL || ctx->state->cuda_slot_fixed) &&
+            kv_growable && !slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16) {
             size_t floor_positions = 0u;
             if (pocket_add(ctx->voice_positions, ctx->text_capacity,
                            &floor_positions) == 0 &&
@@ -7304,6 +7888,20 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
             }
             if (ctx->cuda_backbone_kv_fixed)
                 pocket_cuda_slot_fixed_note(FIXST_REUSED);
+        } else if (ctx->state->cuda_slot_fixed && kv_growable &&
+                   !slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16) {
+            /* MYNAH_CUDA_SLOT_FIXED: a cache too small even for this
+             * request's prefill is parked aside for another request, not
+             * freed (no free on the admission path). Only when there is no
+             * room for it is it freed, as before. */
+            if (slot->bb_kv_fixed == NULL)
+                pocket_cuda_slot_fixed_adopt(ctx->state);
+            if (pocket_cuda_fixed_stash(ctx->state, slot->bb_kv,
+                                        slot->bb_kv_bytes, kv_bf16) != 0) {
+                pocket_cuda_slot_fixed_gone(ctx->state);
+                pocket_cuda_slot_fixed_note(FIXST_MISFIT);
+                pocket_cuda_kv_free(backend, slot->bb_kv, 0);
+            }
         } else {
             if (slot->bb_kv_fixed != NULL) {
                 pocket_cuda_slot_fixed_gone(slot->bb_kv_fixed);
@@ -7316,6 +7914,17 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
         slot->bb_kv_bytes = 0u;
         slot->bb_kv_vmm = 0;
         slot->bb_kv_reserved = 0u;
+        POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
+        POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
+        POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
+        POCKET_SLOT_MOVE(ctx->cuda_attn, slot->bb_attn);
+        POCKET_SLOT_MOVE(ctx->cuda_proj, slot->bb_proj);
+        POCKET_SLOT_MOVE(ctx->cuda_ffn, slot->bb_ffn);
+    } else if (slot != NULL && slot->bb_x != NULL) {
+        /* MYNAH_CUDA_SLOT_FIXED only: a parked set whose cache went to a
+         * growing row (pocket_cuda_fixed_slot_kv_take) or aside at
+         * retirement still brings its other backbone buffers. Without the
+         * flag a set never holds them without a cache. */
         POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
         POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
         POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
@@ -7362,11 +7971,45 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
         }
     }
     if (ctx->cuda_backbone_kv == NULL && kv_growable && !kv_vmm &&
-        ctx->state->cuda_slot_fixed && pocket_cuda_slot_fixed_claim(ctx->state)) {
+        ctx->state->cuda_slot_fixed) {
+        /* MYNAH_CUDA_SLOT_FIXED: no parked set brought a cache; a spare
+         * does, with no driver call: the tightest at or above the starting
+         * estimate, else the largest that holds the prefill and the first
+         * step (the row then starts at what it holds and grows later). */
+        size_t least = 0u, spare_bytes = 0u;
+        if (pocket_add(ctx->voice_positions, ctx->text_capacity, &least) == 0 &&
+            least < SIZE_MAX && least + 1u > kv_skip &&
+            pocket_mul(least + 1u - kv_skip, position_bytes, &least) == 0) {
+            float *spare = pocket_cuda_fixed_spare_take(ctx->state, least,
+                                                        kv_bytes, kv_bf16,
+                                                        &spare_bytes);
+            if (spare != NULL) {
+                ctx->cuda_backbone_kv = spare;
+                ctx->cuda_backbone_kv_bytes = spare_bytes;
+                ctx->cuda_backbone_kv_fixed = 1;
+                reused_kv = 1;
+                pocket_cuda_slot_fixed_note(FIXST_SPARE_TAKE);
+                size_t fits = spare_bytes / position_bytes;
+                if (fits > bc->max_seq_len - kv_skip) fits = bc->max_seq_len - kv_skip;
+                fits += kv_skip;
+                if (fits < kv_capacity) pocket_cuda_slot_fixed_note(FIXST_SHORT);
+                kv_capacity = fits;
+                kv_floats = cfg->layers * 2u * (kv_capacity - kv_skip) * kv_record;
+            }
+        }
+    }
+    if (ctx->cuda_backbone_kv == NULL && kv_growable && !kv_vmm &&
+        ctx->state->cuda_slot_fixed &&
+        pocket_cuda_slot_fixed_claim(
+            ctx->state,
+            pocket_cuda_slot_fixed_size(ctx->state) > kv_bytes
+                ? pocket_cuda_slot_fixed_size(ctx->state)
+                : kv_bytes,
+            1)) {
         /* MYNAH_CUDA_SLOT_FIXED: a new cache of at least the fixed size, laid
          * out over all of it, that goes back to the pool whole. On failure
          * the plain allocation below runs, as with the flag off. */
-        size_t fixed_bytes = ctx->state->cuda_slot_fixed_bytes;
+        size_t fixed_bytes = pocket_cuda_slot_fixed_size(ctx->state);
         if (fixed_bytes < kv_bytes) fixed_bytes = kv_bytes;
         if (mynah_backend_dev_alloc_bytes(ctx->state->backend, fixed_bytes,
                                           (void **)&ctx->cuda_backbone_kv,
@@ -7445,6 +8088,123 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
                     "voice prefix (MYNAH_CUDA_SHARED_VOICE=1)\n", kv_skip);
         }
     }
+    return 0;
+}
+
+/* MYNAH_CUDA_SLOT_FIXED growth, with no device-wide synchronisation: the
+ * new cache (at least `new_bytes`) is a spare, else the cache of a parked
+ * set (pocket_cuda_fixed_slot_kv_take), else a new allocation within the
+ * cap -- never a free. The live prefix of every layer's K and V planes is
+ * copied on the stream, the row is laid out over all of the new cache, and
+ * the old cache is parked (a set without one, else the spare list); the
+ * next user of either is on the same stream, after this row's queued work,
+ * and the host never touches a KV cache, so nothing waits. A failed copy
+ * surfaces here when its launch fails, and otherwise at the step's own
+ * sync, like any kernel of the step. Returns 0 when grown, -1 on a failed
+ * copy (the context keeps its cache), and 1 when nothing was available:
+ * the caller then runs the allocate + sync + free path. */
+static int pocket_cuda_fixed_grow(mynah_engine_ctx *ctx, size_t old_capacity,
+                                  size_t new_bytes, size_t valid_bytes,
+                                  char *error, size_t capacity) {
+    mynah_engine_state *state = ctx->state;
+    const mynah_backend *backend = state->backend;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    const int bf16 = ctx->cuda_backbone_kv_bf16;
+    const size_t element = pocket_cuda_kv_elem(state, bf16);
+    const size_t record = pocket_cuda_kv_record(state, bf16);
+    const size_t skip = ctx->cuda_backbone_kv_skip;
+    size_t position_bytes = 0u;
+    if (bc == NULL || ctx->cuda_backbone_kv_vmm ||
+        pocket_mul(record * element, 2u * cfg->layers, &position_bytes) != 0 ||
+        position_bytes == 0u)
+        return 1;
+    size_t got = 0u;
+    int source = FIXST_GROW_SPARE;
+    float *kv = pocket_cuda_fixed_spare_take(state, new_bytes, new_bytes, bf16,
+                                             &got);
+    if (kv == NULL) {
+        source = FIXST_GROW_SLOT;
+        kv = pocket_cuda_fixed_slot_kv_take(state, new_bytes, bf16, &got);
+    }
+    if (kv == NULL) {
+        source = FIXST_GROW_ALLOC;
+        if (!pocket_cuda_slot_fixed_claim(state, new_bytes, 0)) {
+            pocket_cuda_slot_fixed_note(FIXST_GROW_SYNC);
+            return 1;
+        }
+        void *fresh = NULL;
+        char ignored[256];
+        ignored[0] = '\0';
+        if (mynah_backend_dev_alloc_bytes(backend, new_bytes, &fresh, ignored,
+                                          sizeof(ignored)) != 0 ||
+            fresh == NULL) {
+            pocket_cuda_slot_fixed_gone(state);
+            pocket_cuda_slot_fixed_note(FIXST_GROW_SYNC);
+            return 1;
+        }
+        kv = (float *)fresh;
+        got = new_bytes;
+    }
+    /* Lay the row out over all of the new cache (>= new_bytes). */
+    size_t stored = got / position_bytes;
+    if (stored > bc->max_seq_len - skip) stored = bc->max_seq_len - skip;
+    const size_t new_capacity = stored + skip;
+    const size_t old_half = (old_capacity - skip) * record;
+    const size_t new_half = stored * record;
+    const unsigned char *src = (const unsigned char *)ctx->cuda_backbone_kv;
+    unsigned char *dst = (unsigned char *)kv;
+    char local[256];
+    local[0] = '\0';
+    int failed = 0;
+    for (size_t l = 0; l < cfg->layers && valid_bytes > 0u && !failed; ++l) {
+        const size_t from_k = l * 2u * old_half * element;
+        const size_t to_k = l * 2u * new_half * element;
+        failed = mynah_backend_copy_dev_bytes(backend, dst + to_k, src + from_k,
+                                              valid_bytes, local,
+                                              sizeof(local)) != 0 ||
+                 mynah_backend_copy_dev_bytes(
+                     backend, dst + to_k + new_half * element,
+                     src + from_k + old_half * element, valid_bytes, local,
+                     sizeof(local)) != 0;
+    }
+    if (failed) {
+        if (pocket_cuda_fixed_stash(state, kv, got, bf16) != 0) {
+            pocket_cuda_drain_before_release(backend);
+            mynah_backend_dev_free(backend, kv);
+            pocket_cuda_slot_fixed_gone(state);
+        }
+        pocket_error(error, capacity, "pocket: CUDA backbone KV growth copy: %s",
+                     local[0] != '\0' ? local : "failed");
+        return -1;
+    }
+    float *old = ctx->cuda_backbone_kv;
+    const size_t old_bytes = ctx->cuda_backbone_kv_bytes;
+    if (!ctx->cuda_backbone_kv_fixed) pocket_cuda_slot_fixed_adopt(state);
+    ctx->cuda_backbone_kv = kv;
+    ctx->cuda_backbone_kv_bytes = got;
+    ctx->cuda_backbone_kv_fixed = 1;
+    ctx->cuda_backbone_capacity = new_capacity;
+    ctx->cuda_backbone_kv_floats = new_half * 2u * cfg->layers;
+    pocket_cuda_slot_fixed_note(source);
+    if (pocket_cuda_fixed_stash(state, old, old_bytes, bf16) != 0) {
+        /* Neither a set nor the spare list has room: the old way. Rare by
+         * construction (the spare list holds 1 in 8 rows). */
+        pocket_cuda_drain_before_release(backend);
+        mynah_backend_dev_free(backend, old);
+        pocket_cuda_slot_fixed_gone(state);
+        pocket_cuda_slot_fixed_note(FIXST_GROW_SYNC);
+    }
+    if (pocket_cuda_kv_grow_logged())
+        fprintf(stderr,
+                "pocket: CUDA backbone KV grew %zu -> %zu positions with no "
+                "sync (%s, %zu-position prefix not stored, %zu bytes)\n",
+                old_capacity, new_capacity,
+                source == FIXST_GROW_SPARE ? "spare"
+                : source == FIXST_GROW_SLOT ? "parked set's cache"
+                                            : "new allocation",
+                skip, got);
     return 0;
 }
 
@@ -7563,6 +8323,14 @@ static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
     if (valid > old_capacity) valid = old_capacity;
     valid = valid > skip ? valid - skip : 0u;
     valid_bytes = valid * record * element;
+
+    /* MYNAH_CUDA_SLOT_FIXED: grow without a device-wide sync when a spare, a
+     * parked set's cache or the cap allows; otherwise the path below. */
+    if (ctx->state->cuda_slot_fixed) {
+        const int grown = pocket_cuda_fixed_grow(ctx, old_capacity, new_bytes,
+                                                 valid_bytes, error, capacity);
+        if (grown <= 0) return grown;
+    }
 
     char local[256];
     local[0] = '\0';
@@ -10149,6 +10917,23 @@ static void ctxp_count(void) {
                 __atomic_load_n(&g_fixst[FIXST_OVER], __ATOMIC_RELAXED),
                 __atomic_load_n(&g_fixst[FIXST_MISFIT], __ATOMIC_RELAXED),
                 __atomic_load_n(&g_fixst[FIXST_TRIM], __ATOMIC_RELAXED));
+    if (g_ctxp_fixed_state != NULL)
+        fprintf(stderr,
+                " parked %lu spares %zu (taken %lu) grow: spare %lu set %lu "
+                "alloc %lu sync %lu | len stored p50/p95 %zu/%zu (estimate p95 "
+                "%zu, n %lu) F %zu",
+                __atomic_load_n(&g_fixst[FIXST_PARKED], __ATOMIC_RELAXED),
+                g_ctxp_fixed_state->cuda_slot_spare_count,
+                __atomic_load_n(&g_fixst[FIXST_SPARE_TAKE], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_SPARE], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_SLOT], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_ALLOC], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_SYNC], __ATOMIC_RELAXED),
+                pocket_cuda_fixlen_percentile(1, 50u),
+                pocket_cuda_fixlen_percentile(1, 95u),
+                pocket_cuda_fixlen_percentile(0, 95u),
+                __atomic_load_n(&g_fixlen_n[1], __ATOMIC_RELAXED),
+                g_ctxp_fixed_state->cuda_slot_fixed_positions);
     fputc('\n', stderr);
     pthread_mutex_unlock(&g_ctxp_mu);
 }

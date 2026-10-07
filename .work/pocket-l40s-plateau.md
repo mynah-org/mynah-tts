@@ -439,6 +439,15 @@ fix compiles.
   - compute the cap after the graph warm-up;
   - grow without a device-wide sync (stream-ordered alloc, or keep a small reserve of spare caches);
   - then an A/B on an L40S at 1024 rows (VRAM is tighter there) and on an L4.
+- **Sizing v2 coded (same day, untested on GPU)**, design and VRAM table in `pocket-l40s-1024-host-profile.md` § A1b:
+  - the 833 cap came from the walk itself: its long requests each made a fixed cache of up to ~650 positions, and
+    those stayed in the pool as fixed caches;
+  - the server now marks its start-up and the engine re-plans after the walk and after the prefill: frees the walk's
+    caches, caps at min(rows + rows/32, (free - max(2 GiB, total/16)) / F), fills the sets and a growth reserve;
+  - F = 384 (19.1 MiB), then once to the served p95;
+  - growth takes a spare, a parked set's larger cache or a new allocation within the cap, with no sync and no free;
+  - expected caps: 1056 on the Ada and the L40S at 1024 rows (~14 / ~11 GiB left), 396 on the L4 at 384 rows;
+  - job `a1b.sh` now runs C768/C896/C1024.
 
 **Ping-pong (`8699af7`).**
 - Identity is good: CLI 32/32, split 32/32, `--stream` split, server C1 166/166. Stale errors are now cleared and

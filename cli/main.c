@@ -653,6 +653,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "CPU backend self-test failed: %s\n", error);
             return 1;
         }
+        if (mynah_engine_pocket_slot_fixed_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "%s\n", error);
+            return 1;
+        }
         /* This one had no caller anywhere in the tree. `census-test` claims to
          * exercise it (Makefile) but runs `--dispatch-map`, which only calls
          * mynah_dispatch_report(): the census self-test, the id-collision check

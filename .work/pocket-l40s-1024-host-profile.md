@@ -478,8 +478,9 @@ positions) most takes miss and do `cudaFree` (which waits for the whole device, 
 `cudaMalloc`. The driver decides how expensive that is, which is why the same code costs 1 ms on one host and 12 on
 another.
 
-**Flag.** `MYNAH_CUDA_SLOT_FIXED` = unset/`0` off, `1` on. `MYNAH_CUDA_SLOT_FIXED_POSITIONS` (default 512, 64..65536,
-rounded up to 64) is the fixed size in stored positions; `MYNAH_CUDA_SLOT_FIXED_ROWS` (default the build's `ROW_CAP`)
+**Flag.** `MYNAH_CUDA_SLOT_FIXED` = unset/`0` off, `1` on. `MYNAH_CUDA_SLOT_FIXED_POSITIONS` (default 384 since sizing
+v2, was 512; 64..65536, rounded up to 64; setting it also stops the one-time adaptation) is the fixed size in stored
+positions; `MYNAH_CUDA_SLOT_FIXED_ROWS` (default the build's `ROW_CAP`)
 the rows the start-up plan sizes for. Read once at model load (`pocket_cuda_slot_fixed_resolve`, one start-up line),
 after the KV element type is decided. Needs the slot pool, `MYNAH_CUDA_KV_GROW` and `MYNAH_CUDA_PREFILL_TILE` (all
 default); otherwise a warning and today's pool.
@@ -528,7 +529,77 @@ oversize test returns 0 for an unmarked cache; the count updates only run for ma
 differences are a thread-local load in the backend's allocation/free/zero/fence entry points (the meter below) and
 two struct fields.
 
-**VRAM cost.** Per row: `positions x layers x 2 x record x element` = 512 x 24 x 2 x 1088 B = **25.5 MiB** (int8 records,
+**Sizing v2 (2026-10-07, after the RTX 6000 Ada run; coded, untested on GPU).** The first version ran out of VRAM at
+C896 (833 fixed caches live, 467 over-cap takes). Cause: the cap was planned at model load, before the server's
+width-bucket walk. The walk runs `--max-inflight` requests of a long text at once, so every one of them got a fixed
+cache of max(estimate, F) = up to ~650 stored positions (~32 MiB), and those stayed in the pool as fixed caches. Most of
+the "~40-45 GB of graph warm-up at 1024 rows" is that per-row KV plus the other per-row buffers; the graphs themselves are
+small. Changes:
+- **Cap after the warm-ups.** New public `mynah_tts_startup_mark(serving)`; the server calls it after the width walk
+  (`0`) and after the slot-pool prefill (`1`). At the next admission after each mark, `pocket_cuda_slot_fixed_replan`
+  drains once (the device is idle there), frees every parked cache outside [F, F + 256 positions] (the walk's) and
+  adopts the plain ones inside it, measures free memory and sets
+  `cap = min(rows + spares, live + (free - margin) / F)` (`mynah_backend_fixed_buffers_refit`),
+  `margin = max(2 GiB, total / 16) + (rows - sets made) x 9 MiB + the spare reserve's bytes above F`. It then gives
+  every parked set without a cache one of F and makes the growth reserve (`rows / 32`, min 4, caches of F + 256
+  positions), both within the cap. One log line per mark (`re-planned after the start-up warm-ups` / `(serving
+  next)`). The load-time plan stays as the provisional cap, so the CLI (no marks) behaves as before.
+- **F from data.** Default 384 stored positions = text + frames (the voice prefix is shared, not stored): ~60 tokens +
+  ~320 frames, ~26 s of audio at 12.5 Hz. On the v2 corpus (150 texts, 12-531 characters, p50 58, p90 479) about 90 %
+  hold without growth; the longest (~130 tokens, ~430 positions) grow once, now without a sync. Once serving, the engine
+  keeps histograms (64-position buckets) of the admission's estimate and of the length each request really reached;
+  after 1024 served retirements F moves once to the p95 of the real lengths, clamped to [320, 768], for caches made
+  from then on (made caches keep their size; each still serves any request whose prefill it holds).
+- **Growth with no device-wide sync** (`pocket_cuda_fixed_grow`). The new cache is (1) the tightest spare that holds the
+  new size, else (2) the smallest parked set's fixed cache that holds it (the set is left without one and gets the old
+  cache back), else (3) a new allocation if the cap allows. The live prefix is copied with `cudaMemcpyAsync` on the
+  stream, the row is laid out over all of the new cache, and the old cache is parked (a set without a cache first,
+  then the spare list, at most `rows / 8`, min 16), never freed. This is safe because there is one stream: the next
+  user of the old cache is ordered after this row's queued work, and the host never reads or writes a KV cache. A
+  failed copy surfaces at the step's sync, like any kernel. Only when (1)-(3) all fail, or the spare list is full, does
+  the old path (allocate + `cudaStreamSynchronize` + `cudaFree`) run: `grow ... sync` in `[CTX]`.
+- **No free on the admission path.** With the flag on, any parked plain cache that holds the request's prefill and
+  first step is reused (not only fixed ones). A parked cache too small even for that is parked aside (adopted as fixed)
+  instead of freed. A row whose set brought no cache takes a spare first (the tightest at or above its estimate, else
+  the largest that holds its prefill), then a new fixed cache within the cap, then over-cap the plain allocation as
+  before (counted `over-cap`). A fixed cache that grew past 2 F is parked aside at retirement when there is room,
+  and freed (with the drain) only otherwise (`trimmed`).
+- **`[CTX]`** adds `parked P spares S (taken T) grow: spare a set b alloc c sync d | len stored p50/p95 x/y (estimate
+  p95 z, n N) F f`.
+- **Self-tests** (`make test-c`): the re-plan arithmetic (`mynah_backend_fixed_buffers_refit`, five cases + overflow +
+  bad arguments) in the CPU backend self-test, and `mynah_engine_pocket_slot_fixed_self_test` in `--self-test`. The
+  second runs the host-side bookkeeping on a model-less state with host tokens for caches: where a parked-aside cache
+  goes, which spare or set cache a take or growth gets, the count against the cap, the oversized rule and the
+  percentiles. A mutation (wrong band size) makes it fail.
+- **Flag off.** Unchanged paths: every new branch tests `cuda_slot_fixed`. Two exceptions, both unreachable with the
+  flag off: the set-without-a-cache branch in `pocket_cuda_backbone_alloc` (only the flag leaves a set like that) and
+  the spare loop in the pool drain (the list is empty). The server's two `mynah_tts_startup_mark` calls only bump an
+  atomic.
+
+**VRAM math, sizing v2** (int8 records, 24 layers: 52,224 B per stored position; F = 384 is 19.1 MiB, F + 256 is
+31.9 MiB). Assumes 4.1 GiB for weights, CUDA context, graphs and scratch, derived from the Ada flag-off arm: 24,818 MiB
+ready at 896 sets, minus 896 x (9 MiB other + 14.0 MiB prefill-sized KV). Free after the warm-ups = total - 4.1 GiB -
+rows x 9 MiB (all sets made by the walk, their KV freed by the re-plan). Spares = rows / 32. "Left" is what remains
+free after the fixed caches and spares, margin included.
+
+| GPU (total) | rows | free after warm-ups | margin | F=384: cap | KV + spares | left | F=512: cap | left |
+|---|---|---|---|---|---|---|---|---|
+| L4 (22.5 GiB) | 384 | 15.0 GiB | 2.0 | 396 (all + 12 spares) | 7.2 + 0.4 GiB | 7.5 GiB | 396 | 5.0 GiB |
+| L4 | 768 | 11.7 GiB | 2.0 | **500** (auto-capped) | 9.3 GiB | 2.3 GiB | 375 | 2.3 GiB |
+| L4 | 1024 | 9.4 GiB | 2.0 | **374** | 7.0 GiB | 2.4 GiB | 281 | 2.4 GiB |
+| L40S (~44.5 GiB) | 384 | 37.0 GiB | 2.8 | 396 | 7.2 + 0.4 GiB | 29.5 GiB | 396 | 27.0 GiB |
+| L40S | 768 | 33.7 GiB | 2.8 | 792 | 14.3 + 0.8 GiB | 18.6 GiB | 792 | 13.6 GiB |
+| L40S | 1024 | 31.4 GiB | 2.8 | 1056 | 19.1 + 1.0 GiB | 11.3 GiB | 1056 | 4.7 GiB |
+| RTX 6000 Ada (47.4 GiB) | 384 | 39.9 GiB | 3.0 | 396 | 7.2 + 0.4 GiB | 32.4 GiB | 396 | 29.9 GiB |
+| RTX 6000 Ada | 768 | 36.6 GiB | 3.0 | 792 | 14.3 + 0.8 GiB | 21.5 GiB | 792 | 16.5 GiB |
+| RTX 6000 Ada | 1024 | 34.3 GiB | 3.0 | 1056 | 19.1 + 1.0 GiB | 14.2 GiB | 1056 | 7.6 GiB |
+
+The L4 is the target at <= 384 rows only; past that it auto-caps (as the flag-off path, the rows past the cap allocate
+plain estimate-sized caches). The "left" column must cover what the table does not model: the KV of rows past the cap,
+growth beyond the spares (a new allocation of F + 256 each), live rows' extra graph widths, and the transient of a
+fallback growth. Check it on the box: `nvidia-smi` at the end of each arm, plus the two re-plan lines.
+
+**VRAM cost (first version, load-time plan).** Per row: `positions x layers x 2 x record x element` = 512 x 24 x 2 x 1088 B = **25.5 MiB** (int8 records,
 24L; BF16 would be 48 MiB). Total: `rows x 25.5 MiB`. Start-up plan (`mynah_backend_fixed_buffers_plan`):
 `cap = min(rows, (free - reserve) / per_row)`, `reserve = max(4 GiB, total / 5) + rows x 9 MiB` (the other per-row
 device buffers without the row diet; the fifth covers weights uploaded lazily, graphs, scratch and transients). 0 →
@@ -560,6 +631,8 @@ the off arm shows where today's 10-12 ms go (free vs malloc vs fence wait). Self
 the meter counts exactly the calls made while it is set and the plan arithmetic (`make test-c`).
 
 **Box test** (`.work/l40s-2026-10-06/jobs/a1b.sh`, tree `/root/ma1b`, ROW_CAP 1024, single NUMA node, no pinning).
+Sizing v2: the speed arms are C768/C896/C1024 (server `--max-inflight 1024`). Read the two `re-planned` lines (cap,
+kept/freed/made, spares). In `[CTX]`, expect over-cap 0 at C896 and `grow ... sync` near 0 on the Ada and the L40S.
 1. Identity, flag off vs on: CLI `--batch 32`, CLI `--batch 32 --stream`, server C1 sequence (166 WAVs); plus
    `ZERO_KV=1` with the flag on. All must match the flag-off reference.
 2. Speed at C768/C896, 2-minute levels, PRE=640: A = defaults + A1a, B = A + A1b, then A again (ABA). Read `[CTX]`

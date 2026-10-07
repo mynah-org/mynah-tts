@@ -17,4 +17,8 @@ struct mynah_tts_model {
     void *local_projection_cache;
 };
 
+/* mynah_tts_startup_mark: how many marks so far (0 before the first) and
+ * whether the last one said serving. Lock-free; any thread. */
+unsigned mynah_tts_startup_generation(int *serving);
+
 #endif

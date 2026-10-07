@@ -832,4 +832,22 @@ int mynah_backend_fixed_buffers_plan(size_t free_bytes, size_t total_bytes,
                                      size_t per_row_other_bytes,
                                      size_t *reserve_bytes, size_t *fit_rows);
 
+/* The same buffers re-planned once the start-up warm-ups are done
+ * (MYNAH_CUDA_SLOT_FIXED): `free_bytes` is measured after them, with every
+ * start-up buffer that should not stay already released, and `live` buffers
+ * already exist (their bytes are not in `free_bytes`). The margin is
+ * max(2 GiB, total / 16) -- growth copies, scratch growth, transients --
+ * plus (rows - sets_made) * per_row_other_bytes for the request sets not
+ * made yet, plus `extra_bytes` (what spare buffers take beyond
+ * `buffer_bytes` each). Writes the margin and
+ * cap = min(rows + spares, live + (free - margin) / buffer_bytes).
+ * Pure, saturating arithmetic; -1 only on bad arguments. */
+int mynah_backend_fixed_buffers_refit(size_t free_bytes, size_t total_bytes,
+                                      size_t rows, size_t spares,
+                                      size_t sets_made, size_t live,
+                                      size_t buffer_bytes,
+                                      size_t per_row_other_bytes,
+                                      size_t extra_bytes, size_t *margin_bytes,
+                                      size_t *cap);
+
 #endif

@@ -3507,6 +3507,10 @@ int main(int argc, char **argv) {
                 after.decoder_graph_captures - before.decoder_graph_captures,
                 freed_mb);
     }
+    /* The graph walk is over (or was not run): an engine that sizes a device
+     * pool from free memory re-plans it now, before the prefill takes sets
+     * (MYNAH_CUDA_SLOT_FIXED; a no-op otherwise). */
+    if (device == MYNAH_TTS_DEVICE_CUDA) mynah_tts_startup_mark(0);
     {
         const size_t prefill = pool_prefill_count(device == MYNAH_TTS_DEVICE_CUDA);
         if (prefill > 0u) {
@@ -3517,6 +3521,8 @@ int main(int argc, char **argv) {
                     done, prefill, now_ms() - t0);
         }
     }
+    /* Start-up is over; the same re-plan once more, with traffic next. */
+    if (device == MYNAH_TTS_DEVICE_CUDA) mynah_tts_startup_mark(1);
 
     queue_init(&g_queue);
     pthread_t workers[MYNAH_GRAPH_MAX_ACTIVE];
