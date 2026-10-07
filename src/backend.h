@@ -315,6 +315,11 @@ void mynah_backend_sync_profile_reset(void);
  * counts those calls ("while queued") and this returns their total. */
 void mynah_backend_sync_note_queued(int queued);
 unsigned long long mynah_backend_sync_queued_calls(void);
+/* MYNAH_CUDA_PINGPONG: the same count restricted to STREAM syncs (fence waits
+ * excluded). A stream sync reached while the other group's item is queued
+ * waits for that item too, which is the hidden serialization the ping-pong
+ * profile line reports. */
+unsigned long long mynah_backend_stream_sync_queued_calls(void);
 #define mynah_backend_sync(backend, error, error_capacity) \
     mynah_backend_sync_at((backend), (error), (error_capacity), __FILE__, __LINE__)
 
@@ -359,6 +364,21 @@ void mynah_backend_fence_wait(const mynah_backend *backend, void *fence);
  * mynah_backend_sync, so "device wait" stays comparable).  Without a fence
  * it falls back to a stream sync. */
 int mynah_backend_fence_query(const mynah_backend *backend, void *fence);
+/* MYNAH_CUDA_PINGPONG.  Selects which copy (0 or 1) of the backend's
+ * host-pinned codec-gang staging and of its decoder batch-graph cache the
+ * following calls use.  Two groups of rows with work queued at the same time
+ * on the one stream must not share a pinned block the host rewrites while
+ * the other group's copy out of it is still queued.  Lane 0 is the only lane
+ * unless a serving loop selects another; a backend without lanes ignores it. */
+void mynah_backend_set_lane(const mynah_backend *backend, int lane);
+/* MYNAH_CUDA_PINGPONG.  Clears a recoverable device error left pending by a
+ * call that already failed and was handled (an allocation the caller fell
+ * back from), so the next launch check of the ping-pong paths does not report
+ * it as its own.  Returns 1 with its text in `error` when one was pending, 0
+ * otherwise (always 0 without a device).  An unrecoverable error stays: the
+ * next device call still reports it. */
+int mynah_backend_lane_clear_error(const mynah_backend *backend, char *error,
+                                   size_t error_capacity);
 int mynah_backend_fence_sync_at(const mynah_backend *backend, void *fence,
                                 char *error, size_t error_capacity,
                                 const char *file, int line);

@@ -1199,6 +1199,10 @@ struct cuda_pipeline_graph_entry {
  * graph per width bucket rather than one graph per changing gang. */
 struct cuda_decoder_batch_graph_entry {
     size_t batch;
+    /* The lane that created it (MYNAH_CUDA_PINGPONG).  Only that lane reuses
+     * it: re-recording or patching its pinned tables waits for its last
+     * launch, which for another lane's entry is that lane's queued decode. */
+    int lane;
     size_t encoder_frames;
     std::vector<mynah_backend_decoder *> decoders;
     std::vector<const float *> inputs;
@@ -1475,7 +1479,13 @@ struct cuda_backend_state {
     size_t solo_work_cap = 0u, solo_columns_cap = 0u, solo_window_cap = 0u,
            solo_full_cap = 0u; /* floats */
     std::vector<float *> solo_retired; /* replaced smaller sets */
-    cuda_codec_gang_workspace codec_gang;
+    /* One per lane (mynah_backend_set_lane, MYNAH_CUDA_PINGPONG): with two
+     * groups' decodes queued at once, each group gathers its PCM into its own
+     * pinned block, so one group's queued copy never lands in the block the
+     * host is reading the other group's PCM from.  Lane 0 is the only lane
+     * used unless a serving loop selects another. */
+    cuda_codec_gang_workspace codec_gang[2];
+    int lane = 0;
     std::atomic<unsigned long long> codec_gang_calls[2];
     std::atomic<unsigned long long> codec_gang_rows[2];
     std::atomic<unsigned long long> codec_gang_hist[2][8];
@@ -5002,8 +5012,7 @@ extern "C" int mynah_cuda_gather_rows_to_batch_dev(
 /*  Cross-request Pocket codec gang: quantizer + upsample, PCM collect  */
 /* ------------------------------------------------------------------ */
 
-static void codec_gang_release(cuda_backend_state *st) {
-    cuda_codec_gang_workspace &w = st->codec_gang;
+static void codec_gang_release_lane(cuda_codec_gang_workspace &w) {
     cudaFree(w.up_meta_dev);
     if (w.up_meta_host != nullptr) cudaFreeHost(w.up_meta_host);
     if (w.up_meta_event != nullptr) cudaEventDestroy(w.up_meta_event);
@@ -5014,6 +5023,10 @@ static void codec_gang_release(cuda_backend_state *st) {
     cudaFree(w.pcm_dev);
     if (w.pcm_host != nullptr) cudaFreeHost(w.pcm_host);
     w = cuda_codec_gang_workspace();
+}
+
+static void codec_gang_release(cuda_backend_state *st) {
+    for (cuda_codec_gang_workspace &w : st->codec_gang) codec_gang_release_lane(w);
 }
 
 /* Grow one pinned-host + device pair.  Growth drains the stream first: an
@@ -5092,7 +5105,7 @@ extern "C" int mynah_cuda_codec_upsample_batch_dev(
                        ec)))
         return -1;
 
-    cuda_codec_gang_workspace &w = st->codec_gang;
+    cuda_codec_gang_workspace &w = st->codec_gang[st->lane];
     if (w.up_meta_event == nullptr &&
         ce(cudaEventCreateWithFlags(&w.up_meta_event, cudaEventDisableTiming),
            e, ec))
@@ -5171,7 +5184,7 @@ extern "C" int mynah_cuda_gather_rows_d2h(void *opaque,
             return -1;
         }
     }
-    cuda_codec_gang_workspace &w = st->codec_gang;
+    cuda_codec_gang_workspace &w = st->codec_gang[st->lane];
     if (w.pcm_meta_event == nullptr &&
         ce(cudaEventCreateWithFlags(&w.pcm_meta_event, cudaEventDisableTiming),
            e, ec))
@@ -6416,6 +6429,7 @@ static cuda_decoder_batch_graph_entry *find_decoder_batch_graph(
         outputs == nullptr) return nullptr;
     for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs) {
         if (!entry->valid || entry->batch != batch ||
+            entry->lane != backend->lane ||
             entry->encoder_frames != encoder_frames ||
             entry->decoders.size() != batch)
             continue;
@@ -6440,6 +6454,7 @@ static cuda_decoder_batch_graph_entry *find_decoder_batch_graph_shape(
         return nullptr;
     for (cuda_decoder_batch_graph_entry *entry : backend->decoder_batch_graphs) {
         if (entry->valid && entry->done != nullptr && entry->batch == batch &&
+            entry->lane == backend->lane &&
             entry->encoder_frames == encoder_frames &&
             entry->sig_ops == first->ops.size() &&
             entry->sig_weight == first->ops[0].weight)
@@ -6473,6 +6488,7 @@ static cuda_decoder_batch_graph_entry *decoder_batch_graph_create(
         return nullptr;
     }
     entry->batch = batch;
+    entry->lane = backend->lane;
     entry->encoder_frames = encoder_frames;
     entry->graph = nullptr;
     entry->exec = nullptr;
@@ -12345,6 +12361,26 @@ extern "C" int mynah_cuda_fence_query(void *opaque, void *fence) {
         return 0;
     }
     return -1;
+}
+
+/* MYNAH_CUDA_PINGPONG: the lane of the codec-gang staging and the decoder
+ * batch-graph cache (see cuda_backend_state::codec_gang). */
+extern "C" void mynah_cuda_set_lane(void *opaque, int lane) {
+    auto *st = static_cast<cuda_backend_state *>(opaque);
+    if (st != nullptr) st->lane = lane == 1 ? 1 : 0;
+}
+
+/* MYNAH_CUDA_PINGPONG: cudaGetLastError() after a handled failure.  A failed
+ * cudaMalloc (or event create, graph instantiate) returns its error AND
+ * leaves it as the thread's last error; the next `ce(cudaGetLastError())`
+ * after a perfectly good launch would then report that stale out-of-memory as
+ * the launch's own failure. */
+extern "C" int mynah_cuda_lane_clear_error(void *opaque, char *e, size_t ec) {
+    (void)opaque;
+    const cudaError_t pending = cudaGetLastError();
+    if (pending == cudaSuccess) return 0;
+    set_error(e, ec, cudaGetErrorString(pending));
+    return 1;
 }
 
 /* Wait for a fence and release it, reporting a device error. */
