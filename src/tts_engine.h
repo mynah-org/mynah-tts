@@ -58,6 +58,20 @@ typedef struct {
      * for this model, which is why the engine and not the driver owns it.
      * Appended; see the vtable note. */
     unsigned prefill_slice_tokens;
+    /* Non-zero when `decode_audio_batch` LENDS its out_samples instead of
+     * handing over malloc'd buffers: each stays valid until the next batched
+     * decode of the same context or its ctx_free, and the driver must not free
+     * it. Spares the per-row allocation and free at serving widths. Says
+     * nothing about `decode_audio`, which always hands over ownership.
+     * Appended. */
+    unsigned decode_batch_lends_pcm;
+    /* Non-zero when the serving loop should run dispatch-ahead and
+     * decode-ahead with first-frame-first (MYNAH_CUDA_STEP_OVERLAP,
+     * MYNAH_CUDA_DECODE_OVERLAP, MYNAH_CUDA_FIRST_FRAME_FIRST) unless those
+     * variables say otherwise: the engine measured them on this backend.
+     * Zero leaves all three opt-in. A policy default, never a dispatch
+     * predicate. Appended. */
+    unsigned overlap_by_default;
 } mynah_engine_caps;
 
 typedef struct {
@@ -308,6 +322,93 @@ typedef struct {
                          uint64_t seed, mynah_engine_ctx **out_ctx,
                          char *error, size_t error_capacity);
     int  (*ctx_attach)(mynah_engine_ctx *ctx, char *error, size_t error_capacity);
+
+    /* ---- dispatch-ahead (APPENDED; MYNAH_CUDA_STEP_OVERLAP) ----------------
+     *
+     * OPTIONAL. Queue the next `step_batch` for these contexts on the device
+     * and return without waiting for it, so the driver's host work (retire,
+     * admission, cancellation) runs while the device steps. The next
+     * `step_batch` on exactly these contexts, in this order, finishes the
+     * queued step and must produce exactly what one `step_batch` would have.
+     * 0 means queued; any other value means nothing was queued and nothing
+     * changed, and the driver steps as usual.
+     *
+     * Between the two calls the driver may call `ctx_new`, `ctx_new_host`,
+     * `ctx_attach` and `ctx_free` (never on a queued context), and nothing
+     * else on this scratch. Any other engine call with a step still queued
+     * may discard it, which is legal because nothing was committed: the
+     * finishing `step_batch` then simply runs the whole step.
+     *
+     * With MYNAH_CUDA_DECODE_OVERLAP the driver also calls `decode_collect`
+     * (for the gang submitted before the launch) and `prepare_slice` /
+     * `prepare_slice_batch` on rows that are not queued while a step is
+     * queued. An engine may still discard the step there as its safety net,
+     * which is correct and only slower. */
+    int  (*step_launch)(mynah_engine_ctx *const *ctxs, size_t count,
+                        mynah_engine_scratch *scratch);
+
+    /* ---- decode split (APPENDED; MYNAH_CUDA_DECODE_OVERLAP) ---------------
+     *
+     * OPTIONAL, both or neither. `decode_submit` queues exactly what
+     * `decode_audio_batch` would compute for these ranges and returns without
+     * waiting for the device; `decode_collect` then hands back the same
+     * out_samples / out_count / failed (with the same ownership: lent per
+     * `caps.decode_batch_lends_pcm`) and the same return value that
+     * `decode_audio_batch` would have. Bit-identical per context to
+     * `decode_audio`, which is the `decode_audio_batch` contract.
+     *
+     *  - One gang in flight per scratch. `decode_submit` returns 0 when the
+     *    gang is in flight (queued, or completed inside the call when it
+     *    cannot be queued: a multi-frame range, a CPU fallback), and -1 when
+     *    nothing was submitted at all; the driver then fails the gang.
+     *  - `decode_collect` with `wait == 0` returns 1, with nothing changed,
+     *    while the device is still working; otherwise it waits. `ctxs` and
+     *    `count` are the submitted ones.
+     *  - Between the two the driver may call `step_launch`, `prepare_slice`,
+     *    `prepare_slice_batch`, `decode_audio`, `ctx_new*`, `ctx_attach` and
+     *    `ctx_free` on contexts NOT in the gang, and nothing else on this
+     *    scratch. A context in the gang may also be a row of the step
+     *    launched meanwhile: the step reads none of the decode's state. */
+    int  (*decode_submit)(mynah_engine_ctx *const *ctxs, size_t count,
+                          const size_t *first_frame, const size_t *frame_count,
+                          mynah_engine_scratch *scratch,
+                          char *error, size_t error_capacity);
+    int  (*decode_collect)(mynah_engine_ctx *const *ctxs, size_t count, int wait,
+                           float **out_samples, size_t *out_count, int *failed,
+                           mynah_engine_scratch *scratch,
+                           char *error, size_t error_capacity);
+
+    /* ---- ping-pong groups (APPENDED; MYNAH_CUDA_PINGPONG) ------------------
+     *
+     * OPTIONAL. The driver serves two disjoint groups of contexts, each with
+     * its own scratch (`lane` 0 and 1), and keeps one group's work queued
+     * (`decode_submit`, then `step_launch`) while it finishes, emits, admits
+     * and prefills the other group's. Called once per scratch, before its
+     * first use. From then on:
+     *  - a step queued on a scratch must be finishable without waiting for
+     *    work queued for the other scratch after it (its finish waits on its
+     *    own fence, not on the whole device);
+     *  - nothing the host writes for one scratch may be read by work still
+     *    queued for the other (staging shared by the whole engine or backend
+     *    is selected per lane).
+     * The rules of `step_launch` and `decode_submit` hold per scratch: while
+     * one scratch has a step or a gang queued, the driver calls anything on
+     * the OTHER scratch and on contexts that are not in that step or gang.
+     * Each group's audio must be what its rows would produce served alone.
+     *
+     * The two scratches may differ in width: the driver sizes the second one
+     * for the most rows its group can hold (half the slots), not for
+     * `max_batch`, and never steps or decodes more rows on a scratch than it
+     * was created for. `peer` is the other lane's scratch (or NULL). Returns
+     * 0 when the scratch is now lane `lane`; non-zero, with the reason in
+     * `error` and the scratch unchanged, when it cannot serve next to `peer`
+     * -- typically an optional device workspace that `peer` has could not be
+     * allocated for it. The engine then also clears any recoverable device
+     * error that failed allocation left pending; the driver frees the second
+     * scratch and serves serially. */
+    int (*scratch_set_lane)(mynah_engine_scratch *scratch, int lane,
+                            const mynah_engine_scratch *peer,
+                            char *error, size_t error_capacity);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

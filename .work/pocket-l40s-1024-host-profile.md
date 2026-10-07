@@ -1,0 +1,749 @@
+# Pocket on one L40S toward C1024: where the host time goes, and how to measure it
+
+Board: `PLAN.md` E15-32 (follow-up to `.work/pocket-l40s-plateau.md`). Branch `pocket-l40s-plateau`. Written
+2026-10-06 from a code read only: nothing here was run, and every number marked "est." is an estimate to be confirmed
+by the profiler designed in section 2.
+
+**Question.** On an L40S with a 2.6 GHz host, the single scheduler thread spends ~28 ms per iteration on host work
+(emit, delivery, retire, admission, prefill bookkeeping) while the GPU is idle (~65 % busy). Before splitting that
+work across threads, find out where it goes and what can simply be removed.
+
+**Short answer.**
+
+1. About half of the host time is probably outside `step_live`, and the largest single term is probably **admission**:
+   building the request context.
+   - At ~900 rows about 8 requests finish and 8 are admitted per iteration. That rate depends only on rows and mean
+     request length (~9 s), not on host speed.
+   - Each admission costs ~1.4-2.2 ms of host work even with a warm slot pool (`[CTX]` measurement,
+     `.work/pocket-cuda-cold-burst.md`).
+   - So est. 11-16 ms of the 28 ms.
+   - `MYNAH_ASYNC_ADMIT` does not help as configured: its inline threshold (8) covers the whole steady-state
+     admission rate.
+2. The per-row loops inside the step add up to est. 7-11 µs per row at 2.6 GHz, so 6-10 ms at 900 rows. The decode
+   gang's host side is the largest part. Delivery is ~1 µs per row with L19 on.
+3. Splitting the per-row loops across N threads would save est. 1.5-3 ms per iteration on a large host, and nothing
+   or less than nothing on a 4-vCPU host.
+   - It belongs after the cheaper removals in section 4, behind an opt-in thread count.
+4. The existing profile cannot confirm any of this:
+   - the batched prefill is not accounted;
+   - "other" mixes admission, retire, cancellation and the prefill;
+   - nothing is per row.
+
+   Section 2 is a `MYNAH_SERVE_PROFILE=2` design that answers it in one run.
+
+---
+
+## 1. qwen-tts tooling and host-side techniques, and what ports to mynah
+
+Source: the author's other engine, `qwen-tts` (read-only). It is CPU-first and the HTTP server is plain C. On CUDA it
+is a single process with one sync per step.
+
+What qwen-tts does **not** have, so there is nothing to port for these:
+- rdtsc;
+- NVTX;
+- a Chrome/Perfetto trace exporter;
+- flamegraph or sampling helpers (`perf record` is run by hand);
+- epoll, writev or eventfd;
+- pinned host memory;
+- NUMA calls;
+- lock-free SPSC rings (every queue is mutex + condvar).
+
+On the host side of CUDA serving mynah is already ahead: dispatch-ahead (L13), one sync per frame, pinned staging,
+the slot pool and delivery helpers. What is worth taking from qwen-tts is mostly **observability discipline**.
+
+### 1a. Profiling and observability
+
+| qwen-tts item | what it is | mynah today | port? target | effort | value |
+|---|---|---|---|---|---|
+| `QWEN_STAGE_TRACE=1` → one `[STAGE] v=1` line per iteration (`qwen_tts.c` ~4428): admit/prefill/head/sample/cp/decode/talker/output/queue_wait ms, `serial_ms` = wall minus named phases, `wall_ms`, `active`, decoder-call counts; CLOCK_MONOTONIC, versioned key=value | per-iteration phase record, explains tail iterations rather than means | `[SERVE]` is end-of-run aggregates only; `sink_phase` (`server/main.c`) has four coarse phases as 5 ms histograms on `/debug/first-chunk` | **yes**, as the windowed `[HOSTP]` line of section 2 (`src/inference.c:serve`) | S on top of section 2 | high: tail iterations (the 390 ms B768 worst case in 3d) become visible |
+| `tools/stage_pressure.py` | parses `[STAGE]`, reports phase pressure and the longest iterations; never joins client gaps without an explicit clock alignment | none | **yes**: `tools/host_phases.py` parses `[HOSTP]` lines and the end-of-run table | S | medium |
+| `[TTFA2]` / `[PATH] v=2` per-request timeline (client start from a request header, accept, parse, enqueue, admit, prefill start/done, step 1, decode 1, first PCM, write) with `boot_id` to check clock domains | where a request's TTFA went | `sink_phase` + first-chunk histograms (arrival offset, slot full/free, iterations to first chunk) | partial: add `prefill_done_iter` and `first_frame_iter` to `synth_job` and one line per request under level 2 sampling (`server/main.c:record_job_timing`) | S | medium: L13 costs TTFA, this shows where |
+| Cost map `QWEN_COST_MAP=1/2` with JSON + `tools/costmap_report.py`: thread-local accumulation, declared nesting checked at run time | inclusive/exclusive regions | **mynah already has the same design** (`src/costmap.c`, `MYNAH_COST_MAP`, `MYNAH_COSTMAP_JSON`) | no: but do NOT reuse it for loop phases. Its regions are compute regions and it is too heavy per row (region stack push/pop per call). Keep it for kernels | — | — |
+| `POOLSTATS` dispatch/chunks/park/serial; `qwen_parallel_meter`; pool spin budget `QWEN_POOL_SPIN` | pool overhead | mynah has `MYNAH_POOL_METER`, spin calibration, `mynah_parallel_stats` (`src/threads.h`) | already ported. Relevant only if section 3's parallel-for uses the pool | — | — |
+| SIGUSR1 counter dump (prefork stats, pool, census, cost map) | read counters from a live server | mynah: `on_usr1_dump` / `dump_local_stats` (`server/main.c`) | extend: on SIGUSR1 also print the level-2 phase table so far (flag only; printed by the scheduler thread at its next iteration top) | S | medium: 10-min soaks need no restart |
+| Prometheus `/metrics` with single-writer relaxed atomics; threshold counters instead of histograms (`ttfa_over_250ms` etc.), justified as exact at any N | live counters | mynah has `/metrics` with sums + counts (`handle_metrics`) | optional: add `mynah_scheduler_host_seconds_total{phase=...}` and `iterations_total`, so host share can be watched live | S | low-medium |
+| `[TOPOLOGY] v=1 pid configured_mask actual_mask threads mode` line at start | which CPUs each process actually got | none; `knee.sh` takes `PIN`/`CLIPIN` | **yes**: one start-up line with the affinity mask, the GPU's NUMA node (`/sys/bus/pci/devices/<bdf>/numa_node`), the clocksource, CPU MHz and governor, and the scheduler thread's CPU (`server/main.c:main`) | S | **high**: 3f lost a day to a scheduler thread on the wrong NUMA node and a `powersave` 2.1 GHz host |
+| `QWEN_KERNEL_TIMING` / shape census | kernel buckets by batch | dispatch census exists | no (GPU kernels: use nsys) | — | — |
+| `tools/costmap_ab.sh` (A/B/B/A overhead check of the profiler itself) | proves the profiler does not move the number it measures | none | **yes** for level 2: the same ABBA with level 1 vs level 2 (section 2e) | S | medium |
+| Documented findings (per-region numbers): pool dispatches per frame, context switches/s, `posix_memalign` / mmap / munmap counts per request cut from 11,899 / 78 / 154 to 41 / 1.3 / 1.3 by a decoder arena, bit-identical | the method: count allocations and context switches, not only time | not counted in mynah | **yes**: level 2 also prints `getrusage(RUSAGE_THREAD)` deltas (voluntary/involuntary context switches, minor faults) of the scheduler thread per iteration | S | **high**: admission is suspected to be page-fault bound (section 4) |
+
+### 1b. Host-side serving techniques
+
+| qwen-tts item | measured result there | mynah equivalent | port? (target, effort, value) |
+|---|---|---|---|
+| Engine thread pool: caller + N−1 workers, one atomic chunk counter, spin then park, need-mask wake, sense-reversing spin barrier for persistent regions | dispatch count was the cost (10.7k dispatches per request); persistent regions cut it 384 → 80 per frame-pair | `src/threads.c` (`mynah_parallel_for`, spin calibration, lanes) is the same family. On the GPU server it runs with `MYNAH_THREADS=1` (`tools/gpu/serve.sh`) | reusable for section 3, but with its **own** width and spin budget, not `MYNAH_THREADS` (M, value depends on the host: section 3) |
+| CPU affinity: forked workers pinned core-major (SMT siblings together) from sysfs `core_id`; plans on the inherited mask; `--cpu-mask` | needed for the per-core AMX unit there | none in the server; `knee.sh` uses taskset | **yes**: `MYNAH_SCHED_CPU=<cpu>` (or `auto` = first CPU of the GPU's NUMA node) pins `mynah-sched`; delivery helpers and writers get the rest of that node, never the scheduler's SMT sibling (`server/main.c:scheduler_main`, `stream_out_deliver_init`). S, high on multi-NUMA hosts (3f: 61 → 46 ms host per iteration just from the NUMA pin) |
+| Decoder lane (private pinned team) | 11-17 % better than inline at B2-B4, missed its gate | mynah has the lane (E5-21); exclusive with the CUDA decode gang | no (CUDA gang wins) |
+| Prefill helper thread | rejected: TTFA p95 435 → 2379 ms | `MYNAH_ASYNC_ADMIT` (context build on helpers) | lesson: moving work off the loop costs TTFA when the work then waits one iteration to be collected. Same trade-off as `MYNAH_ASYNC_ADMIT` (+67 ms TTFA p95 on the L4) and L13 (+50-60 ms) |
+| Sliced admission `QWEN_PREFILL_SLICE` | CPU: RTF better, TTFA worse; CUDA: worse | mynah has sliced + batched prefill (default 16 tokens for 24L) | already better in mynah |
+| Async output writer: one detached thread per stream, 1 MB bounded queue, `SO_SNDTIMEO`, malloc per chunk, one signal per chunk | neutral (C3 −0.010, C4 +0.009) | the **same design** (`server/stream_out.c`), plus a ring instead of malloc, plus L19 helpers | lesson: at C4 one thread per stream is free; at C900 it is 900 futex wakes and 900 context switches per step (section 4, item H5) |
+| Synchronous output: per-thread grow-once int16 buffer, three `write()` per chunk, TCP_NODELAY | default there | mynah: `stream_out_enqueue` (grow-once convert buffer) + L8 `writev` | done |
+| Cancellation: per-step `poll(fd, 0)` for POLLRDHUP under a flag | — | `sink_cancelled` → `stream_out_peer_gone` (mutex + `poll`) per row; L7 makes it every N | done (L7); see H4 for a cheaper form |
+| Memory: decoder bump arena per stream, grow-once TLS scratch, preallocated batch buffers | allocations per request 11,899 → 41, mmap/munmap 78/154 → 1.3/1.3, bit-identical | slot pool (device + pinned buffers), but the **host** halves (`ar_states`, `codec_setup`) are still allocated per request | **yes**: this is the top candidate (A1 in section 4) |
+| Execution budget: one pool owns all CPU work, BLAS held to 1 thread | context switches −48 %, C4 p95 0.98 → 0.95 | `MYNAH_THREADS=1` on the GPU server; the CUDA build links no host BLAS in the hot path | check that no stray thread team exists in the GPU server (`top -H` at C900: expect `mynah-sched`, `mynah-dlvN`, `mynah-outNNN`, HTTP workers, CUDA driver threads) |
+| Admission-health publish (seqlock-style release/acquire atomics for `last_iter_ms`) | used by an admission policy that was falsified | — | no |
+| Thread naming (`srv-sched`, `srv-output`, ...) | `top -H` answers "which thread is hot" | mynah names `mynah-sched`, `mynah-dlvN`, `mynah-outFD` | done |
+
+**Net:** port the **observability items** (per-iteration line + parser, topology line, rusage deltas, ABBA overhead
+check). Port the **memory discipline** to the host halves of the request context. Port the **pinning**.
+
+---
+
+## 2. Design: a fine-grained host-phase profiler (`MYNAH_SERVE_PROFILE=2`)
+
+### 2a. What is missing today
+
+- `[SERVE] loop`:
+  - `step` = `step_live` (AR + emit + decode + delivery, device waits included);
+  - `other` = everything else;
+  - `prefill-first/cont` count **only the scalar prefill path**. The CUDA batched prefill (`prepare_slice_batch`
+    returns before the accounting in `src/inference.c:slots_prefill_slice`) lands in `other`. That is why the L40S logs
+    show "prefill-first 0.0 % (8 slices)" with hundreds of admissions.
+- `[SERVE] device wait` gives host vs device for the whole loop, but not per phase.
+- The server's `sink_phase` histograms are coarse (admission / prefill+cancel / step / retire), and on `/debug` only.
+- Nothing is per row, per admission or per retirement. Nothing counts allocations, page faults or context switches.
+
+### 2b. Phases
+
+One enum, `mynah_hp_phase`, in a new `src/hostprof.{h,c}` (no dependency on costmap). Each iteration is cut into
+contiguous phases by **marks**. A mark closes the current phase and opens the next, so the phases tile the iteration
+with no gaps by construction. Device waits are attributed to the phase that is open when they happen.
+
+| id | phase | where the mark goes | unit for "per" column |
+|---|---|---|---|
+| `ITER_TOP` | lane reap, costmap bookkeeping | `serve`, loop top | — |
+| `ADMIT_NEXTJOB` | `sink->next_job` (queue pop, `stream_out_start`: 1 MiB ring malloc, `pthread_create`, setsockopt) | `admit_pass`, around `next_job` | per admission |
+| `ADMIT_CTX` | `slot_start` → `ctx_new` (host half), or `async_submit` | `admit_pass` | per admission |
+| `ADMIT_ATTACH` | `async_collect` (device half) | `serve` | per collected |
+| `CANCEL` | cancellation scan | `serve` | per row scanned |
+| `PREFILL_SELECT` | FIFO / round-robin selection | `slots_prefill_slice` | — |
+| `PREFILL_RUN` | `prepare_slice_batch` / `prepare_slice` (host + its syncs) | `slots_prefill_slice` | per slice, rows |
+| `LATE_ADMIT_WAIT` | `sink->wait_arrival` timed wait. **Blocked, not host** | `prefill_pass` | — |
+| `SELECT` | step row selection (or the ahead-row rebuild with L13) | `serve` | — |
+| `STEP_PRE` | `pocket_step_batch` pre-flight (dup check, KV reserve) | `src/engine_pocket.c:pocket_step_batch` | per row |
+| `STEP_QUEUE` | `pocket_onesync_step` up to the sync: latent staging, noise draw, KV tables, graph launch, flow queue | `pocket_onesync_step` | per row |
+| `STEP_SYNC` | the frame sync (device) | same | — |
+| `STEP_COMMIT` | commit, finite gates, EOS copy-out | same | per row |
+| `EMIT` | `pocket_emit_batch` (+ the survivor flow fallback) | `step_live` | per row |
+| `GANG_SELECT` | `stream_gang` pending/ready pass | `stream_gang` | per row |
+| `DEC_PRE` | `pocket_decode_audio_batch` up to the first device submission: dup check, `decode_admit`, gang upsample staging, `decode_frame_prepare` loop | `pocket_decode_audio_batch` | per row |
+| `DEC_SUBMIT` | Mimi tile / codec transform submit, decoder candidates, `decoder_submit_batch` (L11 table patch), gather | same | per row |
+| `DEC_SYNC` | the gang sync (device) | same | — |
+| `DEC_POST` | PCM placement, finite scan, `decode_frame_finish` | same | per row |
+| `DELIVER` | `slot_deliver` loop → sink callback (enqueue, or L19 hand-off) | `stream_gang` | per row delivered |
+| `STEP_TAIL` | eos/reprepare flags, requeue loop | `step_live`, `serve` | — |
+| `AHEAD_LAUNCH` | L13: the prefill pass + selection + `step_launch` | `step_ahead_launch` | — |
+| `RETIRE_SCAN` | retire predicate scan + swap-remove copies | `serve` | per row scanned |
+| `RETIRE_FREE` | `slot_retire`: finalize, `ctx_free` (park/fence, host frees), `on_done` | `slot_retire` | per retirement |
+
+Engine-side marks (`STEP_*`, `DEC_*`) sit behind one global branch, so the engine needs no new vtable entry. When
+level 2 is off, `mynah_hp_mark()` is an inline function that tests one static int.
+
+### 2c. Timer
+
+- **x86-64:** `__rdtsc()` (not serialising; enough at phase granularity, ~7-10 ns).
+  - Use it only if CPUID 0x80000007 EDX bit 8 (invariant TSC) is set.
+  - Calibrate ticks per ns against `CLOCK_MONOTONIC` at loop start and at report time. Report the drift, and refuse
+    rdtsc if it is above 0.1 %.
+- **aarch64:** `cntvct_el0` with `cntfrq_el0`.
+- **Fallback:** `clock_gettime(CLOCK_MONOTONIC)`.
+  - It is a ~20-25 ns vDSO call when the clocksource is `tsc`, `kvm-clock`, `arch_sys_counter` or `hyperv_clocksource`.
+  - With some cloud clocksources (for example `xen`) it is a **syscall, ~0.5-1 µs**.
+  - Print `/sys/devices/system/clocksource/clocksource0/current_clocksource` in the start-up line. The existing
+    per-row `now_ms()` in `server/main.c:stream_callback` (the deadline check) then costs up to 1 ms per iteration at
+    900 rows (H6).
+- Storage per phase:
+  - `ticks`, `dev_ticks` (sync time inside the phase), `calls`, `units` (rows, admissions, ...);
+  - plus a 32-bucket log2 histogram of per-iteration ticks for each phase that runs once per iteration;
+  - all plain `uint64_t`, written only by the scheduler thread.
+- Device-wait attribution: `mynah_backend_sync_at` (`src/backend.c`) already times every sync under level 1. At level 2
+  it also adds the wait to `dev_ticks[current_phase]`, where `current_phase` is a scheduler-thread global set by the
+  marks. Then **host = ticks − dev_ticks** per phase.
+- Per-row tail sampling: phases with a per-row callout that can block (`DELIVER`, `CANCEL`, `RETIRE_FREE`) time
+  **every 16th row** individually into a log2 histogram, to catch futex wakes and page faults. That is 60 extra timer
+  reads per iteration at 900 rows.
+- Thread counters: `getrusage(RUSAGE_THREAD)` at loop start and end (Linux) gives voluntary and involuntary context
+  switches and minor faults of `mynah-sched`. In the windowed line it is read once per window, not per iteration.
+
+### 2d. Output
+
+1. **End of run, stderr** (with the other `[SERVE]` lines). Example of the intended shape:
+
+```
+[SERVE] host phases (MYNAH_SERVE_PROFILE=2, rdtsc 2.60 GHz, drift 0.002%), 9112 iterations, mean live 897.4:
+[SERVE]   phase          host ms/it  dev ms/it  p50 ms  p99 ms   max ms   per unit
+[SERVE]   admit.ctx          14.10       0.31    13.8    31.2     88.0   1.79 ms/admission (7.9/it)
+[SERVE]   dec.post            2.71       0.00     2.7     3.4      9.1   3.02 us/row
+[SERVE]   deliver             0.95       0.00     0.9     1.6     12.4   1.06 us/row (p99 row 9.8 us)
+[SERVE]   ...
+[SERVE]   (sum)              27.9      29.6                               host = loop - device - blocked
+[SERVE] scheduler thread: 41.2 vol + 3.1 invol ctx switches/it, 1,830 minor faults/it
+```
+
+   - The phase sum must equal the existing `host ... ms per iteration` within 1 %. That is the self-check that the
+     marks tile the loop.
+2. **Windowed line** (port of qwen `[STAGE]`, aggregated so it does not flood the log). With
+   `MYNAH_SERVE_PROFILE_WINDOW=N` (default 1000 iterations), one line per window:
+   `[HOSTP] v=1 iter=<first> n=<N> rows=<mean> admits=<sum> retires=<sum> host_ms=<mean> dev_ms=<mean> worst_iter_ms=<max> worst_phase=<name> <phase>=<host ms/it> ...`.
+   `tools/host_phases.py` turns it into a time series and flags walking phases (soak drift).
+3. **Chrome trace (optional).** With `MYNAH_SERVE_TRACE=/path/trace.json` and `MYNAH_SERVE_TRACE_ITERS=<start>:<count>`
+   (default `2000:200`):
+   - The scheduler thread appends `{phase, t0, t1, units}` into a preallocated ring of 64k events: 200 iterations ×
+     ~25 phases ≈ 5k events, plus per-row samples.
+   - It writes Trace Event JSON once the window closes. The write is outside the window and costs one fwrite of
+     ~1 MB:
+     `{"traceEvents":[{"name":"dec.post","ph":"X","ts":<us>,"dur":<us>,"pid":1,"tid":1,"args":{"rows":897}}, ...]}`
+     Counters (`"ph":"C"`) carry live rows and syncs.
+   - It opens in Perfetto UI or `chrome://tracing`.
+   - Helper threads (`mynah-dlvN`, async admit) can log to per-thread rings under the same window (tid = thread
+     index). Phase 2: S.
+4. **NVTX (optional build flag).** `make cuda-server NVTX=1` defines `MYNAH_NVTX`. Each mark then also calls
+   `nvtxRangePop` and `nvtxRangePushA(name)`, using the header-only NVTX v3 from the CUDA toolkit (no link
+   dependency).
+   - Under `nsys profile` the host phases line up with the GPU timeline. That shows directly which host phase leaves the
+     GPU idle, and whether L13's overlap window is really filled.
+   - Effort S once the marks exist. Off by default; it adds nothing to a normal build.
+
+### 2e. Overhead budget and validation
+
+- Budget: **≤ 0.1 % of an iteration** (≤ 50 µs of a ~50 ms iteration) at level 2 without trace.
+  - ~30 marks × (one timer read ~10 ns + two adds) ≈ 0.5 µs.
+  - Per-row samples: 60 × 2 reads ≈ 1.5 µs.
+  - Histogram updates: `__builtin_clzll` + increment, < 1 µs.
+  - **Total ≈ 3 µs per iteration.** No allocation, no lock, no syscall in the loop. `getrusage` runs per window.
+- Trace mode: + ~20 ns per event inside the window only.
+- Validation (the qwen `costmap_ab.sh` idea): ABBA, level 1 vs level 2, same server start shape, C768 2-minute
+  levels. Accept if `host ms per iteration` differs by less than the noise, i.e. less than the base vs base
+  difference.
+  - Gate check: the phase sum equals level 1's `host per iteration`.
+  - The L13 arm must show `AHEAD_LAUNCH` > 0, otherwise the run did not exercise the path.
+- Env flag: `MYNAH_SERVE_PROFILE=2`.
+  - Today any value means level 1: `getenv(...) != NULL` in `src/inference.c:serve`, `src/backend.c:mynah_backend_sync_at`
+    and `server/main.c:main`. One helper, `mynah_serve_profile_level()` (0, 1, 2; any non-numeric value = 1), replaces
+    the three reads, so existing scripts keep level 1.
+- Effort: **M** (1-1.5 days).
+  - `src/hostprof.{h,c}` ~250 lines.
+  - ~35 marks across `src/inference.c`, `src/engine_pocket.c` and `server/main.c`.
+  - The phase attribution in `src/backend.c`.
+  - The report.
+  - `tools/host_phases.py`.
+
+---
+
+## 3. Parallelising the per-row host work across N threads
+
+### 3a. Which loops are row-parallel
+
+At ~900 rows, per iteration, flags package on (L6-L12, L19-L22, L24):
+
+| loop (file:function) | per-row work | independent per row? | data races / constraints | verdict |
+|---|---|---|---|---|
+| cancellation scan (`src/inference.c:serve` → `server/main.c:sink_cancelled` → `stream_out_peer_gone`) | atomic load; per-stream mutex + `poll(fd, 0)` syscall, ~1-2 µs | yes: per-job state, per-stream mutex | `synth_assert_scheduler()` asserts the thread; `slots[i]` flags are per row (OK) | **do not thread**: L7 already divides it by N. Better still, read the writer's `dead` atomic every iteration and `poll` only every N (H4). Lock-free, ~5 ns per row |
+| one-sync staging + noise draw (`pocket_onesync_step`) | 128 B memcpy + 32 Box-Muller normals ≈ 1 µs | yes: each context owns its RNG | the early-draw put-back must stay per row (it does) | prefer **L23** (draw while blocked in the previous sync). Free time, no threads |
+| step pre-flight / KV tables (`pocket_step_batch`, `pocket_cuda_backbone_step_batch_impl`) | ~0.3-0.5 µs with L10/L22 | yes (writes `scratch->...[i]`) | `pocket_cuda_backbone_reserve` may allocate device memory (must stay serial; rare) | no: too small |
+| emit (`pocket_emit_batch`) | ~0.3-0.5 µs | yes | `scratch->flow_*[gathered]` uses a running index (a prefix sum is needed); region calls go to costmap thread-local stacks | no: too small |
+| decode pre (`pocket_decode_audio_batch`: dup check, `decode_admit`, `pocket_cuda_codec_gang_upsample` staging, `pocket_decode_frame_prepare`) | ~1-1.5 µs | mostly. The dup check is O(n²) **across** rows | `pocket_decode_batch_drop` writes a shared `reported` flag and `error`. `mynah_backend_note_*` counters are plain ints. Fallback branches call the backend (`h2d`, `transform_one`). Device calls must stay on one thread, in order | partial: split into a pure-host per-row part (parallel) and a serial device part. Remove the dup check instead (A3) |
+| decoder submit (`pocket_cuda_decoder_submit_batch`, L11 table patch in `gpu/cuda/backend_cuda.cu:decoder_step_batch_impl`) | validation + table columns ~0.7-1.5 µs | the column scatter is row-parallel | inside the backend, writes the pinned tables of one graph (disjoint columns: safe) | maybe, inside the backend only. Low priority |
+| decode post (PCM placement, `pocket_all_finite` on 1920 floats, `pocket_decode_frame_finish`) | ~1.5-2.5 µs | yes | same `reported`/`error` and note counters | **best candidate** if threading at all. But the finite scan can first be made ~4-8× cheaper (A4) |
+| delivery (`stream_gang` → `slot_deliver` → `stream_callback`) | L19 on: ~1 µs (two lane mutexes + a 7.7 KB copy); L19 off: 3-7 µs (convert, ring copy, futex wake) | yes, per stream | `synth_assert_scheduler()`. Per-stream order must be preserved (L19 pins a stream to one helper). The callback updates `sink->first_audio_*` and `audio_samples` (per job: OK) | already offloaded by **L19**. Next: batch the hand-off per lane per step (H5) |
+| retire (`serve` retire loop, `slot_retire`) | ~8 retirements per iteration | no: swap-remove mutates the array; `on_done` order | — | do not thread. Offload host frees instead (A2) |
+| admission (`admit_pass` → `slot_start`) | ~8 × 1.4-2.2 ms | per request | — | the existing helpers (`MYNAH_ASYNC_ADMIT`) are the threaded form. See A1 |
+
+### 3b. Expected gain
+
+- **Row-parallel host work** that is not better removed first: decode pre + post + submit columns + emit ≈ 3-4.5 µs
+  per row. At 900 rows, 2.6 GHz, that is est. **2.7-4 ms per iteration**.
+- **Overhead per parallel region.**
+  - Fork/join on a spinning pool: ~2-5 µs. With parked workers (futex wake): ~20-50 µs. There would be ~3 regions
+    per iteration.
+  - The work stays memory-bound on the contexts: each row touches its own heap context. After a worker touches it,
+    the scheduler thread's next pass over the same context takes coherence misses (~50-100 ns per line). That claws back
+    part of the gain.
+- **Large host** (≥ 16 CPUs on the GPU's NUMA node), T = 4 workers pinned to that node, not on the scheduler's SMT
+  sibling, spinning ≤ 20 µs between regions:
+  - saving ≈ 3.3 ms × (1 − 1/4) − 3 × 5 µs − coherence ≈ **1.5-2.5 ms per iteration**;
+  - that is ~6-9 % of the 28 ms, so est. +3-5 % throughput while host-bound. With L13 hiding part of the host time,
+    the visible gain shrinks further.
+- **4-vCPU host (2 cores + SMT):**
+  - The scheduler already shares its 4 hyperthreads with the 4 L19 helpers, ~900 writer threads woken every step, the
+    HTTP workers, the CUDA driver threads, async-admit helpers if on, and the load client on the same host.
+  - A worker on the scheduler's SMT sibling makes both run at ~0.6× speed.
+  - Spinning workers steal exactly the cycles the writers and the client need. Parked workers cost a futex wake per
+    region, comparable to the work.
+  - **Expected: zero to negative.** F3 already showed that the 4-vCPU host was CPU-starved (C640: +17-22 % just from
+    more CPUs).
+
+### 3c. If it is built: shape and gating
+
+- `MYNAH_SERVE_HOST_THREADS=N` (default 0 = off). At start, refuse it with a start-up line unless all of these hold:
+  - the affinity mask holds ≥ 8 CPUs;
+  - N ≤ (CPUs on the GPU node − 2 − delivery helpers);
+  - one-sync is on.
+- **A private team**, not `mynah_parallel_for`.
+  - The GPU server runs the engine pool at `MYNAH_THREADS=1`. Its spin calibration was tuned for kernels, not for
+    ~1 ms host regions.
+  - The team is pinned to the GPU node: first the CPUs that are not SMT siblings of `mynah-sched`.
+  - It spins ≤ 20 µs, then parks.
+- Used only when rows ≥ `MYNAH_SERVE_HOST_PAR_MIN_ROWS` (default 256).
+- Contract per loop:
+  - a pure-host, per-row body that writes only its own context and a per-row result slot (error string, failed flag,
+    "note" increments);
+  - followed by a serial merge on the scheduler thread, in row order: first error reported, backend notes summed,
+    device calls issued.
+  - Because the merge runs in row order and the device work is issued from the scheduler thread in the same order, the
+    audio stays **id**. The bodies do not touch any shared float state.
+- Effort: **M-L** (2-3 days). The `pocket_decode_audio_batch` split into host/serial halves is the bulk of it, and it
+  must keep the CPU/compatibility schedule untouched.
+- Value: **low-medium, host-dependent.** Do it after section 4's A-items and L13 have been measured, and only if
+  level 2 then shows `dec.pre` + `dec.post` above ~3 ms per iteration on the target host.
+
+---
+
+## 4. Where the ~28 ms goes at ~900 rows (first-principles estimate)
+
+### Assumptions
+
+- 2.6 GHz host, flags package on, L13 off, ~900 live rows.
+- Pocket 12.5 Hz, `audio_emit_frames` = 1, so every row delivers one 1920-sample frame per step.
+- Mean request ~9 s of audio (from ~5.5 completions per iteration at C640). That gives ~8 admissions and ~8
+  retirements per iteration.
+- Cross-check against the 10-05 L40S logs (3.7 GHz host, all flags, C640/C768):
+  - iteration ~52 ms;
+  - `step` 75 % (~39 ms, of which ~29 ms device wait, so ~10.6 ms host inside `step_live`);
+  - `other` 24-25 % (~12.6 ms: admission, cancellation, prefill incl. its device time, retire);
+  - host 23-25 ms per iteration.
+
+  At 900 rows and a 1.4× slower host, ~28 ms is consistent with ~11-12 ms inside the step and ~15-17 ms outside it.
+
+### Estimate per phase
+
+| phase | per-unit cost (est., 2.6 GHz) | units per iteration | ms per iteration (est.) | basis |
+|---|---|---|---|---|
+| **admission: context build** (`slot_start` → `pocket_ctx_create`: `ar_states` + `codec_setup` + device) | 1.4-2.2 ms (measured on a warm pool) | ~8 | **11-16** | `[CTX]` breakdown: `ar_states` 0.45-0.97, `codec_setup` 0.53-0.87, device 0.13-0.35 ms; ~90 % host. Likely page-fault/memset bound (MBs of host state that device-owned rows never read) |
+| admission: `next_job` (`stream_out_start`: 1 MiB ring, `pthread_create`, setsockopt) | ~0.11 ms | ~8 | ~0.9 | measured `[ADM]` |
+| prefill pass (batched slices: host staging + launches; its syncs are device time) | 0.3-1 ms per call, host | 1-2 | 0.5-1.5 | `prepare_slice_batch`; not accounted today |
+| retire: `ctx_free` (fence, park, ~25 host frees incl. large buffers → munmap + TLB shootdown across a ~1000-thread process), `on_done`, stats | 50-200 µs | ~8 | 0.5-1.5 | code read |
+| retire scan + swap-remove (`synth_slot` ~500 B copy) | ~2 ns per row | 900 | <0.01 | |
+| cancellation (L7, every 4) | 1-2 µs per row / 4 | 900 | 0.25-0.5 | `poll` + mutex per stream |
+| step pre-flight + KV metadata (L10, L22) | 0.3-0.5 µs per row | 900 | 0.3-0.5 | |
+| one-sync staging + noise draw | ~1-1.3 µs per row | 900 | 0.9-1.2 | 16 Box-Muller pairs (log, sqrt, sincos) per row |
+| commit + finite gates + EOS copy | ~0.2 µs per row | 900 | ~0.2 | |
+| emit | 0.3-0.5 µs per row | 900 | 0.3-0.5 | region calls, flags, two 128 B copies |
+| gang selection | ~0.1 µs per row | 900 | ~0.1 | |
+| **decode, host side** | | | **3.5-5** | |
+| — dup check, O(n²) | n/2 compares × ~0.5 ns | 900 | ~0.2-0.25 | `pocket_decode_audio_batch`: **not** covered by L10's epoch stamp |
+| — admit, upsample staging (denorm 32 floats), `decode_frame_prepare` | ~0.8-1.2 µs per row | 900 | 0.7-1.1 | |
+| — Mimi tile tables, decoder candidates, submit validation, L11 column scatter | ~0.8-1.5 µs per row | 900 | 0.7-1.4 | |
+| — post-sync: 7.7 KB PCM copy (L20), finite scan of 1920 floats, `decode_frame_finish` | ~1.7-2.5 µs per row | 900 | 1.5-2.3 | the scan has an early exit per element, so it does not vectorise; CUDA host objects build at `-O2` without `-march` |
+| **delivery** (L19 on) | ~0.9-1.3 µs per row (deadline `now_ms`, 2 lane mutexes, 7.7 KB copy, rare wake) | 900 | **0.8-1.2** | `stream_out_deliver`. With L19 off: 3-7 µs per row = 2.7-6.3 ms |
+| fixed per step (graph launches, cuBLAS/tile launches, H2D/D2H issue, sync calls) | — | — | 0.5-1.5 | ~10-30 API calls at 2-5 µs |
+| cache misses on the per-row passes (~8 passes over 900 heap contexts) | 0.5-2 µs per row | 900 | 0.5-1.8 | contexts are large and spread out; L3-resident at best |
+| **total** | | | **~22-33** | brackets the observed ~28 ms |
+
+### Not on the scheduler thread, but competing with it for CPUs
+
+- The ~900 writer threads (`mynah-outFD`) are woken once per step each: 900 futex wakes, 900 context switches, and
+  900 `writev`s of ~3.9 KB into loopback TCP every ~60 ms.
+- That is est. 5-10 µs of CPU each, so **4.5-9 ms of CPU per iteration**, plus the same order for the client
+  receiving it on the same host.
+- On a 4-vCPU host this, not the scheduler's own code, is the likely reason F3 found the host CPU part of the ceiling.
+
+### Top candidates to cut, in order of expected ms per iteration per unit of effort
+
+Each candidate is an A/B flag, default off until measured, under the 3c close-out rule of the plateau note.
+
+**A1. Cheap admission** (est. **−8 to −13 ms**). Pick one of three ways, best first.
+
+- **(a) Pool the host halves of the context in the slot pool.**
+  - Targets: `src/engine_pocket.c:pocket_ctx_create` / `pocket_cuda_slot_park` / `pocket_ctx_free`.
+  - The parked set keeps the backbone and codec `transformer_ar` host states, the SEANet/codec host state, and the
+    `call` scratch.
+  - On take, reset by the same zeroing the fresh path implies. Better: do not allocate the host KV mirror at all for
+    device-owned rows (lazy-allocation mode in `src/transformer_ar.c`, already named as missing in
+    `.work/pocket-cuda-slot-pool.md`).
+  - id if the reset is exact. Prove it with the slot-pool leak check (same seed and text right after another
+    request).
+  - Effort M. No TTFA cost.
+- **(b) Quick measurement first:** `MYNAH_ASYNC_ADMIT=2 MYNAH_ASYNC_ADMIT_INLINE=0..2`, a one-line config change.
+  - The default inline threshold of 8 equals the steady-state admission rate at 900 rows, so today every admission is
+    built on the scheduler thread.
+  - Costs one iteration of TTFA (+67 ms p95 measured on the L4).
+  - Large host only: the helpers contend on 4 vCPUs (context build rose 2.2 → 3.1 ms there).
+- **(c) With L13 on**, admission runs while AR k+1 is in flight (~11-13 ms), so (a) and L13 compound. Admission alone
+  (~11-16 ms) is larger than the window L13 opens, so without (a) the overlap is still not enough.
+- **First confirm the term** with level 2 (`admit.ctx` ms per admission, and minor faults per iteration of the
+  scheduler thread).
+
+#### A1a design: pool the host halves of the context (`MYNAH_CTX_HOST_POOL`, coded 2026-10-06, untested on GPU)
+
+**Flag.** `MYNAH_CTX_HOST_POOL` = unset/`0` off, `1` on, `2` on and every renewed KV cache zeroed (the leak A/B, as
+`MYNAH_CUDA_SLOT_POOL_ZERO_KV` is for the device KV). Read once at model load (`pocket_host_pool_setting`, one
+start-up line). Works on every backend: it is host memory only, so the CPU server and the CLI exercise it too.
+
+**What a cost is made of (per context, pocket-en, ~1100-position backbone).**
+
+| part | host bytes | what a fresh build pays |
+|---|---|---|
+| backbone `transformer_ar` state: KV `6 x 2 x cap x 1024` floats | ~53 MB | `calloc` above the mmap threshold: an `mmap` now, an `munmap` (+ TLB shootdown across ~1000 threads) at free; pages fault only if touched |
+| backbone row scratch (16-row prefill tile) + refs + scores | ~0.72 MB | heap `calloc` = memset |
+| Mimi `transformer_ar` state: windowed KV `2 x 2 x 500 x 512` + scratch | ~4.4 MB | heap `calloc` (the dynamic mmap threshold has risen past it after the first free) = 4 MB memset |
+| SEANet state: ops + arena (rings, upsample, 3 work buffers) | ~2 MB | heap `calloc` = memset, plus building the ops twice |
+| flow head, three projection scratches | ~0.1 MB | small `calloc`s |
+
+That is the `[CTX]` `ar_states` (0.45-0.97 ms) and `codec_setup` (0.53-0.87 ms) columns: memsets and page faults of
+memory a device-owned row then never reads.
+
+**What is pooled.** `pocket_host_set` = the two `transformer_ar` states, the flow head, the SEANet state and the three
+`pocket_call` scratches. `pocket_ctx_free` parks them (`pocket_host_pool_park`, before the host frees, which then see
+NULLs); `pocket_ctx_create` takes the set whose backbone cache fits the request most tightly, else the largest
+(`pocket_host_pool_take`, mutex, any thread), and each build line becomes "renew the pooled part, or build new if it
+cannot be renewed" (`pocket_host_take_ar/_flow/_seanet/_call`). The shell stays on the context (`ctx->host_set`) and
+carries the parts back at free. Cap `POCKET_MAX_BATCH` sets, as the slot pool; a full pool frees as before. Drained at
+model free.
+
+**Reset contract (byte-equivalent to a fresh build for everything a request can read).**
+
+| part | renew | why it equals fresh |
+|---|---|---|
+| `transformer_ar` state | `mynah_transformer_ar_state_renew(state, config, zero_kv)`: config must equal the state's except `max_seq_len`, and the allocation must hold the new layout. Sets offset 0, window base 0, `kv_positions`/`kv_half`/`kv_layer` by `_new`'s own window rule, RoPE = the shared table for the new length (what `_new` takes; an owned table only serves its own length). Row scratch, refs and scores are zeroed **only if written** (`scratch_dirty`, set by `_prefill`, `_step`, `_step_batch`) | offset/base/layout/RoPE are recomputed exactly as `_new`; scratch is zero as calloc left it. The KV is **not** zeroed: attention reads only `[kv_base, offset)`, positions the request itself wrote — the contract `_reset` (segments, rewinds) already relies on, and the one the CUDA slot pool relies on for the device KV. `=2` zeroes it to prove that on the box |
+| SEANet state | `mynah_seanet_state_renew`: arguments must equal the build's; arena memset **only if written** (`arena_dirty`, set by `_decode`, `_upsample`, `_set_upsample_tail`; `_reset` writes only zeros); ops and conv structs memset and rebuilt by `sea_state_carve`, the code `_create` now calls | `_create` = calloc'd arena + `sea_state_carve`; renew = zero arena + the same `sea_state_carve` |
+| flow head | `mynah_flow_head_renew`: same config; everything after `freqs` zeroed, time memo invalid | `freqs` is a pure function of the config |
+| projection scratch | same `rows`/`k_max`, all four arrays zeroed | calloc-equivalent; hook and `in_prefill` set as `_call_init` sets them |
+
+The prologue then resets offsets, rings, flow memo and EOS state exactly as it always did. Self-tests: a state built
+for a longer request, run to the end of its window on other input, renewed, is bit-identical to a fresh one
+(`transformer_ar` unwindowed and windowed, zero_kv 0/1; SEANet chunked decode; flow head), and renews with other
+arguments refuse without changing anything.
+
+**Host mirrors device-owned rows never read.** Not skipped, deliberately:
+- the backbone host KV of a device-owned row is seeded by `set_offset` only and, in an all-device-owned batch (the
+  ~1000-row steady state), never mirrored (`mirror_host = all_owned ? 0 : 1`); a mixed batch or the single-row
+  fallback writes just each step's own slot. So its pages are (almost) never faulted in, and a pooled one costs
+  virtual address space (~53 MB x parked sets), not RSS. Pooling already removes its only remaining cost
+  (`mmap`/`munmap`). Skipping it would need a lazy cache in
+  `transformer_ar.c` plus a story for the CPU fallback a context keeps until `prepare` decides it is device-owned;
+- the row scratch, scores and SEANet arena of such a row are never written, and the dirty flags make renew skip them;
+- the Mimi host window is still uploaded whole at the first frame without `MYNAH_CUDA_ROW_MEM_DIET`
+  (`pocket_cuda_codec_prepare_window`), so with the pool it uploads the previous owner's bytes in slots the device then
+  only reads after writing them (same argument as the KV); with the diet it is never touched.
+
+**Memory.** Parked sets ≤ peak concurrent contexts (a set exists only because a context needed it). RSS per parked
+set ≈ what its last owner touched: for device-owned rows the Mimi window (if uploaded) and the projection scratch,
+~0.1-4.5 MB; the backbone KV stays unfaulted. Versus today: the same bytes stay mapped instead of being returned and
+re-faulted, and no `munmap` per retirement.
+
+**Interactions.**
+- **L6 / slot pool / fences:** independent. The host set holds no pinned or device memory and nothing on the stream
+  refers to it (pageable copies complete or are staged before the call returns), so parking needs no fence. The CUDA
+  slot pool still takes/parks its set in `pocket_ctx_pinned` / `pocket_cuda_slot_park` unchanged.
+- **`MYNAH_CUDA_SLOT_POOL_PREFILL`:** its N concurrent warm-up requests leave N host sets parked too, sized for its
+  sentence; the first client admissions take them (best fit, else largest with the backbone rebuilt).
+- **L13 (step overlap):** `pocket_ctx_free` discards a queued frame first (unchanged), then parks; the queued step
+  only touches device memory and pinned staging.
+- **`MYNAH_ASYNC_ADMIT`:** helpers take sets under the pool mutex; park is on the scheduler thread.
+- **Cancellation / failure paths:** every failure in `ctx_create` goes through `pocket_ctx_free`. A context missing
+  any part (failed build) frees its parts and the shell as before; a part that cannot be renewed is freed and built
+  new; `reserve_text`'s rebuilt backbone is fresh and is simply parked later.
+- **Flag off:** `state->ctx_host_pool == 0` → no take, every build line is the original call, no park. The only
+  flag-off differences are bookkeeping stores (`scratch_dirty`, `arena_dirty`, capacity fields) and
+  `mynah_seanet_state_create` calling the extracted `sea_state_carve` (same statements, same order).
+
+**Profile.** With `MYNAH_SERVE_PROFILE` and the pool on, the `[CTX]` line gains
+`| host_pool: pooled N (x ms) fresh M (y ms)` (take through the projection scratch, mean per context). The
+`ar_states` and `codec_setup` columns are where the drop should show.
+
+**Verified locally (Mac, CPU).** CPU and server builds; `make test-c` (incl. the new self-tests); GCC 16 and Clang
+`-Wall -Wextra -O2 -DMYNAH_ENABLE_CUDA -DMYNAH_ROW_CAP=1024u` on the four touched files: no new warnings. CLI
+`--batch 4` WAVs identical at `MYNAH_CTX_HOST_POOL=0/1/2` (the CLI loads the model per run and its batch rows are
+concurrent, so it only proves the fresh path is unchanged with the flag on). CPU server, 8 requests (sequential,
+different voices/lengths/seeds, two repeats after other requests, a concurrent pair, one after the pair): 8/8 WAVs
+identical at `0/1/2`; a temporary trace confirmed the server's admissions after warm-up take pooled sets.
+
+**Box test (order).**
+1. Identity, flag off vs `1` vs `2`: CLI `--batch 32` WAVs (fresh path only); server C1 sequence (the 8 requests
+   above) on the CUDA server with all 11 flags; md5 equal across the three. The server run is the one that reuses.
+2. A/B at C768 / C896 / C1024 with all 11 flags on, `MYNAH_SERVE_PROFILE=1`, 2-minute levels, ABBA: watch `[CTX]`
+   mean and `ar_states` + `codec_setup` (expect ~1.5 → ≤0.3 ms), host ms per iteration (expect −8 to −13 ms at
+   ~900 rows), RTF p95, TTFA p50/p95, stalls, and RSS.
+
+#### A1b design: device-side request sets with no driver call on take (`MYNAH_CUDA_SLOT_FIXED`, coded 2026-10-07, untested on GPU)
+
+**Problem (measured).** On one host (RTX 6000 Ada, EPYC 7C13, driver 565) `[CTX] cuda_backbone` is 10-12 ms per
+admission with all 11 flags and A1a, against < 1 ms on the L40S host (driver 575). C768 there: 376 audio-s/s against 867
+on the L40S. (The `MYNAH_CUDA_KV_VMM=1` arm at 7.5 ms was not VMM: VMM is ignored with the default int8 KV, so it was the
+same int8 plane-major path and the difference is run-to-run.) The cost is the misfit take: the slot pool keeps a
+parked backbone KV only if it holds the new request's starting estimate and, for a growable cache, is at most 2x it
+(`pocket_cuda_slot_kv_fits`). With a mixed corpus (12-531 characters, so starting estimates from ~260 to ~640 stored
+positions) most takes miss and do `cudaFree` (which waits for the whole device, i.e. behind the queued step) plus
+`cudaMalloc`. The driver decides how expensive that is, which is why the same code costs 1 ms on one host and 12 on
+another.
+
+**Flag.** `MYNAH_CUDA_SLOT_FIXED` = unset/`0` off, `1` on. `MYNAH_CUDA_SLOT_FIXED_POSITIONS` (default 384 since sizing
+v2, was 512; 64..65536, rounded up to 64; setting it also stops the one-time adaptation) is the fixed size in stored
+positions; `MYNAH_CUDA_SLOT_FIXED_ROWS` (default the build's `ROW_CAP`)
+the rows the start-up plan sizes for. Read once at model load (`pocket_cuda_slot_fixed_resolve`, one start-up line),
+after the KV element type is decided. Needs the slot pool, `MYNAH_CUDA_KV_GROW` and `MYNAH_CUDA_PREFILL_TILE` (all
+default); otherwise a warning and today's pool.
+
+**Why not "the maximum a request can need".** The step budget is 1500 frames, so a request can reach ~1650 stored
+positions: 82 MiB per row with int8 records at 24 layers, 31 GiB at 384 rows and 82 GiB at 1024. No GPU here holds that.
+So the fixed size is the ceiling of the ordinary request instead: 512 positions holds every request of the v2 reference
+corpus, text plus its frames (the longest, ~130 tokens, reach ~420), without growth. A request past it keeps the
+growth path every row already has.
+
+**Mechanism** (`src/engine_pocket.c`).
+- **New cache** (`pocket_cuda_backbone_alloc`, no cache came from the pool): a growable, non-VMM row allocates
+  max(estimate, fixed) bytes, if `pocket_cuda_slot_fixed_claim` allows it (count below the cap, and the device keeps
+  max(1 GiB, total / 20) free after it; the free-memory query only runs on this path, which allocates anyway). The row
+  is laid out over all of it (capacity = what the bytes hold, never past the host ceiling), so it grows later or never.
+  The context carries `cuda_backbone_kv_fixed`; park moves the mark to the set (`bb_kv_fixed`, the owning state).
+- **Take** (`pocket_cuda_slot_acquire`): for a growable plain request a fixed set wins over any other: the tightest at
+  or above the estimate, else the largest; ties go to the set parked earliest (furthest down the LIFO list), whose
+  fence most likely passed already. Then in `pocket_cuda_backbone_alloc` a fixed cache is kept whenever it holds the
+  prefill and the first step (voice + text + 1 positions, minus the voice prefix it does not store), whatever the 2x
+  rule says. If the estimate is larger, the row starts at the fixed capacity and grows only if it really gets there
+  (the estimate is 3 frames per token + 64; the measured rate is 2-2.6). No `cudaFree`, no `cudaMalloc`, no VMM call,
+  no clearing.
+- **What a take still does:** the fence wait of its own set (`cudaEventSynchronize` on that set's event, L6, unchanged:
+  never a device-wide sync), the async Mimi window and decoder zeroing (`cudaMemsetAsync`, stream-ordered, unchanged),
+  and the pinned host memsets (CPU). With `MYNAH_CUDA_SLOT_POOL_ZERO_KV=1` the KV is cleared with an async memset too.
+- **Retire** (`pocket_cuda_slot_park`): a fixed cache goes back whole. One that grew past 2x the fixed size is left on
+  the context and freed by the ordinary release (with the drain that path always had), so the pool does not keep long
+  requests' caches; rare by construction (> 1024 stored positions at the default).
+- **Accounting:** `cuda_slot_fixed_live` (atomic) counts fixed caches; every free of one (pool destroy, misfit at a take,
+  release, model teardown) decrements it. A fixed cache that grew stays one fixed cache.
+- **Not touched:** VMM rows (BF16 only; never fixed), full-capacity rows (not growable), the codec and decoder halves
+  (their geometry is fixed already: a pooled set always fits, with async zeroing).
+
+**Audio identity.** The cache bytes a request reads are the ones it wrote: attention reads only positions
+`[voice, offset)` it wrote itself (the voice prefix comes from the shared model voice cache), the same contract every
+reused or fresh cache relies on (a fresh `cudaMalloc` is uninitialised too). The capacity (row stride) differs from the
+estimate, which the existing reuse path already does (a larger parked cache is laid out over all its bytes) and which
+the kernels take per row; growth copies the live prefix, the property `MYNAH_CUDA_KV_GROW_INITIAL_STEPS` tests.
+`MYNAH_CUDA_SLOT_POOL_ZERO_KV=1` is the leak A/B.
+
+**Flag off = today's code path.** `state->cuda_slot_fixed` stays 0, so: the acquire's fixed candidates are never set
+(pick unchanged); `bb_kv_fixed` is only ever set from `cuda_backbone_kv_fixed`, which only the fixed paths set, so the
+take's `fixed_fit` is 0 and the fits test is the old one; the new-cache block is guarded by the flag; the park's
+oversize test returns 0 for an unmarked cache; the count updates only run for marked caches. The remaining flag-off
+differences are a thread-local load in the backend's allocation/free/zero/fence entry points (the meter below) and
+two struct fields.
+
+**Sizing v2 (2026-10-07, after the RTX 6000 Ada run; coded, untested on GPU).** The first version ran out of VRAM at
+C896 (833 fixed caches live, 467 over-cap takes). Cause: the cap was planned at model load, before the server's
+width-bucket walk. The walk runs `--max-inflight` requests of a long text at once, so every one of them got a fixed
+cache of max(estimate, F) = up to ~650 stored positions (~32 MiB), and those stayed in the pool as fixed caches. Most of
+the "~40-45 GB of graph warm-up at 1024 rows" is that per-row KV plus the other per-row buffers; the graphs themselves are
+small. Changes:
+- **Cap after the warm-ups.** New public `mynah_tts_startup_mark(serving)`; the server calls it after the width walk
+  (`0`) and after the slot-pool prefill (`1`). At the next admission after each mark, `pocket_cuda_slot_fixed_replan`
+  drains once (the device is idle there), frees every parked cache outside [F, F + 256 positions] (the walk's) and
+  adopts the plain ones inside it, measures free memory and sets
+  `cap = min(rows + spares, live + (free - margin) / F)` (`mynah_backend_fixed_buffers_refit`),
+  `margin = max(2 GiB, total / 16) + (rows - sets made) x 9 MiB + the spare reserve's bytes above F`. It then gives
+  every parked set without a cache one of F and makes the growth reserve (`rows / 32`, min 4, caches of F + 256
+  positions), both within the cap. One log line per mark (`re-planned after the start-up warm-ups` / `(serving
+  next)`). The load-time plan stays as the provisional cap, so the CLI (no marks) behaves as before.
+- **F from data.** Default 384 stored positions = text + frames (the voice prefix is shared, not stored): ~60 tokens +
+  ~320 frames, ~26 s of audio at 12.5 Hz. On the v2 corpus (150 texts, 12-531 characters, p50 58, p90 479) about 90 %
+  hold without growth; the longest (~130 tokens, ~430 positions) grow once, now without a sync. Once serving, the engine
+  keeps histograms (64-position buckets) of the admission's estimate and of the length each request really reached;
+  after 1024 served retirements F moves once to the p95 of the real lengths, clamped to [320, 768], for caches made
+  from then on (made caches keep their size; each still serves any request whose prefill it holds).
+- **Growth with no device-wide sync** (`pocket_cuda_fixed_grow`). The new cache is (1) the tightest spare that holds the
+  new size, else (2) the smallest parked set's fixed cache that holds it (the set is left without one and gets the old
+  cache back), else (3) a new allocation if the cap allows. The live prefix is copied with `cudaMemcpyAsync` on the
+  stream, the row is laid out over all of the new cache, and the old cache is parked (a set without a cache first,
+  then the spare list, at most `rows / 8`, min 16), never freed. This is safe because there is one stream: the next
+  user of the old cache is ordered after this row's queued work, and the host never reads or writes a KV cache. A
+  failed copy surfaces at the step's sync, like any kernel. Only when (1)-(3) all fail, or the spare list is full, does
+  the old path (allocate + `cudaStreamSynchronize` + `cudaFree`) run: `grow ... sync` in `[CTX]`.
+- **No free on the admission path.** With the flag on, any parked plain cache that holds the request's prefill and
+  first step is reused (not only fixed ones). A parked cache too small even for that is parked aside (adopted as fixed)
+  instead of freed. A row whose set brought no cache takes a spare first (the tightest at or above its estimate, else
+  the largest that holds its prefill), then a new fixed cache within the cap, then over-cap the plain allocation as
+  before (counted `over-cap`). A fixed cache that grew past 2 F is parked aside at retirement when there is room,
+  and freed (with the drain) only otherwise (`trimmed`).
+- **`[CTX]`** adds `parked P spares S (taken T) grow: spare a set b alloc c sync d | len stored p50/p95 x/y (estimate
+  p95 z, n N) F f`.
+- **Self-tests** (`make test-c`): the re-plan arithmetic (`mynah_backend_fixed_buffers_refit`, five cases + overflow +
+  bad arguments) in the CPU backend self-test, and `mynah_engine_pocket_slot_fixed_self_test` in `--self-test`. The
+  second runs the host-side bookkeeping on a model-less state with host tokens for caches: where a parked-aside cache
+  goes, which spare or set cache a take or growth gets, the count against the cap, the oversized rule and the
+  percentiles. A mutation (wrong band size) makes it fail.
+- **Flag off.** Unchanged paths: every new branch tests `cuda_slot_fixed`. Two exceptions, both unreachable with the
+  flag off: the set-without-a-cache branch in `pocket_cuda_backbone_alloc` (only the flag leaves a set like that) and
+  the spare loop in the pool drain (the list is empty). The server's two `mynah_tts_startup_mark` calls only bump an
+  atomic.
+
+**VRAM math, sizing v2** (int8 records, 24 layers: 52,224 B per stored position; F = 384 is 19.1 MiB, F + 256 is
+31.9 MiB). Assumes 4.1 GiB for weights, CUDA context, graphs and scratch, derived from the Ada flag-off arm: 24,818 MiB
+ready at 896 sets, minus 896 x (9 MiB other + 14.0 MiB prefill-sized KV). Free after the warm-ups = total - 4.1 GiB -
+rows x 9 MiB (all sets made by the walk, their KV freed by the re-plan). Spares = rows / 32. "Left" is what remains
+free after the fixed caches and spares, margin included.
+
+| GPU (total) | rows | free after warm-ups | margin | F=384: cap | KV + spares | left | F=512: cap | left |
+|---|---|---|---|---|---|---|---|---|
+| L4 (22.5 GiB) | 384 | 15.0 GiB | 2.0 | 396 (all + 12 spares) | 7.2 + 0.4 GiB | 7.5 GiB | 396 | 5.0 GiB |
+| L4 | 768 | 11.7 GiB | 2.0 | **500** (auto-capped) | 9.3 GiB | 2.3 GiB | 375 | 2.3 GiB |
+| L4 | 1024 | 9.4 GiB | 2.0 | **374** | 7.0 GiB | 2.4 GiB | 281 | 2.4 GiB |
+| L40S (~44.5 GiB) | 384 | 37.0 GiB | 2.8 | 396 | 7.2 + 0.4 GiB | 29.5 GiB | 396 | 27.0 GiB |
+| L40S | 768 | 33.7 GiB | 2.8 | 792 | 14.3 + 0.8 GiB | 18.6 GiB | 792 | 13.6 GiB |
+| L40S | 1024 | 31.4 GiB | 2.8 | 1056 | 19.1 + 1.0 GiB | 11.3 GiB | 1056 | 4.7 GiB |
+| RTX 6000 Ada (47.4 GiB) | 384 | 39.9 GiB | 3.0 | 396 | 7.2 + 0.4 GiB | 32.4 GiB | 396 | 29.9 GiB |
+| RTX 6000 Ada | 768 | 36.6 GiB | 3.0 | 792 | 14.3 + 0.8 GiB | 21.5 GiB | 792 | 16.5 GiB |
+| RTX 6000 Ada | 1024 | 34.3 GiB | 3.0 | 1056 | 19.1 + 1.0 GiB | 14.2 GiB | 1056 | 7.6 GiB |
+
+The L4 is the target at <= 384 rows only; past that it auto-caps (as the flag-off path, the rows past the cap allocate
+plain estimate-sized caches). The "left" column must cover what the table does not model: the KV of rows past the cap,
+growth beyond the spares (a new allocation of F + 256 each), live rows' extra graph widths, and the transient of a
+fallback growth. Check it on the box: `nvidia-smi` at the end of each arm, plus the two re-plan lines.
+
+**VRAM cost (first version, load-time plan).** Per row: `positions x layers x 2 x record x element` = 512 x 24 x 2 x 1088 B = **25.5 MiB** (int8 records,
+24L; BF16 would be 48 MiB). Total: `rows x 25.5 MiB`. Start-up plan (`mynah_backend_fixed_buffers_plan`):
+`cap = min(rows, (free - reserve) / per_row)`, `reserve = max(4 GiB, total / 5) + rows x 9 MiB` (the other per-row
+device buffers without the row diet; the fifth covers weights uploaded lazily, graphs, scratch and transients). 0 →
+refused (start-up line, today's pool); `< rows` → auto-capped (rows past the cap use today's pool). Estimates with free
+≈ total − 1 GiB at load:
+
+| GPU (total) | rows | fixed KV | reserve | budget | cap |
+|---|---|---|---|---|---|
+| L4 (22.5 GiB) | 384 | 9.56 GiB | 7.88 GiB | 13.6 GiB | 384 (all) |
+| L4 | 1024 | 25.5 GiB | 13.5 GiB | 8.0 GiB | **321** (auto-capped) |
+| L40S (45 GiB) | 384 | 9.56 GiB | 12.4 GiB | 31.6 GiB | 384 |
+| L40S | 1024 | 25.5 GiB | 18.0 GiB | 26.0 GiB | 1024 (0.5 GiB spare) |
+| RTX 6000 Ada (48 GiB) | 384 | 9.56 GiB | 13.0 GiB | 34.0 GiB | 384 |
+| RTX 6000 Ada | 1024 | 25.5 GiB | 18.6 GiB | 28.4 GiB | 1024 |
+
+Against today: a row's starting cache is text + 256 (≤ 64 tokens) or text + 512 positions, and parked sets keep up to
+2x that, so 512 is close to today's mean; the extra peak is est. ≤ 5-8 GiB at 1024 rows. On the L40S at C1024 this is
+the item to watch (`nvidia-smi` at the end of each arm); `MYNAH_CUDA_SLOT_FIXED_POSITIONS=384` is 19.1 MiB per row.
+
+**Profile** (`MYNAH_SERVE_PROFILE=1`). The backend gained a thread-local driver-call meter
+(`mynah_backend_call_meter_set`): while set, `dev_alloc`/`dev_alloc_bytes`/`host_alloc`/`decoder_open` (malloc),
+`dev_free`/`host_free`/`kv_vmm_free`/`decoder_close` (free), `kv_vmm_alloc`/`kv_vmm_resize` (vmm), `zero_dev`/
+`decoder_reset` (memset), `fence_wait` (event) count calls and time. Each admission meters the pool take + pinned
+staging and the device half into `ctx->ctxp_calls`; the `[CTX]` line gains
+`| admit calls: zero-call N fallback M; malloc n ms free n ms vmm n ms memset n ms event n ms` (counts in total, ms
+mean per context; fallback = any malloc/free/vmm call) and, with the flag on,
+`| fixed: live L/cap C reused R (short S) new N over-cap O misfit X trimmed T`. That works with the flag off too, so
+the off arm shows where today's 10-12 ms go (free vs malloc vs fence wait). Self-test: the CPU backend self-test checks
+the meter counts exactly the calls made while it is set and the plan arithmetic (`make test-c`).
+
+**Box test** (`.work/l40s-2026-10-06/jobs/a1b.sh`, tree `/root/ma1b`, ROW_CAP 1024, single NUMA node, no pinning).
+Sizing v2: the speed arms are C768/C896/C1024 (server `--max-inflight 1024`). Read the two `re-planned` lines (cap,
+kept/freed/made, spares). In `[CTX]`, expect over-cap 0 at C896 and `grow ... sync` near 0 on the Ada and the L40S.
+1. Identity, flag off vs on: CLI `--batch 32`, CLI `--batch 32 --stream`, server C1 sequence (166 WAVs); plus
+   `ZERO_KV=1` with the flag on. All must match the flag-off reference.
+2. Speed at C768/C896, 2-minute levels, PRE=640: A = defaults + A1a, B = A + A1b, then A again (ABA). Read `[CTX]`
+   (`cuda_backbone` ms, zero-call vs fallback, per-kind ms), audio-s/s, RTF p95, TTFA p95, stalls and VRAM.
+   Pass: `cuda_backbone` < 1 ms with zero-call ≥ 95 % of takes, audio-s/s up at C768 on this host, bit-identical, no
+   failures. Then one L4 run (ROW_CAP 384) to check the cap and no regression before any default change.
+
+#### Reading of the `MYNAH_ASYNC_ADMIT` OOM at 1024 rows (code only, not reproduced)
+
+- **The hypothesis "async-built contexts bypass parked slots" does not hold.** `ctx_new_host` (helpers) builds only
+  host state; `ctx_attach` → `pocket_ctx_pinned` → `pocket_cuda_slot_acquire` runs on the scheduler thread with the
+  same arguments as the synchronous path (`pocket_cuda_kv_initial_capacity` and `pocket_cuda_kv_vmm_planned` read
+  nothing the helper built), then `pocket_ctx_device` allocates exactly as `ctx_new` does. A `starting` slot counts in
+  `used`, so live sets stay ≤ slot capacity.
+- **Device memory outside the pool, per row:** (1) an empty pool → a whole new set; (2) a misfit take (KV larger than
+  2x need, or smaller) → the parked KV is freed and a new one `cudaMalloc`ed; (3) KV growth without VMM →
+  `cudaMalloc(new)` + copy + free (transient 2x). Per process: width/gang CUDA graphs, `ensure_scratch` growth (frees
+  and re-allocates the shared scratch in 32 MB steps), shared voice KV per speaker. Parked sets are never trimmed:
+  total sets = high-water of live + parked, up to `ROW_CAP` parked.
+- **Most likely mechanism for "out of memory" with 14 GB free: a stale runtime error.** The message is the
+  scheduler's per-row fallback print (`pocket: device-owned row %zu step rc=%d: %s`), i.e. the batched step had
+  already failed. Many allocations are treated as recoverable and their error is swallowed (`ignored` buffers in
+  `pocket_cuda_host_buffer`, the pcm pinned alloc, `POCKET_CUDA_ALLOC` in `pocket_cuda_backbone_alloc` → silent CPU
+  fallback, codec/decoder allocs), but `cudaMalloc`/`cudaHostAlloc` failures also set the runtime's per-thread last
+  error, and ~130 launch checks in `backend_cuda.cu` read `cudaGetLastError()`. So one recoverable allocation
+  failure (a transient peak, e.g. a non-VMM KV grow or a misfit re-allocation during a 1000-row burst, or a pinned
+  host allocation) is reported later by an unrelated kernel launch as "CUDA: out of memory", failing a batched step
+  that was fine. Async admission does not cause it but can make it likelier: a burst's attaches all land in one
+  `async_collect`, after retirements but before the next step, so more takes find the pool momentarily without a
+  fitting set.
+- **Not fixed here** (it is in `gpu/cuda/backend_cuda.cu`, which cannot be compiled on the Mac). Small and safe fix
+  for the next box: in `mynah_cuda_dev_alloc`, `_dev_alloc_bytes`, `_host_alloc` (and the VMM map path), call
+  `(void)cudaGetLastError()` after a failed allocation so a handled failure cannot poison the next launch check.
+  Discriminating run first: the same arm with `MYNAH_SERVE_PROFILE=1` and the device-free bytes printed at the first
+  failed allocation (one diagnostic line in `ce()` on `cudaErrorMemoryAllocation`, naming the call).
+
+**A2. Reaper for host frees** (est. −0.3 to −1 ms).
+- `pocket_ctx_free`'s host `free`s and `stream_out` teardown (1 MiB ring munmap, writer thread exit) go to a helper
+  thread through a list. The device parts stay as they are (L6 fence).
+- The large `free`s → `munmap` → TLB-shootdown IPIs hit every CPU the process runs on. With ~1000 threads that is all
+  of them.
+- Also allocate the 1 MiB stream ring from a recycled pool (`server/stream_out.c:stream_out_start`), which removes an
+  mmap/munmap pair per request.
+- id. Effort S-M.
+
+**A3. Epoch-stamp the decode-gang duplicate check** (est. −0.2 ms, grows as n²: −0.3 ms at 1024).
+- `src/engine_pocket.c:pocket_decode_audio_batch` still runs the O(n²) loop. L10 covers only `pocket_step_batch`.
+- Reuse `MYNAH_DUP_CHECK_EPOCH`. id. Effort S.
+
+**A4. Branch-free finite scans** (est. −0.5 to −1 ms).
+- `pocket_all_finite` exits early per element, so it cannot vectorise.
+- An OR-reduction of `(bits & 0x7f800000) == 0x7f800000` over the row, with one test at the end, vectorises even at
+  `-O2`.
+- Better still: L20's gather kernel computes the per-row flag on the device (the plateau note says L20 does this; the
+  host scan in the post-sync loop is still there). Then the host scan of 1920 floats per row goes away.
+- Same treatment for the 2 × 32-float scans in the one-sync commit.
+- id (same predicate). Effort S.
+
+**A5. L23 noise ahead** (est. −0.9 to −1.2 ms at 900 rows; the plateau note's 0.4-0.7 ms was for 640 rows on a faster
+host). Already planned; the draw moves into the shadow of the previous sync. id.
+
+**A6. One timestamp per step for the deadline check** (est. −0.02 to −1 ms, clocksource-dependent).
+- `server/main.c:stream_callback` calls `now_ms()` per row.
+- Pass a per-step "now" through the sink (or cache it in a scheduler-thread global set at the `sink_phase`
+  boundary).
+- Check the clocksource first: on a syscall clocksource this is ~1 ms per iteration. id. Effort S.
+
+**A7. Batched L19 hand-off** (est. −0.3 to −0.6 ms).
+- `stream_out_deliver` takes the lane mutex twice per row: once for the spare pop, once for the append.
+- Instead, collect the step's items per lane in a scheduler-local list and splice each lane once per step: 4 lock
+  pairs instead of 1800.
+- Also keep the items' PCM capacity at one frame from the start (no `realloc` on warm-up). id. Effort S.
+
+**A8. Lock-free cancellation** (est. −0.2 to −0.4 ms with L7=4).
+- `sink_cancelled` reads `out->dead` (atomic, already maintained) and `j->gave_up` every iteration. It calls the
+  mutex + `poll` probe only every N iterations, since the writer usually finds the hangup first anyway.
+- id (same outcomes, noticed at most N−1 frames later, as with L7). Effort S.
+
+**A9. Writer model** (CPU budget, not scheduler time; est. frees 4-9 ms of CPU per iteration on the host). Medium
+term.
+- Replace one writer thread per stream with the L19 helpers writing directly to non-blocking sockets.
+- Each stream gets a small pending buffer; `epoll` is used only for EAGAIN, and one `writev` is made per stream per
+  step.
+- This removes ~900 wakes and context switches per step and ~900 thread stacks.
+- Effort L (`server/stream_out.c`, the cancellation and backpressure contract must be kept). Value: high on small
+  hosts, relevant for C1024 anywhere.
+
+**A10. Pinning and topology line.**
+- `mynah-sched` goes on the GPU's NUMA node, away from SMT siblings of busy threads. Print the clocksource, MHz and
+  governor at start-up.
+- 3f measured 61 → 46 ms host per iteration from the NUMA pin alone. Effort S.
+
+**Then L13** (dispatch-ahead): it hides retire, admission and cancellation behind AR k+1.
+
+**Then, only if level 2 still shows decode pre/post above ~3 ms per iteration on a large host:** the opt-in host thread
+team of section 3c.
+
+### Rough total
+
+- A1(a) + A2-A8 remove est. **11-19 ms** of the ~28 ms: host per iteration ~10-17 ms at 900 rows.
+- With L13 hiding a further part, the GPU-busy share should move from ~65 % toward 80-90 %. Those are the conditions
+  under which C1024 at RTF p95 < 0.88 becomes plausible on one L40S.
+- All of this is an estimate. The first job on the next box is one level-2 run at C896 that replaces this table with
+  measured numbers.
+
+## 5. Next steps
+
+1. Implement `MYNAH_SERVE_PROFILE=2` (section 2) and the topology line (A10). ABBA the overhead on the Mac CPU server,
+   then on the box.
+2. One box run, all flags, C896, level 2 + `MYNAH_SERVE_TRACE` window + `nsys` with `NVTX=1` for 30 s. Replace the
+   section 4 table with measured numbers.
+3. A1(b) as a config-only arm (async admit, inline 0) at C896 to bound A1's value before writing A1(a).
+4. A3, A4, A6, A7, A8 (all S, all id) as one package with leave-one-out, then A1(a), A2, L23.
+5. Re-measure with L13; decide on section 3 only then.

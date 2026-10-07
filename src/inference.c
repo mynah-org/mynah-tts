@@ -211,6 +211,20 @@ typedef struct {
      * collected by `ticket`. */
     int starting;
     unsigned long long ticket;
+    /* MYNAH_CUDA_STEP_OVERLAP: this slot's context is row `ahead_pos` of the
+     * step queued ahead (`step_launch`). The step that finishes it is already
+     * decided, so retire leaves the slot alone until then. */
+    int ahead;
+    size_t ahead_pos;
+    /* MYNAH_CUDA_DECODE_OVERLAP: this slot's context is member `dec_pos` of
+     * the decode gang in flight (`decode_submit`); its PCM is delivered when
+     * the gang is collected. `held`: the slot was a row of this iteration's
+     * step, so retire leaves it alone until the next iteration -- after the
+     * collect, and at the point where the serial loop's retire would have
+     * removed it from the arrangement the next step is selected over. */
+    int decoding;
+    size_t dec_pos;
+    int held;
 } synth_slot;
 
 static int slot_fail(synth_slot *slot, const char *message) {
@@ -500,7 +514,15 @@ static void slots_prefill_slice(const mynah_tts_engine *engine,
                 if (slots[candidate].in_use && slots[candidate].preparing)
                     selected = candidate;
             }
-            if (selected == resident_rows) continue;
+            if (selected == resident_rows) {
+                /* FIFO scanned every row and found nothing left to prefill,
+                 * and later passes would scan the same rows again: stop, or a
+                 * step with nothing prefilling pays resident_rows^2 checks
+                 * (~590k at 768 rows). Round-robin looks at one row per
+                 * pass, so it keeps going. */
+                if (fifo) break;
+                continue;
+            }
             batch_slots[batch_count] = selected;
             batch_ctxs[batch_count] = slots[selected].ctx;
             batch_done[batch_count] = 0;
@@ -693,6 +715,197 @@ static void lane_reap(synth_slot *slot, size_t index, int blocking) {
     u->failed = 0;
 }
 
+/* ---- decode-ahead (MYNAH_CUDA_DECODE_OVERLAP) ---------------------------
+ *
+ * With dispatch-ahead (MYNAH_CUDA_STEP_OVERLAP) the next AR step runs while
+ * the host retires and admits, but the gang decode of step k is still
+ * waited for before it is queued. With this flag the gang is SUBMITTED
+ * (`decode_submit`) right after emit k, ahead of the next step's launch, and
+ * COLLECTED (`decode_collect`) later in the same loop pass -- polled between
+ * admissions, waited for at the latest before the next step finishes -- so
+ * retire, the prefill pass and the launch run under the decode, and
+ * admission, cancellation and delivery under the next AR step.
+ *
+ * One gang in flight, collected before the next is submitted, so per-stream
+ * PCM order is trivially kept. The frames are charged at submit (as the
+ * decoder lane does) and the samples at delivery. A slot never retires while
+ * its PCM is in flight, and the rows of a step retire one iteration later, at
+ * the point that gives the serial loop's arrangement (see `held`). Offline
+ * slots have no callback and are decoded at retire exactly as before. */
+typedef struct {
+    size_t count;                       /* members in flight; 0 = none */
+    mynah_engine_ctx *ctxs[MYNAH_GRAPH_MAX_JOBS];
+    float *pcm[MYNAH_GRAPH_MAX_JOBS];
+    size_t produced[MYNAH_GRAPH_MAX_JOBS];
+    int failed[MYNAH_GRAPH_MAX_JOBS];
+    size_t slot_of[MYNAH_GRAPH_MAX_JOBS];
+    /* MYNAH_CUDA_FIRST_FRAME_FIRST: the rows of this gang that have not had
+     * any audio yet, decoded and delivered first, as their own small gang. */
+    int first_frame_first;
+    mynah_engine_ctx *fast_ctx[MYNAH_GRAPH_MAX_JOBS];
+    size_t fast_first[MYNAH_GRAPH_MAX_JOBS];
+    size_t fast_want[MYNAH_GRAPH_MAX_JOBS];
+    size_t fast_slot[MYNAH_GRAPH_MAX_JOBS];
+    int lent;
+    /* what the collect needs, also from inside an admission pass (poll) */
+    const mynah_tts_engine *engine;
+    mynah_engine_scratch *scratch;
+    synth_slot *slots;
+    const size_t *used;
+    const size_t *ar_queued;            /* rows of the step queued ahead */
+    int profile;
+    double t_submit;
+    unsigned long long gangs, refused, on_poll, not_ready, waited, late_retired,
+                       fast_gangs, fast_rows, dropped;
+    double wait_s, deliver_s;
+} decode_ahead;
+
+/* Queue the decode of these members. On refusal every member fails, as a
+ * failed gang call does inline. */
+static int dec_submit(decode_ahead *dec, mynah_engine_ctx **gang,
+                      const size_t *first, const size_t *want,
+                      const size_t *slot_index, size_t count) {
+    char error[256];
+    error[0] = '\0';
+    if (dec->engine->decode_submit(gang, count, first, want, dec->scratch, error,
+                                   sizeof(error)) != 0) {
+        for (size_t g = 0; g < count; ++g)
+            slot_fail(&dec->slots[slot_index[g]],
+                      error[0] != '\0' ? error : "decoding audio failed");
+        ++dec->refused;
+        return -1;
+    }
+    for (size_t g = 0; g < count; ++g) {
+        synth_slot *slot = &dec->slots[slot_index[g]];
+        slot->decoding = 1;
+        slot->dec_pos = g;
+        /* Charged now, delivered at the collect: see slot_emit. */
+        slot->streamed_frames += want[g];
+        dec->ctxs[g] = gang[g];
+    }
+    dec->count = count;
+    ++dec->gangs;
+    if (dec->profile) {
+        dec->t_submit = mynah_phase_seconds();
+        mynah_backend_sync_note_queued(1);
+    }
+    return 0;
+}
+
+/* Collect the gang in flight and deliver it. With `wait` unset, returns 0 and
+ * changes nothing while the device is still decoding. Returns 1 once nothing
+ * is in flight. */
+static int dec_collect(decode_ahead *dec, int wait) {
+    if (dec->count == 0u) return 1;
+    char error[256];
+    error[0] = '\0';
+    const double t0 = dec->profile ? mynah_phase_seconds() : 0.0;
+    /* The wait below is for the decode only, which is expected; it is not a
+     * hidden sync. */
+    if (dec->profile) mynah_backend_sync_note_queued(0);
+    const int rc = dec->engine->decode_collect(dec->ctxs, dec->count, wait, dec->pcm,
+                                               dec->produced, dec->failed,
+                                               dec->scratch, error, sizeof(error));
+    if (dec->profile) mynah_backend_sync_note_queued(*dec->ar_queued != 0u);
+    if (rc == 1) {
+        ++dec->not_ready;
+        return 0;
+    }
+    if (dec->profile) {
+        const double now = mynah_phase_seconds();
+        if (wait) {
+            ++dec->waited;
+            dec->wait_s += now - t0;
+        } else {
+            ++dec->on_poll;
+        }
+        dec->deliver_s += now - dec->t_submit;
+    }
+    /* Retire and admission may have moved the members' slots; never dropped
+     * them, because a decoding slot does not retire. */
+    const size_t count = dec->count;
+    for (size_t g = 0; g < count; ++g) dec->slot_of[g] = (size_t)-1;
+    for (size_t i = 0; i < *dec->used; ++i) {
+        synth_slot *s = &dec->slots[i];
+        if (!s->in_use || !s->decoding) continue;
+        s->decoding = 0;
+        if (s->dec_pos < count) dec->slot_of[s->dec_pos] = i;
+    }
+    for (size_t g = 0; g < count; ++g) {
+        float *pcm = dec->pcm[g];
+        if (dec->slot_of[g] == (size_t)-1) {   /* cannot happen */
+            if (!dec->lent) free(pcm);
+            continue;
+        }
+        synth_slot *slot = &dec->slots[dec->slot_of[g]];
+        if (rc != 0 || dec->failed[g]) {
+            if (!dec->lent) free(pcm);
+            slot_fail(slot, error[0] != '\0' ? error : "decoding audio failed");
+            continue;
+        }
+        if (slot->cancelled || slot->failed) {
+            /* Cancelled while its frame was in flight: nobody to hand it to. */
+            ++dec->dropped;
+            if (!dec->lent) free(pcm);
+            continue;
+        }
+        slot_emit(slot, pcm, dec->produced[g]);
+        if (!dec->lent) free(pcm);
+    }
+    dec->count = 0u;
+    return 1;
+}
+
+/* admit_ctx `poll`: deliver a gang that finished while requests are admitted. */
+static void dec_poll(void *ud) {
+    decode_ahead *dec = (decode_ahead *)ud;
+    if (dec->count != 0u) (void)dec_collect(dec, 0);
+}
+
+/* The gang `stream_gang` formed, submitted instead of decoded. With
+ * MYNAH_CUDA_FIRST_FRAME_FIRST the members that have had no audio yet go
+ * first, as their own gang, decoded and delivered before the rest is
+ * submitted: their first frame then does not wait for the full-width decode
+ * and the pass behind it. Same members, ranges and order per context; a
+ * burst's first gang is all first frames, which is exactly the serial loop's
+ * first gang. */
+static void dec_stream_gang(decode_ahead *dec, mynah_engine_ctx **gang,
+                            const size_t *first, const size_t *want,
+                            size_t *slot_index, size_t count) {
+    if (dec->first_frame_first) {
+        size_t fast = 0u, rest = 0u;
+        for (size_t g = 0; g < count; ++g) {
+            if (first[g] != 0u) continue;
+            dec->fast_ctx[fast] = gang[g];
+            dec->fast_first[fast] = first[g];
+            dec->fast_want[fast] = want[g];
+            dec->fast_slot[fast] = slot_index[g];
+            ++fast;
+        }
+        if (fast > 0u) {
+            if (dec_submit(dec, dec->fast_ctx, dec->fast_first, dec->fast_want,
+                           dec->fast_slot, fast) == 0)
+                (void)dec_collect(dec, 1);
+            ++dec->fast_gangs;
+            dec->fast_rows += fast;
+            /* The rest, compacted in place and in order. */
+            for (size_t g = 0; g < count; ++g) {
+                if (first[g] == 0u) continue;
+                dec->fast_ctx[rest] = gang[g];
+                dec->fast_first[rest] = first[g];
+                dec->fast_want[rest] = want[g];
+                dec->fast_slot[rest] = slot_index[g];
+                ++rest;
+            }
+            if (rest > 0u)
+                (void)dec_submit(dec, dec->fast_ctx, dec->fast_first,
+                                 dec->fast_want, dec->fast_slot, rest);
+            return;
+        }
+    }
+    (void)dec_submit(dec, gang, first, want, slot_index, count);
+}
+
 /* Form the decode gang for this step and run it.
  *
  * This is the reference's decoder gang (.work/serving-design.md §5) and the
@@ -736,7 +949,7 @@ static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps 
                         mynah_engine_scratch *scratch, synth_slot *slots,
                         const size_t *step_slot,
                         const mynah_engine_step_result *results, size_t live,
-                        int lane_on) {
+                        int lane_on, decode_ahead *dec) {
     size_t pending[MYNAH_GRAPH_MAX_JOBS];
     int ready[MYNAH_GRAPH_MAX_JOBS];
     int leading = 0;
@@ -836,6 +1049,14 @@ static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps 
         return;
     }
 
+    /* MYNAH_CUDA_DECODE_OVERLAP: the same gang, queued; delivered at the
+     * collect. `member` becomes the members' slot indices. */
+    if (dec != NULL) {
+        for (size_t g = 0; g < count; ++g) member[g] = step_slot[member[g]];
+        dec_stream_gang(dec, gang, first, want, member, count);
+        return;
+    }
+
     char shared_error[256];
     shared_error[0] = '\0';
     /* One wide decode call standing in for `count` narrow ones. `units` is the
@@ -852,16 +1073,24 @@ static void stream_gang(const mynah_tts_engine *engine, const mynah_engine_caps 
                                  sizeof(shared_error)) != 0;
     mynah_region_unwind(gang_depth);
     mynah_region_end(MYNAH_RGN_DECODE_GANG);
+    /* An engine that lends its gang PCM (MYNAH_CUDA_PCM_DIRECT) keeps it per
+     * context and reuses it next step, so the free below would be both a
+     * wasted allocator round trip per row and a double free. The default
+     * one-context-at-a-time gang always hands over ownership. Lending is safe
+     * here because delivery is synchronous: by the time slot_deliver returns
+     * the sink has converted or copied every sample. */
+    const int lent = caps->decode_batch_lends_pcm != 0u &&
+                     engine->decode_audio_batch != NULL;
     for (size_t g = 0; g < count; ++g) {
         synth_slot *slot = &slots[step_slot[member[g]]];
         if (gang_failed || decode_failed[g]) {
-            free(pcm[g]);
+            if (!lent) free(pcm[g]);
             slot_fail(slot, shared_error[0] != '\0' ? shared_error
                                                     : "decoding audio failed");
             continue;
         }
         slot_deliver(slot, pcm[g], produced[g], want[g]);
-        free(pcm[g]);
+        if (!lent) free(pcm[g]);
     }
 }
 
@@ -993,7 +1222,7 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
                       mynah_engine_scratch *scratch, synth_slot *slots,
                       mynah_engine_ctx **step_ctxs, size_t *step_slot,
                       mynah_engine_step_result *results, size_t live, int dump,
-                      int lane_on) {
+                      int lane_on, decode_ahead *dec) {
     char shared_error[256];
     shared_error[0] = '\0';
     if (engine->step_batch(step_ctxs, live, scratch, shared_error,
@@ -1037,7 +1266,7 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     }
     /* Delivery is decided for the whole batch at once, not slot by slot: that
      * is the only place the driver can see two requests' codec work together. */
-    stream_gang(engine, caps, scratch, slots, step_slot, results, live, lane_on);
+    stream_gang(engine, caps, scratch, slots, step_slot, results, live, lane_on, dec);
     for (size_t j = 0; j < live; ++j) {
         synth_slot *slot = &slots[step_slot[j]];
         if (slot->failed) continue;
@@ -1216,6 +1445,11 @@ typedef struct {
     double *adm_next_job_s;
     double *adm_start_s;
     size_t *adm_count;
+    /* MYNAH_CUDA_DECODE_OVERLAP: called after every admitted request, so a
+     * decode that finished meanwhile is delivered within about one context
+     * build instead of after the whole pass. NULL otherwise. */
+    void (*poll)(void *ud);
+    void *poll_ud;
 } admit_ctx;
 
 /* The request checks `slot_start` makes, then the host half of the context goes
@@ -1246,6 +1480,47 @@ static int async_submit(const admit_ctx *a, synth_slot *slot) {
     pthread_cond_signal(&q->work_cv);
     pthread_mutex_unlock(&q->mu);
     return 0;
+}
+
+/* Put one job the sink handed out into slot `index` and start it. A request
+ * that cannot start never occupies the batch. */
+static void admit_start(const admit_ctx *a, size_t index, const mynah_graph_job *job,
+                        void *tag) {
+    synth_slot *slot = &a->slots[index];
+    memset(slot, 0, sizeof(*slot));
+    slot->in_use = 1;
+    slot->tag = tag;
+    slot->request = job->request;
+    slot->samples = job->samples;
+    slot->sample_count = job->sample_count;
+    slot->callback = job->callback;
+    slot->user_data = job->user_data;
+    slot->chunk_samples = job->chunk_samples;
+    slot->error = job->error;
+    slot->error_capacity = job->error_capacity;
+    ++*a->used;
+    ++*a->admitted;
+    ++*a->iter_admits;
+    const double t_st = a->serve_profile ? mynah_phase_seconds() : 0.0;
+    const int start_rc = (a->async != NULL && *a->iter_admits > a->async_inline)
+        ? async_submit(a, slot)
+        : slot_start(a->engine, a->model, a->state, a->caps, slot, a->dump_all,
+                     a->prep_seq_next);
+    if (a->serve_profile) {
+        *a->adm_start_s += mynah_phase_seconds() - t_st;
+        if (++*a->adm_count % 160u == 0u)
+            fprintf(stderr, "[ADM] %zu admissions: next_job %.3f ms, start %.3f ms (mean, "
+                            "non-blocking calls)%s\n", *a->adm_count,
+                    1e3 * *a->adm_next_job_s / (double)*a->adm_count,
+                    1e3 * *a->adm_start_s / (double)*a->adm_count,
+                    a->async != NULL ? ", async" : "");
+    }
+    if (start_rc != 0) {
+        /* A request that cannot start never occupies the batch. */
+        if (slot_retire(a->engine, a->sink, slot, a->dump_all) != 0) *a->result = -1;
+        --*a->used;
+    }
+    if (a->poll != NULL) a->poll(a->poll_ud);
 }
 
 static void admit_pass(const admit_ctx *a) {
@@ -1284,40 +1559,7 @@ static void admit_pass(const admit_ctx *a) {
             break;
         }
         if (a->serve_profile) ++*a->occ_admits;
-        synth_slot *slot = &slots[index];
-        memset(slot, 0, sizeof(*slot));
-        slot->in_use = 1;
-        slot->tag = tag;
-        slot->request = job.request;
-        slot->samples = job.samples;
-        slot->sample_count = job.sample_count;
-        slot->callback = job.callback;
-        slot->user_data = job.user_data;
-        slot->chunk_samples = job.chunk_samples;
-        slot->error = job.error;
-        slot->error_capacity = job.error_capacity;
-        ++*a->used;
-        ++*a->admitted;
-        ++*a->iter_admits;
-        const double t_st = a->serve_profile ? mynah_phase_seconds() : 0.0;
-        const int start_rc = (a->async != NULL && *a->iter_admits > a->async_inline)
-            ? async_submit(a, slot)
-            : slot_start(a->engine, a->model, a->state, a->caps, slot, a->dump_all,
-                         a->prep_seq_next);
-        if (a->serve_profile) {
-            *a->adm_start_s += mynah_phase_seconds() - t_st;
-            if (++*a->adm_count % 160u == 0u)
-                fprintf(stderr, "[ADM] %zu admissions: next_job %.3f ms, start %.3f ms (mean, "
-                                "non-blocking calls)%s\n", *a->adm_count,
-                        1e3 * *a->adm_next_job_s / (double)*a->adm_count,
-                        1e3 * *a->adm_start_s / (double)*a->adm_count,
-                        a->async != NULL ? ", async" : "");
-        }
-        if (start_rc != 0) {
-            /* A request that cannot start never occupies the batch. */
-            if (slot_retire(a->engine, sink, slot, a->dump_all) != 0) *a->result = -1;
-            --*a->used;
-        }
+        admit_start(a, index, &job, tag);
     }
 }
 
@@ -1372,6 +1614,399 @@ static void async_collect(const admit_ctx *a, int wait) {
             slot->active = 1;
         }
         free(it);
+    }
+}
+
+/* The prefill pass, then the optional late admission (`wait_arrival` in
+ * graph.h) and a second pass over what it admitted. Once per iteration: at the
+ * top of the loop, or with MYNAH_CUDA_STEP_OVERLAP right after the step, which
+ * is the same point in the sequence of steps (see step_ahead_launch). */
+typedef struct {
+    const admit_ctx *adm;
+    mynah_engine_scratch *scratch;
+    size_t max_batch;
+    size_t *prefill_rr;
+    prefill_acct *acct;   /* NULL unless MYNAH_SERVE_PROFILE */
+    int late_admit;
+    unsigned late_wait_us;
+} prefill_ctx;
+
+static void prefill_pass(const prefill_ctx *p, size_t retired_last) {
+    const admit_ctx *a = p->adm;
+    const mynah_tts_engine *engine = a->engine;
+    mynah_graph_sink *sink = a->sink;
+    if (engine->prepare_slice != NULL) {
+        const size_t prefill_rows = a->compact_rows ? *a->used : a->slot_capacity;
+        if (prefill_rows != 0u)
+            slots_prefill_slice(engine, a->caps, p->scratch, a->slots, prefill_rows,
+                                p->max_batch, a->dump_all, p->prefill_rr, p->acct);
+    }
+
+    if (p->late_admit && !*a->drained && *a->used < a->slot_capacity &&
+        (sink->running == NULL || sink->running(sink->ud) != 0) &&
+        sink->wait_arrival(sink->ud, retired_last ? p->late_wait_us : 0u) != 0) {
+        const size_t before = *a->used;
+        admit_pass(a);
+        if (*a->used > before && engine->prepare_slice != NULL) {
+            const size_t prefill_rows = a->compact_rows ? *a->used : a->slot_capacity;
+            slots_prefill_slice(engine, a->caps, p->scratch, a->slots, prefill_rows,
+                                p->max_batch, a->dump_all, p->prefill_rr, p->acct);
+        }
+    }
+}
+
+/* ---- dispatch-ahead (MYNAH_CUDA_STEP_OVERLAP) ---------------------------
+ *
+ * Today the device has nothing queued while the host retires, admits and
+ * checks for cancellations: on a fast GPU that host time is a third of the
+ * loop. With the flag the next step is queued (`step_launch`) BEFORE that
+ * work, and the following iteration's `step_batch` on the same rows only
+ * waits for it. Depth 1: one step in flight, never two.
+ *
+ * Membership changes take effect at a launch. Everything that decides the
+ * rows of step k+1 in the serial loop happens before its launch, in the same
+ * order -- emit k (EOS, budget, re-prepare), delivery k, the prefill pass --
+ * except what arrives while k+1 is in flight: an admission joins at k+2, and
+ * a cancellation rides along in k+1 (stepped, never decoded or delivered)
+ * and retires after it. The rows and their order are the serial loop's (see
+ * the retire simulation below), so a burst that is admitted at once gets the
+ * same steps, bit for bit; under concurrency an admission is one step late. */
+typedef struct {
+    const prefill_ctx *pre;
+    size_t max_batch;
+    size_t count;   /* rows of the step queued ahead; 0 = none */
+    size_t order[MYNAH_GRAPH_MAX_ACTIVE];
+    mynah_engine_ctx *ctxs[MYNAH_GRAPH_MAX_JOBS];
+    size_t slot[MYNAH_GRAPH_MAX_JOBS];
+    unsigned long long launched, finished, refused;
+} step_ahead;
+
+/* Run the prefill pass the next iteration would have run, pick the next
+ * step's rows and queue it. Called after the step, BEFORE retire: the rows are
+ * picked from the arrangement retire is about to leave, simulated on an index
+ * array with retire's own predicate and swap-remove, so the selection sees the
+ * same slots in the same places as the serial loop's selection after retire. */
+static void step_ahead_select_launch(step_ahead *ah, synth_slot *slots,
+                                     size_t *step_rr);
+
+static void step_ahead_launch(step_ahead *ah, synth_slot *slots,
+                              size_t *step_rr, size_t retired_last) {
+    prefill_pass(ah->pre, retired_last);
+    step_ahead_select_launch(ah, slots, step_rr);
+}
+
+/* The selection and the launch, without the prefill pass (MYNAH_CUDA_PINGPONG
+ * runs its own prefill pass first). */
+static void step_ahead_select_launch(step_ahead *ah, synth_slot *slots,
+                                     size_t *step_rr) {
+    const admit_ctx *a = ah->pre->adm;
+    if (!a->compact_rows) return;   /* the lane keeps sparse rows; not supported */
+    size_t n = *a->used;
+    for (size_t i = 0; i < n; ++i) ah->order[i] = i;
+    size_t i = 0u;
+    while (i < n) {
+        const synth_slot *s = &slots[ah->order[i]];
+        if (!s->in_use || s->active || s->preparing || s->starting || s->ahead) {
+            ++i;
+            continue;
+        }
+        --n;
+        ah->order[i] = ah->order[n];
+    }
+    if (n == 0u) return;
+    /* The rotation of the step selection in `serve`, over that arrangement. */
+    size_t live = 0u;
+    size_t next_rr = *step_rr;
+    for (size_t offset = 0; offset < n && live < ah->max_batch; ++offset) {
+        const size_t v = (*step_rr + offset) % n;
+        const synth_slot *s = &slots[ah->order[v]];
+        if (!s->in_use || !s->active) continue;
+        ah->slot[live] = ah->order[v];
+        ah->ctxs[live] = s->ctx;
+        ++live;
+        next_rr = (v + 1u) % n;
+    }
+    /* A single row is stepped serially anyway: nothing to queue it on. */
+    if (live < 2u) return;
+    if (a->engine->step_launch(ah->ctxs, live, ah->pre->scratch) != 0) {
+        ++ah->refused;
+        return;
+    }
+    for (size_t p = 0; p < live; ++p) {
+        slots[ah->slot[p]].ahead = 1;
+        slots[ah->slot[p]].ahead_pos = p;
+    }
+    ah->count = live;
+    *step_rr = next_rr;
+    ++ah->launched;
+}
+
+/* Retire, per slot, as soon as it stops. Not after the whole group: the slot
+ * is the unit of capacity, and holding a finished one until its neighbours
+ * catch up is exactly the wait continuous admission exists to remove.
+ * Returns how many slots it retired. */
+static size_t retire_pass(const mynah_tts_engine *engine, mynah_graph_sink *sink,
+                          synth_slot *slots, size_t *used, size_t slot_capacity,
+                          int compact_rows, int dump_all, int *result) {
+    const size_t before = *used;
+    if (compact_rows) {
+        /* Dense rows make this a real swap-remove.  Do not advance `i`
+         * after the move: the last row may itself already be finished. */
+        size_t i = 0u;
+        while (i < *used) {
+            if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
+                slots[i].starting || slots[i].ahead || slots[i].held) {
+                ++i;
+                continue;
+            }
+            if (slot_retire(engine, sink, &slots[i], dump_all) != 0)
+                *result = -1;
+            --*used;
+            if (i != *used) {
+                slots[i] = slots[*used];
+                memset(&slots[*used], 0, sizeof(slots[*used]));
+            }
+        }
+    } else {
+        for (size_t i = 0; i < slot_capacity; ++i) {
+            /* `preparing` is the third state this loop has to know about:
+             * not active, and not finished either. */
+            if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
+                slots[i].starting || slots[i].ahead || slots[i].held)
+                continue;
+            /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates
+             * the frame history and frees the context; a unit still
+             * reading it would be reading freed memory. */
+            lane_reap(&slots[i], i, 1);
+            if (slot_retire(engine, sink, &slots[i], dump_all) != 0)
+                *result = -1;
+            --*used;
+        }
+    }
+    return before - *used;
+}
+
+/* ---- ping-pong groups (MYNAH_CUDA_PINGPONG=2) ---------------------------
+ *
+ * With dispatch-ahead and decode-ahead the device still idles while this
+ * thread emits a step, prepares its decode and selects the next one: those
+ * depend on the step that just finished. Two groups of rows remove that
+ * dependency. Each group has its own slot array, scratch and cursors; on the
+ * one device stream each group owns one item per cycle -- its decode k, then
+ * its AR step k+1 -- and while the device runs one group's item this thread
+ * does the other group's host work. One phase, for group X while Y's item
+ * runs (pp_phase in `serve`):
+ *
+ *   1. finish X's step queued last phase (its own fence), emit it, and
+ *      submit its decode, which the device runs right after Y's item;
+ *   2. retire X's rows that ended a phase ago and whose last PCM is out;
+ *   3. admission (global: one queue, each new row assigned to a group);
+ *   4. cancellation of X's rows;
+ *   5. the prefill pass over X's preparing rows, on X's scratch;
+ *   6. select X's next step and queue it (`step_launch`), or, when Y has no
+ *      rows or the launch is refused, step X serially, as today's loop does;
+ *   7. collect Y's decode and deliver it (normally done by then: it ran
+ *      before Y's AR step).
+ *
+ * A group's row order, step widths, prefill composition and decode gangs
+ * evolve exactly as a stand-alone loop over its rows would (append at
+ * admission, swap-remove at retire, its own rotation cursor), so splitting a
+ * burst into two halves gives each half the audio of a run of that half
+ * alone. Below MYNAH_CUDA_PINGPONG_MIN rows every request goes to group A;
+ * with group B empty, A steps serially, so low concurrency runs today's loop
+ * and keeps today's audio. */
+typedef struct {
+    synth_slot *slots;            /* A: serve()'s array; B: its own */
+    size_t used;
+    /* The most rows one step, prefill pass or gang of this group may take:
+     * its scratch's width. A: max_batch (serve()'s scratch; below the
+     * threshold it holds every row). B: min(max_batch, ceil(slots / 2)),
+     * the most rows pp_admit and the late admission ever give it. */
+    size_t width_cap;
+    size_t row_cap;               /* A: the slots; B: ceil(slots / 2) */
+    size_t step_rr;
+    size_t prefill_rr;
+    size_t retired_last;
+    mynah_engine_scratch *scratch;
+    admit_ctx adm;                /* serve()'s, over this group's rows */
+    prefill_ctx pre;
+    step_ahead ahead;             /* the AR step queued for this group */
+    decode_ahead dec;             /* the decode gang queued for this group */
+    /* MYNAH_SERVE_PROFILE */
+    unsigned long long phases, pipelined, serial, serial_alone, serial_refused;
+    unsigned long long width_sum, rows_sum;
+    size_t width_max, rows_max;
+    double finish_wait_s, deliver_wait_s, host_s, host_hidden_s;
+} pp_group;
+
+typedef struct {
+    pp_group g[2];
+    size_t min_rows;              /* MYNAH_CUDA_PINGPONG_MIN */
+    mynah_graph_job *pend_job;    /* one admission pass, before assignment */
+    void **pend_tag;
+    unsigned long long cycles, admitted_to[2];
+} pingpong;
+
+/* Device wait so far (profile runs only; 0 otherwise). */
+static double pp_device_wait_s(void) {
+    double s = 0.0;
+    mynah_backend_sync_profile(&s, NULL);
+    return s;
+}
+
+/* Profile runs only: a stream sync reached while some group's work is queued
+ * also waits for that work (mynah_backend_stream_sync_queued_calls). */
+static void pp_note_queued(const pingpong *pp, int profile) {
+    if (!profile) return;
+    int queued = 0;
+    for (int k = 0; k < 2; ++k)
+        queued |= pp->g[k].ahead.count > 0u || pp->g[k].dec.count > 0u;
+    mynah_backend_sync_note_queued(queued);
+}
+
+/* The admission pass of ping-pong. Pulls what the sink has (blocking only
+ * when nothing at all is resident), then assigns it: below `min_rows` every
+ * row goes to group A; otherwise the first rows go to the group whose phase
+ * this is (`x`, it launches next) and the rest to the other, so that the two
+ * groups end as close to equal as their room allows. A burst into two empty
+ * groups is split into contiguous halves; one or two arrivals go to the
+ * smaller group, ties to the current one. Rows never move between groups. */
+static void pp_admit(pingpong *pp, int x, const admit_ctx *a) {
+    mynah_graph_sink *sink = a->sink;
+    pp_group *X = &pp->g[x];
+    pp_group *Y = &pp->g[1 - x];
+    const size_t total = X->used + Y->used;
+    const size_t room = a->slot_capacity > total ? a->slot_capacity - total : 0u;
+    size_t n = 0u;
+    while (!*a->drained && n < room &&
+           (a->admit_cap == 0u || *a->iter_admits + n < a->admit_cap) &&
+           (sink->running == NULL || sink->running(sink->ud) != 0)) {
+        mynah_graph_job job;
+        memset(&job, 0, sizeof(job));
+        void *tag = NULL;
+        const int block = (total == 0u && n == 0u);
+        const double t_block = (a->serve_profile && block) ? mynah_phase_seconds() : 0.0;
+        const double t_nj = (a->serve_profile && !block) ? mynah_phase_seconds() : 0.0;
+        const int got = sink->next_job(sink->ud, &job, &tag, block);
+        if (a->serve_profile && block) *a->occ_blocked_s += mynah_phase_seconds() - t_block;
+        if (a->serve_profile && !block && got == 1) *a->adm_next_job_s += mynah_phase_seconds() - t_nj;
+        if (got != 1) {
+            if (a->serve_profile) ++*a->occ_free_nothing_queued;
+            if (block) *a->drained = 1;
+            break;
+        }
+        if (a->serve_profile) ++*a->occ_admits;
+        pp->pend_job[n] = job;
+        pp->pend_tag[n] = tag;
+        ++n;
+    }
+    if (n == 0u) return;
+    /* How many of the n go to X (the first ones); the rest go to Y. */
+    size_t to_x;
+    if (total + n < pp->min_rows) {
+        to_x = x == 0 ? n : 0u;
+    } else {
+        /* ceil((n + |Y| - |X|) / 2), clamped to [0, n] */
+        const long long want = ((long long)n + (long long)Y->used - (long long)X->used + 1ll) / 2ll;
+        to_x = want <= 0ll ? 0u : (want >= (long long)n ? n : (size_t)want);
+        /* Each group's share of the capacity; group A may hold more from a
+         * run below the threshold, and the arrays hold the whole capacity,
+         * so a group over its share only stops receiving rows. */
+        const size_t share = (a->slot_capacity + 1u) / 2u;
+        const size_t room_x = share > X->used ? share - X->used : 0u;
+        const size_t room_y = share > Y->used ? share - Y->used : 0u;
+        if (to_x > room_x) to_x = room_x;
+        if (n - to_x > room_y) to_x = n - room_y;
+    }
+    for (size_t j = 0; j < n; ++j) {
+        const int k = j < to_x ? x : 1 - x;
+        pp_group *G = &pp->g[k];
+        ++pp->admitted_to[k];
+        admit_start(&G->adm, G->used, &pp->pend_job[j], pp->pend_tag[j]);
+    }
+}
+
+/* The rows of the step queued for G, in their order, ready to finish. */
+static size_t pp_take_ahead(pp_group *G, mynah_engine_ctx **step_ctxs,
+                            size_t *step_slot) {
+    step_ahead *ah = &G->ahead;
+    for (size_t p = 0; p < ah->count; ++p) step_ctxs[p] = NULL;
+    for (size_t i = 0; i < G->used; ++i) {
+        synth_slot *s = &G->slots[i];
+        if (!s->ahead) continue;
+        s->ahead = 0;
+        /* A row cannot be cancelled while queued (cancellation is checked in
+         * its own group's phase, before the launch); a failed one rides along
+         * and nothing else happens to it, as with dispatch-ahead. */
+        if (!s->active) s->failed = 1;
+        if (s->ahead_pos >= ah->count) continue;
+        step_slot[s->ahead_pos] = i;
+        step_ctxs[s->ahead_pos] = s->ctx;
+    }
+    size_t live = 0u;
+    for (size_t p = 0; p < ah->count; ++p) {
+        if (step_ctxs[p] == NULL) continue;   /* cannot happen */
+        step_slot[live] = step_slot[p];
+        step_ctxs[live] = step_ctxs[p];
+        ++live;
+    }
+    ah->count = 0u;
+    ++ah->finished;
+    return live;
+}
+
+/* G's decode is delivered: the rows of its last step may retire. */
+static void pp_release_held(pp_group *G) {
+    for (size_t i = 0; i < G->used; ++i) G->slots[i].held = 0;
+}
+
+static void pp_collect(pingpong *pp, pp_group *G, int profile) {
+    if (G->dec.count > 0u) {
+        const double w0 = profile ? pp_device_wait_s() : 0.0;
+        (void)dec_collect(&G->dec, 1);
+        if (profile) G->deliver_wait_s += pp_device_wait_s() - w0;
+        pp_note_queued(pp, profile);
+    }
+    pp_release_held(G);
+}
+
+static void pp_requeue(pp_group *G, unsigned long long *prep_seq_next) {
+    for (size_t i = 0; i < G->used; ++i) {
+        if (!G->slots[i].requeue) continue;
+        G->slots[i].requeue = 0;
+        G->slots[i].prep_seq = (*prep_seq_next)++;
+    }
+}
+
+static void pp_report(const pingpong *pp, unsigned long long stream_syncs_queued) {
+    double host = 0.0, hidden = 0.0;
+    for (int k = 0; k < 2; ++k) {
+        host += pp->g[k].host_s;
+        hidden += pp->g[k].host_hidden_s;
+    }
+    fprintf(stderr,
+            "[SERVE] pingpong (MYNAH_CUDA_PINGPONG=2, groups from %zu rows): %llu cycles; "
+            "admitted to A %llu / B %llu; host time under the other group's item %.1f%% "
+            "(overlap ratio, an upper bound: that item may end first); %llu stream syncs "
+            "while an item was queued (each also waits for the other group's item)\n",
+            pp->min_rows, pp->cycles, pp->admitted_to[0], pp->admitted_to[1],
+            host > 0.0 ? 100.0 * hidden / host : 0.0, stream_syncs_queued);
+    for (int k = 0; k < 2; ++k) {
+        const pp_group *G = &pp->g[k];
+        const unsigned long long steps = G->pipelined + G->serial;
+        const double per = G->phases ? 1e3 / (double)G->phases : 0.0;
+        fprintf(stderr,
+                "[SERVE]   group %c: %llu phases, steps pipelined %llu / serial %llu "
+                "(other group empty %llu, launch refused or < 2 rows %llu); step width "
+                "mean %.1f max %zu; rows mean %.1f max %zu; fence wait per phase: step "
+                "%.3f ms + decode %.3f ms; host %.3f ms per phase (%.1f%% under the "
+                "other group's item)\n",
+                k == 0 ? 'A' : 'B', G->phases, G->pipelined, G->serial,
+                G->serial_alone, G->serial_refused,
+                steps ? (double)G->width_sum / (double)steps : 0.0, G->width_max,
+                G->phases ? (double)G->rows_sum / (double)G->phases : 0.0, G->rows_max,
+                G->finish_wait_s * per, G->deliver_wait_s * per, G->host_s * per,
+                G->host_s > 0.0 ? 100.0 * G->host_hidden_s / G->host_s : 0.0);
     }
 }
 
@@ -1527,6 +2162,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * variance. */
     const int serve_profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
     const double t_profile0 = serve_profile ? mynah_phase_seconds() : 0.0;
+    if (serve_profile) mynah_backend_sync_profile_reset();
     /* Phase boundaries for the sink (graph.h: `phase`), profile runs only. */
     const int report_phase = serve_profile && sink->phase != NULL;
     unsigned long long iteration = 0ull;
@@ -1621,6 +2257,24 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * next. `late_wait_us` optionally holds the step for an arrival that a
      * retirement in the previous iteration makes likely (closed-loop clients
      * send their next request as the previous one completes). */
+    /* MYNAH_CANCEL_CHECK_EVERY=N: ask the sink about cancellation every N
+     * iterations instead of every one (default 4; =0 or =1 is the rollback to
+     * a check per iteration, an invalid value keeps the default). On
+     * the HTTP server each ask is a mutex plus a poll() per live stream, all
+     * on the scheduler thread while the GPU has nothing queued; at hundreds of
+     * streams that is a measurable share of each step. A disconnect is then
+     * noticed up to N-1 frames later; a stream whose writer already saw the
+     * hangup still ends on its own, because it has nowhere to write. */
+    unsigned long long cancel_every = 4ull;
+    {
+        const char *e = getenv("MYNAH_CANCEL_CHECK_EVERY");
+        if (e != NULL && *e != '\0') {
+            char *end = NULL;
+            const unsigned long v = strtoul(e, &end, 10);
+            if (end != e && *end == '\0' && v <= 1000ul)
+                cancel_every = v == 0ul ? 1ull : v;
+        }
+    }
     const int late_admit = sink->wait_arrival != NULL;
     unsigned late_wait_us = 0u;
     if (late_admit) {
@@ -1633,7 +2287,454 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     }
     size_t retired_last = 0u;
 
-    for (;;) {
+    prefill_ctx pre;
+    memset(&pre, 0, sizeof(pre));
+    pre.adm = &adm;
+    pre.scratch = scratch;
+    pre.max_batch = max_batch;
+    pre.prefill_rr = &prefill_rr;
+    pre.acct = serve_profile ? &prefill_profile : NULL;
+    pre.late_admit = late_admit;
+    pre.late_wait_us = late_wait_us;
+
+    /* MYNAH_CUDA_PINGPONG=2 (default off): two groups of rows, one queued on
+     * the device while this thread does the other's host work; see pp_group.
+     * Needs the engine's step and decode split and its lanes, and the sliced
+     * prefill; not with the decoder lane, the parity dump or asynchronous
+     * admission. It replaces dispatch-ahead and decode-ahead. */
+    pingpong *pp = NULL;   /* NULL unless on */
+    {
+        const char *e = getenv("MYNAH_CUDA_PINGPONG");
+        if (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) {
+            const char *why =
+                strcmp(e, "2") != 0 ? "only two groups are supported (=2)"
+                : (engine->step_launch == NULL || engine->decode_submit == NULL ||
+                   engine->decode_collect == NULL || engine->scratch_set_lane == NULL)
+                    ? "the engine cannot queue one group's work behind another's"
+                : lane_on ? "the decoder lane is on"
+                : dump_all ? "the parity dump is on"
+                : (engine->prepare_slice == NULL || prefill_slice_budget(&caps) == 0u)
+                    ? "the prefill is not sliced (MYNAH_PREFILL_SLICE=0)"
+                : async_on ? "asynchronous admission (MYNAH_ASYNC_ADMIT) is on"
+                : NULL;
+            mynah_engine_scratch *scratch_b = NULL;
+            /* Group B never holds more than ceil(slots / 2) rows (pp_admit,
+             * and the late admission of step 5), so its scratch -- and with it every graph,
+             * decoder-graph and codec-gang buffer sized by the widths it
+             * runs -- is sized for that, not for max_batch. */
+            const size_t share_b = (slot_capacity + 1u) / 2u;
+            const size_t width_b = max_batch < share_b ? max_batch : share_b;
+            double scratch_b_mib = -1.0;   /* < 0: the backend cannot tell */
+            char lane_error[256];
+            char scratch_error[256];
+            lane_error[0] = '\0';
+            scratch_error[0] = '\0';
+            if (why == NULL) {
+                pp = (pingpong *)calloc(1, sizeof(*pp));
+                synth_slot *slots_b =
+                    (synth_slot *)calloc(slot_capacity, sizeof(synth_slot));
+                mynah_graph_job *pend_job =
+                    (mynah_graph_job *)calloc(slot_capacity, sizeof(mynah_graph_job));
+                void **pend_tag = (void **)calloc(slot_capacity, sizeof(void *));
+                if (pp == NULL || slots_b == NULL || pend_job == NULL || pend_tag == NULL) {
+                    why = "out of memory";
+                } else {
+                    mynah_tts_backend_metrics m0, m1;
+                    memset(&m0, 0, sizeof(m0));
+                    memset(&m1, 0, sizeof(m1));
+                    const int have_m0 = model != NULL &&
+                        mynah_tts_model_get_backend_metrics(model, &m0) == 0;
+                    if (engine->scratch_new(model, state, width_b, &scratch_b,
+                                            scratch_error, sizeof(scratch_error)) != 0) {
+                        why = "the second group's scratch could not be created";
+                        scratch_b = NULL;
+                    } else {
+                        if (have_m0 && m0.device_memory_free_bytes > 0u &&
+                            mynah_tts_model_get_backend_metrics(model, &m1) == 0 &&
+                            m1.device_memory_free_bytes > 0u)
+                            scratch_b_mib = ((double)m0.device_memory_free_bytes -
+                                             (double)m1.device_memory_free_bytes) /
+                                            (1024.0 * 1024.0);
+                        /* B first, checked against A; A is a lane only once
+                         * B is, so a refusal leaves A exactly as it was. */
+                        if (engine->scratch_set_lane(scratch_b, 1, scratch, lane_error,
+                                                     sizeof(lane_error)) != 0 ||
+                            engine->scratch_set_lane(scratch, 0, scratch_b, lane_error,
+                                                     sizeof(lane_error)) != 0)
+                            why = "the second group's scratch is incomplete";
+                    }
+                }
+                if (why != NULL) {
+                    if (scratch_b != NULL) engine->scratch_free(scratch_b);
+                    scratch_b = NULL;
+                    free(slots_b);
+                    free(pend_job);
+                    free(pend_tag);
+                    free(pp);
+                    pp = NULL;
+                } else {
+                    pp->g[1].slots = slots_b;
+                    pp->pend_job = pend_job;
+                    pp->pend_tag = pend_tag;
+                }
+            }
+            if (why != NULL) {
+                fprintf(stderr, "driver: MYNAH_CUDA_PINGPONG ignored: %s%s%s%s%s%s; "
+                                "serving with one group\n", why,
+                        lane_error[0] != '\0' ? " (" : "", lane_error,
+                        lane_error[0] != '\0' ? ")" : "",
+                        scratch_error[0] != '\0' && lane_error[0] == '\0' ? ": " : "",
+                        lane_error[0] == '\0' ? scratch_error : "");
+            } else {
+                pp->min_rows = 128u;
+                const char *m = getenv("MYNAH_CUDA_PINGPONG_MIN");
+                if (m != NULL && *m != '\0') {
+                    char *end = NULL;
+                    const unsigned long v = strtoul(m, &end, 10);
+                    if (end != m && *end == '\0' && v >= 1ul && v <= 1000000ul)
+                        pp->min_rows = (size_t)v;
+                }
+                pp->g[0].slots = slots;
+                pp->g[0].scratch = scratch;
+                pp->g[1].scratch = scratch_b;
+                for (int k = 0; k < 2; ++k) {
+                    pp_group *G = &pp->g[k];
+                    G->adm = adm;
+                    G->adm.slots = G->slots;
+                    G->adm.used = &G->used;
+                    G->adm.poll = NULL;
+                    G->pre = pre;
+                    G->pre.adm = &G->adm;
+                    G->pre.scratch = G->scratch;
+                    G->pre.prefill_rr = &G->prefill_rr;
+                    G->width_cap = k == 0 ? max_batch : width_b;
+                    G->row_cap = k == 0 ? slot_capacity : share_b;
+                    G->pre.max_batch = G->width_cap;
+                    G->ahead.pre = &G->pre;
+                    G->ahead.max_batch = G->width_cap;
+                    G->dec.lent = caps.decode_batch_lends_pcm != 0u;
+                    G->dec.engine = engine;
+                    G->dec.scratch = G->scratch;
+                    G->dec.slots = G->slots;
+                    G->dec.used = &G->used;
+                    G->dec.ar_queued = &G->ahead.count;
+                    G->dec.profile = serve_profile;
+                }
+                fprintf(stderr,
+                        "driver: ping-pong ON (MYNAH_CUDA_PINGPONG=2): two groups of "
+                        "rows from %zu resident rows (MYNAH_CUDA_PINGPONG_MIN; below it "
+                        "group A steps serially), one group's decode and step queued "
+                        "while the other's host work runs; MYNAH_CUDA_STEP_OVERLAP and "
+                        "MYNAH_CUDA_DECODE_OVERLAP are not used\n",
+                        pp->min_rows);
+                char mib[64];
+                if (scratch_b_mib >= 0.0)
+                    snprintf(mib, sizeof(mib), "%.0f MiB of device memory", scratch_b_mib);
+                else
+                    snprintf(mib, sizeof(mib), "no device memory reported");
+                fprintf(stderr,
+                        "driver: ping-pong groups: A uses the loop's scratch (%zu rows); "
+                        "B holds at most %zu rows (half the %zu slots), so its scratch "
+                        "is %zu rows wide: %s at start-up, and its graphs, decoder "
+                        "graphs and codec-gang staging only ever cover widths up to "
+                        "%zu\n",
+                        max_batch, share_b, slot_capacity, width_b, mib, width_b);
+                /* Deferred release and MYNAH_CUDA_SLOT_FIXED (KV growth without
+                 * a drain; MYNAH_CUDA_KV_VMM with bf16 KV also gives it) are on
+                 * by default. Warn only when one of them was rolled back. */
+                const char *dr = getenv("MYNAH_CUDA_DEFERRED_RELEASE");
+                if (dr != NULL && strcmp(dr, "0") == 0)
+                    fprintf(stderr,
+                            "driver: ping-pong with MYNAH_CUDA_DEFERRED_RELEASE=0: every "
+                            "context release drains the device, the other group's work "
+                            "included\n");
+                const char *sf = getenv("MYNAH_CUDA_SLOT_FIXED");
+                if (sf != NULL && strcmp(sf, "0") == 0 &&
+                    getenv("MYNAH_CUDA_KV_VMM") == NULL)
+                    fprintf(stderr,
+                            "driver: ping-pong with MYNAH_CUDA_SLOT_FIXED=0: a KV growth "
+                            "may drain the device, the other group's work included\n");
+            }
+        }
+    }
+
+    /* MYNAH_CUDA_STEP_OVERLAP: dispatch-ahead, see step_ahead_launch. Default
+     * on when the engine says so (caps.overlap_by_default: Pocket on the CUDA
+     * backend), off otherwise; =0 is the rollback and turns decode-ahead off
+     * with it, a nonzero value asks for it on any engine. Needs the engine
+     * hook and the sliced prefill (a one-shot `prepare` at admission would
+     * run while a step is queued); not with the decoder lane (sparse rows),
+     * the parity dump or ping-pong. */
+    int step_overlap = 0;
+    step_ahead *ahead = NULL;   /* NULL unless on */
+    const int overlap_default = caps.overlap_by_default != 0u;
+    {
+        const char *e = getenv("MYNAH_CUDA_STEP_OVERLAP");
+        const int given = e != NULL && e[0] != '\0';
+        const int want = given ? strcmp(e, "0") != 0 : overlap_default;
+        if (want) {
+            const char *why =
+                pp != NULL ? "MYNAH_CUDA_PINGPONG is on"
+                : engine->step_launch == NULL ? "the engine cannot queue a step ahead"
+                : lane_on ? "the decoder lane is on"
+                : dump_all ? "the parity dump is on"
+                : (engine->prepare_slice == NULL || prefill_slice_budget(&caps) == 0u)
+                    ? "the prefill is not sliced (MYNAH_PREFILL_SLICE=0)"
+                    : NULL;
+            if (why == NULL) {
+                ahead = (step_ahead *)calloc(1, sizeof(*ahead));
+                if (ahead == NULL) why = "out of memory";
+            }
+            if (why != NULL) {
+                /* Ping-pong already said it does not use the overlap. */
+                if (given)
+                    fprintf(stderr, "driver: MYNAH_CUDA_STEP_OVERLAP ignored: %s\n", why);
+                else if (pp == NULL)
+                    fprintf(stderr, "driver: step overlap (default) off: %s\n", why);
+            } else {
+                step_overlap = 1;
+                ahead->pre = &pre;
+                ahead->max_batch = max_batch;
+                fprintf(stderr,
+                        "driver: step overlap ON%s: the next step is queued before "
+                        "retire, admission and cancellation, which run while the "
+                        "device steps; a request admitted meanwhile joins one step "
+                        "later\n",
+                        given ? " (MYNAH_CUDA_STEP_OVERLAP; =0 to roll back)"
+                              : " by default (MYNAH_CUDA_STEP_OVERLAP=0 to roll "
+                                "back, decode overlap included)");
+            }
+        }
+    }
+    /* MYNAH_CUDA_DECODE_OVERLAP: decode-ahead, see dec_submit. Needs
+     * dispatch-ahead (it reorders that loop) and the engine's decode split.
+     * Default on with dispatch-ahead when the engine says so (=0 rolls back
+     * this half only); without dispatch-ahead it stays off, and an explicit
+     * nonzero value says why. MYNAH_CUDA_FIRST_FRAME_FIRST adds the
+     * first-frame gang, see dec_stream_gang: default on under the same
+     * engine default, =0 rolls back. */
+    decode_ahead *dec = NULL;   /* NULL unless on */
+    {
+        const char *e = getenv("MYNAH_CUDA_DECODE_OVERLAP");
+        const int given = e != NULL && e[0] != '\0';
+        const int want = given ? strcmp(e, "0") != 0 : overlap_default && step_overlap;
+        if (want) {
+            const char *why =
+                pp != NULL ? "MYNAH_CUDA_PINGPONG is on"
+                : !step_overlap ? "it needs MYNAH_CUDA_STEP_OVERLAP"
+                : (engine->decode_submit == NULL || engine->decode_collect == NULL)
+                    ? "the engine cannot split its decode"
+                    : NULL;
+            if (why == NULL) {
+                dec = (decode_ahead *)calloc(1, sizeof(*dec));
+                if (dec == NULL) why = "out of memory";
+            }
+            if (why != NULL) {
+                if (given)
+                    fprintf(stderr, "driver: MYNAH_CUDA_DECODE_OVERLAP ignored: %s\n", why);
+                else
+                    fprintf(stderr, "driver: decode overlap (default) off: %s\n", why);
+            } else {
+                dec->lent = caps.decode_batch_lends_pcm != 0u;
+                dec->engine = engine;
+                dec->scratch = scratch;
+                dec->slots = slots;
+                dec->used = &used;
+                dec->ar_queued = &ahead->count;
+                dec->profile = serve_profile;
+                const char *f = getenv("MYNAH_CUDA_FIRST_FRAME_FIRST");
+                const int f_given = f != NULL && f[0] != '\0';
+                dec->first_frame_first = f_given ? strcmp(f, "0") != 0 : overlap_default;
+                adm.poll = dec_poll;
+                adm.poll_ud = dec;
+                fprintf(stderr,
+                        "driver: decode overlap ON%s: each step's decode is queued "
+                        "before the next step and delivered while it runs%s\n",
+                        given ? " (MYNAH_CUDA_DECODE_OVERLAP; =0 to roll back)"
+                              : " by default (MYNAH_CUDA_DECODE_OVERLAP=0 to roll back)",
+                        !dec->first_frame_first ? ""
+                        : f_given ? "; first frames are decoded and delivered first "
+                                    "(MYNAH_CUDA_FIRST_FRAME_FIRST; =0 to roll back)"
+                                  : "; first frames are decoded and delivered first, "
+                                    "by default (MYNAH_CUDA_FIRST_FRAME_FIRST=0 to roll "
+                                    "back)");
+            }
+        }
+    }
+    /* The prefill pass of this iteration already ran after the last step. */
+    int prefilled_ahead = 0;
+
+    /* ---- MYNAH_CUDA_PINGPONG: the loop of two groups (see pp_group) -------
+     * One pass is one phase of group X while group Y's item may be running.
+     * Today's loop below is not entered. */
+    for (int x = 0; pp != NULL;) {
+        pp_group *X = &pp->g[x];
+        pp_group *Y = &pp->g[1 - x];
+        const double t_phase = serve_profile ? mynah_phase_seconds() : 0.0;
+        const double w_phase = serve_profile ? pp_device_wait_s() : 0.0;
+        const double b_phase = occ_blocked_s;
+        const int y_queued = Y->ahead.count > 0u || Y->dec.count > 0u;
+        if (report_phase) sink->phase(sink->ud, iteration, 0);
+        ++X->phases;
+        int finished = 0;   /* X's rows of the step finished here are held */
+
+        /* 1. Finish X's step queued last phase: its fence, then emit, then its
+         *    decode submitted behind Y's item. Its rows retire next phase. */
+        if (X->ahead.count > 0u) {
+            if (X->dec.count > 0u) pp_collect(pp, X, serve_profile);   /* cannot happen */
+            const size_t live = pp_take_ahead(X, step_ctxs, step_slot);
+            finished = 1;
+            for (size_t j = 0; j < live; ++j) X->slots[step_slot[j]].held = 1;
+            const double t_step = serve_profile ? mynah_phase_seconds() : 0.0;
+            const double w0 = serve_profile ? pp_device_wait_s() : 0.0;
+            if (live > 0u)
+                step_live(engine, &caps, X->scratch, X->slots, step_ctxs, step_slot,
+                          results, live, dump_all, 0, &X->dec);
+            pp_requeue(X, &prep_seq_next);
+            if (serve_profile) {
+                const double took = mynah_phase_seconds() - t_step;
+                const size_t b = live <= max_batch ? live : max_batch;
+                X->finish_wait_s += pp_device_wait_s() - w0;
+                ++occ_frames;
+                occ_hist[b] += 1u;
+                occ_time[b] += took;
+                if (took > occ_worst[b]) occ_worst[b] = took;
+                if (occ_deadline_s > 0.0 && took > occ_deadline_s) ++occ_late[b];
+                ++X->pipelined;
+                X->width_sum += live;
+                if (live > X->width_max) X->width_max = live;
+            }
+        }
+        pp_note_queued(pp, serve_profile);
+
+        /* 2. Retire X's rows that ended a phase ago (held until delivered). */
+        X->retired_last = retire_pass(engine, sink, X->slots, &X->used, slot_capacity,
+                                      compact_rows, dump_all, &result);
+
+        /* 3. Admission, for both groups. */
+        const unsigned long long t_admit =
+            mynah_costmap_level() ? mynah_costmap_now_ns() : 0ull;
+        iter_admits = 0u;
+        pp_admit(pp, x, &adm);
+        if (t_admit != 0ull)
+            mynah_region_add_ns(MYNAH_RGN_RT_ADMISSION, mynah_costmap_now_ns() - t_admit);
+        if (timing && t_prep == t_start) t_prep = mynah_phase_seconds();
+        if (pp->g[0].used + pp->g[1].used == 0u) break;
+        if (report_phase) sink->phase(sink->ud, iteration, 1);
+
+        /* 4. Cancellation, X's rows only: none of them is in a queued step.
+         *    The cadence counts X's own phases. */
+        if (sink->cancelled != NULL && (X->phases - 1u) % cancel_every == 0ull) {
+            for (size_t i = 0; i < X->used; ++i) {
+                synth_slot *s = &X->slots[i];
+                if (!s->in_use || (!s->active && !s->preparing)) continue;
+                if (sink->cancelled(sink->ud, s->tag) != 0) {
+                    s->cancelled = 1;
+                    s->active = 0;
+                    s->preparing = 0;
+                }
+            }
+        }
+
+        /* 5. X's prefill pass on X's scratch, then the late admission (into
+         *    X, within the room both groups leave and X's own row cap: group
+         *    B's scratch is only ceil(slots / 2) rows wide). */
+        {
+            const size_t total = pp->g[0].used + pp->g[1].used;
+            size_t room = slot_capacity > total ? slot_capacity - total : 0u;
+            const size_t own = X->row_cap > X->used ? X->row_cap - X->used : 0u;
+            if (room > own) room = own;
+            X->adm.slot_capacity = X->used + room;
+            prefill_pass(&X->pre, X->retired_last);
+        }
+        if (report_phase) sink->phase(sink->ud, iteration, 2);
+
+        /* 6. Queue X's next step behind its decode, or step X serially: Y
+         *    has no rows (low concurrency: today's loop, today's audio), or
+         *    the engine refused the launch, or fewer than two rows step. */
+        int launched = 0;
+        if (Y->used > 0u) {
+            step_ahead_select_launch(&X->ahead, X->slots, &X->step_rr);
+            launched = X->ahead.count > 0u;
+        }
+        if (!launched && X->used > 0u) {
+            /* The serial step selects over today's arrangement: deliver X's
+             * decode first, and retire the rows it held. */
+            if (finished) {
+                pp_collect(pp, X, serve_profile);
+                X->retired_last += retire_pass(engine, sink, X->slots, &X->used,
+                                               slot_capacity, compact_rows, dump_all,
+                                               &result);
+            }
+            size_t live = 0;
+            const size_t resident_rows = X->used;
+            size_t next_step_rr = X->step_rr;
+            for (size_t offset = 0; offset < resident_rows && live < X->width_cap;
+                 ++offset) {
+                const size_t i = (X->step_rr + offset) % resident_rows;
+                if (!X->slots[i].in_use || !X->slots[i].active) continue;
+                step_slot[live] = i;
+                step_ctxs[live] = X->slots[i].ctx;
+                ++live;
+                next_step_rr = (i + 1u) % resident_rows;
+            }
+            if (resident_rows > 0u) {
+                if (live > 0u) X->step_rr = next_step_rr;
+                else X->step_rr = (X->step_rr + 1u) % resident_rows;
+            }
+            if (serve_profile) {
+                ++occ_frames;
+                occ_hist[live <= max_batch ? live : max_batch] += 1u;
+            }
+            if (live > 0u) {
+                const double t_step = serve_profile ? mynah_phase_seconds() : 0.0;
+                step_live(engine, &caps, X->scratch, X->slots, step_ctxs, step_slot,
+                          results, live, dump_all, 0, NULL);
+                pp_requeue(X, &prep_seq_next);
+                if (serve_profile) {
+                    const double took = mynah_phase_seconds() - t_step;
+                    const size_t b = live <= max_batch ? live : max_batch;
+                    occ_time[b] += took;
+                    if (took > occ_worst[b]) occ_worst[b] = took;
+                    if (occ_deadline_s > 0.0 && took > occ_deadline_s) ++occ_late[b];
+                    ++X->serial;
+                    if (Y->used == 0u) ++X->serial_alone;
+                    else ++X->serial_refused;
+                    X->width_sum += live;
+                    if (live > X->width_max) X->width_max = live;
+                }
+            }
+        }
+        pp_note_queued(pp, serve_profile);
+        if (report_phase) sink->phase(sink->ud, iteration, 3);
+        ++iteration;
+
+        /* 7. Deliver Y's decode: it ran before Y's step, so it is normally
+         *    done; Y's rows of that step may retire in Y's next phase. */
+        pp_collect(pp, Y, serve_profile);
+        pp_note_queued(pp, serve_profile);
+
+        if (serve_profile) {
+            const double host = (mynah_phase_seconds() - t_phase) -
+                                (pp_device_wait_s() - w_phase) -
+                                (occ_blocked_s - b_phase);
+            X->host_s += host;
+            if (y_queued) X->host_hidden_s += host;
+            X->rows_sum += X->used;
+            if (X->used > X->rows_max) X->rows_max = X->used;
+        }
+        /* The other group's turn when it has rows; otherwise X again, with
+         * nothing of X's left in flight (its serial step collected it). */
+        if (Y->used > 0u) {
+            if (x == 1) ++pp->cycles;
+            x = 1 - x;
+        } else if (X->dec.count > 0u) {
+            pp_collect(pp, X, serve_profile);   /* cannot happen */
+        }
+    }
+    if (pp != NULL) used = 0u;
+
+    while (pp == NULL) {
         /* ---- reap whatever the decoder lane finished --------------------
          * Non-blocking, and first, so that a unit that completed while the
          * batch was stepping is delivered before anything else looks at the
@@ -1679,7 +2780,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         if (report_phase) sink->phase(sink->ud, iteration, 1);
 
         /* ---- cancellation --------------------------------------------- */
-        if (sink->cancelled != NULL) {
+        if (sink->cancelled != NULL && iteration % cancel_every == 0ull) {
             for (size_t i = 0; i < slot_capacity; ++i) {
                 /* A slot still prefilling is cancellable too, and has to be:
                  * otherwise a client that disconnects during a long prefill
@@ -1695,27 +2796,29 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
 
         if (async_on) async_collect(&adm, 0);
 
-        /* ---- finish the prefills that are in flight -------------------- */
-        if (engine->prepare_slice != NULL) {
-            const size_t prefill_rows = compact_rows ? used : slot_capacity;
-            if (prefill_rows != 0u)
-                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
-                                    max_batch, dump_all, &prefill_rr,
-                                    serve_profile ? &prefill_profile : NULL);
-        }
-
-        if (late_admit && !drained && used < slot_capacity &&
-            (sink->running == NULL || sink->running(sink->ud) != 0) &&
-            sink->wait_arrival(sink->ud, retired_last ? late_wait_us : 0u) != 0) {
-            const size_t before = used;
-            admit_pass(&adm);
-            if (used > before && engine->prepare_slice != NULL) {
-                const size_t prefill_rows = compact_rows ? used : slot_capacity;
-                slots_prefill_slice(engine, &caps, scratch, slots, prefill_rows,
-                                    max_batch, dump_all, &prefill_rr,
-                                    serve_profile ? &prefill_profile : NULL);
+        /* ---- MYNAH_CUDA_DECODE_OVERLAP: collect the decode, deliver ----
+         * Usually already delivered by a poll during admission. Then this
+         * pass's held rows (last step's) are free to retire at the late
+         * retire. Without a step queued ahead the step below is serial and
+         * selects over the current arrangement, so they retire right here,
+         * where the serial loop has already retired them. */
+        if (dec != NULL) {
+            (void)dec_collect(dec, 1);
+            const size_t rows = compact_rows ? used : slot_capacity;
+            for (size_t i = 0; i < rows; ++i) slots[i].held = 0;
+            if (ahead->count == 0u) {
+                retired_last += retire_pass(engine, sink, slots, &used,
+                                            slot_capacity, compact_rows,
+                                            dump_all, &result);
+                if (used == 0u) continue;   /* back to a blocking admission */
             }
         }
+
+        /* ---- finish the prefills that are in flight -------------------- *
+         * Then the late admission. With MYNAH_CUDA_STEP_OVERLAP this already
+         * ran right after the last step, before the next one was queued. */
+        if (!prefilled_ahead) prefill_pass(&pre, retired_last);
+        prefilled_ahead = 0;
         if (report_phase) sink->phase(sink->ud, iteration, 2);
 
         /* ---- one bounded step over the live set -----------------------
@@ -1726,25 +2829,57 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         size_t live = 0;
         size_t next_step_rr = step_rr;
         const size_t resident_rows = compact_rows ? used : slot_capacity;
-        for (size_t offset = 0; offset < resident_rows && live < max_batch;
-             ++offset) {
-            const size_t i = (step_rr + offset) % resident_rows;
-            if (!slots[i].in_use || !slots[i].active) continue;
-            step_slot[live] = i;
-            step_ctxs[live] = slots[i].ctx;
-            ++live;
-            next_step_rr = (i + 1u) % resident_rows;
+        if (ahead != NULL && ahead->count > 0u) {
+            /* MYNAH_CUDA_STEP_OVERLAP: the rows of the step queued ahead, in
+             * their order. Retire and admission may have moved their slots,
+             * never dropped them. A row cancelled (or failed) meanwhile is in
+             * a step that is already running: it rides along, marked failed
+             * so that nothing else happens to it -- no decode, no delivery, no
+             * state change -- and it retires after the step, as cancelled. */
+            for (size_t p = 0; p < ahead->count; ++p) step_ctxs[p] = NULL;
+            for (size_t i = 0; i < resident_rows; ++i) {
+                synth_slot *s = &slots[i];
+                if (!s->ahead) continue;
+                s->ahead = 0;
+                if (!s->active) s->failed = 1;
+                if (s->ahead_pos >= ahead->count) continue;
+                step_slot[s->ahead_pos] = i;
+                step_ctxs[s->ahead_pos] = s->ctx;
+            }
+            for (size_t p = 0; p < ahead->count; ++p) {
+                if (step_ctxs[p] == NULL) continue;   /* cannot happen */
+                step_slot[live] = step_slot[p];
+                step_ctxs[live] = step_ctxs[p];
+                ++live;
+            }
+            ahead->count = 0u;
+            ++ahead->finished;
+            if (serve_profile) mynah_backend_sync_note_queued(0);
+        } else {
+            for (size_t offset = 0; offset < resident_rows && live < max_batch;
+                 ++offset) {
+                const size_t i = (step_rr + offset) % resident_rows;
+                if (!slots[i].in_use || !slots[i].active) continue;
+                step_slot[live] = i;
+                step_ctxs[live] = slots[i].ctx;
+                ++live;
+                next_step_rr = (i + 1u) % resident_rows;
+            }
+            if (live > 0u) step_rr = next_step_rr;
+            else step_rr = (step_rr + 1u) % resident_rows;
         }
-        if (live > 0u) step_rr = next_step_rr;
-        else step_rr = (step_rr + 1u) % resident_rows;
         if (serve_profile) {
             ++occ_frames;
             occ_hist[live <= max_batch ? live : max_batch] += 1u;
         }
+        int retired_early = 0;
         if (live > 0u) {
             const double t_step = serve_profile ? mynah_phase_seconds() : 0.0;
+            /* MYNAH_CUDA_DECODE_OVERLAP: this step's rows retire next pass. */
+            if (dec != NULL)
+                for (size_t j = 0; j < live; ++j) slots[step_slot[j]].held = 1;
             step_live(engine, &caps, scratch, slots, step_ctxs, step_slot, results,
-                      live, dump_all, lane_on);
+                      live, dump_all, lane_on, dec);
             for (size_t i = 0; i < resident_rows; ++i) {
                 if (!slots[i].requeue) continue;
                 slots[i].requeue = 0;
@@ -1757,51 +2892,38 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 if (took > occ_worst[b]) occ_worst[b] = took;
                 if (occ_deadline_s > 0.0 && took > occ_deadline_s) ++occ_late[b];
             }
+            /* MYNAH_CUDA_STEP_OVERLAP: the next iteration's prefill pass, then
+             * its step is queued; retire below and the next admission run
+             * while the device steps. */
+            if (step_overlap) {
+                /* MYNAH_CUDA_DECODE_OVERLAP: the late retire, under the decode
+                 * just submitted and before the prefill pass, so a request
+                 * re-sent as one completes can still join the next step. It
+                 * retires what ended one step ago (`held` keeps this step's
+                 * rows); the launch selects over the arrangement with this
+                 * step's ended rows removed, exactly as the serial loop's. */
+                if (dec != NULL) {
+                    retired_last = retire_pass(engine, sink, slots, &used,
+                                               slot_capacity, compact_rows,
+                                               dump_all, &result);
+                    dec->late_retired += retired_last;
+                    retired_early = 1;
+                }
+                step_ahead_launch(ahead, slots, &step_rr, retired_last);
+                prefilled_ahead = 1;
+                if (serve_profile && ahead->count > 0u)
+                    mynah_backend_sync_note_queued(1);
+            }
         }
 
         if (report_phase) sink->phase(sink->ud, iteration, 3);
         ++iteration;
-        const size_t used_before_retire = used;
 
-        /* ---- retire, per slot, as soon as it stops ---------------------
-         * Not after the whole group: the slot is the unit of capacity, and
-         * holding a finished one until its neighbours catch up is exactly the
-         * wait continuous admission exists to remove. */
-        if (compact_rows) {
-            /* Dense rows make this a real swap-remove.  Do not advance `i`
-             * after the move: the last row may itself already be finished. */
-            size_t i = 0u;
-            while (i < used) {
-                if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
-                    slots[i].starting) {
-                    ++i;
-                    continue;
-                }
-                if (slot_retire(engine, sink, &slots[i], dump_all) != 0)
-                    result = -1;
-                --used;
-                if (i != used) {
-                    slots[i] = slots[used];
-                    memset(&slots[used], 0, sizeof(slots[used]));
-                }
-            }
-        } else {
-            for (size_t i = 0; i < slot_capacity; ++i) {
-                /* `preparing` is the third state this loop has to know about:
-                 * not active, and not finished either. */
-                if (!slots[i].in_use || slots[i].active || slots[i].preparing ||
-                    slots[i].starting)
-                    continue;
-                /* NEVER FREE STATE THE LANE IS DECODING. slot_retire truncates
-                 * the frame history and frees the context; a unit still
-                 * reading it would be reading freed memory. */
-                lane_reap(&slots[i], i, 1);
-                if (slot_retire(engine, sink, &slots[i], dump_all) != 0)
-                    result = -1;
-                --used;
-            }
-        }
-        retired_last = used_before_retire - used;
+        /* ---- retire, per slot, as soon as it stops (retire_pass) -------
+         * With MYNAH_CUDA_DECODE_OVERLAP it already ran, before the launch. */
+        if (!retired_early)
+            retired_last = retire_pass(engine, sink, slots, &used, slot_capacity,
+                                       compact_rows, dump_all, &result);
     }
     if (serve_profile) {
         const double wall = mynah_phase_seconds() - t_start;
@@ -1863,6 +2985,53 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 pre1 * pct, prefill_profile.slices[1], prefill_profile.completed[1],
                 prefill_profile.slices[1] ? 1e3 * pre1 / (double)prefill_profile.slices[1] : 0.0,
                 (loop_s - step_s - pre0 - pre1) * pct, occ_blocked_s * pct);
+        if (step_overlap) {
+            const size_t steps = occ_frames - occ_hist[0];
+            fprintf(stderr,
+                    "[SERVE] step overlap (MYNAH_CUDA_STEP_OVERLAP): %llu of %zu steps "
+                    "queued ahead (%llu launched), %llu launches refused by the engine "
+                    "(not eligible: it then steps serially); %llu syncs while work "
+                    "was queued (by site: \"while queued\" below)\n",
+                    ahead->finished, steps, ahead->launched, ahead->refused,
+                    mynah_backend_sync_queued_calls());
+        }
+        if (dec != NULL) {
+            const unsigned long long collected = dec->on_poll + dec->waited;
+            fprintf(stderr,
+                    "[SERVE] decode overlap (MYNAH_CUDA_DECODE_OVERLAP): %llu gangs "
+                    "submitted (%llu refused), collected on a poll %llu / at the wait "
+                    "%llu (mean wait %.3f ms, mean submit-to-deliver %.3f ms, %llu polls "
+                    "not ready), late retire %llu rows, first-frame gangs %llu (mean "
+                    "width %.1f), PCM dropped for cancelled rows %llu\n",
+                    dec->gangs, dec->refused, dec->on_poll, dec->waited,
+                    dec->waited ? 1e3 * dec->wait_s / (double)dec->waited : 0.0,
+                    collected ? 1e3 * dec->deliver_s / (double)collected : 0.0,
+                    dec->not_ready, dec->late_retired, dec->fast_gangs,
+                    dec->fast_gangs ? (double)dec->fast_rows / (double)dec->fast_gangs
+                                    : 0.0,
+                    dec->dropped);
+        }
+        if (pp != NULL) pp_report(pp, mynah_backend_stream_sync_queued_calls());
+        /* On a GPU this is the line that says whether the device or the host
+         * bounds the loop: the host waits inside mynah_backend_sync while queued
+         * device work runs, and everything else in the loop is host time during
+         * which the GPU has nothing queued (there is no overlap of step N+1
+         * with step N's host work unless MYNAH_CUDA_STEP_OVERLAP is on). CPU
+         * backends have no sync and print nothing. */
+        double sync_s = 0.0;
+        unsigned long long sync_calls = 0ull;
+        mynah_backend_sync_profile(&sync_s, &sync_calls);
+        if (sync_calls > 0ull) {
+            const double host_s = loop_s - sync_s - occ_blocked_s;
+            fprintf(stderr,
+                    "[SERVE] device wait %.1f%% of loop (%llu syncs, %.2f ms mean, %.2f per "
+                    "iteration); host %.1f%% (%.2f ms per iteration); blocked %.1f%%\n",
+                    sync_s * pct, sync_calls, 1e3 * sync_s / (double)sync_calls,
+                    iteration ? (double)sync_calls / (double)iteration : 0.0,
+                    host_s * pct, iteration ? 1e3 * host_s / (double)iteration : 0.0,
+                    occ_blocked_s * pct);
+            mynah_backend_sync_profile_print(stderr, iteration);
+        }
     }
     if (timing) {
         t_ar = mynah_phase_seconds();
@@ -1870,6 +3039,15 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 t_prep - t_start, t_ar - t_prep, admitted);
     }
     if (async_on) async_admit_stop(&async_q);
+    free(dec);
+    free(ahead);
+    if (pp != NULL) {
+        engine->scratch_free(pp->g[1].scratch);
+        free(pp->g[1].slots);
+        free(pp->pend_job);
+        free(pp->pend_tag);
+        free(pp);
+    }
     engine->scratch_free(scratch);
     engine->model_free(state);
     return result;

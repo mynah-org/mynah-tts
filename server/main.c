@@ -90,6 +90,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -249,6 +250,11 @@ static struct {
 } g_prof_stats;
 /* Scheduler thread only. */
 static unsigned long long g_iter_index;
+/* MYNAH_STREAM_DELIVER_THREADS (CUDA default: 1-4 helpers by usable cpus;
+ * =0 rolls back): stream chunks are handed to helper threads (stream_out.h)
+ * instead of being enqueued on the scheduler thread. Set once before the
+ * scheduler starts. */
+static int g_stream_deliver;
 static double g_iter_t[PH_COUNT];
 
 static void prof_hist_add(int h, double ms) {
@@ -578,7 +584,13 @@ static int stream_callback(const float *samples, size_t count, void *user_data) 
         return -1;
     }
     if (count == 0) return stream_out_failed(sink->out) ? -1 : 0;
-    const int rc = stream_out_enqueue(sink->out, samples, count);
+    /* MYNAH_STREAM_DELIVER_THREADS: one copy into the stream's helper queue
+     * instead of conversion, ring copy and writer wake here. The bookkeeping
+     * below stays on this thread, counted at hand-off, because the sink lives
+     * in the job and the job may be gone before the helper gets to it. */
+    const int rc = g_stream_deliver
+        ? stream_out_deliver(sink->out, samples, count)
+        : stream_out_enqueue(sink->out, samples, count);
     if (rc == 0) {
         if (!sink->first_audio_seen) {
             sink->first_audio_ms = now_ms();
@@ -738,7 +750,12 @@ static void sink_on_done(void *ud, void *tag, int result) {
 
     if (j->is_stream) {
         stream_out *out = j->sink.out;
-        stream_out_finish(out);
+        /* With delivery helpers the end of the stream must queue BEHIND this
+         * stream's pending chunks, or it would overtake them and they would be
+         * refused as late: finish and release travel together through the
+         * helper at the bottom. The snapshot below may then predate the last
+         * chunk or two, which only the log lines can see. */
+        if (!g_stream_deliver) stream_out_finish(out);
         atomic_fetch_sub(&g_stats.streams_active, 1ul);
         stream_out_stats stats;
         memset(&stats, 0, sizeof(stats));   /* the getter is a no-op on NULL */
@@ -777,7 +794,8 @@ static void sink_on_done(void *ud, void *tag, int result) {
                               ? (double)j->sink.audio_samples / g.info.sample_rate
                               : 0.0);
         j->sink.out = NULL;
-        stream_out_release(out);
+        if (g_stream_deliver) stream_out_deliver_close(out);
+        else stream_out_release(out);
         job_release(j);
         return;
     }
@@ -2188,6 +2206,14 @@ static void handle_metrics(int fd) {
            "# TYPE mynah_backend_decoder_graph_fallbacks_total counter\n"
            "mynah_backend_decoder_graph_fallbacks_total %llu\n",
            m.decoder_graph_fallbacks);
+    METRIC("# HELP mynah_backend_decoder_graph_rerecords_total Cross-request CUDA decoder graph gang changes served by a host re-record.\n"
+           "# TYPE mynah_backend_decoder_graph_rerecords_total counter\n"
+           "mynah_backend_decoder_graph_rerecords_total %llu\n",
+           m.decoder_graph_rerecords);
+    METRIC("# HELP mynah_backend_decoder_graph_table_patches_total Cross-request CUDA decoder graph gang changes served by a pointer-table patch.\n"
+           "# TYPE mynah_backend_decoder_graph_table_patches_total counter\n"
+           "mynah_backend_decoder_graph_table_patches_total %llu\n",
+           m.decoder_graph_table_patches);
     METRIC("# HELP mynah_backend_decoder_failures_total Decoder failures.\n"
            "# TYPE mynah_backend_decoder_failures_total counter\n"
            "mynah_backend_decoder_failures_total %llu\n",
@@ -2635,6 +2661,35 @@ static void *worker_main(void *arg) {
  * handler, so the call simply resumes. The loop below therefore waits in
  * poll() with a timeout and re-reads the flag, which needs nothing from the
  * handler beyond an async-signal-safe store. */
+/* Every client stream holds one descriptor for its whole life, so a server
+ * sized for N concurrent streams needs a little more than N. The usual soft
+ * limit is 1024: past roughly 1000 streams accept() fails with EMFILE. Raise
+ * the soft limit to the hard one at start-up (no privilege needed), and say
+ * what was granted so an operator can see a low hard limit in the log. */
+static void raise_fd_limit(size_t streams) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return;
+    const rlim_t before = rl.rlim_cur;
+    if (rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            /* macOS refuses RLIM_INFINITY above OPEN_MAX: ask for what the
+             * streams need instead. */
+            rl.rlim_cur = (rlim_t)streams + 128u;
+            if (setrlimit(RLIMIT_NOFILE, &rl) != 0) rl.rlim_cur = before;
+        }
+    }
+    const rlim_t want = (rlim_t)streams + 128u;
+    if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < want)
+        fprintf(stderr, "warning: open-file limit %llu is below the ~%llu descriptors "
+                        "%zu concurrent streams need; raise the hard limit (ulimit -Hn, "
+                        "LimitNOFILE, --ulimit nofile) or accept() will fail with EMFILE\n",
+                (unsigned long long)rl.rlim_cur, (unsigned long long)want, streams);
+    else if (rl.rlim_cur != before)
+        fprintf(stderr, "open-file limit raised from %llu to %llu\n",
+                (unsigned long long)before, (unsigned long long)rl.rlim_cur);
+}
+
 static volatile sig_atomic_t g_shutdown = 0;
 
 static void on_signal(int sig) {
@@ -3128,6 +3183,7 @@ int main(int argc, char **argv) {
 
     g_prof = getenv("MYNAH_SERVE_PROFILE") != NULL;
     g_cuda_serving = device == MYNAH_TTS_DEVICE_CUDA;
+    raise_fd_limit(g.max_active + g.max_pending);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_usr1_dump);
@@ -3275,6 +3331,52 @@ int main(int argc, char **argv) {
      * dispatch-queue label, so the name is visible only to a debugger. */
     mynah_thread_set_name(chan_fd >= 0 ? "mynah-recv" : "mynah-accept");
 
+    /* Before the scheduler, so no stream exists yet that could be pinned to
+     * a helper that is not there. A failure to start is not fatal: delivery
+     * simply stays on the scheduler thread.
+     *
+     * Default on for CUDA serving (`=0` is the rollback, an explicit N
+     * overrides): the helper count follows the cpus this process may use
+     * (mynah_usable_cpus: affinity mask, capped by a cgroup quota), 1 helper
+     * up to 4 cpus, 2 up to 8, 4 above. The CPU engine keeps delivery on the
+     * scheduler unless N is given: its steps are compute, not host overhead,
+     * and its cores are already the pool's. */
+    {
+        const char *e = getenv("MYNAH_STREAM_DELIVER_THREADS");
+        char *end = NULL;
+        const int given = e != NULL && e[0] != '\0';
+        long n = given ? strtol(e, &end, 10) : 0;
+        int automatic = 0;
+        if (given && (end == e || *end != '\0' || n < 0 || n > 64)) {
+            fprintf(stderr, "ignoring MYNAH_STREAM_DELIVER_THREADS=%s "
+                            "(want 0..64)\n", e);
+            n = 0;
+        } else if (!given && g_cuda_serving) {
+            const int cpus = mynah_usable_cpus();
+            n = cpus <= 4 ? 1 : cpus <= 8 ? 2 : 4;
+            automatic = 1;
+        }
+        if (n > 0) {
+            if (stream_out_deliver_init((unsigned)n) == 0 &&
+                stream_out_deliver_enabled()) {
+                g_stream_deliver = 1;
+                if (automatic)
+                    fprintf(stderr, "stream delivery off the scheduler: on by "
+                                    "default, %ld helper threads for %d usable "
+                                    "cpus (MYNAH_STREAM_DELIVER_THREADS=N "
+                                    "overrides, =0 to roll back)\n",
+                            n, mynah_usable_cpus());
+                else
+                    fprintf(stderr, "stream delivery off the scheduler: on, %ld "
+                                    "helper threads (MYNAH_STREAM_DELIVER_THREADS; "
+                                    "=0 to roll back)\n", n);
+            } else {
+                fprintf(stderr, "cannot start stream delivery helpers; "
+                                "delivering on the scheduler thread\n");
+            }
+        }
+    }
+
     pthread_mutex_init(&g_batch.mu, NULL);
     pthread_cond_init(&g_batch.arrived, NULL);
     if (pthread_create(&g_batch.thread, NULL, scheduler_main, NULL) != 0) {
@@ -3405,6 +3507,10 @@ int main(int argc, char **argv) {
                 after.decoder_graph_captures - before.decoder_graph_captures,
                 freed_mb);
     }
+    /* The graph walk is over (or was not run): an engine that sizes a device
+     * pool from free memory re-plans it now, before the prefill takes sets
+     * (MYNAH_CUDA_SLOT_FIXED; a no-op otherwise). */
+    if (device == MYNAH_TTS_DEVICE_CUDA) mynah_tts_startup_mark(0);
     {
         const size_t prefill = pool_prefill_count(device == MYNAH_TTS_DEVICE_CUDA);
         if (prefill > 0u) {
@@ -3415,6 +3521,8 @@ int main(int argc, char **argv) {
                     done, prefill, now_ms() - t0);
         }
     }
+    /* Start-up is over; the same re-plan once more, with traffic next. */
+    if (device == MYNAH_TTS_DEVICE_CUDA) mynah_tts_startup_mark(1);
 
     queue_init(&g_queue);
     pthread_t workers[MYNAH_GRAPH_MAX_ACTIVE];
@@ -3459,6 +3567,7 @@ int main(int argc, char **argv) {
             const int ready = poll(&pfd, 1, 200);
             if (ready < 0) {
                 if (errno == EINTR) continue;
+                perror("poll on the listening socket; shutting down");
                 break;
             }
             if (ready == 0) continue;   /* nothing yet: re-read the shutdown flag */
@@ -3467,6 +3576,25 @@ int main(int argc, char **argv) {
             if (fd < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
                     errno == ECONNABORTED) continue;
+                /* Out of descriptors or kernel memory is a capacity condition,
+                 * not a reason to stop serving: the streams in flight will
+                 * close theirs. Say so (at most once a second), back off
+                 * briefly and keep accepting. Leaving the loop here used to
+                 * shut the whole server down without a word. */
+                if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+                    errno == ENOMEM) {
+                    static double last_note_ms;
+                    const double t = now_ms();
+                    if (t - last_note_ms >= 1000.0) {
+                        last_note_ms = t;
+                        fprintf(stderr, "accept: %s; backing off (raise the open-file "
+                                        "limit if this repeats)\n", strerror(errno));
+                    }
+                    const struct timespec pause = {0, 20 * 1000 * 1000};
+                    nanosleep(&pause, NULL);
+                    continue;
+                }
+                perror("accept; shutting down");
                 break;
             }
         }

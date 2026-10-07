@@ -406,6 +406,12 @@ int mynah_prefork_worker_index(void);
 /* The threads-per-worker actually in force, or 0 outside a worker. */
 int mynah_prefork_worker_threads(void);
 
+/* How many cpus this process may keep busy: the affinity mask (taskset, a
+ * cpuset cgroup, prefork pinning), capped by a cgroup cpu quota when one is in
+ * force (v2 `cpu.max`, else v1 cfs_quota/period), rounded up. At least 1. Reads
+ * the files on every call; meant for start-up decisions. */
+int mynah_usable_cpus(void);
+
 /* How many workers the group has, readable from inside any of them.
  *
  * WHY THIS EXISTS. `mynah_prefork_worker_index()` answers "which am I" and

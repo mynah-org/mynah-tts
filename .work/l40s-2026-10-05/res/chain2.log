@@ -1,0 +1,14 @@
+== chain2 start 16:26:55
+== e3-sites [] procs=1 ready in 28 s, VRAM 30506 MiB
+  C640 aps 766 rtf95 0.797 ttfa95 143ms gap95 138ms st250 0 fail 0 | srv_cpu -1% cli_cpu 109% | gpu 253W sm 60%
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B640  n=95       mean   24.9 ms  worst   412.9 ms  late  2.11%  per-slot   0.0 ms
+[SERVE] loop 171.6 s: step 68.9%  prefill-first 0.1% (8 slices, 4 done, 14.4 ms/slice)  prefill-cont 0.1% (234 slices, 117 done, 0.5 ms/slice)  other 31.0% (blocked 0.2%)
+[SERVE] device wait 44.7% of loop (72336 syncs, 1.06 ms mean, 24.27 per iteration); host 55.1% (31.74 ms per iteration); blocked 0.2%
+[SERVE]   sync src/engine_pocket.c:12409  calls 2881 (0.97 per iteration)  wait 33794.7 ms total, 11.730 ms mean
+[SERVE]   sync src/engine_pocket.c:4964  calls 16469 (5.53 per iteration)  wait 68.6 ms total, 0.004 ms mean
+[SERVE]   sync src/engine_pocket.c:6638  calls 47381 (15.90 per iteration)  wait 9783.8 ms total, 0.206 ms mean
+[SERVE]   sync src/engine_pocket.c:7428  calls 40 (0.01 per iteration)  wait 34.9 ms total, 0.873 ms mean
+[SERVE]   sync src/engine_pocket.c:8233  calls 2626 (0.88 per iteration)  wait 1082.8 ms total, 0.412 ms mean
+[SERVE]   sync src/engine_pocket.c:8642  calls 2939 (0.99 per iteration)  wait 31876.5 ms total, 10.846 ms mean
+== chain2 done 16:29:53

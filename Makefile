@@ -834,7 +834,13 @@ metal:
 endif
 
 CUDA_BUILD_DIR := build/cuda
-CUDA_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include
+# ROW_CAP: rows one CUDA process may step together (src/row_cap.h). 384 is
+# the measured default; `make cuda cuda-server ROW_CAP=768` builds a wider
+# server for a larger GPU. A stamp, like CUDA_ARCH's, rebuilds every CUDA
+# object when it changes, because it sizes arrays in all of them.
+ROW_CAP ?= 384
+CUDA_ROWS_STAMP := $(CUDA_BUILD_DIR)/.row-cap
+CUDA_CPPFLAGS := -Isrc -I$(INGOT_DIR)/include -DMYNAH_ROW_CAP=$(ROW_CAP)u
 CUDA_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -DMYNAH_ENABLE_CUDA
 ifneq ($(UNAME_S),Darwin)
 CUDA_CPPFLAGS += -D_DEFAULT_SOURCE
@@ -854,7 +860,7 @@ CUDA_SERVER_TARGET := $(CUDA_BUILD_DIR)/mynah-tts-server
 # Ada (sm_89) and the CI profiles always rebuilds the CUDA host object.
 CUDA_ARCH_STAMP := $(CUDA_BUILD_DIR)/.cuda-arch
 
-$(CUDA_BUILD_DIR)/%.o: %.c
+$(CUDA_BUILD_DIR)/%.o: %.c $(CUDA_ROWS_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CUDA_CPPFLAGS) $(CUDA_CFLAGS) -MMD -MP -c $< -o $@
 
@@ -864,10 +870,10 @@ else
 CUDA_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 
-$(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o: gpu/cuda/backend_cuda.cu $(CUDA_ARCH_STAMP)
+$(CUDA_BUILD_DIR)/gpu/cuda/backend_cuda.o: gpu/cuda/backend_cuda.cu $(CUDA_ARCH_STAMP) $(CUDA_ROWS_STAMP)
 	@mkdir -p $(@D)
 	@command -v nvcc >/dev/null 2>&1 || (echo "nvcc is required for CUDA; install the NVIDIA CUDA toolkit" >&2; exit 2)
-	nvcc -Isrc -O2 $(CUDA_ARCH_FLAGS) -Xcompiler "-Wall,-Wextra" -c $< -o $@
+	nvcc -Isrc -O2 -DMYNAH_ROW_CAP=$(ROW_CAP)u $(CUDA_ARCH_FLAGS) -Xcompiler "-Wall,-Wextra" -c $< -o $@
 
 
 .PHONY: cuda-arch-stamp-force
@@ -877,6 +883,12 @@ $(CUDA_ARCH_STAMP): cuda-arch-stamp-force
 	@mkdir -p $(@D)
 	@if test ! -f "$@" || ! grep -Fqx '$(CUDA_ARCH)' "$@"; then \
 		printf '%s\n' '$(CUDA_ARCH)' > "$@"; \
+	fi
+
+$(CUDA_ROWS_STAMP): cuda-arch-stamp-force
+	@mkdir -p $(@D)
+	@if test ! -f "$@" || ! grep -Fqx '$(ROW_CAP)' "$@"; then \
+		printf '%s\n' '$(ROW_CAP)' > "$@"; \
 	fi
 
 # $(LDLIBS), not a hand-written `-lm`: the CPU and Metal targets both link

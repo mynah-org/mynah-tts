@@ -22,6 +22,7 @@
 #include "mynah_tts_internal.h"
 #include "mynah_util.h"
 #include "qmat.h"
+#include "row_cap.h"
 #include "seanet.h"
 #include "tokenizer_sentencepiece.h"
 #include "voice_clone.h"
@@ -42,10 +43,13 @@
 /* Storage bound of every per-batch array.  The CPU engine advertises 128 (its
  * qualified ceiling); the CUDA backend advertises the full 384: with the device
  * KV grown on demand the 6L pack still has realtime margin at 256 on an L4. */
-#define POCKET_MAX_BATCH 384u
+#define POCKET_MAX_BATCH MYNAH_ROW_CAP
 #define POCKET_CPU_MAX_BATCH 128u
 #define POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE ((size_t)0x300000u)
 #define POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE ((size_t)0x400000u)
+/* MYNAH_CUDA_HIDDEN_LAZY: the condition-input graph without the output copy. */
+#define POCKET_CUDA_BACKBONE_LAZY_GRAPH_BASE \
+    (POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE + (size_t)0x40000u)
 
 /* MYNAH_CUDA_WIDTH_BUCKETS: execution widths for the cross-request CUDA
  * backbone and flow steps.  Unset or "0" keeps one graph per exact live
@@ -60,8 +64,12 @@
  * server takes traffic.  The Mimi decoder gang keeps exact widths: each of
  * its rows owns causal rings, so it has no inert row to pad with. */
 #define POCKET_WIDTH_BUCKETS_MAX 32u
+/* Entries above POCKET_MAX_BATCH are dropped when the list is copied, so a
+ * default 384-row build keeps exactly the list it always had and a build with
+ * a raised ROW_CAP gets buckets up to its cap. */
 static const size_t pocket_default_width_buckets[] = {
-    1u, 2u, 4u, 8u, 16u, 24u, 32u, 48u, 64u, 96u, 128u, 160u, 192u, 256u, 384u};
+    1u, 2u, 4u, 8u, 16u, 24u, 32u, 48u, 64u, 96u, 128u, 160u, 192u, 256u, 384u,
+    512u, 640u, 768u, 1024u};
 static size_t pocket_width_buckets[POCKET_WIDTH_BUCKETS_MAX];
 static size_t pocket_width_bucket_count; /* 0 = exact widths (MYNAH_CUDA_WIDTH_BUCKETS=0) */
 static pthread_once_t pocket_width_buckets_once = PTHREAD_ONCE_INIT;
@@ -75,9 +83,11 @@ static void pocket_width_buckets_parse(void) {
     if (strcmp(setting, "1") == 0) {
         const size_t n = sizeof(pocket_default_width_buckets) /
                          sizeof(pocket_default_width_buckets[0]);
-        memcpy(pocket_width_buckets, pocket_default_width_buckets,
-               n * sizeof(pocket_width_buckets[0]));
-        pocket_width_bucket_count = n;
+        size_t kept = 0u;
+        for (size_t i = 0u; i < n && kept < POCKET_WIDTH_BUCKETS_MAX; ++i)
+            if (pocket_default_width_buckets[i] <= POCKET_MAX_BATCH)
+                pocket_width_buckets[kept++] = pocket_default_width_buckets[i];
+        pocket_width_bucket_count = kept;
         return;
     }
     size_t n = 0u;
@@ -1081,6 +1091,47 @@ struct mynah_engine_state {
     int cuda_slot_pool_mutex_ready;
     struct pocket_cuda_slot *cuda_slot_pool;
     size_t cuda_slot_pool_count;
+    /* MYNAH_CUDA_SLOT_FIXED (default on, CUDA only), resolved once at model load
+     * (pocket_cuda_slot_fixed_resolve): 1 when pooled sets keep a backbone KV
+     * of at least `cuda_slot_fixed_bytes` (`cuda_slot_fixed_positions` stored
+     * positions) that a take reuses without a driver call. At most
+     * `cuda_slot_fixed_cap` such caches exist at once (`_live`, atomic); a
+     * new one is only made while the device keeps `_floor` bytes free. */
+    int cuda_slot_fixed;
+    size_t cuda_slot_fixed_positions;
+    size_t cuda_slot_fixed_bytes;
+    size_t cuda_slot_fixed_cap;
+    size_t cuda_slot_fixed_floor;
+    size_t cuda_slot_fixed_live;
+    /* The plan's inputs and its start-up re-plan (pocket_cuda_slot_fixed_
+     * replan): the rows it sizes for, the bytes of one stored position, 1
+     * when MYNAH_CUDA_SLOT_FIXED_POSITIONS fixed the size (no adaptation),
+     * the last start-up mark re-planned, and whether it said serving (read
+     * from other threads: atomic). `cuda_slot_fixed_positions`/`_bytes`
+     * change once at most (pocket_cuda_slot_fixed_adapt): atomic too. */
+    size_t cuda_slot_fixed_rows;
+    size_t cuda_slot_fixed_position_bytes;
+    int cuda_slot_fixed_size_set;
+    int cuda_slot_fixed_adapted;
+    unsigned cuda_slot_fixed_mark;
+    int cuda_slot_fixed_serving;
+    /* Fixed caches parked outside any set (under cuda_slot_pool_mutex): the
+     * growth reserve made at the re-plan (`_spare_reserve` caches one growth
+     * chunk larger than the fixed size) and the caches a growth or a take
+     * left behind. At most `_spare_max`; every one counts in `_live`. */
+    struct pocket_cuda_spare *cuda_slot_spare;
+    size_t cuda_slot_spare_count;
+    size_t cuda_slot_spare_reserve;
+    size_t cuda_slot_spare_max;
+    /* Idle host halves of request contexts (MYNAH_CTX_HOST_POOL, default
+     * on for the CUDA backend): both transformer states, the flow head, the SEANet state and the
+     * three projection scratches of a retired context, renewed for the next
+     * one instead of freed and rebuilt.  `ctx_host_pool` is resolved once at
+     * model load: 0 off, 1 on, 2 on and every taken cache zeroed (leak A/B). */
+    int ctx_host_pool;
+    pthread_mutex_t ctx_host_pool_mutex;
+    struct pocket_host_set *ctx_host_pool_head;
+    size_t ctx_host_pool_count;
     /* MYNAH_CUDA_KV_VMM, resolved once at model load: 1 when the flag is on,
      * the KV growth and prefill tile paths it extends are on, and the
      * backend's virtual memory management probe passed. Then
@@ -1246,6 +1297,12 @@ struct mynah_engine_ctx {
      * prefill tile path, or a VMM allocation failed): the next allocation
      * is the plain one. */
     int cuda_kv_vmm_refused;
+    /* MYNAH_CUDA_SLOT_FIXED: the cache counts in `cuda_slot_fixed_live` and
+     * goes back to the pool whole (never trimmed to the next request). */
+    int cuda_backbone_kv_fixed;
+    /* MYNAH_SERVE_PROFILE: the driver calls of this context's admission
+     * (pool take, pinned staging, device half), folded into `[CTX]`. */
+    mynah_backend_call_meter ctxp_calls;
     int cuda_backbone_kv_bf16;
     int cuda_backbone_enabled;
     int cuda_backbone_valid;
@@ -1320,6 +1377,10 @@ struct mynah_engine_ctx {
      * alloc helpers take their parts from it; whatever this request did not
      * consume stays here and is parked again, with the rest, at ctx_free. */
     struct pocket_cuda_slot *cuda_slot;
+    /* MYNAH_CTX_HOST_POOL: the parked host set this context's host states
+     * came from, emptied as they were taken; the shell they go back into at
+     * ctx_free. NULL with the pool off. */
+    struct pocket_host_set *host_set;
     int cuda_decoder_enabled;
     int cuda_decoder_graph_enabled;
     int cuda_decoder_started;
@@ -1339,6 +1400,11 @@ struct mynah_engine_ctx {
     int codec_back_host_pinned;
     float *pcm;        /* [samples_per_frame] */
     int pcm_host_pinned;
+    /* MYNAH_CUDA_PCM_DIRECT: the buffer `decode_audio_batch` lends the driver
+     * instead of a fresh calloc per range. Grown on demand, never shrunk, and
+     * valid until the next batched decode of this context or its free. */
+    float *lent_pcm;
+    size_t lent_pcm_floats;
 
     size_t frames;
     size_t decoded_frames;
@@ -1386,6 +1452,18 @@ struct mynah_engine_ctx {
     uint64_t onesync_rng;
     int onesync_have_spare;
     float onesync_spare;
+    /* MYNAH_DUP_CHECK_EPOCH: the epoch of the last pocket_step_batch
+     * pre-flight that saw this context; equal to the current one means the
+     * context is named twice in the batch.  Bookkeeping only, never audio. */
+    uint64_t dup_epoch;
+    /* MYNAH_CUDA_HIDDEN_LAZY: non-NULL while `hidden` is stale and the
+     * current value is still row `cuda_hidden_lazy_row` of that scratch's
+     * device backbone output (see pocket_cuda_hidden_materialize). */
+    struct mynah_engine_scratch *cuda_hidden_lazy_scratch;
+    size_t cuda_hidden_lazy_row;
+    /* MYNAH_CUDA_STEP_OVERLAP: non-NULL while this context's next step is
+     * queued on that scratch and not yet finished (pocket_step_launch). */
+    struct mynah_engine_scratch *cuda_ahead_scratch;
 
     mynah_pocket_noise_fn noise_fn;
     void *noise_user;
@@ -1536,7 +1614,96 @@ struct mynah_engine_scratch {
     int cuda_onesync_flow_finite;
     size_t cuda_onesync_count;
     mynah_engine_ctx *cuda_onesync_rows[POCKET_MAX_BATCH];
+    /* MYNAH_CUDA_ONESYNC_SUBSET: the chained flow's row layout.  Position k
+     * of the flow buffers holds row cuda_onesync_flow_order[k]; row i sits at
+     * cuda_onesync_flow_pos[i].  The identity unless the flag is on and some
+     * row is known to end at this step. */
+    size_t cuda_onesync_flow_order[POCKET_MAX_BATCH];
+    size_t cuda_onesync_flow_pos[POCKET_MAX_BATCH];
+    /* MYNAH_CUDA_HIDDEN_LAZY: device [batch] per-row finite probe, device
+     * [hidden] zeros, pinned [batch] probe readback.  `pending`: the rows of
+     * the last one-sync step (cuda_onesync_rows, cuda_onesync_count) have a
+     * stale host `hidden` whose value is still in cuda_norm. */
+    float *cuda_hidden_probe;
+    float *cuda_hidden_zero;
+    float *cuda_hidden_probe_host;
+    int cuda_hidden_lazy_enabled;
+    int cuda_hidden_lazy_pending;
+    /* MYNAH_CUDA_KV_TABLE_CACHE: per row slot, the inputs its layers x rows
+     * KV metadata entries were last computed from ([batch], NULL when off). */
+    struct pocket_kv_table_key *cuda_kv_table_keys;
+    /* MYNAH_CUDA_STEP_OVERLAP: a one-sync frame queued by pocket_step_launch
+     * for rows [0, count) and not yet synced; the next pocket_step_batch on
+     * exactly these rows finishes it.  0 when nothing is queued ahead. */
+    size_t cuda_ahead_count;
+    mynah_engine_ctx *cuda_ahead_rows[POCKET_MAX_BATCH];
+    int cuda_ahead_hidden_lazy;
+    int cuda_ahead_all_owned;
+    /* MYNAH_CUDA_DECODE_OVERLAP: the gang submitted by pocket_decode_submit
+     * and not yet collected. NULL until the first submission. */
+    struct pocket_gang_inflight *dec_inflight;
+    /* MYNAH_CUDA_PINGPONG (pocket_scratch_set_lane): this scratch serves one
+     * of two groups whose work is queued on the one stream at the same time.
+     * `lane` selects the group's copy of the backend's pinned codec-gang
+     * staging and decoder graphs; a frame queued ahead records a fence
+     * (`cuda_ahead_fence`) and its finish waits on that fence instead of
+     * draining the stream, which would also wait for the other group's work.
+     * All zero, and never read, unless the driver set a lane. */
+    int pingpong;
+    int lane;
+    void *cuda_ahead_fence;
+    /* One-sync failures on this lane since its last good frame: a lane keeps
+     * the one-sync chain after a recoverable failure (pocket_pp_onesync_keep)
+     * up to POCKET_PP_ONESYNC_RETRIES in a row. */
+    unsigned pp_onesync_failures;
 };
+
+/* MYNAH_CUDA_PINGPONG: consecutive one-sync failures a lane survives before
+ * it gives the chain up, as a scratch outside ping-pong does at the first. */
+#define POCKET_PP_ONESYNC_RETRIES 4u
+
+/* MYNAH_CUDA_PINGPONG: the optional device workspaces a lane must have when
+ * its peer has them (pocket_scratch_new keeps a scratch whose optional CUDA
+ * buffers could not be allocated, falling back to slower paths; for a second
+ * lane that would be a silent slow group, and for device-owned rows a failing
+ * one).  NULL when `scratch` has everything `peer` has. */
+static const char *pocket_pp_lane_missing(const mynah_engine_scratch *scratch,
+                                          const mynah_engine_scratch *peer) {
+    if (peer == NULL) return NULL;
+    if (peer->cuda_batch_enabled && !scratch->cuda_batch_enabled)
+        return "its resident CUDA batch workspace could not be allocated";
+    if (peer->cuda_condition_input != NULL && scratch->cuda_condition_input == NULL)
+        return "its CUDA condition input could not be allocated";
+    if (peer->cuda_flow_enabled && !scratch->cuda_flow_enabled)
+        return "its CUDA flow-head workspace could not be allocated";
+    if (peer->cuda_codec_enabled && !scratch->cuda_codec_enabled)
+        return "its CUDA codec workspace could not be allocated";
+    if (peer->cuda_onesync_enabled && !scratch->cuda_onesync_enabled)
+        return "its MYNAH_CUDA_ONE_SYNC staging could not be allocated";
+    if (peer->cuda_hidden_lazy_enabled && !scratch->cuda_hidden_lazy_enabled)
+        return "its MYNAH_CUDA_HIDDEN_LAZY probe could not be allocated";
+    return NULL;
+}
+
+/* MYNAH_CUDA_PINGPONG: clear a recoverable device error left pending by an
+ * earlier failure that was already handled, before this lane's next launch
+ * checks its own (mynah_backend_lane_clear_error).  Reported, rarely. */
+static void pocket_pp_clear_stale(const mynah_engine_scratch *scratch,
+                                  const char *where) {
+    static unsigned long long cleared;   /* the one serving thread's count */
+    if (scratch == NULL || !scratch->pingpong || scratch->backend == NULL) return;
+    char stale[256];
+    stale[0] = '\0';
+    if (mynah_backend_lane_clear_error(scratch->backend, stale, sizeof(stale)) == 0)
+        return;
+    const unsigned long long n = ++cleared;
+    if (n <= 4ull || (n & (n - 1ull)) == 0ull)
+        fprintf(stderr,
+                "pocket: ping-pong lane %d: cleared a stale device error (%s) "
+                "before %s; it belonged to an earlier failure that was already "
+                "handled (%llu so far)\n",
+                scratch->lane, stale[0] != '\0' ? stale : "unknown", where, n);
+}
 
 /* --------------------------------------------------------------- the dump
  *
@@ -3738,6 +3905,43 @@ static int pocket_resolve_singles(mynah_engine_state *state, char *error,
 /* -------------------------------------------------------------- model_init */
 
 static void pocket_cuda_slot_pool_drain(mynah_engine_state *state);
+static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state);
+static void pocket_host_pool_drain(mynah_engine_state *state);
+
+/* MYNAH_CTX_HOST_POOL: 0 off, 1 on, 2 on and every cache a renewed state
+ * hands out zeroed (the leak A/B: the audio must be bit-identical either
+ * way).  Unset: on (1) for the CUDA backend, where it was measured (=0 is the
+ * rollback); off for the CPU backend, which works with it but was not
+ * measured.  One start-up line per process when on. */
+static int pocket_host_pool_setting(const mynah_backend *backend) {
+    const char *value = getenv("MYNAH_CTX_HOST_POOL");
+    const int given = value != NULL && value[0] != '\0';
+    if (given && strcmp(value, "0") == 0) return 0;
+    if (!given && (backend == NULL ||
+                   strcmp(mynah_backend_name(backend), "cuda") != 0))
+        return 0;
+    const int mode = given && strcmp(value, "2") == 0 ? 2 : 1;
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        if (given)
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CTX_HOST_POOL=%d: a retired request's host "
+                    "state (transformer states, flow head, SEANet state, "
+                    "projection scratch) is parked and renewed for the next "
+                    "request instead of freed and rebuilt%s (=0 to roll back)\n",
+                    mode,
+                    mode == 2 ? "; renewed KV caches are zeroed (leak A/B)" : "");
+        else
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CTX_HOST_POOL (default): a retired "
+                    "request's host state (transformer states, flow head, "
+                    "SEANet state, projection scratch) is parked and renewed "
+                    "for the next request instead of freed and rebuilt "
+                    "(=0 to roll back)\n");
+    }
+    return mode;
+}
 
 static void pocket_model_free(mynah_engine_state *state) {
     if (state == NULL) return;
@@ -3745,6 +3949,11 @@ static void pocket_model_free(mynah_engine_state *state) {
     if (state->cuda_slot_pool_mutex_ready) {
         pthread_mutex_destroy(&state->cuda_slot_pool_mutex);
         state->cuda_slot_pool_mutex_ready = 0;
+    }
+    if (state->ctx_host_pool != 0) {
+        pocket_host_pool_drain(state);
+        pthread_mutex_destroy(&state->ctx_host_pool_mutex);
+        state->ctx_host_pool = 0;
     }
     if (state->cuda_voice_kv != NULL) {
         for (size_t v = 0; v < state->voice_count; ++v)
@@ -4087,6 +4296,12 @@ static int pocket_model_init(const mynah_tts_model *model,
     /* A failed init only disables the CUDA slot pool; `_enabled` checks it. */
     if (pthread_mutex_init(&state->cuda_slot_pool_mutex, NULL) == 0)
         state->cuda_slot_pool_mutex_ready = 1;
+    /* MYNAH_CTX_HOST_POOL, read once (default on for the CUDA backend); a
+     * failed init leaves it off. */
+    state->ctx_host_pool = pocket_host_pool_setting(model->backend);
+    if (state->ctx_host_pool != 0 &&
+        pthread_mutex_init(&state->ctx_host_pool_mutex, NULL) != 0)
+        state->ctx_host_pool = 0;
     state->model_dir = pocket_strdup(model->model_dir, strlen(model->model_dir));
     if (state->model_dir == NULL) {
         pocket_model_free(state);
@@ -4389,6 +4604,9 @@ static int pocket_model_init(const mynah_tts_model *model,
                         "backbone KV growth keeps cudaMalloc + copy\n",
                         reason);
         }
+        /* MYNAH_CUDA_SLOT_FIXED: resolved once here, after the KV element
+         * type; on unless the flag is 0 (one start-up line). */
+        if (resident_on) pocket_cuda_slot_fixed_resolve(state);
         fprintf(stderr,
                 "mynah-tts: pocket backend=cuda resident=%s qgroups=0x%04x "
                 "q8=%s resident{backbone=%s flow=%s codec_transformer=%s} "
@@ -4543,6 +4761,54 @@ static size_t pocket_max_batch_for(const mynah_backend *backend) {
                : POCKET_CPU_MAX_BATCH;
 }
 
+/* MYNAH_CUDA_PCM_DIRECT=1: the gang decode lends each context's PCM instead of
+ * handing the driver a fresh buffer it must free.
+ *
+ * At serving widths the per-row bookkeeping around the codec is host time on
+ * the one scheduler thread: per row and step, a calloc of one range, a copy
+ * of every frame from the pinned gang PCM into `ctx->pcm`, the finite scan,
+ * another copy from `ctx->pcm` into the range, and the driver's free(). With
+ * the flag the range is a per-context buffer reused across steps, and on the
+ * gang-gather path a frame is copied once, straight from the pinned rows into
+ * the range, and scanned there. The samples are the same bytes, moved fewer
+ * times.
+ *
+ * Lending rather than pointing into the pinned gang buffer is deliberate: that
+ * buffer is overwritten by the next frame of a multi-frame range and by the
+ * next step, while a context's own buffer only changes when that context is
+ * decoded again -- which the driver never does before it has delivered (and,
+ * with MYNAH_STREAM_DELIVER_THREADS, copied) the previous range. The driver
+ * learns the ownership change from `caps.decode_batch_lends_pcm`; the single
+ * `decode_audio` path is untouched and still returns malloc'd PCM.
+ *
+ * Not CUDA-specific in mechanism: the lent buffer applies to the CPU gang too
+ * (which is what lets the CPU server check it), only the single-copy half is
+ * on the CUDA gather path. Default on for the CUDA backend, where it was
+ * measured (=0 is the rollback); the CPU backend keeps the malloc'd ranges
+ * unless the variable is set to a nonzero value. The variable is read once. */
+static int pocket_pcm_direct_enabled(const mynah_backend *backend) {
+    static int setting = -2; /* -1 unset, 0 off, 1 on */
+    static int announced;
+    if (setting == -2) {
+        const char *value = getenv("MYNAH_CUDA_PCM_DIRECT");
+        setting = value == NULL || value[0] == '\0' ? -1
+                                                    : strcmp(value, "0") != 0;
+    }
+    const int on = setting >= 0
+                       ? setting
+                       : backend != NULL &&
+                             strcmp(mynah_backend_name(backend), "cuda") == 0;
+    if (on && !announced) {
+        announced = 1;
+        fprintf(stderr, setting < 0
+                            ? "mynah-tts: lent gang decode PCM: on by default "
+                              "(MYNAH_CUDA_PCM_DIRECT=0 to roll back)\n"
+                            : "mynah-tts: lent gang decode PCM: on "
+                              "(MYNAH_CUDA_PCM_DIRECT)\n");
+    }
+    return on;
+}
+
 static int pocket_caps(const mynah_tts_model *model,
                        const mynah_engine_state *state, mynah_engine_caps *out) {
     if (out == NULL) return -1;
@@ -4576,6 +4842,14 @@ static int pocket_caps(const mynah_tts_model *model,
     out->is_discrete_codec = 0u;
     out->latent_dim = (unsigned)cfg->latent_dim;
     out->prefill_slice_tokens = pocket_prefill_slice_tokens(state);
+    out->decode_batch_lends_pcm =
+        (unsigned)pocket_pcm_direct_enabled(state->backend);
+    /* L13/L13b/L13d: measured on the CUDA backend only (bit-identical CLI
+     * --batch, --stream and server C1; faster at every measured L4 and L40S
+     * level); the CPU backend keeps them opt-in. */
+    out->overlap_by_default =
+        state->backend != NULL &&
+        strcmp(mynah_backend_name(state->backend), "cuda") == 0;
     return 0;
 }
 
@@ -4995,6 +5269,9 @@ typedef struct pocket_cuda_slot {
      * is what is mapped, bb_kv_reserved its virtual reservation. */
     int bb_kv_vmm;
     size_t bb_kv_reserved;
+    /* MYNAH_CUDA_SLOT_FIXED: the model state whose `cuda_slot_fixed_live`
+     * counts this cache; NULL for an ordinary cache. */
+    mynah_engine_state *bb_kv_fixed;
     float *bb_x, *bb_norm, *bb_qkv, *bb_attn, *bb_proj, *bb_ffn;
     /* resident Mimi decoder transformer */
     float **codec_kv;
@@ -5013,6 +5290,9 @@ typedef struct pocket_cuda_slot {
     /* pinned host staging (only ever pinned buffers are parked) */
     float *step_input, *hidden, *denorm, *codec_seq, *codec_out, *codec_back,
         *pcm;
+    /* MYNAH_CUDA_DEFERRED_RELEASE: recorded on the stream when the set was
+     * parked without a drain; waited on before the set is used or freed. */
+    void *fence;
 } pocket_cuda_slot;
 
 static int pocket_cuda_slot_pool_enabled(const mynah_engine_state *state) {
@@ -5027,10 +5307,775 @@ static int pocket_cuda_slot_zero_kv_requested(void) {
     return setting != NULL && strcmp(setting, "0") != 0;
 }
 
+/* ------------------------------------------- MYNAH_CUDA_SLOT_FIXED
+ *
+ * Default on for the CUDA backend (=0 is the rollback; the CPU backend has
+ * no slot pool and never reads it); read once at model load. A take from the slot
+ * pool used to keep a parked backbone KV only when it fit the new request's
+ * starting estimate within a factor of two (pocket_cuda_slot_kv_fits);
+ * otherwise the parked cache was cudaFree'd -- which waits for the whole
+ * device, i.e. behind the queued step -- and a new one cudaMalloc'ed. With a
+ * mixed corpus that is most takes, and on some hosts and drivers it is
+ * 10-12 ms of the scheduler thread per admission.
+ *
+ * With the flag on, a tile-path (growable) row's backbone KV is allocated at
+ * no less than a fixed size F, `cuda_slot_fixed_positions` stored positions,
+ * and such a cache goes back to the pool whole. A take of one never calls
+ * the driver: the cache is laid out over all its positions (the stride is
+ * the row's own capacity, exactly as for any reused cache), and when the
+ * request's starting estimate is larger, the row starts at what the cache
+ * holds (at least its prefill and first step) and grows later only if it
+ * really gets there (the starting estimate is 3 frames per text token, the
+ * measured rate is 2-2.6). The KV is not cleared: attention reads only the
+ * positions this request wrote, the contract every reused or fresh cache
+ * relies on (MYNAH_CUDA_SLOT_POOL_ZERO_KV=1 still clears it, with an async
+ * memset).
+ *
+ * F (MYNAH_CUDA_SLOT_FIXED_POSITIONS overrides it, and then it never moves):
+ * 384 stored positions to start with, the text plus its frames (the voice
+ * prefix is shared, not stored): ~60 tokens + ~320 frames, ~26 s of audio
+ * at 12.5 Hz. On the v2 reference corpus (12-531 characters) that holds
+ * about 90 % of the requests without growth; the longest (~130 tokens,
+ * ~430 positions) grow once. 19.1 MiB per row with int8 records at 24
+ * layers, against 25.5 MiB at 512. Once serving, the engine keeps a
+ * histogram of the stored positions each request really reached (and of
+ * the admission's estimate, for the [CTX] line); after the first
+ * POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER requests it moves F, once, to the
+ * 95th percentile of the real lengths rounded up to 64, within
+ * [320, 768]. Caches made before keep their size: every one of them still
+ * serves any request it holds the prefill of.
+ *
+ * The full step budget is not what fixes the size: 1500 frames is ~1700
+ * positions, 83.5 MiB per row with int8 records at 24 layers, which no GPU
+ * holds at hundreds of rows.
+ *
+ * Growth of a fixed row never synchronises the device (pocket_cuda_fixed_
+ * grow): the new cache is a spare (below), else the cache of a parked set
+ * that holds the new size (the set keeps the old one in exchange), else a
+ * new allocation within the cap; the live prefix is copied on the stream,
+ * and the old cache is parked (in a set without one, else on the spare
+ * list) instead of freed. Everything is on the backend's one stream, so the
+ * next user of a parked cache is ordered after every queued read of its
+ * previous owner, and the host never reads or writes a KV cache. Only when
+ * none of that is possible does the old allocate + sync + free path run
+ * (`grow ... sync` in [CTX]).
+ *
+ * VRAM: at most `cuda_slot_fixed_cap` fixed caches exist. At model load the
+ * cap is the provisional min(rows, (free - reserve) / bytes) of
+ * mynah_backend_fixed_buffers_plan, rows = MYNAH_CUDA_SLOT_FIXED_ROWS
+ * (default the build's row cap). A server then marks its start-up
+ * (mynah_tts_startup_mark) after the width-bucket graph walk and again after
+ * the slot-pool prefill; at the next admission after each mark the plan is
+ * redone (pocket_cuda_slot_fixed_replan): the walk's parked caches, sized
+ * for its long text, are freed unless they are within one growth chunk
+ * above F, the free memory is measured, and the cap becomes
+ * mynah_backend_fixed_buffers_refit: min(rows + spares, live + (free -
+ * margin) / bytes) with a margin of max(2 GiB, total / 16) plus the other
+ * per-row buffers of the sets not made yet. The parked sets without a cache
+ * are then given one of F, and `_spare_reserve` spares of F + one growth
+ * chunk are made, both within the cap. A new cache is also only made while
+ * the device keeps max(1 GiB, total / 20) free after it. Anything past the
+ * cap uses the plain pool, as with the flag off, but never frees a parked
+ * cache on the admission path: a cache that does not fit is parked again.
+ * VMM rows (MYNAH_CUDA_KV_VMM, BF16 only) and rows with a full-capacity
+ * cache are never fixed. */
+#define POCKET_CUDA_SLOT_FIXED_DEFAULT_POSITIONS ((size_t)384u)
+#define POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER 1024ul
+#define POCKET_CUDA_SLOT_FIXED_ADAPT_LOW ((size_t)320u)
+#define POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH ((size_t)768u)
+/* Device bytes per row besides the backbone KV, without the row diet (the
+ * conservative figure of .work/pocket-cuda-c208.md: 9.0 MiB at 24L). */
+#define POCKET_CUDA_SLOT_FIXED_OTHER_BYTES ((size_t)9u << 20)
+
+/* A fixed cache parked outside any set (`cuda_slot_spare`). */
+typedef struct pocket_cuda_spare {
+    struct pocket_cuda_spare *next;
+    float *kv;
+    size_t bytes;
+    int bf16;
+} pocket_cuda_spare;
+
+/* `[CTX]` counters of the fixed caches (MYNAH_SERVE_PROFILE): reused whole,
+ * reused short of the starting estimate, made new, refused by the cap or the
+ * free-memory floor, a fixed cache freed at a take (wrong element type, or
+ * no room to park it), freed at retirement after growing past 2x (no room on
+ * the spare list), parked instead of freed (a take's misfit, a growth's old
+ * cache, a retirement's oversized one), taken from the spare list by an
+ * admission, and growths by source: a spare, a parked set's cache, a new
+ * allocation, or the old allocate + sync + free path. */
+enum { FIXST_REUSED, FIXST_SHORT, FIXST_NEW, FIXST_OVER, FIXST_MISFIT,
+       FIXST_TRIM, FIXST_PARKED, FIXST_SPARE_TAKE, FIXST_GROW_SPARE,
+       FIXST_GROW_SLOT, FIXST_GROW_ALLOC, FIXST_GROW_SYNC, FIXST_N };
+static unsigned long g_fixst[FIXST_N];
+static void pocket_cuda_slot_fixed_note(int what) {
+    __atomic_add_fetch(&g_fixst[what], 1ul, __ATOMIC_RELAXED);
+}
+
+/* Stored positions per request, 64-position buckets (the last one open):
+ * [0] the admission's starting estimate, [1] what the request really
+ * reached by retirement. Counted only once a server said it is serving, so
+ * the start-up's synthetic requests stay out. */
+#define POCKET_FIXLEN_BUCKETS 64u
+static unsigned long g_fixlen[2][POCKET_FIXLEN_BUCKETS];
+static unsigned long g_fixlen_n[2];
+static void pocket_cuda_fixlen_note(const mynah_engine_state *state, int kind,
+                                    size_t positions) {
+    if (!__atomic_load_n(&state->cuda_slot_fixed_serving, __ATOMIC_RELAXED))
+        return;
+    size_t bucket = positions / 64u;
+    if (bucket >= POCKET_FIXLEN_BUCKETS) bucket = POCKET_FIXLEN_BUCKETS - 1u;
+    __atomic_add_fetch(&g_fixlen[kind][bucket], 1ul, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_fixlen_n[kind], 1ul, __ATOMIC_RELAXED);
+}
+
+/* The upper edge of the bucket holding the `percent` percentile; 0 when
+ * nothing was counted. */
+static size_t pocket_fixlen_percentile_of(const unsigned long *buckets,
+                                          unsigned long n, unsigned percent) {
+    if (n == 0ul) return 0u;
+    const unsigned long want = (n * percent + 99ul) / 100ul;
+    unsigned long seen = 0ul;
+    for (size_t b = 0; b < POCKET_FIXLEN_BUCKETS; ++b) {
+        seen += __atomic_load_n(&buckets[b], __ATOMIC_RELAXED);
+        if (seen >= want) return (b + 1u) * 64u;
+    }
+    return POCKET_FIXLEN_BUCKETS * 64u;
+}
+
+static size_t pocket_cuda_fixlen_percentile(int kind, unsigned percent) {
+    return pocket_fixlen_percentile_of(
+        g_fixlen[kind], __atomic_load_n(&g_fixlen_n[kind], __ATOMIC_RELAXED),
+        percent);
+}
+
+static size_t pocket_cuda_slot_fixed_size(const mynah_engine_state *state) {
+    return __atomic_load_n(&state->cuda_slot_fixed_bytes, __ATOMIC_RELAXED);
+}
+
+/* Bytes of a cache one growth chunk larger than the fixed size: the spare
+ * reserve's size, and the upper edge of what the re-plan keeps. */
+static size_t pocket_cuda_slot_fixed_band(const mynah_engine_state *state) {
+    const size_t chunk = POCKET_CUDA_KV_GROW_CHUNK * state->cuda_slot_fixed_position_bytes;
+    const size_t fixed = pocket_cuda_slot_fixed_size(state);
+    return fixed > SIZE_MAX - chunk ? SIZE_MAX : fixed + chunk;
+}
+
+static size_t pocket_cuda_slot_fixed_env_size(const char *name, size_t fallback,
+                                              size_t low, size_t high) {
+    const char *setting = getenv(name);
+    if (setting == NULL || setting[0] == '\0') return fallback;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long value = strtoull(setting, &end, 10);
+    if (end == setting || errno != 0 || value < low || value > high) {
+        fprintf(stderr, "mynah-tts: warning: %s=%s ignored (want %zu..%zu)\n",
+                name, setting, low, high);
+        return fallback;
+    }
+    return (size_t)value;
+}
+
+/* Model load, after the KV element type is decided. Leaves
+ * state->cuda_slot_fixed 0 (the plain pool) when the flag is 0, when the pool
+ * or the growable tile-path cache is off, or when no cache fits. */
+static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
+    const char *setting = getenv("MYNAH_CUDA_SLOT_FIXED");
+    const int given = setting != NULL && setting[0] != '\0';
+    state->cuda_slot_fixed = 0;
+    if (given && strcmp(setting, "0") == 0) return;
+    if (!pocket_cuda_slot_pool_enabled(state) || !pocket_cuda_kv_grow_enabled() ||
+        !pocket_cuda_prefill_tile_enabled()) {
+        fprintf(stderr,
+                given ? "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED=1 ignored: it "
+                        "needs the CUDA slot pool, MYNAH_CUDA_KV_GROW and "
+                        "MYNAH_CUDA_PREFILL_TILE on\n"
+                      : "mynah-tts: MYNAH_CUDA_SLOT_FIXED (default) off: it needs "
+                        "the CUDA slot pool, MYNAH_CUDA_KV_GROW and "
+                        "MYNAH_CUDA_PREFILL_TILE on\n");
+        return;
+    }
+    const char *size_setting = getenv("MYNAH_CUDA_SLOT_FIXED_POSITIONS");
+    size_t positions = pocket_cuda_slot_fixed_env_size(
+        "MYNAH_CUDA_SLOT_FIXED_POSITIONS", POCKET_CUDA_SLOT_FIXED_DEFAULT_POSITIONS,
+        64u, 65536u);
+    const int size_set = size_setting != NULL && size_setting[0] != '\0';
+    positions = (positions + 63u) / 64u * 64u;
+    const size_t rows = pocket_cuda_slot_fixed_env_size(
+        "MYNAH_CUDA_SLOT_FIXED_ROWS", POCKET_CUDA_SLOT_POOL_CAP, 1u,
+        POCKET_CUDA_SLOT_POOL_CAP);
+    const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
+    const pocket_config *cfg = &state->cfg;
+    size_t position_bytes = 0u, bytes = 0u;
+    if (pocket_mul(pocket_cuda_kv_record(state, kv_bf16), 2u * cfg->layers,
+                   &position_bytes) != 0 ||
+        pocket_mul(position_bytes, pocket_cuda_kv_elem(state, kv_bf16),
+                   &position_bytes) != 0 ||
+        pocket_mul(positions, position_bytes, &bytes) != 0 || bytes == 0u ||
+        position_bytes > SIZE_MAX / POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH) {
+        fprintf(stderr, "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED ignored "
+                        "(size overflow)\n");
+        return;
+    }
+    mynah_tts_backend_metrics metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    if (mynah_backend_metrics_get(state->backend, &metrics) != 0 ||
+        metrics.device_memory_bytes == 0u) {
+        fprintf(stderr, "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED ignored "
+                        "(the backend reports no device memory)\n");
+        return;
+    }
+    const size_t total = (size_t)metrics.device_memory_bytes;
+    const size_t free_now = (size_t)metrics.device_memory_free_bytes;
+    size_t reserve = 0u, fit = 0u;
+    (void)mynah_backend_fixed_buffers_plan(free_now, total, rows, bytes,
+                                           POCKET_CUDA_SLOT_FIXED_OTHER_BYTES,
+                                           &reserve, &fit);
+    const double mib = 1024.0 * 1024.0, gib = mib * 1024.0;
+    fprintf(stderr,
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED%s: pooled request sets keep a "
+            "backbone KV of >= %zu positions (%.2f MiB, %s; %s), reused with "
+            "no driver call; %zu rows x %.2f MiB = %.2f GiB against %.2f GiB "
+            "free - %.2f GiB reserve (max(4 GiB, %.1f GiB / 5) + %zu x %zu MiB "
+            "other per-row buffers) = %.2f GiB: ",
+            given ? "=1 (=0 to roll back)" : " (default; =0 to roll back)",
+            positions, (double)bytes / mib,
+            kv_bf16 ? (state->cuda_kv_int8 ? "int8 records" : "bf16") : "f32",
+            size_set ? "MYNAH_CUDA_SLOT_FIXED_POSITIONS"
+                     : "default, moves once to the served p95",
+            rows, (double)bytes / mib, (double)rows * (double)bytes / gib,
+            (double)free_now / gib, (double)reserve / gib, (double)total / gib,
+            rows, POCKET_CUDA_SLOT_FIXED_OTHER_BYTES >> 20,
+            free_now > reserve ? (double)(free_now - reserve) / gib : 0.0);
+    if (fit == 0u) {
+        fprintf(stderr, "REFUSED, nothing fits; the plain slot pool is used "
+                        "(as with the flag off)\n");
+        return;
+    }
+    if (fit < rows)
+        fprintf(stderr, "auto-capped to %zu fixed caches; rows past them use the "
+                        "plain slot pool", fit);
+    else
+        fprintf(stderr, "all %zu rows fit", rows);
+    fprintf(stderr, " (provisional: a server re-plans after its start-up "
+                    "warm-ups)\n");
+    state->cuda_slot_fixed = 1;
+    state->cuda_slot_fixed_positions = positions;
+    state->cuda_slot_fixed_bytes = bytes;
+    state->cuda_slot_fixed_cap = fit;
+    state->cuda_slot_fixed_floor = total / 20u;
+    if (state->cuda_slot_fixed_floor < ((size_t)1u << 30))
+        state->cuda_slot_fixed_floor = (size_t)1u << 30;
+    state->cuda_slot_fixed_live = 0u;
+    state->cuda_slot_fixed_rows = rows;
+    state->cuda_slot_fixed_position_bytes = position_bytes;
+    state->cuda_slot_fixed_size_set = size_set;
+    state->cuda_slot_fixed_adapted = 0;
+    state->cuda_slot_fixed_mark = 0u;
+    state->cuda_slot_fixed_serving = 0;
+    state->cuda_slot_spare = NULL;
+    state->cuda_slot_spare_count = 0u;
+    /* A small growth reserve, 1 in 32 rows (32 caches, ~1 GiB, at 1024
+     * rows), and room for 1 in 8 rows of parked-aside caches. */
+    state->cuda_slot_spare_reserve = rows / 32u < 4u ? 4u : rows / 32u;
+    state->cuda_slot_spare_max = rows / 8u < 16u ? 16u : rows / 8u;
+}
+
+/* Count one more fixed cache of `bytes` if the cap and the free-memory
+ * floor allow it. Only on paths that allocate anyway, so the free-memory
+ * query adds nothing to a zero-call take. `note`: count a refusal in
+ * [CTX] (the re-plan's own refills do not). */
+static int pocket_cuda_slot_fixed_claim(mynah_engine_state *state,
+                                        size_t bytes, int note) {
+    if (state == NULL || !state->cuda_slot_fixed) return 0;
+    size_t live = __atomic_load_n(&state->cuda_slot_fixed_live, __ATOMIC_RELAXED);
+    do {
+        if (live >= __atomic_load_n(&state->cuda_slot_fixed_cap,
+                                    __ATOMIC_RELAXED)) {
+            if (note) pocket_cuda_slot_fixed_note(FIXST_OVER);
+            return 0;
+        }
+    } while (!__atomic_compare_exchange_n(&state->cuda_slot_fixed_live, &live,
+                                          live + 1u, 0, __ATOMIC_RELAXED,
+                                          __ATOMIC_RELAXED));
+    mynah_tts_backend_metrics metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    if (mynah_backend_metrics_get(state->backend, &metrics) == 0 &&
+        metrics.device_memory_bytes != 0u &&
+        ((size_t)metrics.device_memory_free_bytes < bytes ||
+         (size_t)metrics.device_memory_free_bytes - bytes <
+             state->cuda_slot_fixed_floor)) {
+        __atomic_sub_fetch(&state->cuda_slot_fixed_live, 1u, __ATOMIC_RELAXED);
+        if (note) pocket_cuda_slot_fixed_note(FIXST_OVER);
+        return 0;
+    }
+    return 1;
+}
+
+/* A fixed cache was freed (or a claim was not used). */
+static void pocket_cuda_slot_fixed_gone(mynah_engine_state *state) {
+    if (state != NULL)
+        __atomic_sub_fetch(&state->cuda_slot_fixed_live, 1u, __ATOMIC_RELAXED);
+}
+
+/* An existing plain cache becomes a fixed one (it is parked aside instead
+ * of freed): counted, whatever the cap -- the memory is spent already. */
+static void pocket_cuda_slot_fixed_adopt(mynah_engine_state *state) {
+    __atomic_add_fetch(&state->cuda_slot_fixed_live, 1u, __ATOMIC_RELAXED);
+}
+
+/* Retirement: whether a fixed cache grew past twice the fixed size. Such a
+ * cache is parked aside as a growth spare when the spare list has room, and
+ * freed otherwise, so the pool does not keep long requests' caches. */
+static int pocket_cuda_slot_fixed_oversized(const mynah_engine_ctx *ctx) {
+    if (ctx == NULL || !ctx->cuda_backbone_kv_fixed || ctx->state == NULL)
+        return 0;
+    const size_t fixed = pocket_cuda_slot_fixed_size(ctx->state);
+    return fixed <= SIZE_MAX / 2u && ctx->cuda_backbone_kv_bytes > 2u * fixed;
+}
+
+/* Park a counted fixed cache without freeing it: into a parked set that has
+ * no backbone KV (its other backbone buffers wait there), else onto the
+ * spare list. 0 when placed; -1 when neither has room (the caller still
+ * owns the cache). Never a driver call: the next user of the cache is on
+ * the same stream, after every queued read of the previous owner. */
+static int pocket_cuda_fixed_stash(mynah_engine_state *state, float *kv,
+                                   size_t bytes, int bf16) {
+    pocket_cuda_spare *node = (pocket_cuda_spare *)malloc(sizeof(*node));
+    int placed = 0;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_slot *slot = state->cuda_slot_pool; slot != NULL;
+         slot = slot->next) {
+        if (slot->bb_kv == NULL) {
+            slot->bb_kv = kv;
+            slot->bb_kv_bytes = bytes;
+            slot->bb_kv_bf16 = bf16;
+            slot->bb_kv_vmm = 0;
+            slot->bb_kv_reserved = 0u;
+            slot->bb_kv_fixed = state;
+            placed = 1;
+            break;
+        }
+    }
+    if (!placed && node != NULL &&
+        state->cuda_slot_spare_count < state->cuda_slot_spare_max) {
+        node->kv = kv;
+        node->bytes = bytes;
+        node->bf16 = bf16;
+        node->next = state->cuda_slot_spare;
+        state->cuda_slot_spare = node;
+        state->cuda_slot_spare_count++;
+        node = NULL;
+        placed = 1;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    free(node);
+    if (placed) pocket_cuda_slot_fixed_note(FIXST_PARKED);
+    return placed ? 0 : -1;
+}
+
+/* Take the spare that holds `want` bytes most tightly, else the largest that
+ * holds `least`; NULL when there is none. The cache stays counted. */
+static float *pocket_cuda_fixed_spare_take(mynah_engine_state *state,
+                                           size_t least, size_t want, int bf16,
+                                           size_t *bytes) {
+    pocket_cuda_spare **best = NULL, **largest = NULL;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_spare **link = &state->cuda_slot_spare; *link != NULL;
+         link = &(*link)->next) {
+        const pocket_cuda_spare *spare = *link;
+        if (spare->bf16 != bf16 || spare->bytes < least) continue;
+        if (spare->bytes >= want &&
+            (best == NULL || spare->bytes < (*best)->bytes))
+            best = link;
+        if (largest == NULL || spare->bytes > (*largest)->bytes) largest = link;
+    }
+    pocket_cuda_spare **pick = best != NULL ? best : largest;
+    pocket_cuda_spare *node = NULL;
+    if (pick != NULL) {
+        node = *pick;
+        *pick = node->next;
+        state->cuda_slot_spare_count--;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    if (node == NULL) return NULL;
+    float *kv = node->kv;
+    *bytes = node->bytes;
+    free(node);
+    return kv;
+}
+
+/* Take the backbone KV of a parked set: the smallest fixed, plain cache of
+ * this element type with at least `least` bytes. The set stays parked
+ * without one (pocket_cuda_fixed_stash refills it); the cache stays
+ * counted. NULL when there is none. */
+static float *pocket_cuda_fixed_slot_kv_take(mynah_engine_state *state,
+                                             size_t least, int bf16,
+                                             size_t *bytes) {
+    pocket_cuda_slot *best = NULL;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_slot *slot = state->cuda_slot_pool; slot != NULL;
+         slot = slot->next) {
+        if (slot->bb_kv != NULL && slot->bb_kv_fixed != NULL &&
+            !slot->bb_kv_vmm && slot->bb_kv_bf16 == bf16 &&
+            slot->bb_kv_bytes >= least &&
+            (best == NULL || slot->bb_kv_bytes < best->bb_kv_bytes))
+            best = slot;
+    }
+    float *kv = NULL;
+    if (best != NULL) {
+        kv = best->bb_kv;
+        *bytes = best->bb_kv_bytes;
+        best->bb_kv = NULL;
+        best->bb_kv_bytes = 0u;
+        best->bb_kv_fixed = NULL;
+    }
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    return kv;
+}
+
+/* Allocate one fixed cache of `bytes` under the cap and park it (a set
+ * without a cache first, else the spare list). 0 when made. Start-up only
+ * (the re-plan): an allocation, never a free, except of the cache just made
+ * when there is nowhere to park it. */
+static int pocket_cuda_fixed_make(mynah_engine_state *state, size_t bytes,
+                                  int bf16) {
+    if (!pocket_cuda_slot_fixed_claim(state, bytes, 0)) return -1;
+    void *kv = NULL;
+    char ignored[256];
+    ignored[0] = '\0';
+    if (mynah_backend_dev_alloc_bytes(state->backend, bytes, &kv, ignored,
+                                      sizeof(ignored)) != 0 || kv == NULL) {
+        pocket_cuda_slot_fixed_gone(state);
+        return -1;
+    }
+    if (pocket_cuda_fixed_stash(state, (float *)kv, bytes, bf16) != 0) {
+        mynah_backend_dev_free(state->backend, (float *)kv);
+        pocket_cuda_slot_fixed_gone(state);
+        return -1;
+    }
+    return 0;
+}
+
+/* The start-up re-plan, at the first admission after each
+ * mynah_tts_startup_mark (a server calls it after the width-bucket graph
+ * walk and after the slot-pool prefill; nothing else does, so a CLI run
+ * keeps the load-time plan). One drain (the device is idle at those points),
+ * then:
+ *   1. every parked plain cache within [F, F + one growth chunk] is adopted
+ *      as fixed; every other parked cache (the walk's, sized for its long
+ *      text, or a too-small one) is freed;
+ *   2. free memory is measured and the cap re-planned from it
+ *      (mynah_backend_fixed_buffers_refit);
+ *   3. parked sets without a cache get one of F, then the spare reserve is
+ *      made (F + one growth chunk), both while the cap allows.
+ * One log line per mark. */
+static void pocket_cuda_slot_fixed_replan(mynah_engine_state *state) {
+    int serving = 0;
+    const unsigned mark = mynah_tts_startup_generation(&serving);
+    unsigned seen = __atomic_load_n(&state->cuda_slot_fixed_mark, __ATOMIC_RELAXED);
+    if (mark == seen ||
+        !__atomic_compare_exchange_n(&state->cuda_slot_fixed_mark, &seen, mark,
+                                     0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    /* Lengths are counted from the serving mark on (the start-up's own
+     * requests are synthetic). */
+    __atomic_store_n(&state->cuda_slot_fixed_serving, serving, __ATOMIC_RELAXED);
+    const mynah_backend *backend = state->backend;
+    const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
+    const size_t fixed = pocket_cuda_slot_fixed_size(state);
+    const size_t band = pocket_cuda_slot_fixed_band(state);
+    pocket_cuda_drain_before_release(backend);
+    size_t sets = 0u, kept = 0u, freed = 0u, holes = 0u;
+    pthread_mutex_lock(&state->cuda_slot_pool_mutex);
+    for (pocket_cuda_slot *slot = state->cuda_slot_pool; slot != NULL;
+         slot = slot->next) {
+        ++sets;
+        if (slot->bb_kv != NULL && !slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16) {
+            if (slot->bb_kv_bytes >= fixed && slot->bb_kv_bytes <= band) {
+                if (slot->bb_kv_fixed == NULL) {
+                    slot->bb_kv_fixed = state;
+                    pocket_cuda_slot_fixed_adopt(state);
+                }
+                ++kept;
+            } else {
+                if (slot->bb_kv_fixed != NULL) pocket_cuda_slot_fixed_gone(state);
+                mynah_backend_dev_free(backend, slot->bb_kv);
+                slot->bb_kv = NULL;
+                slot->bb_kv_bytes = 0u;
+                slot->bb_kv_fixed = NULL;
+                ++freed;
+            }
+        }
+        if (slot->bb_kv == NULL) ++holes;
+    }
+    const size_t spares_have = state->cuda_slot_spare_count;
+    pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    mynah_tts_backend_metrics metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    if (mynah_backend_metrics_get(backend, &metrics) != 0 ||
+        metrics.device_memory_bytes == 0u)
+        return; /* keep the load-time cap */
+    const size_t total = (size_t)metrics.device_memory_bytes;
+    const size_t free_now = (size_t)metrics.device_memory_free_bytes;
+    const size_t reserve = state->cuda_slot_spare_reserve;
+    const size_t to_make = reserve > spares_have ? reserve - spares_have : 0u;
+    const size_t extra = band - fixed > SIZE_MAX / (to_make + 1u)
+                             ? SIZE_MAX
+                             : to_make * (band - fixed);
+    size_t margin = 0u, cap = 0u;
+    (void)mynah_backend_fixed_buffers_refit(
+        free_now, total, state->cuda_slot_fixed_rows, reserve, sets,
+        __atomic_load_n(&state->cuda_slot_fixed_live, __ATOMIC_RELAXED), fixed,
+        POCKET_CUDA_SLOT_FIXED_OTHER_BYTES, extra, &margin, &cap);
+    __atomic_store_n(&state->cuda_slot_fixed_cap, cap, __ATOMIC_RELAXED);
+    size_t made = 0u, spares_made = 0u;
+    for (size_t i = 0; i < holes; ++i) {
+        if (pocket_cuda_fixed_make(state, fixed, kv_bf16) != 0) break;
+        ++made;
+    }
+    for (size_t i = 0; i < to_make; ++i) {
+        if (pocket_cuda_fixed_make(state, band, kv_bf16) != 0) break;
+        ++spares_made;
+    }
+    const double mib = 1024.0 * 1024.0, gib = mib * 1024.0;
+    fprintf(stderr,
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED re-planned after the start-up "
+            "%s (mark %u): %.2f GiB free of %.2f GiB, margin %.2f GiB "
+            "(max(2 GiB, total / 16) + sets still to make + spare reserve); "
+            "cap %zu fixed caches of >= %zu positions (%.2f MiB) = %zu rows + "
+            "%zu spares at most; %zu parked sets: kept %zu caches, freed %zu, "
+            "made %zu, spares made %zu of %zu (%zu positions); %zu live\n",
+            serving ? "(serving next)" : "warm-ups", mark,
+            (double)free_now / gib, (double)total / gib, (double)margin / gib,
+            cap, fixed / state->cuda_slot_fixed_position_bytes,
+            (double)fixed / mib, state->cuda_slot_fixed_rows, reserve, sets, kept,
+            freed, made, spares_made, to_make,
+            band / state->cuda_slot_fixed_position_bytes,
+            __atomic_load_n(&state->cuda_slot_fixed_live, __ATOMIC_RELAXED));
+}
+
+/* Once serving, after POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER retirements: F
+ * moves, once, to the 95th percentile of the stored positions requests
+ * really reached, within [320, 768] (unless MYNAH_CUDA_SLOT_FIXED_POSITIONS
+ * set it). Only caches made from then on use it. */
+static void pocket_cuda_slot_fixed_adapt(mynah_engine_state *state) {
+    if (state->cuda_slot_fixed_size_set || state->cuda_slot_fixed_adapted ||
+        __atomic_load_n(&g_fixlen_n[1], __ATOMIC_RELAXED) <
+            POCKET_CUDA_SLOT_FIXED_ADAPT_AFTER)
+        return;
+    state->cuda_slot_fixed_adapted = 1;
+    size_t positions = pocket_cuda_fixlen_percentile(1, 95u);
+    if (positions < POCKET_CUDA_SLOT_FIXED_ADAPT_LOW)
+        positions = POCKET_CUDA_SLOT_FIXED_ADAPT_LOW;
+    if (positions > POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH)
+        positions = POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH;
+    const size_t old = state->cuda_slot_fixed_positions;
+    fprintf(stderr,
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED: %lu served requests reached "
+            "p50/p95/p99 %zu/%zu/%zu stored positions (admission estimate p95 "
+            "%zu); new fixed caches: %zu -> %zu positions\n",
+            __atomic_load_n(&g_fixlen_n[1], __ATOMIC_RELAXED),
+            pocket_cuda_fixlen_percentile(1, 50u),
+            pocket_cuda_fixlen_percentile(1, 95u),
+            pocket_cuda_fixlen_percentile(1, 99u),
+            pocket_cuda_fixlen_percentile(0, 95u), old, positions);
+    if (positions == old) return;
+    state->cuda_slot_fixed_positions = positions;
+    __atomic_store_n(&state->cuda_slot_fixed_bytes,
+                     positions * state->cuda_slot_fixed_position_bytes,
+                     __ATOMIC_RELAXED);
+}
+
+/* See engine_pocket.h. The host-side bookkeeping of the fixed caches on a
+ * model-less state: no device call is made, the "caches" are host tokens. */
+int mynah_engine_pocket_slot_fixed_self_test(char *error, size_t capacity) {
+    mynah_engine_state *state = (mynah_engine_state *)calloc(1, sizeof(*state));
+    pocket_cuda_slot *a = (pocket_cuda_slot *)calloc(1, sizeof(*a));
+    pocket_cuda_slot *b = (pocket_cuda_slot *)calloc(1, sizeof(*b));
+    static float token[8];
+    const char *failed = NULL;
+    if (state == NULL || a == NULL || b == NULL ||
+        pthread_mutex_init(&state->cuda_slot_pool_mutex, NULL) != 0) {
+        free(state);
+        free(a);
+        free(b);
+        pocket_error(error, capacity, "slot-fixed self-test: out of memory");
+        return -1;
+    }
+    state->cuda_slot_fixed = 1;
+    state->cuda_slot_fixed_position_bytes = 1000u;
+    state->cuda_slot_fixed_positions = 384u;
+    state->cuda_slot_fixed_bytes = 384000u;
+    state->cuda_slot_fixed_cap = 8u;
+    state->cuda_slot_spare_max = 2u;
+    /* Pool: a (parked without a cache, its other buffers there), then b
+     * (a fixed cache of 500 positions). */
+    a->bb_x = &token[0];
+    b->bb_kv = &token[1];
+    b->bb_kv_bytes = 500000u;
+    b->bb_kv_fixed = state;
+    a->next = b;
+    state->cuda_slot_pool = a;
+    state->cuda_slot_pool_count = 2u;
+    size_t got = 0u;
+    if (pocket_cuda_slot_fixed_band(state) != 640000u)
+        failed = "the spare size is not one growth chunk above F";
+    /* A park fills the set without a cache first, then the spare list up to
+     * its room, then refuses (the caller keeps the cache). */
+    else if (pocket_cuda_fixed_stash(state, &token[2], 384000u, 0) != 0 ||
+             a->bb_kv != &token[2] || a->bb_kv_fixed != state ||
+             state->cuda_slot_spare_count != 0u)
+        failed = "a parked cache did not go to the set without one";
+    else if (pocket_cuda_fixed_stash(state, &token[3], 640000u, 0) != 0 ||
+             pocket_cuda_fixed_stash(state, &token[4], 384000u, 0) != 0 ||
+             state->cuda_slot_spare_count != 2u ||
+             pocket_cuda_fixed_stash(state, &token[5], 384000u, 0) != -1)
+        failed = "the spare list did not hold exactly its room";
+    /* Spares: the tightest at or above `want`, else the largest above
+     * `least`, else none; wrong element type never. */
+    else if (pocket_cuda_fixed_spare_take(state, 300000u, 400000u, 1, &got) != NULL)
+        failed = "a spare of the other element type was taken";
+    else if (pocket_cuda_fixed_spare_take(state, 300000u, 400000u, 0, &got) !=
+                 &token[3] || got != 640000u)
+        failed = "the tightest spare holding the estimate was not taken";
+    else if (pocket_cuda_fixed_spare_take(state, 300000u, 900000u, 0, &got) !=
+                 &token[4] || got != 384000u)
+        failed = "the largest spare holding the prefill was not taken";
+    else if (pocket_cuda_fixed_spare_take(state, 1u, 1u, 0, &got) != NULL ||
+             state->cuda_slot_spare_count != 0u)
+        failed = "an empty spare list gave a cache";
+    /* A growth takes the smallest parked fixed cache that holds the new
+     * size; the set stays parked without one. */
+    else if (pocket_cuda_fixed_slot_kv_take(state, 450000u, 0, &got) !=
+                 &token[1] || got != 500000u || b->bb_kv != NULL ||
+             b->bb_kv_fixed != NULL || state->cuda_slot_pool_count != 2u)
+        failed = "a growth did not take the parked cache that holds it";
+    else if (pocket_cuda_fixed_slot_kv_take(state, 450000u, 0, &got) != NULL)
+        failed = "a growth took a parked cache too small for it";
+    else if (pocket_cuda_fixed_stash(state, &token[1], 500000u, 0) != 0 ||
+             b->bb_kv != &token[1])
+        failed = "the set emptied by a growth did not get the old cache back";
+    else {
+        /* Count: claims stop at the cap, adoption does not, frees undo. */
+        state->cuda_slot_fixed_live = 7u;
+        pocket_cuda_slot_fixed_adopt(state);
+        pocket_cuda_slot_fixed_adopt(state);
+        if (state->cuda_slot_fixed_live != 9u ||
+            pocket_cuda_slot_fixed_claim(state, 384000u, 0) != 0 ||
+            state->cuda_slot_fixed_live != 9u)
+            failed = "the fixed-cache count is wrong";
+        pocket_cuda_slot_fixed_gone(state);
+        if (failed == NULL && state->cuda_slot_fixed_live != 8u)
+            failed = "a freed fixed cache was not uncounted";
+    }
+    if (failed == NULL) {
+        /* Oversized: a fixed cache past 2 F only. */
+        mynah_engine_ctx *ctx = (mynah_engine_ctx *)calloc(1, sizeof(*ctx));
+        if (ctx == NULL) {
+            failed = "out of memory";
+        } else {
+            ctx->state = state;
+            ctx->cuda_backbone_kv_fixed = 1;
+            ctx->cuda_backbone_kv_bytes = 768000u;
+            const int at_two = pocket_cuda_slot_fixed_oversized(ctx);
+            ctx->cuda_backbone_kv_bytes = 768001u;
+            const int past_two = pocket_cuda_slot_fixed_oversized(ctx);
+            ctx->cuda_backbone_kv_fixed = 0;
+            const int plain = pocket_cuda_slot_fixed_oversized(ctx);
+            if (at_two || !past_two || plain)
+                failed = "the oversized rule is not 'fixed and past 2 F'";
+            free(ctx);
+        }
+    }
+    if (failed == NULL) {
+        /* Percentiles: upper bucket edges, the last bucket open. */
+        unsigned long buckets[POCKET_FIXLEN_BUCKETS];
+        memset(buckets, 0, sizeof(buckets));
+        buckets[3] = 50u;  /* 192..255 */
+        buckets[5] = 45u;  /* 320..383 */
+        buckets[6] = 4u;   /* 384..447 */
+        buckets[POCKET_FIXLEN_BUCKETS - 1u] = 1u;
+        if (pocket_fixlen_percentile_of(buckets, 0u, 95u) != 0u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 50u) != 256u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 95u) != 384u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 99u) != 448u ||
+            pocket_fixlen_percentile_of(buckets, 100u, 100u) !=
+                POCKET_FIXLEN_BUCKETS * 64u)
+            failed = "the length percentiles are wrong";
+    }
+    /* The pool and spares hold host tokens only: unlink, never free them. */
+    while (state->cuda_slot_spare != NULL) {
+        pocket_cuda_spare *next = state->cuda_slot_spare->next;
+        free(state->cuda_slot_spare);
+        state->cuda_slot_spare = next;
+    }
+    pthread_mutex_destroy(&state->cuda_slot_pool_mutex);
+    free(a);
+    free(b);
+    free(state);
+    if (failed != NULL) {
+        pocket_error(error, capacity, "slot-fixed self-test: %s", failed);
+        return -1;
+    }
+    return 0;
+}
+
+/* MYNAH_CUDA_DEFERRED_RELEASE (default on; =0 is the rollback; needs the slot
+ * pool, so CPU runs never read it).  Parking
+ * a retired context used to start with a full stream drain.  On the backend's
+ * one stream nothing the next owner queues can overtake the previous owner's
+ * work, so the device buffers need no drain.  The host does touch the set
+ * when it is taken again -- pocket_cuda_host_take zeroes the pinned staging
+ * that a late async copy may still read or write, and a taken set may free or
+ * remap its backbone cache -- so the drain becomes a stream event recorded at
+ * park and waited on only when the set is taken (or freed).  Anything the
+ * park cannot keep is still freed after a drain, as before. */
+static int pocket_cuda_deferred_release_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_DEFERRED_RELEASE");
+        cached = value == NULL || strcmp(value, "0") != 0;
+        if (cached)
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CUDA_DEFERRED_RELEASE (default): a "
+                    "retired request's CUDA set is parked behind a stream "
+                    "event, waited on when the set is taken again, instead of "
+                    "a full drain (=0 to roll back)\n");
+    }
+    return cached;
+}
+
+/* Whether a context still holds device memory or pinned staging that the
+ * ordinary release helpers in ctx_free would free: whatever the park did not
+ * move into the pool. */
+static int pocket_cuda_ctx_holds_device(const mynah_engine_ctx *ctx) {
+    return ctx->cuda_backbone_kv != NULL || ctx->cuda_x != NULL ||
+           ctx->cuda_norm != NULL || ctx->cuda_qkv != NULL ||
+           ctx->cuda_attn != NULL || ctx->cuda_proj != NULL ||
+           ctx->cuda_ffn != NULL || ctx->cuda_codec_kv != NULL ||
+           ctx->cuda_codec_x != NULL || ctx->cuda_codec_norm != NULL ||
+           ctx->cuda_codec_qkv != NULL || ctx->cuda_codec_attn != NULL ||
+           ctx->cuda_codec_proj != NULL || ctx->cuda_codec_ffn != NULL ||
+           ctx->cuda_codec_denorm != NULL || ctx->cuda_codec_up_input != NULL ||
+           ctx->cuda_codec_up != NULL || ctx->cuda_codec_up_partial != NULL ||
+           ctx->cuda_decoder != NULL || ctx->cuda_decoder_input != NULL ||
+           ctx->cuda_decoder_output != NULL || ctx->cuda_slot != NULL ||
+           (ctx->step_input != NULL && ctx->step_input_host_pinned) ||
+           (ctx->hidden != NULL && ctx->hidden_host_pinned) ||
+           (ctx->denorm != NULL && ctx->denorm_host_pinned) ||
+           (ctx->codec_seq != NULL && ctx->codec_seq_host_pinned) ||
+           (ctx->codec_out != NULL && ctx->codec_out_host_pinned) ||
+           (ctx->codec_back != NULL && ctx->codec_back_host_pinned) ||
+           (ctx->pcm != NULL && ctx->pcm_host_pinned);
+}
+
 static void pocket_cuda_kv_free(const mynah_backend *backend, void *kv, int vmm);
 
 static void pocket_cuda_slot_free_backbone(const mynah_backend *backend,
                                            pocket_cuda_slot *slot) {
+    if (slot->bb_kv != NULL && slot->bb_kv_fixed != NULL)
+        pocket_cuda_slot_fixed_gone(slot->bb_kv_fixed);
+    slot->bb_kv_fixed = NULL;
     pocket_cuda_kv_free(backend, slot->bb_kv, slot->bb_kv_vmm);
     mynah_backend_dev_free(backend, slot->bb_x);
     mynah_backend_dev_free(backend, slot->bb_norm);
@@ -5092,6 +6137,8 @@ static void pocket_cuda_slot_free_decoder(const mynah_backend *backend,
 static void pocket_cuda_slot_destroy(const mynah_backend *backend,
                                      pocket_cuda_slot *slot) {
     if (slot == NULL) return;
+    mynah_backend_fence_wait(backend, slot->fence);
+    slot->fence = NULL;
     pocket_cuda_slot_free_backbone(backend, slot);
     pocket_cuda_slot_free_codec(backend, slot);
     pocket_cuda_slot_free_upsample(backend, slot);
@@ -5124,19 +6171,44 @@ static int pocket_cuda_slot_kv_fits(size_t have, size_t need, int bounded) {
  * reserved bytes fits, whatever it has mapped (the allocation maps more or
  * unmaps the excess in place); the tightest mapped size at or above the
  * need wins, else the largest. A plain request never takes a VMM cache
- * (different layout) and vice versa. */
+ * (different layout) and vice versa.
+ *
+ * MYNAH_CUDA_SLOT_FIXED, for a growable plain request: a fixed cache wins
+ * over any other, the tightest at or above the need, else the largest; among
+ * equal ones the one parked earliest (furthest down the list), whose fence is
+ * the most likely to have passed already, so the fence wait below rarely
+ * blocks. Off (or no fixed cache parked): the rule above, unchanged. */
 static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
                                                   size_t bb_kv_bytes,
                                                   int bb_kv_bf16, int bounded,
                                                   int vmm, size_t vmm_reserve) {
     if (!pocket_cuda_slot_pool_enabled(state)) return NULL;
+    if (state->cuda_slot_fixed) {
+        /* A start-up mark since the last admission: re-plan the cap; once
+         * serving, move F to the served lengths (both at most once each). */
+        pocket_cuda_slot_fixed_replan(state);
+        pocket_cuda_slot_fixed_adapt(state);
+    }
+    const int fixed = state->cuda_slot_fixed && bounded && !vmm;
     pthread_mutex_lock(&state->cuda_slot_pool_mutex);
     pocket_cuda_slot **best = NULL;
     pocket_cuda_slot **largest = NULL;
     pocket_cuda_slot **vmm_any = NULL;
+    pocket_cuda_slot **fixed_best = NULL;
+    pocket_cuda_slot **fixed_any = NULL;
     for (pocket_cuda_slot **link = &state->cuda_slot_pool; *link != NULL;
          link = &(*link)->next) {
         const pocket_cuda_slot *slot = *link;
+        if (fixed && slot->bb_kv != NULL && slot->bb_kv_fixed != NULL &&
+            !slot->bb_kv_vmm && slot->bb_kv_bf16 == bb_kv_bf16) {
+            if (slot->bb_kv_bytes >= bb_kv_bytes &&
+                (fixed_best == NULL ||
+                 slot->bb_kv_bytes <= (*fixed_best)->bb_kv_bytes))
+                fixed_best = link;
+            if (fixed_any == NULL ||
+                slot->bb_kv_bytes >= (*fixed_any)->bb_kv_bytes)
+                fixed_any = link;
+        }
         if (vmm) {
             if (slot->bb_kv != NULL && slot->bb_kv_vmm &&
                 slot->bb_kv_bf16 == bb_kv_bf16 &&
@@ -5157,6 +6229,8 @@ static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
             largest = link;
     }
     if (best == NULL) best = vmm_any;
+    if (fixed_best != NULL) best = fixed_best;
+    else if (fixed_any != NULL) best = fixed_any;
     pocket_cuda_slot **pick = best != NULL ? best : largest;
     pocket_cuda_slot *slot = NULL;
     if (pick != NULL) {
@@ -5166,6 +6240,12 @@ static pocket_cuda_slot *pocket_cuda_slot_acquire(mynah_engine_state *state,
         state->cuda_slot_pool_count--;
     }
     pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    if (slot != NULL && slot->fence != NULL) {
+        /* MYNAH_CUDA_DEFERRED_RELEASE: the previous owner's queued work is
+         * done before the host zeroes, frees or remaps any of the set. */
+        mynah_backend_fence_wait(state->backend, slot->fence);
+        slot->fence = NULL;
+    }
     return slot;
 }
 
@@ -5193,8 +6273,10 @@ static float *pocket_cuda_host_take(const mynah_engine_state *state,
 /* Move this context's CUDA resources into a pooled set.  Runs after the
  * drain in ctx_free; the ctx pointers it moves are left NULL, so the ordinary
  * release helpers that follow only reset flags.  A disabled pool, a full pool
- * or an empty set frees instead. */
-static void pocket_cuda_slot_park(mynah_engine_ctx *ctx) {
+ * or an empty set frees instead.  `deferred` (MYNAH_CUDA_DEFERRED_RELEASE):
+ * ctx_free did not drain; the pooled set carries a fence instead, and the
+ * pool-full path drains before it frees. */
+static void pocket_cuda_slot_park(mynah_engine_ctx *ctx, int deferred) {
     if (ctx == NULL || ctx->state == NULL) return;
     mynah_engine_state *state = ctx->state;
     const mynah_backend *backend = state->backend;
@@ -5208,14 +6290,46 @@ static void pocket_cuda_slot_park(mynah_engine_ctx *ctx) {
         slot = (pocket_cuda_slot *)calloc(1, sizeof(*slot));
         if (slot == NULL) return; /* the ordinary release frees everything */
     }
-    if (ctx->cuda_backbone_kv != NULL && ctx->cuda_x != NULL &&
+    /* MYNAH_CUDA_SLOT_FIXED: count how far the request really got, and a
+     * fixed cache that grew past twice the fixed size is parked aside (a
+     * growth spare) when there is room; otherwise it stays on the context
+     * and is freed below, as before. Off: none of this runs. */
+    int kv_aside = 0, kv_oversized = 0;
+    if (state->cuda_slot_fixed && ctx->cuda_backbone_kv != NULL &&
+        !ctx->cuda_backbone_kv_vmm) {
+        if (ctx->backbone != NULL) {
+            const size_t reached = mynah_transformer_ar_state_offset(ctx->backbone);
+            pocket_cuda_fixlen_note(state, 1,
+                                    reached > ctx->cuda_backbone_kv_skip
+                                        ? reached - ctx->cuda_backbone_kv_skip
+                                        : 0u);
+        }
+        if (pocket_cuda_slot_fixed_oversized(ctx)) {
+            if (pocket_cuda_fixed_stash(state, ctx->cuda_backbone_kv,
+                                        ctx->cuda_backbone_kv_bytes,
+                                        ctx->cuda_backbone_kv_bf16) == 0) {
+                ctx->cuda_backbone_kv = NULL;
+                ctx->cuda_backbone_kv_bytes = 0u;
+                ctx->cuda_backbone_kv_fixed = 0;
+                kv_aside = 1;
+            } else {
+                kv_oversized = 1;
+                pocket_cuda_slot_fixed_note(FIXST_TRIM);
+            }
+        }
+    }
+    if ((ctx->cuda_backbone_kv != NULL || kv_aside) && ctx->cuda_x != NULL &&
         ctx->cuda_norm != NULL && ctx->cuda_qkv != NULL &&
         ctx->cuda_attn != NULL && ctx->cuda_proj != NULL &&
-        ctx->cuda_ffn != NULL && ctx->cuda_backbone_kv_bytes != 0u) {
+        ctx->cuda_ffn != NULL &&
+        (ctx->cuda_backbone_kv_bytes != 0u || kv_aside) && !kv_oversized) {
         pocket_cuda_slot_free_backbone(backend, slot);
         POCKET_SLOT_MOVE(slot->bb_kv, ctx->cuda_backbone_kv);
         slot->bb_kv_bytes = ctx->cuda_backbone_kv_bytes;
         slot->bb_kv_bf16 = ctx->cuda_backbone_kv_bf16;
+        /* MYNAH_CUDA_SLOT_FIXED: the count moves with the cache. */
+        slot->bb_kv_fixed = ctx->cuda_backbone_kv_fixed ? state : NULL;
+        ctx->cuda_backbone_kv_fixed = 0;
         /* A VMM cache is parked with its mappings: the next owner maps more
          * or unmaps the excess in place (pocket_cuda_backbone_alloc). */
         slot->bb_kv_vmm = ctx->cuda_backbone_kv_vmm;
@@ -5263,7 +6377,10 @@ static void pocket_cuda_slot_park(mynah_engine_ctx *ctx) {
         /* The same graph bookkeeping decoder_close did: the per-decoder graph
          * and any cross-request batch graph naming this decoder go now, so
          * the bounded graph caches never fill up with retired gangs. */
-        mynah_backend_graph_forget(backend, ctx->cuda_decoder);
+        if (deferred)
+            mynah_backend_graph_forget_parked(backend, ctx->cuda_decoder);
+        else
+            mynah_backend_graph_forget(backend, ctx->cuda_decoder);
         POCKET_SLOT_MOVE(slot->decoder, ctx->cuda_decoder);
         POCKET_SLOT_MOVE(slot->decoder_input, ctx->cuda_decoder_input);
         POCKET_SLOT_MOVE(slot->decoder_output, ctx->cuda_decoder_output);
@@ -5294,14 +6411,24 @@ static void pocket_cuda_slot_park(mynah_engine_ctx *ctx) {
         pocket_cuda_slot_destroy(backend, slot);
         return;
     }
+    /* Recorded before the set is visible to an admission. */
+    void *fence = NULL;
+    if (deferred) {
+        fence = mynah_backend_fence_record(backend);
+        if (fence == NULL) pocket_cuda_drain_before_release(backend);
+    }
     pthread_mutex_lock(&state->cuda_slot_pool_mutex);
     if (state->cuda_slot_pool_count < POCKET_CUDA_SLOT_POOL_CAP) {
+        slot->fence = fence;
+        fence = NULL;
         slot->next = state->cuda_slot_pool;
         state->cuda_slot_pool = slot;
         state->cuda_slot_pool_count++;
         slot = NULL;
     }
     pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
+    /* Pool full: the unused fence is the drain ctx_free skipped. */
+    mynah_backend_fence_wait(backend, fence);
     pocket_cuda_slot_destroy(backend, slot); /* pool full: free as before */
 }
 
@@ -5312,8 +6439,19 @@ static void pocket_cuda_slot_pool_drain(mynah_engine_state *state) {
     pocket_cuda_slot *slot = state->cuda_slot_pool;
     state->cuda_slot_pool = NULL;
     state->cuda_slot_pool_count = 0u;
+    pocket_cuda_spare *spare = state->cuda_slot_spare;
+    state->cuda_slot_spare = NULL;
+    state->cuda_slot_spare_count = 0u;
     pthread_mutex_unlock(&state->cuda_slot_pool_mutex);
-    if (slot != NULL) pocket_cuda_drain_before_release(state->backend);
+    if (slot != NULL || spare != NULL)
+        pocket_cuda_drain_before_release(state->backend);
+    while (spare != NULL) { /* MYNAH_CUDA_SLOT_FIXED spares */
+        pocket_cuda_spare *next = spare->next;
+        mynah_backend_dev_free(state->backend, spare->kv);
+        pocket_cuda_slot_fixed_gone(state);
+        free(spare);
+        spare = next;
+    }
     while (slot != NULL) {
         pocket_cuda_slot *next = slot->next;
         pocket_cuda_slot_destroy(state->backend, slot);
@@ -5463,6 +6601,8 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     const mynah_backend *backend =
         (ctx->state == NULL) ? NULL : ctx->state->backend;
     if (backend != NULL) {
+        if (ctx->cuda_backbone_kv != NULL && ctx->cuda_backbone_kv_fixed)
+            pocket_cuda_slot_fixed_gone(ctx->state);
         pocket_cuda_kv_free(backend, ctx->cuda_backbone_kv,
                             ctx->cuda_backbone_kv_vmm);
         mynah_backend_dev_free(backend, ctx->cuda_x);
@@ -5485,6 +6625,7 @@ static void pocket_cuda_backbone_release(mynah_engine_ctx *ctx) {
     ctx->cuda_backbone_kv_bytes = 0u;
     ctx->cuda_backbone_kv_vmm = 0;
     ctx->cuda_backbone_kv_reserved = 0u;
+    ctx->cuda_backbone_kv_fixed = 0;
     ctx->cuda_backbone_kv_bf16 = 0;
     ctx->cuda_backbone_valid = 0;
 }
@@ -6725,6 +7866,10 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
         return 0;
     }
 
+    /* MYNAH_CUDA_SLOT_FIXED: the starting estimate, for the [CTX] line. */
+    if (ctx->state->cuda_slot_fixed && kv_growable)
+        pocket_cuda_fixlen_note(ctx->state, 0, kv_capacity - kv_skip);
+
     char ignored[256];
     /* MYNAH_CUDA_KV_VMM: a growable (tile-path) cache becomes a VMM range,
      * position-major, reserving `vmm_reserve` virtual bytes. Its byte size
@@ -6768,7 +7913,14 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
                 kept = 1;
             }
         }
-        if (!kept) pocket_cuda_kv_free(backend, slot->bb_kv, slot->bb_kv_vmm);
+        if (!kept) {
+            if (slot->bb_kv_fixed != NULL) {
+                pocket_cuda_slot_fixed_gone(slot->bb_kv_fixed);
+                pocket_cuda_slot_fixed_note(FIXST_MISFIT);
+            }
+            pocket_cuda_kv_free(backend, slot->bb_kv, slot->bb_kv_vmm);
+        }
+        slot->bb_kv_fixed = NULL;
         slot->bb_kv = NULL;
         slot->bb_kv_bytes = 0u;
         slot->bb_kv_vmm = 0;
@@ -6781,10 +7933,26 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
         POCKET_SLOT_MOVE(ctx->cuda_ffn, slot->bb_ffn);
     } else if (slot != NULL && slot->bb_kv != NULL) {
         const mynah_backend *backend = ctx->state->backend;
-        if (!slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16 &&
-            pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, kv_bytes, kv_growable)) {
+        /* MYNAH_CUDA_SLOT_FIXED: a fixed cache serves any growable row whose
+         * prefill and first step it holds (voice + text + 1 positions),
+         * whatever the starting estimate; the row grows later only if it
+         * really passes the end. Never set with the flag off. */
+        int fixed_fit = 0;
+        if ((slot->bb_kv_fixed != NULL || ctx->state->cuda_slot_fixed) &&
+            kv_growable && !slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16) {
+            size_t floor_positions = 0u;
+            if (pocket_add(ctx->voice_positions, ctx->text_capacity,
+                           &floor_positions) == 0 &&
+                floor_positions < SIZE_MAX && floor_positions + 1u > kv_skip &&
+                slot->bb_kv_bytes / position_bytes >= floor_positions + 1u - kv_skip)
+                fixed_fit = 1;
+        }
+        if (fixed_fit ||
+            (!slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16 &&
+             pocket_cuda_slot_kv_fits(slot->bb_kv_bytes, kv_bytes, kv_growable))) {
             ctx->cuda_backbone_kv = slot->bb_kv;
             ctx->cuda_backbone_kv_bytes = slot->bb_kv_bytes;
+            ctx->cuda_backbone_kv_fixed = slot->bb_kv_fixed != NULL;
             reused_kv = 1;
             if (kv_growable) {
                 /* A larger parked cache is capacity already paid for: lay it
@@ -6797,15 +7965,54 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
                 if (fits > kv_capacity) {
                     kv_capacity = fits;
                     kv_floats = cfg->layers * 2u * (kv_capacity - kv_skip) * attn_dim;
+                } else if (fixed_fit && fits < kv_capacity) {
+                    /* A fixed cache short of the starting estimate: the row
+                     * starts at what the cache holds (>= voice + text + 1). */
+                    kv_capacity = fits;
+                    kv_floats = cfg->layers * 2u * (kv_capacity - kv_skip) *
+                                kv_record;
+                    pocket_cuda_slot_fixed_note(FIXST_SHORT);
                 }
             }
+            if (ctx->cuda_backbone_kv_fixed)
+                pocket_cuda_slot_fixed_note(FIXST_REUSED);
+        } else if (ctx->state->cuda_slot_fixed && kv_growable &&
+                   !slot->bb_kv_vmm && slot->bb_kv_bf16 == kv_bf16) {
+            /* MYNAH_CUDA_SLOT_FIXED: a cache too small even for this
+             * request's prefill is parked aside for another request, not
+             * freed (no free on the admission path). Only when there is no
+             * room for it is it freed, as before. */
+            if (slot->bb_kv_fixed == NULL)
+                pocket_cuda_slot_fixed_adopt(ctx->state);
+            if (pocket_cuda_fixed_stash(ctx->state, slot->bb_kv,
+                                        slot->bb_kv_bytes, kv_bf16) != 0) {
+                pocket_cuda_slot_fixed_gone(ctx->state);
+                pocket_cuda_slot_fixed_note(FIXST_MISFIT);
+                pocket_cuda_kv_free(backend, slot->bb_kv, 0);
+            }
         } else {
+            if (slot->bb_kv_fixed != NULL) {
+                pocket_cuda_slot_fixed_gone(slot->bb_kv_fixed);
+                pocket_cuda_slot_fixed_note(FIXST_MISFIT);
+            }
             pocket_cuda_kv_free(backend, slot->bb_kv, slot->bb_kv_vmm);
         }
+        slot->bb_kv_fixed = NULL;
         slot->bb_kv = NULL;
         slot->bb_kv_bytes = 0u;
         slot->bb_kv_vmm = 0;
         slot->bb_kv_reserved = 0u;
+        POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
+        POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
+        POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
+        POCKET_SLOT_MOVE(ctx->cuda_attn, slot->bb_attn);
+        POCKET_SLOT_MOVE(ctx->cuda_proj, slot->bb_proj);
+        POCKET_SLOT_MOVE(ctx->cuda_ffn, slot->bb_ffn);
+    } else if (slot != NULL && slot->bb_x != NULL) {
+        /* MYNAH_CUDA_SLOT_FIXED only: a parked set whose cache went to a
+         * growing row (pocket_cuda_fixed_slot_kv_take) or aside at
+         * retirement still brings its other backbone buffers. Without the
+         * flag a set never holds them without a cache. */
         POCKET_SLOT_MOVE(ctx->cuda_x, slot->bb_x);
         POCKET_SLOT_MOVE(ctx->cuda_norm, slot->bb_norm);
         POCKET_SLOT_MOVE(ctx->cuda_qkv, slot->bb_qkv);
@@ -6848,6 +8055,67 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
             }
             ctx->cuda_kv_vmm_refused = 1;
             kv_vmm = 0;
+            ignored[0] = '\0';
+        }
+    }
+    if (ctx->cuda_backbone_kv == NULL && kv_growable && !kv_vmm &&
+        ctx->state->cuda_slot_fixed) {
+        /* MYNAH_CUDA_SLOT_FIXED: no parked set brought a cache; a spare
+         * does, with no driver call: the tightest at or above the starting
+         * estimate, else the largest that holds the prefill and the first
+         * step (the row then starts at what it holds and grows later). */
+        size_t least = 0u, spare_bytes = 0u;
+        if (pocket_add(ctx->voice_positions, ctx->text_capacity, &least) == 0 &&
+            least < SIZE_MAX && least + 1u > kv_skip &&
+            pocket_mul(least + 1u - kv_skip, position_bytes, &least) == 0) {
+            float *spare = pocket_cuda_fixed_spare_take(ctx->state, least,
+                                                        kv_bytes, kv_bf16,
+                                                        &spare_bytes);
+            if (spare != NULL) {
+                ctx->cuda_backbone_kv = spare;
+                ctx->cuda_backbone_kv_bytes = spare_bytes;
+                ctx->cuda_backbone_kv_fixed = 1;
+                reused_kv = 1;
+                pocket_cuda_slot_fixed_note(FIXST_SPARE_TAKE);
+                size_t fits = spare_bytes / position_bytes;
+                if (fits > bc->max_seq_len - kv_skip) fits = bc->max_seq_len - kv_skip;
+                fits += kv_skip;
+                if (fits < kv_capacity) pocket_cuda_slot_fixed_note(FIXST_SHORT);
+                kv_capacity = fits;
+                kv_floats = cfg->layers * 2u * (kv_capacity - kv_skip) * kv_record;
+            }
+        }
+    }
+    if (ctx->cuda_backbone_kv == NULL && kv_growable && !kv_vmm &&
+        ctx->state->cuda_slot_fixed &&
+        pocket_cuda_slot_fixed_claim(
+            ctx->state,
+            pocket_cuda_slot_fixed_size(ctx->state) > kv_bytes
+                ? pocket_cuda_slot_fixed_size(ctx->state)
+                : kv_bytes,
+            1)) {
+        /* MYNAH_CUDA_SLOT_FIXED: a new cache of at least the fixed size, laid
+         * out over all of it, that goes back to the pool whole. On failure
+         * the plain allocation below runs, as with the flag off. */
+        size_t fixed_bytes = pocket_cuda_slot_fixed_size(ctx->state);
+        if (fixed_bytes < kv_bytes) fixed_bytes = kv_bytes;
+        if (mynah_backend_dev_alloc_bytes(ctx->state->backend, fixed_bytes,
+                                          (void **)&ctx->cuda_backbone_kv,
+                                          ignored, sizeof(ignored)) == 0 &&
+            ctx->cuda_backbone_kv != NULL) {
+            ctx->cuda_backbone_kv_bytes = fixed_bytes;
+            ctx->cuda_backbone_kv_fixed = 1;
+            pocket_cuda_slot_fixed_note(FIXST_NEW);
+            size_t fits = fixed_bytes / position_bytes;
+            if (fits > bc->max_seq_len - kv_skip) fits = bc->max_seq_len - kv_skip;
+            fits += kv_skip;
+            if (fits > kv_capacity) {
+                kv_capacity = fits;
+                kv_floats = cfg->layers * 2u * (kv_capacity - kv_skip) * kv_record;
+            }
+        } else {
+            ctx->cuda_backbone_kv = NULL;
+            pocket_cuda_slot_fixed_gone(ctx->state);
             ignored[0] = '\0';
         }
     }
@@ -6908,6 +8176,123 @@ static int pocket_cuda_backbone_alloc(mynah_engine_ctx *ctx) {
                     "voice prefix (MYNAH_CUDA_SHARED_VOICE=1)\n", kv_skip);
         }
     }
+    return 0;
+}
+
+/* MYNAH_CUDA_SLOT_FIXED growth, with no device-wide synchronisation: the
+ * new cache (at least `new_bytes`) is a spare, else the cache of a parked
+ * set (pocket_cuda_fixed_slot_kv_take), else a new allocation within the
+ * cap -- never a free. The live prefix of every layer's K and V planes is
+ * copied on the stream, the row is laid out over all of the new cache, and
+ * the old cache is parked (a set without one, else the spare list); the
+ * next user of either is on the same stream, after this row's queued work,
+ * and the host never touches a KV cache, so nothing waits. A failed copy
+ * surfaces here when its launch fails, and otherwise at the step's own
+ * sync, like any kernel of the step. Returns 0 when grown, -1 on a failed
+ * copy (the context keeps its cache), and 1 when nothing was available:
+ * the caller then runs the allocate + sync + free path. */
+static int pocket_cuda_fixed_grow(mynah_engine_ctx *ctx, size_t old_capacity,
+                                  size_t new_bytes, size_t valid_bytes,
+                                  char *error, size_t capacity) {
+    mynah_engine_state *state = ctx->state;
+    const mynah_backend *backend = state->backend;
+    const pocket_config *cfg = &state->cfg;
+    const mynah_transformer_ar_config *bc =
+        mynah_transformer_ar_state_config(ctx->backbone);
+    const int bf16 = ctx->cuda_backbone_kv_bf16;
+    const size_t element = pocket_cuda_kv_elem(state, bf16);
+    const size_t record = pocket_cuda_kv_record(state, bf16);
+    const size_t skip = ctx->cuda_backbone_kv_skip;
+    size_t position_bytes = 0u;
+    if (bc == NULL || ctx->cuda_backbone_kv_vmm ||
+        pocket_mul(record * element, 2u * cfg->layers, &position_bytes) != 0 ||
+        position_bytes == 0u)
+        return 1;
+    size_t got = 0u;
+    int source = FIXST_GROW_SPARE;
+    float *kv = pocket_cuda_fixed_spare_take(state, new_bytes, new_bytes, bf16,
+                                             &got);
+    if (kv == NULL) {
+        source = FIXST_GROW_SLOT;
+        kv = pocket_cuda_fixed_slot_kv_take(state, new_bytes, bf16, &got);
+    }
+    if (kv == NULL) {
+        source = FIXST_GROW_ALLOC;
+        if (!pocket_cuda_slot_fixed_claim(state, new_bytes, 0)) {
+            pocket_cuda_slot_fixed_note(FIXST_GROW_SYNC);
+            return 1;
+        }
+        void *fresh = NULL;
+        char ignored[256];
+        ignored[0] = '\0';
+        if (mynah_backend_dev_alloc_bytes(backend, new_bytes, &fresh, ignored,
+                                          sizeof(ignored)) != 0 ||
+            fresh == NULL) {
+            pocket_cuda_slot_fixed_gone(state);
+            pocket_cuda_slot_fixed_note(FIXST_GROW_SYNC);
+            return 1;
+        }
+        kv = (float *)fresh;
+        got = new_bytes;
+    }
+    /* Lay the row out over all of the new cache (>= new_bytes). */
+    size_t stored = got / position_bytes;
+    if (stored > bc->max_seq_len - skip) stored = bc->max_seq_len - skip;
+    const size_t new_capacity = stored + skip;
+    const size_t old_half = (old_capacity - skip) * record;
+    const size_t new_half = stored * record;
+    const unsigned char *src = (const unsigned char *)ctx->cuda_backbone_kv;
+    unsigned char *dst = (unsigned char *)kv;
+    char local[256];
+    local[0] = '\0';
+    int failed = 0;
+    for (size_t l = 0; l < cfg->layers && valid_bytes > 0u && !failed; ++l) {
+        const size_t from_k = l * 2u * old_half * element;
+        const size_t to_k = l * 2u * new_half * element;
+        failed = mynah_backend_copy_dev_bytes(backend, dst + to_k, src + from_k,
+                                              valid_bytes, local,
+                                              sizeof(local)) != 0 ||
+                 mynah_backend_copy_dev_bytes(
+                     backend, dst + to_k + new_half * element,
+                     src + from_k + old_half * element, valid_bytes, local,
+                     sizeof(local)) != 0;
+    }
+    if (failed) {
+        if (pocket_cuda_fixed_stash(state, kv, got, bf16) != 0) {
+            pocket_cuda_drain_before_release(backend);
+            mynah_backend_dev_free(backend, kv);
+            pocket_cuda_slot_fixed_gone(state);
+        }
+        pocket_error(error, capacity, "pocket: CUDA backbone KV growth copy: %s",
+                     local[0] != '\0' ? local : "failed");
+        return -1;
+    }
+    float *old = ctx->cuda_backbone_kv;
+    const size_t old_bytes = ctx->cuda_backbone_kv_bytes;
+    if (!ctx->cuda_backbone_kv_fixed) pocket_cuda_slot_fixed_adopt(state);
+    ctx->cuda_backbone_kv = kv;
+    ctx->cuda_backbone_kv_bytes = got;
+    ctx->cuda_backbone_kv_fixed = 1;
+    ctx->cuda_backbone_capacity = new_capacity;
+    ctx->cuda_backbone_kv_floats = new_half * 2u * cfg->layers;
+    pocket_cuda_slot_fixed_note(source);
+    if (pocket_cuda_fixed_stash(state, old, old_bytes, bf16) != 0) {
+        /* Neither a set nor the spare list has room: the old way. Rare by
+         * construction (the spare list holds 1 in 8 rows). */
+        pocket_cuda_drain_before_release(backend);
+        mynah_backend_dev_free(backend, old);
+        pocket_cuda_slot_fixed_gone(state);
+        pocket_cuda_slot_fixed_note(FIXST_GROW_SYNC);
+    }
+    if (pocket_cuda_kv_grow_logged())
+        fprintf(stderr,
+                "pocket: CUDA backbone KV grew %zu -> %zu positions with no "
+                "sync (%s, %zu-position prefix not stored, %zu bytes)\n",
+                old_capacity, new_capacity,
+                source == FIXST_GROW_SPARE ? "spare"
+                : source == FIXST_GROW_SLOT ? "parked set's cache"
+                                            : "new allocation",
+                skip, got);
     return 0;
 }
 
@@ -7026,6 +8411,14 @@ static int pocket_cuda_backbone_reserve(mynah_engine_ctx *ctx, size_t needed,
     if (valid > old_capacity) valid = old_capacity;
     valid = valid > skip ? valid - skip : 0u;
     valid_bytes = valid * record * element;
+
+    /* MYNAH_CUDA_SLOT_FIXED: grow without a device-wide sync when a spare, a
+     * parked set's cache or the cap allows; otherwise the path below. */
+    if (ctx->state->cuda_slot_fixed) {
+        const int grown = pocket_cuda_fixed_grow(ctx, old_capacity, new_bytes,
+                                                 valid_bytes, error, capacity);
+        if (grown <= 0) return grown;
+    }
 
     char local[256];
     local[0] = '\0';
@@ -7531,6 +8924,126 @@ static int pocket_cuda_backbone_layer_bf16_fused(
     return 0;
 }
 
+/* MYNAH_CUDA_HIDDEN_LAZY (default on; =0 is the rollback): the one-sync step does not copy
+ * the backbone output (the `hidden` rows, 4 KB each) back to the host, does
+ * not scan it and does not memcpy it into every context.  Nothing on the host
+ * reads it in a step whose EOS logits and flow head ran on the device; the
+ * paths that do read it (an emit that reruns the flow head, a CPU fallback)
+ * copy it back on demand from the device output, which stays put until the
+ * next batched backbone call.  The finite gate moves to the device: see
+ * pocket_onesync_step. */
+static int pocket_cuda_hidden_lazy_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_CUDA_HIDDEN_LAZY");
+        cached = setting == NULL || strcmp(setting, "0") != 0;
+        if (cached)
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CUDA_HIDDEN_LAZY (default): one-sync "
+                    "steps keep the hidden rows on the device (finite gate on "
+                    "the device, host copy on demand; =0 to roll back)\n");
+    }
+    return cached;
+}
+
+/* MYNAH_CUDA_KV_TABLE_CACHE (default on; =0 is the rollback): the layers x rows KV pointer
+ * tables the backbone graphs replay are rewritten only for a row slot whose
+ * inputs changed since the last write.  The entries of a slot are a pure
+ * function of the fields in this key (the row's allocation, its capacity and
+ * skip, its layout and its shared voice entry, or the scratch pad KV for an
+ * inert row), so an equal key means the bytes already in the table are the
+ * bytes the loop would write: a different context reusing a pooled
+ * allocation, a grow, a VMM resize, a swap-remove or an admission all change
+ * the key or leave the entries correct. */
+struct pocket_kv_table_key {
+    int valid;
+    int pad;          /* an inert padding row */
+    int shared_voice; /* the prefix tables were written too */
+    int kv_bf16;
+    int kv_vmm;
+    const mynah_engine_state *state;
+    const void *kv;   /* cuda_backbone_kv, or the scratch pad KV */
+    size_t capacity;
+    size_t skip;
+    const void *voice;
+    size_t voice_positions;
+};
+
+static int pocket_cuda_kv_table_cache_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_CUDA_KV_TABLE_CACHE");
+        cached = setting == NULL || strcmp(setting, "0") != 0;
+        if (cached)
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CUDA_KV_TABLE_CACHE (default): KV pointer "
+                    "tables rewritten only for rows whose cache changed "
+                    "(=0 to roll back)\n");
+    }
+    return cached;
+}
+
+static int pocket_kv_table_key_equal(const struct pocket_kv_table_key *a,
+                                     const struct pocket_kv_table_key *b) {
+    return a->valid && b->valid && a->pad == b->pad &&
+           a->shared_voice == b->shared_voice && a->kv_bf16 == b->kv_bf16 &&
+           a->kv_vmm == b->kv_vmm && a->state == b->state && a->kv == b->kv &&
+           a->capacity == b->capacity && a->skip == b->skip &&
+           a->voice == b->voice && a->voice_positions == b->voice_positions;
+}
+
+/* Copy the stale `hidden` rows of the last lazy one-sync step back from the
+ * device output (rows in cuda_onesync_rows order) and clear the mark.  Called
+ * before anything that reads them on the host or overwrites cuda_norm.  A
+ * context freed in between has removed itself from the list
+ * (pocket_ctx_free), so no pointer here is dangling.  Returns -1 when the
+ * copy failed; those rows are then marked broken, which retires each of them
+ * the way any other failed step does. */
+static int pocket_cuda_hidden_materialize(mynah_engine_scratch *scratch) {
+    if (scratch == NULL || !scratch->cuda_hidden_lazy_pending) return 0;
+    scratch->cuda_hidden_lazy_pending = 0;
+    const size_t count = scratch->cuda_onesync_count;
+    size_t hidden_dim = 0u;
+    for (size_t i = 0; i < count && hidden_dim == 0u; ++i)
+        if (scratch->cuda_onesync_rows[i] != NULL)
+            hidden_dim = scratch->cuda_onesync_rows[i]->state->cfg.hidden_dim;
+    int failed = 0;
+    if (hidden_dim != 0u) {
+        char local[256];
+        local[0] = '\0';
+        failed = mynah_backend_d2h(scratch->backend, scratch->cuda_norm,
+                                   scratch->cuda_host_output, count * hidden_dim,
+                                   local, sizeof(local)) != 0 ||
+                 mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0;
+        if (failed)
+            fprintf(stderr, "mynah-tts: MYNAH_CUDA_HIDDEN_LAZY: hidden copy "
+                    "back failed: %s\n", local[0] != '\0' ? local : "unknown");
+    }
+    for (size_t i = 0; i < count; ++i) {
+        mynah_engine_ctx *ctx = scratch->cuda_onesync_rows[i];
+        if (ctx == NULL || ctx->cuda_hidden_lazy_scratch != scratch) continue;
+        ctx->cuda_hidden_lazy_scratch = NULL;
+        if (failed) {
+            ctx->broken = 1;
+            continue;
+        }
+        memcpy(ctx->hidden, scratch->cuda_host_output + i * hidden_dim,
+               hidden_dim * sizeof(float));
+    }
+    return failed ? -1 : 0;
+}
+
+/* The stale rows were not needed: forget them without a copy. */
+static void pocket_cuda_hidden_drop(mynah_engine_scratch *scratch) {
+    if (scratch == NULL || !scratch->cuda_hidden_lazy_pending) return;
+    scratch->cuda_hidden_lazy_pending = 0;
+    for (size_t i = 0; i < scratch->cuda_onesync_count; ++i) {
+        mynah_engine_ctx *ctx = scratch->cuda_onesync_rows[i];
+        if (ctx != NULL && ctx->cuda_hidden_lazy_scratch == scratch)
+            ctx->cuda_hidden_lazy_scratch = NULL;
+    }
+}
+
 /* Cross-request CUDA batch: projections and residual/FFN work are stacked,
  * while every row keeps its own KV pointer and absolute position.  A return of
  * 1 means "not eligible" and leaves all host state untouched; -1 means a CUDA
@@ -7547,13 +9060,16 @@ static int pocket_cuda_backbone_step_commit(mynah_engine_ctx *const *ctxs,
                                             mynah_engine_scratch *scratch,
                                             float *const *output_rows,
                                             int mirror_host, int prefill,
+                                            int hidden_lazy,
                                             char *local, size_t local_capacity) {
     const mynah_engine_state *state = ctxs[0]->state;
     const pocket_config *cfg = &state->cfg;
     const size_t attn_dim = cfg->heads * cfg->head_dim;
     const size_t shadow_row = 2u * attn_dim;
     const size_t exec = pocket_cuda_exec_width(count, scratch->cuda_batch_capacity);
-    if (!prefill || output_rows != NULL) {
+    /* MYNAH_CUDA_HIDDEN_LAZY: no host output was copied; the caller has
+     * already run the equivalent finite gate on the device. */
+    if ((!prefill || output_rows != NULL) && !hidden_lazy) {
         for (size_t i = 0; i < count; ++i) {
             if (!pocket_all_finite(
                     scratch->cuda_host_output + i * cfg->hidden_dim,
@@ -7611,11 +9127,14 @@ static int pocket_cuda_backbone_step_commit(mynah_engine_ctx *const *ctxs,
  * 0 without the stream sync and without committing anything on the host; the
  * caller syncs once for the whole frame and then runs
  * pocket_cuda_backbone_step_commit.  Requires a device-resident condition
- * input (`cuda_condition_ready`) and a decode step (no input_rows). */
+ * input (`cuda_condition_ready`) and a decode step (no input_rows).
+ * `hidden_lazy` (MYNAH_CUDA_HIDDEN_LAZY, deferred steps only): the output
+ * rows stay in cuda_norm and are not copied to the host; a graph of its own
+ * because the copy is one of the captured nodes. */
 static int pocket_cuda_backbone_step_batch_impl(
     mynah_engine_ctx *const *ctxs, size_t count, mynah_engine_scratch *scratch,
     const float *const *input_rows, float *const *output_rows, int mirror_host,
-    int defer, char *error, size_t capacity) {
+    int defer, int hidden_lazy, char *error, size_t capacity) {
     if (ctxs == NULL || scratch == NULL || count < 2u ||
         !scratch->cuda_batch_enabled || scratch->backend == NULL ||
         count > scratch->cuda_batch_capacity || count > POCKET_MAX_BATCH) {
@@ -7623,6 +9142,11 @@ static int pocket_cuda_backbone_step_batch_impl(
     }
     if (defer && (input_rows != NULL || !scratch->cuda_condition_ready))
         return 1;
+    if (hidden_lazy && !defer) return 1;
+    /* This call is about to overwrite cuda_norm: stale host rows of the last
+     * lazy step are copied back first (normally emit has settled them). */
+    if (scratch->cuda_hidden_lazy_pending)
+        (void)pocket_cuda_hidden_materialize(scratch);
     const int prefill = input_rows != NULL;
     if (prefill) scratch->cuda_condition_ready = 0;
     scratch->cuda_backbone_output_ready = 0;
@@ -7755,7 +9279,79 @@ static int pocket_cuda_backbone_step_batch_impl(
      * layer.  The table cannot be a stack array and it cannot be shared by all
      * layers: each layer owns a different KV allocation, while the captured
      * memcpy nodes are replayed later with new requests. */
-    for (size_t l = 0; l < cfg->layers; ++l) {
+    struct pocket_kv_table_key *const table_keys = scratch->cuda_kv_table_keys;
+    if (table_keys != NULL) {
+        /* MYNAH_CUDA_KV_TABLE_CACHE: the same entries as the loop below,
+         * written row by row, and only for a slot whose key changed.  The
+         * overflow checks are a function of the key too, so a slot whose key
+         * matches passed them when it was written. */
+        const size_t pad_layer = state->cuda_kv_int8 ? 2u * kv_record
+                                                     : shadow_row;
+        for (size_t i = 0; i < exec; ++i) {
+            struct pocket_kv_table_key key;
+            memset(&key, 0, sizeof(key));
+            key.valid = 1;
+            key.pad = i >= count;
+            key.shared_voice = shared_voice;
+            key.kv_bf16 = kv_bf16;
+            key.state = state;
+            if (!key.pad) {
+                const mynah_engine_ctx *row = ctxs[i];
+                key.kv_vmm = row->cuda_backbone_kv_vmm;
+                key.kv = row->cuda_backbone_kv;
+                key.capacity = row->cuda_backbone_capacity;
+                key.skip = row->cuda_backbone_kv_skip;
+                key.voice = row->cuda_voice_shared;
+                key.voice_positions = row->cuda_voice_shared_positions;
+            } else {
+                key.kv = scratch->cuda_pad_kv;
+            }
+            if (pocket_kv_table_key_equal(&table_keys[i], &key)) continue;
+            table_keys[i].valid = 0; /* until every layer is written */
+            for (size_t l = 0; l < cfg->layers; ++l) {
+                const size_t metadata_offset = l * scratch->cuda_batch_capacity + i;
+                if (key.pad) {
+                    scratch->cuda_kcache[metadata_offset] =
+                        (float *)pocket_cuda_kv_offset(state, scratch->cuda_pad_kv,
+                                                       l * pad_layer, kv_bf16);
+                    scratch->cuda_vcache[metadata_offset] =
+                        (float *)pocket_cuda_kv_offset(
+                            state, scratch->cuda_pad_kv, l * pad_layer + kv_record,
+                            kv_bf16);
+                    if (shared_voice) {
+                        scratch->cuda_kprefix[metadata_offset] = NULL;
+                        scratch->cuda_vprefix[metadata_offset] = NULL;
+                        if (l == 0u) scratch->cuda_prefix_len[i] = 0u;
+                    }
+                    continue;
+                }
+                size_t layer_half = 0u;
+                size_t layer_span = 0u;
+                size_t layer_offset = 0u;
+                if (mynah_transformer_ar_state_config(ctxs[i]->backbone) == NULL ||
+                    pocket_mul(pocket_cuda_kv_stored(ctxs[i]), attn_dim,
+                               &layer_half) != 0 ||
+                    pocket_mul(layer_half, 2u, &layer_span) != 0 ||
+                    pocket_mul(l, layer_span, &layer_offset) != 0) return -1;
+                scratch->cuda_kcache[metadata_offset] =
+                    (float *)pocket_cuda_kv_position_base(ctxs[i], l, 0);
+                scratch->cuda_vcache[metadata_offset] =
+                    (float *)pocket_cuda_kv_position_base(ctxs[i], l, 1);
+                if (shared_voice) {
+                    const size_t p = ctxs[i]->cuda_voice_shared != NULL
+                                         ? ctxs[i]->cuda_voice_shared_positions : 0u;
+                    const uint16_t *voice = (const uint16_t *)ctxs[i]->cuda_voice_shared;
+                    scratch->cuda_kprefix[metadata_offset] =
+                        p != 0u ? (void *)(voice + l * 2u * p * attn_dim) : NULL;
+                    scratch->cuda_vprefix[metadata_offset] =
+                        p != 0u ? (void *)(voice + (l * 2u + 1u) * p * attn_dim) : NULL;
+                    if (l == 0u) scratch->cuda_prefix_len[i] = p;
+                }
+            }
+            table_keys[i] = key;
+        }
+    }
+    for (size_t l = 0; l < cfg->layers && table_keys == NULL; ++l) {
         for (size_t i = 0; i < count; ++i) {
             const mynah_transformer_ar_config *config =
                 mynah_transformer_ar_state_config(ctxs[i]->backbone);
@@ -7812,9 +9408,11 @@ static int pocket_cuda_backbone_step_batch_impl(
     int graph_capture = 0;
     const size_t graph_key = prefill
         ? POCKET_CUDA_BACKBONE_PREFILL_GRAPH_BASE + exec
-        : (scratch->cuda_condition_ready
-               ? POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE + exec
-               : exec);
+        : (hidden_lazy
+               ? POCKET_CUDA_BACKBONE_LAZY_GRAPH_BASE + exec
+               : (scratch->cuda_condition_ready
+                      ? POCKET_CUDA_BACKBONE_CONDITION_GRAPH_BASE + exec
+                      : exec));
     local[0] = '\0';
     if (mynah_backend_batch_begin(scratch->backend, local, sizeof(local)) != 0)
         goto fail;
@@ -7990,7 +9588,7 @@ static int pocket_cuda_backbone_step_batch_impl(
                 state->backbone.out_norm_weight,
                 state->backbone.out_norm_bias, exec, cfg->hidden_dim, local,
                 sizeof(local)) != 0 ||
-            ( (!prefill || output_rows != NULL) &&
+            ( (!prefill || output_rows != NULL) && !hidden_lazy &&
               mynah_backend_d2h(scratch->backend, scratch->cuda_norm,
                                 scratch->cuda_host_output,
                                 exec * cfg->hidden_dim, local,
@@ -8019,7 +9617,7 @@ static int pocket_cuda_backbone_step_batch_impl(
     }
     if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) goto fail;
     if (pocket_cuda_backbone_step_commit(ctxs, count, scratch, output_rows,
-                                         mirror_host, prefill, local,
+                                         mirror_host, prefill, 0, local,
                                          sizeof(local)) != 0) goto fail;
     if (error != NULL && capacity > 0u) error[0] = '\0';
     return 0;
@@ -8050,7 +9648,7 @@ static int pocket_cuda_backbone_step_batch(
     char *error, size_t capacity) {
     return pocket_cuda_backbone_step_batch_impl(ctxs, count, scratch,
                                                 input_rows, output_rows,
-                                                mirror_host, 0, error,
+                                                mirror_host, 0, 0, error,
                                                 capacity);
 }
 
@@ -8293,6 +9891,38 @@ static int pocket_cuda_one_sync_enabled(void) {
     return cached;
 }
 
+/* MYNAH_CUDA_ONESYNC_SUBSET (default on; =0 is the rollback): in a one-sync step where some
+ * rows end, emit takes the survivors' flow output and latent from the chained
+ * flow pass instead of rerunning the flow head on them.  To make that pass
+ * the very call the rerun would have made, the chain lays its rows out the
+ * way the rerun would: the rows already known to end at this step (their EOS
+ * was crossed at an earlier step, so only `frames_after_eos` decides) go
+ * after the others, so every survivor sits at its rerun position.  Emit
+ * reuses the pass only when that layout came true and the execution width is
+ * the rerun's; see pocket_emit_batch. */
+static int pocket_cuda_onesync_subset_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_CUDA_ONESYNC_SUBSET");
+        cached = setting == NULL || strcmp(setting, "0") != 0;
+        if (cached)
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CUDA_ONESYNC_SUBSET (default): a one-sync "
+                    "step whose rows end reuses the chained flow head for the "
+                    "survivors (=0 to roll back)\n");
+    }
+    return cached;
+}
+
+/* The row of a one-sync step that emit will certainly end at this step
+ * without a latent, decided before its EOS logit is known: its EOS step is
+ * already set, so this step's logit cannot move it, and emit's terminal test
+ * reads only fields fixed before the step. */
+static int pocket_onesync_known_terminal(const mynah_engine_ctx *ctx) {
+    return ctx->eos_step != SIZE_MAX &&
+           ctx->step >= ctx->eos_step + ctx->frames_after_eos;
+}
+
 /* Undo an early noise draw that no emit consumed. */
 static void pocket_onesync_rng_restore(mynah_engine_ctx *ctx) {
     if (ctx == NULL || !ctx->onesync_noise_drawn) return;
@@ -8327,6 +9957,13 @@ static void pocket_cuda_onesync_release(mynah_engine_scratch *scratch) {
     mynah_backend_host_free(scratch->backend, scratch->cuda_onesync_host_latent);
     mynah_backend_dev_free(scratch->backend, scratch->cuda_onesync_latent);
     pocket_host_free_bytes(scratch->backend, scratch->cuda_onesync_cond_rows);
+    mynah_backend_dev_free(scratch->backend, scratch->cuda_hidden_probe);
+    mynah_backend_dev_free(scratch->backend, scratch->cuda_hidden_zero);
+    mynah_backend_host_free(scratch->backend, scratch->cuda_hidden_probe_host);
+    scratch->cuda_hidden_probe = NULL;
+    scratch->cuda_hidden_zero = NULL;
+    scratch->cuda_hidden_probe_host = NULL;
+    scratch->cuda_hidden_lazy_enabled = 0;
     scratch->cuda_onesync_host_latent_in = NULL;
     scratch->cuda_onesync_host_eos = NULL;
     scratch->cuda_onesync_host_latent = NULL;
@@ -8376,6 +10013,36 @@ static void pocket_cuda_onesync_reserve(const mynah_engine_state *state,
     fprintf(stderr,
             "mynah-tts: MYNAH_CUDA_ONE_SYNC: condition, backbone, EOS and flow "
             "head share one stream sync per batched frame\n");
+    (void)pocket_cuda_onesync_subset_enabled(); /* its start-up line */
+    if (pocket_cuda_hidden_lazy_enabled()) {
+        ignored[0] = '\0';
+        if (mynah_backend_dev_alloc(scratch->backend, batch,
+                                    &scratch->cuda_hidden_probe, ignored,
+                                    sizeof(ignored)) != 0 ||
+            mynah_backend_dev_alloc(scratch->backend, cfg->hidden_dim,
+                                    &scratch->cuda_hidden_zero, ignored,
+                                    sizeof(ignored)) != 0 ||
+            mynah_backend_host_alloc(scratch->backend, batch,
+                                     &scratch->cuda_hidden_probe_host, ignored,
+                                     sizeof(ignored)) != 0 ||
+            mynah_backend_zero_dev(scratch->backend, scratch->cuda_hidden_zero,
+                                   cfg->hidden_dim, ignored,
+                                   sizeof(ignored)) != 0 ||
+            mynah_backend_sync(scratch->backend, ignored, sizeof(ignored)) != 0) {
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CUDA_HIDDEN_LAZY unavailable: %s\n",
+                    ignored[0] != '\0' ? ignored : "allocation failed");
+            mynah_backend_dev_free(scratch->backend, scratch->cuda_hidden_probe);
+            mynah_backend_dev_free(scratch->backend, scratch->cuda_hidden_zero);
+            mynah_backend_host_free(scratch->backend,
+                                    scratch->cuda_hidden_probe_host);
+            scratch->cuda_hidden_probe = NULL;
+            scratch->cuda_hidden_zero = NULL;
+            scratch->cuda_hidden_probe_host = NULL;
+        } else {
+            scratch->cuda_hidden_lazy_enabled = 1;
+        }
+    }
 }
 
 /* Queue the flow head on the backbone output that is still in `cuda_norm`,
@@ -8418,9 +10085,14 @@ static int pocket_cuda_onesync_flow_queue(mynah_engine_ctx *const *ctxs,
         pocket_mul(cfg->flow_time_conds, flow_freq_width, &time_rows) != 0 ||
         flow_freq_width == 0u || cfg->flow_time_conds == 0u) return 1;
 
-    /* Rows [count, exec) repeat row 0, as in the ordinary flow call. */
+    /* Rows [count, exec) repeat row 0, as in the ordinary flow call.  With
+     * MYNAH_CUDA_ONESYNC_SUBSET, position i holds row order[i] (the identity
+     * when no row is known to end), and the padding repeats position 0, as
+     * the survivors' rerun would. */
+    const int ordered = pocket_cuda_onesync_subset_enabled();
     for (size_t i = 0; i < exec; ++i) {
-        const size_t src = i < count ? i : 0u;
+        const size_t at = i < count ? i : 0u;
+        const size_t src = ordered ? scratch->cuda_onesync_flow_order[at] : at;
         scratch->cuda_onesync_cond_rows[i] =
             scratch->cuda_norm + src * cfg->hidden_dim;
         memcpy(scratch->cuda_flow_host_noise + i * cfg->latent_dim,
@@ -8532,10 +10204,41 @@ static int pocket_cuda_onesync_flow_queue(mynah_engine_ctx *const *ctxs,
  * (hidden rows, offsets, valid flags), with the EOS logits in each context
  * and the flow results staged for emit; 1 when it did not run or must be
  * redone on the ordinary path, with no host state changed (the early noise
- * draws are put back). */
+ * draws are put back).
+ *
+ * MYNAH_CUDA_STEP_OVERLAP splits the frame at its one sync.  `phase`
+ * POCKET_ONESYNC_QUEUE runs everything before the sync and returns 0 with the
+ * frame queued (recorded in scratch->cuda_ahead_*); POCKET_ONESYNC_FINISH,
+ * on exactly those rows, runs the sync and everything after it.  The two
+ * halves are the code of POCKET_ONESYNC_WHOLE, which is the frame as it has
+ * always run. */
+#define POCKET_ONESYNC_WHOLE 0
+#define POCKET_ONESYNC_QUEUE 1
+#define POCKET_ONESYNC_FINISH 2
+
 static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
                                const int *will_step, int can_gather,
-                               mynah_engine_scratch *scratch) {
+                               mynah_engine_scratch *scratch, int phase) {
+    const mynah_engine_state *state = NULL;
+    const pocket_config *cfg = NULL;
+    int all_device_owned = 1;
+    int hidden_lazy = 0;
+    char local[256];
+    char drain[256];
+    local[0] = '\0';
+    drain[0] = '\0';
+    if (phase == POCKET_ONESYNC_FINISH) {
+        /* The caller matched these rows against scratch->cuda_ahead_rows; the
+         * pre-flight below already passed for them when the frame was queued,
+         * and nothing they read has changed since (no commit happened). */
+        state = ctxs[0]->state;
+        cfg = &state->cfg;
+        all_device_owned = scratch->cuda_ahead_all_owned;
+        hidden_lazy = scratch->cuda_ahead_hidden_lazy;
+        scratch->cuda_ahead_count = 0u;
+        for (size_t i = 0; i < count; ++i) ctxs[i]->cuda_ahead_scratch = NULL;
+        goto frame_sync;
+    }
     if (ctxs == NULL || scratch == NULL || !scratch->cuda_onesync_enabled ||
         !can_gather || count < 2u || count > POCKET_MAX_BATCH ||
         count > scratch->cuda_batch_capacity ||
@@ -8546,17 +10249,16 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
         scratch->cuda_proj == NULL ||
         strcmp(mynah_backend_name(scratch->backend), "cuda") != 0)
         return 1;
-    const mynah_engine_state *state = ctxs[0] == NULL ? NULL : ctxs[0]->state;
+    state = ctxs[0] == NULL ? NULL : ctxs[0]->state;
     if (state == NULL || state->input_linear == NULL ||
         state->out_eos_weight == NULL ||
         !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_IN) ||
         !pocket_cuda_groups_are_resident_compatible(state, POCKET_QG_COND_EOS))
         return 1;
-    const pocket_config *cfg = &state->cfg;
+    cfg = &state->cfg;
     if (cfg->latent_dim > cfg->hidden_dim || count > (size_t)INT_MAX ||
         cfg->hidden_dim > (size_t)INT_MAX)
         return 1;
-    int all_device_owned = 1;
     for (size_t i = 0; i < count; ++i) {
         const mynah_engine_ctx *ctx = ctxs[i];
         if (!will_step[i] || ctx == NULL || ctx->state != state ||
@@ -8577,11 +10279,26 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
                previous, cfg->latent_dim * sizeof(float));
         pocket_onesync_draw_noise(ctx);
     }
+    if (pocket_cuda_onesync_subset_enabled()) {
+        /* MYNAH_CUDA_ONESYNC_SUBSET: rows that go on first, in step order,
+         * then the rows known to end here; the identity when none is. */
+        size_t at = 0u;
+        for (size_t pass = 0; pass < 2u; ++pass) {
+            for (size_t i = 0; i < count; ++i) {
+                if (pocket_onesync_known_terminal(ctxs[i]) != (pass == 1u))
+                    continue;
+                scratch->cuda_onesync_flow_order[at] = i;
+                scratch->cuda_onesync_flow_pos[i] = at;
+                ++at;
+            }
+        }
+    }
+    /* MYNAH_CUDA_HIDDEN_LAZY, unless a parity dump wants every hidden row
+     * on the host right after the step. */
+    hidden_lazy = scratch->cuda_hidden_lazy_enabled;
+    for (size_t i = 0; i < count && hidden_lazy; ++i)
+        if (ctxs[i]->dump != NULL) hidden_lazy = 0;
 
-    char local[256];
-    char drain[256];
-    local[0] = '\0';
-    drain[0] = '\0';
     /* 1. condition: the same resolved projection as pocket_cuda_condition_batch,
      * left in cuda_x for the backbone (no D2H, no host finite scan: a
      * non-finite input reaches the hidden rows, which are checked below). */
@@ -8604,7 +10321,7 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
         backbone_error[0] = '\0';
         const int rc = pocket_cuda_backbone_step_batch_impl(
             ctxs, count, scratch, NULL, NULL, all_device_owned ? 0 : 1, 1,
-            backbone_error, sizeof(backbone_error));
+            hidden_lazy, backbone_error, sizeof(backbone_error));
         /* rc > 0: not eligible this step (the queued projection is simply
          * redone by the ordinary path on the same stream).  rc < 0: it has
          * already drained and taken the rows off the device, which is what
@@ -8626,19 +10343,87 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
             goto fallback_drain;
     }
 
+    /* 3b. MYNAH_CUDA_HIDDEN_LAZY: the finite gate of the commit, on the
+     * device.  probe[i] = sum_k hidden[i][k] * 0.0f in an FP32 GEMM: every
+     * product is +-0 for a finite element and NaN for an infinite or NaN one
+     * (IEEE: inf * 0 and NaN * 0 are NaN, in any GEMM precision), and NaN
+     * survives the sum, so probe[i] == 0 exactly when the host scan would
+     * have passed row i.  A reduced-precision compute mode can only turn a
+     * huge finite value into an infinity, i.e. flag a row the host scan
+     * would pass; that sends the frame to the ordinary path, which then
+     * passes it, so the outcome is the same either way.  4 bytes per row
+     * come back instead of the whole row. */
+    if (hidden_lazy &&
+        mynah_backend_sgemm_dev(scratch->backend, 0, 0, count, 1u,
+                                cfg->hidden_dim, 1.0f, scratch->cuda_norm,
+                                cfg->hidden_dim, scratch->cuda_hidden_zero, 1u,
+                                0.0f, scratch->cuda_hidden_probe, 1u, local,
+                                sizeof(local)) != 0) {
+        /* Not a frame failure: the backbone and EOS are queued and fine.
+         * Stop using the lazy mode and redo the frame on the ordinary
+         * path, the same as any other ineligible step. */
+        (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+        fprintf(stderr, "mynah-tts: MYNAH_CUDA_HIDDEN_LAZY disabled: %s\n",
+                local[0] != '\0' ? local : "probe launch failed");
+        scratch->cuda_hidden_lazy_enabled = 0;
+        goto fallback;
+    }
+    if (hidden_lazy &&
+        mynah_backend_d2h(scratch->backend, scratch->cuda_hidden_probe,
+                          scratch->cuda_hidden_probe_host, count, local,
+                          sizeof(local)) != 0)
+        goto fallback_drain;
+
     /* 4. flow head + latent on the device. */
     if (pocket_cuda_onesync_flow_queue(ctxs, count, scratch, local,
                                        sizeof(local)) != 0)
         goto fallback_drain;
 
-    /* 5. the one sync of the frame. */
-    if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0)
-        goto fallback_drain;
+    if (phase == POCKET_ONESYNC_QUEUE) {
+        /* MYNAH_CUDA_STEP_OVERLAP: the frame is queued; the sync and the
+         * commit wait for the finish.  Host state changed so far: the early
+         * noise draws (saved for a put-back) and scratch staging nobody else
+         * writes before then. */
+        scratch->cuda_ahead_count = count;
+        scratch->cuda_ahead_hidden_lazy = hidden_lazy;
+        scratch->cuda_ahead_all_owned = all_device_owned;
+        for (size_t i = 0; i < count; ++i) {
+            scratch->cuda_ahead_rows[i] = ctxs[i];
+            ctxs[i]->cuda_ahead_scratch = scratch;
+        }
+        /* MYNAH_CUDA_PINGPONG: the end of this frame's work on the stream.
+         * NULL (no fence) falls back to the stream drain below. */
+        if (scratch->pingpong) {
+            scratch->cuda_ahead_fence = mynah_backend_fence_record(scratch->backend);
+            if (scratch->cuda_ahead_fence == NULL)
+                pocket_pp_clear_stale(scratch, "a fence fallback");
+        }
+        return 0;
+    }
 
+frame_sync:
+    /* 5. the one sync of the frame.  MYNAH_CUDA_PINGPONG: the frame's own
+     * fence, so the other group's work queued behind it is not waited for. */
+    if (scratch->cuda_ahead_fence != NULL) {
+        void *fence = scratch->cuda_ahead_fence;
+        scratch->cuda_ahead_fence = NULL;
+        if (mynah_backend_fence_sync(scratch->backend, fence, local,
+                                     sizeof(local)) != 0)
+            goto fallback_drain;
+    } else if (mynah_backend_sync(scratch->backend, local, sizeof(local)) != 0) {
+        goto fallback_drain;
+    }
+
+    for (size_t i = 0; i < count && hidden_lazy; ++i) {
+        /* `!(x == 0)` is also true for NaN.  The same outcome as the commit's
+         * host scan returning 1: nothing committed, the ordinary path redoes
+         * the frame (copying the rows) and reports the bad row. */
+        if (!(scratch->cuda_hidden_probe_host[i] == 0.0f)) goto fallback;
+    }
     {
         const int commit = pocket_cuda_backbone_step_commit(
-            ctxs, count, scratch, NULL, all_device_owned ? 0 : 1, 0, local,
-            sizeof(local));
+            ctxs, count, scratch, NULL, all_device_owned ? 0 : 1, 0,
+            hidden_lazy, local, sizeof(local));
         /* 1: a non-finite hidden row, nothing committed; -1: an offset could
          * not advance and the commit put the others back.  Either way the
          * ordinary path redoes the frame and reports it. */
@@ -8659,14 +10444,44 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
     scratch->cuda_onesync_flow_finite = flow_finite;
     scratch->cuda_onesync_count = count;
     for (size_t i = 0; i < count; ++i) scratch->cuda_onesync_rows[i] = ctxs[i];
+    if (hidden_lazy) {
+        /* The host `hidden` rows are stale until emit settles them. */
+        for (size_t i = 0; i < count; ++i) {
+            ctxs[i]->cuda_hidden_lazy_scratch = scratch;
+            ctxs[i]->cuda_hidden_lazy_row = i;
+        }
+        scratch->cuda_hidden_lazy_pending = 1;
+    }
     scratch->cuda_onesync_ready = 1;
+    scratch->pp_onesync_failures = 0u;   /* MYNAH_CUDA_PINGPONG */
     (void)mynah_backend_note_backbone_batch(scratch->backend, count);
     return 0;
 
 fallback_drain:
     /* A launch or sync error: drain, forget this scratch's graphs (as the
      * ordinary stages do on failure) and stop using the chain. */
-    (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+    if (mynah_backend_sync(scratch->backend, drain, sizeof(drain)) == 0 &&
+        scratch->pingpong &&
+        ++scratch->pp_onesync_failures <= POCKET_PP_ONESYNC_RETRIES) {
+        /* MYNAH_CUDA_PINGPONG: the device is healthy (the drain passed), so
+         * the failure was a recoverable one -- typically an allocation that
+         * ran out of memory, or its error left pending and reported by a
+         * later launch check.  Clear it and keep the chain: without it this
+         * lane could never queue a step again.  This frame still takes the
+         * per-stage path below; a lane failing every frame gives up. */
+        pocket_pp_clear_stale(scratch, "the per-stage retry");
+        fprintf(stderr,
+                "mynah-tts: ping-pong lane %d: a one-sync frame failed (%s); "
+                "this frame takes the per-stage path, MYNAH_CUDA_ONE_SYNC stays on "
+                "(%u of %u in a row)\n",
+                scratch->lane, local[0] != '\0' ? local : "not eligible",
+                scratch->pp_onesync_failures, POCKET_PP_ONESYNC_RETRIES);
+        if (scratch->cuda_graph_enabled) {
+            scratch->cuda_graph_ready = 0;
+            mynah_backend_graph_forget(scratch->backend, scratch);
+        }
+        goto fallback;
+    }
     fprintf(stderr,
             "mynah-tts: MYNAH_CUDA_ONE_SYNC disabled after a failure (%s); "
             "continuing on the per-stage path\n",
@@ -8684,8 +10499,329 @@ fallback:
     return 1;
 }
 
+/* MYNAH_CUDA_STEP_OVERLAP: discard a frame queued ahead on this scratch.
+ * Nothing was committed (offsets advance only at the finish), so after the
+ * drain and the put-back of the early noise draws the rows are exactly as
+ * before the launch, and the next ordinary step recomputes the same frame:
+ * the K/V written at the uncommitted position is past every offset, where
+ * nothing reads it, and is overwritten with the same values.  The serving
+ * loop never needs this; every entry that could otherwise read or overwrite
+ * the queued frame's buffers calls it first, as a safety net. */
+/* MYNAH_CUDA_DECODE_OVERLAP safety net (defined with the decode split). */
+static void pocket_decode_inflight_settle(mynah_engine_scratch *scratch);
+
+static unsigned long pocket_ahead_discarded;
+
+static void pocket_cuda_ahead_discard(mynah_engine_scratch *scratch,
+                                      const char *why) {
+    if (scratch == NULL || scratch->cuda_ahead_count == 0u) return;
+    char drain[256];
+    drain[0] = '\0';
+    (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+    if (scratch->cuda_ahead_fence != NULL) {   /* MYNAH_CUDA_PINGPONG */
+        mynah_backend_fence_wait(scratch->backend, scratch->cuda_ahead_fence);
+        scratch->cuda_ahead_fence = NULL;
+    }
+    for (size_t i = 0; i < scratch->cuda_ahead_count; ++i) {
+        mynah_engine_ctx *ctx = scratch->cuda_ahead_rows[i];
+        if (ctx == NULL) continue;
+        pocket_onesync_rng_restore(ctx);
+        ctx->cuda_ahead_scratch = NULL;
+    }
+    scratch->cuda_ahead_count = 0u;
+    scratch->cuda_condition_ready = 0;
+    scratch->cuda_backbone_output_ready = 0;
+    scratch->cuda_onesync_ready = 0;
+    if (pocket_ahead_discarded++ == 0ul)
+        fprintf(stderr,
+                "mynah-tts: MYNAH_CUDA_STEP_OVERLAP: a step queued ahead was "
+                "discarded (%s) and will be recomputed; further discards are "
+                "not reported\n", why);
+}
+
+/* The rows queued ahead are exactly these, in this order, and all step. */
+static int pocket_cuda_ahead_matches(const mynah_engine_scratch *scratch,
+                                     mynah_engine_ctx *const *ctxs,
+                                     size_t count, const int *will_step) {
+    if (scratch->cuda_ahead_count != count || !scratch->cuda_onesync_enabled)
+        return 0;
+    for (size_t i = 0; i < count; ++i)
+        if (scratch->cuda_ahead_rows[i] != ctxs[i] || !will_step[i]) return 0;
+    return 1;
+}
+
+/* tts_engine.h `step_launch` (MYNAH_CUDA_STEP_OVERLAP): queue the one-sync
+ * frame for these rows and return without the sync, so the driver's host work
+ * runs while the GPU steps.  The next pocket_step_batch on the same rows in
+ * the same order finishes it.  Returns 1, with nothing changed, whenever the
+ * frame would not take the one-sync path or pocket_step_batch's pre-flight
+ * would have work to do first (a refusal, or a KV cache to grow): the driver
+ * then steps as usual. */
+static int pocket_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
+                              mynah_engine_scratch *scratch) {
+    if (ctxs == NULL || scratch == NULL || count < 2u ||
+        count > POCKET_MAX_BATCH || !scratch->cuda_onesync_enabled)
+        return 1;
+    pocket_cuda_ahead_discard(scratch, "a second launch");
+    pocket_pp_clear_stale(scratch, "a queued step");
+    int will_step[POCKET_MAX_BATCH];
+    for (size_t i = 0; i < count; ++i) {
+        const mynah_engine_ctx *ctx = ctxs[i];
+        if (ctx == NULL || !ctx->prepared || ctx->text_open || ctx->eos ||
+            ctx->broken || ctx->state != ctxs[0]->state ||
+            ctx->step >= ctx->max_steps || ctx->cuda_ahead_scratch != NULL)
+            return 1;
+        const mynah_transformer_ar_config *bc =
+            mynah_transformer_ar_state_config(ctx->backbone);
+        const size_t offset = mynah_transformer_ar_state_offset(ctx->backbone);
+        if (bc == NULL || offset >= bc->max_seq_len ||
+            (ctx->cuda_backbone_enabled && ctx->cuda_backbone_kv != NULL &&
+             offset >= ctx->cuda_backbone_capacity))
+            return 1;
+        will_step[i] = 1;
+    }
+    /* A context named twice: the mark set for its first slot is seen at the
+     * second.  The marks are cleared again; the queue phase sets them. */
+    int twice = 0;
+    size_t marked = 0u;
+    for (; marked < count && !twice; ++marked) {
+        if (ctxs[marked]->cuda_ahead_scratch != NULL) twice = 1;
+        else ctxs[marked]->cuda_ahead_scratch = scratch;
+    }
+    for (size_t i = 0; i < marked; ++i) ctxs[i]->cuda_ahead_scratch = NULL;
+    if (twice) return 1;
+    const size_t batch_capacity =
+        mynah_transformer_ar_batch_capacity(scratch->backbone_batch);
+    const int can_gather = scratch->backbone_batch != NULL &&
+                           scratch->states != NULL && count <= batch_capacity;
+    scratch->cuda_backbone_output_ready = 0;
+    scratch->cuda_onesync_ready = 0;
+    mynah_region_begin(MYNAH_RGN_STEP);
+    mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
+    const int rc = pocket_onesync_step(ctxs, count, will_step, can_gather,
+                                       scratch, POCKET_ONESYNC_QUEUE);
+    mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
+    mynah_region_end(MYNAH_RGN_STEP);
+    return rc == 0 ? 0 : 1;
+}
+
+/* ------------------------------------------- host halves pool
+ *
+ * MYNAH_CTX_HOST_POOL (default on for the CUDA backend, =0 rolls back; works
+ * on every backend, opt-in on the CPU).  Building a
+ * request context allocates and clears megabytes of host state: the backbone
+ * transformer state (KV cache sized for voice + text + step budget, a
+ * prefill-tile row scratch), the Mimi transformer state (its windowed KV), the
+ * SEANet state (ring buffers and work arena), the flow head and the three
+ * projection scratches.  At ~900 rows that is ~8 builds per iteration at
+ * 1-2 ms each on the scheduler thread, and as many teardowns with munmap.
+ *
+ * A retired context parks those parts here and the next context renews them
+ * instead (pocket_host_take_*).  The renew contract is "what a fresh build
+ * returns, for everything a request can read":
+ *   - transformer states: mynah_transformer_ar_state_renew -- offset, window
+ *     base, layout and RoPE tables exactly `_new`'s; row scratch and scores
+ *     zeroed if they were written; the KV cache left as `_reset` leaves it
+ *     (attention reads only positions this request wrote; =2 zeroes it);
+ *   - SEANet: mynah_seanet_state_renew -- ops rebuilt by `_create`'s code over
+ *     an arena that is all zero again;
+ *   - flow head: mynah_flow_head_renew -- scratch and memo zeroed;
+ *   - projection scratch: zeroed, like the calloc it replaces.
+ * A part that cannot be renewed for this request (a backbone cache too short,
+ * say) is freed and built new, so a take never fails where a build would not.
+ * Only host memory is involved: nothing here waits on the device, and the CUDA
+ * slot pool, its fences and MYNAH_CUDA_SLOT_POOL_PREFILL are unaffected. */
+#define POCKET_HOST_POOL_CAP POCKET_MAX_BATCH
+
+typedef struct pocket_host_set {
+    struct pocket_host_set *next;
+    mynah_transformer_ar_state *backbone;
+    mynah_transformer_ar_state *codec_transformer;
+    mynah_flow_head *flow;
+    mynah_seanet_state *codec;
+    pocket_call backbone_call, codec_call, flow_call;
+} pocket_host_set;
+
+/* Frees whatever the set still holds; the shell stays. */
+static void pocket_host_set_clear(pocket_host_set *set) {
+    mynah_transformer_ar_state_free(set->backbone);
+    mynah_transformer_ar_state_free(set->codec_transformer);
+    mynah_flow_head_destroy(set->flow);
+    mynah_seanet_state_destroy(set->codec);
+    set->backbone = set->codec_transformer = NULL;
+    set->flow = NULL;
+    set->codec = NULL;
+    pocket_call_release(&set->backbone_call);
+    pocket_call_release(&set->codec_call);
+    pocket_call_release(&set->flow_call);
+}
+
+static void pocket_host_set_destroy(pocket_host_set *set) {
+    if (set == NULL) return;
+    pocket_host_set_clear(set);
+    free(set);
+}
+
+/* The idle set whose backbone cache holds `backbone_positions` most tightly;
+ * failing that the largest (its backbone is then rebuilt).  NULL with the
+ * pool off or empty.  Any thread (MYNAH_ASYNC_ADMIT builds on helpers). */
+static pocket_host_set *pocket_host_pool_take(mynah_engine_state *state,
+                                              size_t backbone_positions) {
+    if (state == NULL || state->ctx_host_pool == 0) return NULL;
+    pthread_mutex_lock(&state->ctx_host_pool_mutex);
+    pocket_host_set **best = NULL, **largest = NULL;
+    size_t best_cap = 0u, largest_cap = 0u;
+    for (pocket_host_set **link = &state->ctx_host_pool_head; *link != NULL;
+         link = &(*link)->next) {
+        const size_t cap = mynah_transformer_ar_state_kv_capacity((*link)->backbone);
+        if (cap >= backbone_positions && (best == NULL || cap < best_cap)) {
+            best = link;
+            best_cap = cap;
+        }
+        if (largest == NULL || cap > largest_cap) {
+            largest = link;
+            largest_cap = cap;
+        }
+    }
+    pocket_host_set **pick = best != NULL ? best : largest;
+    pocket_host_set *set = NULL;
+    if (pick != NULL) {
+        set = *pick;
+        *pick = set->next;
+        set->next = NULL;
+        state->ctx_host_pool_count--;
+    }
+    pthread_mutex_unlock(&state->ctx_host_pool_mutex);
+    return set;
+}
+
+static mynah_transformer_ar_state *pocket_host_take_ar(
+    mynah_transformer_ar_state **pooled, const mynah_transformer_ar_config *config,
+    int zero_kv, char *error, size_t capacity) {
+    if (*pooled != NULL) {
+        mynah_transformer_ar_state *taken = *pooled;
+        *pooled = NULL;
+        if (mynah_transformer_ar_state_renew(taken, config, zero_kv) == 0)
+            return taken;
+        mynah_transformer_ar_state_free(taken);
+    }
+    return mynah_transformer_ar_state_new(config, error, capacity);
+}
+
+static mynah_flow_head *pocket_host_take_flow(mynah_flow_head **pooled,
+                                              const mynah_flow_head_config *config,
+                                              char *error, size_t capacity) {
+    if (*pooled != NULL) {
+        mynah_flow_head *taken = *pooled;
+        *pooled = NULL;
+        if (mynah_flow_head_renew(taken, config) == 0) return taken;
+        mynah_flow_head_destroy(taken);
+    }
+    return mynah_flow_head_create(config, error, capacity);
+}
+
+static mynah_seanet_state *pocket_host_take_seanet(
+    mynah_seanet_state **pooled, const mynah_seanet_config *config,
+    const mynah_resample_config *up, size_t max_latent_frames, char *error,
+    size_t capacity) {
+    if (*pooled != NULL) {
+        mynah_seanet_state *taken = *pooled;
+        *pooled = NULL;
+        if (mynah_seanet_state_renew(taken, config, up, max_latent_frames) == 0)
+            return taken;
+        mynah_seanet_state_destroy(taken);
+    }
+    return mynah_seanet_state_create(config, up, max_latent_frames, error,
+                                     capacity);
+}
+
+/* `pocket_call_init` from a pooled scratch of the same shape, zeroed. */
+static int pocket_host_take_call(pocket_call *call, pocket_call *pooled,
+                                 size_t rows, size_t k_max, char *error,
+                                 size_t capacity) {
+    if (rows == 0) rows = 1u;
+    if (pooled->qx != NULL && pooled->rows == rows && pooled->k_max == k_max) {
+        *call = *pooled;
+        memset(pooled, 0, sizeof(*pooled));
+        const size_t qbytes = rows * k_max; /* checked when it was built */
+        memset(call->qx, 0, qbytes ? qbytes : 1u);
+        memset(call->sx, 0, rows * sizeof(*call->sx));
+        memset(call->in_ptr, 0, rows * sizeof(*call->in_ptr));
+        memset(call->out_ptr, 0, rows * sizeof(*call->out_ptr));
+        return 0;
+    }
+    pocket_call_release(pooled);
+    return pocket_call_init(call, rows, k_max, error, capacity);
+}
+
+/* ctx_free: move the host parts into the context's shell (or a new one) and
+ * park it.  A context missing any part (a failed build) frees as before. */
+static void pocket_host_pool_park(mynah_engine_ctx *ctx) {
+    mynah_engine_state *state = ctx->state;
+    pocket_host_set *set = ctx->host_set;
+    ctx->host_set = NULL;
+    if (ctx->backbone == NULL || ctx->codec_transformer == NULL ||
+        ctx->flow == NULL || ctx->codec == NULL ||
+        ctx->backbone_call.call.qx == NULL || ctx->codec_call.call.qx == NULL ||
+        ctx->flow_call.call.qx == NULL) {
+        pocket_host_set_destroy(set);
+        return;
+    }
+    if (set == NULL) {
+        set = (pocket_host_set *)calloc(1, sizeof(*set));
+        if (set == NULL) return; /* the ordinary frees follow */
+    }
+    pocket_host_set_clear(set);
+    POCKET_SLOT_MOVE(set->backbone, ctx->backbone);
+    POCKET_SLOT_MOVE(set->codec_transformer, ctx->codec_transformer);
+    POCKET_SLOT_MOVE(set->flow, ctx->flow);
+    POCKET_SLOT_MOVE(set->codec, ctx->codec);
+    set->backbone_call = ctx->backbone_call.call;
+    set->codec_call = ctx->codec_call.call;
+    set->flow_call = ctx->flow_call.call;
+    memset(&ctx->backbone_call.call, 0, sizeof(ctx->backbone_call.call));
+    memset(&ctx->codec_call.call, 0, sizeof(ctx->codec_call.call));
+    memset(&ctx->flow_call.call, 0, sizeof(ctx->flow_call.call));
+    pthread_mutex_lock(&state->ctx_host_pool_mutex);
+    if (state->ctx_host_pool_count < POCKET_HOST_POOL_CAP) {
+        set->next = state->ctx_host_pool_head;
+        state->ctx_host_pool_head = set;
+        state->ctx_host_pool_count++;
+        set = NULL;
+    }
+    pthread_mutex_unlock(&state->ctx_host_pool_mutex);
+    pocket_host_set_destroy(set); /* pool full: free as before */
+}
+
+/* Model teardown: every context is gone. */
+static void pocket_host_pool_drain(mynah_engine_state *state) {
+    pthread_mutex_lock(&state->ctx_host_pool_mutex);
+    pocket_host_set *set = state->ctx_host_pool_head;
+    state->ctx_host_pool_head = NULL;
+    state->ctx_host_pool_count = 0u;
+    pthread_mutex_unlock(&state->ctx_host_pool_mutex);
+    while (set != NULL) {
+        pocket_host_set *next = set->next;
+        pocket_host_set_destroy(set);
+        set = next;
+    }
+}
+
 static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     if (ctx == NULL) return;
+    /* MYNAH_CUDA_STEP_OVERLAP: never free a row of a queued frame. */
+    if (ctx->cuda_ahead_scratch != NULL)
+        pocket_cuda_ahead_discard(ctx->cuda_ahead_scratch,
+                                  "a queued row was freed");
+    if (ctx->cuda_hidden_lazy_scratch != NULL) {
+        /* MYNAH_CUDA_HIDDEN_LAZY: leave the scratch's list of stale rows, so
+         * a later copy-back never writes into freed memory. */
+        mynah_engine_scratch *lazy = ctx->cuda_hidden_lazy_scratch;
+        if (ctx->cuda_hidden_lazy_row < lazy->cuda_onesync_count &&
+            lazy->cuda_onesync_rows[ctx->cuda_hidden_lazy_row] == ctx)
+            lazy->cuda_onesync_rows[ctx->cuda_hidden_lazy_row] = NULL;
+        ctx->cuda_hidden_lazy_scratch = NULL;
+    }
     if (ctx->t_created_ns != 0u) {
         mynah_region_add_ns(MYNAH_RGN_REQUEST,
                             mynah_costmap_now_ns() - ctx->t_created_ns);
@@ -8693,15 +10829,29 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     }
     pocket_dump_flush(ctx);
     pocket_dump_free(ctx->dump);
-    pocket_cuda_drain_before_release(ctx->state == NULL ? NULL
-                                                           : ctx->state->backend);
+    /* MYNAH_CUDA_DEFERRED_RELEASE: with the slot pool the drain moves to a
+     * fence on the parked set (pocket_cuda_slot_park); off, as always. */
+    const int deferred = ctx->state != NULL &&
+                         pocket_cuda_deferred_release_enabled() &&
+                         pocket_cuda_slot_pool_enabled(ctx->state);
+    if (!deferred)
+        pocket_cuda_drain_before_release(ctx->state == NULL ? NULL
+                                                               : ctx->state->backend);
     /* With MYNAH_CUDA_SLOT_POOL the device buffers, decoder and pinned
      * staging move to the pool here; the releases below then free nothing
      * and only reset flags.  Without it this frees a taken-but-unused set. */
-    pocket_cuda_slot_park(ctx);
+    pocket_cuda_slot_park(ctx, deferred);
+    /* Deferred: whatever the park left on the context is freed below, after
+     * the drain it always had. */
+    if (deferred && pocket_cuda_ctx_holds_device(ctx))
+        pocket_cuda_drain_before_release(ctx->state->backend);
     pocket_cuda_backbone_release(ctx);
     pocket_cuda_codec_release(ctx);
     pocket_cuda_decoder_release(ctx);
+    /* MYNAH_CTX_HOST_POOL: the host parts go to the pool here; the frees
+     * below then see NULLs.  Off, as always. */
+    if (ctx->state != NULL && ctx->state->ctx_host_pool != 0)
+        pocket_host_pool_park(ctx);
     pocket_call_release(&ctx->backbone_call.call);
     pocket_call_release(&ctx->codec_call.call);
     pocket_call_release(&ctx->flow_call.call);
@@ -8736,6 +10886,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
         mynah_backend_host_free(ctx->state->backend, ctx->pcm);
     else
         free(ctx->pcm);
+    free(ctx->lent_pcm);
     free(ctx);
 }
 
@@ -8821,6 +10972,43 @@ static void ctxp_mark(int section, double *t) {
     pthread_mutex_unlock(&g_ctxp_mu);
     *t = now;
 }
+/* MYNAH_CTX_HOST_POOL: host states built from a pooled set [1] or new [0],
+ * and their time (pool take through the projection scratch). Only ever
+ * counted with the pool on, so the line below gains its tail only then. */
+static unsigned long g_ctxp_pool_n[2];
+static double g_ctxp_pool_s[2];
+static void ctxp_host_pool(int pooled, double t0) {
+    const double dt = mynah_phase_seconds() - t0;
+    pthread_mutex_lock(&g_ctxp_mu);
+    g_ctxp_pool_n[pooled != 0]++;
+    g_ctxp_pool_s[pooled != 0] += dt;
+    pthread_mutex_unlock(&g_ctxp_mu);
+}
+/* The driver calls of each admission (ctx->ctxp_calls, pool take through the
+ * device half): a take is "zero-call" when it made no allocation, free or
+ * VMM call (async zeroing and fence waits are allowed; their time is shown).
+ * Only with MYNAH_SERVE_PROFILE. */
+static unsigned long g_ctxp_calls_ctx;
+static unsigned long g_ctxp_take[2];
+static unsigned long g_ctxp_call_n[MYNAH_BACKEND_CALL_KINDS];
+static double g_ctxp_call_s[MYNAH_BACKEND_CALL_KINDS];
+static const mynah_engine_state *g_ctxp_fixed_state;
+static void ctxp_calls_fold(const mynah_engine_ctx *ctx) {
+    const mynah_backend_call_meter *m = &ctx->ctxp_calls;
+    const int fallback = m->count[MYNAH_BACKEND_CALL_MALLOC] +
+                             m->count[MYNAH_BACKEND_CALL_FREE] +
+                             m->count[MYNAH_BACKEND_CALL_VMM] != 0u;
+    pthread_mutex_lock(&g_ctxp_mu);
+    g_ctxp_calls_ctx++;
+    g_ctxp_take[fallback]++;
+    for (int k = 0; k < MYNAH_BACKEND_CALL_KINDS; ++k) {
+        g_ctxp_call_n[k] += m->count[k];
+        g_ctxp_call_s[k] += m->seconds[k];
+    }
+    if (ctx->state != NULL && ctx->state->cuda_slot_fixed)
+        g_ctxp_fixed_state = ctx->state;
+    pthread_mutex_unlock(&g_ctxp_mu);
+}
 static void ctxp_count(void) {
     if (!ctxp_on()) return;
     pthread_mutex_lock(&g_ctxp_mu);
@@ -8832,6 +11020,51 @@ static void ctxp_count(void) {
     fprintf(stderr, "[CTX] %lu contexts, mean %.3f ms:", g_ctxp_n, 1000.0 * total / (double)g_ctxp_n);
     for (int i = 0; i < CTXP_N; ++i)
         fprintf(stderr, " %s %.3f", name[i], 1000.0 * g_ctxp_s[i] / (double)g_ctxp_n);
+    if (g_ctxp_pool_n[0] + g_ctxp_pool_n[1] != 0u)
+        fprintf(stderr, " | host_pool: pooled %lu (%.3f ms) fresh %lu (%.3f ms)",
+                g_ctxp_pool_n[1],
+                g_ctxp_pool_n[1] ? 1000.0 * g_ctxp_pool_s[1] / (double)g_ctxp_pool_n[1] : 0.0,
+                g_ctxp_pool_n[0],
+                g_ctxp_pool_n[0] ? 1000.0 * g_ctxp_pool_s[0] / (double)g_ctxp_pool_n[0] : 0.0);
+    if (g_ctxp_calls_ctx != 0u) {
+        /* Per kind: calls in total, then mean ms per context. */
+        fprintf(stderr, " | admit calls: zero-call %lu fallback %lu;",
+                g_ctxp_take[0], g_ctxp_take[1]);
+        for (int k = 0; k < MYNAH_BACKEND_CALL_KINDS; ++k)
+            fprintf(stderr, " %s %lu %.3f", mynah_backend_call_kind_name(k),
+                    g_ctxp_call_n[k],
+                    1000.0 * g_ctxp_call_s[k] / (double)g_ctxp_calls_ctx);
+    }
+    if (g_ctxp_fixed_state != NULL)
+        fprintf(stderr,
+                " | fixed: live %zu/%zu reused %lu (short %lu) new %lu "
+                "over-cap %lu misfit %lu trimmed %lu",
+                __atomic_load_n(&g_ctxp_fixed_state->cuda_slot_fixed_live,
+                                __ATOMIC_RELAXED),
+                g_ctxp_fixed_state->cuda_slot_fixed_cap,
+                __atomic_load_n(&g_fixst[FIXST_REUSED], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_SHORT], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_NEW], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_OVER], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_MISFIT], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_TRIM], __ATOMIC_RELAXED));
+    if (g_ctxp_fixed_state != NULL)
+        fprintf(stderr,
+                " parked %lu spares %zu (taken %lu) grow: spare %lu set %lu "
+                "alloc %lu sync %lu | len stored p50/p95 %zu/%zu (estimate p95 "
+                "%zu, n %lu) F %zu",
+                __atomic_load_n(&g_fixst[FIXST_PARKED], __ATOMIC_RELAXED),
+                g_ctxp_fixed_state->cuda_slot_spare_count,
+                __atomic_load_n(&g_fixst[FIXST_SPARE_TAKE], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_SPARE], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_SLOT], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_ALLOC], __ATOMIC_RELAXED),
+                __atomic_load_n(&g_fixst[FIXST_GROW_SYNC], __ATOMIC_RELAXED),
+                pocket_cuda_fixlen_percentile(1, 50u),
+                pocket_cuda_fixlen_percentile(1, 95u),
+                pocket_cuda_fixlen_percentile(0, 95u),
+                __atomic_load_n(&g_fixlen_n[1], __ATOMIC_RELAXED),
+                g_ctxp_fixed_state->cuda_slot_fixed_positions);
     fputc('\n', stderr);
     pthread_mutex_unlock(&g_ctxp_mu);
 }
@@ -8872,12 +11105,17 @@ static int pocket_ctx_pinned(mynah_engine_ctx *ctx, const pocket_ctx_sizes *z,
                              char *error, size_t capacity) {
     mynah_engine_state *state = ctx->state;
     const pocket_config *cfg = &state->cfg;
+    /* MYNAH_SERVE_PROFILE: count this admission's driver calls. */
+    const int metered = ctxp_on();
+    mynah_backend_call_meter *meter_previous =
+        metered ? mynah_backend_call_meter_set(&ctx->ctxp_calls) : NULL;
     /* MYNAH_CUDA_SLOT_POOL: take an idle CUDA resource set before any of it
      * would be allocated.  NULL on the CPU path, with the pool off, or when
      * the pool is empty -- every helper below then allocates as before.  From
      * here on the set belongs to the context, so every failure path returns it
      * to the pool through ctx_free. */
     if (pocket_cuda_slot_pool_enabled(state)) {
+        (void)pocket_cuda_deferred_release_enabled(); /* start-up line */
         const int kv_bf16 = pocket_cuda_kv_bf16_requested(state);
         /* What `pocket_cuda_backbone_alloc` will ask for: the full worst case,
          * or the growable cache's starting size (MYNAH_CUDA_KV_GROW). */
@@ -8942,6 +11180,7 @@ static int pocket_ctx_pinned(mynah_engine_ctx *ctx, const pocket_ctx_sizes *z,
     }
     if (ctx->pcm == NULL)
         ctx->pcm = mynah_alloc_floats(z->pcm_floats, error, capacity);
+    if (metered) (void)mynah_backend_call_meter_set(meter_previous);
     if (ctx->step_input == NULL || ctx->hidden == NULL || ctx->denorm == NULL ||
         ctx->codec_seq == NULL || ctx->codec_out == NULL || ctx->codec_back == NULL ||
         ctx->pcm == NULL)
@@ -9024,11 +11263,18 @@ static void pocket_cuda_row_mem_report(const mynah_engine_ctx *ctx) {
  * valid CPU context, which is the backend contract's safe fallback. */
 static void pocket_ctx_device(mynah_engine_ctx *ctx, double *ctxp_t) {
     ctxp_mark(CTXP_REST, ctxp_t);
+    const int metered = ctxp_on();
+    mynah_backend_call_meter *meter_previous =
+        metered ? mynah_backend_call_meter_set(&ctx->ctxp_calls) : NULL;
     (void)pocket_cuda_backbone_alloc(ctx);
     ctxp_mark(CTXP_BACKBONE, ctxp_t);
     (void)pocket_cuda_codec_alloc(ctx);
     ctxp_mark(CTXP_CODEC, ctxp_t);
     (void)pocket_cuda_decoder_alloc(ctx);
+    if (metered) {
+        (void)mynah_backend_call_meter_set(meter_previous);
+        ctxp_calls_fold(ctx);
+    }
     pocket_cuda_row_mem_report(ctx);
     ctxp_mark(CTXP_DECODER, ctxp_t);
     ctxp_count();
@@ -9230,9 +11476,21 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     }
 
     ctxp_mark(CTXP_HOST, &ctxp_t);
+    /* MYNAH_CTX_HOST_POOL: a parked host set, whose parts the builds below
+     * renew instead of allocating; NULL with the pool off (every build is
+     * then the one it always was) or empty. */
+    const double host_t0 =
+        (state->ctx_host_pool != 0 && ctxp_on()) ? mynah_phase_seconds() : 0.0;
+    pocket_host_set *pooled = state->ctx_host_pool != 0
+                                  ? pocket_host_pool_take(state, backbone_capacity)
+                                  : NULL;
+    ctx->host_set = pooled;
+    const int zero_kv = state->ctx_host_pool == 2;
     mynah_transformer_ar_config backbone;
     pocket_backbone_config(ctx, backbone_capacity, &backbone);
-    ctx->backbone = mynah_transformer_ar_state_new(&backbone, error, capacity);
+    ctx->backbone = pooled != NULL
+        ? pocket_host_take_ar(&pooled->backbone, &backbone, zero_kv, error, capacity)
+        : mynah_transformer_ar_state_new(&backbone, error, capacity);
 
     mynah_transformer_ar_config codec;
     mynah_transformer_ar_config_defaults(&codec);
@@ -9244,7 +11502,10 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     codec.max_seq_len = codec_positions;
     codec.context = cfg->codec_tf_context;
     codec.layernorm_eps = cfg->layernorm_eps;
-    ctx->codec_transformer = mynah_transformer_ar_state_new(&codec, error, capacity);
+    ctx->codec_transformer = pooled != NULL
+        ? pocket_host_take_ar(&pooled->codec_transformer, &codec, zero_kv, error,
+                              capacity)
+        : mynah_transformer_ar_state_new(&codec, error, capacity);
 
     mynah_flow_head_config flow;
     mynah_flow_head_config_defaults(&flow);
@@ -9255,7 +11516,9 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     flow.num_time_conds = cfg->flow_time_conds;
     flow.freq_embed_dim = 2u * cfg->flow_freqs;
     flow.layernorm_eps = cfg->flow_layernorm_eps;
-    ctx->flow = mynah_flow_head_create(&flow, error, capacity);
+    ctx->flow = pooled != NULL
+        ? pocket_host_take_flow(&pooled->flow, &flow, error, capacity)
+        : mynah_flow_head_create(&flow, error, capacity);
 
     ctxp_mark(CTXP_STATES, &ctxp_t);
     mynah_seanet_config seanet;
@@ -9291,7 +11554,10 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     upsample.groups = cfg->codec_dim; /* depthwise: [512, 1, 32], not [512, 512, 32] */
     /* One latent frame per call: the streaming unit and the offline unit are
      * the same call, so there is no second code path to keep in step. */
-    ctx->codec = mynah_seanet_state_create(&seanet, &upsample, 1u, error, capacity);
+    ctx->codec = pooled != NULL
+        ? pocket_host_take_seanet(&pooled->codec, &seanet, &upsample, 1u, error,
+                                  capacity)
+        : mynah_seanet_state_create(&seanet, &upsample, 1u, error, capacity);
 
     if (ctx->backbone == NULL || ctx->codec_transformer == NULL || ctx->flow == NULL ||
         ctx->codec == NULL) {
@@ -9309,17 +11575,37 @@ static int pocket_ctx_create(const mynah_tts_model *model, mynah_engine_state *s
     if (cfg->codec_tf_ffn > codec_k) codec_k = cfg->codec_tf_ffn;
     size_t flow_k = cfg->flow_dim;
     if (cfg->hidden_dim > flow_k) flow_k = cfg->hidden_dim;
-    if (pocket_tar_call_init(&ctx->backbone_call, &state->backbone_hook, tile,
-                             backbone_k, error, capacity) != 0 ||
-        pocket_tar_call_init(&ctx->codec_call, &state->codec_hook, tile, codec_k,
-                             error, capacity) != 0 ||
-        /* The flow head is evaluated one row at a time per request: a tile of
-         * one is all this scratch ever needs. */
-        pocket_flow_call_init(&ctx->flow_call, &state->flow_hook, 1u, flow_k, error,
-                              capacity) != 0) {
+    int calls_failed;
+    if (pooled != NULL) {
+        /* What the three `_call_init`s below set, over pooled scratch. */
+        ctx->backbone_call.hook = &state->backbone_hook;
+        ctx->backbone_call.in_prefill = 0;
+        ctx->codec_call.hook = &state->codec_hook;
+        ctx->codec_call.in_prefill = 0;
+        ctx->flow_call.hook = &state->flow_hook;
+        calls_failed =
+            pocket_host_take_call(&ctx->backbone_call.call, &pooled->backbone_call,
+                                  tile, backbone_k, error, capacity) != 0 ||
+            pocket_host_take_call(&ctx->codec_call.call, &pooled->codec_call, tile,
+                                  codec_k, error, capacity) != 0 ||
+            pocket_host_take_call(&ctx->flow_call.call, &pooled->flow_call, 1u,
+                                  flow_k, error, capacity) != 0;
+    } else {
+        calls_failed =
+            pocket_tar_call_init(&ctx->backbone_call, &state->backbone_hook, tile,
+                                 backbone_k, error, capacity) != 0 ||
+            pocket_tar_call_init(&ctx->codec_call, &state->codec_hook, tile, codec_k,
+                                 error, capacity) != 0 ||
+            /* The flow head is evaluated one row at a time per request: a tile
+             * of one is all this scratch ever needs. */
+            pocket_flow_call_init(&ctx->flow_call, &state->flow_hook, 1u, flow_k,
+                                  error, capacity) != 0;
+    }
+    if (calls_failed) {
         pocket_ctx_free(ctx);
         return -1;
     }
+    if (host_t0 != 0.0) ctxp_host_pool(pooled != NULL, host_t0);
     pocket_bind_hooks(&ctx->backbone_w, &state->backbone, &ctx->backbone_call);
     pocket_bind_hooks(&ctx->codec_w, &state->codec_transformer, &ctx->codec_call);
     pocket_bind_flow_hooks(&ctx->flow_w, &state->flow, &ctx->flow_call);
@@ -10170,6 +12456,9 @@ static int pocket_prepare_slice_batch(
     if (ctxs == NULL || done == NULL || scratch == NULL || count < 2u ||
         count > POCKET_MAX_BATCH || count > scratch->cuda_batch_capacity) return 1;
     if (!pocket_cuda_prefill_batch_enabled()) return 1;
+    /* MYNAH_CUDA_STEP_OVERLAP safety net: a host-shadowed row's prefill
+     * goes through this scratch's backbone buffers. */
+    pocket_cuda_ahead_discard(scratch, "a batched prefill");
     for (size_t i = 0; i < count; ++i) done[i] = 0;
 
     mynah_engine_ctx *first = ctxs[0];
@@ -10363,6 +12652,22 @@ static int pocket_all_finite(const float *v, size_t n) {
     return 1;
 }
 
+/* MYNAH_DUP_CHECK_EPOCH (default on; =0 is the rollback): the "named twice" pre-flight test
+ * of pocket_step_batch stamps each context with a per-call epoch instead of
+ * comparing every pair of slots (~200k pointer compares at 640 rows).  The
+ * counter is process-wide, so two calls never share an epoch, and a context
+ * is in at most one call at a time. */
+static uint64_t pocket_dup_epoch_counter;
+
+static int pocket_dup_check_epoch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *setting = getenv("MYNAH_DUP_CHECK_EPOCH");
+        cached = setting == NULL || strcmp(setting, "0") != 0;
+    }
+    return cached;
+}
+
 /*
  * One AR step for `count` independent requests.
  *
@@ -10434,10 +12739,20 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                      POCKET_MAX_BATCH);
         return -1;
     }
+    /* MYNAH_CUDA_DECODE_OVERLAP safety net (a no-op unless a gang is queued). */
+    pocket_decode_inflight_settle(scratch);
+    /* MYNAH_CUDA_PINGPONG: no stale error charged to this step's launches. */
+    pocket_pp_clear_stale(scratch, "a step");
 
     /* ---- 1. pre-flight: decided for every context, mutating none of them --- */
     size_t offset_before[POCKET_MAX_BATCH];
     int will_step[POCKET_MAX_BATCH];
+    /* MYNAH_DUP_CHECK_EPOCH: a fresh epoch for this call. */
+    const int dup_epoch_check = pocket_dup_check_epoch_enabled();
+    const uint64_t dup_epoch =
+        dup_epoch_check ? __atomic_add_fetch(&pocket_dup_epoch_counter, 1u,
+                                             __ATOMIC_RELAXED)
+                        : 0u;
     for (size_t i = 0; i < count; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         if (ctx == NULL || !ctx->prepared) {
@@ -10467,7 +12782,18 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                          "pocket: request %zu belongs to a different model", i);
             return -1;
         }
-        for (size_t j = 0; j < i; ++j) {
+        if (dup_epoch_check) {
+            /* The same test in O(1): the context was stamped by an earlier
+             * slot of this call.  Only the stamp moves on a refusal, and it is
+             * bookkeeping that no audio path reads. */
+            if (ctx->dup_epoch == dup_epoch) {
+                pocket_error(error, capacity,
+                             "pocket: request %zu appears twice in the batch", i);
+                return -1;
+            }
+            ctx->dup_epoch = dup_epoch;
+        }
+        for (size_t j = 0; j < i && !dup_epoch_check; ++j) {
             /* Two slots naming one context would have the second write of a
              * position overwrite the first, and the rollback below would then
              * restore the wrong offset. */
@@ -10531,6 +12857,17 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     if (scratch != NULL) scratch->cuda_backbone_output_ready = 0;
     if (scratch != NULL) scratch->cuda_onesync_ready = 0;
 
+    /* MYNAH_CUDA_STEP_OVERLAP: these rows' frame may already be queued
+     * (pocket_step_launch); then only its sync and commit are left.  A frame
+     * queued for other rows is discarded first. */
+    int onesync_phase = POCKET_ONESYNC_WHOLE;
+    if (scratch != NULL && scratch->cuda_ahead_count != 0u) {
+        if (pocket_cuda_ahead_matches(scratch, ctxs, count, will_step))
+            onesync_phase = POCKET_ONESYNC_FINISH;
+        else
+            pocket_cuda_ahead_discard(scratch, "a step on other rows");
+    }
+
     /* MYNAH_CUDA_ONE_SYNC: the whole frame (condition, backbone, EOS, flow
      * head) with one stream sync.  It commits exactly what the CUDA batch
      * path below commits, or nothing, in which case that path runs as usual. */
@@ -10538,7 +12875,8 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
         mynah_region_begin(MYNAH_RGN_STEP);
         mynah_region_begin2(MYNAH_RGN_STEP_BACKBONE);
         const int onesync_rc =
-            pocket_onesync_step(ctxs, count, will_step, can_gather, scratch);
+            pocket_onesync_step(ctxs, count, will_step, can_gather, scratch,
+                                onesync_phase);
         mynah_region_end2(MYNAH_RGN_STEP_BACKBONE);
         mynah_region_end(MYNAH_RGN_STEP);
         if (onesync_rc == 0) {
@@ -10770,6 +13108,10 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
         return -1;
     }
     if (count == 0u) return 0;
+    /* MYNAH_CUDA_STEP_OVERLAP safety net: emit reads the staged outputs. */
+    pocket_cuda_ahead_discard(scratch, "an emit");
+    /* MYNAH_CUDA_DECODE_OVERLAP safety net (a no-op unless a gang is queued). */
+    pocket_decode_inflight_settle(scratch);
 
     /* s and t, pinned at the endpoints; the manifest check at load time is what
      * makes this array the right length. */
@@ -10788,6 +13130,8 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
     if (!onesync) {
         /* Not the rows the chain ran for: no early draw is consumed. */
         for (size_t i = 0; i < count; ++i) pocket_onesync_rng_restore(ctxs[i]);
+        /* MYNAH_CUDA_HIDDEN_LAZY: the ordinary emit below reads `hidden`. */
+        (void)pocket_cuda_hidden_materialize(scratch);
     }
     int cuda_eos_used = 0;
     if (onesync) {
@@ -10921,13 +13265,58 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
      * width).  Otherwise the ordinary call below runs on the subset. */
     const int onesync_flow = onesync && gathered == count &&
                              scratch->cuda_onesync_flow_finite;
-    if (gathered > 0) {
+    /* MYNAH_CUDA_ONESYNC_SUBSET: some rows ended.  The call below would run
+     * the CUDA flow head on the survivors in step order, at execution width
+     * W = exec(gathered), survivor k at position k, padding = survivor 0,
+     * cond = the hidden row (the host copy of the same cuda_norm row the
+     * chain gathered on the device), noise = the draw the chain used.  The
+     * chain placed the rows known to end after the others, so when every
+     * row that ended was one of those (survivor k sits at position k) and
+     * exec(count) == W, the chained pass was that same call: same kernels at
+     * the same width, the same input bits at every survivor position.  Only
+     * the rows past the survivors differ, in content, and a row's result
+     * never depends on another row's content at a fixed width (the property
+     * the padding rows of every bucketed call already rely on).  The latent
+     * is the same single fp32 addition, done on the device.  Anything else
+     * (a row ended on this step's own EOS logit, a different bucket, a
+     * non-finite row) falls back to the call below. */
+    int onesync_subset = 0;
+    if (onesync && !onesync_flow && gathered > 0u && gathered < count &&
+        scratch->cuda_onesync_flow_finite && scratch->cuda_flow_enabled &&
+        gathered <= flow_capacity && scratch->flow_heads != NULL &&
+        pocket_cuda_onesync_subset_enabled() &&
+        pocket_cuda_exec_width(gathered, scratch->cuda_flow_batch_capacity) ==
+            pocket_cuda_exec_width(count, scratch->cuda_flow_batch_capacity)) {
+        onesync_subset = 1;
+        size_t k = 0u;
+        for (size_t i = 0; i < count && onesync_subset; ++i) {
+            if (results[i].frames_appended == 0u) continue;
+            if (scratch->cuda_onesync_flow_pos[i] != k++) onesync_subset = 0;
+        }
+    }
+    /* MYNAH_CUDA_HIDDEN_LAZY: the paths below that are not the chained
+     * result read `hidden` on the host. */
+    if (gathered > 0 && !onesync_flow && !onesync_subset &&
+        pocket_cuda_hidden_materialize(scratch) != 0)
+        flow_failed = 1;
+    pocket_cuda_hidden_drop(scratch);
+    if (gathered > 0 && !flow_failed) {
         if (onesync_flow) {
             const size_t latent_dim = ctxs[0]->state->cfg.latent_dim;
             for (size_t i = 0; i < count; ++i)
                 memcpy(ctxs[i]->flow_out,
                        scratch->cuda_flow_host_output + i * latent_dim,
                        latent_dim * sizeof(float));
+            cuda_flow_used = 1;
+        } else if (onesync_subset) {
+            const size_t latent_dim = ctxs[0]->state->cfg.latent_dim;
+            for (size_t i = 0; i < count; ++i) {
+                if (results[i].frames_appended == 0u) continue;
+                memcpy(ctxs[i]->flow_out,
+                       scratch->cuda_flow_host_output +
+                           scratch->cuda_onesync_flow_pos[i] * latent_dim,
+                       latent_dim * sizeof(float));
+            }
             cuda_flow_used = 1;
         } else if (scratch != NULL && scratch->cuda_flow_enabled) {
             char cuda_error[256];
@@ -10975,6 +13364,11 @@ static int pocket_emit_batch(mynah_engine_ctx *const *ctxs, size_t count,
             /* noise + flow_out, added on the device (same fp32 addition). */
             memcpy(latent,
                    scratch->cuda_onesync_host_latent + i * cfg->latent_dim,
+                   cfg->latent_dim * sizeof(float));
+        } else if (onesync_subset) {
+            memcpy(latent,
+                   scratch->cuda_onesync_host_latent +
+                       scratch->cuda_onesync_flow_pos[i] * cfg->latent_dim,
                    cfg->latent_dim * sizeof(float));
         } else {
             for (size_t d = 0; d < cfg->latent_dim; ++d) {
@@ -11385,9 +13779,15 @@ static int pocket_decode_frame(mynah_engine_ctx *ctx, size_t frame, char *error,
  *
  * `*out_pcm` is malloc'd and becomes the caller's on success; on any refusal it
  * is NULL and nothing about the context has changed.
+ *
+ * With `lend` (MYNAH_CUDA_PCM_DIRECT, gang entry point only) it is instead the
+ * context's own `lent_pcm`, which the caller must NOT free: see
+ * pocket_pcm_direct_enabled() for why that is safe and what it saves. The
+ * buffer is not zeroed, unlike the calloc it replaces; nothing can tell,
+ * because a range is either written frame by frame in full or dropped.
  */
 static int pocket_decode_admit(mynah_engine_ctx *ctx, size_t first_frame,
-                               size_t frame_count, float **out_pcm,
+                               size_t frame_count, int lend, float **out_pcm,
                                size_t *out_samples, char *error, size_t capacity) {
     *out_pcm = NULL;
     *out_samples = 0;
@@ -11420,6 +13820,25 @@ static int pocket_decode_admit(mynah_engine_ctx *ctx, size_t first_frame,
         pocket_error(error, capacity, "pocket: sample count overflow");
         return -1;
     }
+    if (lend) {
+        if (samples > ctx->lent_pcm_floats) {
+            if (samples > SIZE_MAX / sizeof(float)) {
+                pocket_error(error, capacity, "pocket: sample count overflow");
+                return -1;
+            }
+            float *grown = (float *)realloc(ctx->lent_pcm, samples * sizeof(float));
+            if (grown == NULL) {
+                pocket_error(error, capacity,
+                             "pocket: out of memory for %zu PCM samples", samples);
+                return -1;
+            }
+            ctx->lent_pcm = grown;
+            ctx->lent_pcm_floats = samples;
+        }
+        *out_pcm = ctx->lent_pcm;
+        *out_samples = samples;
+        return 0;
+    }
     float *pcm = mynah_alloc_floats(samples, error, capacity);
     if (pcm == NULL) return -1;
     *out_pcm = pcm;
@@ -11438,8 +13857,8 @@ static int pocket_decode_audio(mynah_engine_ctx *ctx, size_t first_frame,
     }
     float *pcm = NULL;
     size_t samples = 0;
-    if (pocket_decode_admit(ctx, first_frame, frame_count, &pcm, &samples, error,
-                            capacity) != 0) {
+    if (pocket_decode_admit(ctx, first_frame, frame_count, 0, &pcm, &samples,
+                            error, capacity) != 0) {
         return -1;
     }
     if (pcm == NULL) return 0; /* an empty range is a legal no-op */
@@ -11534,7 +13953,9 @@ static void pocket_decode_batch_drop(mynah_engine_ctx *ctx, size_t index,
                                      size_t capacity) {
     if (ctx != NULL) ctx->broken = 1;
     if (out_samples != NULL && out_samples[index] != NULL) {
-        free(out_samples[index]);
+        /* A lent range (MYNAH_CUDA_PCM_DIRECT) belongs to the context. */
+        if (ctx == NULL || out_samples[index] != ctx->lent_pcm)
+            free(out_samples[index]);
         out_samples[index] = NULL;
     }
     if (out_count != NULL) out_count[index] = 0u;
@@ -12044,12 +14465,151 @@ fail:
     return 1;
 }
 
-static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
-                                     const size_t *first_frame,
-                                     const size_t *frame_count, float **out_samples,
-                                     size_t *out_count, int *failed,
-                                     mynah_engine_scratch *scratch, char *error,
-                                     size_t capacity) {
+/* ---- the decode split (MYNAH_CUDA_DECODE_OVERLAP) ------------------------
+ *
+ * pocket_decode_gang below is the gang decode, cut at its one stream drain.
+ * Called by pocket_decode_audio_batch it runs through, exactly as before.
+ * Called by pocket_decode_submit with `defer` it stops at the drain of a
+ * single-frame CUDA gang -- everything before it queued, nothing after it
+ * done -- records a fence, and leaves the rest here; pocket_decode_collect
+ * waits for the fence and runs the same landing code (pocket_decode_gang_land)
+ * the through path runs after its drain. Any other gang (a multi-frame range,
+ * the CPU schedule, nothing left on the device) completes inside the
+ * submission and the collect only hands its results over.
+ *
+ * Between the two only the PCM of this gang is in flight: the backend's
+ * pinned gather block, the rows' decoder outputs and `ctx->pcm`. The step the
+ * driver queues meanwhile (pocket_step_launch) reads and writes none of them,
+ * and the next gang is submitted only after this one was collected, so the
+ * L11 table patch, the gather meta and the upsample meta events all refer to
+ * completed work by then. */
+typedef struct pocket_gang_inflight {
+    int active;          /* submitted and not yet collected */
+    int queued;          /* device work queued; the landing is still to run */
+    int rc;              /* the gang call's own result */
+    int reported;
+    void *fence;
+    size_t count;
+    int lend;
+    const mynah_backend *backend;
+    const float *gang_pcm;
+    size_t gang_pcm_rows;
+    size_t gang_pcm_floats;
+    size_t submitted_count;
+    char error[256];
+    mynah_engine_ctx *ctxs[POCKET_MAX_BATCH];
+    size_t frame_count[POCKET_MAX_BATCH];
+    float *out_samples[POCKET_MAX_BATCH];
+    size_t out_count[POCKET_MAX_BATCH];
+    int failed[POCKET_MAX_BATCH];
+    int submitted[POCKET_MAX_BATCH];
+    size_t gang_pcm_index[POCKET_MAX_BATCH];
+} pocket_gang_inflight;
+
+/* After the drain: place every submitted row's PCM, check it, finish the
+ * frame; then copy the rows that were not placed. Frame `f` of the gang. */
+static void pocket_decode_gang_land(
+    mynah_engine_ctx *const *ctxs, size_t count, const size_t *frame_count,
+    float **out_samples, size_t *out_count, int *failed, int *reported,
+    char *error, size_t capacity, const mynah_backend *batch_backend,
+    const int *submitted, size_t submitted_count, const float *gang_pcm,
+    size_t gang_pcm_rows, size_t gang_pcm_floats, const size_t *gang_pcm_index,
+    int lend, size_t f, int sync_failed, const char *sync_error) {
+    /* MYNAH_CUDA_PCM_DIRECT: this frame went from the pinned gang rows
+     * straight into the range, so `ctx->pcm` was skipped both ways. */
+    int placed[POCKET_MAX_BATCH];
+    memset(placed, 0, sizeof(placed));
+    char one_error[256];
+    if (submitted_count > 0u) {
+                if (sync_failed) {
+                    for (size_t i = 0; i < count; ++i) {
+                        if (submitted[i] && !failed[i])
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, reported,
+                                                     sync_error, error, capacity);
+                    }
+                } else {
+                    if (gang_pcm != NULL) {
+                        for (size_t r = 0; r < gang_pcm_rows; ++r) {
+                            const size_t i = gang_pcm_index[r];
+                            mynah_engine_ctx *ctx = ctxs[i];
+                            const size_t frame_samples =
+                                ctx->state->cfg.samples_per_frame;
+                            /* Only when the row IS one frame of the range and
+                             * nobody reads `ctx->pcm` afterwards: the debug
+                             * dump copies it in decode_frame_finish. Anything
+                             * else takes the two-copy route below. */
+                            if (lend && ctx->dump == NULL &&
+                                gang_pcm_floats == frame_samples &&
+                                out_samples[i] != NULL && f < frame_count[i]) {
+                                memcpy(out_samples[i] + f * frame_samples,
+                                       gang_pcm + r * gang_pcm_floats,
+                                       gang_pcm_floats * sizeof(float));
+                                placed[i] = 1;
+                                continue;
+                            }
+                            memcpy(ctx->pcm, gang_pcm + r * gang_pcm_floats,
+                                   gang_pcm_floats * sizeof(float));
+                        }
+                        mynah_backend_note_codec_gang(batch_backend, 1,
+                                                      gang_pcm_rows);
+                    }
+                    for (size_t i = 0; i < count; ++i) {
+                        if (!submitted[i] || failed[i]) continue;
+                        size_t input_floats = 0u;
+                        size_t output_floats = 0u;
+                        one_error[0] = '\0';
+                        /* The same scan over the same floats, wherever they
+                         * landed: a placed row's slice is exactly the row. */
+                        const float *frame_pcm =
+                            placed[i] ? out_samples[i] +
+                                            f * ctxs[i]->state->cfg.samples_per_frame
+                                      : ctxs[i]->pcm;
+                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
+                                                      &output_floats) != 0 ||
+                            !pocket_all_finite(frame_pcm, output_floats)) {
+                            snprintf(one_error, sizeof(one_error),
+                                     "CUDA decoder produced non-finite PCM");
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, reported,
+                                                     one_error, error, capacity);
+                            continue;
+                        }
+                        if (pocket_decode_frame_finish(ctxs[i], 0, one_error,
+                                                       sizeof(one_error)) != 0)
+                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
+                                                     out_count, failed, reported,
+                                                     one_error, error, capacity);
+                    }
+                }
+    }
+
+            for (size_t i = 0; i < count; ++i) {
+                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
+                if (placed[i]) continue;
+                const size_t frame_samples = ctxs[i]->state->cfg.samples_per_frame;
+                memcpy(out_samples[i] + f * frame_samples, ctxs[i]->pcm,
+                       frame_samples * sizeof(float));
+            }
+}
+
+/* The codec position of every row whose range was decoded in full. */
+static void pocket_decode_gang_advance(mynah_engine_ctx *const *ctxs,
+                                       size_t count, const size_t *frame_count,
+                                       float *const *out_samples,
+                                       const int *failed) {
+    for (size_t i = 0; i < count; ++i) {
+        if (failed[i] || out_samples[i] == NULL) continue;
+        ctxs[i]->decoded_frames += frame_count[i];
+    }
+}
+
+static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
+                              const size_t *first_frame,
+                              const size_t *frame_count, float **out_samples,
+                              size_t *out_count, int *failed,
+                              mynah_engine_scratch *scratch, char *error,
+                              size_t capacity, pocket_gang_inflight *defer) {
     /* The driver owns the arrays and pre-clears them; scratch is shared only
      * for the resident CUDA codec gang and never retains request ownership. */
     if (ctxs == NULL || first_frame == NULL || frame_count == NULL ||
@@ -12058,6 +14618,15 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
         return -1;
     }
     if (count == 0u) return 0;
+    /* MYNAH_CUDA_PINGPONG: this group's pinned PCM block and decoder graphs. */
+    if (scratch != NULL && scratch->pingpong) {
+        mynah_backend_set_lane(scratch->backend, scratch->lane);
+        pocket_pp_clear_stale(scratch, "a gang decode");
+    }
+    /* MYNAH_CUDA_STEP_OVERLAP safety net. */
+    pocket_cuda_ahead_discard(scratch, "a gang decode");
+    /* MYNAH_CUDA_DECODE_OVERLAP safety net: land a gang still in flight. */
+    pocket_decode_inflight_settle(scratch);
     if (count > POCKET_MAX_BATCH) {
         /* Not a buffer bound -- this function stages nothing and the loop below
          * would serve any width. It is refused because a gang wider than the
@@ -12090,12 +14659,15 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
     size_t longest = 0;
     int reported = 0;
     char one_error[256];
+    /* Same answer as pocket_caps gave the driver: one state per model. */
+    const int lend = pocket_pcm_direct_enabled(ctxs[0]->state->backend);
     for (size_t i = 0; i < count; ++i) {
         float *pcm = NULL;
         size_t samples = 0;
         one_error[0] = '\0';
-        if (pocket_decode_admit(ctxs[i], first_frame[i], frame_count[i], &pcm,
-                                &samples, one_error, sizeof(one_error)) != 0) {
+        if (pocket_decode_admit(ctxs[i], first_frame[i], frame_count[i], lend,
+                                &pcm, &samples, one_error,
+                                sizeof(one_error)) != 0) {
             failed[i] = 1;
             if (!reported) {
                 pocket_error(error, capacity, "%s",
@@ -12162,6 +14734,15 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
             memset(submitted, 0, sizeof(submitted));
             size_t submitted_count = 0u;
             int decoder_batch_used = 0;
+            /* Declared outside the drain's block so a gang that queued nothing
+             * still lands (pocket_decode_gang_land copies its CPU rows). */
+            const float *gang_pcm = NULL;
+            size_t gang_pcm_rows = 0u;
+            size_t gang_pcm_floats = 0u;
+            size_t gang_pcm_index[POCKET_MAX_BATCH];
+            int sync_failed = 0;
+            char sync_error[256];
+            sync_error[0] = '\0';
 
             /* Queue every request's quantizer + upsample for this frame in
              * one submission before the per-request host preparation. */
@@ -12356,10 +14937,6 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                 /* One gather + one D2H for the whole gang's PCM.  Any
                  * refusal leaves nothing queued and falls back to the
                  * per-request copies below. */
-                const float *gang_pcm = NULL;
-                size_t gang_pcm_rows = 0u;
-                size_t gang_pcm_floats = 0u;
-                size_t gang_pcm_index[POCKET_MAX_BATCH];
                 if (pocket_cuda_codec_gang_enabled() && submitted_count > 1u) {
                     const float *sources[POCKET_MAX_BATCH];
                     int uniform = 1;
@@ -12397,64 +14974,232 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
                                                  one_error, error, capacity);
                 }
 
-                char sync_error[256];
-                sync_error[0] = '\0';
-                const int sync_failed = mynah_backend_sync(
-                    batch_backend, sync_error, sizeof(sync_error)) != 0;
-                if (sync_failed) {
-                    for (size_t i = 0; i < count; ++i) {
-                        if (submitted[i] && !failed[i])
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, &reported,
-                                                     sync_error, error, capacity);
-                    }
-                } else {
-                    if (gang_pcm != NULL) {
-                        for (size_t r = 0; r < gang_pcm_rows; ++r)
-                            memcpy(ctxs[gang_pcm_index[r]]->pcm,
-                                   gang_pcm + r * gang_pcm_floats,
-                                   gang_pcm_floats * sizeof(float));
-                        mynah_backend_note_codec_gang(batch_backend, 1,
-                                                      gang_pcm_rows);
-                    }
-                    for (size_t i = 0; i < count; ++i) {
-                        if (!submitted[i] || failed[i]) continue;
-                        size_t input_floats = 0u;
-                        size_t output_floats = 0u;
-                        one_error[0] = '\0';
-                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
-                                                      &output_floats) != 0 ||
-                            !pocket_all_finite(ctxs[i]->pcm, output_floats)) {
-                            snprintf(one_error, sizeof(one_error),
-                                     "CUDA decoder produced non-finite PCM");
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, &reported,
-                                                     one_error, error, capacity);
-                            continue;
-                        }
-                        if (pocket_decode_frame_finish(ctxs[i], 0, one_error,
-                                                       sizeof(one_error)) != 0)
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, &reported,
-                                                     one_error, error, capacity);
-                    }
+                /* MYNAH_CUDA_DECODE_OVERLAP: everything up to the drain is
+                 * queued; the drain and the landing run in the collect. */
+                if (defer != NULL && longest == 1u) {
+                    defer->reported = reported;
+                    defer->lend = lend;
+                    defer->backend = batch_backend;
+                    defer->gang_pcm = gang_pcm;
+                    defer->gang_pcm_rows = gang_pcm_rows;
+                    defer->gang_pcm_floats = gang_pcm_floats;
+                    defer->submitted_count = submitted_count;
+                    for (size_t i = 0; i < count; ++i)
+                        defer->submitted[i] = submitted[i];
+                    for (size_t r = 0; r < gang_pcm_rows; ++r)
+                        defer->gang_pcm_index[r] = gang_pcm_index[r];
+                    defer->fence = mynah_backend_fence_record(batch_backend);
+                    defer->queued = 1;
+                    mynah_region_end(MYNAH_RGN_CODEC);
+                    return 0;
                 }
+                sync_failed = mynah_backend_sync(
+                    batch_backend, sync_error, sizeof(sync_error)) != 0;
             }
-
-            for (size_t i = 0; i < count; ++i) {
-                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
-                const size_t frame_samples = ctxs[i]->state->cfg.samples_per_frame;
-                memcpy(out_samples[i] + f * frame_samples, ctxs[i]->pcm,
-                       frame_samples * sizeof(float));
-            }
+            pocket_decode_gang_land(ctxs, count, frame_count, out_samples,
+                                    out_count, failed, &reported, error,
+                                    capacity, batch_backend, submitted,
+                                    submitted_count, gang_pcm, gang_pcm_rows,
+                                    gang_pcm_floats, gang_pcm_index, lend, f,
+                                    sync_failed, sync_error);
         }
     }
     mynah_region_end(MYNAH_RGN_CODEC);
 
-    for (size_t i = 0; i < count; ++i) {
-        if (failed[i] || out_samples[i] == NULL) continue;
-        ctxs[i]->decoded_frames += frame_count[i];
+    pocket_decode_gang_advance(ctxs, count, frame_count, out_samples, failed);
+    return 0;
+}
+
+static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
+                                     const size_t *first_frame,
+                                     const size_t *frame_count, float **out_samples,
+                                     size_t *out_count, int *failed,
+                                     mynah_engine_scratch *scratch, char *error,
+                                     size_t capacity) {
+    return pocket_decode_gang(ctxs, count, first_frame, frame_count, out_samples,
+                              out_count, failed, scratch, error, capacity, NULL);
+}
+
+/* Wait for the gang's fence and run what pocket_decode_gang would have run
+ * after its drain. The results stay in `g` until the collect hands them on. */
+static void pocket_decode_inflight_land(pocket_gang_inflight *g) {
+    char sync_error[256];
+    sync_error[0] = '\0';
+    const int sync_failed = mynah_backend_fence_sync(g->backend, g->fence,
+                                                     sync_error,
+                                                     sizeof(sync_error)) != 0;
+    g->fence = NULL;
+    mynah_region_begin(MYNAH_RGN_CODEC);
+    pocket_decode_gang_land(g->ctxs, g->count, g->frame_count, g->out_samples,
+                            g->out_count, g->failed, &g->reported, g->error,
+                            sizeof(g->error), g->backend, g->submitted,
+                            g->submitted_count, g->gang_pcm, g->gang_pcm_rows,
+                            g->gang_pcm_floats, g->gang_pcm_index, g->lend, 0u,
+                            sync_failed, sync_error);
+    mynah_region_end(MYNAH_RGN_CODEC);
+    pocket_decode_gang_advance(g->ctxs, g->count, g->frame_count, g->out_samples,
+                               g->failed);
+    g->queued = 0;
+}
+
+/* Safety net, like pocket_cuda_ahead_discard: an engine call that could read
+ * or overwrite a queued gang's buffers lands it first. Its results are kept
+ * for the collect, so nothing is lost; the driver never needs this. */
+static void pocket_decode_inflight_settle(mynah_engine_scratch *scratch) {
+    if (scratch == NULL || scratch->dec_inflight == NULL ||
+        !scratch->dec_inflight->active || !scratch->dec_inflight->queued)
+        return;
+    pocket_decode_inflight_land(scratch->dec_inflight);
+}
+
+/* Scratch teardown: never leave a fence or queued copies behind. A gang that
+ * was never collected is not landed -- its contexts may be gone already. */
+static void pocket_decode_inflight_release(mynah_engine_scratch *scratch) {
+    if (scratch == NULL || scratch->dec_inflight == NULL) return;
+    pocket_gang_inflight *g = scratch->dec_inflight;
+    if (g->queued) {
+        char drain[256];
+        drain[0] = '\0';
+        (void)mynah_backend_fence_sync(g->backend, g->fence, drain, sizeof(drain));
     }
+    free(g);
+    scratch->dec_inflight = NULL;
+}
+
+static unsigned long pocket_decode_sync_submits;
+
+/* tts_engine.h `decode_submit` (MYNAH_CUDA_DECODE_OVERLAP). */
+static int pocket_decode_submit(mynah_engine_ctx *const *ctxs, size_t count,
+                                const size_t *first_frame,
+                                const size_t *frame_count,
+                                mynah_engine_scratch *scratch, char *error,
+                                size_t capacity) {
+    if (ctxs == NULL || first_frame == NULL || frame_count == NULL ||
+        scratch == NULL || count == 0u || count > POCKET_MAX_BATCH) {
+        pocket_error(error, capacity, "pocket: invalid decode gang submission");
+        return -1;
+    }
+    if (scratch->dec_inflight == NULL) {
+        scratch->dec_inflight =
+            (pocket_gang_inflight *)calloc(1, sizeof(*scratch->dec_inflight));
+        if (scratch->dec_inflight == NULL) {
+            pocket_error(error, capacity,
+                         "pocket: out of memory for the decode gang record");
+            return -1;
+        }
+    }
+    pocket_gang_inflight *g = scratch->dec_inflight;
+    if (g->active) {
+        pocket_error(error, capacity,
+                     "pocket: a decode gang is already in flight on this scratch");
+        return -1;
+    }
+    g->queued = 0;
+    g->fence = NULL;
+    g->reported = 0;
+    g->error[0] = '\0';
+    g->count = count;
+    g->backend = NULL;
+    g->gang_pcm = NULL;
+    g->gang_pcm_rows = 0u;
+    g->gang_pcm_floats = 0u;
+    g->submitted_count = 0u;
+    for (size_t i = 0; i < count; ++i) {
+        g->ctxs[i] = ctxs[i];
+        g->frame_count[i] = frame_count[i];
+        g->out_samples[i] = NULL;
+        g->out_count[i] = 0u;
+        g->failed[i] = 0;
+    }
+    /* The codec-batch opt-in drains inside its transformer and shares the
+     * scratch's codec arrays: it runs through, synchronously. */
+    const int can_queue = !pocket_cuda_codec_batch_enabled();
+    g->rc = pocket_decode_gang(ctxs, count, first_frame, g->frame_count,
+                               g->out_samples, g->out_count, g->failed, scratch,
+                               g->error, sizeof(g->error), can_queue ? g : NULL);
+    g->active = 1;
+    /* MYNAH_CUDA_DECODE_CHECK=1 (debug): land the gang right here, so nothing
+     * the driver does before the collect can overlap it. The audio must be
+     * byte-identical to a run without it; a difference is a race on a buffer
+     * the gang and the work queued after it share. */
+    static int decode_check = -1;
+    if (decode_check < 0) {
+        const char *value = getenv("MYNAH_CUDA_DECODE_CHECK");
+        decode_check = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    if (decode_check && g->queued) {
+        pocket_decode_inflight_land(g);
+        return 0;
+    }
+    if (!g->queued && pocket_decode_sync_submits++ == 0ul)
+        fprintf(stderr,
+                "mynah-tts: MYNAH_CUDA_DECODE_OVERLAP: a decode gang completed "
+                "inside its submission (%s); correct, not overlapped; further "
+                "ones are not reported\n",
+                !can_queue ? "MYNAH_CUDA_CODEC_BATCH is on"
+                           : "not a single-frame gang on the CUDA decoder");
+    return 0;
+}
+
+/* tts_engine.h `decode_collect` (MYNAH_CUDA_DECODE_OVERLAP). */
+static int pocket_decode_collect(mynah_engine_ctx *const *ctxs, size_t count,
+                                 int wait, float **out_samples, size_t *out_count,
+                                 int *failed, mynah_engine_scratch *scratch,
+                                 char *error, size_t capacity) {
+    pocket_gang_inflight *g = scratch != NULL ? scratch->dec_inflight : NULL;
+    if (g == NULL || !g->active || ctxs == NULL || out_samples == NULL ||
+        out_count == NULL || failed == NULL || count != g->count) {
+        pocket_error(error, capacity, "pocket: no such decode gang in flight");
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (ctxs[i] != g->ctxs[i]) {
+            pocket_error(error, capacity,
+                         "pocket: decode collect for other rows than submitted");
+            return -1;
+        }
+    }
+    if (g->queued) {
+        /* Not ready is not an error: the driver polls between admissions. */
+        if (!wait && mynah_backend_fence_query(g->backend, g->fence) == 0)
+            return 1;
+        pocket_decode_inflight_land(g);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        out_samples[i] = g->out_samples[i];
+        out_count[i] = g->out_count[i];
+        failed[i] = g->failed[i];
+    }
+    if (g->error[0] != '\0') pocket_error(error, capacity, "%s", g->error);
+    g->active = 0;
+    return g->rc;
+}
+
+/* tts_engine.h `scratch_set_lane` (MYNAH_CUDA_PINGPONG). */
+static int pocket_scratch_set_lane(mynah_engine_scratch *scratch, int lane,
+                                   const mynah_engine_scratch *peer,
+                                   char *error, size_t capacity) {
+    if (scratch == NULL) {
+        pocket_error(error, capacity, "pocket: no scratch for a ping-pong lane");
+        return -1;
+    }
+    const char *missing = pocket_pp_lane_missing(scratch, peer);
+    if (missing != NULL) {
+        /* The failed allocation's error is still the thread's last one. */
+        char stale[256];
+        stale[0] = '\0';
+        if (scratch->backend != NULL)
+            (void)mynah_backend_lane_clear_error(scratch->backend, stale,
+                                                 sizeof(stale));
+        pocket_error(error, capacity, "pocket: lane %d scratch (%zu rows): %s%s%s%s",
+                     lane == 1 ? 1 : 0, scratch->batch, missing,
+                     stale[0] != '\0' ? " (" : "", stale,
+                     stale[0] != '\0' ? ")" : "");
+        return -1;
+    }
+    scratch->pingpong = 1;
+    scratch->lane = lane == 1 ? 1 : 0;
+    scratch->pp_onesync_failures = 0u;
     return 0;
 }
 
@@ -12603,6 +15348,11 @@ static void pocket_cuda_flow_release(mynah_engine_scratch *scratch) {
 
 static void pocket_scratch_free(mynah_engine_scratch *scratch) {
     if (scratch == NULL) return;
+    pocket_cuda_ahead_discard(scratch, "scratch freed");
+    pocket_decode_inflight_release(scratch);
+    /* MYNAH_CUDA_HIDDEN_LAZY: the rows' host copies before cuda_norm goes. */
+    (void)pocket_cuda_hidden_materialize(scratch);
+    free(scratch->cuda_kv_table_keys);
     pocket_cuda_drain_before_release(scratch->backend);
     pocket_cuda_codec_scratch_release(scratch);
     if (scratch->backend != NULL) {
@@ -12679,6 +15429,19 @@ static int pocket_scratch_new(const mynah_tts_model *model,
     if (out == NULL || state == NULL) return -1;
     *out = NULL;
     if (batch == 0u) batch = 1u;
+    /* Its start-up line, on the CUDA backend only: the check is the same on
+     * every backend, and a CPU run need not say so on every synthesis. */
+    {
+        static int announced;
+        if (!announced && pocket_dup_check_epoch_enabled() &&
+            state->backend != NULL &&
+            strcmp(mynah_backend_name(state->backend), "cuda") == 0) {
+            announced = 1;
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_DUP_CHECK_EPOCH (default): duplicate-context "
+                    "check by per-step epoch stamp (=0 to roll back)\n");
+        }
+    }
     mynah_engine_scratch *scratch =
         (mynah_engine_scratch *)calloc(1, sizeof(*scratch));
     if (scratch == NULL) {
@@ -13182,6 +15945,11 @@ static int pocket_scratch_new(const mynah_tts_model *model,
                 scratch->cuda_graph_ready = 0;
                 scratch->cuda_kv_shadow_floats = kv_shadow_floats;
                 pocket_cuda_onesync_reserve(state, scratch, batch);
+                /* All slots start invalid: the first step writes every one. */
+                if (pocket_cuda_kv_table_cache_enabled())
+                    scratch->cuda_kv_table_keys =
+                        (struct pocket_kv_table_key *)calloc(
+                            batch, sizeof(*scratch->cuda_kv_table_keys));
             }
         }
     }
@@ -13292,6 +16060,10 @@ static const mynah_tts_engine pocket_engine = {
     pocket_prepare_slice_batch,/* APPENDED */
     pocket_ctx_new_host,       /* APPENDED: MYNAH_ASYNC_ADMIT, first phase */
     pocket_ctx_attach,         /* APPENDED: MYNAH_ASYNC_ADMIT, second phase */
+    pocket_step_launch,        /* APPENDED: MYNAH_CUDA_STEP_OVERLAP */
+    pocket_decode_submit,      /* APPENDED: MYNAH_CUDA_DECODE_OVERLAP */
+    pocket_decode_collect,     /* APPENDED: MYNAH_CUDA_DECODE_OVERLAP */
+    pocket_scratch_set_lane,   /* APPENDED: MYNAH_CUDA_PINGPONG */
 };
 
 const mynah_tts_engine *mynah_engine_pocket(void) { return &pocket_engine; }
@@ -13609,6 +16381,10 @@ int mynah_engine_pocket_set_noise(mynah_engine_ctx *ctx, mynah_pocket_noise_fn f
     return 0;
 }
 
+/* With MYNAH_CUDA_HIDDEN_LAZY on, a context stepped by the CUDA one-sync
+ * chain keeps the hidden row of its last such step on the device only, so
+ * this returns an older row for it; a parity dump turns the mode off for
+ * the steps it records. */
 const float *mynah_engine_pocket_hidden(const mynah_engine_ctx *ctx,
                                         size_t *out_count) {
     if (ctx == NULL) return NULL;
@@ -14052,9 +16828,20 @@ static int pocket_check_gang(mynah_engine_state *state,
         float *got[POCKET_CHECK_MAX];
         size_t got_n[POCKET_CHECK_MAX];
         int failed[POCKET_CHECK_MAX];
+        /* MYNAH_CUDA_DECODE_OVERLAP: every other round goes through the
+         * decode split instead, with one frame per row, which is the shape
+         * it queues (multi-frame ranges complete inside the submission).
+         * Unset follows the serving default (on for the CUDA backend). */
+        const char *split_env = getenv("MYNAH_CUDA_DECODE_OVERLAP");
+        const int split_on =
+            split_env != NULL && split_env[0] != '\0'
+                ? strcmp(split_env, "0") != 0
+                : state->backend != NULL &&
+                      strcmp(mynah_backend_name(state->backend), "cuda") == 0;
+        const int split = split_on && (round % 2u) == 1u;
         for (size_t i = 0; i < count; ++i) {
             const size_t available = b.ctx[i]->frames - done_frames[i];
-            size_t quantum = (i % 3u) + 1u;
+            size_t quantum = split ? 1u : (i % 3u) + 1u;
             if (quantum > available) quantum = available;
             first[i] = done_frames[i];
             want[i] = quantum;
@@ -14063,8 +16850,15 @@ static int pocket_check_gang(mynah_engine_state *state,
             failed[i] = 0;
         }
         mynah_engine_ctx *const *bctxs = b.ctx;
-        if (pocket_decode_audio_batch(bctxs, count, first, want, got, got_n, failed,
-                                      scratch, error, capacity) != 0) {
+        if (split) {
+            if (pocket_decode_submit(bctxs, count, first, want, scratch, error,
+                                     capacity) != 0 ||
+                pocket_decode_collect(bctxs, count, 1, got, got_n, failed,
+                                      scratch, error, capacity) != 0)
+                goto done;
+        } else if (pocket_decode_audio_batch(bctxs, count, first, want, got,
+                                             got_n, failed, scratch, error,
+                                             capacity) != 0) {
             goto done;
         }
         for (size_t i = 0; i < count; ++i) {
@@ -14126,11 +16920,13 @@ static int pocket_check_gang(mynah_engine_state *state,
                 free(solo);
                 /* Only what this loop has not handed back yet: got[0..i-1] were
                  * already freed at the bottom of their own iteration. */
-                for (size_t j = i; j < count; ++j) free(got[j]);
+                for (size_t j = i; j < count; ++j)
+                    if (got[j] != b.ctx[j]->lent_pcm) free(got[j]);
                 goto done;
             }
             free(solo);
-            free(got[i]);
+            /* MYNAH_CUDA_PCM_DIRECT lends the range; it is b.ctx[i]'s. */
+            if (got[i] != b.ctx[i]->lent_pcm) free(got[i]);
             done_frames[i] += want[i];
         }
     }

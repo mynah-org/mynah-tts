@@ -4,12 +4,14 @@
 #include "kernels.h"
 #include "sgemm.h"
 #include "threads.h"
+#include "mynah_util.h"
 
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -64,6 +66,13 @@ struct mynah_backend {
     int (*graph_launch)(void *, size_t, const void *, char *, size_t);
     void (*graph_abort)(void *, size_t, const void *);
     void (*graph_forget)(void *, const void *);
+    void (*graph_forget_parked)(void *, const void *);
+    void *(*fence_record)(void *);
+    void (*fence_wait)(void *, void *);
+    int (*fence_query)(void *, void *);
+    int (*fence_sync)(void *, void *, char *, size_t);
+    void (*set_lane)(void *, int);
+    int (*lane_clear_error)(void *, char *, size_t);
     int (*flow_batch_dev)(void *, const mynah_backend_flow_batch *, char *, size_t);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
@@ -187,6 +196,13 @@ extern int mynah_cuda_graph_end(void *, size_t, const void *, char *, size_t);
 extern int mynah_cuda_graph_launch(void *, size_t, const void *, char *, size_t);
 extern void mynah_cuda_graph_abort(void *, size_t, const void *);
 extern void mynah_cuda_graph_forget(void *, const void *);
+extern void mynah_cuda_graph_forget_parked(void *, const void *);
+extern void *mynah_cuda_fence_record(void *);
+extern void mynah_cuda_fence_wait(void *, void *);
+extern int mynah_cuda_fence_query(void *, void *);
+extern int mynah_cuda_fence_sync(void *, void *, char *, size_t);
+extern void mynah_cuda_set_lane(void *, int);
+extern int mynah_cuda_lane_clear_error(void *, char *, size_t);
 extern int mynah_cuda_flow_batch_dev(void *, const mynah_backend_flow_batch *, char *, size_t);
 extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
@@ -283,6 +299,85 @@ extern int mynah_cuda_metrics_get(void *, mynah_tts_backend_metrics *);
 
 static void set_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
+}
+
+/* Driver-call meter (backend.h).  Only the thread that installed a meter
+ * pays for the clock reads; every other call costs one thread-local load. */
+static _Thread_local mynah_backend_call_meter *t_call_meter;
+
+mynah_backend_call_meter *mynah_backend_call_meter_set(
+    mynah_backend_call_meter *meter) {
+    mynah_backend_call_meter *previous = t_call_meter;
+    t_call_meter = meter;
+    return previous;
+}
+
+const char *mynah_backend_call_kind_name(int kind) {
+    static const char *const names[MYNAH_BACKEND_CALL_KINDS] = {
+        "malloc", "free", "vmm", "memset", "event"};
+    return kind >= 0 && kind < MYNAH_BACKEND_CALL_KINDS ? names[kind] : "?";
+}
+
+static double call_meter_begin(void) {
+    return t_call_meter != NULL ? mynah_phase_seconds() : 0.0;
+}
+
+static void call_meter_end(int kind, double t0) {
+    mynah_backend_call_meter *meter = t_call_meter;
+    if (meter == NULL) return;
+    meter->count[kind]++;
+    meter->seconds[kind] += mynah_phase_seconds() - t0;
+}
+
+int mynah_backend_fixed_buffers_plan(size_t free_bytes, size_t total_bytes,
+                                     size_t rows, size_t buffer_bytes,
+                                     size_t per_row_other_bytes,
+                                     size_t *reserve_bytes, size_t *fit_rows) {
+    if (buffer_bytes == 0u || reserve_bytes == NULL || fit_rows == NULL)
+        return -1;
+    size_t reserve = total_bytes / 5u;
+    const size_t floor = (size_t)4u << 30;
+    if (reserve < floor) reserve = floor;
+    const size_t other = per_row_other_bytes != 0u &&
+                                 rows > SIZE_MAX / per_row_other_bytes
+                             ? SIZE_MAX
+                             : rows * per_row_other_bytes;
+    reserve = other > SIZE_MAX - reserve ? SIZE_MAX : reserve + other;
+    const size_t budget = free_bytes > reserve ? free_bytes - reserve : 0u;
+    size_t fit = budget / buffer_bytes;
+    if (fit > rows) fit = rows;
+    *reserve_bytes = reserve;
+    *fit_rows = fit;
+    return 0;
+}
+
+static size_t sat_add(size_t a, size_t b) {
+    return a > SIZE_MAX - b ? SIZE_MAX : a + b;
+}
+
+int mynah_backend_fixed_buffers_refit(size_t free_bytes, size_t total_bytes,
+                                      size_t rows, size_t spares,
+                                      size_t sets_made, size_t live,
+                                      size_t buffer_bytes,
+                                      size_t per_row_other_bytes,
+                                      size_t extra_bytes, size_t *margin_bytes,
+                                      size_t *cap) {
+    if (buffer_bytes == 0u || margin_bytes == NULL || cap == NULL) return -1;
+    size_t margin = total_bytes / 16u;
+    const size_t floor = (size_t)2u << 30;
+    if (margin < floor) margin = floor;
+    const size_t missing = rows > sets_made ? rows - sets_made : 0u;
+    const size_t other = per_row_other_bytes != 0u &&
+                                 missing > SIZE_MAX / per_row_other_bytes
+                             ? SIZE_MAX
+                             : missing * per_row_other_bytes;
+    margin = sat_add(sat_add(margin, other), extra_bytes);
+    const size_t budget = free_bytes > margin ? free_bytes - margin : 0u;
+    const size_t limit = sat_add(rows, spares);
+    const size_t fit = sat_add(live, budget / buffer_bytes);
+    *margin_bytes = margin;
+    *cap = fit < limit ? fit : limit;
+    return 0;
 }
 
 static int metal_cpu_path_enabled(const char *cpu_name, const char *gpu_name,
@@ -718,6 +813,13 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->graph_launch = mynah_cuda_graph_launch;
         backend->graph_abort = mynah_cuda_graph_abort;
         backend->graph_forget = mynah_cuda_graph_forget;
+        backend->graph_forget_parked = mynah_cuda_graph_forget_parked;
+        backend->fence_record = mynah_cuda_fence_record;
+        backend->fence_wait = mynah_cuda_fence_wait;
+        backend->fence_query = mynah_cuda_fence_query;
+        backend->fence_sync = mynah_cuda_fence_sync;
+        backend->set_lane = mynah_cuda_set_lane;
+        backend->lane_clear_error = mynah_cuda_lane_clear_error;
         backend->flow_batch_dev = mynah_cuda_flow_batch_dev;
         backend->snake_dev = mynah_cuda_snake_dev;
         backend->gelu_dev = mynah_cuda_gelu_dev;
@@ -864,11 +966,115 @@ int mynah_backend_sgemm(const mynah_backend *backend,
                           error, error_capacity);
 }
 
+/* The driver-call meter counts exactly the calls made while it is set, on
+ * this thread only, and the fixed-buffer plan's arithmetic (the start-up cap
+ * of MYNAH_CUDA_SLOT_FIXED) matches hand-computed cases. */
+static int call_meter_self_test(const mynah_backend *backend, char *error,
+                                size_t error_capacity) {
+    mynah_backend_call_meter meter;
+    memset(&meter, 0, sizeof(meter));
+    float *untracked = NULL;
+    if (mynah_backend_dev_alloc(backend, 8u, &untracked, error,
+                                error_capacity) != 0)
+        return -1;
+    mynah_backend_call_meter *previous = mynah_backend_call_meter_set(&meter);
+    float *a = NULL;
+    void *b = NULL;
+    float *h = NULL;
+    const int failed =
+        mynah_backend_dev_alloc(backend, 16u, &a, error, error_capacity) != 0 ||
+        mynah_backend_dev_alloc_bytes(backend, 64u, &b, error,
+                                      error_capacity) != 0 ||
+        mynah_backend_host_alloc(backend, 4u, &h, error, error_capacity) != 0 ||
+        mynah_backend_zero_dev(backend, a, 16u, error, error_capacity) != 0;
+    mynah_backend_dev_free(backend, a);
+    mynah_backend_dev_free(backend, (float *)b);
+    mynah_backend_host_free(backend, h);
+    (void)mynah_backend_call_meter_set(previous);
+    mynah_backend_dev_free(backend, untracked); /* not counted */
+    if (failed) return -1;
+    if (meter.count[MYNAH_BACKEND_CALL_MALLOC] != 3u ||
+        meter.count[MYNAH_BACKEND_CALL_FREE] != 3u ||
+        meter.count[MYNAH_BACKEND_CALL_MEMSET] != 1u ||
+        meter.count[MYNAH_BACKEND_CALL_VMM] != 0u ||
+        meter.count[MYNAH_BACKEND_CALL_EVENT] != 0u ||
+        meter.seconds[MYNAH_BACKEND_CALL_MALLOC] < 0.0) {
+        set_error(error, error_capacity,
+                  "driver-call meter counted the wrong calls");
+        return -1;
+    }
+    const size_t gib = (size_t)1u << 30, mib = (size_t)1u << 20;
+    size_t reserve = 0u, fit = 0u;
+    /* 46 GiB card, 44 GiB free, 1024 rows of 25.5 MiB + 9 MiB other:
+     * reserve 9.2 + 9 GiB, budget ~25.8 GiB -> 1024 rows. */
+    if (sizeof(size_t) >= 8u &&
+        (mynah_backend_fixed_buffers_plan(44u * gib, 46u * gib, 1024u,
+                                          51u * mib / 2u, 9u * mib, &reserve,
+                                          &fit) != 0 ||
+         reserve != 46u * gib / 5u + 1024u * 9u * mib || fit != 1024u ||
+         /* the same at 768 positions (38.25 MiB): capped */
+         mynah_backend_fixed_buffers_plan(44u * gib, 46u * gib, 1024u,
+                                          153u * mib / 4u, 9u * mib, &reserve,
+                                          &fit) != 0 ||
+         fit != (44u * gib - reserve) / (153u * mib / 4u) || fit >= 1024u ||
+         /* 8 GiB card: the 4 GiB floor wins, nothing fits */
+         mynah_backend_fixed_buffers_plan(3u * gib, 8u * gib, 64u, mib, 0u,
+                                          &reserve, &fit) != 0 ||
+         reserve != 4u * gib || fit != 0u ||
+         mynah_backend_fixed_buffers_plan(SIZE_MAX, SIZE_MAX, SIZE_MAX, 1u,
+                                          SIZE_MAX, &reserve, &fit) != 0 ||
+         reserve != SIZE_MAX || fit != 0u ||
+         mynah_backend_fixed_buffers_plan(1u, 1u, 1u, 0u, 0u, &reserve,
+                                          &fit) != -1)) {
+        set_error(error, error_capacity, "fixed-buffer plan arithmetic is wrong");
+        return -1;
+    }
+    /* Re-plan after the warm-ups. 48 GiB card, 30 GiB free, 1024 rows + 32
+     * spares of 20 MiB, every set made: margin 3 GiB, 1382 fit -> 1056. */
+    size_t margin = 0u, cap = 0u;
+    if (sizeof(size_t) >= 8u &&
+        (mynah_backend_fixed_buffers_refit(30u * gib, 48u * gib, 1024u, 32u,
+                                           1024u, 0u, 20u * mib, 9u * mib, 0u,
+                                           &margin, &cap) != 0 ||
+         margin != 3u * gib || cap != 1056u ||
+         /* 22 GiB card at 768 rows: the 2 GiB floor wins, 409 fit */
+         mynah_backend_fixed_buffers_refit(10u * gib, 22u * gib, 768u, 24u,
+                                           768u, 0u, 20u * mib, 9u * mib, 0u,
+                                           &margin, &cap) != 0 ||
+         margin != 2u * gib || cap != (8u * gib) / (20u * mib) ||
+         /* sets not made yet and spare extra bytes widen the margin; the
+          * caches that already exist count on top of what fits */
+         mynah_backend_fixed_buffers_refit(10u * gib, 22u * gib, 384u, 12u, 1u,
+                                           40u, 20u * mib, 9u * mib, 150u * mib,
+                                           &margin, &cap) != 0 ||
+         margin != 2u * gib + 383u * 9u * mib + 150u * mib ||
+         cap != 40u + (10u * gib - margin) / (20u * mib) ||
+         /* nothing free: the existing caches are the cap */
+         mynah_backend_fixed_buffers_refit(gib, 48u * gib, 1024u, 32u, 1024u,
+                                           100u, 20u * mib, 9u * mib, 0u,
+                                           &margin, &cap) != 0 ||
+         cap != 100u ||
+         mynah_backend_fixed_buffers_refit(SIZE_MAX, SIZE_MAX, SIZE_MAX,
+                                           SIZE_MAX, 0u, SIZE_MAX, 1u,
+                                           SIZE_MAX, SIZE_MAX, &margin,
+                                           &cap) != 0 ||
+         margin != SIZE_MAX || cap != SIZE_MAX ||
+         mynah_backend_fixed_buffers_refit(1u, 1u, 1u, 0u, 0u, 0u, 0u, 0u, 0u,
+                                           &margin, &cap) != -1)) {
+        set_error(error, error_capacity,
+                  "fixed-buffer re-plan arithmetic is wrong");
+        return -1;
+    }
+    return 0;
+}
+
 int mynah_backend_self_test(mynah_tts_device device, char *error, size_t error_capacity) {
     mynah_backend *backend = NULL;
     if (mynah_backend_open(device, &backend, error, error_capacity) != 0) return -1;
     int result = backend->self_test == NULL ? 0 :
         backend->self_test(backend->state, error, error_capacity);
+    if (result == 0 && device == MYNAH_TTS_DEVICE_CPU)
+        result = call_meter_self_test(backend, error, error_capacity);
 #if defined(MYNAH_ENABLE_METAL)
     if (result == 0 && device == MYNAH_TTS_DEVICE_METAL)
         result = mynah_metal_ops_self_test(backend->state, error, error_capacity);
@@ -888,15 +1094,21 @@ int mynah_backend_decoder_open(const mynah_backend *backend,
         set_error(error, error_capacity, "resident decoder is unavailable");
         return -1;
     }
-    return backend->decoder_open(backend->state, desc, max_encoder_frames, out,
-                                 error, error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->decoder_open(backend->state, desc, max_encoder_frames,
+                                         out, error, error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 void mynah_backend_decoder_close(const mynah_backend *backend,
                                  mynah_backend_decoder *decoder) {
     if (backend == NULL || decoder == NULL) return;
-    if (backend->decoder_close != NULL)
+    if (backend->decoder_close != NULL) {
+        const double t0 = call_meter_begin();
         backend->decoder_close(backend->state, decoder);
+        call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
+    }
 }
 
 int mynah_backend_decoder_reset(const mynah_backend *backend,
@@ -906,7 +1118,11 @@ int mynah_backend_decoder_reset(const mynah_backend *backend,
         set_error(error, error_capacity, "resident decoder is unavailable");
         return -1;
     }
-    return backend->decoder_reset(backend->state, decoder, error, error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->decoder_reset(backend->state, decoder, error,
+                                          error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_MEMSET, t0);
+    return rc;
 }
 
 int mynah_backend_decoder_step(const mynah_backend *backend,
@@ -1045,12 +1261,132 @@ int mynah_backend_download(const mynah_backend *backend, const float *dev_ptr,
     return 0;
 }
 
+/* Counters for mynah_backend_sync_profile(). Written only by the thread that
+ * syncs (the scheduler), read once at the end of a run; atomics keep a stray
+ * reader on another thread defined rather than torn. */
+static _Atomic unsigned long long g_sync_wait_ns;
+static _Atomic unsigned long long g_sync_calls;
+static _Atomic int g_sync_profile = -1; /* -1 = MYNAH_SERVE_PROFILE not read yet */
+
+/* Per-site table. Sites are string literals (__FILE__) plus a line, so a
+ * pointer compare is enough; a site that does not fit is counted in the
+ * totals only. Written by the syncing thread; a second syncing thread would
+ * at worst lose a row of the report, never corrupt the totals. */
+#define SYNC_SITES_MAX 64
+static struct { const char *file; int line; unsigned long long calls, ns, queued; }
+    g_sync_sites[SYNC_SITES_MAX];
+static _Atomic int g_sync_site_count;
+
+/* MYNAH_CUDA_STEP_OVERLAP / MYNAH_CUDA_DECODE_OVERLAP: set by the serving loop
+ * while it has device work queued that it means to hide (a step launched
+ * ahead, a decode gang submitted and not collected). A sync reached meanwhile
+ * waits for that work too, so the overlap of that iteration is silently gone;
+ * those calls are counted per site. Profile runs only. */
+static _Atomic int g_sync_queued;
+static _Atomic unsigned long long g_sync_queued_calls;
+static _Atomic unsigned long long g_stream_sync_queued_calls;
+
+static void sync_site_note(const char *file, int line, unsigned long long ns) {
+    const unsigned long long queued =
+        atomic_load_explicit(&g_sync_queued, memory_order_relaxed) ? 1ull : 0ull;
+    if (queued) atomic_fetch_add_explicit(&g_sync_queued_calls, 1ull, memory_order_relaxed);
+    const int n = atomic_load_explicit(&g_sync_site_count, memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_sync_sites[i].line == line && g_sync_sites[i].file == file) {
+            g_sync_sites[i].calls++;
+            g_sync_sites[i].ns += ns;
+            g_sync_sites[i].queued += queued;
+            return;
+        }
+    }
+    if (n >= SYNC_SITES_MAX) return;
+    g_sync_sites[n].file = file;
+    g_sync_sites[n].line = line;
+    g_sync_sites[n].calls = 1ull;
+    g_sync_sites[n].ns = ns;
+    g_sync_sites[n].queued = queued;
+    atomic_store_explicit(&g_sync_site_count, n + 1, memory_order_release);
+}
+
+void mynah_backend_sync_note_queued(int queued) {
+    atomic_store_explicit(&g_sync_queued, queued != 0, memory_order_relaxed);
+}
+
+unsigned long long mynah_backend_sync_queued_calls(void) {
+    return atomic_load_explicit(&g_sync_queued_calls, memory_order_relaxed);
+}
+
+unsigned long long mynah_backend_stream_sync_queued_calls(void) {
+    return atomic_load_explicit(&g_stream_sync_queued_calls, memory_order_relaxed);
+}
+
+int mynah_backend_sync_at(const mynah_backend *backend, char *error,
+                          size_t error_capacity, const char *file, int line) {
+    if (backend == NULL) return -1;
+    if (backend->sync == NULL) return 0; /* CPU: nothing to sync */
+    int profile = atomic_load_explicit(&g_sync_profile, memory_order_relaxed);
+    if (profile < 0) {
+        profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
+        atomic_store_explicit(&g_sync_profile, profile, memory_order_relaxed);
+    }
+    if (!profile) return backend->sync(backend->state, error, error_capacity);
+    const double t0 = mynah_phase_seconds();
+    const int result = backend->sync(backend->state, error, error_capacity);
+    const double waited = mynah_phase_seconds() - t0;
+    const unsigned long long ns = (unsigned long long)(waited > 0.0 ? waited * 1e9 : 0.0);
+    atomic_fetch_add_explicit(&g_sync_wait_ns, ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_sync_calls, 1ull, memory_order_relaxed);
+    if (atomic_load_explicit(&g_sync_queued, memory_order_relaxed))
+        atomic_fetch_add_explicit(&g_stream_sync_queued_calls, 1ull,
+                                  memory_order_relaxed);
+    sync_site_note(file, line, ns);
+    return result;
+}
+
+#undef mynah_backend_sync
 int mynah_backend_sync(const mynah_backend *backend,
                        char *error, size_t error_capacity) {
-    if (backend == NULL) return -1;
-    if (backend->sync != NULL)
-        return backend->sync(backend->state, error, error_capacity);
-    return 0; /* CPU: nothing to sync */
+    return mynah_backend_sync_at(backend, error, error_capacity, "unknown", 0);
+}
+
+void mynah_backend_sync_profile_reset(void) {
+    const int n = atomic_load_explicit(&g_sync_site_count, memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        g_sync_sites[i].calls = 0ull;
+        g_sync_sites[i].ns = 0ull;
+        g_sync_sites[i].queued = 0ull;
+    }
+    atomic_store_explicit(&g_sync_wait_ns, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_sync_calls, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_sync_queued_calls, 0ull, memory_order_relaxed);
+    atomic_store_explicit(&g_stream_sync_queued_calls, 0ull, memory_order_relaxed);
+}
+
+void mynah_backend_sync_profile_print(FILE *out, unsigned long long iterations) {
+    const int n = atomic_load_explicit(&g_sync_site_count, memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        if (g_sync_sites[i].calls == 0ull) continue;
+        fprintf(out, "[SERVE]   sync %s:%d  calls %llu (%.2f per iteration)  wait %.1f ms "
+                     "total, %.3f ms mean",
+                g_sync_sites[i].file, g_sync_sites[i].line, g_sync_sites[i].calls,
+                iterations ? (double)g_sync_sites[i].calls / (double)iterations : 0.0,
+                1e-6 * (double)g_sync_sites[i].ns,
+                g_sync_sites[i].calls ? 1e-6 * (double)g_sync_sites[i].ns /
+                                            (double)g_sync_sites[i].calls : 0.0);
+        /* Only overlapped runs ever set the queued flag, so other runs print
+         * exactly the line they printed before. */
+        if (g_sync_sites[i].queued != 0ull)
+            fprintf(out, "  while queued %llu", g_sync_sites[i].queued);
+        fputc('\n', out);
+    }
+}
+
+void mynah_backend_sync_profile(double *wait_seconds, unsigned long long *calls) {
+    if (wait_seconds != NULL)
+        *wait_seconds = 1e-9 * (double)atomic_load_explicit(&g_sync_wait_ns,
+                                                            memory_order_relaxed);
+    if (calls != NULL)
+        *calls = atomic_load_explicit(&g_sync_calls, memory_order_relaxed);
 }
 
 int mynah_backend_batch_begin(const mynah_backend *backend,
@@ -1101,6 +1437,69 @@ void mynah_backend_graph_forget(const mynah_backend *backend,
                                 const void *identity) {
     if (backend != NULL && backend->graph_forget != NULL && identity != NULL)
         backend->graph_forget(backend->state, identity);
+}
+
+void mynah_backend_graph_forget_parked(const mynah_backend *backend,
+                                       const void *identity) {
+    if (backend == NULL || identity == NULL) return;
+    if (backend->graph_forget_parked != NULL)
+        backend->graph_forget_parked(backend->state, identity);
+    else if (backend->graph_forget != NULL)
+        backend->graph_forget(backend->state, identity);
+}
+
+void *mynah_backend_fence_record(const mynah_backend *backend) {
+    if (backend == NULL || backend->fence_record == NULL) return NULL;
+    return backend->fence_record(backend->state);
+}
+
+void mynah_backend_fence_wait(const mynah_backend *backend, void *fence) {
+    if (backend != NULL && backend->fence_wait != NULL && fence != NULL) {
+        const double t0 = call_meter_begin();
+        backend->fence_wait(backend->state, fence);
+        call_meter_end(MYNAH_BACKEND_CALL_EVENT, t0);
+    }
+}
+
+int mynah_backend_fence_query(const mynah_backend *backend, void *fence) {
+    if (backend == NULL || fence == NULL || backend->fence_query == NULL) return 1;
+    return backend->fence_query(backend->state, fence);
+}
+
+void mynah_backend_set_lane(const mynah_backend *backend, int lane) {
+    if (backend != NULL && backend->set_lane != NULL)
+        backend->set_lane(backend->state, lane);
+}
+
+int mynah_backend_lane_clear_error(const mynah_backend *backend, char *error,
+                                   size_t error_capacity) {
+    if (backend == NULL || backend->lane_clear_error == NULL) return 0;
+    return backend->lane_clear_error(backend->state, error, error_capacity);
+}
+
+int mynah_backend_fence_sync_at(const mynah_backend *backend, void *fence,
+                                char *error, size_t error_capacity,
+                                const char *file, int line) {
+    if (backend == NULL) return -1;
+    if (fence == NULL || backend->fence_sync == NULL) {
+        /* No fence: the stream drain covers it, and is profiled as itself. */
+        if (fence != NULL) mynah_backend_fence_wait(backend, fence);
+        return mynah_backend_sync_at(backend, error, error_capacity, file, line);
+    }
+    int profile = atomic_load_explicit(&g_sync_profile, memory_order_relaxed);
+    if (profile < 0) {
+        profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
+        atomic_store_explicit(&g_sync_profile, profile, memory_order_relaxed);
+    }
+    if (!profile) return backend->fence_sync(backend->state, fence, error, error_capacity);
+    const double t0 = mynah_phase_seconds();
+    const int result = backend->fence_sync(backend->state, fence, error, error_capacity);
+    const double waited = mynah_phase_seconds() - t0;
+    const unsigned long long ns = (unsigned long long)(waited > 0.0 ? waited * 1e9 : 0.0);
+    atomic_fetch_add_explicit(&g_sync_wait_ns, ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_sync_calls, 1ull, memory_order_relaxed);
+    sync_site_note(file, line, ns);
+    return result;
 }
 
 int mynah_backend_flow_batch_dev(const mynah_backend *backend,
@@ -1472,10 +1871,16 @@ int mynah_backend_dev_alloc(const mynah_backend *backend, size_t n,
         set_error(error, error_capacity, "invalid device allocation size");
         return -1;
     }
-    if (backend->dev_alloc != NULL)
-        return backend->dev_alloc(backend->state, n, dev_ptr, error, error_capacity);
-    *dev_ptr = (float *)malloc(n * sizeof(float));
-    return *dev_ptr == NULL ? -1 : 0;
+    const double t0 = call_meter_begin();
+    int rc;
+    if (backend->dev_alloc != NULL) {
+        rc = backend->dev_alloc(backend->state, n, dev_ptr, error, error_capacity);
+    } else {
+        *dev_ptr = (float *)malloc(n * sizeof(float));
+        rc = *dev_ptr == NULL ? -1 : 0;
+    }
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 int mynah_backend_dev_alloc_bytes(const mynah_backend *backend, size_t bytes,
@@ -1486,19 +1891,28 @@ int mynah_backend_dev_alloc_bytes(const mynah_backend *backend, size_t bytes,
         return -1;
     }
     *dev_ptr = NULL;
-    if (backend->dev_alloc_bytes != NULL)
-        return backend->dev_alloc_bytes(backend->state, bytes, dev_ptr,
-                                        error, error_capacity);
-    *dev_ptr = malloc(bytes);
-    if (*dev_ptr == NULL)
-        set_error(error, error_capacity, "out of memory for byte device allocation");
-    return *dev_ptr == NULL ? -1 : 0;
+    const double t0 = call_meter_begin();
+    int rc;
+    if (backend->dev_alloc_bytes != NULL) {
+        rc = backend->dev_alloc_bytes(backend->state, bytes, dev_ptr, error,
+                                      error_capacity);
+    } else {
+        *dev_ptr = malloc(bytes);
+        if (*dev_ptr == NULL)
+            set_error(error, error_capacity,
+                      "out of memory for byte device allocation");
+        rc = *dev_ptr == NULL ? -1 : 0;
+    }
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 void mynah_backend_dev_free(const mynah_backend *backend, float *dev_ptr) {
     if (backend == NULL || dev_ptr == NULL) return;
-    if (backend->dev_free != NULL) { backend->dev_free(backend->state, dev_ptr); return; }
-    free(dev_ptr);
+    const double t0 = call_meter_begin();
+    if (backend->dev_free != NULL) backend->dev_free(backend->state, dev_ptr);
+    else free(dev_ptr);
+    call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
 }
 
 int mynah_backend_host_alloc(const mynah_backend *backend, size_t n,
@@ -1507,21 +1921,27 @@ int mynah_backend_host_alloc(const mynah_backend *backend, size_t n,
     if (backend == NULL || host_ptr == NULL || n == 0u ||
         n > SIZE_MAX / sizeof(float)) return -1;
     *host_ptr = NULL;
-    if (backend->host_alloc != NULL)
-        return backend->host_alloc(backend->state, n, host_ptr, error,
-                                   error_capacity);
-    *host_ptr = (float *)malloc(n * sizeof(float));
-    if (*host_ptr == NULL) set_error(error, error_capacity, "out of host staging memory");
-    return *host_ptr == NULL ? -1 : 0;
+    const double t0 = call_meter_begin();
+    int rc;
+    if (backend->host_alloc != NULL) {
+        rc = backend->host_alloc(backend->state, n, host_ptr, error,
+                                 error_capacity);
+    } else {
+        *host_ptr = (float *)malloc(n * sizeof(float));
+        if (*host_ptr == NULL)
+            set_error(error, error_capacity, "out of host staging memory");
+        rc = *host_ptr == NULL ? -1 : 0;
+    }
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 void mynah_backend_host_free(const mynah_backend *backend, float *host_ptr) {
     if (backend == NULL || host_ptr == NULL) return;
-    if (backend->host_free != NULL) {
-        backend->host_free(backend->state, host_ptr);
-        return;
-    }
-    free(host_ptr);
+    const double t0 = call_meter_begin();
+    if (backend->host_free != NULL) backend->host_free(backend->state, host_ptr);
+    else free(host_ptr);
+    call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
 }
 
 int mynah_backend_has_dev_ops(const mynah_backend *backend) {
@@ -1611,8 +2031,11 @@ int mynah_backend_kv_vmm_alloc(const mynah_backend *backend, size_t reserve,
                   "the backend has no virtual memory management path");
         return -1;
     }
-    return backend->kv_vmm_alloc(backend->state, reserve, map, dev_ptr, mapped,
-                                 error, error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->kv_vmm_alloc(backend->state, reserve, map, dev_ptr,
+                                         mapped, error, error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_VMM, t0);
+    return rc;
 }
 
 int mynah_backend_kv_vmm_resize(const mynah_backend *backend, void *dev_ptr,
@@ -1622,14 +2045,19 @@ int mynah_backend_kv_vmm_resize(const mynah_backend *backend, void *dev_ptr,
         set_error(error, error_capacity, "invalid virtual memory resize");
         return -1;
     }
-    return backend->kv_vmm_resize(backend->state, dev_ptr, want, mapped, error,
-                                  error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->kv_vmm_resize(backend->state, dev_ptr, want, mapped,
+                                          error, error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_VMM, t0);
+    return rc;
 }
 
 void mynah_backend_kv_vmm_free(const mynah_backend *backend, void *dev_ptr) {
     if (backend == NULL || dev_ptr == NULL) return;
     if (backend->kv_vmm_free != NULL) {
+        const double t0 = call_meter_begin();
         backend->kv_vmm_free(backend->state, dev_ptr);
+        call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
         return;
     }
     mynah_backend_dev_free(backend, (float *)dev_ptr);
@@ -1965,14 +2393,20 @@ int mynah_backend_gather_rows_to_batch_dev(
 int mynah_backend_zero_dev(const mynah_backend *bk, float *data, size_t n,
                            char *e, size_t ec) {
     if (bk == NULL || data == NULL || n == 0u) return -1;
-    if (bk->zero_dev != NULL)
-        return bk->zero_dev(bk->state, data, n, e, ec);
+    if (bk->zero_dev != NULL) {
+        const double t0 = call_meter_begin();
+        const int rc = bk->zero_dev(bk->state, data, n, e, ec);
+        call_meter_end(MYNAH_BACKEND_CALL_MEMSET, t0);
+        return rc;
+    }
     if (bk->device != MYNAH_TTS_DEVICE_CPU) return -1;
     if (n > SIZE_MAX / sizeof(float)) {
         set_error(e, ec, "device-zero size overflow");
         return -1;
     }
+    const double t0 = call_meter_begin();
     memset(data, 0, n * sizeof(float));
+    call_meter_end(MYNAH_BACKEND_CALL_MEMSET, t0);
     return 0;
 }
 

@@ -1,0 +1,51 @@
+== speed start 17:32:25
+== s-base [] procs=4 ready in 40 s, VRAM 24832 MiB
+  C640 aps 826 rtf95 0.666 ttfa95 113ms gap95 111ms st250 0 fail 0 | srv_cpu -1% cli_cpu 105% | gpu 269W sm 67% | dg_rerecords_total=1320
+  C768 aps 811 rtf95 0.849 ttfa95 136ms gap95 134ms st250 0 fail 0 | srv_cpu -1% cli_cpu 109% | gpu 277W sm 68% | dg_rerecords_total=1260
+  C896 aps 816 rtf95 0.912 ttfa95 155ms gap95 152ms st250 0 fail 0 | srv_cpu -1% cli_cpu 110% | gpu 276W sm 67% | dg_rerecords_total=1204
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B384  n=2        mean   31.1 ms  worst    31.8 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B512  n=1        mean   36.6 ms  worst    36.6 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B640  n=649      mean   46.6 ms  worst    93.4 ms  late  0.15%  per-slot   0.1 ms
+[SERVE]   B768  n=569      mean   55.6 ms  worst   392.5 ms  late  0.70%  per-slot   0.1 ms
+[SERVE] loop 293.7 s: step 72.3%  prefill-first 0.0% (10 slices, 5 done, 11.4 ms/slice)  prefill-cont 0.2% (1152 slices, 576 done, 0.5 ms/slice)  other 27.4% (blocked 0.3%)
+[SERVE] device wait 50.2% of loop (114917 syncs, 1.28 ms mean, 20.37 per iteration); host 49.4% (25.74 ms per iteration); blocked 0.3%
+== s-all [MYNAH_CANCEL_CHECK_EVERY=4 MYNAH_STREAM_OUT_WRITEV=1 MYNAH_DUP_CHECK_EPOCH=1 MYNAH_CUDA_DECODER_TABLE_PATCH=1 MYNAH_CUDA_ONESYNC_SUBSET=1 MYNAH_CUDA_DEFERRED_RELEASE=1 MYNAH_STREAM_DELIVER_THREADS=4 MYNAH_CUDA_PCM_DIRECT=1 MYNAH_CUDA_HIDDEN_LAZY=1 MYNAH_CUDA_KV_TABLE_CACHE=1 MYNAH_CUDA_DECODER_VALIDATE_ONCE=1] procs=4 ready in 40 s, VRAM 24832 MiB
+  C640 aps 937 rtf95 0.601 ttfa95 103ms gap95 101ms st250 0 fail 0 | srv_cpu -1% cli_cpu 121% | gpu 291W sm 75% | dg_rerecords_total=147 dg_table_patches_total=1283
+  C768 aps 804 rtf95 0.852 ttfa95 144ms gap95 141ms st250 0 fail 0 | srv_cpu -1% cli_cpu 113% | gpu 277W sm 67% | dg_table_patches_total=1265
+  C896 aps 908 rtf95 0.829 ttfa95 142ms gap95 140ms st250 0 fail 0 | srv_cpu -1% cli_cpu 122% | gpu 287W sm 73% | dg_table_patches_total=1298
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B384  n=2        mean   27.2 ms  worst    28.7 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B512  n=2        mean   32.7 ms  worst    33.6 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B640  n=613      mean   41.5 ms  worst    56.9 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B768  n=550      mean   53.6 ms  worst   390.0 ms  late  0.36%  per-slot   0.1 ms
+[SERVE] loop 290.3 s: step 71.9%  prefill-first 0.0% (14 slices, 7 done, 8.3 ms/slice)  prefill-cont 0.2% (1078 slices, 539 done, 0.4 ms/slice)  other 27.9% (blocked 0.3%)
+[SERVE] device wait 54.4% of loop (79143 syncs, 2.00 ms mean, 13.39 per iteration); host 45.2% (22.22 ms per iteration); blocked 0.3%
+== s-L6 [MYNAH_CUDA_DEFERRED_RELEASE=1] procs=4 ready in 33 s, VRAM 27274 MiB
+  C640 aps 798 rtf95 0.779 ttfa95 125ms gap95 121ms st250 0 fail 0 | srv_cpu -1% cli_cpu 107% | gpu 266W sm 67% | dg_rerecords_total=1273
+  C768 aps 770 rtf95 0.933 ttfa95 153ms gap95 151ms st250 0 fail 0 | srv_cpu -1% cli_cpu 104% | gpu 271W sm 65% | dg_rerecords_total=1232
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B384  n=1        mean   30.7 ms  worst    30.7 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B640  n=640      mean   47.1 ms  worst    80.3 ms  late  0.16%  per-slot   0.1 ms
+[SERVE]   B768  n=622      mean   52.8 ms  worst   494.2 ms  late  0.80%  per-slot   0.1 ms
+[SERVE] loop 200.4 s: step 70.2%  prefill-first 0.1% (6 slices, 3 done, 23.2 ms/slice)  prefill-cont 0.2% (818 slices, 409 done, 0.4 ms/slice)  other 29.6% (blocked 0.3%)
+[SERVE] device wait 48.9% of loop (67885 syncs, 1.44 ms mean, 17.39 per iteration); host 50.7% (26.06 ms per iteration); blocked 0.3%
+== s-L7L8 [MYNAH_CANCEL_CHECK_EVERY=4 MYNAH_STREAM_OUT_WRITEV=1] procs=4 ready in 33 s, VRAM 27274 MiB
+  C640 aps 800 rtf95 0.764 ttfa95 126ms gap95 124ms st250 0 fail 0 | srv_cpu -1% cli_cpu 101% | gpu 269W sm 67% | dg_rerecords_total=1262
+  C768 aps 810 rtf95 0.911 ttfa95 144ms gap95 138ms st250 0 fail 0 | srv_cpu -1% cli_cpu 105% | gpu 274W sm 68% | dg_rerecords_total=1284
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B640  n=656      mean   47.4 ms  worst    86.8 ms  late  0.15%  per-slot   0.1 ms
+[SERVE]   B768  n=643      mean   51.8 ms  worst   495.1 ms  late  0.47%  per-slot   0.1 ms
+[SERVE] loop 199.6 s: step 71.2%  prefill-first 0.1% (8 slices, 4 done, 14.4 ms/slice)  prefill-cont 0.2% (876 slices, 438 done, 0.4 ms/slice)  other 28.5% (blocked 0.3%)
+[SERVE] device wait 49.9% of loop (88965 syncs, 1.12 ms mean, 22.79 per iteration); host 49.8% (25.46 ms per iteration); blocked 0.3%
+== s-L10 [MYNAH_DUP_CHECK_EPOCH=1] procs=4 ready in 34 s, VRAM 27274 MiB
+Terminated
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+FileNotFoundError: [Errno 2] No such file or directory: '/root/res/s-L10/c640-summary.jsonl'
+  C768 aps 215 rtf95 0.119 ttfa95 24ms gap95 25ms st250 0 fail 0 | srv_cpu -1% cli_cpu 52% | gpu 220W sm 66%
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B640  n=522      mean   46.9 ms  worst   116.8 ms  late  0.19%  per-slot   0.1 ms
+[SERVE]   B768  n=75       mean   19.5 ms  worst   494.4 ms  late  1.33%  per-slot   0.0 ms
+[SERVE] loop 94.4 s: step 54.8%  prefill-first 0.1% (2 slices, 1 done, 68.8 ms/slice)  prefill-cont 0.1% (182 slices, 91 done, 0.4 ms/slice)  other 45.0% (blocked 0.2%)
+[SERVE] device wait 46.3% of loop (69836 syncs, 0.63 ms mean, 57.43 per iteration); host 53.5% (41.53 ms per iteration); blocked 0.2%

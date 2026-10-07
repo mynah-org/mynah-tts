@@ -39,6 +39,8 @@ static void usage(const char *program) {
     printf("      options: --speaker N --max-steps N --temperature F --topk N --seed N\n");
     printf("               --parallel --device cpu|metal|cuda --warmup N --runs N\n");
     printf("               --batch N (step N requests together, seeds N..N+batch-1)\n");
+    printf("               --stream (with --batch: every request streams through a\n");
+    printf("                 callback, as on the server; the WAV is the streamed PCM)\n");
     printf("  %s --clone-voice MODEL_DIR --reference REF.wav --output VOICE.safetensors --consent \"...\"\n", program);
     printf("  %s --gpu-self-test metal|cuda\n", program);
     printf("\nMagpie and PocketTTS run on the CPU path; Metal/CUDA are explicit build variants.\n");
@@ -76,6 +78,33 @@ static int parse_unsigned(const char *text, unsigned *out) {
     const unsigned long value = strtoul(text, &end, 10);
     if (errno != 0 || end == text || *end != '\0' || value > UINT_MAX) return -1;
     *out = (unsigned)value;
+    return 0;
+}
+
+/* --batch N --stream: one request's streamed PCM, appended chunk by chunk. */
+typedef struct {
+    float *samples;
+    size_t count;
+    size_t capacity;
+} stream_capture;
+
+static int stream_capture_append(const float *samples, size_t count, void *ud) {
+    stream_capture *out = (stream_capture *)ud;
+    if (count > SIZE_MAX - out->count) return 1;
+    const size_t required = out->count + count;
+    if (required > out->capacity) {
+        size_t capacity = out->capacity == 0u ? 24000u : out->capacity;
+        while (capacity < required) {
+            if (capacity > SIZE_MAX / 2u / sizeof(float)) return 1;
+            capacity *= 2u;
+        }
+        float *grown = (float *)realloc(out->samples, capacity * sizeof(*grown));
+        if (grown == NULL) return 1;
+        out->samples = grown;
+        out->capacity = capacity;
+    }
+    memcpy(out->samples + out->count, samples, count * sizeof(*samples));
+    out->count = required;
     return 0;
 }
 
@@ -230,6 +259,7 @@ static int synthesize(int argc, char **argv) {
     unsigned topk = 0;
     uint64_t seed = UINT64_C(42);
     unsigned batch = 1u;
+    int stream = 0;
     unsigned warmups = 0;
     unsigned runs = 1;
     int use_local = 1;
@@ -249,6 +279,7 @@ static int synthesize(int argc, char **argv) {
         else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &runs) == 0) {}
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc && parse_unsigned(argv[++i], &batch) == 0) {}
         else if (strcmp(argv[i], "--parallel") == 0) use_local = 0;
+        else if (strcmp(argv[i], "--stream") == 0) stream = 1;
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc &&
                  parse_device(argv[++i], &device) == 0) {}
         else if (argv[i][0] != '-' && model_dir == NULL) model_dir = argv[i];
@@ -384,6 +415,22 @@ static int synthesize(int argc, char **argv) {
         float *outs[64];
         size_t counts[64];
         char errors[64][256];
+        /* --stream: the same burst through the streaming decode (the decode
+         * gang, the quantum ramp, MYNAH_CUDA_DECODE_OVERLAP), which the
+         * offline sink never runs -- its rows are decoded once, at retire.
+         * Compare streamed WAVs with streamed WAVs: the chunked codec is not
+         * bit-identical to a one-shot decode of the whole sequence. */
+        mynah_graph_job stream_jobs[64];
+        stream_capture captured[64];
+        if (batch > 64u) {
+            fprintf(stderr, "--batch is limited to 64 here\n");
+            mynah_tts_model_close(model);
+            free(tokens);
+    free(segment_lengths);
+            return 1;
+        }
+        memset(stream_jobs, 0, sizeof(stream_jobs));
+        memset(captured, 0, sizeof(captured));
         for (unsigned b = 0; b < batch; ++b) {
             requests[b] = request;
             requests[b].seed = seed + b;
@@ -396,9 +443,25 @@ static int synthesize(int argc, char **argv) {
             jobs[b].error = errors[b];
             jobs[b].error_capacity = sizeof(errors[b]);
             jobs[b].result = 0;
+            stream_jobs[b].request = &requests[b];
+            stream_jobs[b].callback = stream_capture_append;
+            stream_jobs[b].user_data = &captured[b];
+            stream_jobs[b].chunk_samples = 4096u;
+            stream_jobs[b].error = errors[b];
+            stream_jobs[b].error_capacity = sizeof(errors[b]);
         }
         const double batch_start = now_seconds();
-        const int batch_result = mynah_tts_synthesize_batch(model, jobs, batch);
+        int batch_result = 0;
+        if (stream) {
+            batch_result = mynah_graph_synthesize_jobs(model, stream_jobs, batch);
+            for (unsigned b = 0; b < batch; ++b) {
+                jobs[b].result = stream_jobs[b].result;
+                outs[b] = captured[b].samples;   /* freed below like the offline PCM */
+                counts[b] = captured[b].count;
+            }
+        } else {
+            batch_result = mynah_tts_synthesize_batch(model, jobs, batch);
+        }
         const double batch_seconds = now_seconds() - batch_start;
         double audio_total = 0.0;
         int failures = 0;
@@ -422,8 +485,8 @@ static int synthesize(int argc, char **argv) {
             printf("batch job %u: seed=%llu %zu samples -> %s\n", b,
                    (unsigned long long)requests[b].seed, counts[b], path);
         }
-        printf("batch: requests=%u synth=%.3fs audio=%.3fs aggregate_RTF=%.3f\n",
-               batch, batch_seconds, audio_total,
+        printf("batch%s: requests=%u synth=%.3fs audio=%.3fs aggregate_RTF=%.3f\n",
+               stream ? " (streamed)" : "", batch, batch_seconds, audio_total,
                audio_total > 0.0 ? batch_seconds / audio_total : 0.0);
         for (unsigned b = 0; b < batch; ++b) mynah_tts_free_samples(outs[b]);
         mynah_tts_model_close(model);
@@ -588,6 +651,10 @@ int main(int argc, char **argv) {
         }
         if (mynah_tts_device_self_test(MYNAH_TTS_DEVICE_CPU, error, sizeof(error)) != 0) {
             fprintf(stderr, "CPU backend self-test failed: %s\n", error);
+            return 1;
+        }
+        if (mynah_engine_pocket_slot_fixed_self_test(error, sizeof(error)) != 0) {
+            fprintf(stderr, "%s\n", error);
             return 1;
         }
         /* This one had no caller anywhere in the tree. `census-test` claims to

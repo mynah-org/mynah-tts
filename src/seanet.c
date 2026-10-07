@@ -1423,6 +1423,11 @@ struct mynah_seanet_state {
     size_t arena_floats;
     float *work[3];
     size_t work_floats;
+    /* Something other than zeros was written into `arena` since it was last
+     * all zero (MYNAH_CTX_HOST_POOL): `_renew` clears it only then, so a state
+     * whose decoder ran on a device is renewed without touching it. */
+    int arena_dirty;
+    size_t up_scratch; /* the upsample's share of `arena` */
 };
 
 struct mynah_seanet_downsample {
@@ -1685,6 +1690,108 @@ static int sea_config_valid(const mynah_seanet_config *config, char *error,
     return 0;
 }
 
+/* Lays the ops and the work buffers over `arena`: everything `_create` does
+ * after allocating, shared with `_renew` so that a renewed state is built by
+ * the very same code.  `up_scratch` is the upsample's share of the arena. */
+static int sea_state_carve(mynah_seanet_state *state, size_t up_scratch,
+                           char *error, size_t error_capacity) {
+    size_t counted_ops = 0;
+    if (sea_build_ops(&state->config, state->max_encoder_frames, state->ops,
+                      &counted_ops, NULL, NULL, error, error_capacity) != 0 ||
+        counted_ops != state->n_ops) {
+        sea_set_error(error, error_capacity, "seanet: topology mismatch");
+        return -1;
+    }
+
+    float *cursor = state->arena;
+    size_t remaining = state->arena_floats;
+
+#define SEA_TAKE(N)                                  \
+    do {                                             \
+        if ((N) > remaining) {                       \
+            sea_set_error(error, error_capacity,     \
+                          "seanet: arena exhausted"); \
+            return -1;                               \
+        }                                            \
+        remaining -= (N);                            \
+    } while (0)
+
+    for (size_t i = 0; i < state->n_ops; ++i) {
+        sea_op *op = &state->ops[i];
+        if (op->kind == SEA_OP_CONV) {
+            const size_t need =
+                mynah_causal_conv1d_scratch(&op->conv_spec, op->in_len);
+            SEA_TAKE(need);
+            if (mynah_causal_conv1d_init(&op->conv, &op->conv_spec, op->in_len,
+                                         cursor, need, error,
+                                         error_capacity) != 0) {
+                return -1;
+            }
+            op->conv.quantize = state->config.quantize_conv;
+            cursor += need;
+        } else if (op->kind == SEA_OP_CONVTR) {
+            const size_t need =
+                mynah_causal_convtr1d_scratch(&op->convtr_spec, op->in_len);
+            SEA_TAKE(need);
+            if (mynah_causal_convtr1d_init(&op->convtr, &op->convtr_spec,
+                                           op->in_len, cursor, need, error,
+                                           error_capacity) != 0) {
+                return -1;
+            }
+            op->convtr.quantize = state->config.quantize_convtr;
+            cursor += need;
+        } else {
+            const size_t need1 =
+                mynah_causal_conv1d_scratch(&op->rb1_spec, op->in_len);
+            SEA_TAKE(need1);
+            if (mynah_causal_conv1d_init(&op->rb1, &op->rb1_spec, op->in_len,
+                                         cursor, need1, error,
+                                         error_capacity) != 0) {
+                return -1;
+            }
+            op->rb1.quantize = state->config.quantize_conv;
+            cursor += need1;
+            const size_t need2 =
+                mynah_causal_conv1d_scratch(&op->rb2_spec, op->in_len);
+            SEA_TAKE(need2);
+            if (mynah_causal_conv1d_init(&op->rb2, &op->rb2_spec, op->in_len,
+                                         cursor, need2, error,
+                                         error_capacity) != 0) {
+                return -1;
+            }
+            op->rb2.quantize = state->config.quantize_conv;
+            cursor += need2;
+        }
+    }
+
+    if (state->has_upsample) {
+        mynah_convtr1d_spec uspec;
+        uspec.in_channels = state->up_config.in_channels;
+        uspec.out_channels = state->up_config.out_channels;
+        uspec.kernel_size = state->up_config.stride * 2u;
+        uspec.stride = state->up_config.stride;
+        uspec.groups = state->up_config.groups;
+        SEA_TAKE(up_scratch);
+        if (mynah_causal_convtr1d_init(&state->upsample, &uspec,
+                                       state->max_latent_frames, cursor,
+                                       up_scratch,
+                                       error, error_capacity) != 0) {
+            return -1;
+        }
+        cursor += up_scratch;
+    }
+
+    for (size_t i = 0; i < 3u; ++i) {
+        SEA_TAKE(state->work_floats);
+        state->work[i] = cursor;
+        cursor += state->work_floats;
+    }
+
+#undef SEA_TAKE
+
+    return 0;
+}
+
 mynah_seanet_state *mynah_seanet_state_create(const mynah_seanet_config *config,
                                               const mynah_resample_config *up,
                                               size_t max_latent_frames,
@@ -1789,108 +1896,55 @@ mynah_seanet_state *mynah_seanet_state_create(const mynah_seanet_config *config,
         return NULL;
     }
     state->arena_floats = arena_floats;
+    state->up_scratch = up_scratch;
 
-    size_t counted_ops = 0;
-    if (sea_build_ops(&state->config, max_encoder_frames, state->ops,
-                      &counted_ops, NULL, NULL, error, error_capacity) != 0 ||
-        counted_ops != n_ops) {
-        sea_set_error(error, error_capacity, "seanet: topology mismatch");
+    if (sea_state_carve(state, up_scratch, error, error_capacity) != 0) {
         mynah_seanet_state_destroy(state);
         return NULL;
     }
-
-    float *cursor = state->arena;
-    size_t remaining = arena_floats;
-
-#define SEA_TAKE(N)                                  \
-    do {                                             \
-        if ((N) > remaining) {                       \
-            sea_set_error(error, error_capacity,     \
-                          "seanet: arena exhausted"); \
-            mynah_seanet_state_destroy(state);       \
-            return NULL;                             \
-        }                                            \
-        remaining -= (N);                            \
-    } while (0)
-
-    for (size_t i = 0; i < n_ops; ++i) {
-        sea_op *op = &state->ops[i];
-        if (op->kind == SEA_OP_CONV) {
-            const size_t need =
-                mynah_causal_conv1d_scratch(&op->conv_spec, op->in_len);
-            SEA_TAKE(need);
-            if (mynah_causal_conv1d_init(&op->conv, &op->conv_spec, op->in_len,
-                                         cursor, need, error,
-                                         error_capacity) != 0) {
-                mynah_seanet_state_destroy(state);
-                return NULL;
-            }
-            op->conv.quantize = state->config.quantize_conv;
-            cursor += need;
-        } else if (op->kind == SEA_OP_CONVTR) {
-            const size_t need =
-                mynah_causal_convtr1d_scratch(&op->convtr_spec, op->in_len);
-            SEA_TAKE(need);
-            if (mynah_causal_convtr1d_init(&op->convtr, &op->convtr_spec,
-                                           op->in_len, cursor, need, error,
-                                           error_capacity) != 0) {
-                mynah_seanet_state_destroy(state);
-                return NULL;
-            }
-            op->convtr.quantize = state->config.quantize_convtr;
-            cursor += need;
-        } else {
-            const size_t need1 =
-                mynah_causal_conv1d_scratch(&op->rb1_spec, op->in_len);
-            SEA_TAKE(need1);
-            if (mynah_causal_conv1d_init(&op->rb1, &op->rb1_spec, op->in_len,
-                                         cursor, need1, error,
-                                         error_capacity) != 0) {
-                mynah_seanet_state_destroy(state);
-                return NULL;
-            }
-            op->rb1.quantize = state->config.quantize_conv;
-            cursor += need1;
-            const size_t need2 =
-                mynah_causal_conv1d_scratch(&op->rb2_spec, op->in_len);
-            SEA_TAKE(need2);
-            if (mynah_causal_conv1d_init(&op->rb2, &op->rb2_spec, op->in_len,
-                                         cursor, need2, error,
-                                         error_capacity) != 0) {
-                mynah_seanet_state_destroy(state);
-                return NULL;
-            }
-            op->rb2.quantize = state->config.quantize_conv;
-            cursor += need2;
-        }
-    }
-
-    if (state->has_upsample) {
-        mynah_convtr1d_spec uspec;
-        uspec.in_channels = state->up_config.in_channels;
-        uspec.out_channels = state->up_config.out_channels;
-        uspec.kernel_size = state->up_config.stride * 2u;
-        uspec.stride = state->up_config.stride;
-        uspec.groups = state->up_config.groups;
-        SEA_TAKE(up_scratch);
-        if (mynah_causal_convtr1d_init(&state->upsample, &uspec,
-                                       max_latent_frames, cursor, up_scratch,
-                                       error, error_capacity) != 0) {
-            mynah_seanet_state_destroy(state);
-            return NULL;
-        }
-        cursor += up_scratch;
-    }
-
-    for (size_t i = 0; i < 3u; ++i) {
-        SEA_TAKE(max_elems);
-        state->work[i] = cursor;
-        cursor += max_elems;
-    }
-
-#undef SEA_TAKE
-
     return state;
+}
+
+int mynah_seanet_state_renew(mynah_seanet_state *state,
+                             const mynah_seanet_config *config,
+                             const mynah_resample_config *up,
+                             size_t max_latent_frames) {
+    if (state == NULL || config == NULL) return -1;
+    /* The state must have been built from exactly this description. */
+    const mynah_seanet_config *c = &state->config;
+    if (config->channels != c->channels || config->dimension != c->dimension ||
+        config->n_filters != c->n_filters ||
+        config->n_residual_layers != c->n_residual_layers ||
+        config->n_ratios != c->n_ratios || config->ratios == NULL ||
+        memcmp(config->ratios, c->ratios, c->n_ratios * sizeof(size_t)) != 0 ||
+        config->kernel_size != c->kernel_size ||
+        config->residual_kernel_size != c->residual_kernel_size ||
+        config->last_kernel_size != c->last_kernel_size ||
+        config->dilation_base != c->dilation_base ||
+        config->compress != c->compress ||
+        memcmp(&config->elu_alpha, &c->elu_alpha, sizeof(float)) != 0 ||
+        config->quantize_conv != c->quantize_conv ||
+        config->quantize_convtr != c->quantize_convtr ||
+        max_latent_frames != state->max_latent_frames ||
+        (up != NULL) != (state->has_upsample != 0) ||
+        (up != NULL && (up->stride != state->up_config.stride ||
+                        up->in_channels != state->up_config.in_channels ||
+                        up->out_channels != state->up_config.out_channels ||
+                        up->groups != state->up_config.groups)))
+        return -1;
+    /* A clean arena holds only zeros, which is what `_create`'s calloc gave. */
+    if (state->arena_dirty) {
+        memset(state->arena, 0, state->arena_floats * sizeof(float));
+        state->arena_dirty = 0;
+    }
+    /* The ops and the convolution structs are rebuilt by the code that built
+     * them, from the zeros `_create` started from. */
+    memset(state->ops, 0, state->n_ops * sizeof(*state->ops));
+    memset(&state->upsample, 0, sizeof(state->upsample));
+    memset(state->work, 0, sizeof(state->work));
+    state->position = 0;
+    char ignored[128];
+    return sea_state_carve(state, state->up_scratch, ignored, sizeof(ignored));
 }
 
 void mynah_seanet_state_destroy(mynah_seanet_state *state) {
@@ -1930,6 +1984,7 @@ int mynah_seanet_state_set_upsample_tail(mynah_seanet_state *state,
     size_t bytes = 0u;
     if (sea_mul(channels, tail_length, &count) != 0 ||
         sea_mul(count, sizeof(float), &bytes) != 0) return -1;
+    state->arena_dirty = 1;
     memcpy(state->upsample.partial, tail, bytes);
     return 0;
 }
@@ -2023,6 +2078,7 @@ int mynah_seanet_upsample(mynah_seanet_state *state,
     if (n_latent_frames == 0 || n_latent_frames > state->max_latent_frames) {
         return -1;
     }
+    state->arena_dirty = 1;
     return mynah_causal_convtr1d_apply(&state->upsample, weights, input,
                                        n_latent_frames, output);
 }
@@ -2038,6 +2094,7 @@ int mynah_seanet_decode(mynah_seanet_state *state,
         n_encoder_frames > state->max_encoder_frames) {
         return -1;
     }
+    state->arena_dirty = 1;
     const unsigned long long t_decode = sea_prof_now();
     const float alpha = state->config.elu_alpha;
     float *a = state->work[0];
@@ -2896,6 +2953,51 @@ int mynah_seanet_self_test(char *error, size_t error_capacity) {
                           "reset left the position counter at %zu",
                           mynah_seanet_state_position(many));
             goto decoder_done;
+        }
+
+        /* `_renew` (MYNAH_CTX_HOST_POOL): a state left mid-stream by a
+         * decode, renewed, decodes bit for bit what a new state decodes; a
+         * renew with other arguments refuses. */
+        {
+            mynah_seanet_state *fresh =
+                mynah_seanet_state_create(&config, &up, max_latent, local,
+                                          sizeof(local));
+            float *out_fresh = calloc(out_len, sizeof(float));
+            int failed = fresh == NULL || out_fresh == NULL ||
+                         mynah_seanet_decode(many, &dw, input, 2u, piece_out) != 0 ||
+                         mynah_seanet_state_renew(many, &config, &up,
+                                                  max_latent + 1u) == 0 ||
+                         mynah_seanet_state_renew(many, &config, NULL,
+                                                  max_latent) == 0 ||
+                         mynah_seanet_state_renew(many, &config, &up,
+                                                  max_latent) != 0 ||
+                         mynah_seanet_state_position(many) != 0u;
+            for (int pass = 0; pass < 2 && !failed; ++pass) {
+                mynah_seanet_state *s = pass == 0 ? fresh : many;
+                float *out = pass == 0 ? out_fresh : out_many;
+                for (size_t off = 0; off < enc_frames && !failed; off += 2u) {
+                    for (size_t c = 0; c < config.dimension; ++c) {
+                        memcpy(piece + c * 2u, input + c * enc_frames + off,
+                               2u * sizeof(float));
+                    }
+                    failed = mynah_seanet_decode(s, &dw, piece, 2u, piece_out) != 0;
+                    memcpy(out + off * hop, piece_out, 2u * hop * sizeof(float));
+                    mynah_seanet_state_advance(s, 1u);
+                }
+            }
+            if (!failed && memcmp(out_fresh, out_many, out_len * sizeof(float)) != 0)
+                failed = 2;
+            mynah_seanet_state_destroy(fresh);
+            free(out_fresh);
+            if (failed) {
+                sea_set_error(error, error_capacity,
+                              failed == 2 ? "seanet renew: a renewed state is not "
+                                            "bit-identical to a new one"
+                                          : "seanet renew failed or accepted "
+                                            "other arguments");
+                goto decoder_done;
+            }
+            mynah_seanet_state_reset(many);
         }
 
         /* Upsample: frame-by-frame must match the batched call. */

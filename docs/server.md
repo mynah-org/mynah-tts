@@ -39,7 +39,7 @@ label.
 | `--host ADDR` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose) |
 | `-w, --workers N` | connection workers (default 4) — see Concurrency |
 | `--max-batch N` | engine/CUDA microbatch width (Pocket default 8 at the server layer, capped by model metadata) |
-| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`; maximum 128 on CPU, 384 for Pocket on CUDA); does not widen one engine call |
+| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`; maximum 128 on CPU; for Pocket on CUDA the build's `ROW_CAP`, 384 by default, 1024 with `make cuda-server ROW_CAP=1024`); does not widen one engine call |
 | `--device cpu\|metal\|cuda` | backend, same rules as the CLI |
 | `--prefork W` | serve from W worker processes that share the loaded pack (pinned to their own core slice on Linux); the parent routes each connection to the least loaded worker. Several `-m` packs (one per language) imply it |
 | `--prefork-threads T` | thread-pool width per worker (default: allowed CPUs / W) |
@@ -302,6 +302,34 @@ Set decode precision with the same environment variable the CLI uses:
 ```bash
 MYNAH_QUANT=int8 ./build/cpu/mynah-tts-server -m models/magpie-v2607-pack
 ```
+
+### Open-file limit
+
+Every client stream holds one descriptor (its socket) for its whole life, so a
+server sized for N concurrent streams needs a little more than N descriptors.
+The usual soft limit is 1024, which stops a server at roughly 1000 streams.
+
+At start-up the server raises its soft limit to the hard limit (no privilege
+needed) and logs `open-file limit raised from A to B`. If the hard limit is
+still below what `--max-batch` needs, it prints a warning instead. When
+`accept()` runs out of descriptors anyway (`EMFILE`), the server does not stop:
+it logs `accept: Too many open files; backing off` at most once a second, waits
+20 ms and keeps accepting while the streams in flight close theirs.
+
+Only the hard limit has to be raised, and that is set by whatever starts the
+process:
+
+```bash
+ulimit -Hn                    # the hard limit this shell passes on
+ulimit -n 65536               # as root, or within the existing hard limit
+```
+
+| launcher | setting |
+|---|---|
+| systemd unit | `LimitNOFILE=65536` in `[Service]` |
+| `docker run` | `--ulimit nofile=65536:65536` |
+| Docker Compose | `ulimits: { nofile: { soft: 65536, hard: 65536 } }` under the service |
+| Kubernetes | no per-pod setting: the container inherits the container runtime's default (often 1048576, sometimes 1024); raise it in the runtime's configuration on the node |
 
 ## Errors
 

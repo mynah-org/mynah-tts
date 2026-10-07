@@ -1,0 +1,36 @@
+== chain1 start 16:08:12
+== e0-p1 [] procs=1 ready in 28 s, VRAM 30506 MiB
+  C640 aps 827 rtf95 0.794 ttfa95 137ms gap95 136ms st250 0 fail 0 | srv_cpu -1% cli_cpu 113% | gpu 261W sm 63%
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B384  n=e0-p4: server did not start
+[SERVE]   B639  n=10       mean   44.5 ms  worst    51.1 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B640  n=1182     mean   47.1 ms  worst   412.1 ms  late  0.08%  per-slot   0.1 ms
+[SERVE] a free slot found no work queued 1841 times; the loop spent 0.0% of wall blocked waiting for an arrival -- high here means the box is IDLE, not saturated
+[SERVE] loop 169.4 s: step 69.9%  prefill-first 0.1% (2 slices, 1 done, 55.9 ms/slice)  prefill-cont 0.2% (672 slices, 336 done, 0.4 ms/slice)  other 29.9% (blocked 0.3%)
+[SERVE] device wait 46.6% of loop (72997 syncs, 1.08 ms mean, 24.15 per iteration); host 53.2% (29.81 ms per iteration); blocked 0.3%
+= 1 frame(s) at 12.50 Hz)
+[SERVE]   B512  n=1        mean   37.3 ms  worst    37.3 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B640  n=1182     mean   47.1 ms  worst   412.1 ms  late  0.08%  per-slot   0.1 ms
+[SERVE] loop 169.4 s: step 69.9%  prefill-first 0.1% (2 slices, 1 done, 55.9 ms/slice)  prefill-cont 0.2% (672 slices, 336 done, 0.4 ms/slice)  other 29.9% (blocked 0.3%)
+[SERVE] device wait 46.6% of loop (72997 syncs, 1.08 ms mean, 24.15 per iteration); host 53.2% (29.81 ms per iteration); blocked 0.3%
+== e1-768 [] procs=4 ready in 34 s, VRAM 26974 MiB
+  C384 aps 723 rtf95 0.506 ttfa95 88ms gap95 86ms st250 0 fail 0 | srv_cpu -1% cli_cpu 89% | gpu 239W sm 58%
+  C512 aps 834 rtf95 0.648 ttfa95 106ms gap95 97ms st250 0 fail 0 | srv_cpu -1% cli_cpu 103% | gpu 266W sm 64%
+  C640 aps 877 rtf95 0.680 ttfa95 115ms gap95 114ms st250 0 fail 0 | srv_cpu -1% cli_cpu 108% | gpu 277W sm 66%
+  C768 aps 813 rtf95 0.950 ttfa95 156ms gap95 152ms st250 0 fail 0 | srv_cpu -1% cli_cpu 105% | gpu 267W sm 63%
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B384  n=1676     mean   32.5 ms  worst    43.6 ms  late  0.00%  per-slot   0.1 ms
+[SERVE]   B512  n=1413     mean   38.8 ms  worst   266.5 ms  late  0.14%  per-slot   0.1 ms
+[SERVE]   B640  n=1189     mean   46.5 ms  worst   334.6 ms  late  0.25%  per-slot   0.1 ms
+[SERVE]   B768  n=1051     mean   54.8 ms  worst   495.5 ms  late  0.29%  per-slot   0.1 ms
+[SERVE] loop 605.9 s: step 77.0%  prefill-first 0.0% (34 slices, 17 done, 3.7 ms/slice)  prefill-cont 0.3% (3424 slices, 1712 done, 0.5 ms/slice)  other 22.7% (blocked 0.3%)
+[SERVE] device wait 48.0% of loop (160168 syncs, 1.82 ms mean, 11.87 per iteration); host 51.7% (23.24 ms per iteration); blocked 0.3%
+== e1-384 [] procs=4 ready in 17 s, VRAM 19064 MiB
+Terminated
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+FileNotFoundError: [Errno 2] No such file or directory: '/root/res/e1-384/c384-summary.jsonl'
+[SERVE] step cost per width (deadline 80.0 ms = 1 frame(s) at 12.50 Hz)
+[SERVE]   B384  n=1689     mean   30.8 ms  worst   248.2 ms  late  0.06%  per-slot   0.1 ms
+[SERVE] loop 144.9 s: step 72.7%  prefill-first 0.1% (48 slices, 24 done, 2.7 ms/slice)  prefill-cont 0.3% (1008 slices, 504 done, 0.4 ms/slice)  other 26.9% (blocked 0.1%)
+[SERVE] device wait 46.2% of loop (53849 syncs, 1.24 ms mean, 15.16 per iteration); host 53.7% (21.88 ms per iteration); blocked 0.1%

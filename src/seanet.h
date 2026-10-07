@@ -217,6 +217,16 @@ mynah_seanet_state *mynah_seanet_state_create(const mynah_seanet_config *config,
                                               size_t error_capacity);
 void mynah_seanet_state_destroy(mynah_seanet_state *state);
 
+/* Makes a used state what `_create` with the same arguments returns, without
+ * allocating (MYNAH_CTX_HOST_POOL): the ops and the convolutions are rebuilt by
+ * `_create`'s own code over an arena that is all zero again (cleared only if
+ * something other than zeros was written into it).  -1, changing nothing,
+ * when the arguments are not the ones the state was built from. */
+int mynah_seanet_state_renew(mynah_seanet_state *state,
+                             const mynah_seanet_config *config,
+                             const mynah_resample_config *up,
+                             size_t max_latent_frames);
+
 /* Clears the ring buffers *and* the position counter. */
 void mynah_seanet_state_reset(mynah_seanet_state *state);
 

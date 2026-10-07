@@ -66,7 +66,7 @@ how many requests stream at once with every one faster than real time.
 
 | Model | Hardware | Backend | Streams | Stream RTF p95 | Audio-s per s | First audio p95 | Status |
 |---|---|---|---:|---:|---:|---:|---|
-| Pocket 24L | 1x NVIDIA L40S (48 GB) | CUDA | **384** | 0.488 | 740 | 87 ms | 2-min screen, current defaults; 384 is the build's row cap |
+| Pocket 24L | 1x NVIDIA L40S (48 GB) | CUDA | **1024** | 0.746 | 1283 | 106 ms | 2-min screen, `ROW_CAP=1024` build, large-row defaults ([cuda-serving](docs/cuda-serving.md#serving-loop-defaults-2026-10-07-and-large-row-serving)) |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | **320** | 0.855 | 338 | 146 ms | 2-min screen, current defaults |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 288 | 0.782 | 335 | 134 ms | 2-min screen, current defaults |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 160 | 0.855 | 184.5 | 155 ms | qualified, 2 x 30 min, WER checked |
@@ -81,11 +81,23 @@ fused layers, a fused SEANet decoder, one host sync per frame, a per-request
 device-memory diet and int8 backbone KV. Profiles with every setting and its
 measured effect: [`configs/perf/`](configs/perf/README.md).
 
-On the L40S, throughput stays at ~720-740 audio-s/s from C384 upwards, with
-the GPU at ~60% SM. One engine issues one batched step at a time, and on a GPU
-this large one step does not fill the SMs, so a bigger GPU raises per-stream
-headroom more than total throughput (see
-[performance](docs/performance.md#2026-10-04--pockettts-24l-on-cuda--one-nvidia-l40s-screen)).
+On an L40S the limit was the single scheduler thread, not the GPU. With the
+serving-loop defaults of 2026-10-07 (the eleven loop flags, then the
+host-context pool, step and decode overlap and fixed KV slots, all on by
+default on CUDA since the same day) one L40S holds C1024 for a
+30-minute soak at RTF p95 0.746, zero stalls, first audio p95 106 ms, ~1,400
+audio-s/s with the GPU 96 % busy; the eleven loop flags alone hold C768. The
+new defaults also make the L4 faster: C320 367 -> 382 audio-s/s, TTFA p95
+137 -> 121 ms. In a 4-vCPU
+affinity experiment (server pinned to 4 vCPUs) C1024 still held a 10-minute soak
+at RTF p95 0.752. The English 6-layer model holds C1536 at RTF p95 0.823 (~1,950
+audio-s/s) in a 30-minute soak. Per-GPU thresholds (L40S, RTX 6000 Ada, L4)
+and the host lessons:
+[performance](docs/performance.md#pocket-cuda-serving-thresholds-2026-10);
+how they are measured, and on which Vast.ai hosts: [benchmarking](docs/benchmarking.md).
+Copy-paste build, server and load-test commands:
+[large-row quick start](docs/cuda-serving.md#quick-start-large-row-serving).
+The story of how it got there: [blog post, from an L4 to C1024 on one L40S](blog/pocket-tts-l4-to-l40s-c1024.md).
 
 ### Pocket TTS on the CPU — what got it there
 
@@ -362,6 +374,9 @@ diverge from the streaming one.
   the Metal verdict, benchmarking your own machine
 - **[Serving Pocket TTS on a GPU](docs/cuda-serving.md)** — build, start,
   size, tune, monitor and qualify the CUDA server
+- **[Benchmarking](docs/benchmarking.md)** — the GPU serving screen: closed-loop
+  knees, NUMA pinning, thermal pre-check, audio-identity checks, reading the
+  serving profile
 - **[Serving profiles](configs/perf/README.md)** — the measured server
   configuration per host and engine, and the validator that enforces it
 - **[Quantization](docs/quantization.md)** — f16/int8/int4 trade-offs and how to

@@ -159,6 +159,11 @@ mynah_flow_head *mynah_flow_head_create(const mynah_flow_head_config *config,
                                         char *error, size_t error_capacity);
 void mynah_flow_head_destroy(mynah_flow_head *head);
 
+/* Makes a used head what `_create(config)` returns, without allocating
+ * (MYNAH_CTX_HOST_POOL). -1, changing nothing, for any other config. */
+int mynah_flow_head_renew(mynah_flow_head *head,
+                          const mynah_flow_head_config *config);
+
 const mynah_flow_head_config *mynah_flow_head_get_config(
     const mynah_flow_head *head);
 

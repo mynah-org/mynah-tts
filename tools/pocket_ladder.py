@@ -16,6 +16,12 @@ Two load shapes:
 Each level has a warmup window whose requests are discarded, then a
 measurement window. A request belongs to the window in which it was sent.
 
+Client capacity: one process holds one GIL, and at hundreds of streams it
+reads thousands of chunks per second. --client-procs N (closed mode) spreads
+the workers over N processes; every summary reports client_cpu_pct, the load
+generator's own CPU. Run the same level at N=1 and N=4: if throughput moves,
+the client was the ceiling.
+
 Output: <out>/<tag>-c<C>.jsonl (one record per request) and a summary JSON
 line per level on stdout and in <out>/<tag>-summary.jsonl.
 
@@ -37,6 +43,7 @@ import hashlib
 import http.client
 import json
 import math
+import multiprocessing
 import os
 import queue
 import random
@@ -391,6 +398,63 @@ def parse_metrics(text):
     return out
 
 
+def body_for(a, seed, i):
+    """The request with id i: a pure function of (--seed, i), so a request id
+    carries the same text, voice and seed whichever client process sends it."""
+    r = random.Random(seed * 1000003 + i)
+    kind, cid, text = pick_text(r, a.mix_w, a.pool)
+    # Drawn, not i % len: --save-every N on ids would otherwise keep
+    # only the voices whose index shares a factor with N.
+    voice = r.choice(a.voice_list) if a.voice_list else a.voice
+    return kind, cid, {"model": "pocket", "input": text, "voice": voice,
+                       "response_format": "pcm", "stream": True,
+                       "seed": (seed * 7919 + i) % 1000000}
+
+
+def send_one(a, seed, i):
+    """One request without audio capture, finished into its record."""
+    kind, cid, body = body_for(a, seed, i)
+    r, chunks = one_request(a.host, a.port, body, a.bytes_per_s, a.timeout)
+    r["id"] = i
+    finish_record(r, chunks, a.bytes_per_s, kind)
+    if a.annotate:
+        r["corpus_id"] = cid
+        r["text"] = body["input"]
+        r["voice"] = body["voice"]
+        r["seed"] = body["seed"]
+    return r
+
+
+def closed_shard(a, conc, seed, shard, nshards, t_end, out_q):
+    """A client process of --client-procs: `conc` closed-loop workers sending
+    request ids shard+1, shard+1+nshards, ... until t_end (time.monotonic is
+    one clock for every process of the host). Puts (records, max_active,
+    cpu_s) on out_q. Each process has its own interpreter and GIL, which is
+    the point: one process reading thousands of chunks per second on
+    hundreds of threads can become the ceiling it is meant to measure."""
+    rec = Recorder()
+    seq = [0]
+    seq_lock = threading.Lock()
+    cpu0 = sum(os.times()[:2])
+
+    def worker():
+        while time.monotonic() < t_end:
+            with seq_lock:
+                i = seq[0] * nshards + shard + 1
+                seq[0] += 1
+            rec.enter()
+            rec.leave(send_one(a, seed, i))
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(conc)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=max(1.0, t_end - time.monotonic() + a.timeout))
+    with rec.lock:
+        records = list(rec.records)
+    out_q.put((records, rec.max_active, sum(os.times()[:2]) - cpu0))
+
+
 def run_level(a, conc, seed):
     rng = random.Random(seed)
     rec = Recorder()
@@ -400,16 +464,8 @@ def run_level(a, conc, seed):
     t_end = t_meas + a.duration
     req_seq = [0]
     seq_lock = threading.Lock()
-
-    def body_for(i):
-        r = random.Random(seed * 1000003 + i)
-        kind, cid, text = pick_text(r, a.mix_w, a.pool)
-        # Drawn, not i % len: --save-every N on ids would otherwise keep
-        # only the voices whose index shares a factor with N.
-        voice = r.choice(a.voice_list) if a.voice_list else a.voice
-        return kind, cid, {"model": "pocket", "input": text, "voice": voice,
-                           "response_format": "pcm", "stream": True,
-                           "seed": (seed * 7919 + i) % 1000000}
+    cpu0 = sum(os.times()[:2])
+    shards = []
 
     def next_id():
         with seq_lock:
@@ -417,7 +473,7 @@ def run_level(a, conc, seed):
             return req_seq[0]
 
     def do_one(i):
-        kind, cid, body = body_for(i)
+        kind, cid, body = body_for(a, seed, i)
         keep = [] if saver is not None and saver.wants(i) else None
         rec.enter()
         r, chunks = one_request(a.host, a.port, body, a.bytes_per_s, a.timeout,
@@ -442,7 +498,17 @@ def run_level(a, conc, seed):
 
     threads = []
     rejected_client = [0]
-    if a.mode == "closed":
+    if a.mode == "closed" and a.client_procs > 1:
+        ctx = multiprocessing.get_context("spawn")
+        out_q = ctx.Queue()
+        n = min(a.client_procs, conc)
+        for k in range(n):
+            share = conc // n + (1 if k < conc % n else 0)
+            p = ctx.Process(target=closed_shard,
+                            args=(a, share, seed, k, n, t_end, out_q), daemon=True)
+            p.start()
+            shards.append(p)
+    elif a.mode == "closed":
         def worker():
             while time.monotonic() < t_end:
                 do_one(next_id())
@@ -487,6 +553,19 @@ def run_level(a, conc, seed):
     m0 = parse_metrics(fetch(a.host, a.port, "/metrics"))
     for th in threads:
         th.join(timeout=max(1.0, t_end - time.monotonic() + a.timeout))
+    client_cpu_s = sum(os.times()[:2]) - cpu0
+    for _ in shards:
+        try:
+            recs, max_active, cpu_s = out_q.get(
+                timeout=max(1.0, t_end - time.monotonic() + a.timeout + 30.0))
+        except queue.Empty:
+            print("client shard did not report", file=sys.stderr)
+            continue
+        rec.records.extend(recs)
+        rec.max_active += max_active
+        client_cpu_s += cpu_s
+    for p in shards:
+        p.join(timeout=10.0)
     m1 = parse_metrics(fetch(a.host, a.port, "/metrics"))
     stop.set()
     t_last = time.monotonic()
@@ -542,6 +621,11 @@ def run_level(a, conc, seed):
         "gpu_power_mean_w": (sum(g["power_w"] for g in gpu_m) / len(gpu_m)) if gpu_m else None,
         "gpu_sm_mhz_min": min((g["sm_mhz"] for g in gpu_m), default=None),
         "server_cpu_pct_mean": (sum(p["cpu_pct"] for p in proc_m) / len(proc_m)) if proc_m else None,
+        # The load generator's own CPU over the level (warmup included), all
+        # client processes summed: near 100 x client_procs it is the client,
+        # not the server, that sets the ceiling.
+        "client_procs": max(1, len(shards)),
+        "client_cpu_pct": 100.0 * client_cpu_s / max(1e-6, t_last - t_start),
         "server_rss_max_mib": max((p["rss_mib"] for p in proc_m), default=None),
         "metrics_delta": delta,
         "wall_s": t_last - t_start,
@@ -595,7 +679,12 @@ def main():
                     help="save every Nth request id (default 1: all)")
     ap.add_argument("--save-max-mb", type=float, default=4000.0,
                     help="stop saving once this many MB were written")
+    ap.add_argument("--client-procs", type=int, default=1,
+                    help="closed mode: spread the C workers over N client "
+                         "processes (one GIL each); default 1")
     a = ap.parse_args()
+    if a.client_procs > 1 and (a.mode != "closed" or a.save_audio):
+        ap.error("--client-procs > 1 needs --mode closed and no --save-audio")
     a.bytes_per_s = a.sample_rate * 2
     a.voice_list = [v.strip() for v in a.voices.split(",") if v.strip()]
     a.corpus_sha256 = None

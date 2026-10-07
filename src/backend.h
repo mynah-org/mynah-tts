@@ -5,6 +5,7 @@
 #include "seanet.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 typedef struct mynah_backend mynah_backend;
 typedef struct mynah_backend_decoder mynah_backend_decoder;
@@ -289,6 +290,39 @@ int mynah_backend_download(const mynah_backend *backend, const float *dev_ptr,
 int mynah_backend_sync(const mynah_backend *backend,
                        char *error, size_t error_capacity);
 
+/* MYNAH_SERVE_PROFILE only: wall seconds the calling process has spent inside
+ * mynah_backend_sync on a device backend, and how many such calls it made.
+ * On a GPU that is the time the host waited for queued device work, so
+ * (loop wall - this) is the host's own share of a serving loop: the time the
+ * GPU sat idle unless something else was queued. Both are zero when the
+ * profile is off or the backend has no sync. */
+void mynah_backend_sync_profile(double *wait_seconds, unsigned long long *calls);
+
+/* The same accounting per call site (file:line), printed by the serving
+ * loop's profile: which sync points a step actually runs, how often, and how
+ * long each one waits. Every mynah_backend_sync() call records its site
+ * through the macro below; the function itself is still a real symbol. */
+int mynah_backend_sync_at(const mynah_backend *backend, char *error,
+                          size_t error_capacity, const char *file, int line);
+void mynah_backend_sync_profile_print(FILE *out, unsigned long long iterations);
+/* Zero the totals and the per-site table: the serving loop calls it when it
+ * starts, so start-up work (slot pool fill, graph capture, warm-up) is not
+ * charged to the loop's shares. */
+void mynah_backend_sync_profile_reset(void);
+/* Profile runs only: the serving loop says when it has device work queued
+ * that it means to hide (MYNAH_CUDA_STEP_OVERLAP, MYNAH_CUDA_DECODE_OVERLAP).
+ * A sync reached meanwhile waits for that work as well; the per-site table
+ * counts those calls ("while queued") and this returns their total. */
+void mynah_backend_sync_note_queued(int queued);
+unsigned long long mynah_backend_sync_queued_calls(void);
+/* MYNAH_CUDA_PINGPONG: the same count restricted to STREAM syncs (fence waits
+ * excluded). A stream sync reached while the other group's item is queued
+ * waits for that item too, which is the hidden serialization the ping-pong
+ * profile line reports. */
+unsigned long long mynah_backend_stream_sync_queued_calls(void);
+#define mynah_backend_sync(backend, error, error_capacity) \
+    mynah_backend_sync_at((backend), (error), (error_capacity), __FILE__, __LINE__)
+
 /* Begin a resident GPU command batch.  CPU backends are no-ops.  The batch is
  * submitted by mynah_backend_sync at the next CPU-visible boundary. */
 int mynah_backend_batch_begin(const mynah_backend *backend,
@@ -313,6 +347,44 @@ void mynah_backend_graph_abort(const mynah_backend *backend, size_t key,
                                const void *identity);
 void mynah_backend_graph_forget(const mynah_backend *backend,
                                 const void *identity);
+/* MYNAH_CUDA_DEFERRED_RELEASE.  graph_forget for an identity whose owner is
+ * parked, not freed: skips graph_forget's device sync when forgetting
+ * destroys nothing (falls back to graph_forget otherwise).  A fence is a
+ * point in the backend's stream recorded now and waited on (then released)
+ * later; NULL when the backend has none, in which case the caller syncs. */
+void mynah_backend_graph_forget_parked(const mynah_backend *backend,
+                                       const void *identity);
+void *mynah_backend_fence_record(const mynah_backend *backend);
+void mynah_backend_fence_wait(const mynah_backend *backend, void *fence);
+/* MYNAH_CUDA_DECODE_OVERLAP.  fence_query: 1 when the work before the fence
+ * is complete (or the backend cannot tell, so the caller goes on to wait), 0
+ * while it is still running, -1 on a device error; the fence stays owned by
+ * the caller.  fence_sync waits for it and releases it like fence_wait, but
+ * reports a device error and is a profiled sync site (the same accounting as
+ * mynah_backend_sync, so "device wait" stays comparable).  Without a fence
+ * it falls back to a stream sync. */
+int mynah_backend_fence_query(const mynah_backend *backend, void *fence);
+/* MYNAH_CUDA_PINGPONG.  Selects which copy (0 or 1) of the backend's
+ * host-pinned codec-gang staging and of its decoder batch-graph cache the
+ * following calls use.  Two groups of rows with work queued at the same time
+ * on the one stream must not share a pinned block the host rewrites while
+ * the other group's copy out of it is still queued.  Lane 0 is the only lane
+ * unless a serving loop selects another; a backend without lanes ignores it. */
+void mynah_backend_set_lane(const mynah_backend *backend, int lane);
+/* MYNAH_CUDA_PINGPONG.  Clears a recoverable device error left pending by a
+ * call that already failed and was handled (an allocation the caller fell
+ * back from), so the next launch check of the ping-pong paths does not report
+ * it as its own.  Returns 1 with its text in `error` when one was pending, 0
+ * otherwise (always 0 without a device).  An unrecoverable error stays: the
+ * next device call still reports it. */
+int mynah_backend_lane_clear_error(const mynah_backend *backend, char *error,
+                                   size_t error_capacity);
+int mynah_backend_fence_sync_at(const mynah_backend *backend, void *fence,
+                                char *error, size_t error_capacity,
+                                const char *file, int line);
+#define mynah_backend_fence_sync(backend, fence, error, error_capacity)          \
+    mynah_backend_fence_sync_at((backend), (fence), (error), (error_capacity), \
+                                __FILE__, __LINE__)
 
 /* Pocket flow-head descriptor. The engine owns the host weights and device
  * scratch; CUDA owns cached weight copies and the chained kernels. No CUDA or
@@ -744,5 +816,58 @@ void mynah_backend_host_free(const mynah_backend *backend, float *host_ptr);
  * projection that stops taking the matvec path is otherwise silent. */
 const char *mynah_cpu_matvec_mode(size_t rows, size_t input_width,
                                   size_t output_width, const char **why);
+
+/* Driver-call meter (MYNAH_SERVE_PROFILE): while a thread has a meter set,
+ * the allocation, free, VMM, zeroing and fence-wait entry points above count
+ * their calls and time on it, by kind.  Thread-local; NULL (the default) costs
+ * one thread-local load per call.  `_set` installs `meter` (or clears it with
+ * NULL) and returns the previous one.  MALLOC: dev/host alloc, decoder open;
+ * FREE: dev/host free, VMM free, decoder close; VMM: VMM alloc and resize
+ * (map/unmap); MEMSET: device zeroing and decoder reset (stream-ordered on
+ * CUDA); EVENT: fence wait (blocks until the fence's work is done). */
+enum {
+    MYNAH_BACKEND_CALL_MALLOC,
+    MYNAH_BACKEND_CALL_FREE,
+    MYNAH_BACKEND_CALL_VMM,
+    MYNAH_BACKEND_CALL_MEMSET,
+    MYNAH_BACKEND_CALL_EVENT,
+    MYNAH_BACKEND_CALL_KINDS
+};
+typedef struct {
+    unsigned long count[MYNAH_BACKEND_CALL_KINDS];
+    double seconds[MYNAH_BACKEND_CALL_KINDS];
+} mynah_backend_call_meter;
+mynah_backend_call_meter *mynah_backend_call_meter_set(
+    mynah_backend_call_meter *meter);
+const char *mynah_backend_call_kind_name(int kind);
+
+/* How many fixed-size per-row device buffers of `buffer_bytes` fit next to
+ * everything else: `free_bytes` (free device memory now) minus a reserve of
+ * max(4 GiB, total / 5) for weights still to upload, graphs, scratch and
+ * transients, plus `rows * per_row_other_bytes` for the other per-row
+ * buffers.  Writes the reserve and min(rows, budget / buffer_bytes); 0 rows
+ * when nothing fits.  Pure, saturating arithmetic; -1 only on bad arguments. */
+int mynah_backend_fixed_buffers_plan(size_t free_bytes, size_t total_bytes,
+                                     size_t rows, size_t buffer_bytes,
+                                     size_t per_row_other_bytes,
+                                     size_t *reserve_bytes, size_t *fit_rows);
+
+/* The same buffers re-planned once the start-up warm-ups are done
+ * (MYNAH_CUDA_SLOT_FIXED): `free_bytes` is measured after them, with every
+ * start-up buffer that should not stay already released, and `live` buffers
+ * already exist (their bytes are not in `free_bytes`). The margin is
+ * max(2 GiB, total / 16) -- growth copies, scratch growth, transients --
+ * plus (rows - sets_made) * per_row_other_bytes for the request sets not
+ * made yet, plus `extra_bytes` (what spare buffers take beyond
+ * `buffer_bytes` each). Writes the margin and
+ * cap = min(rows + spares, live + (free - margin) / buffer_bytes).
+ * Pure, saturating arithmetic; -1 only on bad arguments. */
+int mynah_backend_fixed_buffers_refit(size_t free_bytes, size_t total_bytes,
+                                      size_t rows, size_t spares,
+                                      size_t sets_made, size_t live,
+                                      size_t buffer_bytes,
+                                      size_t per_row_other_bytes,
+                                      size_t extra_bytes, size_t *margin_bytes,
+                                      size_t *cap);
 
 #endif

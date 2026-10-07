@@ -88,4 +88,43 @@ void stream_out_get_stats(stream_out *out, stream_out_stats *stats);
 /* Drops the producer's reference. `out` must not be touched afterwards. */
 void stream_out_release(stream_out *out);
 
+/* ---- MYNAH_STREAM_DELIVER_THREADS: enqueue off the producer's thread ----
+ *
+ * The producer side of a stream_out -- PCM16 conversion, the ring memcpy and
+ * the condvar signal that wakes the writer -- is cheap per chunk and costly
+ * per step: at hundreds of streams it is that many conversions, mutexes and
+ * futex wakes in a row on the one scheduler thread. These calls move it onto
+ * a small pool of helper threads.
+ *
+ * Ordering is the whole contract. Every stream is pinned to ONE helper for
+ * its lifetime (round-robin at stream_out_start), and a helper serves its
+ * queue strictly FIFO, so a stream's chunks reach its ring in the order they
+ * were handed over and its end-of-stream comes after the last of them. Two
+ * streams on different helpers are unordered relative to each other, which
+ * nothing can observe: they are different sockets.
+ *
+ * Nothing changes on the wire. The helper runs the same stream_out_enqueue()
+ * on the same samples, and the writer is untouched. */
+
+/* Starts `threads` helpers. Call once, before any stream starts; 0 leaves
+ * delivery synchronous. Returns 0, or -1 having started none. */
+int stream_out_deliver_init(unsigned threads);
+
+/* Non-zero once stream_out_deliver_init() started helpers. */
+int stream_out_deliver_enabled(void);
+
+/* The asynchronous stream_out_enqueue(): copies `count` floats into the
+ * stream's helper queue and returns, so the caller's buffer is free again on
+ * return. Returns -1 only for a stream already known to be dead or when the
+ * copy cannot be allocated (the stream is then marked failed, as an
+ * out-of-memory enqueue would). A queue overflow is discovered by the helper
+ * and surfaces through stream_out_failed(), one step later than before. */
+int stream_out_deliver(stream_out *out, const float *samples, size_t count);
+
+/* stream_out_finish() + stream_out_release(), queued behind the stream's
+ * pending chunks on its helper. Takes the producer's reference: `out` must not
+ * be touched afterwards. Never fails -- the request for it lives inside the
+ * stream_out, so it needs no allocation. */
+void stream_out_deliver_close(stream_out *out);
+
 #endif

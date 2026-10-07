@@ -90,6 +90,12 @@ typedef struct {
     unsigned long long kv_vmm_reserved_bytes;
     unsigned long long kv_vmm_maps;
     unsigned long long kv_vmm_unmaps;
+    /* Cross-request decoder graph, same width and a different gang: served
+     * by a host re-record of the graph (counted in decoder_graph_replays
+     * too), or by MYNAH_CUDA_DECODER_TABLE_PATCH's per-decoder column
+     * scatter (likewise).  Appended so older fields keep their offsets. */
+    unsigned long long decoder_graph_rerecords;
+    unsigned long long decoder_graph_table_patches;
 } mynah_tts_backend_metrics;
 
 typedef struct {
@@ -185,6 +191,14 @@ void mynah_tts_model_close(mynah_tts_model *model);
  * it, one worker at a time and slower. Returns 0, or -1 with `error` set. */
 int mynah_tts_model_warm(mynah_tts_model *model, char *error,
                          size_t error_capacity);
+/* Start-up progress, told by a server that runs its own warm-ups before it
+ * takes traffic. `serving` 0: the start-up warm-ups that size device memory
+ * (graph capture walks) are done and more start-up work may follow; 1: the
+ * start-up is over and traffic follows. Process-wide, cheap, and optional:
+ * an engine that sizes a device pool from free memory re-plans it at its
+ * next admission after each call (MYNAH_CUDA_SLOT_FIXED); everything else
+ * ignores it, and a caller that never calls it keeps the load-time plan. */
+void mynah_tts_startup_mark(int serving);
 int mynah_tts_model_get_info(const mynah_tts_model *model,
                              mynah_tts_model_info *info);
 int mynah_tts_model_get_backend_metrics(const mynah_tts_model *model,
