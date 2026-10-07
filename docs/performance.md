@@ -1172,6 +1172,10 @@ passes; levels below the first one listed were not measured. These are
 2-minute screens, not 30-minute qualifications. GPU busy is the `dmon sm` time
 share (the share of time at least one kernel runs), power its mean.
 
+**Hosts.** All boxes were rented on Vast.ai; which ones were used, which were
+rejected and why (clock, NUMA, driver, thermals), plus a checklist for picking
+one, are in [benchmarking.md, "Hosts used for the 2026-10 screens"](benchmarking.md#hosts-used-for-the-2026-10-screens-vastai).
+
 **Configurations.**
 
 | name | environment | what it does |
@@ -1181,7 +1185,7 @@ share (the share of time at least one kernel runs), power its mean.
 | + A1a | `MYNAH_CTX_HOST_POOL=1` | a finished request's host-side state is renewed for the next admission instead of rebuilt. A fresh context built while the server is full cost ~13 ms; a pooled one 0.1-0.3 ms |
 | + L13 | `MYNAH_CUDA_STEP_OVERLAP=1` | the next AR step is queued before retire, admission and cancellation run |
 | + L13b | L13 + `MYNAH_CUDA_DECODE_OVERLAP=1` | the gang decode of step k also runs under AR step k+1 |
-| + L13d | L13b + `MYNAH_CUDA_FIRST_FRAME_FIRST=1` (measured with `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=3000`) | new streams' first frames are decoded and delivered first, as their own small gang: 50-70 ms lower TTFA p95 for ~1-2 % throughput |
+| + L13d | L13b + `MYNAH_CUDA_FIRST_FRAME_FIRST=1` (the runs also set `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=3000`, inactive without `MYNAH_CUDA_FAST_FIRST_CHUNK=1`, which was not set) | new streams' first frames are decoded and delivered first, as their own small gang: 50-70 ms lower TTFA p95 for ~1-2 % throughput |
 | combined | 11 flags + A1a + L13 + L13b + L13d | the recommended large-row configuration, with A1b |
 | + A1b | `MYNAH_CUDA_SLOT_FIXED=1` | pooled request sets keep a backbone KV of a fixed size, so an admission makes no `cudaFree` / `cudaMalloc` |
 | L26 | `MYNAH_CUDA_PINGPONG=2` | two half-batches in one engine, one's host work under the other's GPU work (experimental) |
@@ -1234,9 +1238,15 @@ RTF p95 / TTFA p95.
 - **Combined** is +31 % over the 11 flags at C1024 with the lowest TTFA at
   that load, the GPU 87-90 % busy at 327-332 W of 350 W. The 2026-10-07 re-run on the defaults tree reproduces the 2026-10-06
   numbers within 1 audio-s/s; VRAM at the end of the run: 39 GB.
-- **On 4 vCPUs** the combined configuration loses only ~3 % throughput
-  (host time ~31 ms per iteration). Projected from the C512-C768 slope: C896
-  ≈ 0.77, C1024 ≈ 0.88, i.e. borderline; not measured.
+- **On 4 vCPUs** (the server confined with `taskset` to two physical cores
+  and their SMT siblings of the GPU's node, so L19 picked 1 delivery helper)
+  the combined configuration loses only ~3 % throughput against the full
+  host: C512 1131 / 0.445, C640 1135 / 0.549, C768 1126 / 0.658, GPU 87 %
+  busy, host time ~31 ms per iteration. Projected from the C512-C768 slope:
+  C896 ≈ 0.77, C1024 ≈ 0.88, i.e. borderline; not measured. For a small-core
+  host this means: four vCPUs carry C768 with margin and C896 most likely;
+  for C1024 measure first, and use fast cores, since one scheduler thread
+  sets the pace (A1b, which cuts admission host time, was not in this run).
 - **A1b v2 is the best L40S result:** C1024 at 1283 audio-s/s and RTF p95
   0.746, +11 % over the combined configuration without it, with headroom left
   under the gate. Sizing after the start-up warm-up, F = 384 positions, growth
@@ -1325,4 +1335,5 @@ decides the result as much as the GPU does.
   `[CTX] cuda_backbone` is in milliseconds, use `MYNAH_CUDA_SLOT_FIXED=1`
   (A1b).
 - **Four vCPUs are enough** for C768 on an L40S with the combined
-  configuration (-3 % against the full host).
+  configuration (-3 % against the full host; C896 projected at RTF p95
+  ≈ 0.77, C1024 ≈ 0.88, borderline).

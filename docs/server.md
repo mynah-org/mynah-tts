@@ -39,7 +39,7 @@ label.
 | `--host ADDR` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose) |
 | `-w, --workers N` | connection workers (default 4) — see Concurrency |
 | `--max-batch N` | engine/CUDA microbatch width (Pocket default 8 at the server layer, capped by model metadata) |
-| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`; maximum 128 on CPU, 384 for Pocket on CUDA); does not widen one engine call |
+| `--max-inflight N` | resident continuous-service slots (default follows `--max-batch`; maximum 128 on CPU; for Pocket on CUDA the build's `ROW_CAP`, 384 by default, 1024 with `make cuda-server ROW_CAP=1024`); does not widen one engine call |
 | `--device cpu\|metal\|cuda` | backend, same rules as the CLI |
 | `--prefork W` | serve from W worker processes that share the loaded pack (pinned to their own core slice on Linux); the parent routes each connection to the least loaded worker. Several `-m` packs (one per language) imply it |
 | `--prefork-threads T` | thread-pool width per worker (default: allowed CPUs / W) |

@@ -73,6 +73,59 @@ are fine. `0x20` / `0x40` (thermal slowdown) or `0x8` (hardware slowdown), or a
 clock far below the GPU's boost clock, mean the box is not comparable: move to
 another one.
 
+### Hosts used for the 2026-10 screens (Vast.ai)
+
+Every GPU number of [performance.md](performance.md#pocket-cuda-serving-thresholds-2026-10)
+was measured on rented Vast.ai instances. The same GPU model on two hosts gave
+results up to 2x apart, so this is the list of boxes, what was found on each
+and whether its numbers are used. "—" means not recorded.
+
+| dates | GPU | CPU | clock / CPU quota | NUMA | driver | verdict |
+|---|---|---|---|---|---|---|
+| 2026-09-28 .. 10-04 | NVIDIA L4 24 GB | AMD EPYC 7702 | 128 threads; the server needs ~1.3-1.4 cores | — | 595 | the L4 results: C160 (24L) and C256 (6L) qualified, then the 2026-10-02/04 screens |
+| 2026-10-05 | NVIDIA L40S 48 GB | AMD EPYC 9534 | ~3.7 GHz | — | — | fastest host seen; the "pre-flag base, faster host" row and the first package A/B. Not kept |
+| 2026-10-06 | NVIDIA L40S 48 GB | Intel Xeon Platinum 8558 | capped at 2.1 GHz (`powersave`, no turbo, not changeable in the container); 23-CPU quota; load average ~31 (noisy neighbours) | 4 nodes, GPU on node 2 | — | **rejected**: host time per iteration ~2x the others (61 ms unpinned, 46 ms pinned). Only its relative A/B (package +10 %) is quoted |
+| 2026-10-06 | NVIDIA L40S 48 GB | AMD Threadripper 7960X | — | 1 node | — | **rejected**: the GPU throttled to 630 MHz at 87 °C under load |
+| 2026-10-06 | NVIDIA L4 24 GB | AMD EPYC 7702 | — | 1 node | — | normal: 72 W power cap, ~1250 MHz under `sw_power_cap` at 74-80 °C (expected for an L4). The L4 regression check and the leave-one-out |
+| 2026-10-06 .. 07 | NVIDIA L40S 48 GB | Intel Xeon Gold 6430 | cores ≤ 2.6 GHz | 2 nodes, GPU on node 1 (CPUs 32-63, 96-127) | 575 | **the reference box**: server pinned to node 1, clients on node 0; GPU 70 °C at its full 2520 MHz. Every L40S row of the 2026-10-06/07 tables, the 4-vCPU run included |
+| 2026-10 (briefly) | NVIDIA RTX 6000 Ada 48 GB | AMD Threadripper PRO 5955WX | — | — | — | used briefly; the GPU ran hot (85-88 °C). No numbers quoted |
+| 2026-10-07 | NVIDIA RTX 6000 Ada 48 GB | AMD EPYC 7C13 | up to ~3.1 GHz; 20-CPU quota | 1 node | 565 | usable, GPU 61-73 °C, but every admission paid 11-30 ms of `cudaFree` / `cudaMalloc` on the device: the finding that led to A1b (`MYNAH_CUDA_SLOT_FIXED`). The RTX 6000 Ada table |
+
+A separate 2026-10-04 L40S screen ran on a 4-vCPU host outside this list; its
+flat ~740 audio-s/s is explained in performance.md.
+
+### Picking a Vast.ai box for these benches
+
+The serving loop on a 48 GB GPU is bound by one host thread, so choose the host
+as carefully as the GPU, then run the 3-minute check before anything else.
+
+1. **CPU single-core clock.** Prefer ≥ 3 GHz sustained (a recent EPYC or
+   Threadripper). Check the model, the governor and the real clock (`lscpu`,
+   `cpufreq/scaling_governor`); a 2.1 GHz `powersave` host doubled the host
+   time per iteration. A container cannot change the governor.
+2. **NUMA.** One node is simplest. On two or more, read the GPU's node from
+   `nvidia-smi topo -m` and pin the server there (`taskset`).
+3. **CPU quota.** `nproc` and `/sys/fs/cgroup/cpu.max`: four usable vCPUs are
+   enough for the server; give the load generator its own cores (another
+   NUMA node, or another machine).
+4. **Driver.** Record it. The 565 host paid milliseconds per admission in
+   `cudaFree`, the 575 host < 1 ms; if `[CTX] cuda_backbone` is in
+   milliseconds, use `MYNAH_CUDA_SLOT_FIXED=1` or move.
+5. **GPU temperature, idle and under load.** Idle should be cool (the good
+   boxes sat at ~30-40 °C); under load the L40S reference ran at 70 °C at full
+   clock. 85 °C and above, or throttle reasons `0x20` / `0x40` / `0x8`, mean
+   move on.
+6. **PCIe link.** `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=csv`
+   under load (links train down when idle). x16 is expected; an x8 link was not
+   measured here, so record it if you get one.
+7. **Reliability and neighbours.** Prefer a verified host with a high
+   reliability score; check `uptime` (a load average far above your own work
+   means other tenants) and that the instance survives a stop / start if you
+   need it twice.
+8. **Run the 3-minute check first** (`THERM=1 ... DUR=180`, above). It catches
+   throttling, a slow host and a missing open-file limit before an A/B costs an
+   hour.
+
 ## 3. Audio identity
 
 A change that claims "same audio" is checked where batch composition is
@@ -138,7 +191,11 @@ TAG=combined LEVELS="768 896 1024" PRE=640 PROCS=4 DUR=120 \
 ```
 
 (the combined configuration of performance.md, run on an NVIDIA L40S on
-2026-10-06; the 11 default flags need no variable):
+2026-10-06; the 11 default flags need no variable). `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US`
+is listed because the measured runs set it, but it only acts together with
+`MYNAH_CUDA_FAST_FIRST_CHUNK=1`, which none of them set: the late wait was
+inactive, and leaving the variable out gives the same configuration.
+Output:
 
 ```
 == combined [MYNAH_CTX_HOST_POOL=1 ...] procs=4 pin=32-63,96-127 ready in 170 s, VRAM 27395 MiB

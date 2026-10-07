@@ -2439,12 +2439,20 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                         "graphs and codec-gang staging only ever cover widths up to "
                         "%zu\n",
                         max_batch, share_b, slot_capacity, width_b, mib, width_b);
-                if (getenv("MYNAH_CUDA_DEFERRED_RELEASE") == NULL ||
+                /* Deferred release is on by default; KV growth without a drain
+                 * comes from MYNAH_CUDA_SLOT_FIXED (or MYNAH_CUDA_KV_VMM with bf16
+                 * KV). Warn only when one of them is missing. */
+                const char *dr = getenv("MYNAH_CUDA_DEFERRED_RELEASE");
+                if (dr != NULL && strcmp(dr, "0") == 0)
+                    fprintf(stderr,
+                            "driver: ping-pong with MYNAH_CUDA_DEFERRED_RELEASE=0: every "
+                            "context release drains the device, the other group's work "
+                            "included\n");
+                if (getenv("MYNAH_CUDA_SLOT_FIXED") == NULL &&
                     getenv("MYNAH_CUDA_KV_VMM") == NULL)
                     fprintf(stderr,
-                            "driver: ping-pong expects MYNAH_CUDA_DEFERRED_RELEASE=1 and "
-                            "MYNAH_CUDA_KV_VMM=1: without them a context release or a KV "
-                            "growth drains the device, the other group's work included\n");
+                            "driver: ping-pong without MYNAH_CUDA_SLOT_FIXED=1: a KV growth "
+                            "may drain the device, the other group's work included\n");
             }
         }
     }

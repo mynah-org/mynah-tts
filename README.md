@@ -84,10 +84,14 @@ measured effect: [`configs/perf/`](configs/perf/README.md).
 On an L40S the limit was the single scheduler thread, not the GPU. With the
 serving-loop defaults of 2026-10-07 and a few opt-in variables (host-context
 pool, step and decode overlap, fixed KV slots) one L40S holds C1024 at RTF p95
-0.746 with the GPU 95 % busy; the defaults alone hold C768. Per-GPU thresholds
-(L40S, RTX 6000 Ada, L4) and the host lessons:
+0.746 with the GPU 95 % busy; the defaults alone hold C768. A small host is
+enough: with the server confined to 4 vCPUs the same L40S held C768 at RTF p95
+0.658, ~3 % below the whole host. Per-GPU thresholds (L40S, RTX 6000 Ada, L4)
+and the host lessons:
 [performance](docs/performance.md#pocket-cuda-serving-thresholds-2026-10);
-how they are measured: [benchmarking](docs/benchmarking.md).
+how they are measured, and on which Vast.ai hosts: [benchmarking](docs/benchmarking.md).
+Copy-paste build, server and load-test commands:
+[large-row quick start](docs/cuda-serving.md#quick-start-large-row-serving).
 
 ### Pocket TTS on the CPU — what got it there
 
