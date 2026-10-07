@@ -560,7 +560,19 @@ at a small RTF cost that stays far inside the gate. The identity checks passed o
 each with an `=0` rollback (`MYNAH_CUDA_STEP_OVERLAP=0` turns the whole overlap off). Ping-pong
 stays experimental.
 
-**L4 above C384: (pending)**
+With a `ROW_CAP=512` build and everything on, the L4 knee moved up one step:
+
+```text
+C320   RTF p95 0.775   382 audio-s/s   comfortable
+C352   RTF p95 0.846   383 audio-s/s   passes the 0.88 gate
+C384   RTF p95 0.914   385 audio-s/s   over the gate, still 0 stalls
+C416   RTF p95 0.999   379 audio-s/s   realtime edge, 0 stalls
+C448   RTF p95 1.057   386 audio-s/s   overloaded, 16,954 stalls
+```
+
+The old defaults stopped around C320; the new ones pass C352. Throughput sits at ~380-385
+audio-s/s with the GPU 98-99 % busy at its 72 W cap: on this card the limit really is the GPU now,
+which is what an L4 should look like.
 
 ## Try it / links
 

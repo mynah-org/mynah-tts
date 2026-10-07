@@ -1379,6 +1379,24 @@ On this evidence the five became default on CUDA serving (`=0` rollbacks in
 [cuda-serving.md](cuda-serving.md#serving-flag-reference)). The L4 above C320
 with them has not been screened yet.
 
+
+With a `ROW_CAP=512` build and every new default on (2-minute levels):
+
+| C | audio-s/s | RTF p95 | TTFA p95 | stalls@250 | GPU busy | reading |
+|---|---|---|---|---|---|---|
+| 320 | 382 | 0.775 | 121 ms | 0 | 98 % | comfortable |
+| **352** | **383** | **0.846** | **132 ms** | **0** | 98 % | passes the gate |
+| 384 | 385 | 0.914 | 143 ms | 0 | 98 % | over the gate |
+| 416 | 379 | 0.999 | 155 ms | 0 | 99 % | realtime edge |
+| 448 | 386 | 1.057 | 164 ms | 16,954 | 99 % | overloaded |
+
+With **no environment variables set** (the new defaults), the same L4 gives the same audio as the
+explicit-variable run (CLI 32/32, streaming 32/32) and the same speed: C288 381 / 0.706 / 112 ms,
+C320 385 / 0.768 / 120 ms.
+
+The L4 knee moves from ~C320 to **C352**; throughput plateaus at ~380-385 audio-s/s at the
+72 W power cap (GPU-bound).
+
 ### Host lessons
 
 On a GPU this fast the serving loop is bound by one host thread, so the host
