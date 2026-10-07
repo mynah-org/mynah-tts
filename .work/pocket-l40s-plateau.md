@@ -402,6 +402,53 @@ Evidence (summaries and job scripts only): `.work/l40s-2026-10-05/` (`res/*.log`
   (clients killed mid-stream). They are not errors.
 
 
+## 3i. 2026-10-07, Vast.ai RTX 6000 Ada (EPYC 7C13, 1 NUMA node, driver 565): admission device cost, A1b
+
+**Box.** The GPU is cool: 32 °C idle, 61-73 °C under load, no throttling. The EPYC 7C13 runs up to ~3.1 GHz on a
+20-CPU quota.
+
+**Symptom.** Every arm was 2-3× slower than on the L40S of 10-06, including the 11 flags alone: C768 at 376 audio-s/s
+and RTF p95 2.08.
+- `[CTX]` shows `cuda_backbone` (the device half of a context) at **11-30 ms per admission**, vs < 1 ms on the L40S.
+- `MYNAH_CUDA_KV_VMM=1` is ignored with the default int8 KV, so it is not a fix.
+
+**Cause** (A1b meter): parked backbone KV caches that do not fit are freed and re-allocated, and **`cudaFree`
+synchronizes the device behind the queued work**. Mallocs alone cost ~0.4 ms per context. On this host and driver,
+each sync costs a whole step.
+
+**Defaults tree (`8184035`).** With no env set, its output is identical to the explicit-env combined tree: CLI 32/32,
+`--stream` 32/32, server C1 157/157. L19 picked 4 helpers for 21 usable CPUs. The CUDA build with the stale-error
+fix compiles.
+
+**A1b `MYNAH_CUDA_SLOT_FIXED=1` (`3730104`).**
+- Identity in every arm (off, off, on, on + zero KV, on with 64 positions): CLI 32/32, `--stream` 32/32, server C1
+  166/166 (141/141 at 64 positions).
+- At C1, `cuda_backbone` drops from 26.9-29.8 ms to 0.05 ms.
+
+| C | defaults + A1a | defaults + A1a + A1b |
+|---|---|---|
+| 768 | 455 / 1.714 / 668 ms, 89,847 stalls, 65 % SM | **1114 / 0.708 ✓ / 101 ms**, 135 stalls, 85 % SM |
+| 896 | 505 / 1.972 / 659 ms | 925 / 1.159 / 202 ms, 8,071 stalls |
+
+- Host per iteration: 62-100 ms without A1b, **23 ms** with it.
+- **At C896 A1b runs out of VRAM.** 833 fixed rows are live and 467 requests went "over-cap" (fallback with
+  frees): the start-up graph warm-up takes ~40 GB, and 896 × 25.5 MiB does not fit next to it on 48 GB.
+- **Next for A1b:**
+  - size F from the real request-length distribution (~320-384 positions; 25 s of audio is ~312 frames) and grow
+    only long requests;
+  - compute the cap after the graph warm-up;
+  - grow without a device-wide sync (stream-ordered alloc, or keep a small reserve of spare caches);
+  - then an A/B on an L40S at 1024 rows (VRAM is tighter there) and on an L4.
+
+**Ping-pong (`8699af7`).**
+- Identity is good: CLI 32/32, split 32/32, `--stream` split, server C1 166/166. Stale errors are now cleared and
+  logged.
+- The speed arm at 1024 rows hit **real VRAM exhaustion** (48.5/49.1 GB): the graph warm-up up to 1024 rows already
+  takes ~45 GB without ping-pong.
+- Next: run it with `--max-batch` ~768, or capture fewer widths when ping-pong is on.
+
+Evidence: `.work/l40s-2026-10-07/res-ada-ee.tgz` (summary logs only) and its `jobs/`.
+
 ## 3e. Next session (start here)
 
 **2026-10-07: the 11 flags are defaults (close-out, 3c).** L6, L7, L8, L10, L11, L12, L19, L20, L21, L22 and L24
