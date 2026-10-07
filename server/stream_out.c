@@ -105,14 +105,14 @@ static size_t stream_out_capacity_bytes(void) {
     return (size_t)v;
 }
 
-/* MYNAH_STREAM_OUT_WRITEV=1: send each HTTP chunk (size line, PCM, CRLF) with
- * one writev() instead of three send() calls. The bytes on the wire are the
- * same; what changes is a third of the syscalls on the writer threads, which
- * at hundreds of streams share the host's cores with the scheduler thread.
- * Off by default until measured. */
+/* MYNAH_STREAM_OUT_WRITEV (default on; =0 is the rollback): send each HTTP
+ * chunk (size line, PCM, CRLF) with one writev() instead of three send()
+ * calls. The bytes on the wire are the same; what changes is a third of the
+ * syscalls on the writer threads, which at hundreds of streams share the
+ * host's cores with the scheduler thread. */
 static int stream_out_one_write(void) {
     const char *e = getenv("MYNAH_STREAM_OUT_WRITEV");
-    return e != NULL && strcmp(e, "1") == 0;
+    return e == NULL || strcmp(e, "0") != 0;
 }
 
 static int stream_out_timeout_ms(void) {

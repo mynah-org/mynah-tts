@@ -2017,19 +2017,21 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
      * retirement in the previous iteration makes likely (closed-loop clients
      * send their next request as the previous one completes). */
     /* MYNAH_CANCEL_CHECK_EVERY=N: ask the sink about cancellation every N
-     * iterations instead of every one (default 1). On the HTTP server each ask
-     * is a mutex plus a poll() per live stream, all on the scheduler thread
-     * while the GPU has nothing queued; at hundreds of streams that is a
-     * measurable share of each step. A disconnect is then noticed up to N-1
-     * frames later; a stream whose writer already saw the hangup still ends
-     * on its own, because it has nowhere to write. */
-    unsigned long long cancel_every = 1ull;
+     * iterations instead of every one (default 4; =0 or =1 is the rollback to
+     * a check per iteration, an invalid value keeps the default). On
+     * the HTTP server each ask is a mutex plus a poll() per live stream, all
+     * on the scheduler thread while the GPU has nothing queued; at hundreds of
+     * streams that is a measurable share of each step. A disconnect is then
+     * noticed up to N-1 frames later; a stream whose writer already saw the
+     * hangup still ends on its own, because it has nowhere to write. */
+    unsigned long long cancel_every = 4ull;
     {
         const char *e = getenv("MYNAH_CANCEL_CHECK_EVERY");
         if (e != NULL && *e != '\0') {
             char *end = NULL;
             const unsigned long v = strtoul(e, &end, 10);
-            if (end != e && *end == '\0' && v >= 1ul && v <= 1000ul) cancel_every = v;
+            if (end != e && *end == '\0' && v <= 1000ul)
+                cancel_every = v == 0ul ? 1ull : v;
         }
     }
     const int late_admit = sink->wait_arrival != NULL;

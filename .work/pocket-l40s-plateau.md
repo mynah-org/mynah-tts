@@ -404,6 +404,29 @@ Evidence (summaries and job scripts only): `.work/l40s-2026-10-05/` (`res/*.log`
 
 ## 3e. Next session (start here)
 
+**2026-10-07: the 11 flags are defaults (close-out, 3c).** L6, L7, L8, L10, L11, L12, L19, L20, L21, L22 and L24
+are on without any variable; each keeps a `=0` rollback and its start-up line now says "(default)" and how to roll
+back. Details that differ from a plain flip:
+- L7 defaults to 4; `=0` and `=1` both mean a check every iteration.
+- L19 is automatic on CUDA serving only: 1 helper for <= 4 usable cpus, 2 for <= 8, 4 above
+  (`mynah_usable_cpus`: affinity mask, capped by the cgroup `cpu.max` / v1 quota, rounded up); `N` overrides. CPU
+  serving keeps delivery on the scheduler unless `N` is set. Note it counts a full stream queue one step later (3c
+  listed that as a visible change; accepted).
+- L20 is on for the CUDA backend; the CPU backend keeps malloc'd ranges unless `=1`. L10's start-up line prints on
+  CUDA only (the check itself is on everywhere).
+- L11 follows `MYNAH_CUDA_DECODER_GRAPH_REUSE`; the "needs graph reuse" warning only for an explicit `=1`.
+- L13 / L13b / L13d and A1a stay opt-in pending a soak. L40S C1024: 11 flags 880 audio-s/s / RTF p95 1.076;
+  + A1a 1112 / 0.852; + L13 + L13b + L13d + A1a 1157 / 0.846, TTFA p95 130 ms.
+- `backend_cuda.cu`: `ce()` clears a non-sticky `cudaErrorMemoryAllocation` from the runtime's last-error record
+  (peek first, so a sticky error is never touched), plus the bare fallbacks (cuBLASLt workspace, decoder-graph
+  done event, deferred-release fence event, the matmul graph instantiate) and a guard in `cuda_vmm_check`. This is
+  the fix for the stale "device-owned row step rc=-1: CUDA: out of memory" read in
+  `pocket-l40s-1024-host-profile.md` (A1a). Not compiled locally (no nvcc): build it on the next box first.
+- Verified on the Mac: `make`, `make server`, `make test-c`, CPU server concurrency gate (pocket-en) PASS; GCC 16 /
+  Clang `-fsyntax-only -DMYNAH_ENABLE_CUDA -DMYNAH_ROW_CAP=1024u` on the changed C files clean.
+- Next box: one defaults-only knee (no flag variables) to confirm the flip, and re-run the async-admission arm to
+  see the OOM line gone.
+
 1. Soak at the threshold: 10 minutes at C832 (between the solid C768 and the borderline C896), all flags vs base.
 2. Remove one flag at a time from the package, the doubtful ones first (L6, then L19, L21), 2-minute levels at
    C768 and C896: what carries the gain? Then mark each item WIN / KO here and in `PLAN.md`, and apply the

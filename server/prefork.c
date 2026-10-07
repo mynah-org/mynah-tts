@@ -498,6 +498,22 @@ static int cpus_allowed(int *out, int max) {
     }
 }
 
+int mynah_usable_cpus(void) {
+    int ids[CPU_LIST_MAX];
+    int n = cpus_allowed(ids, CPU_LIST_MAX);
+    if (n < 1) n = 1;
+    double budget = 0.0;
+    if (cgroup_cpu_budget(&budget, NULL, 0) && budget > 0.0) {
+        /* A quota of 2.5 cpus lets 3 threads run part of the time: round
+         * up, so a fractional quota never reads as less than it allows. */
+        int quota = (int)budget;
+        if ((double)quota < budget) ++quota;
+        if (quota < 1) quota = 1;
+        if (quota < n) n = quota;
+    }
+    return n;
+}
+
 #if defined(__linux__)
 static long sysfs_cpu_long(int cpu, const char *leaf) {
     char path[160];

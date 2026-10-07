@@ -250,9 +250,10 @@ static struct {
 } g_prof_stats;
 /* Scheduler thread only. */
 static unsigned long long g_iter_index;
-/* MYNAH_STREAM_DELIVER_THREADS=N: stream chunks are handed to N helper threads
- * (stream_out.h) instead of being enqueued on the scheduler thread. Set once
- * before the scheduler starts. */
+/* MYNAH_STREAM_DELIVER_THREADS (CUDA default: 1-4 helpers by usable cpus;
+ * =0 rolls back): stream chunks are handed to helper threads (stream_out.h)
+ * instead of being enqueued on the scheduler thread. Set once before the
+ * scheduler starts. */
 static int g_stream_deliver;
 static double g_iter_t[PH_COUNT];
 
@@ -3332,20 +3333,43 @@ int main(int argc, char **argv) {
 
     /* Before the scheduler, so no stream exists yet that could be pinned to
      * a helper that is not there. A failure to start is not fatal: delivery
-     * simply stays on the scheduler thread, which is today's behaviour. */
+     * simply stays on the scheduler thread.
+     *
+     * Default on for CUDA serving (`=0` is the rollback, an explicit N
+     * overrides): the helper count follows the cpus this process may use
+     * (mynah_usable_cpus: affinity mask, capped by a cgroup quota), 1 helper
+     * up to 4 cpus, 2 up to 8, 4 above. The CPU engine keeps delivery on the
+     * scheduler unless N is given: its steps are compute, not host overhead,
+     * and its cores are already the pool's. */
     {
         const char *e = getenv("MYNAH_STREAM_DELIVER_THREADS");
         char *end = NULL;
-        const long n = (e != NULL && e[0] != '\0') ? strtol(e, &end, 10) : 0;
-        if (e != NULL && e[0] != '\0' && (end == e || *end != '\0' || n < 0 || n > 64)) {
+        const int given = e != NULL && e[0] != '\0';
+        long n = given ? strtol(e, &end, 10) : 0;
+        int automatic = 0;
+        if (given && (end == e || *end != '\0' || n < 0 || n > 64)) {
             fprintf(stderr, "ignoring MYNAH_STREAM_DELIVER_THREADS=%s "
                             "(want 0..64)\n", e);
-        } else if (n > 0) {
+            n = 0;
+        } else if (!given && g_cuda_serving) {
+            const int cpus = mynah_usable_cpus();
+            n = cpus <= 4 ? 1 : cpus <= 8 ? 2 : 4;
+            automatic = 1;
+        }
+        if (n > 0) {
             if (stream_out_deliver_init((unsigned)n) == 0 &&
                 stream_out_deliver_enabled()) {
                 g_stream_deliver = 1;
-                fprintf(stderr, "stream delivery off the scheduler: on, %ld "
-                                "helper threads (MYNAH_STREAM_DELIVER_THREADS)\n", n);
+                if (automatic)
+                    fprintf(stderr, "stream delivery off the scheduler: on by "
+                                    "default, %ld helper threads for %d usable "
+                                    "cpus (MYNAH_STREAM_DELIVER_THREADS=N "
+                                    "overrides, =0 to roll back)\n",
+                            n, mynah_usable_cpus());
+                else
+                    fprintf(stderr, "stream delivery off the scheduler: on, %ld "
+                                    "helper threads (MYNAH_STREAM_DELIVER_THREADS; "
+                                    "=0 to roll back)\n", n);
             } else {
                 fprintf(stderr, "cannot start stream delivery helpers; "
                                 "delivering on the scheduler thread\n");

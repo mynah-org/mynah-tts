@@ -213,7 +213,9 @@ The defaults are the tuned configuration. Together, the 2026-10-02 rows of the
 table below (shared voice through one sync) read on the L4 24L 60-s knees:
 stream RTF p95 0.594-0.607 at C208 and 0.710-0.714 at C256, ~303-306 audio-s/s,
 TTFA p95 ~102-104 ms at C208, against 1.03 with stalls at C208 for the
-2026-09-28 defaults. **Set only the required
+2026-09-28 defaults. The 2026-10-07 rows (deferred release through the
+delivery helpers) take the serial host loop off the critical path: see
+"Serving-loop defaults" below. **Set only the required
 variable**; everything else exists to roll a change back while debugging, or
 to opt into something that is not a production default. A profile run refuses
 to start if a "must be absent" variable is set.
@@ -270,6 +272,17 @@ never read it.
 | `MYNAH_CUDA_DECODER_FUSE` | `0` | SEANet gang decoder: ELU, causal window, residual add, conv bias and the transposed-conv fold folded into the kernels that read them; `MYNAH_CUDA_DECODER_FUSE_BIAS=0` keeps only the bias on the old path | 36 -> 20 elementwise launches per step; bit-identical audio |
 | `MYNAH_CUDA_ONE_SYNC` | `0` | condition, backbone, EOS and flow head share one stream sync per batched frame | 3 fewer syncs per frame; same audio |
 | `MYNAH_POCKET_VOICE_CACHE` | `0` (or `all` / `startup` to preload) | voice prompts cached on first use | |
+| `MYNAH_CUDA_DEFERRED_RELEASE` | `0` | a finished stream's GPU set is parked behind a stream event, waited on when it is reused, instead of a full stream drain at release | 2026-10-07 serving-loop default; ~2.4 fewer syncs per step |
+| `MYNAH_CANCEL_CHECK_EVERY` | `1` (or `0`) | client disconnects are polled every 4 steps instead of every step (`N` sets the interval); a disconnect is noticed up to 3 frames later | 2026-10-07 serving-loop default |
+| `MYNAH_STREAM_OUT_WRITEV` | `0` | each HTTP chunk leaves in one `writev()` instead of three `send()` calls; same bytes on the wire | 2026-10-07 serving-loop default |
+| `MYNAH_DUP_CHECK_EPOCH` | `0` | the "same request twice in a step" check stamps each request once per step instead of comparing every pair | 2026-10-07 serving-loop default |
+| `MYNAH_CUDA_DECODER_TABLE_PATCH` | `0` | a decoder gang change of the same width patches the graph's pointer tables instead of re-recording the decoder (follows `MYNAH_CUDA_DECODER_GRAPH_REUSE`) | decoder re-records per level ~2,000 -> 1-160 |
+| `MYNAH_CUDA_ONESYNC_SUBSET` | `0` | when some rows end in a step, the survivors reuse the chained flow-head pass instead of a second one | 2026-10-07 serving-loop default; ~1.6 fewer syncs per step |
+| `MYNAH_STREAM_DELIVER_THREADS` | `0` (or `N` helpers) | PCM conversion and hand-off to each stream's writer run on helper threads, not the scheduler thread. CUDA serving only; the count follows the cpus the process may use (affinity mask, capped by a cgroup cpu quota): 1 helper up to 4 cpus, 2 up to 8, 4 above. A full stream queue is found by the helper, one step later | largest single loss when removed on the L4 |
+| `MYNAH_CUDA_PCM_DIRECT` | `0` | the gang decode lends each stream a reusable PCM buffer and copies a frame once, straight from the pinned gang rows (the CPU backend keeps the old path unless set to `1`) | 2026-10-07 serving-loop default |
+| `MYNAH_CUDA_HIDDEN_LAZY` | `0` | one-sync steps keep the backbone output on the GPU (finite check on the GPU, host copy only on demand) | 2026-10-07 serving-loop default |
+| `MYNAH_CUDA_KV_TABLE_CACHE` | `0` | the attention-cache pointer tables are rewritten only for rows whose cache changed | 2026-10-07 serving-loop default |
+| `MYNAH_CUDA_DECODER_VALIDATE_ONCE` | `0` | the decoder gang's topology check runs once per decoder, then by compatibility class | 2026-10-07 serving-loop default |
 
 ### Opt-in (off by default; not production settings)
 
@@ -284,6 +297,31 @@ never read it.
 | `MYNAH_CUDA_FAST_MATH=1` | FP16 GEMMs | not qualified |
 | `MYNAH_CUDA_CODEC_BATCH=1` | older multi-row codec path | fails the waveform parity gate |
 | `MYNAH_CUDA_ALLOW_CPU_STAGES=1` | lets hot stages run on the CPU | 20-30x slower while reporting CUDA: never in production |
+| `MYNAH_CTX_HOST_POOL=1` | a finished request's host-side state (backbone and codec states, flow head, scratch) is renewed for the next admission instead of rebuilt | NVIDIA L40S C1024: 880 -> 1112 audio-s/s, RTF p95 1.076 -> 0.852; pending a soak |
+| `MYNAH_CUDA_STEP_OVERLAP=1` | dispatch-ahead: the next AR step is queued before the previous step's retire, admission and cancellation run | L4: +1 % audio-s/s, RTF p95 -0.01, TTFA p95 +50-60 ms; pending a soak |
+| `MYNAH_CUDA_DECODE_OVERLAP=1` (needs `MYNAH_CUDA_STEP_OVERLAP=1`) | the gang decode of step k runs under AR step k+1 | with the row below and the host pool, see "Serving-loop defaults"; pending a soak |
+| `MYNAH_CUDA_FIRST_FRAME_FIRST=1` (with `MYNAH_CUDA_DECODE_OVERLAP=1`) | new streams' first frames are decoded and delivered as their own small gang first | keeps TTFA down under the decode overlap; pending a soak |
+
+### Serving-loop defaults (2026-10-07)
+
+At hundreds of streams the GPU waited on the single scheduler thread: host
+time per step, not GPU time, set the ceiling. The eleven 2026-10-07 rows of the
+"on by default" table cut that host time (fewer stream syncs, no per-step
+decoder re-recording, no per-row copies). Each one gives bit-identical audio
+wherever batch composition is the same (CLI `--batch 32` and the server at C1)
+and keeps its variable as a rollback. Measured, `ROW_CAP=1024` build:
+
+| configuration | NVIDIA L40S C1024: audio-s/s | stream RTF p95 |
+|---|---|---|
+| the eleven defaults | 880 | 1.076 |
+| + `MYNAH_CTX_HOST_POOL=1` | 1112 | 0.852 |
+| + `MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1 MYNAH_CUDA_FIRST_FRAME_FIRST=1` + `MYNAH_CTX_HOST_POOL=1` | 1157 | 0.846 (TTFA p95 130 ms) |
+
+Before them, the same GPU held the 0.88 RTF gate at C640; with them, at C768
+(+6 % audio-s/s), and C896 ran with 0 stalls where it had 46,640. On the L4
+(GPU-bound, `ROW_CAP=384`) they give +4 % audio-s/s and -0.03 RTF p95 at
+C288-C320, with no regression. The opt-in rows stay off until a soak at those
+widths.
 
 ### Pedantic mode (rollback to fp32, batch-invariant)
 
@@ -301,7 +339,8 @@ MYNAH_CUDA_TF32=0 MYNAH_CUDA_SEANET_BF16=0 MYNAH_CUDA_QUANT=f32 MYNAH_CUDA_ATTN_
 `MYNAH_CUDA_ATTN_SPLIT=0` restores the summation order of the old decode
 attention (the split kernel is batch-invariant too, but its last bits differ).
 The other 2026-10-02 defaults (shared voice, decoder fusion, one sync, bf16
-fusion) give bit-identical audio and need no switch. Without
+fusion) and the 2026-10-07 serving-loop defaults give bit-identical audio and
+need no switch. Without
 `MYNAH_CUDA_QUANT=f32` the bf16 backbone makes the self-check fall back to its
 tolerance comparison.
 

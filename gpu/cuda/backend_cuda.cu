@@ -1606,8 +1606,30 @@ static bool cuda_size_add(size_t a, size_t b, size_t *out) {
     return true;
 }
 
+/* A failed allocation -- cudaMalloc, cudaHostAlloc, and the calls that
+ * allocate on the way (graph instantiation, event creation) -- returns
+ * cudaErrorMemoryAllocation AND records it as the calling thread's last
+ * runtime error.  That record is not sticky: the context is intact and the
+ * next allocation may well succeed.  But it stays until something reads it,
+ * and the launch checks below read cudaGetLastError().  After a failure the
+ * engine handles (a fallback to another path, a smaller buffer, the CPU, or
+ * one failed request), the next unrelated kernel launch would then report
+ * the old "CUDA: out of memory" and fail a step that was fine.  So once an
+ * allocation failure has been reported through its return code, the record is
+ * cleared.  Only that one: cudaPeekAtLastError shows what is pending, and
+ * anything else -- above all a sticky error such as an illegal address or a
+ * launch failure, which no read can clear -- is left for the next check to
+ * report. */
+static void cuda_clear_alloc_error(void) {
+    if (cudaPeekAtLastError() == cudaErrorMemoryAllocation)
+        (void)cudaGetLastError();
+}
+
 static int ce(cudaError_t r, char *e, size_t c) {
     if (r == cudaSuccess) return 0;
+    /* Every caller below handles a failure from its return value, so the
+     * runtime's copy of an allocation failure carries nothing more. */
+    if (r == cudaErrorMemoryAllocation) cuda_clear_alloc_error();
     std::snprintf(e, c, "CUDA: %s", cudaGetErrorString(r)); return -1;
 }
 static int cbe(cublasStatus_t s, char *e, size_t c) {
@@ -1903,6 +1925,7 @@ static void cuda_lt_init(cuda_backend_state *st) {
     const size_t ws = (size_t)32 << 20;
     if (cublasLtCreate(&st->lt) != CUBLAS_STATUS_SUCCESS ||
         cudaMalloc(&st->lt_ws, ws) != cudaSuccess) {
+        cuda_clear_alloc_error(); /* handled: cublasGemmEx instead */
         if (st->lt) cublasLtDestroy(st->lt);
         st->lt = nullptr;
         st->lt_ws = nullptr;
@@ -3283,6 +3306,11 @@ static void *cuda_driver_symbol(const char *name) {
 static int cuda_vmm_check(const cuda_kv_vmm &v, CUresult r, const char *what,
                           char *e, size_t ec) {
     if (r == CUDA_SUCCESS) return 0;
+    /* Driver API calls do not normally write the runtime's last-error record;
+     * the guard is for a driver that does on CUDA_ERROR_OUT_OF_MEMORY, since
+     * every VMM failure is handled by the caller (the KV falls back to a
+     * plain cudaMalloc range or the request fails alone). */
+    if (r == CUDA_ERROR_OUT_OF_MEMORY) cuda_clear_alloc_error();
     const char *text = nullptr;
     if (v.GetErrorString == nullptr || v.GetErrorString(r, &text) != CUDA_SUCCESS ||
         text == nullptr)
@@ -6198,13 +6226,13 @@ static bool cuda_decoder_graph_reuse_enabled(void) {
     return on;
 }
 
-/* MYNAH_CUDA_DECODER_TABLE_PATCH=1 (default off): a same-width gang change
+/* MYNAH_CUDA_DECODER_TABLE_PATCH (default on; =0 is the rollback): a same-width gang change
  * rewrites the reused graph's pinned pointer tables from per-decoder columns
  * cached at an earlier real recording, instead of re-recording the whole
  * decoder on the host to produce the same tables.  Needs graph reuse. */
 static bool cuda_decoder_table_patch_enabled(void) {
     static const bool on =
-        cuda_env_enabled("MYNAH_CUDA_DECODER_TABLE_PATCH", false) &&
+        cuda_env_enabled("MYNAH_CUDA_DECODER_TABLE_PATCH", true) &&
         cuda_decoder_graph_reuse_enabled();
     return on;
 }
@@ -6214,12 +6242,12 @@ static bool cuda_decoder_table_patch_enabled(void) {
  * build, and every later gang change re-records as before. */
 static std::atomic<bool> g_decoder_table_patch_broken{false};
 
-/* MYNAH_CUDA_DECODER_VALIDATE_ONCE=1 (default off): a gang row whose
+/* MYNAH_CUDA_DECODER_VALIDATE_ONCE (default on; =0 is the rollback): a gang row whose
  * compatibility class matches the first row's skips the op-by-op
  * decoder_ops_compatible scan (see mynah_backend_decoder::compat_class). */
 static bool cuda_decoder_validate_once_enabled(void) {
     static const bool on =
-        cuda_env_enabled("MYNAH_CUDA_DECODER_VALIDATE_ONCE", false);
+        cuda_env_enabled("MYNAH_CUDA_DECODER_VALIDATE_ONCE", true);
     return on;
 }
 
@@ -7712,15 +7740,20 @@ extern "C" int mynah_cuda_decoder_open(
                              ? "deferred to the reader (beta = 0)"
                              : "kept in the GEMM (MYNAH_CUDA_DECODER_FUSE_BIAS=0)");
     }
-    if (cuda_env_enabled("MYNAH_CUDA_DECODER_TABLE_PATCH", false)) {
+    /* The warning only for an explicit request: by default the patch simply
+     * follows graph reuse. */
+    const char *table_patch = std::getenv("MYNAH_CUDA_DECODER_TABLE_PATCH");
+    if (cuda_decoder_table_patch_enabled() ||
+        (table_patch != nullptr && std::strcmp(table_patch, "0") != 0)) {
         static std::atomic<bool> announced_patch{false};
         if (!announced_patch.exchange(true))
             std::fprintf(stderr,
                          cuda_decoder_table_patch_enabled()
                              ? "mynah-tts: CUDA decoder batch graph gang changes "
                                "patch per-decoder pointer-table columns instead "
-                               "of re-recording (MYNAH_CUDA_DECODER_TABLE_PATCH=1)\n"
-                             : "mynah-tts: warning: MYNAH_CUDA_DECODER_TABLE_PATCH=1 "
+                               "of re-recording (MYNAH_CUDA_DECODER_TABLE_PATCH, "
+                               "default; =0 to roll back)\n"
+                             : "mynah-tts: warning: MYNAH_CUDA_DECODER_TABLE_PATCH "
                                "needs MYNAH_CUDA_DECODER_GRAPH_REUSE; ignored\n");
     }
     if (cuda_decoder_validate_once_enabled()) {
@@ -7729,7 +7762,8 @@ extern "C" int mynah_cuda_decoder_open(
             std::fprintf(stderr,
                          "mynah-tts: CUDA decoder gang topology checked once per "
                          "decoder, then by compatibility class "
-                         "(MYNAH_CUDA_DECODER_VALIDATE_ONCE=1)\n");
+                         "(MYNAH_CUDA_DECODER_VALIDATE_ONCE, default; =0 to "
+                         "roll back)\n");
     }
     *out = decoder;
     return 0;
@@ -8088,8 +8122,10 @@ extern "C" int mynah_cuda_decoder_step_batch(
     entry->exec = exec;
     entry->valid = true;
     if (cuda_decoder_graph_reuse_enabled() &&
-        cudaEventCreateWithFlags(&entry->done, cudaEventDisableTiming) != cudaSuccess)
+        cudaEventCreateWithFlags(&entry->done, cudaEventDisableTiming) != cudaSuccess) {
+        cuda_clear_alloc_error(); /* handled: no event, reuse waits as before */
         entry->done = nullptr;
+    }
     if (entry->slot_channels != nullptr) {
         entry->layout_key = decoder_table_layout_key(entry);
         decoder_table_harvest(entry, decoders, dev_inputs, dev_outputs);
@@ -12279,8 +12315,10 @@ extern "C" void *mynah_cuda_fence_record(void *opaque) {
     auto *st = static_cast<cuda_backend_state *>(opaque);
     if (st == nullptr) return nullptr;
     cudaEvent_t event = nullptr;
-    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess)
+    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+        cuda_clear_alloc_error(); /* handled: the caller drains instead */
         return nullptr;
+    }
     if (cudaEventRecord(event, st->stream) != cudaSuccess) {
         cudaEventDestroy(event);
         return nullptr;
@@ -12405,6 +12443,7 @@ extern "C" int mynah_cuda_matmul_graph(void *opaque, const float *input, float *
 
     cudaGraphExec_t exec;
     if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+        cuda_clear_alloc_error(); /* handled: the ordinary matmul below */
         cudaGraphDestroy(graph);
         return cuda_matmul(opaque, input, output, rows, iw, ow, weight, bias, e, ec);
     }

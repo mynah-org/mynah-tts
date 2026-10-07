@@ -4664,17 +4664,30 @@ static size_t pocket_max_batch_for(const mynah_backend *backend) {
  *
  * Not CUDA-specific in mechanism: the lent buffer applies to the CPU gang too
  * (which is what lets the CPU server check it), only the single-copy half is
- * on the CUDA gather path. Default off; read once. */
-static int pocket_pcm_direct_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
+ * on the CUDA gather path. Default on for the CUDA backend, where it was
+ * measured (=0 is the rollback); the CPU backend keeps the malloc'd ranges
+ * unless the variable is set to a nonzero value. The variable is read once. */
+static int pocket_pcm_direct_enabled(const mynah_backend *backend) {
+    static int setting = -2; /* -1 unset, 0 off, 1 on */
+    static int announced;
+    if (setting == -2) {
         const char *value = getenv("MYNAH_CUDA_PCM_DIRECT");
-        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
-        if (cached)
-            fprintf(stderr, "mynah-tts: lent gang decode PCM: on "
-                            "(MYNAH_CUDA_PCM_DIRECT)\n");
+        setting = value == NULL || value[0] == '\0' ? -1
+                                                    : strcmp(value, "0") != 0;
     }
-    return cached;
+    const int on = setting >= 0
+                       ? setting
+                       : backend != NULL &&
+                             strcmp(mynah_backend_name(backend), "cuda") == 0;
+    if (on && !announced) {
+        announced = 1;
+        fprintf(stderr, setting < 0
+                            ? "mynah-tts: lent gang decode PCM: on by default "
+                              "(MYNAH_CUDA_PCM_DIRECT=0 to roll back)\n"
+                            : "mynah-tts: lent gang decode PCM: on "
+                              "(MYNAH_CUDA_PCM_DIRECT)\n");
+    }
+    return on;
 }
 
 static int pocket_caps(const mynah_tts_model *model,
@@ -4710,7 +4723,8 @@ static int pocket_caps(const mynah_tts_model *model,
     out->is_discrete_codec = 0u;
     out->latent_dim = (unsigned)cfg->latent_dim;
     out->prefill_slice_tokens = pocket_prefill_slice_tokens(state);
-    out->decode_batch_lends_pcm = (unsigned)pocket_pcm_direct_enabled();
+    out->decode_batch_lends_pcm =
+        (unsigned)pocket_pcm_direct_enabled(state->backend);
     return 0;
 }
 
@@ -5165,7 +5179,8 @@ static int pocket_cuda_slot_zero_kv_requested(void) {
     return setting != NULL && strcmp(setting, "0") != 0;
 }
 
-/* MYNAH_CUDA_DEFERRED_RELEASE=1 (default off; needs the slot pool).  Parking
+/* MYNAH_CUDA_DEFERRED_RELEASE (default on; =0 is the rollback; needs the slot
+ * pool, so CPU runs never read it).  Parking
  * a retired context used to start with a full stream drain.  On the backend's
  * one stream nothing the next owner queues can overtake the previous owner's
  * work, so the device buffers need no drain.  The host does touch the set
@@ -5178,13 +5193,13 @@ static int pocket_cuda_deferred_release_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *value = getenv("MYNAH_CUDA_DEFERRED_RELEASE");
-        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+        cached = value == NULL || strcmp(value, "0") != 0;
         if (cached)
             fprintf(stderr,
-                    "mynah-tts: MYNAH_CUDA_DEFERRED_RELEASE=1: a retired "
-                    "request's CUDA set is parked behind a stream event, "
-                    "waited on when the set is taken again, instead of a "
-                    "full drain\n");
+                    "mynah-tts: MYNAH_CUDA_DEFERRED_RELEASE (default): a "
+                    "retired request's CUDA set is parked behind a stream "
+                    "event, waited on when the set is taken again, instead of "
+                    "a full drain (=0 to roll back)\n");
     }
     return cached;
 }
@@ -7740,7 +7755,7 @@ static int pocket_cuda_backbone_layer_bf16_fused(
     return 0;
 }
 
-/* MYNAH_CUDA_HIDDEN_LAZY (default 0 = off): the one-sync step does not copy
+/* MYNAH_CUDA_HIDDEN_LAZY (default on; =0 is the rollback): the one-sync step does not copy
  * the backbone output (the `hidden` rows, 4 KB each) back to the host, does
  * not scan it and does not memcpy it into every context.  Nothing on the host
  * reads it in a step whose EOS logits and flow head ran on the device; the
@@ -7752,18 +7767,17 @@ static int pocket_cuda_hidden_lazy_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *setting = getenv("MYNAH_CUDA_HIDDEN_LAZY");
-        cached = setting != NULL && setting[0] != '\0' &&
-                 strcmp(setting, "0") != 0;
+        cached = setting == NULL || strcmp(setting, "0") != 0;
         if (cached)
             fprintf(stderr,
-                    "mynah-tts: MYNAH_CUDA_HIDDEN_LAZY: one-sync steps keep the "
-                    "hidden rows on the device (finite gate on the device, "
-                    "host copy on demand)\n");
+                    "mynah-tts: MYNAH_CUDA_HIDDEN_LAZY (default): one-sync "
+                    "steps keep the hidden rows on the device (finite gate on "
+                    "the device, host copy on demand; =0 to roll back)\n");
     }
     return cached;
 }
 
-/* MYNAH_CUDA_KV_TABLE_CACHE (default 0 = off): the layers x rows KV pointer
+/* MYNAH_CUDA_KV_TABLE_CACHE (default on; =0 is the rollback): the layers x rows KV pointer
  * tables the backbone graphs replay are rewritten only for a row slot whose
  * inputs changed since the last write.  The entries of a slot are a pure
  * function of the fields in this key (the row's allocation, its capacity and
@@ -7790,12 +7804,12 @@ static int pocket_cuda_kv_table_cache_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *setting = getenv("MYNAH_CUDA_KV_TABLE_CACHE");
-        cached = setting != NULL && setting[0] != '\0' &&
-                 strcmp(setting, "0") != 0;
+        cached = setting == NULL || strcmp(setting, "0") != 0;
         if (cached)
             fprintf(stderr,
-                    "mynah-tts: MYNAH_CUDA_KV_TABLE_CACHE: KV pointer tables "
-                    "rewritten only for rows whose cache changed\n");
+                    "mynah-tts: MYNAH_CUDA_KV_TABLE_CACHE (default): KV pointer "
+                    "tables rewritten only for rows whose cache changed "
+                    "(=0 to roll back)\n");
     }
     return cached;
 }
@@ -8708,7 +8722,7 @@ static int pocket_cuda_one_sync_enabled(void) {
     return cached;
 }
 
-/* MYNAH_CUDA_ONESYNC_SUBSET (default 0 = off): in a one-sync step where some
+/* MYNAH_CUDA_ONESYNC_SUBSET (default on; =0 is the rollback): in a one-sync step where some
  * rows end, emit takes the survivors' flow output and latent from the chained
  * flow pass instead of rerunning the flow head on them.  To make that pass
  * the very call the rerun would have made, the chain lays its rows out the
@@ -8721,12 +8735,12 @@ static int pocket_cuda_onesync_subset_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *setting = getenv("MYNAH_CUDA_ONESYNC_SUBSET");
-        cached = setting != NULL && setting[0] != '\0' &&
-                 strcmp(setting, "0") != 0;
+        cached = setting == NULL || strcmp(setting, "0") != 0;
         if (cached)
             fprintf(stderr,
-                    "mynah-tts: MYNAH_CUDA_ONESYNC_SUBSET: a one-sync step whose "
-                    "rows end reuses the chained flow head for the survivors\n");
+                    "mynah-tts: MYNAH_CUDA_ONESYNC_SUBSET (default): a one-sync "
+                    "step whose rows end reuses the chained flow head for the "
+                    "survivors (=0 to roll back)\n");
     }
     return cached;
 }
@@ -11350,7 +11364,7 @@ static int pocket_all_finite(const float *v, size_t n) {
     return 1;
 }
 
-/* MYNAH_DUP_CHECK_EPOCH (default 0 = off): the "named twice" pre-flight test
+/* MYNAH_DUP_CHECK_EPOCH (default on; =0 is the rollback): the "named twice" pre-flight test
  * of pocket_step_batch stamps each context with a per-call epoch instead of
  * comparing every pair of slots (~200k pointer compares at 640 rows).  The
  * counter is process-wide, so two calls never share an epoch, and a context
@@ -11361,12 +11375,7 @@ static int pocket_dup_check_epoch_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *setting = getenv("MYNAH_DUP_CHECK_EPOCH");
-        cached = setting != NULL && setting[0] != '\0' &&
-                 strcmp(setting, "0") != 0;
-        if (cached)
-            fprintf(stderr,
-                    "mynah-tts: MYNAH_DUP_CHECK_EPOCH: duplicate-context check "
-                    "by per-step epoch stamp\n");
+        cached = setting == NULL || strcmp(setting, "0") != 0;
     }
     return cached;
 }
@@ -13355,7 +13364,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
     size_t longest = 0;
     int reported = 0;
     char one_error[256];
-    const int lend = pocket_pcm_direct_enabled();
+    /* Same answer as pocket_caps gave the driver: one state per model. */
+    const int lend = pocket_pcm_direct_enabled(ctxs[0]->state->backend);
     for (size_t i = 0; i < count; ++i) {
         float *pcm = NULL;
         size_t samples = 0;
@@ -14096,7 +14106,19 @@ static int pocket_scratch_new(const mynah_tts_model *model,
     if (out == NULL || state == NULL) return -1;
     *out = NULL;
     if (batch == 0u) batch = 1u;
-    (void)pocket_dup_check_epoch_enabled(); /* its start-up line */
+    /* Its start-up line, on the CUDA backend only: the check is the same on
+     * every backend, and a CPU run need not say so on every synthesis. */
+    {
+        static int announced;
+        if (!announced && pocket_dup_check_epoch_enabled() &&
+            state->backend != NULL &&
+            strcmp(mynah_backend_name(state->backend), "cuda") == 0) {
+            announced = 1;
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_DUP_CHECK_EPOCH (default): duplicate-context "
+                    "check by per-step epoch stamp (=0 to roll back)\n");
+        }
+    }
     mynah_engine_scratch *scratch =
         (mynah_engine_scratch *)calloc(1, sizeof(*scratch));
     if (scratch == NULL) {
