@@ -466,6 +466,107 @@ identical at `0/1/2`; a temporary trace confirmed the server's admissions after 
    mean and `ar_states` + `codec_setup` (expect ~1.5 → ≤0.3 ms), host ms per iteration (expect −8 to −13 ms at
    ~900 rows), RTF p95, TTFA p50/p95, stalls, and RSS.
 
+#### A1b design: device-side request sets with no driver call on take (`MYNAH_CUDA_SLOT_FIXED`, coded 2026-10-07, untested on GPU)
+
+**Problem (measured).** On one host (RTX 6000 Ada, EPYC 7C13, driver 565) `[CTX] cuda_backbone` is 10-12 ms per
+admission with all 11 flags and A1a, against < 1 ms on the L40S host (driver 575). C768 there: 376 audio-s/s against 867
+on the L40S. (The `MYNAH_CUDA_KV_VMM=1` arm at 7.5 ms was not VMM: VMM is ignored with the default int8 KV, so it was the
+same int8 plane-major path and the difference is run-to-run.) The cost is the misfit take: the slot pool keeps a
+parked backbone KV only if it holds the new request's starting estimate and, for a growable cache, is at most 2x it
+(`pocket_cuda_slot_kv_fits`). With a mixed corpus (12-531 characters, so starting estimates from ~260 to ~640 stored
+positions) most takes miss and do `cudaFree` (which waits for the whole device, i.e. behind the queued step) plus
+`cudaMalloc`. The driver decides how expensive that is, which is why the same code costs 1 ms on one host and 12 on
+another.
+
+**Flag.** `MYNAH_CUDA_SLOT_FIXED` = unset/`0` off, `1` on. `MYNAH_CUDA_SLOT_FIXED_POSITIONS` (default 512, 64..65536,
+rounded up to 64) is the fixed size in stored positions; `MYNAH_CUDA_SLOT_FIXED_ROWS` (default the build's `ROW_CAP`)
+the rows the start-up plan sizes for. Read once at model load (`pocket_cuda_slot_fixed_resolve`, one start-up line),
+after the KV element type is decided. Needs the slot pool, `MYNAH_CUDA_KV_GROW` and `MYNAH_CUDA_PREFILL_TILE` (all
+default); otherwise a warning and today's pool.
+
+**Why not "the maximum a request can need".** The step budget is 1500 frames, so a request can reach ~1650 stored
+positions: 82 MiB per row with int8 records at 24 layers, 31 GiB at 384 rows and 82 GiB at 1024. No GPU here holds that.
+So the fixed size is the ceiling of the ordinary request instead: 512 positions holds every request of the v2 reference
+corpus, text plus its frames (the longest, ~130 tokens, reach ~420), without growth. A request past it keeps the
+growth path every row already has.
+
+**Mechanism** (`src/engine_pocket.c`).
+- **New cache** (`pocket_cuda_backbone_alloc`, no cache came from the pool): a growable, non-VMM row allocates
+  max(estimate, fixed) bytes, if `pocket_cuda_slot_fixed_claim` allows it (count below the cap, and the device keeps
+  max(1 GiB, total / 20) free after it; the free-memory query only runs on this path, which allocates anyway). The row
+  is laid out over all of it (capacity = what the bytes hold, never past the host ceiling), so it grows later or never.
+  The context carries `cuda_backbone_kv_fixed`; park moves the mark to the set (`bb_kv_fixed`, the owning state).
+- **Take** (`pocket_cuda_slot_acquire`): for a growable plain request a fixed set wins over any other: the tightest at
+  or above the estimate, else the largest; ties go to the set parked earliest (furthest down the LIFO list), whose
+  fence most likely passed already. Then in `pocket_cuda_backbone_alloc` a fixed cache is kept whenever it holds the
+  prefill and the first step (voice + text + 1 positions, minus the voice prefix it does not store), whatever the 2x
+  rule says. If the estimate is larger, the row starts at the fixed capacity and grows only if it really gets there
+  (the estimate is 3 frames per token + 64; the measured rate is 2-2.6). No `cudaFree`, no `cudaMalloc`, no VMM call,
+  no clearing.
+- **What a take still does:** the fence wait of its own set (`cudaEventSynchronize` on that set's event, L6, unchanged:
+  never a device-wide sync), the async Mimi window and decoder zeroing (`cudaMemsetAsync`, stream-ordered, unchanged),
+  and the pinned host memsets (CPU). With `MYNAH_CUDA_SLOT_POOL_ZERO_KV=1` the KV is cleared with an async memset too.
+- **Retire** (`pocket_cuda_slot_park`): a fixed cache goes back whole. One that grew past 2x the fixed size is left on
+  the context and freed by the ordinary release (with the drain that path always had), so the pool does not keep long
+  requests' caches; rare by construction (> 1024 stored positions at the default).
+- **Accounting:** `cuda_slot_fixed_live` (atomic) counts fixed caches; every free of one (pool destroy, misfit at a take,
+  release, model teardown) decrements it. A fixed cache that grew stays one fixed cache.
+- **Not touched:** VMM rows (BF16 only; never fixed), full-capacity rows (not growable), the codec and decoder halves
+  (their geometry is fixed already: a pooled set always fits, with async zeroing).
+
+**Audio identity.** The cache bytes a request reads are the ones it wrote: attention reads only positions
+`[voice, offset)` it wrote itself (the voice prefix comes from the shared model voice cache), the same contract every
+reused or fresh cache relies on (a fresh `cudaMalloc` is uninitialised too). The capacity (row stride) differs from the
+estimate, which the existing reuse path already does (a larger parked cache is laid out over all its bytes) and which
+the kernels take per row; growth copies the live prefix, the property `MYNAH_CUDA_KV_GROW_INITIAL_STEPS` tests.
+`MYNAH_CUDA_SLOT_POOL_ZERO_KV=1` is the leak A/B.
+
+**Flag off = today's code path.** `state->cuda_slot_fixed` stays 0, so: the acquire's fixed candidates are never set
+(pick unchanged); `bb_kv_fixed` is only ever set from `cuda_backbone_kv_fixed`, which only the fixed paths set, so the
+take's `fixed_fit` is 0 and the fits test is the old one; the new-cache block is guarded by the flag; the park's
+oversize test returns 0 for an unmarked cache; the count updates only run for marked caches. The remaining flag-off
+differences are a thread-local load in the backend's allocation/free/zero/fence entry points (the meter below) and
+two struct fields.
+
+**VRAM cost.** Per row: `positions x layers x 2 x record x element` = 512 x 24 x 2 x 1088 B = **25.5 MiB** (int8 records,
+24L; BF16 would be 48 MiB). Total: `rows x 25.5 MiB`. Start-up plan (`mynah_backend_fixed_buffers_plan`):
+`cap = min(rows, (free - reserve) / per_row)`, `reserve = max(4 GiB, total / 5) + rows x 9 MiB` (the other per-row
+device buffers without the row diet; the fifth covers weights uploaded lazily, graphs, scratch and transients). 0 →
+refused (start-up line, today's pool); `< rows` → auto-capped (rows past the cap use today's pool). Estimates with free
+≈ total − 1 GiB at load:
+
+| GPU (total) | rows | fixed KV | reserve | budget | cap |
+|---|---|---|---|---|---|
+| L4 (22.5 GiB) | 384 | 9.56 GiB | 7.88 GiB | 13.6 GiB | 384 (all) |
+| L4 | 1024 | 25.5 GiB | 13.5 GiB | 8.0 GiB | **321** (auto-capped) |
+| L40S (45 GiB) | 384 | 9.56 GiB | 12.4 GiB | 31.6 GiB | 384 |
+| L40S | 1024 | 25.5 GiB | 18.0 GiB | 26.0 GiB | 1024 (0.5 GiB spare) |
+| RTX 6000 Ada (48 GiB) | 384 | 9.56 GiB | 13.0 GiB | 34.0 GiB | 384 |
+| RTX 6000 Ada | 1024 | 25.5 GiB | 18.6 GiB | 28.4 GiB | 1024 |
+
+Against today: a row's starting cache is text + 256 (≤ 64 tokens) or text + 512 positions, and parked sets keep up to
+2x that, so 512 is close to today's mean; the extra peak is est. ≤ 5-8 GiB at 1024 rows. On the L40S at C1024 this is
+the item to watch (`nvidia-smi` at the end of each arm); `MYNAH_CUDA_SLOT_FIXED_POSITIONS=384` is 19.1 MiB per row.
+
+**Profile** (`MYNAH_SERVE_PROFILE=1`). The backend gained a thread-local driver-call meter
+(`mynah_backend_call_meter_set`): while set, `dev_alloc`/`dev_alloc_bytes`/`host_alloc`/`decoder_open` (malloc),
+`dev_free`/`host_free`/`kv_vmm_free`/`decoder_close` (free), `kv_vmm_alloc`/`kv_vmm_resize` (vmm), `zero_dev`/
+`decoder_reset` (memset), `fence_wait` (event) count calls and time. Each admission meters the pool take + pinned
+staging and the device half into `ctx->ctxp_calls`; the `[CTX]` line gains
+`| admit calls: zero-call N fallback M; malloc n ms free n ms vmm n ms memset n ms event n ms` (counts in total, ms
+mean per context; fallback = any malloc/free/vmm call) and, with the flag on,
+`| fixed: live L/cap C reused R (short S) new N over-cap O misfit X trimmed T`. That works with the flag off too, so
+the off arm shows where today's 10-12 ms go (free vs malloc vs fence wait). Self-test: the CPU backend self-test checks
+the meter counts exactly the calls made while it is set and the plan arithmetic (`make test-c`).
+
+**Box test** (`.work/l40s-2026-10-06/jobs/a1b.sh`, tree `/root/ma1b`, ROW_CAP 1024, single NUMA node, no pinning).
+1. Identity, flag off vs on: CLI `--batch 32`, CLI `--batch 32 --stream`, server C1 sequence (166 WAVs); plus
+   `ZERO_KV=1` with the flag on. All must match the flag-off reference.
+2. Speed at C768/C896, 2-minute levels, PRE=640: A = defaults + A1a, B = A + A1b, then A again (ABA). Read `[CTX]`
+   (`cuda_backbone` ms, zero-call vs fallback, per-kind ms), audio-s/s, RTF p95, TTFA p95, stalls and VRAM.
+   Pass: `cuda_backbone` < 1 ms with zero-call ≥ 95 % of takes, audio-s/s up at C768 on this host, bit-identical, no
+   failures. Then one L4 run (ROW_CAP 384) to check the cap and no regression before any default change.
+
 #### Reading of the `MYNAH_ASYNC_ADMIT` OOM at 1024 rows (code only, not reproduced)
 
 - **The hypothesis "async-built contexts bypass parked slots" does not hold.** `ctx_new_host` (helpers) builds only

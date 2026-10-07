@@ -301,6 +301,7 @@ never read it.
 | `MYNAH_CUDA_STEP_OVERLAP=1` | dispatch-ahead: the next AR step is queued before the previous step's retire, admission and cancellation run | L4: +1 % audio-s/s, RTF p95 -0.01, TTFA p95 +50-60 ms; pending a soak |
 | `MYNAH_CUDA_DECODE_OVERLAP=1` (needs `MYNAH_CUDA_STEP_OVERLAP=1`) | the gang decode of step k runs under AR step k+1 | with the row below and the host pool, see "Serving-loop defaults"; pending a soak |
 | `MYNAH_CUDA_FIRST_FRAME_FIRST=1` (with `MYNAH_CUDA_DECODE_OVERLAP=1`) | new streams' first frames are decoded and delivered as their own small gang first | keeps TTFA down under the decode overlap; pending a soak |
+| `MYNAH_CUDA_SLOT_FIXED=1` (`MYNAH_CUDA_SLOT_FIXED_POSITIONS=512`, `MYNAH_CUDA_SLOT_FIXED_ROWS`) | pooled request sets keep a backbone KV of at least a fixed size (512 positions: 25.5 MiB with int8 KV at 24 layers), so taking one from the pool makes no allocation or free; the start-up line prints rows x size against free memory and caps (or refuses) what does not fit | for hosts where a misfit take (`cudaFree` + `cudaMalloc`) costs milliseconds per admission; `MYNAH_SERVE_PROFILE=1` shows zero-call vs fallback takes and the time per driver-call kind in `[CTX]`; untested on GPU |
 
 ### Serving-loop defaults (2026-10-07)
 

@@ -297,6 +297,56 @@ static void set_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity > 0) snprintf(error, capacity, "%s", message);
 }
 
+/* Driver-call meter (backend.h).  Only the thread that installed a meter
+ * pays for the clock reads; every other call costs one thread-local load. */
+static _Thread_local mynah_backend_call_meter *t_call_meter;
+
+mynah_backend_call_meter *mynah_backend_call_meter_set(
+    mynah_backend_call_meter *meter) {
+    mynah_backend_call_meter *previous = t_call_meter;
+    t_call_meter = meter;
+    return previous;
+}
+
+const char *mynah_backend_call_kind_name(int kind) {
+    static const char *const names[MYNAH_BACKEND_CALL_KINDS] = {
+        "malloc", "free", "vmm", "memset", "event"};
+    return kind >= 0 && kind < MYNAH_BACKEND_CALL_KINDS ? names[kind] : "?";
+}
+
+static double call_meter_begin(void) {
+    return t_call_meter != NULL ? mynah_phase_seconds() : 0.0;
+}
+
+static void call_meter_end(int kind, double t0) {
+    mynah_backend_call_meter *meter = t_call_meter;
+    if (meter == NULL) return;
+    meter->count[kind]++;
+    meter->seconds[kind] += mynah_phase_seconds() - t0;
+}
+
+int mynah_backend_fixed_buffers_plan(size_t free_bytes, size_t total_bytes,
+                                     size_t rows, size_t buffer_bytes,
+                                     size_t per_row_other_bytes,
+                                     size_t *reserve_bytes, size_t *fit_rows) {
+    if (buffer_bytes == 0u || reserve_bytes == NULL || fit_rows == NULL)
+        return -1;
+    size_t reserve = total_bytes / 5u;
+    const size_t floor = (size_t)4u << 30;
+    if (reserve < floor) reserve = floor;
+    const size_t other = per_row_other_bytes != 0u &&
+                                 rows > SIZE_MAX / per_row_other_bytes
+                             ? SIZE_MAX
+                             : rows * per_row_other_bytes;
+    reserve = other > SIZE_MAX - reserve ? SIZE_MAX : reserve + other;
+    const size_t budget = free_bytes > reserve ? free_bytes - reserve : 0u;
+    size_t fit = budget / buffer_bytes;
+    if (fit > rows) fit = rows;
+    *reserve_bytes = reserve;
+    *fit_rows = fit;
+    return 0;
+}
+
 static int metal_cpu_path_enabled(const char *cpu_name, const char *gpu_name,
                                   int default_cpu) {
     const char *cpu = getenv(cpu_name);
@@ -881,11 +931,79 @@ int mynah_backend_sgemm(const mynah_backend *backend,
                           error, error_capacity);
 }
 
+/* The driver-call meter counts exactly the calls made while it is set, on
+ * this thread only, and the fixed-buffer plan's arithmetic (the start-up cap
+ * of MYNAH_CUDA_SLOT_FIXED) matches hand-computed cases. */
+static int call_meter_self_test(const mynah_backend *backend, char *error,
+                                size_t error_capacity) {
+    mynah_backend_call_meter meter;
+    memset(&meter, 0, sizeof(meter));
+    float *untracked = NULL;
+    if (mynah_backend_dev_alloc(backend, 8u, &untracked, error,
+                                error_capacity) != 0)
+        return -1;
+    mynah_backend_call_meter *previous = mynah_backend_call_meter_set(&meter);
+    float *a = NULL;
+    void *b = NULL;
+    float *h = NULL;
+    const int failed =
+        mynah_backend_dev_alloc(backend, 16u, &a, error, error_capacity) != 0 ||
+        mynah_backend_dev_alloc_bytes(backend, 64u, &b, error,
+                                      error_capacity) != 0 ||
+        mynah_backend_host_alloc(backend, 4u, &h, error, error_capacity) != 0 ||
+        mynah_backend_zero_dev(backend, a, 16u, error, error_capacity) != 0;
+    mynah_backend_dev_free(backend, a);
+    mynah_backend_dev_free(backend, (float *)b);
+    mynah_backend_host_free(backend, h);
+    (void)mynah_backend_call_meter_set(previous);
+    mynah_backend_dev_free(backend, untracked); /* not counted */
+    if (failed) return -1;
+    if (meter.count[MYNAH_BACKEND_CALL_MALLOC] != 3u ||
+        meter.count[MYNAH_BACKEND_CALL_FREE] != 3u ||
+        meter.count[MYNAH_BACKEND_CALL_MEMSET] != 1u ||
+        meter.count[MYNAH_BACKEND_CALL_VMM] != 0u ||
+        meter.count[MYNAH_BACKEND_CALL_EVENT] != 0u ||
+        meter.seconds[MYNAH_BACKEND_CALL_MALLOC] < 0.0) {
+        set_error(error, error_capacity,
+                  "driver-call meter counted the wrong calls");
+        return -1;
+    }
+    const size_t gib = (size_t)1u << 30, mib = (size_t)1u << 20;
+    size_t reserve = 0u, fit = 0u;
+    /* 46 GiB card, 44 GiB free, 1024 rows of 25.5 MiB + 9 MiB other:
+     * reserve 9.2 + 9 GiB, budget ~25.8 GiB -> 1024 rows. */
+    if (sizeof(size_t) >= 8u &&
+        (mynah_backend_fixed_buffers_plan(44u * gib, 46u * gib, 1024u,
+                                          51u * mib / 2u, 9u * mib, &reserve,
+                                          &fit) != 0 ||
+         reserve != 46u * gib / 5u + 1024u * 9u * mib || fit != 1024u ||
+         /* the same at 768 positions (38.25 MiB): capped */
+         mynah_backend_fixed_buffers_plan(44u * gib, 46u * gib, 1024u,
+                                          153u * mib / 4u, 9u * mib, &reserve,
+                                          &fit) != 0 ||
+         fit != (44u * gib - reserve) / (153u * mib / 4u) || fit >= 1024u ||
+         /* 8 GiB card: the 4 GiB floor wins, nothing fits */
+         mynah_backend_fixed_buffers_plan(3u * gib, 8u * gib, 64u, mib, 0u,
+                                          &reserve, &fit) != 0 ||
+         reserve != 4u * gib || fit != 0u ||
+         mynah_backend_fixed_buffers_plan(SIZE_MAX, SIZE_MAX, SIZE_MAX, 1u,
+                                          SIZE_MAX, &reserve, &fit) != 0 ||
+         reserve != SIZE_MAX || fit != 0u ||
+         mynah_backend_fixed_buffers_plan(1u, 1u, 1u, 0u, 0u, &reserve,
+                                          &fit) != -1)) {
+        set_error(error, error_capacity, "fixed-buffer plan arithmetic is wrong");
+        return -1;
+    }
+    return 0;
+}
+
 int mynah_backend_self_test(mynah_tts_device device, char *error, size_t error_capacity) {
     mynah_backend *backend = NULL;
     if (mynah_backend_open(device, &backend, error, error_capacity) != 0) return -1;
     int result = backend->self_test == NULL ? 0 :
         backend->self_test(backend->state, error, error_capacity);
+    if (result == 0 && device == MYNAH_TTS_DEVICE_CPU)
+        result = call_meter_self_test(backend, error, error_capacity);
 #if defined(MYNAH_ENABLE_METAL)
     if (result == 0 && device == MYNAH_TTS_DEVICE_METAL)
         result = mynah_metal_ops_self_test(backend->state, error, error_capacity);
@@ -905,15 +1023,21 @@ int mynah_backend_decoder_open(const mynah_backend *backend,
         set_error(error, error_capacity, "resident decoder is unavailable");
         return -1;
     }
-    return backend->decoder_open(backend->state, desc, max_encoder_frames, out,
-                                 error, error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->decoder_open(backend->state, desc, max_encoder_frames,
+                                         out, error, error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 void mynah_backend_decoder_close(const mynah_backend *backend,
                                  mynah_backend_decoder *decoder) {
     if (backend == NULL || decoder == NULL) return;
-    if (backend->decoder_close != NULL)
+    if (backend->decoder_close != NULL) {
+        const double t0 = call_meter_begin();
         backend->decoder_close(backend->state, decoder);
+        call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
+    }
 }
 
 int mynah_backend_decoder_reset(const mynah_backend *backend,
@@ -923,7 +1047,11 @@ int mynah_backend_decoder_reset(const mynah_backend *backend,
         set_error(error, error_capacity, "resident decoder is unavailable");
         return -1;
     }
-    return backend->decoder_reset(backend->state, decoder, error, error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->decoder_reset(backend->state, decoder, error,
+                                          error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_MEMSET, t0);
+    return rc;
 }
 
 int mynah_backend_decoder_step(const mynah_backend *backend,
@@ -1246,8 +1374,11 @@ void *mynah_backend_fence_record(const mynah_backend *backend) {
 }
 
 void mynah_backend_fence_wait(const mynah_backend *backend, void *fence) {
-    if (backend != NULL && backend->fence_wait != NULL && fence != NULL)
+    if (backend != NULL && backend->fence_wait != NULL && fence != NULL) {
+        const double t0 = call_meter_begin();
         backend->fence_wait(backend->state, fence);
+        call_meter_end(MYNAH_BACKEND_CALL_EVENT, t0);
+    }
 }
 
 int mynah_backend_fence_query(const mynah_backend *backend, void *fence) {
@@ -1649,10 +1780,16 @@ int mynah_backend_dev_alloc(const mynah_backend *backend, size_t n,
         set_error(error, error_capacity, "invalid device allocation size");
         return -1;
     }
-    if (backend->dev_alloc != NULL)
-        return backend->dev_alloc(backend->state, n, dev_ptr, error, error_capacity);
-    *dev_ptr = (float *)malloc(n * sizeof(float));
-    return *dev_ptr == NULL ? -1 : 0;
+    const double t0 = call_meter_begin();
+    int rc;
+    if (backend->dev_alloc != NULL) {
+        rc = backend->dev_alloc(backend->state, n, dev_ptr, error, error_capacity);
+    } else {
+        *dev_ptr = (float *)malloc(n * sizeof(float));
+        rc = *dev_ptr == NULL ? -1 : 0;
+    }
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 int mynah_backend_dev_alloc_bytes(const mynah_backend *backend, size_t bytes,
@@ -1663,19 +1800,28 @@ int mynah_backend_dev_alloc_bytes(const mynah_backend *backend, size_t bytes,
         return -1;
     }
     *dev_ptr = NULL;
-    if (backend->dev_alloc_bytes != NULL)
-        return backend->dev_alloc_bytes(backend->state, bytes, dev_ptr,
-                                        error, error_capacity);
-    *dev_ptr = malloc(bytes);
-    if (*dev_ptr == NULL)
-        set_error(error, error_capacity, "out of memory for byte device allocation");
-    return *dev_ptr == NULL ? -1 : 0;
+    const double t0 = call_meter_begin();
+    int rc;
+    if (backend->dev_alloc_bytes != NULL) {
+        rc = backend->dev_alloc_bytes(backend->state, bytes, dev_ptr, error,
+                                      error_capacity);
+    } else {
+        *dev_ptr = malloc(bytes);
+        if (*dev_ptr == NULL)
+            set_error(error, error_capacity,
+                      "out of memory for byte device allocation");
+        rc = *dev_ptr == NULL ? -1 : 0;
+    }
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 void mynah_backend_dev_free(const mynah_backend *backend, float *dev_ptr) {
     if (backend == NULL || dev_ptr == NULL) return;
-    if (backend->dev_free != NULL) { backend->dev_free(backend->state, dev_ptr); return; }
-    free(dev_ptr);
+    const double t0 = call_meter_begin();
+    if (backend->dev_free != NULL) backend->dev_free(backend->state, dev_ptr);
+    else free(dev_ptr);
+    call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
 }
 
 int mynah_backend_host_alloc(const mynah_backend *backend, size_t n,
@@ -1684,21 +1830,27 @@ int mynah_backend_host_alloc(const mynah_backend *backend, size_t n,
     if (backend == NULL || host_ptr == NULL || n == 0u ||
         n > SIZE_MAX / sizeof(float)) return -1;
     *host_ptr = NULL;
-    if (backend->host_alloc != NULL)
-        return backend->host_alloc(backend->state, n, host_ptr, error,
-                                   error_capacity);
-    *host_ptr = (float *)malloc(n * sizeof(float));
-    if (*host_ptr == NULL) set_error(error, error_capacity, "out of host staging memory");
-    return *host_ptr == NULL ? -1 : 0;
+    const double t0 = call_meter_begin();
+    int rc;
+    if (backend->host_alloc != NULL) {
+        rc = backend->host_alloc(backend->state, n, host_ptr, error,
+                                 error_capacity);
+    } else {
+        *host_ptr = (float *)malloc(n * sizeof(float));
+        if (*host_ptr == NULL)
+            set_error(error, error_capacity, "out of host staging memory");
+        rc = *host_ptr == NULL ? -1 : 0;
+    }
+    call_meter_end(MYNAH_BACKEND_CALL_MALLOC, t0);
+    return rc;
 }
 
 void mynah_backend_host_free(const mynah_backend *backend, float *host_ptr) {
     if (backend == NULL || host_ptr == NULL) return;
-    if (backend->host_free != NULL) {
-        backend->host_free(backend->state, host_ptr);
-        return;
-    }
-    free(host_ptr);
+    const double t0 = call_meter_begin();
+    if (backend->host_free != NULL) backend->host_free(backend->state, host_ptr);
+    else free(host_ptr);
+    call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
 }
 
 int mynah_backend_has_dev_ops(const mynah_backend *backend) {
@@ -1788,8 +1940,11 @@ int mynah_backend_kv_vmm_alloc(const mynah_backend *backend, size_t reserve,
                   "the backend has no virtual memory management path");
         return -1;
     }
-    return backend->kv_vmm_alloc(backend->state, reserve, map, dev_ptr, mapped,
-                                 error, error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->kv_vmm_alloc(backend->state, reserve, map, dev_ptr,
+                                         mapped, error, error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_VMM, t0);
+    return rc;
 }
 
 int mynah_backend_kv_vmm_resize(const mynah_backend *backend, void *dev_ptr,
@@ -1799,14 +1954,19 @@ int mynah_backend_kv_vmm_resize(const mynah_backend *backend, void *dev_ptr,
         set_error(error, error_capacity, "invalid virtual memory resize");
         return -1;
     }
-    return backend->kv_vmm_resize(backend->state, dev_ptr, want, mapped, error,
-                                  error_capacity);
+    const double t0 = call_meter_begin();
+    const int rc = backend->kv_vmm_resize(backend->state, dev_ptr, want, mapped,
+                                          error, error_capacity);
+    call_meter_end(MYNAH_BACKEND_CALL_VMM, t0);
+    return rc;
 }
 
 void mynah_backend_kv_vmm_free(const mynah_backend *backend, void *dev_ptr) {
     if (backend == NULL || dev_ptr == NULL) return;
     if (backend->kv_vmm_free != NULL) {
+        const double t0 = call_meter_begin();
         backend->kv_vmm_free(backend->state, dev_ptr);
+        call_meter_end(MYNAH_BACKEND_CALL_FREE, t0);
         return;
     }
     mynah_backend_dev_free(backend, (float *)dev_ptr);
@@ -2142,14 +2302,20 @@ int mynah_backend_gather_rows_to_batch_dev(
 int mynah_backend_zero_dev(const mynah_backend *bk, float *data, size_t n,
                            char *e, size_t ec) {
     if (bk == NULL || data == NULL || n == 0u) return -1;
-    if (bk->zero_dev != NULL)
-        return bk->zero_dev(bk->state, data, n, e, ec);
+    if (bk->zero_dev != NULL) {
+        const double t0 = call_meter_begin();
+        const int rc = bk->zero_dev(bk->state, data, n, e, ec);
+        call_meter_end(MYNAH_BACKEND_CALL_MEMSET, t0);
+        return rc;
+    }
     if (bk->device != MYNAH_TTS_DEVICE_CPU) return -1;
     if (n > SIZE_MAX / sizeof(float)) {
         set_error(e, ec, "device-zero size overflow");
         return -1;
     }
+    const double t0 = call_meter_begin();
     memset(data, 0, n * sizeof(float));
+    call_meter_end(MYNAH_BACKEND_CALL_MEMSET, t0);
     return 0;
 }
 

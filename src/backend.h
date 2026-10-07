@@ -797,4 +797,39 @@ void mynah_backend_host_free(const mynah_backend *backend, float *host_ptr);
 const char *mynah_cpu_matvec_mode(size_t rows, size_t input_width,
                                   size_t output_width, const char **why);
 
+/* Driver-call meter (MYNAH_SERVE_PROFILE): while a thread has a meter set,
+ * the allocation, free, VMM, zeroing and fence-wait entry points above count
+ * their calls and time on it, by kind.  Thread-local; NULL (the default) costs
+ * one thread-local load per call.  `_set` installs `meter` (or clears it with
+ * NULL) and returns the previous one.  MALLOC: dev/host alloc, decoder open;
+ * FREE: dev/host free, VMM free, decoder close; VMM: VMM alloc and resize
+ * (map/unmap); MEMSET: device zeroing and decoder reset (stream-ordered on
+ * CUDA); EVENT: fence wait (blocks until the fence's work is done). */
+enum {
+    MYNAH_BACKEND_CALL_MALLOC,
+    MYNAH_BACKEND_CALL_FREE,
+    MYNAH_BACKEND_CALL_VMM,
+    MYNAH_BACKEND_CALL_MEMSET,
+    MYNAH_BACKEND_CALL_EVENT,
+    MYNAH_BACKEND_CALL_KINDS
+};
+typedef struct {
+    unsigned long count[MYNAH_BACKEND_CALL_KINDS];
+    double seconds[MYNAH_BACKEND_CALL_KINDS];
+} mynah_backend_call_meter;
+mynah_backend_call_meter *mynah_backend_call_meter_set(
+    mynah_backend_call_meter *meter);
+const char *mynah_backend_call_kind_name(int kind);
+
+/* How many fixed-size per-row device buffers of `buffer_bytes` fit next to
+ * everything else: `free_bytes` (free device memory now) minus a reserve of
+ * max(4 GiB, total / 5) for weights still to upload, graphs, scratch and
+ * transients, plus `rows * per_row_other_bytes` for the other per-row
+ * buffers.  Writes the reserve and min(rows, budget / buffer_bytes); 0 rows
+ * when nothing fits.  Pure, saturating arithmetic; -1 only on bad arguments. */
+int mynah_backend_fixed_buffers_plan(size_t free_bytes, size_t total_bytes,
+                                     size_t rows, size_t buffer_bytes,
+                                     size_t per_row_other_bytes,
+                                     size_t *reserve_bytes, size_t *fit_rows);
+
 #endif
