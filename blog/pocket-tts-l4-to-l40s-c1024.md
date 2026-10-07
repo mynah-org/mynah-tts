@@ -531,17 +531,43 @@ screens, not with the soak.
 7. **Let the program say where it dies.** The silent exit was solved by listing the driver's exits
    and noticing which log line was missing, not by re-running the ladder.
 
-**Next.** A1a, L13b + L13d and A1b are bit-identical and recommended for large-row serving, but
-stay opt-in until an L4 regression run passes — the same rule the eleven defaults went through. After
-that: a 30-minute soak at C1024 on the L40S (everything above is a screen), re-running the RTX 6000
+**Next.** A1a, L13b + L13d and A1b were bit-identical and recommended for large-row serving, but
+stayed opt-in until an L4 regression run passed — the same rule the eleven defaults went through.
+That run is the next section; they are defaults now. After that: a 30-minute soak at C1024 on the L40S (everything above is a screen), re-running the RTX 6000
 Ada with A1b v2, and a build beyond `ROW_CAP=1024`, since at 95 % busy with RTF p95 0.746 there is
 still margin under the gate that the row cap does not let us use.
+
+## 13. Back to the L4: it got faster too
+
+I optimized for the faster GPU. Then I went back to the slower one — and it got faster too.
+
+The L4 is the opposite case from the L40S: it is GPU-bound, 88-90 % busy with the eleven defaults,
+so hiding host time should buy little there. The rule was still to check it before promoting the
+large-row set, on a Vast.ai L4 (EPYC 7702 host), default `ROW_CAP=384` build, 2-minute levels,
+audio-s/s / stream RTF p95 / TTFA p95:
+
+| level | the eleven defaults | + A1a + A1b (pools only) | + A1a + L13/L13b/L13d + A1b |
+|---|---:|---:|---:|
+| C256 | 354 / 0.715 / 117 ms (19 stalls) | 373 / 0.632 / 106 ms | **382 / 0.634 / 100 ms** (0 stalls) |
+| C288 | 361 / 0.735 / 128 ms | 373 / 0.702 / 118 ms | **378 / 0.712 / 112 ms** |
+| C320 | 367 / 0.788 / 137 ms | 381 / 0.757 / 126 ms | **382 / 0.775 / 121 ms** |
+
+The GPU went from 88-90 % to 98 % busy: even on the L4 the host loop was leaving 10 % of the card
+idle. The pools do most of the work (they remove the per-admission context build and the
+`cudaFree` behind it); the overlap package adds a few audio-s/s and another 5-6 ms off first audio,
+at a small RTF cost that stays far inside the gate. The identity checks passed on the L4 as well
+(32/32, 32/32, 95/95), so A1a, L13 + L13b + L13d and A1b are now on by default for CUDA serving,
+each with an `=0` rollback (`MYNAH_CUDA_STEP_OVERLAP=0` turns the whole overlap off). Ping-pong
+stays experimental.
+
+**L4 above C384: (pending)**
 
 ## Try it / links
 
 The full copy-paste version — build, NUMA check, pinned server, 4-vCPU and L4 variants, load test —
 is the **[large-row quick start in `docs/cuda-serving.md`](https://github.com/mynah-org/mynah-tts/blob/main/docs/cuda-serving.md#quick-start-large-row-serving)**.
-The short form, for one 48 GB GPU:
+The short form, for one 48 GB GPU (the large-row variables are defaults now, so the server line sets
+none of them):
 
 ```bash
 make cuda cuda-server CUDA_ARCH=sm_89 ROW_CAP=1024
@@ -549,8 +575,6 @@ nvidia-smi topo -m            # the GPU's CPU list, e.g. 32-63,96-127
 ulimit -Hn                    # must exceed the target concurrency
 
 MYNAH_THREADS=1 MYNAH_QUANT_GROUPS=none \
-MYNAH_CTX_HOST_POOL=1 MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1 \
-MYNAH_CUDA_FIRST_FRAME_FIRST=1 MYNAH_CUDA_SLOT_FIXED=1 \
 taskset -c 32-63,96-127 ./build/cuda/mynah-tts-server --device cuda -w 8 \
   --max-batch 1024 --max-inflight 1024 --max-pending 2048 \
   -p 8080 -m models/pocket-english-24l

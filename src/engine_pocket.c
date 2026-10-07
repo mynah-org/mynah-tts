@@ -1091,7 +1091,7 @@ struct mynah_engine_state {
     int cuda_slot_pool_mutex_ready;
     struct pocket_cuda_slot *cuda_slot_pool;
     size_t cuda_slot_pool_count;
-    /* MYNAH_CUDA_SLOT_FIXED (default off), resolved once at model load
+    /* MYNAH_CUDA_SLOT_FIXED (default on, CUDA only), resolved once at model load
      * (pocket_cuda_slot_fixed_resolve): 1 when pooled sets keep a backbone KV
      * of at least `cuda_slot_fixed_bytes` (`cuda_slot_fixed_positions` stored
      * positions) that a take reuses without a driver call. At most
@@ -1124,7 +1124,7 @@ struct mynah_engine_state {
     size_t cuda_slot_spare_reserve;
     size_t cuda_slot_spare_max;
     /* Idle host halves of request contexts (MYNAH_CTX_HOST_POOL, default
-     * off): both transformer states, the flow head, the SEANet state and the
+     * on for the CUDA backend): both transformer states, the flow head, the SEANet state and the
      * three projection scratches of a retired context, renewed for the next
      * one instead of freed and rebuilt.  `ctx_host_pool` is resolved once at
      * model load: 0 off, 1 on, 2 on and every taken cache zeroed (leak A/B). */
@@ -3908,22 +3908,37 @@ static void pocket_cuda_slot_pool_drain(mynah_engine_state *state);
 static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state);
 static void pocket_host_pool_drain(mynah_engine_state *state);
 
-/* MYNAH_CTX_HOST_POOL (default off): 0/unset off, 1 on, 2 on and every cache
- * a renewed state hands out zeroed (the leak A/B: the audio must be
- * bit-identical either way).  One start-up line per process when on. */
-static int pocket_host_pool_setting(void) {
+/* MYNAH_CTX_HOST_POOL: 0 off, 1 on, 2 on and every cache a renewed state
+ * hands out zeroed (the leak A/B: the audio must be bit-identical either
+ * way).  Unset: on (1) for the CUDA backend, where it was measured (=0 is the
+ * rollback); off for the CPU backend, which works with it but was not
+ * measured.  One start-up line per process when on. */
+static int pocket_host_pool_setting(const mynah_backend *backend) {
     const char *value = getenv("MYNAH_CTX_HOST_POOL");
-    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0) return 0;
-    const int mode = strcmp(value, "2") == 0 ? 2 : 1;
+    const int given = value != NULL && value[0] != '\0';
+    if (given && strcmp(value, "0") == 0) return 0;
+    if (!given && (backend == NULL ||
+                   strcmp(mynah_backend_name(backend), "cuda") != 0))
+        return 0;
+    const int mode = given && strcmp(value, "2") == 0 ? 2 : 1;
     static int announced = 0;
     if (!announced) {
         announced = 1;
-        fprintf(stderr,
-                "mynah-tts: MYNAH_CTX_HOST_POOL=%d: a retired request's host "
-                "state (transformer states, flow head, SEANet state, projection "
-                "scratch) is parked and renewed for the next request instead of "
-                "freed and rebuilt%s\n",
-                mode, mode == 2 ? "; renewed KV caches are zeroed (leak A/B)" : "");
+        if (given)
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CTX_HOST_POOL=%d: a retired request's host "
+                    "state (transformer states, flow head, SEANet state, "
+                    "projection scratch) is parked and renewed for the next "
+                    "request instead of freed and rebuilt%s (=0 to roll back)\n",
+                    mode,
+                    mode == 2 ? "; renewed KV caches are zeroed (leak A/B)" : "");
+        else
+            fprintf(stderr,
+                    "mynah-tts: MYNAH_CTX_HOST_POOL (default): a retired "
+                    "request's host state (transformer states, flow head, "
+                    "SEANet state, projection scratch) is parked and renewed "
+                    "for the next request instead of freed and rebuilt "
+                    "(=0 to roll back)\n");
     }
     return mode;
 }
@@ -4281,8 +4296,9 @@ static int pocket_model_init(const mynah_tts_model *model,
     /* A failed init only disables the CUDA slot pool; `_enabled` checks it. */
     if (pthread_mutex_init(&state->cuda_slot_pool_mutex, NULL) == 0)
         state->cuda_slot_pool_mutex_ready = 1;
-    /* MYNAH_CTX_HOST_POOL, read once; a failed init leaves it off. */
-    state->ctx_host_pool = pocket_host_pool_setting();
+    /* MYNAH_CTX_HOST_POOL, read once (default on for the CUDA backend); a
+     * failed init leaves it off. */
+    state->ctx_host_pool = pocket_host_pool_setting(model->backend);
     if (state->ctx_host_pool != 0 &&
         pthread_mutex_init(&state->ctx_host_pool_mutex, NULL) != 0)
         state->ctx_host_pool = 0;
@@ -4589,7 +4605,7 @@ static int pocket_model_init(const mynah_tts_model *model,
                         reason);
         }
         /* MYNAH_CUDA_SLOT_FIXED: resolved once here, after the KV element
-         * type; off unless the flag is set (one start-up line then). */
+         * type; on unless the flag is 0 (one start-up line). */
         if (resident_on) pocket_cuda_slot_fixed_resolve(state);
         fprintf(stderr,
                 "mynah-tts: pocket backend=cuda resident=%s qgroups=0x%04x "
@@ -4828,6 +4844,12 @@ static int pocket_caps(const mynah_tts_model *model,
     out->prefill_slice_tokens = pocket_prefill_slice_tokens(state);
     out->decode_batch_lends_pcm =
         (unsigned)pocket_pcm_direct_enabled(state->backend);
+    /* L13/L13b/L13d: measured on the CUDA backend only (bit-identical CLI
+     * --batch, --stream and server C1; faster at every measured L4 and L40S
+     * level); the CPU backend keeps them opt-in. */
+    out->overlap_by_default =
+        state->backend != NULL &&
+        strcmp(mynah_backend_name(state->backend), "cuda") == 0;
     return 0;
 }
 
@@ -5287,7 +5309,8 @@ static int pocket_cuda_slot_zero_kv_requested(void) {
 
 /* ------------------------------------------- MYNAH_CUDA_SLOT_FIXED
  *
- * Default off (unset or 0); read once at model load. A take from the slot
+ * Default on for the CUDA backend (=0 is the rollback; the CPU backend has
+ * no slot pool and never reads it); read once at model load. A take from the slot
  * pool used to keep a parked backbone KV only when it fit the new request's
  * starting estimate within a factor of two (pocket_cuda_slot_kv_fits);
  * otherwise the parked cache was cudaFree'd -- which waits for the whole
@@ -5453,19 +5476,22 @@ static size_t pocket_cuda_slot_fixed_env_size(const char *name, size_t fallback,
 }
 
 /* Model load, after the KV element type is decided. Leaves
- * state->cuda_slot_fixed 0 (today's pool) unless the flag is on, the pool
- * and the growable tile-path cache are on, and at least one cache fits. */
+ * state->cuda_slot_fixed 0 (the plain pool) when the flag is 0, when the pool
+ * or the growable tile-path cache is off, or when no cache fits. */
 static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
     const char *setting = getenv("MYNAH_CUDA_SLOT_FIXED");
+    const int given = setting != NULL && setting[0] != '\0';
     state->cuda_slot_fixed = 0;
-    if (setting == NULL || setting[0] == '\0' || strcmp(setting, "0") == 0)
-        return;
+    if (given && strcmp(setting, "0") == 0) return;
     if (!pocket_cuda_slot_pool_enabled(state) || !pocket_cuda_kv_grow_enabled() ||
         !pocket_cuda_prefill_tile_enabled()) {
         fprintf(stderr,
-                "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED=1 ignored: it needs "
-                "the CUDA slot pool, MYNAH_CUDA_KV_GROW and "
-                "MYNAH_CUDA_PREFILL_TILE on\n");
+                given ? "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED=1 ignored: it "
+                        "needs the CUDA slot pool, MYNAH_CUDA_KV_GROW and "
+                        "MYNAH_CUDA_PREFILL_TILE on\n"
+                      : "mynah-tts: MYNAH_CUDA_SLOT_FIXED (default) off: it needs "
+                        "the CUDA slot pool, MYNAH_CUDA_KV_GROW and "
+                        "MYNAH_CUDA_PREFILL_TILE on\n");
         return;
     }
     const char *size_setting = getenv("MYNAH_CUDA_SLOT_FIXED_POSITIONS");
@@ -5486,7 +5512,7 @@ static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
                    &position_bytes) != 0 ||
         pocket_mul(positions, position_bytes, &bytes) != 0 || bytes == 0u ||
         position_bytes > SIZE_MAX / POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH) {
-        fprintf(stderr, "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED=1 ignored "
+        fprintf(stderr, "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED ignored "
                         "(size overflow)\n");
         return;
     }
@@ -5494,7 +5520,7 @@ static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
     memset(&metrics, 0, sizeof(metrics));
     if (mynah_backend_metrics_get(state->backend, &metrics) != 0 ||
         metrics.device_memory_bytes == 0u) {
-        fprintf(stderr, "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED=1 ignored "
+        fprintf(stderr, "mynah-tts: warning: MYNAH_CUDA_SLOT_FIXED ignored "
                         "(the backend reports no device memory)\n");
         return;
     }
@@ -5506,11 +5532,12 @@ static void pocket_cuda_slot_fixed_resolve(mynah_engine_state *state) {
                                            &reserve, &fit);
     const double mib = 1024.0 * 1024.0, gib = mib * 1024.0;
     fprintf(stderr,
-            "mynah-tts: MYNAH_CUDA_SLOT_FIXED=1: pooled request sets keep a "
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED%s: pooled request sets keep a "
             "backbone KV of >= %zu positions (%.2f MiB, %s; %s), reused with "
             "no driver call; %zu rows x %.2f MiB = %.2f GiB against %.2f GiB "
             "free - %.2f GiB reserve (max(4 GiB, %.1f GiB / 5) + %zu x %zu MiB "
             "other per-row buffers) = %.2f GiB: ",
+            given ? "=1 (=0 to roll back)" : " (default; =0 to roll back)",
             positions, (double)bytes / mib,
             kv_bf16 ? (state->cuda_kv_int8 ? "int8 records" : "bf16") : "f32",
             size_set ? "MYNAH_CUDA_SLOT_FIXED_POSITIONS"
@@ -5812,7 +5839,7 @@ static void pocket_cuda_slot_fixed_replan(mynah_engine_state *state) {
     }
     const double mib = 1024.0 * 1024.0, gib = mib * 1024.0;
     fprintf(stderr,
-            "mynah-tts: MYNAH_CUDA_SLOT_FIXED=1 re-planned after the start-up "
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED re-planned after the start-up "
             "%s (mark %u): %.2f GiB free of %.2f GiB, margin %.2f GiB "
             "(max(2 GiB, total / 16) + sets still to make + spare reserve); "
             "cap %zu fixed caches of >= %zu positions (%.2f MiB) = %zu rows + "
@@ -5844,7 +5871,7 @@ static void pocket_cuda_slot_fixed_adapt(mynah_engine_state *state) {
         positions = POCKET_CUDA_SLOT_FIXED_ADAPT_HIGH;
     const size_t old = state->cuda_slot_fixed_positions;
     fprintf(stderr,
-            "mynah-tts: MYNAH_CUDA_SLOT_FIXED=1: %lu served requests reached "
+            "mynah-tts: MYNAH_CUDA_SLOT_FIXED: %lu served requests reached "
             "p50/p95/p99 %zu/%zu/%zu stored positions (admission estimate p95 "
             "%zu); new fixed caches: %zu -> %zu positions\n",
             __atomic_load_n(&g_fixlen_n[1], __ATOMIC_RELAXED),
@@ -10580,7 +10607,8 @@ static int pocket_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
 
 /* ------------------------------------------- host halves pool
  *
- * MYNAH_CTX_HOST_POOL (default off; works on every backend).  Building a
+ * MYNAH_CTX_HOST_POOL (default on for the CUDA backend, =0 rolls back; works
+ * on every backend, opt-in on the CPU).  Building a
  * request context allocates and clears megabytes of host state: the backbone
  * transformer state (KV cache sized for voice + text + step budget, a
  * prefill-tile row scratch), the Mimi transformer state (its windowed KV), the
@@ -16802,10 +16830,15 @@ static int pocket_check_gang(mynah_engine_state *state,
         int failed[POCKET_CHECK_MAX];
         /* MYNAH_CUDA_DECODE_OVERLAP: every other round goes through the
          * decode split instead, with one frame per row, which is the shape
-         * it queues (multi-frame ranges complete inside the submission). */
+         * it queues (multi-frame ranges complete inside the submission).
+         * Unset follows the serving default (on for the CUDA backend). */
         const char *split_env = getenv("MYNAH_CUDA_DECODE_OVERLAP");
-        const int split = split_env != NULL && split_env[0] != '\0' &&
-                          strcmp(split_env, "0") != 0 && (round % 2u) == 1u;
+        const int split_on =
+            split_env != NULL && split_env[0] != '\0'
+                ? strcmp(split_env, "0") != 0
+                : state->backend != NULL &&
+                      strcmp(mynah_backend_name(state->backend), "cuda") == 0;
+        const int split = split_on && (round % 2u) == 1u;
         for (size_t i = 0; i < count; ++i) {
             const size_t available = b.ctx[i]->frames - done_frames[i];
             size_t quantum = split ? 1u : (i % 3u) + 1u;

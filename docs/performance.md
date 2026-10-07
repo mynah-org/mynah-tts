@@ -27,8 +27,9 @@ stalls), English packs, mixed v2 corpus:
 | 24L | 1x NVIDIA L4 | CUDA | 160 | 184.5 | qualified, 2 x 30 min, WER | 2026-09-28 |
 | 24L | 1x NVIDIA L4 | CUDA | 288 | 341 | 10-min soak, 2026-10-02 defaults (bf16 KV) | 2026-10-02 |
 | 24L | 1x NVIDIA L4 | CUDA | 320 | 338 | 2-min screen, int8 KV | 2026-10-04 |
+| 24L | 1x NVIDIA L4 | CUDA | 320 | 382 | 2-min screen, large-row defaults (RTF p95 0.775) | [L4 (2026-10)](#nvidia-l4-24-gb) |
 | 24L | 1x NVIDIA L40S | CUDA | 384 (row cap) | 740 | 2-min screen, 2026-10-04 defaults | 2026-10-04 |
-| 24L | 1x NVIDIA L40S | CUDA | 1024 (row cap) | 1283 | 2-min screen, `ROW_CAP=1024` build, opt-in serving flags (RTF p95 0.746) | [thresholds (2026-10)](#pocket-cuda-serving-thresholds-2026-10) |
+| 24L | 1x NVIDIA L40S | CUDA | 1024 (row cap) | 1283 | 2-min screen, `ROW_CAP=1024` build, serving flags (default since 2026-10-07; RTF p95 0.746) | [thresholds (2026-10)](#pocket-cuda-serving-thresholds-2026-10) |
 
 How the CPU numbers were reached, one change at a time:
 2026-09-18 (C90) -> 2026-09-19 (C96, C110, C120) -> 2026-09-21 (C126) ->
@@ -1186,9 +1187,15 @@ one, are in [benchmarking.md, "Hosts used for the 2026-10 screens"](benchmarking
 | + L13 | `MYNAH_CUDA_STEP_OVERLAP=1` | the next AR step is queued before retire, admission and cancellation run |
 | + L13b | L13 + `MYNAH_CUDA_DECODE_OVERLAP=1` | the gang decode of step k also runs under AR step k+1 |
 | + L13d | L13b + `MYNAH_CUDA_FIRST_FRAME_FIRST=1` (the runs also set `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=3000`, inactive without `MYNAH_CUDA_FAST_FIRST_CHUNK=1`, which was not set) | new streams' first frames are decoded and delivered first, as their own small gang: 50-70 ms lower TTFA p95 for ~1-2 % throughput |
-| combined | 11 flags + A1a + L13 + L13b + L13d | the recommended large-row configuration, with A1b |
+| combined | 11 flags + A1a + L13 + L13b + L13d | the large-row configuration, with A1b |
 | + A1b | `MYNAH_CUDA_SLOT_FIXED=1` | pooled request sets keep a backbone KV of a fixed size, so an admission makes no `cudaFree` / `cudaMalloc` |
 | L26 | `MYNAH_CUDA_PINGPONG=2` | two half-batches in one engine, one's host work under the other's GPU work (experimental) |
+
+The variables in this table are the ones the runs set. Since 2026-10-07, A1a,
+L13 + L13b + L13d and A1b are default on CUDA serving as well (after the L4
+check below), so "combined + A1b" is what a CUDA server runs with nothing set;
+each keeps its `=0` rollback (`MYNAH_CUDA_STEP_OVERLAP=0` turns off the whole
+overlap package). L26 stays opt-in.
 
 **All of them are bit-identical** wherever batch composition is
 deterministic: CLI `--batch 32` (32/32 WAVs identical), CLI `--batch 32
@@ -1199,7 +1206,8 @@ A1a at `=1` and `=2` (renewed caches zeroed), A1b (first version) with and
 without zeroed KV and at 64 positions (forced growth), L26 below and above its
 split threshold, and the defaults tree against the same flags set explicitly.
 A1b v2 was checked the same way on the L40S (off, on, and at 64 positions):
-32/32, 32/32 and 166/166 identical. Under concurrency the
+32/32, 32/32 and 166/166 identical. On the L4, the eleven defaults plus A1a,
+L13 + L13b + L13d and A1b against the eleven alone: 32/32, 32/32 and 95/95. Under concurrency the
 batch composition follows arrival timing, so no serving mode is
 bit-reproducible there, with or without these flags.
 
@@ -1271,7 +1279,7 @@ audio-s/s is not comparable with the 2-minute screens (see `docs/benchmarking.md
 
 Same box, server pinned to the GPU node, every win on (the eleven defaults plus
 `MYNAH_CTX_HOST_POOL=1 MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1
-MYNAH_CUDA_FIRST_FRAME_FIRST=1 MYNAH_CUDA_SLOT_FIXED=1`), a `ROW_CAP=2048` build,
+MYNAH_CUDA_FIRST_FRAME_FIRST=1 MYNAH_CUDA_SLOT_FIXED=1`, all default since), a `ROW_CAP=2048` build,
 2-minute levels:
 
 | C | audio-s/s | RTF p95 | TTFA p95 | stalls@250 | GPU busy / power | reading |
@@ -1348,11 +1356,28 @@ A Vast.ai L4 on an EPYC 7702 host, `ROW_CAP=384` build (the default),
 | pre-flag base | C320 | 341 / 0.847 / 146 ms | 0 | 86 % | 71 W | |
 | 11 flags (default) | C320 | 354 / 0.820 / 142 ms | 0 | 90 % | 71 W | C352: 355 / 0.891 ✗ |
 | + L13 alone | C352 | 358 / 0.878 / 215 ms | 0 | 90 % | 71 W | |
-| + A1a, + L13b / L13d, + A1b | pending | | | | | |
 
 The 11 flags give +4 % audio-s/s and -0.03 RTF p95 at C288-C320, reproduced,
-with no regression in a leave-one-out of every flag. A1a, L13b + L13d and A1b
-stay opt-in until this table has its L4 row.
+with no regression in a leave-one-out of every flag.
+
+**The large-row set on the L4 (2026-10-07).** A Vast.ai L4 on an EPYC 7702
+host, `ROW_CAP=384`, 2-minute levels, one fresh server per configuration;
+audio-s/s / stream RTF p95 / TTFA p95. A separate session from the table
+above, so compare within this table:
+
+| level | 11 flags | + A1a + A1b (pools only) | + A1a + L13/L13b/L13d + A1b |
+|---|---:|---:|---:|
+| C256 | 354 / 0.715 / 117 ms (19 stalls) | 373 / 0.632 / 106 ms | **382 / 0.634 / 100 ms** (0 stalls) |
+| C288 | 361 / 0.735 / 128 ms | 373 / 0.702 / 118 ms | **378 / 0.712 / 112 ms** |
+| C320 | 367 / 0.788 / 137 ms | 381 / 0.757 / 126 ms | **382 / 0.775 / 121 ms** |
+
+GPU busy 88-90 % with the 11 flags, 98 % with the full set. The pools (A1a +
+A1b) bring most of the throughput and the best RTF p95; the overlap package
+adds up to 9 audio-s/s and takes another 5-6 ms off TTFA p95 for +0.002 to
++0.018 RTF p95, all well inside the gate. Bit-identical: 32/32, 32/32, 95/95.
+On this evidence the five became default on CUDA serving (`=0` rollbacks in
+[cuda-serving.md](cuda-serving.md#serving-flag-reference)). The L4 above C320
+with them has not been screened yet.
 
 ### Host lessons
 
@@ -1381,9 +1406,11 @@ decides the result as much as the GPU does.
   `EMFILE` ([server.md](server.md#open-file-limit)).
 - **The driver and platform can make admission expensive.** The same code paid
   < 1 ms per admission on the L40S host (driver 575) and 11-30 ms on the RTX
-  6000 Ada host (driver 565), because `cudaFree` synchronizes the device. If
-  `[CTX] cuda_backbone` is in milliseconds, use `MYNAH_CUDA_SLOT_FIXED=1`
-  (A1b).
+  6000 Ada host (driver 565), because `cudaFree` synchronizes the device. The
+  fixed slot pool (A1b, default since 2026-10-07) takes that call off the
+  admission path; if `[CTX] cuda_backbone` is still in milliseconds, check
+  that `MYNAH_CUDA_SLOT_FIXED=0` is not set and that its start-up line did
+  not report an auto-cap to few caches.
 - **Four vCPUs are enough** for C768 on an L40S with the combined
   configuration (-3 % against the full host; C896 projected at RTF p95
   ≈ 0.77, C1024 ≈ 0.88, borderline).

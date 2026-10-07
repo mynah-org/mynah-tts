@@ -66,7 +66,7 @@ how many requests stream at once with every one faster than real time.
 
 | Model | Hardware | Backend | Streams | Stream RTF p95 | Audio-s per s | First audio p95 | Status |
 |---|---|---|---:|---:|---:|---:|---|
-| Pocket 24L | 1x NVIDIA L40S (48 GB) | CUDA | **1024** | 0.746 | 1283 | 106 ms | 2-min screen, `ROW_CAP=1024` build, large-row variables ([cuda-serving](docs/cuda-serving.md#serving-loop-defaults-2026-10-07-and-large-row-serving)) |
+| Pocket 24L | 1x NVIDIA L40S (48 GB) | CUDA | **1024** | 0.746 | 1283 | 106 ms | 2-min screen, `ROW_CAP=1024` build, large-row defaults ([cuda-serving](docs/cuda-serving.md#serving-loop-defaults-2026-10-07-and-large-row-serving)) |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | **320** | 0.855 | 338 | 146 ms | 2-min screen, current defaults |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 288 | 0.782 | 335 | 134 ms | 2-min screen, current defaults |
 | Pocket 24L | 1x NVIDIA L4 (24 GB) | CUDA | 160 | 0.855 | 184.5 | 155 ms | qualified, 2 x 30 min, WER checked |
@@ -82,10 +82,13 @@ device-memory diet and int8 backbone KV. Profiles with every setting and its
 measured effect: [`configs/perf/`](configs/perf/README.md).
 
 On an L40S the limit was the single scheduler thread, not the GPU. With the
-serving-loop defaults of 2026-10-07 and a few opt-in variables (host-context
-pool, step and decode overlap, fixed KV slots) one L40S holds C1024 for a
+serving-loop defaults of 2026-10-07 (the eleven loop flags, then the
+host-context pool, step and decode overlap and fixed KV slots, all on by
+default on CUDA since the same day) one L40S holds C1024 for a
 30-minute soak at RTF p95 0.746, zero stalls, first audio p95 106 ms, ~1,400
-audio-s/s with the GPU 96 % busy; the defaults alone hold C768. In a 4-vCPU
+audio-s/s with the GPU 96 % busy; the eleven loop flags alone hold C768. The
+new defaults also make the L4 faster: C320 367 -> 382 audio-s/s, TTFA p95
+137 -> 121 ms. In a 4-vCPU
 affinity experiment (server pinned to 4 vCPUs) C1024 still held a 10-minute soak
 at RTF p95 0.752. The English 6-layer model holds C1536 at RTF p95 0.823 (~1,950
 audio-s/s) in a 30-minute soak. Per-GPU thresholds (L40S, RTX 6000 Ada, L4)

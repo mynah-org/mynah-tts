@@ -2439,33 +2439,40 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                         "graphs and codec-gang staging only ever cover widths up to "
                         "%zu\n",
                         max_batch, share_b, slot_capacity, width_b, mib, width_b);
-                /* Deferred release is on by default; KV growth without a drain
-                 * comes from MYNAH_CUDA_SLOT_FIXED (or MYNAH_CUDA_KV_VMM with bf16
-                 * KV). Warn only when one of them is missing. */
+                /* Deferred release and MYNAH_CUDA_SLOT_FIXED (KV growth without
+                 * a drain; MYNAH_CUDA_KV_VMM with bf16 KV also gives it) are on
+                 * by default. Warn only when one of them was rolled back. */
                 const char *dr = getenv("MYNAH_CUDA_DEFERRED_RELEASE");
                 if (dr != NULL && strcmp(dr, "0") == 0)
                     fprintf(stderr,
                             "driver: ping-pong with MYNAH_CUDA_DEFERRED_RELEASE=0: every "
                             "context release drains the device, the other group's work "
                             "included\n");
-                if (getenv("MYNAH_CUDA_SLOT_FIXED") == NULL &&
+                const char *sf = getenv("MYNAH_CUDA_SLOT_FIXED");
+                if (sf != NULL && strcmp(sf, "0") == 0 &&
                     getenv("MYNAH_CUDA_KV_VMM") == NULL)
                     fprintf(stderr,
-                            "driver: ping-pong without MYNAH_CUDA_SLOT_FIXED=1: a KV growth "
+                            "driver: ping-pong with MYNAH_CUDA_SLOT_FIXED=0: a KV growth "
                             "may drain the device, the other group's work included\n");
             }
         }
     }
 
-    /* MYNAH_CUDA_STEP_OVERLAP (default 0 = off): dispatch-ahead, see
-     * step_ahead_launch. Needs the engine hook and the sliced prefill (a
-     * one-shot `prepare` at admission would run while a step is queued); not
-     * with the decoder lane (sparse rows) or the parity dump. */
+    /* MYNAH_CUDA_STEP_OVERLAP: dispatch-ahead, see step_ahead_launch. Default
+     * on when the engine says so (caps.overlap_by_default: Pocket on the CUDA
+     * backend), off otherwise; =0 is the rollback and turns decode-ahead off
+     * with it, a nonzero value asks for it on any engine. Needs the engine
+     * hook and the sliced prefill (a one-shot `prepare` at admission would
+     * run while a step is queued); not with the decoder lane (sparse rows),
+     * the parity dump or ping-pong. */
     int step_overlap = 0;
     step_ahead *ahead = NULL;   /* NULL unless on */
+    const int overlap_default = caps.overlap_by_default != 0u;
     {
         const char *e = getenv("MYNAH_CUDA_STEP_OVERLAP");
-        if (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) {
+        const int given = e != NULL && e[0] != '\0';
+        const int want = given ? strcmp(e, "0") != 0 : overlap_default;
+        if (want) {
             const char *why =
                 pp != NULL ? "MYNAH_CUDA_PINGPONG is on"
                 : engine->step_launch == NULL ? "the engine cannot queue a step ahead"
@@ -2479,27 +2486,39 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 if (ahead == NULL) why = "out of memory";
             }
             if (why != NULL) {
-                fprintf(stderr, "driver: MYNAH_CUDA_STEP_OVERLAP ignored: %s\n", why);
+                /* Ping-pong already said it does not use the overlap. */
+                if (given)
+                    fprintf(stderr, "driver: MYNAH_CUDA_STEP_OVERLAP ignored: %s\n", why);
+                else if (pp == NULL)
+                    fprintf(stderr, "driver: step overlap (default) off: %s\n", why);
             } else {
                 step_overlap = 1;
                 ahead->pre = &pre;
                 ahead->max_batch = max_batch;
                 fprintf(stderr,
-                        "driver: step overlap ON (MYNAH_CUDA_STEP_OVERLAP): the next "
-                        "step is queued before retire, admission and cancellation, "
-                        "which run while the device steps; a request admitted "
-                        "meanwhile joins one step later\n");
+                        "driver: step overlap ON%s: the next step is queued before "
+                        "retire, admission and cancellation, which run while the "
+                        "device steps; a request admitted meanwhile joins one step "
+                        "later\n",
+                        given ? " (MYNAH_CUDA_STEP_OVERLAP; =0 to roll back)"
+                              : " by default (MYNAH_CUDA_STEP_OVERLAP=0 to roll "
+                                "back, decode overlap included)");
             }
         }
     }
-    /* MYNAH_CUDA_DECODE_OVERLAP (default 0 = off): decode-ahead, see
-     * dec_submit. Needs dispatch-ahead (it reorders that loop) and the
-     * engine's decode split. MYNAH_CUDA_FIRST_FRAME_FIRST (default 0) adds the
-     * first-frame gang, see dec_stream_gang. */
+    /* MYNAH_CUDA_DECODE_OVERLAP: decode-ahead, see dec_submit. Needs
+     * dispatch-ahead (it reorders that loop) and the engine's decode split.
+     * Default on with dispatch-ahead when the engine says so (=0 rolls back
+     * this half only); without dispatch-ahead it stays off, and an explicit
+     * nonzero value says why. MYNAH_CUDA_FIRST_FRAME_FIRST adds the
+     * first-frame gang, see dec_stream_gang: default on under the same
+     * engine default, =0 rolls back. */
     decode_ahead *dec = NULL;   /* NULL unless on */
     {
         const char *e = getenv("MYNAH_CUDA_DECODE_OVERLAP");
-        if (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) {
+        const int given = e != NULL && e[0] != '\0';
+        const int want = given ? strcmp(e, "0") != 0 : overlap_default && step_overlap;
+        if (want) {
             const char *why =
                 pp != NULL ? "MYNAH_CUDA_PINGPONG is on"
                 : !step_overlap ? "it needs MYNAH_CUDA_STEP_OVERLAP"
@@ -2511,7 +2530,10 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 if (dec == NULL) why = "out of memory";
             }
             if (why != NULL) {
-                fprintf(stderr, "driver: MYNAH_CUDA_DECODE_OVERLAP ignored: %s\n", why);
+                if (given)
+                    fprintf(stderr, "driver: MYNAH_CUDA_DECODE_OVERLAP ignored: %s\n", why);
+                else
+                    fprintf(stderr, "driver: decode overlap (default) off: %s\n", why);
             } else {
                 dec->lent = caps.decode_batch_lends_pcm != 0u;
                 dec->engine = engine;
@@ -2521,17 +2543,21 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 dec->ar_queued = &ahead->count;
                 dec->profile = serve_profile;
                 const char *f = getenv("MYNAH_CUDA_FIRST_FRAME_FIRST");
-                dec->first_frame_first = f != NULL && f[0] != '\0' && strcmp(f, "0") != 0;
+                const int f_given = f != NULL && f[0] != '\0';
+                dec->first_frame_first = f_given ? strcmp(f, "0") != 0 : overlap_default;
                 adm.poll = dec_poll;
                 adm.poll_ud = dec;
                 fprintf(stderr,
-                        "driver: decode overlap ON (MYNAH_CUDA_DECODE_OVERLAP): each "
-                        "step's decode is queued before the next step and delivered "
-                        "while it runs%s\n",
-                        dec->first_frame_first
-                            ? "; first frames are decoded and delivered first "
-                              "(MYNAH_CUDA_FIRST_FRAME_FIRST)"
-                            : "");
+                        "driver: decode overlap ON%s: each step's decode is queued "
+                        "before the next step and delivered while it runs%s\n",
+                        given ? " (MYNAH_CUDA_DECODE_OVERLAP; =0 to roll back)"
+                              : " by default (MYNAH_CUDA_DECODE_OVERLAP=0 to roll back)",
+                        !dec->first_frame_first ? ""
+                        : f_given ? "; first frames are decoded and delivered first "
+                                    "(MYNAH_CUDA_FIRST_FRAME_FIRST; =0 to roll back)"
+                                  : "; first frames are decoded and delivered first, "
+                                    "by default (MYNAH_CUDA_FIRST_FRAME_FIRST=0 to roll "
+                                    "back)");
             }
         }
     }

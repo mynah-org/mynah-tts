@@ -41,7 +41,7 @@ Peak GPU memory: 16.3 GB at `--max-batch 320` with int8 KV, 21.3 GB at
 defaults is pending, so C160 stays the qualified figure until it lands.
 
 A 4-vCPU host is enough: on the L4 the server needs about 1.3-1.4 cores, and
-pinning it to four cores cost 1.5%. On an L40S, with the large-row variables
+pinning it to four cores cost 1.5%. On an L40S, with the large-row defaults
 of section 7, a server confined to 4 vCPUs (two cores and their SMT siblings)
 held C768 at RTF p95 0.658, ~3 % below the full host (section 6); with the fixed
 slot pool (A1b) it held a 10-minute soak at C1024 at RTF p95 0.752 (affinity
@@ -204,15 +204,16 @@ For 1,000 concurrent listeners on L4s: 4 GPUs for the small model, 7 for the
 large one.
 
 **A larger GPU (L40S, RTX 6000 Ada).** On a GPU this fast one scheduler
-thread, not the GPU, sets the ceiling, so the build, the host and a few opt-in
-variables matter more than on the L4:
+thread, not the GPU, sets the ceiling, so the build, the host and the
+serving-loop defaults matter more than on the L4:
 
 - Build with `ROW_CAP=1024` (section 2) and start with `--max-batch 1024
   --max-inflight 1024`.
-- With the defaults alone an L40S holds **C768** (867 audio-s/s, stream RTF p95
-  0.829); with the recommended large-row variables of section 7 it holds
-  **C1024 at RTF p95 0.746, 1283 audio-s/s, TTFA p95 106 ms**, the GPU 95 %
-  busy (2-minute screens on a Xeon Gold 6430 host).
+- With the eleven serving-loop defaults alone an L40S holds **C768** (867
+  audio-s/s, stream RTF p95 0.829); with the large-row defaults of section 7
+  (on since 2026-10-07, no variable to set) it holds **C1024 at RTF p95 0.746,
+  1283 audio-s/s, TTFA p95 106 ms**, the GPU 95 % busy (2-minute screens on a
+  Xeon Gold 6430 host).
 - Pin the server to the GPU's NUMA node, prefer a host with fast cores, and
   check the open-file limit ([server.md](server.md#open-file-limit)).
 - **A small-core host (4 vCPUs) is enough for C768.** With the server confined
@@ -238,7 +239,8 @@ table below (shared voice through one sync) read on the L4 24L 60-s knees:
 stream RTF p95 0.594-0.607 at C208 and 0.710-0.714 at C256, ~303-306 audio-s/s,
 TTFA p95 ~102-104 ms at C208, against 1.03 with stalls at C208 for the
 2026-09-28 defaults. The 2026-10-07 rows (deferred release through the
-delivery helpers) take the serial host loop off the critical path: see
+delivery helpers, then the host-context pool, the step and decode overlap and
+the fixed slot pool) take the serial host loop off the critical path: see
 "Serving-loop defaults" below. **Set only the required
 variable**; everything else exists to roll a change back while debugging, or
 to opt into something that is not a production default. A profile run refuses
@@ -307,13 +309,18 @@ never read it.
 | `MYNAH_CUDA_HIDDEN_LAZY` | `0` | one-sync steps keep the backbone output on the GPU (finite check on the GPU, host copy only on demand) | 2026-10-07 serving-loop default |
 | `MYNAH_CUDA_KV_TABLE_CACHE` | `0` | the attention-cache pointer tables are rewritten only for rows whose cache changed | 2026-10-07 serving-loop default |
 | `MYNAH_CUDA_DECODER_VALIDATE_ONCE` | `0` | the decoder gang's topology check runs once per decoder, then by compatibility class | 2026-10-07 serving-loop default |
+| `MYNAH_CTX_HOST_POOL` (A1a) | `0` (`2` keeps it on and zeroes renewed caches, the leak A/B) | a finished request's host-side state (backbone and codec states, flow head, scratch) is renewed for the next admission instead of rebuilt. CUDA backend only; the CPU backend keeps it opt-in (`=1`) | 2026-10-07 large-row default; L40S C1024 880 -> 1112 audio-s/s, RTF p95 1.076 -> 0.852 |
+| `MYNAH_CUDA_STEP_OVERLAP` (L13) | `0` (turns the whole overlap off: L13, L13b and L13d) | dispatch-ahead: the next AR step is queued before the previous step's retire, admission and cancellation run. CUDA backend only | 2026-10-07 large-row default, as one package with the two rows below (alone it gave the same throughput with TTFA p95 +45-60 ms) |
+| `MYNAH_CUDA_DECODE_OVERLAP` (L13b, needs L13) | `0` (this half only) | the gang decode of step k runs under AR step k+1 | 2026-10-07 large-row default; L40S C896 passes (RTF p95 0.853) where the eleven defaults fail |
+| `MYNAH_CUDA_FIRST_FRAME_FIRST` (L13d, with L13b) | `0` (this part only) | new streams' first frames are decoded and delivered as their own small gang first | 2026-10-07 large-row default; TTFA p95 -50 to -70 ms for ~1-2 % throughput |
+| `MYNAH_CUDA_SLOT_FIXED` (A1b; `MYNAH_CUDA_SLOT_FIXED_POSITIONS`, `MYNAH_CUDA_SLOT_FIXED_ROWS`) | `0` | pooled request sets keep a backbone KV of at least a fixed size F, so taking one from the pool makes no allocation or free. F starts at 384 stored positions (19.1 MiB with int8 KV at 24 layers, ~26 s of audio) and moves once, after 1024 served requests, to the 95th percentile of the lengths requests really reached (320..768); `_POSITIONS` fixes it. The cap is provisional at load; the server re-plans it after its start-up walk and again before traffic (`mynah_tts_startup_mark`): it frees the walk's long caches, measures free memory and caps at min(rows + spares, (free - max(2 GiB, total/16)) / F), then fills the parked sets and a small growth reserve (1 in 32 rows, F + 256 positions); when nothing fits it falls back to the plain slot pool. A row that outgrows its cache grows with no device-wide sync (a spare, a parked set's larger cache, or a new allocation within the cap; the old cache is parked, never freed), and a take never frees a parked cache. Needs the slot pool, KV grow and the prefill tile; `MYNAH_SERVE_PROFILE=1` shows zero-call vs fallback takes, the fixed-cache counts, growths by source and the served length percentiles in `[CTX]` | 2026-10-07 large-row default; L40S C1024 1156 -> 1283 audio-s/s, RTF p95 0.843 -> 0.746, VRAM 34 GB at the end; RTX 6000 Ada C768 455 -> 1114 audio-s/s (first version) |
 
 ### Opt-in (off by default)
 
-Most rows here are not production settings. The exceptions are the rows marked
-**recommended for large-row serving**: on a 48 GB GPU with a `ROW_CAP=1024`
-build, set them together (see "Serving-loop defaults (2026-10-07) and
-large-row serving" below).
+The rows here are not production settings. (The large-row rows that used to be
+here, the host-context pool, the step and decode overlap with first frame
+first, and the fixed slot pool, are on by default since 2026-10-07; see the
+table above.)
 
 | variable | effect | why it is off |
 |---|---|---|
@@ -326,13 +333,8 @@ large-row serving" below).
 | `MYNAH_CUDA_FAST_MATH=1` | FP16 GEMMs | not qualified |
 | `MYNAH_CUDA_CODEC_BATCH=1` | older multi-row codec path | fails the waveform parity gate |
 | `MYNAH_CUDA_ALLOW_CPU_STAGES=1` | lets hot stages run on the CPU | 20-30x slower while reporting CUDA: never in production |
-| `MYNAH_CTX_HOST_POOL=1` (A1a) | a finished request's host-side state (backbone and codec states, flow head, scratch) is renewed for the next admission instead of rebuilt | **recommended for large-row serving** (see below); NVIDIA L40S C1024: 880 -> 1112 audio-s/s, RTF p95 1.076 -> 0.852; off by default pending an L4 check |
-| `MYNAH_CUDA_STEP_OVERLAP=1` (L13) | dispatch-ahead: the next AR step is queued before the previous step's retire, admission and cancellation run | **not recommended alone**: L40S about the same throughput as without it, L4 +1 %, TTFA p95 +45-60 ms on both. Use it only as the base of the row below |
-| `MYNAH_CUDA_DECODE_OVERLAP=1` (L13b, needs `MYNAH_CUDA_STEP_OVERLAP=1`) | the gang decode of step k runs under AR step k+1 | **recommended for large-row serving** with the row below; L40S C896 passes (RTF p95 0.853) where the defaults fail; off by default pending an L4 check |
-| `MYNAH_CUDA_FIRST_FRAME_FIRST=1` (L13d, with `MYNAH_CUDA_DECODE_OVERLAP=1`) | new streams' first frames are decoded and delivered as their own small gang first | **recommended for large-row serving**; TTFA p95 -50 to -70 ms for ~1-2 % throughput; off by default pending an L4 check. (The runs also set `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=3000`, which acts only with `MYNAH_CUDA_FAST_FIRST_CHUNK=1`; that was not set, so the late wait was not part of the measurement) |
-| `MYNAH_CUDA_FAST_FIRST_CHUNK=1` (with `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=N`, 0..20000, default 0) | late admission: a second admission and prefill pass right before each step, and, when a row retired in the previous step, a hold of up to N µs for a new arrival | L4 C64: with N = 3000, TTFA p50 69 -> 39 ms for -4.6 % throughput; at C160 the hold costs RTF (0.840 -> 0.892) for no TTFA gain. Only for deployments well below their knee; not part of the large-row set |
-| `MYNAH_CUDA_SLOT_FIXED=1` (A1b; `MYNAH_CUDA_SLOT_FIXED_POSITIONS`, `MYNAH_CUDA_SLOT_FIXED_ROWS`) | pooled request sets keep a backbone KV of at least a fixed size F, so taking one from the pool makes no allocation or free. F starts at 384 stored positions (19.1 MiB with int8 KV at 24 layers, ~26 s of audio) and moves once, after 1024 served requests, to the 95th percentile of the lengths requests really reached (320..768); `_POSITIONS` fixes it. The cap is provisional at load; the server re-plans it after its start-up walk and again before traffic (`mynah_tts_startup_mark`): it frees the walk's long caches, measures free memory and caps at min(rows + spares, (free - max(2 GiB, total/16)) / F), then fills the parked sets and a small growth reserve (1 in 32 rows, F + 256 positions). A row that outgrows its cache grows with no device-wide sync (a spare, a parked set's larger cache, or a new allocation within the cap; the old cache is parked, never freed), and a take never frees a parked cache | for hosts where a misfit take (`cudaFree` + `cudaMalloc`) costs milliseconds per admission; `MYNAH_SERVE_PROFILE=1` shows zero-call vs fallback takes, the fixed-cache counts, growths by source and the served length percentiles in `[CTX]`; **recommended for large-row serving**: NVIDIA L40S C1024 with the rows above, 1156 -> 1283 audio-s/s, RTF p95 0.843 -> 0.746, all 1056 planned caches live, VRAM 34 GB at the end; RTX 6000 Ada C768 455 -> 1114 audio-s/s (first version); off by default pending an L4 check |
-| `MYNAH_CUDA_PINGPONG=2` (L26; `MYNAH_CUDA_PINGPONG_MIN`, default 128 rows) | **experimental.** Two groups of rows in one engine: the scheduler finishes, admits and launches one group while the other group's decode and AR step run | RTX 6000 Ada, `--max-batch 768`, with A1a and A1b: 92 % of the host time hidden, but 7-8 % slower than L13 + L13b once the GPU is >= 93 % busy (C640 1110 vs 1205, C768 1037 vs 1111 audio-s/s), because of the stream syncs it reaches while an item is queued. Bit-identical. A 1024-row run ran out of device memory, so it was measured at 768 rows |
+| `MYNAH_CUDA_FAST_FIRST_CHUNK=1` (with `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=N`, 0..20000, default 0) | late admission: a second admission and prefill pass right before each step, and, when a row retired in the previous step, a hold of up to N µs for a new arrival | L4 C64: with N = 3000, TTFA p50 69 -> 39 ms for -4.6 % throughput; at C160 the hold costs RTF (0.840 -> 0.892) for no TTFA gain. Only for deployments well below their knee; not part of the large-row defaults |
+| `MYNAH_CUDA_PINGPONG=2` (L26; `MYNAH_CUDA_PINGPONG_MIN`, default 128 rows) | **experimental.** Two groups of rows in one engine: the scheduler finishes, admits and launches one group while the other group's decode and AR step run | RTX 6000 Ada, `--max-batch 768`, with A1a and A1b: 92 % of the host time hidden, but 7-8 % slower than L13 + L13b (now default) once the GPU is >= 93 % busy (C640 1110 vs 1205, C768 1037 vs 1111 audio-s/s), because of the stream syncs it reaches while an item is queued. Bit-identical. A 1024-row run ran out of device memory, so it was measured at 768 rows |
 
 ### Serving-loop defaults (2026-10-07) and large-row serving
 
@@ -344,25 +346,32 @@ count follows the usable CPUs). Each one gives bit-identical audio wherever
 batch composition is the same (CLI `--batch 32`, CLI `--batch 32 --stream` and
 the server at C1) and keeps its variable as a rollback.
 
-**Recommended for large-row serving** (`ROW_CAP=1024` build, 48 GB GPU): the
-defaults plus
+**Large-row defaults (2026-10-07).** Five more rows of that table, first
+measured as large-row opt-ins on the L40S, are on by default on CUDA serving
+since they passed the same L4 regression check: the host-context pool (A1a),
+the step and decode overlap with first frame first (L13 + L13b + L13d, one
+package) and the fixed slot pool (A1b). Nothing needs to be set for them. Each
+keeps a rollback:
 
 ```bash
-MYNAH_CTX_HOST_POOL=1 \
-MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1 \
-MYNAH_CUDA_FIRST_FRAME_FIRST=1 \
-MYNAH_CUDA_SLOT_FIXED=1
+MYNAH_CTX_HOST_POOL=0           # host state rebuilt per request
+MYNAH_CUDA_STEP_OVERLAP=0       # the whole overlap package off (L13, L13b, L13d)
+MYNAH_CUDA_DECODE_OVERLAP=0     # keep dispatch-ahead, decode at retire as before
+MYNAH_CUDA_FIRST_FRAME_FIRST=0  # keep both overlaps, no first-frame gang
+MYNAH_CUDA_SLOT_FIXED=0         # plain slot pool (a misfit take frees and reallocates)
 ```
 
-(The measured runs also set `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=3000`. It
-has no effect without `MYNAH_CUDA_FAST_FIRST_CHUNK=1`, which they did not set,
-so the set above is the measured configuration.)
-
-Each was bit-identical in the same checks (A1b in both its first version and its
-v2 sizing), and they stay opt-in until an L4
-regression check (the same rule the eleven defaults passed).
-`MYNAH_CUDA_STEP_OVERLAP` alone is not recommended, and `MYNAH_CUDA_PINGPONG`
-is experimental.
+They are on for the CUDA backend only; on the CPU backend they stay off
+(opt-in where they apply), so CPU serving and a CPU CLI run are unchanged. A
+CUDA CLI `--batch` run goes through the same serving loop and uses them too,
+which is how the identity checks exercise them. The decode overlap
+needs dispatch-ahead, so with `MYNAH_CUDA_STEP_OVERLAP=0` it stays off; the
+fixed slot pool keeps its VRAM plan and falls back to the plain slot pool
+when no fixed cache fits. Each was bit-identical in the same checks as the
+eleven (CLI `--batch 32`, `--batch 32 --stream`, server C1; A1b in both its
+first version and its v2 sizing; on the L4 32/32, 32/32 and 95/95).
+`MYNAH_CUDA_PINGPONG` stays experimental and opt-in; when set it replaces the
+overlap package.
 
 Measured on an NVIDIA L40S (Xeon Gold 6430 host, server pinned to the GPU's
 NUMA node), `ROW_CAP=1024` build, 2-minute levels:
@@ -370,22 +379,34 @@ NUMA node), `ROW_CAP=1024` build, 2-minute levels:
 | configuration | C1024 audio-s/s | stream RTF p95 | TTFA p95 | GPU busy |
 |---|---:|---:|---:|---:|
 | the eleven defaults | 880 | 1.076 (162,015 stalls) | 181 ms | 64 % |
-| + `MYNAH_CTX_HOST_POOL=1` | 1112 | 0.852 | 147 ms | 84 % |
-| + step and decode overlap, first frame first | 1156 | 0.843 | 127 ms | 88 % |
-| + `MYNAH_CUDA_SLOT_FIXED=1` (the recommended set) | **1283** | **0.746** | **106 ms** | 95 % |
+| + host-context pool (A1a) | 1112 | 0.852 | 147 ms | 84 % |
+| + step and decode overlap, first frame first (L13 + L13b + L13d) | 1156 | 0.843 | 127 ms | 88 % |
+| + fixed slot pool (A1b): today's defaults | **1283** | **0.746** | **106 ms** | 95 % |
 
 Before the eleven defaults the same GPU did not hold C768 on this host; with
 them it holds C768 (0.829), and C896 runs with 0 stalls where it had 80,583. On
-the L4 (GPU-bound, `ROW_CAP=384`) they give +4 % audio-s/s and -0.03 RTF p95
-at C288-C320, with no regression. Every configuration and GPU, with TTFA,
-power and the host lessons:
+the L4 (GPU-bound, `ROW_CAP=384`) the eleven give +4 % audio-s/s and -0.03 RTF
+p95 at C288-C320, with no regression.
+
+The five large-row defaults on the NVIDIA L4 (Vast.ai, EPYC 7702 host, default
+`ROW_CAP=384` build, 2-minute levels), audio-s/s / stream RTF p95 / TTFA p95:
+
+| level | the eleven defaults | + A1a + A1b (pools only) | + A1a + L13/L13b/L13d + A1b (today's defaults) |
+|---|---:|---:|---:|
+| C256 | 354 / 0.715 / 117 ms (19 stalls) | 373 / 0.632 / 106 ms | **382 / 0.634 / 100 ms** (0 stalls) |
+| C288 | 361 / 0.735 / 128 ms | 373 / 0.702 / 118 ms | **378 / 0.712 / 112 ms** |
+| C320 | 367 / 0.788 / 137 ms | 381 / 0.757 / 126 ms | **382 / 0.775 / 121 ms** |
+
+GPU busy goes from 88-90 % to 98 %. So the GPU-bound L4 gains too: up to
++8 % audio-s/s and 16-17 ms less TTFA p95 at every level. Every
+configuration and GPU, with TTFA, power and the host lessons:
 [performance.md](performance.md#pocket-cuda-serving-thresholds-2026-10).
 
 ### Quick start: large-row serving
 
 Ready-to-run commands for one 48 GB GPU (NVIDIA L40S or RTX 6000 Ada) at up
-to 1024 streams, as measured. The eleven serving-loop defaults need no
-variable; the line below adds only the large-row opt-ins.
+to 1024 streams, as measured. The serving-loop defaults, the large-row ones
+included, need no variable: the server line only sets threads and pinning.
 
 **1. Build** with room for 1024 rows:
 
@@ -405,18 +426,19 @@ ulimit -Hn                    # must exceed the target concurrency (server.md, o
 
 ```bash
 MYNAH_THREADS=1 MYNAH_QUANT_GROUPS=none \
-MYNAH_CTX_HOST_POOL=1 MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1 \
-MYNAH_CUDA_FIRST_FRAME_FIRST=1 MYNAH_CUDA_SLOT_FIXED=1 \
 taskset -c 32-63,96-127 ./build/cuda/mynah-tts-server --device cuda -w 8 \
   --max-batch 1024 --max-inflight 1024 --max-pending 2048 \
   -p 8080 -m models/pocket-english-24l
 ```
 
 Add `MYNAH_SERVE_PROFILE=1` for the `[SERVE]` report at shutdown and the
-`[CTX]` lines during the run. Each opt-in prints one start-up line when it is
-active (`step overlap ON`, `decode overlap ON ... first frames ...`,
-`MYNAH_CTX_HOST_POOL=1 ...`); a missing line means the variable was ignored,
-and the reason is printed instead.
+`[CTX]` lines during the run. Each large-row default prints one start-up line
+when it is active (`MYNAH_CTX_HOST_POOL (default) ...`, `step overlap ON by
+default`, `decode overlap ON by default ... first frames ...`,
+`MYNAH_CUDA_SLOT_FIXED (default; =0 to roll back) ...`), each naming its
+rollback; a missing line means the feature is off, and the reason is printed
+instead. To roll one back for an A/B, put its `=0` from the block above in
+front of the command, e.g. `MYNAH_CUDA_STEP_OVERLAP=0` for the whole overlap.
 
 **4-vCPU variant.** The same command with the server confined to two physical
 cores and their SMT siblings on the GPU's node (siblings:
@@ -426,15 +448,14 @@ C1024 is projected at the gate, so start at 768:
 
 ```bash
 MYNAH_THREADS=1 MYNAH_QUANT_GROUPS=none \
-MYNAH_CTX_HOST_POOL=1 MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1 \
-MYNAH_CUDA_FIRST_FRAME_FIRST=1 MYNAH_CUDA_SLOT_FIXED=1 \
 taskset -c 32,33,96,97 ./build/cuda/mynah-tts-server --device cuda -w 8 \
   --max-batch 768 --max-inflight 768 --max-pending 2048 \
   -p 8080 -m models/pocket-english-24l
 ```
 
 **NVIDIA L4 variant (≤ 384 rows).** The default `ROW_CAP=384` build and the
-defaults only: the large-row opt-ins have not been checked on the L4 yet.
+defaults; the large-row defaults apply here too (C320 367 -> 382 audio-s/s,
+TTFA p95 137 -> 121 ms against the eleven alone).
 
 ```bash
 make cuda cuda-server CUDA_ARCH=sm_89
@@ -461,9 +482,8 @@ server, runs the levels and prints one line each
 ```bash
 TAG=large LEVELS="768 896 1024" PRE=640 PROCS=4 DUR=120 \
   PIN=32-63,96-127 CLIPIN=0-31,64-95 \
-  ENVS="MYNAH_CTX_HOST_POOL=1 MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1 \
-        MYNAH_CUDA_FIRST_FRAME_FIRST=1 MYNAH_CUDA_SLOT_FIXED=1" \
   timeout 1800 tools/gpu/knee_closed.sh
+# A/B against a rollback: the same line with ENVS="MYNAH_CUDA_STEP_OVERLAP=0"
 ```
 
 Pass: `rtf95` ≤ 0.88, `st250 0`, `fail 0` at the level you will serve.
@@ -473,7 +493,8 @@ Before the first level, run the 3-minute thermal check of benchmarking.md.
 
 Every variable of the October serving-loop work, as the code reads it.
 "Default on" flags are on when unset and off at `=0` (any other value keeps
-them on). Opt-ins are off when unset or `=0`. Effects are 2-minute screens
+them on). Opt-ins are off when unset or `=0`. The large-row defaults (A1a,
+L13/L13b/L13d, A1b) are on for the CUDA backend only. Effects are 2-minute screens
 (performance.md); L40S = Xeon Gold 6430 reference host, L4 = EPYC 7702 host.
 
 | flag | default | what it does | when to use | measured effect | rollback |
@@ -489,22 +510,22 @@ them on). Opt-ins are off when unset or `=0`. Effects are 2-minute screens
 | `MYNAH_CUDA_HIDDEN_LAZY` (L21) | on | one-sync steps keep the backbone output on the GPU; host copy on demand | always | L40S ~-2 % without it | `=0` |
 | `MYNAH_CUDA_KV_TABLE_CACHE` (L22) | on | KV pointer tables rewritten only for rows whose cache changed | always | neutral on the L4 | `=0` |
 | `MYNAH_CUDA_DECODER_VALIDATE_ONCE` (L24) | on | decoder gang topology check once per decoder, then by compatibility class | always | neutral on the L4 | `=0` |
-| `MYNAH_CTX_HOST_POOL` (A1a) | off | a retired request's host state is renewed for the next admission instead of rebuilt; `=2` also zeroes renewed caches (leak A/B) | large-row serving | L40S C1024 880 -> 1112 audio-s/s, RTF p95 1.076 -> 0.852 | unset or `=0` |
-| `MYNAH_CUDA_STEP_OVERLAP` (L13) | off | the next AR step is queued before retire, admission and cancellation | only as the base of L13b | alone: same throughput, TTFA p95 +45-60 ms | unset or `=0` |
-| `MYNAH_CUDA_DECODE_OVERLAP` (L13b) | off; needs L13 | the gang decode of step k runs under step k+1 | large-row serving | L40S C896 passes (0.853) where the defaults fail | unset or `=0` |
-| `MYNAH_CUDA_FIRST_FRAME_FIRST` (L13d) | off; needs L13b | new streams' first frames decoded and delivered first, as their own small gang | large-row serving | TTFA p95 -50 to -70 ms for ~1-2 % throughput | unset or `=0` |
+| `MYNAH_CTX_HOST_POOL` (A1a) | on for the CUDA backend (CPU: off) | a retired request's host state is renewed for the next admission instead of rebuilt; `=2` also zeroes renewed caches (leak A/B) | always | L40S C1024 880 -> 1112 audio-s/s, RTF p95 1.076 -> 0.852; L4 with A1b C256 354 -> 373, C320 367 -> 381 | `=0` |
+| `MYNAH_CUDA_STEP_OVERLAP` (L13) | on for the CUDA backend (CPU: off), with L13b and L13d as one package | the next AR step is queued before retire, admission and cancellation | always (as the package) | the package, on top of A1a + A1b on the L4: +1 to +9 audio-s/s and TTFA p95 -5 to -6 ms (C320 381 -> 382, 126 -> 121 ms) for RTF p95 +0.002 to +0.018; on top of A1a on the L40S C1024: 1112 -> 1156 audio-s/s, RTF p95 0.852 -> 0.843, TTFA p95 147 -> 127 ms. Alone it gave the same throughput with TTFA p95 +45-60 ms | `=0`: the whole package off |
+| `MYNAH_CUDA_DECODE_OVERLAP` (L13b) | on with L13; off when L13 is off | the gang decode of step k runs under step k+1 | always | L40S C896 passes (0.853) where the eleven defaults fail | `=0`: this half only |
+| `MYNAH_CUDA_FIRST_FRAME_FIRST` (L13d) | on with L13b | new streams' first frames decoded and delivered first, as their own small gang | always | TTFA p95 -50 to -70 ms for ~1-2 % throughput | `=0`: this part only |
 | `MYNAH_CUDA_FAST_FIRST_CHUNK` + `_WAIT_US` | off; wait 0 µs (max 20000) | late admission pass before each step, optional hold for an arrival | low load, well below the knee | L4 C64 TTFA p50 69 -> 39 ms at 3000 µs, -4.6 % throughput; hurts RTF near the knee. `_WAIT_US` alone does nothing | unset or `=0` |
-| `MYNAH_CUDA_SLOT_FIXED` (A1b) | off; needs the slot pool, KV grow and prefill tile (all default on) | pooled sets keep a fixed-size backbone KV: an admission makes no `cudaFree` / `cudaMalloc`; growth without a device-wide sync | large-row serving; any host where `[CTX] cuda_backbone` is in ms | L40S C1024 1156 -> 1283 audio-s/s, RTF p95 0.843 -> 0.746; RTX 6000 Ada C768 455 -> 1114 | unset or `=0` |
+| `MYNAH_CUDA_SLOT_FIXED` (A1b) | on for CUDA serving; needs the slot pool, KV grow and prefill tile (all default on); the VRAM cap and its auto-cap stay, and the plain pool is used when nothing fits | pooled sets keep a fixed-size backbone KV: an admission makes no `cudaFree` / `cudaMalloc`; growth without a device-wide sync | always; most visible on hosts where `[CTX] cuda_backbone` is in ms | L40S C1024 1156 -> 1283 audio-s/s, RTF p95 0.843 -> 0.746; RTX 6000 Ada C768 455 -> 1114 | `=0` |
 | `MYNAH_CUDA_SLOT_FIXED_POSITIONS` | 384, then the served p95 after 1024 requests | fixed cache size F (64..65536, rounded up to 64) | only to pin F | | unset |
 | `MYNAH_CUDA_SLOT_FIXED_ROWS` | the build's `ROW_CAP` | upper bound on fixed caches (1..`ROW_CAP`) | to cap A1b's VRAM | | unset |
-| `MYNAH_CUDA_PINGPONG` (L26) | off; only `=2` accepted | two row groups in one engine, one's host work under the other's GPU work; not with L13 / L13b | experimental | 7-8 % slower than L13 + L13b once the GPU is ≥ 93 % busy | unset or `=0` |
+| `MYNAH_CUDA_PINGPONG` (L26) | off; only `=2` accepted | two row groups in one engine, one's host work under the other's GPU work; replaces L13 / L13b when set | experimental | 7-8 % slower than L13 + L13b once the GPU is ≥ 93 % busy | unset or `=0` |
 | `MYNAH_CUDA_PINGPONG_MIN` | 128 rows | below this many rows the loop does not split | with L26 only | | unset |
 | `MYNAH_SERVE_PROFILE` | off | `[SERVE]` report at shutdown, `[CTX]` lines, per-feature counters | diagnostics, benchmarks | | **unset**: any value, `=0` included, turns it on |
 
 `MYNAH_CUDA_PINGPONG` warns when deferred release is rolled back
-(`MYNAH_CUDA_DEFERRED_RELEASE=0`) and when neither `MYNAH_CUDA_SLOT_FIXED=1` nor
-`MYNAH_CUDA_KV_VMM=1` is set, because a KV growth may then drain the device
-(`MYNAH_CUDA_KV_VMM` applies only to bf16 KV).
+(`MYNAH_CUDA_DEFERRED_RELEASE=0`) and when the fixed slot pool is rolled back
+(`MYNAH_CUDA_SLOT_FIXED=0`) without `MYNAH_CUDA_KV_VMM=1`, because a KV growth
+may then drain the device (`MYNAH_CUDA_KV_VMM` applies only to bf16 KV).
 
 ### Pedantic mode (rollback to fp32, batch-invariant)
 

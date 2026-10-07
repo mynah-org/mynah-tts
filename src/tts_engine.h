@@ -65,6 +65,13 @@ typedef struct {
      * nothing about `decode_audio`, which always hands over ownership.
      * Appended. */
     unsigned decode_batch_lends_pcm;
+    /* Non-zero when the serving loop should run dispatch-ahead and
+     * decode-ahead with first-frame-first (MYNAH_CUDA_STEP_OVERLAP,
+     * MYNAH_CUDA_DECODE_OVERLAP, MYNAH_CUDA_FIRST_FRAME_FIRST) unless those
+     * variables say otherwise: the engine measured them on this backend.
+     * Zero leaves all three opt-in. A policy default, never a dispatch
+     * predicate. Appended. */
+    unsigned overlap_by_default;
 } mynah_engine_caps;
 
 typedef struct {

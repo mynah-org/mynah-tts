@@ -11,7 +11,7 @@
 #   WARM     warm-up seconds per level, discarded               (default: 15)
 #   PRE      optional warm-up level run first (45 s, not reported), e.g. 640
 #   PROCS    load-generator processes (pocket_ladder --client-procs) (default: 4)
-#   ENVS     extra server environment, e.g. "MYNAH_CTX_HOST_POOL=1"
+#   ENVS     extra server environment, e.g. "MYNAH_CTX_HOST_POOL=0" (a rollback)
 #   PIN      taskset CPU list for the server (the GPU's NUMA node), e.g. 32-63,96-127
 #   CLIPIN   taskset CPU list for the clients (another node)
 #   THERM    1 = log temperature, SM clock, power and throttle reasons every 15 s

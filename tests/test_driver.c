@@ -165,6 +165,16 @@ static int fake_caps(const mynah_tts_model *model, const mynah_engine_state *sta
     return 0;
 }
 
+/* An engine that asks for the overlap package by default, as Pocket does on
+ * the CUDA backend (caps.overlap_by_default). */
+static int fake_caps_overlap_default(const mynah_tts_model *model,
+                                     const mynah_engine_state *state,
+                                     mynah_engine_caps *out) {
+    if (fake_caps(model, state, out) != 0) return -1;
+    out->overlap_by_default = 1u;
+    return 0;
+}
+
 /* The request carries the scenario: `topk` is how many frames this request
  * generates, and `speaker` is one more than the step at which it refuses to
  * advance (0 meaning it never does). */
@@ -785,6 +795,23 @@ static const mynah_tts_engine fake_engine_overlap = {
 static const mynah_tts_engine fake_engine_decode_overlap = {
     "fake-decode-overlap",
     fake_model_init, fake_model_free, fake_caps,
+    fake_ctx_new, fake_prepare, fake_reset, fake_ctx_free,
+    fake_step_batch, fake_emit_batch,
+    fake_frame_count, fake_truncate, fake_decode_audio,
+    fake_scratch_new, fake_scratch_free,
+    NULL,
+    fake_decode_audio_batch,
+    fake_prepare_slice,
+    NULL,                     /* prepare_slice_batch */
+    NULL, NULL,               /* ctx_new_host, ctx_attach */
+    fake_step_launch,
+    fake_decode_submit, fake_decode_collect,
+};
+
+/* The same, with the overlap package on by default (unset variables). */
+static const mynah_tts_engine fake_engine_overlap_default = {
+    "fake-overlap-default",
+    fake_model_init, fake_model_free, fake_caps_overlap_default,
     fake_ctx_new, fake_prepare, fake_reset, fake_ctx_free,
     fake_step_batch, fake_emit_batch,
     fake_frame_count, fake_truncate, fake_decode_audio,
@@ -1445,6 +1472,85 @@ int main(void) {
         if (bad == 11) return fail("decode overlap: continuous admission changed a request's audio");
         if (bad == 12) return fail("decode overlap: the failing request did not fail");
         if (bad == 13) return fail("decode overlap: one request's failure hurt a sibling");
+    }
+
+    /* ---- 8b. the overlap package as an engine default --------------------- *
+     * With caps.overlap_by_default and every variable unset, dispatch-ahead,
+     * decode-ahead and first-frame-first are all on. MYNAH_CUDA_STEP_OVERLAP=0
+     * turns the whole package off; MYNAH_CUDA_DECODE_OVERLAP=0 and
+     * MYNAH_CUDA_FIRST_FRAME_FIRST=0 roll back their own part only. Each arm
+     * must run exactly what the explicit opt-in variables run on an engine
+     * without the default (the same steps, launches and gangs), and give
+     * each request its solo audio. */
+    {
+        static const char *const names[3] = {
+            "MYNAH_CUDA_STEP_OVERLAP", "MYNAH_CUDA_DECODE_OVERLAP",
+            "MYNAH_CUDA_FIRST_FRAME_FIRST",
+        };
+        /* The variable rolled back on the default engine (-1 none), and the
+         * explicit opt-ins (step, decode, first frame) it must match. */
+        const struct { int rollback; int on[3]; } arms[] = {
+            {-1, {1, 1, 1}},
+            {0, {0, 0, 0}},
+            {1, {1, 0, 0}},
+            {2, {1, 1, 0}},
+        };
+        int bad = 0;
+        size_t arm = 0;
+        for (; arm < sizeof(arms) / sizeof(arms[0]) && !bad; ++arm) {
+            static observation want;
+            capture got[REQUESTS];
+            for (int pass = 0; pass < 2 && !bad; ++pass) {
+                for (int k = 0; k < 3; ++k) unsetenv(names[k]);
+                if (pass == 0) {
+                    for (int k = 0; k < 3; ++k)
+                        if (arms[arm].on[k]) setenv(names[k], "1", 1);
+                } else if (arms[arm].rollback >= 0) {
+                    setenv(names[arms[arm].rollback], "0", 1);
+                }
+                build_requests(requests, healthy, REQUESTS);
+                memset(&g_obs, 0, sizeof(g_obs));
+                g_pending_count = 0u;
+                g_dec_inflight = 0;
+                if (run(pass == 0 ? &fake_engine_decode_overlap
+                                  : &fake_engine_overlap_default,
+                        requests, REQUESTS, REQUESTS, got, results, errors) != 0)
+                    bad = 1;
+                for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                    if (results[i] != MYNAH_GRAPH_OK) bad = 1;
+                    else if (!same_audio(&got[i], &solo[i])) bad = 2;
+                }
+                if (!bad && (g_obs.overlap_violations != 0u ||
+                             g_obs.dec_violations != 0u))
+                    bad = 4;
+                if (pass == 0) {
+                    want = g_obs;
+                } else if (!bad &&
+                           (g_obs.steps != want.steps ||
+                            g_obs.launches != want.launches ||
+                            g_obs.dec_submits != want.dec_submits ||
+                            g_obs.dec_first_gangs != want.dec_first_gangs ||
+                            memcmp(g_obs.step_rows, want.step_rows,
+                                   g_obs.steps * sizeof(g_obs.step_rows[0])) != 0)) {
+                    bad = 3;
+                }
+                release(got, REQUESTS);
+            }
+        }
+        for (int k = 0; k < 3; ++k) unsetenv(names[k]);
+        g_pending_count = 0u;
+        g_dec_inflight = 0;
+        if (!bad)
+            printf("  overlap by default: the full package with nothing set; "
+                   "STEP_OVERLAP=0, DECODE_OVERLAP=0 and FIRST_FRAME_FIRST=0 "
+                   "each match their explicit opt-in run\n");
+        if (bad == 1) return fail("overlap default: a request failed");
+        if (bad == 2) return fail("overlap default: a request's audio is not its solo audio");
+        if (bad == 3) {
+            fprintf(stderr, "overlap default arm %zu\n", arm - 1u);
+            return fail("overlap default: an arm differs from its explicit opt-in run");
+        }
+        if (bad == 4) return fail("overlap default: the engine was called against the seam");
     }
 
     /* ---- 9. ping-pong groups (MYNAH_CUDA_PINGPONG=2) --------------------- *
