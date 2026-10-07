@@ -83,15 +83,18 @@ measured effect: [`configs/perf/`](configs/perf/README.md).
 
 On an L40S the limit was the single scheduler thread, not the GPU. With the
 serving-loop defaults of 2026-10-07 and a few opt-in variables (host-context
-pool, step and decode overlap, fixed KV slots) one L40S holds C1024 at RTF p95
-0.746 with the GPU 95 % busy; the defaults alone hold C768. A small host is
-enough: with the server confined to 4 vCPUs the same L40S held C768 at RTF p95
-0.658, ~3 % below the whole host. Per-GPU thresholds (L40S, RTX 6000 Ada, L4)
+pool, step and decode overlap, fixed KV slots) one L40S holds C1024 for a
+30-minute soak at RTF p95 0.746, zero stalls, first audio p95 106 ms, ~1,400
+audio-s/s with the GPU 96 % busy; the defaults alone hold C768. In a 4-vCPU
+affinity experiment (server pinned to 4 vCPUs) C1024 still held a 10-minute soak
+at RTF p95 0.752. The English 6-layer model holds C1536 at RTF p95 0.823 (~1,950
+audio-s/s) in a 30-minute soak. Per-GPU thresholds (L40S, RTX 6000 Ada, L4)
 and the host lessons:
 [performance](docs/performance.md#pocket-cuda-serving-thresholds-2026-10);
 how they are measured, and on which Vast.ai hosts: [benchmarking](docs/benchmarking.md).
 Copy-paste build, server and load-test commands:
 [large-row quick start](docs/cuda-serving.md#quick-start-large-row-serving).
+The story of how it got there: [blog post, from an L4 to C1024 on one L40S](blog/pocket-tts-l4-to-l40s-c1024.md).
 
 ### Pocket TTS on the CPU — what got it there
 

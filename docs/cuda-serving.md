@@ -43,7 +43,9 @@ defaults is pending, so C160 stays the qualified figure until it lands.
 A 4-vCPU host is enough: on the L4 the server needs about 1.3-1.4 cores, and
 pinning it to four cores cost 1.5%. On an L40S, with the large-row variables
 of section 7, a server confined to 4 vCPUs (two cores and their SMT siblings)
-held C768 at RTF p95 0.658, ~3 % below the full host (section 6).
+held C768 at RTF p95 0.658, ~3 % below the full host (section 6); with the fixed
+slot pool (A1b) it held a 10-minute soak at C1024 at RTF p95 0.752 (affinity
+experiment, not a real 4-vCPU instance).
 
 ## 1. What you need
 
@@ -223,6 +225,7 @@ variables matter more than on the L4:
   matter more than many cores, because one scheduler thread sets the pace.
 - Copy-paste commands for all of this: "Quick start: large-row serving" in
   section 7.
+  This is a **4-vCPU affinity experiment**: `taskset` on a larger host keeps that host's memory bandwidth, caches, clock and NUMA layout, so it is not a measurement on a real 4-vCPU instance; qualify one before relying on it.
 
 Per-GPU thresholds, configuration by configuration, and the host lessons:
 [performance.md, "Pocket CUDA serving thresholds (2026-10)"](performance.md#pocket-cuda-serving-thresholds-2026-10).

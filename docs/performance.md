@@ -1254,6 +1254,56 @@ RTF p95 / TTFA p95.
   were live; 60,819 of 61,920 admissions made no driver call, and the mean
   context build fell to 0.40 ms (device half 0.006 ms). VRAM 32.3 GB at ready,
   34 GB at the end of the run (39 GB without A1b).
+  This is a **4-vCPU affinity experiment**: `taskset` on a larger host keeps that host's memory bandwidth, caches, clock and NUMA layout, so it is not a measurement on a real 4-vCPU instance; qualify one before relying on it.
+
+#### Soaks on the same L40S (2026-10-07, 24-layer model, every win on)
+
+| run | requests | failed | stalls@250 | RTF p95 (p99) | TTFA p95 | prebuffer p95 | first / last 5 min audio-s/s | GPU |
+|---|---|---|---|---|---|---|---|---|
+| **30 min at C1024**, full host | 328,625 | 0 | **0** | **0.746** (0.766) | 106 ms | 23 ms | 1403 / 1427 | 337-341 W, 72-74 °C, 96 % |
+| **10 min at C1024**, server on 4 vCPUs (affinity experiment) | 108,837 | 0 | **0** | **0.752** (0.773) | 107 ms | 27 ms | — | 344 W, 95 % |
+
+The 24-layer model is qualified at C1024 on this card: no drift between the first and the last
+five minutes, no stalls, and the 4-vCPU affinity run within noise of the full host. Soak
+audio-s/s is not comparable with the 2-minute screens (see `docs/benchmarking.md`).
+
+#### English 6-layer model on the same L40S (2026-10-07)
+
+Same box, server pinned to the GPU node, every win on (the eleven defaults plus
+`MYNAH_CTX_HOST_POOL=1 MYNAH_CUDA_STEP_OVERLAP=1 MYNAH_CUDA_DECODE_OVERLAP=1
+MYNAH_CUDA_FIRST_FRAME_FIRST=1 MYNAH_CUDA_SLOT_FIXED=1`), a `ROW_CAP=2048` build,
+2-minute levels:
+
+| C | audio-s/s | RTF p95 | TTFA p95 | stalls@250 | GPU busy / power | reading |
+|---|---|---|---|---|---|---|
+| 1024 | 1802 | 0.562 | 78 ms | 0 | 89 % / 337 W | comfortable |
+| **1536** | **1776** | **0.835** | **116 ms** | **0** | 89 % / 342 W | near the safe knee |
+| 1792 | 1773 | 0.965 | 132 ms | 0 | 89 % / 338 W | realtime edge |
+| 2048 | 1744 | 1.112 | 153 ms | 570,980 | 89 % / 340 W | overloaded |
+
+**30-minute soak at C1536:** 535,593 requests, 0 failures, 0 timeouts; stream RTF p95 **0.823**
+(p99 0.846), first audio p95 **113 ms**, client prebuffer 44 ms at p95; first vs last 5 minutes
+1934 vs 1968 audio-s/s, RTF p95 0.821 vs 0.823, GPU 344 W / 73 °C vs 346 W / 75 °C at 91 % busy,
+0 stalled requests in either window. **102 requests (0.02 %) stalled above 250 ms, all in the first
+~50 s**, when the load stepped from C768 to C1536 and 768 requests were admitted at once; after that
+ramp, none. In steady state C1536 holds; a strict zero-stall gate needs a gentler ramp (or a planned
+capacity below C1536).
+
+- **Reducing transformer depth 4× raised serving throughput only ~1.3-1.4×**
+  (plateau ~1750-1800 audio-s/s vs the 24-layer screens at ~1280). At these row
+  counts both GPU power (~340 W of 350 W) and the host's per-row work (51-56 ms
+  per iteration at 1,500-2,000 rows, vs ~41 ms for the 24-layer model at 1,024)
+  are significant, so the transformer is no longer the dominant scaling term.
+  Which GPU components make up the rest needs a kernel-level profile; these
+  numbers alone do not attribute it.
+- The collapse at C2048 happens with the GPU still at 89 % busy: the limit is
+  composite (per-row host work, GPU pipeline and power, synchronisation and
+  decode), not "all CUDA cores full".
+- C1536 leaves 0.015 under the gate; for capacity planning a value below it
+  (e.g. C1408-C1472) is the conservative choice until the soak says otherwise.
+- A `ROW_CAP=4096` server was also tried: its start-up width walk (4,096 fresh
+  contexts at ~52 ms each, plus graphs) was still running after 29 minutes at
+  45.4 of 46 GB, so very large caps need a cheaper warm-up first.
 
 ### NVIDIA RTX 6000 Ada (48 GB)
 

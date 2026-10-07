@@ -249,6 +249,16 @@ one record per request in `c<C>-c<C>.jsonl`.
   only the server: a knee left behind will run its cleanup at the wrong time.
   `knee_closed.sh` only ever signals the server it started.
 
+### Screens and soaks report audio-s/s differently
+
+`pocket_ladder.py` counts the requests **sent** after the warm-up and divides their audio by the
+time until the **last** of them finishes. In a 2-minute screen that denominator includes the drain
+tail, when concurrency is already falling, so a screen reads lower than the steady rate: at C1024 on
+the L40S the screen says 1283 audio-s/s while a 30-minute soak at the same C says 1393, and its
+first and last 5-minute windows (audio of the requests that finished inside the window, divided by
+the window) say 1403 and 1427. Compare screens with screens and soaks with soaks; for a soak, report
+the windows as well, to show the rate does not drift (`.work/l40s-2026-10-07/jobs/windows.sh`).
+
 ## 5. Reading the serving profile
 
 With `MYNAH_SERVE_PROFILE=1` the server prints, at shutdown:
