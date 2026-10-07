@@ -27,12 +27,16 @@ stalls), English packs, mixed v2 corpus:
 | 24L | 1x NVIDIA L4 | CUDA | 160 | 184.5 | qualified, 2 x 30 min, WER | 2026-09-28 |
 | 24L | 1x NVIDIA L4 | CUDA | 288 | 341 | 10-min soak, 2026-10-02 defaults (bf16 KV) | 2026-10-02 |
 | 24L | 1x NVIDIA L4 | CUDA | 320 | 338 | 2-min screen, int8 KV | 2026-10-04 |
-| 24L | 1x NVIDIA L40S | CUDA | 384 (row cap) | 740 | 2-min screen, current defaults | 2026-10-04 |
+| 24L | 1x NVIDIA L40S | CUDA | 384 (row cap) | 740 | 2-min screen, 2026-10-04 defaults | 2026-10-04 |
+| 24L | 1x NVIDIA L40S | CUDA | 1024 (row cap) | 1283 | 2-min screen, `ROW_CAP=1024` build, opt-in serving flags (RTF p95 0.746) | [thresholds (2026-10)](#pocket-cuda-serving-thresholds-2026-10) |
 
 How the CPU numbers were reached, one change at a time:
 2026-09-18 (C90) -> 2026-09-19 (C96, C110, C120) -> 2026-09-21 (C126) ->
 2026-09-27 (C164 for 6L, C88 for 24L). The CUDA defaults and the measured
-effect of each are in [cuda-serving.md](cuda-serving.md) section 7.
+effect of each are in [cuda-serving.md](cuda-serving.md) section 7; the
+highest passing level per GPU and configuration is in
+[Pocket CUDA serving thresholds (2026-10)](#pocket-cuda-serving-thresholds-2026-10),
+and how these numbers are measured in [benchmarking.md](benchmarking.md).
 
 ## Magpie reference numbers
 
@@ -463,6 +467,10 @@ make self-test                                           # kernels correct on th
 
 Report ISA, thread count, backend and model revision with any number.
 Single-request latency and batched throughput are different metrics.
+
+For the Pocket CUDA server (closed-loop knees, NUMA pinning, the thermal
+pre-check, the audio-identity protocol and how to read the serving profile),
+see [benchmarking.md](benchmarking.md).
 
 ## First production-hardware capacity screen — 2026-09-13
 
@@ -1100,6 +1108,10 @@ pending, so C160 remains the qualified point. Detail:
 
 ## 2026-10-04 · PocketTTS 24L on CUDA — one NVIDIA L40S screen
 
+> Superseded. The flat throughput below was the single scheduler thread, not
+> an underfilled GPU; the same L40S now passes C1024 at 1283 audio-s/s. See
+> [Pocket CUDA serving thresholds (2026-10)](#pocket-cuda-serving-thresholds-2026-10).
+
 One NVIDIA L40S (48 GB, `sm_89`, 142 SMs, 350 W cap). The same `sm_89` build
 and every default of [cuda-serving.md](cuda-serving.md) section 7, int8
 backbone KV included. 2-minute closed-loop knees with `tools/pocket_ladder.py`,
@@ -1141,3 +1153,176 @@ Open items:
 
 The analysis written before this session is in
 `.work/pocket-cuda-inefficiencies-and-l40s.md`.
+
+## Pocket CUDA serving thresholds (2026-10)
+
+What one GPU holds with the 24-layer English pack, per serving configuration,
+after the October serving-loop work. The 2026-10-04 L40S screen above stopped
+at ~740 audio-s/s with the GPU ~60 % busy. That reading was wrong about the
+cause: the GPU was waiting on the single scheduler thread (host work per step,
+in series with the GPU work), not underfilled. Every change below shortens or
+hides that host work.
+
+**Method** (detail and scripts in [benchmarking.md](benchmarking.md)): v2 corpus,
+four voices, seed 1234, closed loop, 2-minute levels after a 15-second warm-up,
+`tools/pocket_ladder.py --client-procs 4`, one fresh server per configuration,
+`nvidia-smi dmon` during each level. **Gate:** stream RTF p95 ≤ 0.88, 0 stalls
+at 250 ms and 0 failures. "Highest C" is the highest *measured* level that
+passes; levels below the first one listed were not measured. These are
+2-minute screens, not 30-minute qualifications. GPU busy is the `dmon sm` time
+share (the share of time at least one kernel runs), power its mean.
+
+**Configurations.**
+
+| name | environment | what it does |
+|---|---|---|
+| pre-flag base | (the defaults before 2026-10-07) | |
+| 11 flags (default since 2026-10-07) | none: L6, L7, L8, L10, L11, L12, L19, L20, L21, L22, L24 | fewer stream syncs (deferred release, survivor flow reuse), no decoder graph re-record per step (table patch), no per-row copies (PCM direct, lazy hidden state), PCM hand-off on helper threads (L19: 1 helper up to 4 usable CPUs, 2 up to 8, 4 above), cheaper duplicate, cancellation and KV-table bookkeeping, one `writev` per HTTP chunk |
+| + A1a | `MYNAH_CTX_HOST_POOL=1` | a finished request's host-side state is renewed for the next admission instead of rebuilt. A fresh context built while the server is full cost ~13 ms; a pooled one 0.1-0.3 ms |
+| + L13 | `MYNAH_CUDA_STEP_OVERLAP=1` | the next AR step is queued before retire, admission and cancellation run |
+| + L13b | L13 + `MYNAH_CUDA_DECODE_OVERLAP=1` | the gang decode of step k also runs under AR step k+1 |
+| + L13d | L13b + `MYNAH_CUDA_FIRST_FRAME_FIRST=1` (measured with `MYNAH_CUDA_FAST_FIRST_CHUNK_WAIT_US=3000`) | new streams' first frames are decoded and delivered first, as their own small gang: 50-70 ms lower TTFA p95 for ~1-2 % throughput |
+| combined | 11 flags + A1a + L13 + L13b + L13d | the recommended large-row configuration, with A1b |
+| + A1b | `MYNAH_CUDA_SLOT_FIXED=1` | pooled request sets keep a backbone KV of a fixed size, so an admission makes no `cudaFree` / `cudaMalloc` |
+| L26 | `MYNAH_CUDA_PINGPONG=2` | two half-batches in one engine, one's host work under the other's GPU work (experimental) |
+
+**All of them are bit-identical** wherever batch composition is
+deterministic: CLI `--batch 32` (32/32 WAVs identical), CLI `--batch 32
+--stream` (32/32) and the server at C1 with saved audio (141-192 of 141-192
+common WAVs identical, depending on the arm). That covers each of the 11 flags
+alone and together, L13, L13b, L13d and L13b with `MYNAH_CUDA_DECODE_CHECK=1`,
+A1a at `=1` and `=2` (renewed caches zeroed), A1b (first version) with and
+without zeroed KV and at 64 positions (forced growth), L26 below and above its
+split threshold, and the defaults tree against the same flags set explicitly.
+A1b v2 was checked the same way on the L40S (off, on, and at 64 positions):
+32/32, 32/32 and 166/166 identical. Under concurrency the
+batch composition follows arrival timing, so no serving mode is
+bit-reproducible there, with or without these flags.
+
+### NVIDIA L40S (48 GB)
+
+A Vast.ai L40S on a Xeon Gold 6430 host (2 NUMA nodes, cores ≤ 2.6 GHz),
+server pinned to the GPU's NUMA node and the clients
+on the other node, `ROW_CAP=1024` build, `--max-batch` = the highest level,
+driver 575. The GPU ran at 70 °C and full clock. Cells are audio-s/s / stream
+RTF p95 / TTFA p95.
+
+| configuration | highest C | at that level | stalls | GPU busy | power | next level measured |
+|---|---|---|---:|---:|---:|---|
+| pre-flag base | none (C768 fails) | C768: 773 / 0.919 ✗ / 157 ms | 0 | 61 % | 260 W | C896: 785 / 1.034, 80,583 stalls |
+| pre-flag base, faster host (EPYC 9534, ~3.7 GHz, 2026-10-05) | C640 | 873 / 0.681 / 114 ms | 0 | 67 % | 274 W | C768: 854 / 0.911 ✗ (0.849 in a second run) |
+| 11 flags (default) | C768 | 867 / 0.829 / 141 ms | 0 | 67 % | 279 W | C896: 891 / 0.915 ✗; C1024: 880 / 1.076, 162,015 stalls |
+| + L13 alone | C768 | 882-901 / 0.785-0.811 / 186-189 ms | 0 | 69 % | 282 W | C896: 0.914-0.928 ✗ |
+| + L13 + L13b | C896 | 961 / 0.853 / 195 ms | 0 | 74 % | 300 W | C1024: 943 / 0.998 ✗ |
+| + L13 + L13b + L13d | C768 | 970 / 0.761 / 118 ms | 0 | 73 % | 298 W | C896: 947 / 0.899 ✗ |
+| + A1a | **C1024** | 1112 / 0.852 / 147 ms | 0 | 84 % | 319 W | (top of the build) |
+| combined (2026-10-06) | **C1024** | 1157 / 0.846 / 130 ms | 0 | 87 % | 327 W | C896: 1158 / 0.738 / 111 ms |
+| combined, defaults tree (2026-10-07) | **C1024** | 1156 / 0.843 / 127 ms | 0 | 88 % | 332 W | C896: 1161 / 0.734 / 110 ms; C768 (3-min check): 1193 / 0.631 / 95 ms, 90 %, 329 W |
+| combined, server confined to 4 vCPUs (2 cores + SMT), L19 auto = 1 helper | C768 (top level run) | 1126 / 0.658 / 102 ms | 0 | 87 % | ~325 W | C512: 1131 / 0.445 / 70 ms; C640: 1135 / 0.549 / 87 ms |
+| **combined + A1b v2** | **C1024** | **1283 / 0.746 / 106 ms** | 0 | 95 % | 342 W | C896: 1263 / 0.669 / 96 ms, 94 %, 337 W |
+
+- **The 11 flags** move the gate from below C768 to C768 on this host, with
+  0 stalls at C896 where the base had 80,583. Host time per iteration 33.5 →
+  28.4 ms, stream syncs per iteration 19.5 → 11.8.
+- **A1a is the largest single step:** C1024 880 → 1112 audio-s/s, host time
+  per iteration 44 → 26.5 ms. Admission was the real ceiling: the cost of a
+  fresh context grows with the number of live ones.
+- **L13 alone is not worth it:** about the same throughput as the 11 flags,
+  +45-60 ms TTFA p95 (an admission waits for the queued step, then its own).
+  **L13b** on top passes C896. **L13d** gives back 1-2 % of the throughput and
+  some RTF margin (C896 0.853 → 0.899) for 50-70 ms lower TTFA p95.
+- **Combined** is +31 % over the 11 flags at C1024 with the lowest TTFA at
+  that load, the GPU 87-90 % busy at 327-332 W of 350 W. The 2026-10-07 re-run on the defaults tree reproduces the 2026-10-06
+  numbers within 1 audio-s/s; VRAM at the end of the run: 39 GB.
+- **On 4 vCPUs** the combined configuration loses only ~3 % throughput
+  (host time ~31 ms per iteration). Projected from the C512-C768 slope: C896
+  ≈ 0.77, C1024 ≈ 0.88, i.e. borderline; not measured.
+- **A1b v2 is the best L40S result:** C1024 at 1283 audio-s/s and RTF p95
+  0.746, +11 % over the combined configuration without it, with headroom left
+  under the gate. Sizing after the start-up warm-up, F = 384 positions, growth
+  without a device-wide sync: the cap planned 1056 fixed caches and all 1056
+  were live; 60,819 of 61,920 admissions made no driver call, and the mean
+  context build fell to 0.40 ms (device half 0.006 ms). VRAM 32.3 GB at ready,
+  34 GB at the end of the run (39 GB without A1b).
+
+### NVIDIA RTX 6000 Ada (48 GB)
+
+A Vast.ai RTX 6000 Ada on an EPYC 7C13 host (1 NUMA node, up to ~3.1 GHz,
+20-CPU quota), driver 565, `ROW_CAP=1024`, no pinning. GPU 61-73 °C under
+load, no thermal throttling.
+
+| configuration | highest C | at that level | stalls | GPU busy | power | next level measured |
+|---|---|---|---:|---:|---:|---|
+| pre-flag base | not measured | | | | | |
+| 11 flags (default) | none (C768 fails) | C768: 376 / 2.084 ✗ / 763 ms | 87,677 | 58 % | 167 W | |
+| + A1a | none (C768 fails) | C768: 455 / 1.714 ✗ / 668 ms | 89,847 | 65 % | 182 W | C896: 505 / 1.972 ✗ |
+| + A1a + A1b (first version) | C768 on RTF, not clean | 1114 / 0.708 / 101 ms | 135 | 85 % | 278 W | C896: 925 / 1.159 ✗, 8,071 stalls (out of VRAM) |
+| + A1a + A1b + L13 + L13b, `--max-batch 768` | C768 on RTF, not clean | 1111 / 0.845 / 122 ms | 2,145 | 93 % | 280 W | C640: 1205 / 0.510 / 101 ms, 88 stalls, 96 % |
+| + A1a + A1b + L26, `--max-batch 768` | C640 on RTF, not clean | 1110 / 0.617 / 114 ms | 557 | 94 % | 287 W | C768: 1037 / 0.996 ✗, 4,202 stalls |
+
+- **This host pays for every misfit admission.** `[CTX]` showed the device
+  half of a new context at 11-30 ms per admission, against < 1 ms on the L40S
+  host: a pooled backbone KV that does not fit the new request is freed and
+  re-allocated, and `cudaFree` waits for the whole device, behind the queued
+  step. Even the 11 flags alone run at 376 audio-s/s here.
+- **A1b removes it:** C768 455 → 1114 audio-s/s, host time per iteration
+  62-100 → 23 ms, 49,197 of 50,880 admissions with no driver call. The first
+  version ran out of VRAM at C896 (its cap was planned before the start-up
+  warm-up, whose long caches then stayed in the pool). Sizing v2 fixes that:
+  see the L40S table, where it runs C1024 with every planned cache live. The
+  RTX 6000 Ada has not been re-run with it.
+- **None of the A1b arms on this box is clean yet:** each level had a few
+  hundred to a few thousand stalls at 250 ms (gap p95 0.4-0.8 s). Open.
+- **L26 ping-pong** hid 92 % of the host time under the other group's GPU work,
+  but once the GPU is ≥ 93 % busy it is 7-8 % slower than L13 + L13b (28,562
+  stream syncs while an item was queued). It stays opt-in and experimental.
+
+### NVIDIA L4 (24 GB)
+
+A Vast.ai L4 on an EPYC 7702 host, `ROW_CAP=384` build (the default),
+2026-10-06. The L4 is GPU-bound: 86-91 % busy at its 72 W cap (~1250 MHz under
+`sw_power_cap`, 74-80 °C), host time 13-15 ms per iteration.
+
+| configuration | highest C | at that level | stalls | GPU busy | power | next level measured |
+|---|---|---|---:|---:|---:|---|
+| pre-flag base | C320 | 341 / 0.847 / 146 ms | 0 | 86 % | 71 W | |
+| 11 flags (default) | C320 | 354 / 0.820 / 142 ms | 0 | 90 % | 71 W | C352: 355 / 0.891 ✗ |
+| + L13 alone | C352 | 358 / 0.878 / 215 ms | 0 | 90 % | 71 W | |
+| + A1a, + L13b / L13d, + A1b | pending | | | | | |
+
+The 11 flags give +4 % audio-s/s and -0.03 RTF p95 at C288-C320, reproduced,
+with no regression in a leave-one-out of every flag. A1a, L13b + L13d and A1b
+stay opt-in until this table has its L4 row.
+
+### Host lessons
+
+On a GPU this fast the serving loop is bound by one host thread, so the host
+decides the result as much as the GPU does.
+
+- **CPU clock matters.** Same L40S class, base configuration, host time per
+  iteration: 25-29 ms on an EPYC 9534 at ~3.7 GHz (C640-C896), 33.5 ms on the
+  Xeon Gold 6430 at ≤ 2.6 GHz (pinned, C768-C896), 45.8 ms pinned and 61 ms
+  unpinned on a Xeon Platinum 8558 capped at 2.1 GHz (C832, where it managed
+  635 audio-s/s at RTF p95 1.55). Check the governor and the real clock
+  (`lscpu`, `/sys/devices/system/cpu/cpu0/cpufreq/`) before trusting a box;
+  inside a container they often cannot be changed.
+- **Pin the server to the GPU's NUMA node** (`nvidia-smi topo -m` gives the
+  CPU list; `taskset -c <list>`), and the load generator to another node. On
+  the 4-node Xeon Platinum 8558 host the scheduler thread had landed on a
+  remote node; pinning took the host time per iteration from 61 to 46 ms.
+- **Check GPU thermals before measuring.** One box (a Threadripper 7960X
+  host) had its GPU throttling to 630 MHz under load. A 3-minute run at one
+  level with `nvidia-smi --query-gpu=temperature.gpu,clocks.sm,power.draw,clocks_throttle_reasons.active`
+  sampling catches that before an A/B wastes an hour.
+- **Raise the open-file limit.** Every stream holds a socket. With the usual
+  soft limit of 1024, a server stopped silently near 1000 streams (`accept()`
+  returned `EMFILE`); C1024 had never really been measured before that was
+  found. The server now raises its soft limit to the hard one and backs off on
+  `EMFILE` ([server.md](server.md#open-file-limit)).
+- **The driver and platform can make admission expensive.** The same code paid
+  < 1 ms per admission on the L40S host (driver 575) and 11-30 ms on the RTX
+  6000 Ada host (driver 565), because `cudaFree` synchronizes the device. If
+  `[CTX] cuda_backbone` is in milliseconds, use `MYNAH_CUDA_SLOT_FIXED=1`
+  (A1b).
+- **Four vCPUs are enough** for C768 on an L40S with the combined
+  configuration (-3 % against the full host).
