@@ -1601,7 +1601,58 @@ struct mynah_engine_scratch {
     int pingpong;
     int lane;
     void *cuda_ahead_fence;
+    /* One-sync failures on this lane since its last good frame: a lane keeps
+     * the one-sync chain after a recoverable failure (pocket_pp_onesync_keep)
+     * up to POCKET_PP_ONESYNC_RETRIES in a row. */
+    unsigned pp_onesync_failures;
 };
+
+/* MYNAH_CUDA_PINGPONG: consecutive one-sync failures a lane survives before
+ * it gives the chain up, as a scratch outside ping-pong does at the first. */
+#define POCKET_PP_ONESYNC_RETRIES 4u
+
+/* MYNAH_CUDA_PINGPONG: the optional device workspaces a lane must have when
+ * its peer has them (pocket_scratch_new keeps a scratch whose optional CUDA
+ * buffers could not be allocated, falling back to slower paths; for a second
+ * lane that would be a silent slow group, and for device-owned rows a failing
+ * one).  NULL when `scratch` has everything `peer` has. */
+static const char *pocket_pp_lane_missing(const mynah_engine_scratch *scratch,
+                                          const mynah_engine_scratch *peer) {
+    if (peer == NULL) return NULL;
+    if (peer->cuda_batch_enabled && !scratch->cuda_batch_enabled)
+        return "its resident CUDA batch workspace could not be allocated";
+    if (peer->cuda_condition_input != NULL && scratch->cuda_condition_input == NULL)
+        return "its CUDA condition input could not be allocated";
+    if (peer->cuda_flow_enabled && !scratch->cuda_flow_enabled)
+        return "its CUDA flow-head workspace could not be allocated";
+    if (peer->cuda_codec_enabled && !scratch->cuda_codec_enabled)
+        return "its CUDA codec workspace could not be allocated";
+    if (peer->cuda_onesync_enabled && !scratch->cuda_onesync_enabled)
+        return "its MYNAH_CUDA_ONE_SYNC staging could not be allocated";
+    if (peer->cuda_hidden_lazy_enabled && !scratch->cuda_hidden_lazy_enabled)
+        return "its MYNAH_CUDA_HIDDEN_LAZY probe could not be allocated";
+    return NULL;
+}
+
+/* MYNAH_CUDA_PINGPONG: clear a recoverable device error left pending by an
+ * earlier failure that was already handled, before this lane's next launch
+ * checks its own (mynah_backend_lane_clear_error).  Reported, rarely. */
+static void pocket_pp_clear_stale(const mynah_engine_scratch *scratch,
+                                  const char *where) {
+    static unsigned long long cleared;   /* the one serving thread's count */
+    if (scratch == NULL || !scratch->pingpong || scratch->backend == NULL) return;
+    char stale[256];
+    stale[0] = '\0';
+    if (mynah_backend_lane_clear_error(scratch->backend, stale, sizeof(stale)) == 0)
+        return;
+    const unsigned long long n = ++cleared;
+    if (n <= 4ull || (n & (n - 1ull)) == 0ull)
+        fprintf(stderr,
+                "pocket: ping-pong lane %d: cleared a stale device error (%s) "
+                "before %s; it belonged to an earlier failure that was already "
+                "handled (%llu so far)\n",
+                scratch->lane, stale[0] != '\0' ? stale : "unknown", where, n);
+}
 
 /* --------------------------------------------------------------- the dump
  *
@@ -9176,8 +9227,11 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
         }
         /* MYNAH_CUDA_PINGPONG: the end of this frame's work on the stream.
          * NULL (no fence) falls back to the stream drain below. */
-        if (scratch->pingpong)
+        if (scratch->pingpong) {
             scratch->cuda_ahead_fence = mynah_backend_fence_record(scratch->backend);
+            if (scratch->cuda_ahead_fence == NULL)
+                pocket_pp_clear_stale(scratch, "a fence fallback");
+        }
         return 0;
     }
 
@@ -9233,13 +9287,35 @@ frame_sync:
         scratch->cuda_hidden_lazy_pending = 1;
     }
     scratch->cuda_onesync_ready = 1;
+    scratch->pp_onesync_failures = 0u;   /* MYNAH_CUDA_PINGPONG */
     (void)mynah_backend_note_backbone_batch(scratch->backend, count);
     return 0;
 
 fallback_drain:
     /* A launch or sync error: drain, forget this scratch's graphs (as the
      * ordinary stages do on failure) and stop using the chain. */
-    (void)mynah_backend_sync(scratch->backend, drain, sizeof(drain));
+    if (mynah_backend_sync(scratch->backend, drain, sizeof(drain)) == 0 &&
+        scratch->pingpong &&
+        ++scratch->pp_onesync_failures <= POCKET_PP_ONESYNC_RETRIES) {
+        /* MYNAH_CUDA_PINGPONG: the device is healthy (the drain passed), so
+         * the failure was a recoverable one -- typically an allocation that
+         * ran out of memory, or its error left pending and reported by a
+         * later launch check.  Clear it and keep the chain: without it this
+         * lane could never queue a step again.  This frame still takes the
+         * per-stage path below; a lane failing every frame gives up. */
+        pocket_pp_clear_stale(scratch, "the per-stage retry");
+        fprintf(stderr,
+                "mynah-tts: ping-pong lane %d: a one-sync frame failed (%s); "
+                "this frame takes the per-stage path, MYNAH_CUDA_ONE_SYNC stays on "
+                "(%u of %u in a row)\n",
+                scratch->lane, local[0] != '\0' ? local : "not eligible",
+                scratch->pp_onesync_failures, POCKET_PP_ONESYNC_RETRIES);
+        if (scratch->cuda_graph_enabled) {
+            scratch->cuda_graph_ready = 0;
+            mynah_backend_graph_forget(scratch->backend, scratch);
+        }
+        goto fallback;
+    }
     fprintf(stderr,
             "mynah-tts: MYNAH_CUDA_ONE_SYNC disabled after a failure (%s); "
             "continuing on the per-stage path\n",
@@ -9321,6 +9397,7 @@ static int pocket_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
         count > POCKET_MAX_BATCH || !scratch->cuda_onesync_enabled)
         return 1;
     pocket_cuda_ahead_discard(scratch, "a second launch");
+    pocket_pp_clear_stale(scratch, "a queued step");
     int will_step[POCKET_MAX_BATCH];
     for (size_t i = 0; i < count; ++i) {
         const mynah_engine_ctx *ctx = ctxs[i];
@@ -11163,6 +11240,8 @@ static int pocket_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
     }
     /* MYNAH_CUDA_DECODE_OVERLAP safety net (a no-op unless a gang is queued). */
     pocket_decode_inflight_settle(scratch);
+    /* MYNAH_CUDA_PINGPONG: no stale error charged to this step's launches. */
+    pocket_pp_clear_stale(scratch, "a step");
 
     /* ---- 1. pre-flight: decided for every context, mutating none of them --- */
     size_t offset_before[POCKET_MAX_BATCH];
@@ -13039,8 +13118,10 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
     }
     if (count == 0u) return 0;
     /* MYNAH_CUDA_PINGPONG: this group's pinned PCM block and decoder graphs. */
-    if (scratch != NULL && scratch->pingpong)
+    if (scratch != NULL && scratch->pingpong) {
         mynah_backend_set_lane(scratch->backend, scratch->lane);
+        pocket_pp_clear_stale(scratch, "a gang decode");
+    }
     /* MYNAH_CUDA_STEP_OVERLAP safety net. */
     pocket_cuda_ahead_discard(scratch, "a gang decode");
     /* MYNAH_CUDA_DECODE_OVERLAP safety net: land a gang still in flight. */
@@ -13593,10 +13674,31 @@ static int pocket_decode_collect(mynah_engine_ctx *const *ctxs, size_t count,
 }
 
 /* tts_engine.h `scratch_set_lane` (MYNAH_CUDA_PINGPONG). */
-static void pocket_scratch_set_lane(mynah_engine_scratch *scratch, int lane) {
-    if (scratch == NULL) return;
+static int pocket_scratch_set_lane(mynah_engine_scratch *scratch, int lane,
+                                   const mynah_engine_scratch *peer,
+                                   char *error, size_t capacity) {
+    if (scratch == NULL) {
+        pocket_error(error, capacity, "pocket: no scratch for a ping-pong lane");
+        return -1;
+    }
+    const char *missing = pocket_pp_lane_missing(scratch, peer);
+    if (missing != NULL) {
+        /* The failed allocation's error is still the thread's last one. */
+        char stale[256];
+        stale[0] = '\0';
+        if (scratch->backend != NULL)
+            (void)mynah_backend_lane_clear_error(scratch->backend, stale,
+                                                 sizeof(stale));
+        pocket_error(error, capacity, "pocket: lane %d scratch (%zu rows): %s%s%s%s",
+                     lane == 1 ? 1 : 0, scratch->batch, missing,
+                     stale[0] != '\0' ? " (" : "", stale,
+                     stale[0] != '\0' ? ")" : "");
+        return -1;
+    }
     scratch->pingpong = 1;
     scratch->lane = lane == 1 ? 1 : 0;
+    scratch->pp_onesync_failures = 0u;
+    return 0;
 }
 
 /* ---------------------------------------------------------------- scratch */

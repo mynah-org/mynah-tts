@@ -387,8 +387,21 @@ typedef struct {
      * The rules of `step_launch` and `decode_submit` hold per scratch: while
      * one scratch has a step or a gang queued, the driver calls anything on
      * the OTHER scratch and on contexts that are not in that step or gang.
-     * Each group's audio must be what its rows would produce served alone. */
-    void (*scratch_set_lane)(mynah_engine_scratch *scratch, int lane);
+     * Each group's audio must be what its rows would produce served alone.
+     *
+     * The two scratches may differ in width: the driver sizes the second one
+     * for the most rows its group can hold (half the slots), not for
+     * `max_batch`, and never steps or decodes more rows on a scratch than it
+     * was created for. `peer` is the other lane's scratch (or NULL). Returns
+     * 0 when the scratch is now lane `lane`; non-zero, with the reason in
+     * `error` and the scratch unchanged, when it cannot serve next to `peer`
+     * -- typically an optional device workspace that `peer` has could not be
+     * allocated for it. The engine then also clears any recoverable device
+     * error that failed allocation left pending; the driver frees the second
+     * scratch and serves serially. */
+    int (*scratch_set_lane)(mynah_engine_scratch *scratch, int lane,
+                            const mynah_engine_scratch *peer,
+                            char *error, size_t error_capacity);
 } mynah_tts_engine;
 
 /* The default implementation of `decode_audio_batch`, and the driver's only

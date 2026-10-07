@@ -371,6 +371,14 @@ int mynah_backend_fence_query(const mynah_backend *backend, void *fence);
  * the other group's copy out of it is still queued.  Lane 0 is the only lane
  * unless a serving loop selects another; a backend without lanes ignores it. */
 void mynah_backend_set_lane(const mynah_backend *backend, int lane);
+/* MYNAH_CUDA_PINGPONG.  Clears a recoverable device error left pending by a
+ * call that already failed and was handled (an allocation the caller fell
+ * back from), so the next launch check of the ping-pong paths does not report
+ * it as its own.  Returns 1 with its text in `error` when one was pending, 0
+ * otherwise (always 0 without a device).  An unrecoverable error stays: the
+ * next device call still reports it. */
+int mynah_backend_lane_clear_error(const mynah_backend *backend, char *error,
+                                   size_t error_capacity);
 int mynah_backend_fence_sync_at(const mynah_backend *backend, void *fence,
                                 char *error, size_t error_capacity,
                                 const char *file, int line);

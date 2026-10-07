@@ -12332,6 +12332,19 @@ extern "C" void mynah_cuda_set_lane(void *opaque, int lane) {
     if (st != nullptr) st->lane = lane == 1 ? 1 : 0;
 }
 
+/* MYNAH_CUDA_PINGPONG: cudaGetLastError() after a handled failure.  A failed
+ * cudaMalloc (or event create, graph instantiate) returns its error AND
+ * leaves it as the thread's last error; the next `ce(cudaGetLastError())`
+ * after a perfectly good launch would then report that stale out-of-memory as
+ * the launch's own failure. */
+extern "C" int mynah_cuda_lane_clear_error(void *opaque, char *e, size_t ec) {
+    (void)opaque;
+    const cudaError_t pending = cudaGetLastError();
+    if (pending == cudaSuccess) return 0;
+    set_error(e, ec, cudaGetErrorString(pending));
+    return 1;
+}
+
 /* Wait for a fence and release it, reporting a device error. */
 extern "C" int mynah_cuda_fence_sync(void *opaque, void *fence, char *e,
                                      size_t ec) {

@@ -57,6 +57,11 @@ cli() { # label env batch seed sub(cli|str)
   env MYNAH_QUANT_GROUPS=none MYNAH_THREADS=1 MYNAH_SERVE_PROFILE=1 $E timeout 600 ./build/cuda/mynah-tts --synthesize $M --text "$TEXT" --lang en --speaker 0 --seed $S --batch $N $X --device cuda --output $R/out.wav > $I/$L/$SUB.log 2>&1 || { echo "  $L $SUB FAILED"; tail -5 $I/$L/$SUB.log; }
 }
 ppgrep() { grep -h "\[SERVE\] pingpong\|\[SERVE\]   group\|ignored\|discarded\|inside its submission" "$@" | cut -c1-400 | sed "s/^/    /"; }
+# Start-up memory and the recoverable-failure path (section 13.7): group B's
+# scratch line, the width-bucket warm-up delta (compare arm B with arm PP:
+# same build, same flags but the ping-pong one), and any stale-error clear,
+# one-sync retry or failed device-owned step.
+memgrep() { grep -h "ping-pong groups\|width-bucket graph warm-up\|stale device error\|one-sync frame failed\|ONE_SYNC disabled\|device-owned row\|out of memory" "$@" | sort | uniq -c | sort -rn | head -12 | cut -c1-400 | sed "s/^/    /"; }
 for SUB in cli str; do
   echo "== ident $SUB $(date -u +%T)"
   cli REF "$BASE" 32 1000 $SUB
@@ -84,6 +89,7 @@ for arm in "SREF|$BASE" "SPP|$BASE $PP"; do
     tmux send-keys -t isrv C-c; sleep 4; pkill -f "[b]uild/cuda/mynah-tts-server"; tmux kill-session -t isrv 2>/dev/null
     [ $L = SPP ] && cmp_py $R/srvwav $I/SREF/srvwav SPP/SREF srv
     ppgrep $R/server.log
+    memgrep $R/server.log
   else echo "  server did not start"; tail -5 $R/server.log; tmux kill-session -t isrv 2>/dev/null; fi
 done
 
@@ -96,6 +102,7 @@ for r in 1; do
     S=/root/res/pp-$a$r/server.log
     grep -h "\[SERVE\] device wait\|\[SERVE\] step overlap\|\[SERVE\] decode overlap" $S | tail -3 | cut -c1-400 | sed "s/^/    /"
     ppgrep $S
+    memgrep $S
     grep -h "while queued" $S | sed "s/^/    /" | head -8
   done
 done

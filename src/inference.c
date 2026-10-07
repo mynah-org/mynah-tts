@@ -1818,6 +1818,12 @@ static size_t retire_pass(const mynah_tts_engine *engine, mynah_graph_sink *sink
 typedef struct {
     synth_slot *slots;            /* A: serve()'s array; B: its own */
     size_t used;
+    /* The most rows one step, prefill pass or gang of this group may take:
+     * its scratch's width. A: max_batch (serve()'s scratch; below the
+     * threshold it holds every row). B: min(max_batch, ceil(slots / 2)),
+     * the most rows pp_admit and the late admission ever give it. */
+    size_t width_cap;
+    size_t row_cap;               /* A: the slots; B: ceil(slots / 2) */
     size_t step_rr;
     size_t prefill_rr;
     size_t retired_last;
@@ -2310,6 +2316,17 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 : async_on ? "asynchronous admission (MYNAH_ASYNC_ADMIT) is on"
                 : NULL;
             mynah_engine_scratch *scratch_b = NULL;
+            /* Group B never holds more than ceil(slots / 2) rows (pp_admit,
+             * and the late admission of step 5), so its scratch -- and with it every graph,
+             * decoder-graph and codec-gang buffer sized by the widths it
+             * runs -- is sized for that, not for max_batch. */
+            const size_t share_b = (slot_capacity + 1u) / 2u;
+            const size_t width_b = max_batch < share_b ? max_batch : share_b;
+            double scratch_b_mib = -1.0;   /* < 0: the backend cannot tell */
+            char lane_error[256];
+            char scratch_error[256];
+            lane_error[0] = '\0';
+            scratch_error[0] = '\0';
             if (why == NULL) {
                 pp = (pingpong *)calloc(1, sizeof(*pp));
                 synth_slot *slots_b =
@@ -2317,16 +2334,37 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 mynah_graph_job *pend_job =
                     (mynah_graph_job *)calloc(slot_capacity, sizeof(mynah_graph_job));
                 void **pend_tag = (void **)calloc(slot_capacity, sizeof(void *));
-                char scratch_error[256];
-                scratch_error[0] = '\0';
                 if (pp == NULL || slots_b == NULL || pend_job == NULL || pend_tag == NULL) {
                     why = "out of memory";
-                } else if (engine->scratch_new(model, state, max_batch, &scratch_b,
-                                               scratch_error, sizeof(scratch_error)) != 0) {
-                    why = "the second group's scratch could not be created";
-                    scratch_b = NULL;
+                } else {
+                    mynah_tts_backend_metrics m0, m1;
+                    memset(&m0, 0, sizeof(m0));
+                    memset(&m1, 0, sizeof(m1));
+                    const int have_m0 = model != NULL &&
+                        mynah_tts_model_get_backend_metrics(model, &m0) == 0;
+                    if (engine->scratch_new(model, state, width_b, &scratch_b,
+                                            scratch_error, sizeof(scratch_error)) != 0) {
+                        why = "the second group's scratch could not be created";
+                        scratch_b = NULL;
+                    } else {
+                        if (have_m0 && m0.device_memory_free_bytes > 0u &&
+                            mynah_tts_model_get_backend_metrics(model, &m1) == 0 &&
+                            m1.device_memory_free_bytes > 0u)
+                            scratch_b_mib = ((double)m0.device_memory_free_bytes -
+                                             (double)m1.device_memory_free_bytes) /
+                                            (1024.0 * 1024.0);
+                        /* B first, checked against A; A is a lane only once
+                         * B is, so a refusal leaves A exactly as it was. */
+                        if (engine->scratch_set_lane(scratch_b, 1, scratch, lane_error,
+                                                     sizeof(lane_error)) != 0 ||
+                            engine->scratch_set_lane(scratch, 0, scratch_b, lane_error,
+                                                     sizeof(lane_error)) != 0)
+                            why = "the second group's scratch is incomplete";
+                    }
                 }
                 if (why != NULL) {
+                    if (scratch_b != NULL) engine->scratch_free(scratch_b);
+                    scratch_b = NULL;
                     free(slots_b);
                     free(pend_job);
                     free(pend_tag);
@@ -2339,7 +2377,12 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                 }
             }
             if (why != NULL) {
-                fprintf(stderr, "driver: MYNAH_CUDA_PINGPONG ignored: %s\n", why);
+                fprintf(stderr, "driver: MYNAH_CUDA_PINGPONG ignored: %s%s%s%s%s%s; "
+                                "serving with one group\n", why,
+                        lane_error[0] != '\0' ? " (" : "", lane_error,
+                        lane_error[0] != '\0' ? ")" : "",
+                        scratch_error[0] != '\0' && lane_error[0] == '\0' ? ": " : "",
+                        lane_error[0] == '\0' ? scratch_error : "");
             } else {
                 pp->min_rows = 128u;
                 const char *m = getenv("MYNAH_CUDA_PINGPONG_MIN");
@@ -2362,8 +2405,11 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                     G->pre.adm = &G->adm;
                     G->pre.scratch = G->scratch;
                     G->pre.prefill_rr = &G->prefill_rr;
+                    G->width_cap = k == 0 ? max_batch : width_b;
+                    G->row_cap = k == 0 ? slot_capacity : share_b;
+                    G->pre.max_batch = G->width_cap;
                     G->ahead.pre = &G->pre;
-                    G->ahead.max_batch = max_batch;
+                    G->ahead.max_batch = G->width_cap;
                     G->dec.lent = caps.decode_batch_lends_pcm != 0u;
                     G->dec.engine = engine;
                     G->dec.scratch = G->scratch;
@@ -2371,7 +2417,6 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                     G->dec.used = &G->used;
                     G->dec.ar_queued = &G->ahead.count;
                     G->dec.profile = serve_profile;
-                    engine->scratch_set_lane(G->scratch, k);
                 }
                 fprintf(stderr,
                         "driver: ping-pong ON (MYNAH_CUDA_PINGPONG=2): two groups of "
@@ -2380,6 +2425,18 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                         "while the other's host work runs; MYNAH_CUDA_STEP_OVERLAP and "
                         "MYNAH_CUDA_DECODE_OVERLAP are not used\n",
                         pp->min_rows);
+                char mib[64];
+                if (scratch_b_mib >= 0.0)
+                    snprintf(mib, sizeof(mib), "%.0f MiB of device memory", scratch_b_mib);
+                else
+                    snprintf(mib, sizeof(mib), "no device memory reported");
+                fprintf(stderr,
+                        "driver: ping-pong groups: A uses the loop's scratch (%zu rows); "
+                        "B holds at most %zu rows (half the %zu slots), so its scratch "
+                        "is %zu rows wide: %s at start-up, and its graphs, decoder "
+                        "graphs and codec-gang staging only ever cover widths up to "
+                        "%zu\n",
+                        max_batch, share_b, slot_capacity, width_b, mib, width_b);
                 if (getenv("MYNAH_CUDA_DEFERRED_RELEASE") == NULL ||
                     getenv("MYNAH_CUDA_KV_VMM") == NULL)
                     fprintf(stderr,
@@ -2544,11 +2601,14 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         }
 
         /* 5. X's prefill pass on X's scratch, then the late admission (into
-         *    X, within the room both groups leave). */
+         *    X, within the room both groups leave and X's own row cap: group
+         *    B's scratch is only ceil(slots / 2) rows wide). */
         {
             const size_t total = pp->g[0].used + pp->g[1].used;
-            X->adm.slot_capacity =
-                X->used + (slot_capacity > total ? slot_capacity - total : 0u);
+            size_t room = slot_capacity > total ? slot_capacity - total : 0u;
+            const size_t own = X->row_cap > X->used ? X->row_cap - X->used : 0u;
+            if (room > own) room = own;
+            X->adm.slot_capacity = X->used + room;
             prefill_pass(&X->pre, X->retired_last);
         }
         if (report_phase) sink->phase(sink->ud, iteration, 2);
@@ -2573,7 +2633,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             size_t live = 0;
             const size_t resident_rows = X->used;
             size_t next_step_rr = X->step_rr;
-            for (size_t offset = 0; offset < resident_rows && live < max_batch;
+            for (size_t offset = 0; offset < resident_rows && live < X->width_cap;
                  ++offset) {
                 const size_t i = (X->step_rr + offset) % resident_rows;
                 if (!X->slots[i].in_use || !X->slots[i].active) continue;

@@ -61,7 +61,9 @@ typedef struct {
      * can be compared with a run of its rows alone. */
     uint64_t lane_rows[2][LOG_MAX];
     size_t lane_steps[2];
-    size_t lanes_set;             /* scratch_set_lane calls */
+    size_t lanes_set;             /* scratch_set_lane calls that made a lane */
+    size_t lane_width[2];         /* each lane's scratch width */
+    size_t lane_widest[2];        /* each lane's widest step or gang */
     size_t pp_overlapped;         /* launches while the other lane had work queued */
     size_t pp_violations;         /* calls the per-scratch seam forbids */
 } observation;
@@ -572,9 +574,29 @@ static int pp_is_queued(const mynah_engine_ctx *ctx, int decode) {
     return 0;
 }
 
-static void pp_scratch_set_lane(mynah_engine_scratch *scratch, int lane) {
+/* Set: the next scratch_set_lane for lane 1 refuses, as an engine whose
+ * second scratch lacks a device workspace the first has. */
+static int g_pp_refuse_lane;
+
+static int pp_scratch_set_lane(mynah_engine_scratch *scratch, int lane,
+                               const mynah_engine_scratch *peer, char *error,
+                               size_t capacity) {
+    (void)peer;
+    if (lane == 1 && g_pp_refuse_lane) {
+        fake_err(error, capacity, "fake: lane 1 scratch incomplete");
+        return -1;
+    }
     scratch->lane = lane == 1 ? 1 : 0;
+    g_obs.lane_width[scratch->lane] = scratch->batch;
     ++g_obs.lanes_set;
+    return 0;
+}
+
+/* A lane is never asked for more rows than its scratch was made for. */
+static void pp_note_width(const mynah_engine_scratch *scratch, size_t count) {
+    if (count > scratch->batch) ++g_obs.pp_violations;
+    if (count > g_obs.lane_widest[scratch->lane])
+        g_obs.lane_widest[scratch->lane] = count;
 }
 
 static void pp_ctx_free(mynah_engine_ctx *ctx) {
@@ -596,6 +618,7 @@ static int pp_step_batch(mynah_engine_ctx *const *ctxs, size_t count,
                          size_t capacity) {
     pp_lane *L = &g_lane[scratch->lane];
     const pp_lane *other = &g_lane[1 - scratch->lane];
+    pp_note_width(scratch, count);
     if (L->dec_inflight) ++g_obs.pp_violations;
     if (L->pending_count != 0u) {
         int same = L->pending_count == count;
@@ -629,6 +652,7 @@ static int pp_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count,
                                  int *failed, mynah_engine_scratch *scratch,
                                  char *error, size_t capacity) {
     if (g_lane[scratch->lane].dec_inflight) ++g_obs.pp_violations;
+    pp_note_width(scratch, count);
     return fake_decode_audio_batch(ctxs, count, first, frames, out_samples,
                                    out_count, failed, scratch, error, capacity);
 }
@@ -637,6 +661,7 @@ static int pp_step_launch(mynah_engine_ctx *const *ctxs, size_t count,
                           mynah_engine_scratch *scratch) {
     pp_lane *L = &g_lane[scratch->lane];
     const pp_lane *other = &g_lane[1 - scratch->lane];
+    pp_note_width(scratch, count);
     if (L->pending_count != 0u) ++g_obs.pp_violations;
     if (count < 2u || count > FAKE_MAX_BATCH) return 1;
     for (size_t i = 0; i < count; ++i) {
@@ -656,6 +681,7 @@ static int pp_decode_submit(mynah_engine_ctx *const *ctxs, size_t count,
                             mynah_engine_scratch *scratch, char *error,
                             size_t capacity) {
     pp_lane *L = &g_lane[scratch->lane];
+    pp_note_width(scratch, count);
     /* One gang per scratch, submitted ahead of that scratch's next launch. */
     if (L->dec_inflight || L->pending_count != 0u) ++g_obs.pp_violations;
     if (count == 0u || count > FAKE_MAX_BATCH) {
@@ -1433,6 +1459,10 @@ int main(void) {
      * (c) Continuous admission (four slots for eight requests): solo audio.
      * (d) One request's codec fails at the collect, or one refuses a step:
      *     it fails alone.
+     * (e) Group B's scratch is ceil(slots / 2) rows wide, not max_batch, and
+     *     no step or gang on a lane is wider than its scratch ((a), (c)).
+     * (f) The engine refuses lane B (an incomplete second scratch): the flag
+     *     is ignored, nothing is queued, and the run is the flag-off run.
      * Throughout: nothing on a lane while that lane has work queued, no
      * queued context freed or prefilled, every queued step finished and
      * every gang collected. */
@@ -1489,6 +1519,11 @@ int main(void) {
             if (!bad && (g_obs.lanes_set != 2u || g_obs.launches == 0u ||
                          g_obs.finishes != g_obs.launches || g_obs.pp_overlapped == 0u))
                 bad = 6;
+            if (!bad && (g_obs.lane_width[0] != REQUESTS ||
+                         g_obs.lane_width[1] != (REQUESTS + 1u) / 2u ||
+                         g_obs.lane_widest[1] == 0u ||
+                         g_obs.lane_widest[1] > g_obs.lane_width[1]))
+                bad = 15;
             if (!bad && (g_obs.dec_submits == 0u || g_obs.dec_collects != g_obs.dec_submits))
                 bad = 7;
             if (!bad && (g_obs.pp_violations != 0u || g_obs.withheld != 0u ||
@@ -1554,6 +1589,9 @@ int main(void) {
                          g_obs.dec_collects != g_obs.dec_submits ||
                          g_obs.lane_steps[1] == 0u))
                 bad = 6;
+            if (!bad && (g_obs.lane_width[1] != (BATCH_WIDTH + 1u) / 2u ||
+                         g_obs.lane_widest[1] > g_obs.lane_width[1]))
+                bad = 15;
             if (!bad && (g_obs.pp_violations != 0u || g_obs.withheld != 0u)) bad = 8;
             release(got, REQUESTS);
         }
@@ -1583,8 +1621,47 @@ int main(void) {
             if (!bad && g_obs.pp_violations != 0u) bad = 8;
             release(got, REQUESTS);
         }
+
+        if (!bad) {
+            static observation off_obs;
+            capture off[REQUESTS], got[REQUESTS];
+            unsetenv("MYNAH_CUDA_PINGPONG");
+            unsetenv("MYNAH_CUDA_PINGPONG_MIN");
+            build_requests(requests, healthy, REQUESTS);
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (run(&fake_engine_pingpong, requests, REQUESTS, REQUESTS, off, results,
+                    errors) != 0)
+                bad = 1;
+            off_obs = g_obs;
+            setenv("MYNAH_CUDA_PINGPONG", "2", 1);
+            setenv("MYNAH_CUDA_PINGPONG_MIN", "2", 1);
+            g_pp_refuse_lane = 1;
+            memset(&g_obs, 0, sizeof(g_obs));
+            pp_reset();
+            if (!bad && run(&fake_engine_pingpong, requests, REQUESTS, REQUESTS, got,
+                            results, errors) != 0)
+                bad = 16;
+            g_pp_refuse_lane = 0;
+            for (size_t i = 0; i < REQUESTS && !bad; ++i) {
+                if (results[i] != MYNAH_GRAPH_OK || !same_audio(&got[i], &off[i]))
+                    bad = 16;
+            }
+            if (!bad && (g_obs.lanes_set != 0u || g_obs.launches != 0u ||
+                         g_obs.dec_submits != 0u || g_obs.lane_steps[1] != 0u ||
+                         g_obs.lane_steps[0] != off_obs.lane_steps[0] ||
+                         memcmp(g_obs.lane_rows[0], off_obs.lane_rows[0],
+                                g_obs.lane_steps[0] * sizeof(g_obs.lane_rows[0][0])) != 0))
+                bad = 16;
+            if (!bad)
+                printf("  ping-pong refused by the engine (incomplete second scratch): "
+                       "%zu steps, the flag-off run\n", g_obs.lane_steps[0]);
+            release(off, REQUESTS);
+            release(got, REQUESTS);
+        }
         unsetenv("MYNAH_CUDA_PINGPONG");
         unsetenv("MYNAH_CUDA_PINGPONG_MIN");
+        g_pp_refuse_lane = 0;
         pp_reset();
         if (bad == 1) return fail("ping-pong: a reference half run failed");
         if (bad == 2) return fail("ping-pong: work was queued or a lane set with the flag off");
@@ -1600,6 +1677,8 @@ int main(void) {
         if (bad == 12) return fail("ping-pong: continuous admission changed a request's audio");
         if (bad == 13) return fail("ping-pong: the failing request did not fail");
         if (bad == 14) return fail("ping-pong: one request's failure hurt a sibling");
+        if (bad == 15) return fail("ping-pong: group B's scratch is not half the slots wide, or a lane ran wider than its scratch");
+        if (bad == 16) return fail("ping-pong: a refused second lane did not fall back to the flag-off run");
     }
 
     /* Restore the healthy requests for anything added after this point. */

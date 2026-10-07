@@ -72,6 +72,7 @@ struct mynah_backend {
     int (*fence_query)(void *, void *);
     int (*fence_sync)(void *, void *, char *, size_t);
     void (*set_lane)(void *, int);
+    int (*lane_clear_error)(void *, char *, size_t);
     int (*flow_batch_dev)(void *, const mynah_backend_flow_batch *, char *, size_t);
     int (*snake_dev)(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
     int (*gelu_dev)(void *, float *, size_t, char *, size_t);
@@ -201,6 +202,7 @@ extern void mynah_cuda_fence_wait(void *, void *);
 extern int mynah_cuda_fence_query(void *, void *);
 extern int mynah_cuda_fence_sync(void *, void *, char *, size_t);
 extern void mynah_cuda_set_lane(void *, int);
+extern int mynah_cuda_lane_clear_error(void *, char *, size_t);
 extern int mynah_cuda_flow_batch_dev(void *, const mynah_backend_flow_batch *, char *, size_t);
 extern int mynah_cuda_snake_dev(void *, float *, const float *, size_t, size_t, size_t, char *, size_t);
 extern int mynah_cuda_gelu_dev(void *, float *, size_t, char *, size_t);
@@ -738,6 +740,7 @@ int mynah_backend_open(mynah_tts_device device, mynah_backend **out,
         backend->fence_query = mynah_cuda_fence_query;
         backend->fence_sync = mynah_cuda_fence_sync;
         backend->set_lane = mynah_cuda_set_lane;
+        backend->lane_clear_error = mynah_cuda_lane_clear_error;
         backend->flow_batch_dev = mynah_cuda_flow_batch_dev;
         backend->snake_dev = mynah_cuda_snake_dev;
         backend->gelu_dev = mynah_cuda_gelu_dev;
@@ -1270,6 +1273,12 @@ int mynah_backend_fence_query(const mynah_backend *backend, void *fence) {
 void mynah_backend_set_lane(const mynah_backend *backend, int lane) {
     if (backend != NULL && backend->set_lane != NULL)
         backend->set_lane(backend->state, lane);
+}
+
+int mynah_backend_lane_clear_error(const mynah_backend *backend, char *error,
+                                   size_t error_capacity) {
+    if (backend == NULL || backend->lane_clear_error == NULL) return 0;
+    return backend->lane_clear_error(backend->state, error, error_capacity);
 }
 
 int mynah_backend_fence_sync_at(const mynah_backend *backend, void *fence,
