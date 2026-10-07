@@ -402,6 +402,126 @@ Evidence (summaries and job scripts only): `.work/l40s-2026-10-05/` (`res/*.log`
   (clients killed mid-stream). They are not errors.
 
 
+## 3h. 2026-10-06 evening, Vast.ai L40S (Xeon Gold 6430, 2 NUMA nodes, cores ≤ 2.6 GHz)
+
+**Setup.** The server is pinned to the GPU's NUMA node and the clients run on the other node. GPU at 70 °C, full
+2520 MHz, no throttling. Levels are 2 minutes long. Cells are audio-s/s / stream RTF p95 / TTFA p95.
+
+**Package (all 11 flags) vs base:**
+
+| C | base | all 11 flags |
+|---|---|---|
+| 768 | 773 / 0.919 / 157 ms | 867 / 0.829 / 141 ms |
+| 896 | 785 / 1.034, 80,583 stalls | 891 / 0.915 / 158 ms, 0 stalls |
+
+- Syncs per iteration go from 19.5 to 11.8, host per iteration from 33.5 to 28.4 ms.
+- The leave-one-out was stopped after 4 flags to save time. The data so far:
+  - **L19** carries the most here: removing it costs 5 % (822 / 0.864 at C768).
+  - **L21** costs ~2 % when removed.
+  - **L6** changes no throughput but saves ~6 syncs per iteration.
+- **VRAM** at the end of each arm: 35.0-35.3 GB in every arm, with or without L6. L6 does not grow device memory.
+
+**Defaults decided** (close-out rule 3c; bit-identical, no regression on the L4 or the L40S):
+- All 11 flags become default on.
+- L19 gets an automatic thread count: 1 at ≤ 4 CPUs, 2 at ≤ 8, 4 above. `MYNAH_STREAM_DELIVER_THREADS=N` overrides
+  it and `=0` turns it off.
+- To do: implement the defaults, then update `docs/cuda-serving.md` §7 and `configs/perf/`.
+
+**L13 (step overlap) alone: KO as a default.** It stays opt-in, superseded by L13b.
+
+| C | all 11 flags | + L13 |
+|---|---|---|
+| 768 | 867 / 0.829 / 141 ms | 882-901 / 0.785-0.811 / 186-189 ms |
+| 896 | 891 / 0.915 / 158 ms | 881-899 / 0.914-0.928 / 216-220 ms |
+
+- At C768 one run also showed a gap p95 of 872 ms and 209 stalls.
+
+**The silent exit at C1024 is the fd limit, not the engine.**
+- The soft `RLIMIT_NOFILE` is 1024. Past ~1000 streams, `accept()` returns EMFILE, the accept loop breaks without a
+  log line, and the normal shutdown then answers 503 "server is shutting down".
+- With `ulimit -n 65536`, C1024 ran clean: 880 / 1.076, 0 failures.
+- The fix is commit `bee72f7`. The server raises its soft limit to the hard one and backs off on EMFILE. On the box
+  it logged "open-file limit raised from 1024 to 1048576".
+- **Consequence:** C1024 was never really measured before today.
+
+**L13b decode-ahead** (branch `pocket-l13b`, commit `1d244c8`):
+- Identity: 32/32 CLI, 32/32 CLI `--stream` and 166/166 server C1 in every arm, including with `DECODE_CHECK`.
+
+| C | all + L13 | all + L13 + L13b | all + L13 + L13b + L13d (+ late wait 3 ms) |
+|---|---|---|---|
+| 768 | 901 / 0.785 / 186 ms | 979 / 0.727 / 167 ms | 970 / 0.761 / **118 ms** |
+| 896 | 899 / 0.914 / 216 ms | **961 / 0.853 ✓** / 195 ms | 947 / 0.899 / 139 ms |
+| 1024 | 894 / 1.065 / 246 ms | 943 / 0.998 / 227 ms, 0 stalls | 940 / 1.038 / 160 ms, 10 stalls |
+
+- **L13b passes the gate at C896.**
+- L13d trades ~2-4 % throughput for a much lower TTFA.
+- Device wait is now ~6 % of the loop and host ~90 % (55-56 ms per iteration at C1024). The GPU-side waits are
+  hidden; what is left is pure host time.
+
+**A1a host-context pool** (`MYNAH_CTX_HOST_POOL`, commit `6a5f996`):
+- Identity at =0, =1 and =2 (=2 also zeroes the KV): CLI 32/32 and server C1 166/166 (150/150 at =2).
+- At C1, 144 of 160 contexts were pooled. The mean context build is 1.28 ms (was 1.4-2.2 ms fresh under load), and
+  `codec_setup` goes from 0.5-0.9 ms to 0.03 ms.
+- **Speed (all 11 flags + A1a):**
+
+  | C | audio-s/s / RTF p95 / TTFA p95 | SM | power |
+  |---|---|---|---|
+  | 768 | 1110 / 0.638 / 111 ms | 85 % | 316 W |
+  | 896 | 1108 / 0.742 / 128 ms | 83 % | 318 W |
+  | **1024** | **1112 / 0.852 ✓ / 147 ms**, 0 stalls | 84 % | 319 W |
+
+- **C1024 passes the 0.88 gate.** Host per iteration drops from ~55 to 26.5 ms, and device wait is back to 52 % of
+  the loop.
+- `[CTX]` shows the cause: a fresh context built while the server is full costs **~13 ms** (`ar_states` grows with
+  load), while a pooled one costs **0.1-0.3 ms**. Admission was the real ceiling.
+
+**`MYNAH_ASYNC_ADMIT` with INLINE=0: 72 "CUDA: out of memory" step failures** at C768 with 32/46 GB used.
+- Diagnosis from reading the code: a stale CUDA error from a recoverable failed allocation is re-read by later
+  launch checks.
+- Fix proposed but not applied: clear the error after a failed allocation in `backend_cuda.cu`.
+
+**Combined tree** (`pocket-combo`, merge `16e4950`): all 11 flags + L13 + L13b + L13d (late wait 3 ms) + A1a.
+- Identity: CLI 32/32, CLI `--stream` 32/32.
+
+| C | audio-s/s / RTF p95 / TTFA p95 | SM | power |
+|---|---|---|---|
+| 896 | 1158 / 0.738 / 111 ms | 89 % | 329 W |
+| **1024** | **1157 / 0.846 ✓ / 130 ms**, 0 stalls | 87 % | 327 W |
+
+- **This is the best result.** It is +31 % over the 11 flags alone at C1024 (880 / 1.076), with the lowest TTFA at
+  this load.
+- The GPU is near its physical ceiling: 87-89 % busy at 327-329 W out of 350 W.
+
+**Ping-pong L26** (`pocket-pingpong`, `6bc7566`, based on L13b, without A1a):
+- Identity is good:
+  - below the threshold, CLI 32/32;
+  - the split (`MIN=2`) vs the reference, 32/32;
+  - `DECODE_CHECK` split 32/32;
+  - server C1 166/166.
+- 45-55 % of host time ran under the other group's GPU work.
+- **The speed arm hit "CUDA: out of memory" during the start-up width-bucket warm-up**, with device memory at
+  +42.4 GB, and one-sync was disabled. Stopped; no speed numbers.
+- Likely cause: group B's scratch is sized at the full `max_batch` (a deferred stage). That doubles the per-width
+  scratch at ROW_CAP 1024, on top of the stale-CUDA-error effect seen with async admission.
+- **Next:**
+  - size group B's scratch at half width (or cap the groups at ROW_CAP/2);
+  - clear the CUDA error after recoverable allocation failures;
+  - rebase onto A1a;
+  - re-test.
+- With the GPU already at 87 % on the combined tree, the remaining headroom for ping-pong is small. It matters more
+  for slower hosts (4 vCPU).
+
+**Next session:**
+1. Make the 11 flags default (L19 with the automatic thread count). Promote A1a and L13b + L13d after one L4
+   regression run and a 10-minute soak at C1024 on the combined tree.
+2. Merge `pocket-combo` into the main branch.
+3. Apply the CUDA stale-error fix, which also covers `MYNAH_ASYNC_ADMIT`.
+4. Ping-pong memory fix and re-test.
+5. Test on a 4-vCPU host: the combined tree with L19 = 1.
+6. Docs: `docs/server.md` (fd limit), `docs/cuda-serving.md` §7, `configs/perf/`.
+
+Evidence (32 KB of summary logs only): `.work/l40s-2026-10-06/res-l40s-jp.tgz`, and the job scripts in
+`.work/l40s-2026-10-06/jobs/`.
 ## 3i. 2026-10-07, Vast.ai RTX 6000 Ada (EPYC 7C13, 1 NUMA node, driver 565): admission device cost, A1b
 
 **Box.** The GPU is cool: 32 °C idle, 61-73 °C under load, no throttling. The EPYC 7C13 runs up to ~3.1 GHz on a
