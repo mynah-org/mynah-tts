@@ -128,7 +128,7 @@ a Zen 4 host. The first x86 serving figures (2026-10-08) are on the low
 tier: an AMD EPYC 7702 with AVX2 and FMA only (no AVX-512, no VNNI), ~24 vCPUs
 of quota, where new AVX2 kernels (an exact int8 sign-trick dot, a 6x16 FMA
 tile, laid-out codec convs) took the streaming knee from C12 to **C24** on
-the 24L and to about **C36** on the 6L (2-3 minute screens at the knee), byte-identical audio.
+the 24L and to about **C36** on the 6L (2-3 minute screens at the knee), byte-identical audio; the 6L then takes an int8 backbone by default on x86 hosts without AVX512-BF16 (ASR gate 1.44% vs 1.57% WER), which moves it to **C48**.
 Detail: [performance](docs/performance.md).
 
 ### Magpie — single request

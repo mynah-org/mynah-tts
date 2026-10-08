@@ -1035,7 +1035,7 @@ bank, **2-3 minute screens, not 30-minute soaks**), base vs this branch:
 |---|---|---|---|---|---|---|
 | 24L | 6 x 4, `--max-batch 8` | C12 | **C24** | 15.1 -> 22.6 | 0.793 | 380 ms |
 | 6L | 11 x 2, `--max-batch 8` | C28 (C36 fails one screen in two) | **C36** at the edge (2 of 3 screens pass) | 33.9 -> 42.4 at C36 | 0.745 | 267 ms |
-| 6L, int8 backbone (opt-in, changes audio) | 11 x 2 | — | **C48** safe, C56 at the edge | 61.8 at C48 | 0.709 | 160 ms |
+| 6L, int8 backbone (**default on x86 without AVX512-BF16** since 2026-10-08) | 11 x 2 | — | **C48** safe, C56 at the edge | 61.8 at C48 | 0.709 | 160 ms |
 
 No request failed at any level. A last check of the merged branch (same
 commands) gave 24L C24 at STREAM_RTF p95 0.786 with 0 stalls, missing only the
@@ -1051,6 +1051,11 @@ WER 1.57% bf16 against **1.44% int8** (60 utterances each; one short int8
 utterance over 30%, none for bf16). A clean C56 re-screen (no other load) gave
 2147 requests, STREAM_RTF p95 0.770, TTFA p95 182 ms but 5 stalls@500, so C56
 is the edge on this host and C48 (0 stalls, RTF p95 0.709) the safe point.
+With the gate passed, the shallow pack now takes the int8 backbone by default
+on any x86 host whose bf16 kernel is not `VDPBF16PS` (the deep pack already
+did everywhere on CPU); ARM keeps bf16. `MYNAH_POCKET_X86_INT8_BACKBONE=0`
+restores bf16 (checked byte-identical to the previous default on the 7702), and
+the new default is byte-identical to the explicit `MYNAH_QUANT_GROUPS` int8 spec.
 
 Against Axion (32 Neoverse-V2 cores, 30-minute soaks: 24L C88, 6L C164), this
 slice reaches roughly a quarter (24L) to a third (6L) of an Axion core per CPU

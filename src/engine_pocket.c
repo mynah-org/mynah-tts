@@ -680,6 +680,31 @@ enum {
     "backbone:int8,flow_net:f16,conditioner:f16"
 #define POCKET_DEEP_BACKBONE_LAYERS 24u
 
+/* The deep spec also for a SHALLOW pack on an x86 host with no native bf16 dot
+ * (no AVX512-BF16): there the bf16 backbone runs the AVX2 widening kernel, a
+ * shift plus an f32 FMA per weight, while int8 runs the exact sign-trick dot.
+ * Measured on an AMD EPYC 7702 slice (~24 CPUs, 2026-10-08): 6L backbone step
+ * at B=1 3.6 ms int8 against 8.7 ms bf16; streaming knee C36 -> C48 (C56 at the
+ * edge); ASR gate 1.44% WER int8 against 1.57% bf16 on the same 60 utterances
+ * (docs/performance.md). ARM keeps bf16: BFDOT/BFMMLA made it the faster 6L
+ * backbone on the Axion, and ARM hosts without FEAT_BF16 were not measured.
+ * MYNAH_POCKET_X86_INT8_BACKBONE=0 restores bf16 on such a host. */
+static int pocket_x86_prefers_int8_backbone(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("MYNAH_POCKET_X86_INT8_BACKBONE");
+        if (env != NULL && strcmp(env, "0") == 0)
+            cached = 0;
+        else
+            cached = strcmp(mynah_qmat_bf16_kernel(NULL), "vdpbf16ps") != 0;
+    }
+    return cached;
+#else
+    return 0;
+#endif
+}
+
 /* What MYNAH_CUDA_QUANT=int8 selects when MYNAH_QUANT_GROUPS is unset. */
 #define POCKET_QG_CUDA_INT8_SPEC "backbone:int8,flow_net:int8"
 
@@ -4449,7 +4474,8 @@ static int pocket_model_init(const mynah_tts_model *model,
             /* With no MYNAH_QUANT to obey, the default names its own encodings
              * rather than inheriting a base that has changed underneath it. */
             spec = (mynah_qmat_qtype_from_env() >= 0) ? POCKET_QG_DEFAULT_SPEC
-                 : (state->cfg.layers >= POCKET_DEEP_BACKBONE_LAYERS &&
+                 : ((state->cfg.layers >= POCKET_DEEP_BACKBONE_LAYERS ||
+                     pocket_x86_prefers_int8_backbone()) &&
                     (state->backend == NULL ||
                      strcmp(mynah_backend_name(state->backend), "cuda") != 0))
                      ? POCKET_QG_DEFAULT_SPEC_PINNED_DEEP
