@@ -328,6 +328,7 @@ table above.)
 | `MYNAH_CUDA_KV_VMM=1` (with `MYNAH_CUDA_KV_DTYPE=bf16`; ignored with int8 KV) | backbone KV rows are VMM ranges that grow in place (no copy, no second allocation, no sync); with `MYNAH_CUDA_KV_VMM_CHUNK=64 MYNAH_CUDA_KV_GROW_INITIAL_STEPS=64` rows start small | L4, `--max-batch 320`, with the diet: start-up 9.6 GB (was 16.0), C320 runs with 0 failures at peak 14.4 GB, but the position-major layout costs ~4 % (C288 0.851 vs 0.819) and C320 is compute-bound (0.926): off on the L4; for GPUs with more compute than memory headroom |
 | `MYNAH_CUDA_QUANT_STAGES=all` | bf16 weights for the flow head and the Mimi transformer too | no measurable gain over `backbone` (C256 0.714 -> 0.712) |
 | `MYNAH_CUDA_SYNC=blocking` | host thread sleeps while the GPU works: server CPU 117% -> 43% | -9% throughput (each wake-up idles the GPU) |
+| `MYNAH_CUDA_STARTUP_WALK=1` | start-up graph walk over the width buckets only (short text, two steps each) and a two-step slot-pool prefill: L4 24L ready 57 -> 17 s at `--max-batch 320`, 210 -> 54 s at `ROW_CAP=1024`; 6L `ROW_CAP=2048` from not ready after 14 min to 21 s; bit-identical, C320 steady state equal | a C320 burst arriving at ready had a worse first 30 s (TTFA p95 994 vs 693 ms, 14 stalls at 250 ms vs 0; one run each). Use it for large `ROW_CAP` builds, where the default walk does not finish |
 | `MYNAH_CUDA_TILE_TC=1` | own tensor-core fixed-order GEMM for the f32 prefill | +1-2% only |
 | `MYNAH_CUDA_QUANT=int8` | int8 resident weights | diagnostic only |
 | `MYNAH_CUDA_FAST_MATH=1` | FP16 GEMMs | not qualified |
@@ -524,6 +525,7 @@ L13/L13b/L13d, A1b) are on for the CUDA backend only. Effects are 2-minute scree
 | `MYNAH_SERVE_HOST_MIN_ROWS` / `MYNAH_SERVE_HOST_SPIN_US` | 64 rows / 50 µs | regions below this many rows run inline; a worker spins this long after a region before parking | with `MYNAH_SERVE_HOST_THREADS` | | unset |
 | `MYNAH_CUDA_PREFILL_PINNED` | off (opt-in, `=1`) | the prefill tile stages the text embeddings in one pinned buffer and uploads them with one copy, instead of a pageable `cudaMemcpyAsync` per row, which first waited for the decode gang queued just before it | always, once screened on a host-bound GPU | L4 C320: the upload was 9.3 ms of host time per iteration (12.7 ms per call); same bytes, bit-identical | unset or `=0` |
 | `MYNAH_CUDA_MIMI_STALE_WINDOW` | off (opt-in, `=1`) | a row owned by the Mimi tile advances its host codec window without copying its stale host K/V (never read again: the K/V lives in the device ring) | always, once screened on a host-bound GPU | L4 C320: the copy was ~9 µs per row and frame, 2.0 ms per iteration; bit-identical | unset or `=0` |
+| `MYNAH_CUDA_STARTUP_WALK` | off (opt-in, CUDA serving with `MYNAH_CUDA_WIDTH_BUCKETS`) | `=1`: the start-up graph walk visits each width bucket for two steps on a short text (`4 + 2 x (buckets + 2)` steps) instead of stepping every width from `--max-batch` down to 1 on a long text, and the slot-pool prefill runs two steps per request. The server prints `start-up phases: ...` when ready, either way | large `ROW_CAP` builds and fast restarts, where start-up time matters more than the first 30 s after ready; the full-width walk grows with the square of `--max-batch` and its long-text caches can fill the GPU | L4 24L: `--max-batch 320` ready 57 -> 17 s, VRAM at ready 16.0 -> 11.0 GB; `ROW_CAP=1024` 210 -> 54 s (and the walk captures its graphs, where the old one captured none); 6L `ROW_CAP=2048` not ready after 14 min -> 21 s. Bit-identical; C320 steady state equal. First 30 s of a C320 burst at ready: TTFA p95 994 vs 693 ms, 14 stalls vs 0 (one run each), hence opt-in | unset or `=0` |
 | `MYNAH_SERVE_PROFILE` | off | `[SERVE]` report at shutdown, `[CTX]` lines, per-feature counters; `=2` adds the `[HOSTP]` per-phase host table (wall, device wait, host, rows and µs per row for each loop and engine phase) | diagnostics, benchmarks | | **unset**: any value, `=0` included, turns it on |
 
 `MYNAH_CUDA_PINGPONG` warns when deferred release is rolled back
@@ -562,6 +564,7 @@ tolerance comparison.
 | `MYNAH_CUDA_KV_GROW_LOG=1` | log each attention-cache growth |
 | `MYNAH_CUDA_KV_GROW_INITIAL_STEPS=N` | force growth early (bit-identity tests) |
 | `MYNAH_CUDA_SLOT_POOL_ZERO_KV=1` | zero reused caches (leak A/B: audio must not change) |
+| `MYNAH_CUDA_GRAPH_TRACE=1` | log each pipeline CUDA graph capture (key, record and instantiate time) |
 
 ## 8. Monitoring
 
