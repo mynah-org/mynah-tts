@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: MIT */
 #include "engine_pocket.h"
+#include "hostpool.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -1081,6 +1082,11 @@ struct mynah_engine_state {
     int cuda_voice_kv_bf16;
     float *cuda_prefill_in;
     size_t cuda_prefill_in_floats;
+    /* MYNAH_CUDA_PREFILL_PINNED: pinned staging of the text embeddings the
+     * prefill tile uploads, and the fence of its last upload. */
+    float *cuda_prefill_host;
+    size_t cuda_prefill_host_floats;
+    void *cuda_prefill_host_fence;
 
     /* Idle per-request CUDA resource sets (MYNAH_CUDA_SLOT_POOL).  A retired
      * CUDA context parks its device buffers, resident decoder and pinned host
@@ -3961,6 +3967,9 @@ static void pocket_model_free(mynah_engine_state *state) {
         free(state->cuda_voice_kv);
     }
     mynah_backend_dev_free(state->backend, state->cuda_prefill_in);
+    if (state->cuda_prefill_host_fence != NULL)
+        mynah_backend_fence_wait(state->backend, state->cuda_prefill_host_fence);
+    mynah_backend_host_free(state->backend, state->cuda_prefill_host);
     mynah_sp_close(state->tokenizer);
     pocket_voices_free(state->voices, state->voice_count);
     if (state->voice_cache_mutex_ready) {
@@ -9123,6 +9132,82 @@ static int pocket_cuda_backbone_step_commit(mynah_engine_ctx *const *ctxs,
     return 0;
 }
 
+/* MYNAH_SERVE_HOST_THREADS: the per-row part of a batched backbone step's
+ * preparation (pocket_cuda_backbone_step_batch_impl). Statuses, in the order
+ * the serial loop tests them: refuse (return 1), full (return -1), grow (the
+ * cache must be widened on the scheduler thread first), no input (return 1
+ * after the growth), ok. */
+enum {
+    POCKET_BB_ROW_OK = 0,
+    POCKET_BB_ROW_REFUSE = 1,
+    POCKET_BB_ROW_FULL = 2,
+    POCKET_BB_ROW_GROW = 4,       /* flag: grow first */
+    POCKET_BB_ROW_NO_INPUT = 8    /* flag: then refuse */
+};
+
+typedef struct {
+    mynah_engine_ctx *const *ctxs;
+    const mynah_engine_state *state;
+    const mynah_transformer_ar_config *first_config;
+    int kv_bf16;
+    mynah_engine_scratch *scratch;
+    const float *const *input_rows;
+    int defer;
+    size_t hidden_dim;
+    unsigned char *status;
+} pocket_bb_rows_job;
+
+static void pocket_bb_rows_body(void *ud, size_t begin, size_t end) {
+    const pocket_bb_rows_job *job = (const pocket_bb_rows_job *)ud;
+    mynah_engine_scratch *scratch = job->scratch;
+    const mynah_transformer_ar_config *first_config = job->first_config;
+    for (size_t i = begin; i < end; ++i) {
+        mynah_engine_ctx *ctx = job->ctxs[i];
+        unsigned char *st = &job->status[i];
+        if (ctx == NULL || ctx->state != job->state || !ctx->cuda_backbone_enabled ||
+            ctx->cuda_backbone_kv == NULL || ctx->cuda_x == NULL ||
+            ctx->cuda_backbone_capacity == 0u ||
+            ctx->cuda_backbone_kv_bf16 != job->kv_bf16) {
+            *st = POCKET_BB_ROW_REFUSE;
+            continue;
+        }
+        const mynah_transformer_ar_config *config =
+            mynah_transformer_ar_state_config(ctx->backbone);
+        if (config == NULL || config->d_model != first_config->d_model ||
+            config->num_heads != first_config->num_heads ||
+            config->head_dim != first_config->head_dim ||
+            config->num_layers != first_config->num_layers ||
+            config->ffn_dim != first_config->ffn_dim ||
+            config->max_period != first_config->max_period ||
+            config->layernorm_eps != first_config->layernorm_eps ||
+            config->max_seq_len == 0u ||
+            ctx->cuda_backbone_capacity > config->max_seq_len) {
+            *st = POCKET_BB_ROW_REFUSE;
+            continue;
+        }
+        const size_t position = mynah_transformer_ar_state_offset(ctx->backbone);
+        scratch->cuda_positions[i] = position;
+        if (position >= config->max_seq_len) {
+            *st = POCKET_BB_ROW_FULL;
+            continue;
+        }
+        scratch->cuda_cache_strides[i] = pocket_cuda_kv_stride(ctx);
+        const float *input = job->input_rows != NULL ? job->input_rows[i]
+                                                     : ctx->step_input;
+        /* pocket_cuda_backbone_reserve's no-op test: anything else grows. */
+        const unsigned char grow =
+            position + 1u > ctx->cuda_backbone_capacity ? POCKET_BB_ROW_GROW : 0u;
+        if (grow != 0u || input == NULL) {
+            *st = (unsigned char)(grow | (input == NULL ? POCKET_BB_ROW_NO_INPUT : 0u));
+            continue;
+        }
+        if (!job->defer)
+            memcpy(scratch->cuda_host_input + i * job->hidden_dim, input,
+                   job->hidden_dim * sizeof(float));
+        *st = POCKET_BB_ROW_OK;
+    }
+}
+
 /* `defer` (MYNAH_CUDA_ONE_SYNC only): queue the step on the stream and return
  * 0 without the stream sync and without committing anything on the host; the
  * caller syncs once for the whole frame and then runs
@@ -9186,7 +9271,45 @@ static int pocket_cuda_backbone_step_batch_impl(
         return 1;
     }
     int all_kv_valid = 1;
-    for (size_t i = 0; i < count; ++i) {
+    /* MYNAH_SERVE_HOST_THREADS: the per-row checks and staging below, on the
+     * pool; each row writes only its own scratch entries and status. A row
+     * whose cache must grow (a device allocation) is marked, and grows here,
+     * on this thread, in row order, as do the early returns. */
+    pocket_bb_rows_job job;
+    job.ctxs = ctxs;
+    job.state = state;
+    job.first_config = first_config;
+    job.kv_bf16 = kv_bf16;
+    job.scratch = scratch;
+    job.input_rows = input_rows;
+    job.defer = defer;
+    job.hidden_dim = cfg->hidden_dim;
+    unsigned char row_status[POCKET_MAX_BATCH];
+    job.status = row_status;
+    const int pooled_rows = mynah_hostpool_threads() > 1;
+    if (pooled_rows) {
+        mynah_hostpool_run(count, pocket_bb_rows_body, &job);
+        for (size_t i = 0; i < count; ++i) {
+            const unsigned char st = row_status[i];
+            if (st == POCKET_BB_ROW_REFUSE) return 1;
+            if (st == POCKET_BB_ROW_FULL) return -1;
+            mynah_engine_ctx *ctx = ctxs[i];
+            if (st & POCKET_BB_ROW_GROW) {
+                /* MYNAH_CUDA_KV_GROW, as below. */
+                if (pocket_cuda_backbone_reserve(ctx, scratch->cuda_positions[i] + 1u,
+                                                 NULL, 0u) != 0) return 1;
+                scratch->cuda_cache_strides[i] = pocket_cuda_kv_stride(ctx);
+            }
+            if (!ctx->cuda_backbone_valid) all_kv_valid = 0;
+            if (st & POCKET_BB_ROW_NO_INPUT) return 1;
+            if ((st & POCKET_BB_ROW_GROW) && !defer)
+                memcpy(scratch->cuda_host_input + i * cfg->hidden_dim,
+                       input_rows != NULL ? input_rows[i] : ctx->step_input,
+                       cfg->hidden_dim * sizeof(float));
+        }
+    }
+    /* The pool off: the loop as it always was. */
+    for (size_t i = 0; i < count && !pooled_rows; ++i) {
         mynah_engine_ctx *ctx = ctxs[i];
         if (ctx == NULL || ctx->state != state || !ctx->cuda_backbone_enabled ||
             ctx->cuda_backbone_kv == NULL || ctx->cuda_x == NULL ||
@@ -9950,6 +10073,31 @@ static void pocket_onesync_draw_noise(mynah_engine_ctx *ctx) {
     ctx->onesync_noise_drawn = 1;
 }
 
+/* MYNAH_SERVE_HOST_THREADS: the per-row half of a one-sync frame's queue
+ * phase -- put back a draw no emit consumed, stage the previous latent, draw
+ * this step's noise.  Row i reads and writes only ctxs[i] and its own staging
+ * row, so the rows can run on any thread in any order. */
+typedef struct {
+    mynah_engine_ctx *const *ctxs;
+    float *latent_in;
+    const float *bos;
+    size_t latent_dim;
+} pocket_onesync_rows_job;
+
+static void pocket_onesync_rows_body(void *ud, size_t begin, size_t end) {
+    const pocket_onesync_rows_job *job = (const pocket_onesync_rows_job *)ud;
+    for (size_t i = begin; i < end; ++i) {
+        mynah_engine_ctx *ctx = job->ctxs[i];
+        pocket_onesync_rng_restore(ctx);
+        const float *previous = ctx->frames > ctx->seg_frame0
+            ? ctx->latents + (ctx->frames - 1u) * job->latent_dim
+            : job->bos;
+        memcpy(job->latent_in + i * job->latent_dim, previous,
+               job->latent_dim * sizeof(float));
+        pocket_onesync_draw_noise(ctx);
+    }
+}
+
 static void pocket_cuda_onesync_release(mynah_engine_scratch *scratch) {
     if (scratch == NULL || scratch->backend == NULL) return;
     mynah_backend_host_free(scratch->backend, scratch->cuda_onesync_host_latent_in);
@@ -10268,16 +10416,16 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
         if (!ctx->cuda_backbone_device_owned) all_device_owned = 0;
     }
     /* A draw left over from a step whose emit never ran is not consumed. */
-    pocket_onesync_rng_restore_all(ctxs, count);
-
-    for (size_t i = 0; i < count; ++i) {
-        mynah_engine_ctx *ctx = ctxs[i];
-        const float *previous = ctx->frames > ctx->seg_frame0
-            ? ctx->latents + (ctx->frames - 1u) * cfg->latent_dim
-            : state->bos_emb;
-        memcpy(scratch->cuda_onesync_host_latent_in + i * cfg->latent_dim,
-               previous, cfg->latent_dim * sizeof(float));
-        pocket_onesync_draw_noise(ctx);
+    mynah_hostprof_begin(MYNAH_HP_OS_ROWS);
+    /* Per row: put back a draw left over from a step whose emit never ran
+     * (it is not consumed), stage the previous latent, draw the noise. */
+    {
+        pocket_onesync_rows_job job;
+        job.ctxs = ctxs;
+        job.latent_in = scratch->cuda_onesync_host_latent_in;
+        job.bos = state->bos_emb;
+        job.latent_dim = cfg->latent_dim;
+        mynah_hostpool_run(count, pocket_onesync_rows_body, &job);
     }
     if (pocket_cuda_onesync_subset_enabled()) {
         /* MYNAH_CUDA_ONESYNC_SUBSET: rows that go on first, in step order,
@@ -10298,6 +10446,8 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
     hidden_lazy = scratch->cuda_hidden_lazy_enabled;
     for (size_t i = 0; i < count && hidden_lazy; ++i)
         if (ctxs[i]->dump != NULL) hidden_lazy = 0;
+    mynah_hostprof_end(MYNAH_HP_OS_ROWS, count);
+    mynah_hostprof_begin(MYNAH_HP_OS_BACKBONE);
 
     /* 1. condition: the same resolved projection as pocket_cuda_condition_batch,
      * left in cuda_x for the backbone (no D2H, no host finite scan: a
@@ -10328,6 +10478,8 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
          * the ordinary path would have done with this failure. */
         if (rc != 0) goto fallback;
     }
+    mynah_hostprof_end(MYNAH_HP_OS_BACKBONE, count);
+    mynah_hostprof_begin(MYNAH_HP_OS_FLOW);
 
     /* 3. EOS logits, the same resolved projection as pocket_cuda_eos_batch. */
     {
@@ -10379,6 +10531,7 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
                                        sizeof(local)) != 0)
         goto fallback_drain;
 
+    mynah_hostprof_end(MYNAH_HP_OS_FLOW, count);
     if (phase == POCKET_ONESYNC_QUEUE) {
         /* MYNAH_CUDA_STEP_OVERLAP: the frame is queued; the sync and the
          * commit wait for the finish.  Host state changed so far: the early
@@ -10414,6 +10567,7 @@ frame_sync:
         goto fallback_drain;
     }
 
+    mynah_hostprof_begin(MYNAH_HP_OS_FINISH);
     for (size_t i = 0; i < count && hidden_lazy; ++i) {
         /* `!(x == 0)` is also true for NaN.  The same outcome as the commit's
          * host scan returning 1: nothing committed, the ordinary path redoes
@@ -10455,6 +10609,7 @@ frame_sync:
     scratch->cuda_onesync_ready = 1;
     scratch->pp_onesync_failures = 0u;   /* MYNAH_CUDA_PINGPONG */
     (void)mynah_backend_note_backbone_batch(scratch->backend, count);
+    mynah_hostprof_end(MYNAH_HP_OS_FINISH, count);
     return 0;
 
 fallback_drain:
@@ -10829,6 +10984,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     }
     pocket_dump_flush(ctx);
     pocket_dump_free(ctx->dump);
+    mynah_hostprof_begin(MYNAH_HP_CF_DEVICE);
     /* MYNAH_CUDA_DEFERRED_RELEASE: with the slot pool the drain moves to a
      * fence on the parked set (pocket_cuda_slot_park); off, as always. */
     const int deferred = ctx->state != NULL &&
@@ -10848,6 +11004,8 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     pocket_cuda_backbone_release(ctx);
     pocket_cuda_codec_release(ctx);
     pocket_cuda_decoder_release(ctx);
+    mynah_hostprof_end(MYNAH_HP_CF_DEVICE, 1u);
+    mynah_hostprof_begin(MYNAH_HP_CF_HOST);
     /* MYNAH_CTX_HOST_POOL: the host parts go to the pool here; the frees
      * below then see NULLs.  Off, as always. */
     if (ctx->state != NULL && ctx->state->ctx_host_pool != 0)
@@ -10888,6 +11046,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
         free(ctx->pcm);
     free(ctx->lent_pcm);
     free(ctx);
+    mynah_hostprof_end(MYNAH_HP_CF_HOST, 1u);
 }
 
 /* Opens the voice and resolves its model-owned KV prefix.  With the default
@@ -11883,6 +12042,21 @@ static int pocket_cuda_prefill_fixed_order(void) {
     return cached;
 }
 
+/* MYNAH_CUDA_PREFILL_PINNED (opt-in, =1): the prefill tile
+ * stages the text embeddings it uploads in a pinned buffer and sends them with
+ * one copy. From pageable memory each cudaMemcpyAsync first waits for the
+ * stream, i.e. for the decode gang queued just before the prefill pass, so the
+ * scheduler sat out the whole decode there and the next step was queued only
+ * after it. Same bytes in the same device buffer either way. */
+static int pocket_cuda_prefill_pinned_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_PREFILL_PINNED");
+        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    return cached;
+}
+
 static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                     int final, char *error, size_t capacity) {
     if (count == 0u) return 0;
@@ -11922,6 +12096,7 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                                           : sizeof(float);
     char local[256];
     local[0] = '\0';
+    mynah_hostprof_begin(MYNAH_HP_PT_VOICE);
     /* Voice prefixes first: one D2D per layer and plane per fresh request.
      * A row that does not store its prefix (cuda_backbone_kv_skip, phase 2
      * of MYNAH_CUDA_SHARED_VOICE) copies nothing: it only records the shared
@@ -12001,6 +12176,7 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         ctx->cuda_voice_shared = ctx->cuda_backbone_kv_bf16 ? voice : NULL;
         ctx->cuda_voice_shared_positions = ctx->voice_positions;
     }
+    mynah_hostprof_end(MYNAH_HP_PT_VOICE, count);
     if (total > 0u) {
         /* Text embeddings: one packed device buffer, owned by the model and
          * grown outside any graph. */
@@ -12057,15 +12233,41 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         size_t rows = 0u, offset = 0u;
         size_t row_take[POCKET_MAX_BATCH], row_start[POCKET_MAX_BATCH];
         size_t row_ring[POCKET_MAX_BATCH];
+        mynah_hostprof_begin(MYNAH_HP_PT_H2D);
+        /* MYNAH_CUDA_PREFILL_PINNED: the staging, free again once the last
+         * upload from it has run (an iteration ago: no wait in practice). */
+        float *staging = NULL;
+        if (pocket_cuda_prefill_pinned_enabled()) {
+            if (state->cuda_prefill_host_fence != NULL) {
+                mynah_backend_fence_wait(state->backend,
+                                         state->cuda_prefill_host_fence);
+                state->cuda_prefill_host_fence = NULL;
+            }
+            if (floats > state->cuda_prefill_host_floats) {
+                char ignored[256];
+                mynah_backend_host_free(state->backend, state->cuda_prefill_host);
+                state->cuda_prefill_host = NULL;
+                state->cuda_prefill_host_floats = 0u;
+                if (mynah_backend_host_alloc(state->backend, floats,
+                                             &state->cuda_prefill_host, ignored,
+                                             sizeof(ignored)) == 0)
+                    state->cuda_prefill_host_floats = floats;
+                else
+                    state->cuda_prefill_host = NULL;   /* pageable copies below */
+            }
+            staging = state->cuda_prefill_host;
+        }
         for (size_t i = 0; i < count; ++i) {
             mynah_engine_ctx *ctx = ctxs[i];
             if (take[i] == 0u) continue;
             float *dst = state->cuda_prefill_in + offset * cfg->hidden_dim;
-            if (mynah_backend_h2d(state->backend,
-                                  ctx->text_embed +
-                                      ctx->text_prefilled * cfg->hidden_dim,
-                                  dst, take[i] * cfg->hidden_dim, local,
-                                  sizeof(local)) != 0) {
+            const float *src = ctx->text_embed + ctx->text_prefilled * cfg->hidden_dim;
+            if (staging != NULL) {
+                memcpy(staging + offset * cfg->hidden_dim, src,
+                       take[i] * cfg->hidden_dim * sizeof(float));
+            } else if (mynah_backend_h2d(state->backend, src, dst,
+                                         take[i] * cfg->hidden_dim, local,
+                                         sizeof(local)) != 0) {
                 pocket_error(error, capacity, "pocket: CUDA prefill H2D: %s", local);
                 free(prefix);
                 return -1;
@@ -12093,6 +12295,23 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             offset += take[i];
             ++rows;
         }
+        if (staging != NULL) {
+            if (mynah_backend_h2d(state->backend, staging, state->cuda_prefill_in,
+                                  offset * cfg->hidden_dim, local,
+                                  sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA prefill H2D: %s", local);
+                free(prefix);
+                return -1;
+            }
+            state->cuda_prefill_host_fence = mynah_backend_fence_record(state->backend);
+            if (state->cuda_prefill_host_fence == NULL) {
+                /* No fence: drain, so the next call may overwrite the staging. */
+                char drain[256];
+                drain[0] = '\0';
+                (void)mynah_backend_sync(state->backend, drain, sizeof(drain));
+            }
+        }
+        mynah_hostprof_end(MYNAH_HP_PT_H2D, rows);
         mynah_transformer_tile_layer layer[64];
         for (size_t l = 0; l < layers; ++l) {
             const mynah_transformer_ar_layer *src = &state->backbone_layers[l];
@@ -12149,8 +12368,10 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             .kv_int8 = state->cuda_kv_int8,
         };
         mynah_region_begin(MYNAH_RGN_PREFILL);
+        mynah_hostprof_begin(MYNAH_HP_PT_CALL);
         const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
                                                           local, sizeof(local));
+        mynah_hostprof_end(MYNAH_HP_PT_CALL, rows);
         mynah_region_end(MYNAH_RGN_PREFILL);
         /* The backend copied the tables into its staging before returning. */
         free(prefix);
@@ -12474,6 +12695,7 @@ static int pocket_prepare_slice_batch(
 
     mynah_region_begin(MYNAH_RGN_PREPARE);
     const int depth = mynah_region_depth();
+    mynah_hostprof_begin(MYNAH_HP_PRE_PROLOGUE);
     for (size_t i = 0; i < count; ++i) {
         if (ctxs[i]->seeding) continue;
         if ((ctxs[i]->segment_pending
@@ -12485,6 +12707,7 @@ static int pocket_prepare_slice_batch(
         }
         ctxs[i]->seeding = 1;
     }
+    mynah_hostprof_end(MYNAH_HP_PRE_PROLOGUE, count);
 
     {
         /* Device-owned rows: one prefill tile for all of them. */
@@ -12495,7 +12718,11 @@ static int pocket_prepare_slice_batch(
             else ++others;
         }
         if (owned_count > 0u) {
-            if (pocket_cuda_prefill_tile(owned, owned_count, 0, error, capacity) != 0) {
+            mynah_hostprof_begin(MYNAH_HP_PRE_TILE);
+            const int tile_rc = pocket_cuda_prefill_tile(owned, owned_count, 0, error,
+                                                         capacity);
+            mynah_hostprof_end(MYNAH_HP_PRE_TILE, owned_count);
+            if (tile_rc != 0) {
                 mynah_region_unwind(depth);
                 mynah_region_end(MYNAH_RGN_PREPARE);
                 return -1;
@@ -14002,10 +14229,84 @@ static int pocket_cuda_mimi_tile_eligible(const mynah_engine_ctx *ctx) {
  * attention against each request's own ring. On success the request's frame
  * is in its device decoder input and its host offset has advanced; the host
  * KV window is not maintained. `done[i]` reports which contexts it served. */
+/* MYNAH_SERVE_HOST_THREADS: the host half of a Mimi tile, per row -- advance
+ * the row's host codec offset past the frame the device just ran (its host KV
+ * window is intentionally stale; only the offset matters) and mark the row as
+ * owned by the device. Row r touches only its own context; a failure keeps
+ * the message of the highest failing row, which is what the serial loop left
+ * in `error`. */
+typedef struct {
+    mynah_engine_ctx *const *ctxs;
+    const size_t *index;
+    const size_t *start;
+    size_t stride;
+    int stale;                     /* MYNAH_CUDA_MIMI_STALE_WINDOW */
+    int *done;
+    pthread_mutex_t mu;            /* guards the two fields below */
+    size_t failed_row;             /* SIZE_MAX: none */
+    char error[256];
+} pocket_mimi_post_job;
+
+static void pocket_mimi_post_body(void *ud, size_t begin, size_t end_row) {
+    pocket_mimi_post_job *job = (pocket_mimi_post_job *)ud;
+    for (size_t r = begin; r < end_row; ++r) {
+        mynah_engine_ctx *ctx = job->ctxs[job->index[r]];
+        const size_t end = job->start[r] + job->stride;
+        char local[256];
+        local[0] = '\0';
+        const int prepared = job->stale
+            ? mynah_transformer_ar_state_prepare_window_stale(ctx->codec_transformer,
+                                                              end)
+            : mynah_transformer_ar_state_prepare_window(ctx->codec_transformer, end);
+        if (prepared != 0 ||
+            mynah_transformer_ar_state_set_window_offset(ctx->codec_transformer, end,
+                                                  local, sizeof(local)) != 0) {
+            ctx->cuda_mimi_tile_owned = 1;
+            pthread_mutex_lock(&job->mu);
+            if (job->failed_row == SIZE_MAX || r > job->failed_row) {
+                job->failed_row = r;
+                snprintf(job->error, sizeof(job->error),
+                         "pocket: CUDA Mimi tile cannot advance the host codec "
+                         "offset to %zu (capacity %zu): %s",
+                         end,
+                         mynah_transformer_ar_state_kv_positions(
+                             ctx->codec_transformer),
+                         local);
+            }
+            pthread_mutex_unlock(&job->mu);
+            continue; /* done stays 0: the caller drops an owned row */
+        }
+        ctx->cuda_mimi_tile_owned = 1;
+        ctx->cuda_codec_valid = 0;
+        ctx->cuda_codec_needs_host_sync = 0;
+        ctx->cuda_codec_device_input_ready = 0;
+        ctx->cuda_codec_device_output_ready = 1;
+        ctx->cuda_codec_pending = 0;
+        job->done[job->index[r]] = 1;
+    }
+}
+
+/* MYNAH_CUDA_MIMI_STALE_WINDOW (opt-in, =1): a row the Mimi
+ * tile owns keeps its codec K/V only in the device ring and never reads the
+ * host window again (a failure drops the row; there is no host state to
+ * continue from), yet advancing its host offset compacted that window, a
+ * ~2 MB memmove per row every 250 positions (~16 frames): ~9 us per row and
+ * frame on an EPYC 7702. With the flag the window moves without its stale
+ * contents. Only host memory nobody reads changes; the audio cannot. */
+static int pocket_cuda_mimi_stale_window_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_MIMI_STALE_WINDOW");
+        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    return cached;
+}
+
 static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                  int *done, char *error, size_t capacity) {
     for (size_t i = 0; i < count; ++i) done[i] = 0;
     if (count == 0u || !pocket_cuda_mimi_tile_enabled()) return 0;
+    mynah_hostprof_begin(MYNAH_HP_MT_PRE);
     const mynah_engine_state *state = NULL;
     const float *input[POCKET_MAX_BATCH];
     float *output[POCKET_MAX_BATCH];
@@ -14104,9 +14405,12 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
     };
     char local[256];
     local[0] = '\0';
+    mynah_hostprof_end(MYNAH_HP_MT_PRE, rows);
     mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    mynah_hostprof_begin(MYNAH_HP_MT_CALL);
     const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
                                                       local, sizeof(local));
+    mynah_hostprof_end(MYNAH_HP_MT_CALL, rows);
     mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
     if (rc != 0) {
         /* Nothing was committed on the host. Owned rows cannot recover; the
@@ -14115,33 +14419,27 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
         return rc < 0 ? -1 : 0;
     }
     (void)mynah_backend_note_codec_transformer_batch(state->backend, rows, rows);
-    for (size_t r = 0; r < rows; ++r) {
-        mynah_engine_ctx *ctx = ctxs[index[r]];
-        const size_t end = start[r] + cfg->upsample_stride;
-        /* Only the host offset matters now; its KV window is intentionally
-         * stale, so the window is compacted without any device traffic. */
-        if (mynah_transformer_ar_state_prepare_window(ctx->codec_transformer,
-                                                       end) != 0 ||
-            mynah_transformer_ar_state_set_window_offset(ctx->codec_transformer, end,
-                                                  local, sizeof(local)) != 0) {
-            ctx->cuda_mimi_tile_owned = 1;
-            pocket_error(error, capacity,
-                         "pocket: CUDA Mimi tile cannot advance the host codec "
-                         "offset to %zu (capacity %zu): %s",
-                         end,
-                         mynah_transformer_ar_state_kv_positions(
-                             ctx->codec_transformer),
-                         local);
-            continue; /* done stays 0: the caller drops an owned row */
-        }
-        ctx->cuda_mimi_tile_owned = 1;
-        ctx->cuda_codec_valid = 0;
-        ctx->cuda_codec_needs_host_sync = 0;
-        ctx->cuda_codec_device_input_ready = 0;
-        ctx->cuda_codec_device_output_ready = 1;
-        ctx->cuda_codec_pending = 0;
-        done[index[r]] = 1;
-    }
+    mynah_hostprof_begin(MYNAH_HP_MT_POST);
+    pocket_mimi_post_job job;
+    job.ctxs = ctxs;
+    job.index = index;
+    job.start = start;
+    job.stride = cfg->upsample_stride;
+    job.stale = pocket_cuda_mimi_stale_window_enabled();
+    job.done = done;
+    job.failed_row = SIZE_MAX;
+    job.error[0] = '\0';
+    pthread_mutex_init(&job.mu, NULL);
+    /* Without the copies the rows are a few stores each: not worth a wake. */
+    if (job.stale)
+        pocket_mimi_post_body(&job, 0u, rows);
+    else
+        mynah_hostpool_run(rows, pocket_mimi_post_body, &job);
+    pthread_mutex_destroy(&job.mu);
+    /* The serial loop reported every failing row in turn, so the message is
+     * the last failing row's. */
+    if (job.failed_row != SIZE_MAX) pocket_error(error, capacity, "%s", job.error);
+    mynah_hostprof_end(MYNAH_HP_MT_POST, rows);
     return 0;
 }
 
@@ -14506,6 +14804,75 @@ typedef struct pocket_gang_inflight {
     size_t gang_pcm_index[POCKET_MAX_BATCH];
 } pocket_gang_inflight;
 
+/* MYNAH_SERVE_HOST_THREADS: one row of a landing gang -- place its PCM (from
+ * the pinned gang rows, or from ctx->pcm), check it, finish the frame, copy
+ * what was not placed. Row i reads its own gang row and writes only its own
+ * context and range; a row whose PCM is not finite is only marked here and
+ * dropped by the caller, in row order, so the error reported is the one the
+ * serial loop reported. */
+typedef struct {
+    mynah_engine_ctx *const *ctxs;
+    const size_t *frame_count;
+    float **out_samples;
+    const int *failed;
+    const int *submitted;
+    const float *gang_pcm;
+    size_t gang_pcm_floats;
+    const size_t *gang_row;    /* row i's index in gang_pcm, SIZE_MAX if none */
+    int lend;
+    size_t f;
+    int land;                  /* the drain succeeded and rows were submitted */
+    int *bad;                  /* out: 1 = non-finite PCM, drop it */
+} pocket_gang_land_job;
+
+static void pocket_gang_land_body(void *ud, size_t begin, size_t end) {
+    const pocket_gang_land_job *job = (const pocket_gang_land_job *)ud;
+    const size_t f = job->f;
+    for (size_t i = begin; i < end; ++i) {
+        mynah_engine_ctx *ctx = job->ctxs[i];
+        job->bad[i] = 0;
+        if (job->failed[i]) continue;
+        const size_t frame_samples = ctx->state->cfg.samples_per_frame;
+        int placed = 0;
+        if (job->land && job->submitted[i]) {
+            const size_t r = job->gang_row[i];
+            if (r != SIZE_MAX) {
+                const float *row = job->gang_pcm + r * job->gang_pcm_floats;
+                /* Only when the row IS one frame of the range and nobody reads
+                 * `ctx->pcm` afterwards: the debug dump copies it in
+                 * decode_frame_finish. Anything else takes the two-copy route. */
+                if (job->lend && ctx->dump == NULL &&
+                    job->gang_pcm_floats == frame_samples &&
+                    job->out_samples[i] != NULL && f < job->frame_count[i]) {
+                    memcpy(job->out_samples[i] + f * frame_samples, row,
+                           job->gang_pcm_floats * sizeof(float));
+                    placed = 1;
+                } else {
+                    memcpy(ctx->pcm, row, job->gang_pcm_floats * sizeof(float));
+                }
+            }
+            size_t input_floats = 0u;
+            size_t output_floats = 0u;
+            /* The same scan over the same floats, wherever they landed: a
+             * placed row's slice is exactly the row. */
+            const float *frame_pcm =
+                placed ? job->out_samples[i] + f * frame_samples : ctx->pcm;
+            if (pocket_cuda_decoder_sizes(ctx, &input_floats, &output_floats) != 0 ||
+                !pocket_all_finite(frame_pcm, output_floats)) {
+                job->bad[i] = 1;
+                continue;
+            }
+            /* With cuda_decode 0 the finish only advances host state; it
+             * cannot fail. */
+            (void)pocket_decode_frame_finish(ctx, 0, NULL, 0u);
+        }
+        if (job->out_samples[i] == NULL || f >= job->frame_count[i] || placed)
+            continue;
+        memcpy(job->out_samples[i] + f * frame_samples, ctx->pcm,
+               frame_samples * sizeof(float));
+    }
+}
+
 /* After the drain: place every submitted row's PCM, check it, finish the
  * frame; then copy the rows that were not placed. Frame `f` of the gang. */
 static void pocket_decode_gang_land(
@@ -14515,82 +14882,43 @@ static void pocket_decode_gang_land(
     const int *submitted, size_t submitted_count, const float *gang_pcm,
     size_t gang_pcm_rows, size_t gang_pcm_floats, const size_t *gang_pcm_index,
     int lend, size_t f, int sync_failed, const char *sync_error) {
-    /* MYNAH_CUDA_PCM_DIRECT: this frame went from the pinned gang rows
-     * straight into the range, so `ctx->pcm` was skipped both ways. */
-    int placed[POCKET_MAX_BATCH];
-    memset(placed, 0, sizeof(placed));
-    char one_error[256];
-    if (submitted_count > 0u) {
-                if (sync_failed) {
-                    for (size_t i = 0; i < count; ++i) {
-                        if (submitted[i] && !failed[i])
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, reported,
-                                                     sync_error, error, capacity);
-                    }
-                } else {
-                    if (gang_pcm != NULL) {
-                        for (size_t r = 0; r < gang_pcm_rows; ++r) {
-                            const size_t i = gang_pcm_index[r];
-                            mynah_engine_ctx *ctx = ctxs[i];
-                            const size_t frame_samples =
-                                ctx->state->cfg.samples_per_frame;
-                            /* Only when the row IS one frame of the range and
-                             * nobody reads `ctx->pcm` afterwards: the debug
-                             * dump copies it in decode_frame_finish. Anything
-                             * else takes the two-copy route below. */
-                            if (lend && ctx->dump == NULL &&
-                                gang_pcm_floats == frame_samples &&
-                                out_samples[i] != NULL && f < frame_count[i]) {
-                                memcpy(out_samples[i] + f * frame_samples,
-                                       gang_pcm + r * gang_pcm_floats,
-                                       gang_pcm_floats * sizeof(float));
-                                placed[i] = 1;
-                                continue;
-                            }
-                            memcpy(ctx->pcm, gang_pcm + r * gang_pcm_floats,
-                                   gang_pcm_floats * sizeof(float));
-                        }
-                        mynah_backend_note_codec_gang(batch_backend, 1,
-                                                      gang_pcm_rows);
-                    }
-                    for (size_t i = 0; i < count; ++i) {
-                        if (!submitted[i] || failed[i]) continue;
-                        size_t input_floats = 0u;
-                        size_t output_floats = 0u;
-                        one_error[0] = '\0';
-                        /* The same scan over the same floats, wherever they
-                         * landed: a placed row's slice is exactly the row. */
-                        const float *frame_pcm =
-                            placed[i] ? out_samples[i] +
-                                            f * ctxs[i]->state->cfg.samples_per_frame
-                                      : ctxs[i]->pcm;
-                        if (pocket_cuda_decoder_sizes(ctxs[i], &input_floats,
-                                                      &output_floats) != 0 ||
-                            !pocket_all_finite(frame_pcm, output_floats)) {
-                            snprintf(one_error, sizeof(one_error),
-                                     "CUDA decoder produced non-finite PCM");
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, reported,
-                                                     one_error, error, capacity);
-                            continue;
-                        }
-                        if (pocket_decode_frame_finish(ctxs[i], 0, one_error,
-                                                       sizeof(one_error)) != 0)
-                            pocket_decode_batch_drop(ctxs[i], i, out_samples,
-                                                     out_count, failed, reported,
-                                                     one_error, error, capacity);
-                    }
-                }
+    if (submitted_count > 0u && sync_failed) {
+        for (size_t i = 0; i < count; ++i) {
+            if (submitted[i] && !failed[i])
+                pocket_decode_batch_drop(ctxs[i], i, out_samples, out_count, failed,
+                                         reported, sync_error, error, capacity);
+        }
     }
-
-            for (size_t i = 0; i < count; ++i) {
-                if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
-                if (placed[i]) continue;
-                const size_t frame_samples = ctxs[i]->state->cfg.samples_per_frame;
-                memcpy(out_samples[i] + f * frame_samples, ctxs[i]->pcm,
-                       frame_samples * sizeof(float));
-            }
+    /* MYNAH_CUDA_PCM_DIRECT: a frame that goes from the pinned gang rows
+     * straight into the range skips `ctx->pcm` both ways. */
+    size_t gang_row[POCKET_MAX_BATCH];
+    int bad[POCKET_MAX_BATCH];
+    for (size_t i = 0; i < count; ++i) gang_row[i] = SIZE_MAX;
+    const int land = submitted_count > 0u && !sync_failed;
+    if (land && gang_pcm != NULL) {
+        for (size_t r = 0; r < gang_pcm_rows; ++r) gang_row[gang_pcm_index[r]] = r;
+        mynah_backend_note_codec_gang(batch_backend, 1, gang_pcm_rows);
+    }
+    pocket_gang_land_job job;
+    job.ctxs = ctxs;
+    job.frame_count = frame_count;
+    job.out_samples = out_samples;
+    job.failed = failed;
+    job.submitted = submitted;
+    job.gang_pcm = gang_pcm;
+    job.gang_pcm_floats = gang_pcm_floats;
+    job.gang_row = gang_row;
+    job.lend = lend;
+    job.f = f;
+    job.land = land;
+    job.bad = bad;
+    mynah_hostpool_run(count, pocket_gang_land_body, &job);
+    for (size_t i = 0; i < count; ++i) {
+        if (!bad[i]) continue;
+        pocket_decode_batch_drop(ctxs[i], i, out_samples, out_count, failed, reported,
+                                 "CUDA decoder produced non-finite PCM", error,
+                                 capacity);
+    }
 }
 
 /* The codec position of every row whose range was decoded in full. */
@@ -14746,6 +15074,7 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
 
             /* Queue every request's quantizer + upsample for this frame in
              * one submission before the per-request host preparation. */
+            mynah_hostprof_begin(MYNAH_HP_DS_UPSAMPLE);
             {
                 size_t gang_frames[POCKET_MAX_BATCH];
                 int gang_failed[POCKET_MAX_BATCH];
@@ -14767,6 +15096,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                                                  one_error, error, capacity);
                 }
             }
+            mynah_hostprof_end(MYNAH_HP_DS_UPSAMPLE, count);
+            mynah_hostprof_begin(MYNAH_HP_DS_PREPARE);
 
             for (size_t i = 0; i < count; ++i) {
                 if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
@@ -14780,6 +15111,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                 }
                 prepared[i] = 1;
             }
+            mynah_hostprof_end(MYNAH_HP_DS_PREPARE, count);
+            mynah_hostprof_begin(MYNAH_HP_DS_CODEC);
 
             /* All host-side frame preparation is complete. Run the pending
              * codec-transformer tiles together; contexts that cannot use the
@@ -14860,6 +15193,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                 }
             }
 
+            mynah_hostprof_end(MYNAH_HP_DS_CODEC, codec_count);
+            mynah_hostprof_begin(MYNAH_HP_DS_DECODER);
             mynah_engine_ctx *decoder_candidates[POCKET_MAX_BATCH];
             size_t decoder_candidate_indices[POCKET_MAX_BATCH];
             size_t decoder_candidate_count = 0u;
@@ -14930,6 +15265,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                 }
             }
 
+            mynah_hostprof_end(MYNAH_HP_DS_DECODER, decoder_candidate_count);
+            mynah_hostprof_begin(MYNAH_HP_DS_GATHER);
             if (submitted_count > 0u) {
                 if (decoder_batch_used)
                     (void)mynah_backend_decoder_note_batch(
@@ -14990,12 +15327,14 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                         defer->gang_pcm_index[r] = gang_pcm_index[r];
                     defer->fence = mynah_backend_fence_record(batch_backend);
                     defer->queued = 1;
+                    mynah_hostprof_end(MYNAH_HP_DS_GATHER, gang_pcm_rows);
                     mynah_region_end(MYNAH_RGN_CODEC);
                     return 0;
                 }
                 sync_failed = mynah_backend_sync(
                     batch_backend, sync_error, sizeof(sync_error)) != 0;
             }
+            mynah_hostprof_end(MYNAH_HP_DS_GATHER, gang_pcm_rows);
             pocket_decode_gang_land(ctxs, count, frame_count, out_samples,
                                     out_count, failed, &reported, error,
                                     capacity, batch_backend, submitted,
@@ -15025,6 +15364,7 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
 static void pocket_decode_inflight_land(pocket_gang_inflight *g) {
     char sync_error[256];
     sync_error[0] = '\0';
+    mynah_hostprof_begin(MYNAH_HP_DEC_LAND);
     const int sync_failed = mynah_backend_fence_sync(g->backend, g->fence,
                                                      sync_error,
                                                      sizeof(sync_error)) != 0;
@@ -15040,6 +15380,7 @@ static void pocket_decode_inflight_land(pocket_gang_inflight *g) {
     pocket_decode_gang_advance(g->ctxs, g->count, g->frame_count, g->out_samples,
                                g->failed);
     g->queued = 0;
+    mynah_hostprof_end(MYNAH_HP_DEC_LAND, g->count);
 }
 
 /* Safety net, like pocket_cuda_ahead_discard: an engine call that could read

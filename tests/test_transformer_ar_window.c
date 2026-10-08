@@ -762,6 +762,53 @@ done:
     return rc;
 }
 
+/* ------------------------------------- case: the stale window advance */
+
+/* `_prepare_window_stale` (a device-owned Mimi row) must move the window
+ * exactly as `_prepare_window` does -- same base, same offsets, same refusals
+ * -- for a frame-sized advance of `stride` positions at a time, far past
+ * several compactions. Only the stored K/V may differ. */
+static int case_stale_window(size_t context, size_t stride, size_t frames) {
+    g_case = "window/stale-advance";
+    char error[256];
+    mynah_transformer_ar_state *copied = NULL, *stale = NULL;
+    int rc = -1;
+    mynah_transformer_ar_config config;
+    win_config(&config, 2u, context, (frames + 1u) * stride);
+    copied = mynah_transformer_ar_state_new(&config, error, sizeof(error));
+    REQUIRE(copied != NULL, "state_new: %s", error);
+    stale = mynah_transformer_ar_state_new(&config, error, sizeof(error));
+    REQUIRE(stale != NULL, "state_new: %s", error);
+    size_t compactions = 0u;
+    for (size_t f = 0; f < frames; ++f) {
+        const size_t end = (f + 1u) * stride;
+        const size_t base_before = mynah_transformer_ar_state_kv_base(copied);
+        const int a = mynah_transformer_ar_state_prepare_window(copied, end);
+        const int b = mynah_transformer_ar_state_prepare_window_stale(stale, end);
+        REQUIRE(a == b, "frame %zu: prepare %d, stale prepare %d", f, a, b);
+        REQUIRE(mynah_transformer_ar_state_kv_base(copied) ==
+                    mynah_transformer_ar_state_kv_base(stale),
+                "frame %zu: base %zu vs %zu", f,
+                mynah_transformer_ar_state_kv_base(copied),
+                mynah_transformer_ar_state_kv_base(stale));
+        if (mynah_transformer_ar_state_kv_base(copied) != base_before) ++compactions;
+        const int c = mynah_transformer_ar_state_set_window_offset(copied, end, NULL, 0u);
+        const int d = mynah_transformer_ar_state_set_window_offset(stale, end, NULL, 0u);
+        REQUIRE(c == d && c == 0, "frame %zu: set offset %d / %d", f, c, d);
+        REQUIRE(mynah_transformer_ar_state_offset(copied) ==
+                    mynah_transformer_ar_state_offset(stale),
+                "frame %zu: offsets differ", f);
+    }
+    REQUIRE(compactions > 0u, "the window never moved: the case tests nothing");
+    printf("  ok   %-44s %zu frames of %zu, %zu window moves\n",
+           "window/stale-advance", frames, stride, compactions);
+    rc = 0;
+done:
+    mynah_transformer_ar_state_free(copied);
+    mynah_transformer_ar_state_free(stale);
+    return rc;
+}
+
 /* --------------------------------------------- case: the ragged batch */
 
 /* A hook that does exactly what the fallback does, so that installing it
@@ -955,6 +1002,11 @@ int main(void) {
     /* 5. The cache does not wrap, and says so. */
     case_capacity(37u);
     case_capacity(250u);
+
+    /* 5b. The stale advance of a device-owned row moves the window as the
+     *     copying one does (the Mimi tile: 16 positions per frame). */
+    case_stale_window(250u, 16u, 200u);
+    case_stale_window(13u, 4u, 90u);
 
     /* 6. Ragged batch across the window regime, with and without a row hook. */
     for (int hooked = 0; hooked < 2; ++hooked) {
