@@ -361,6 +361,15 @@ typedef struct synth_job {
      * gating something inside the driver, the warm-up has stopped being the
      * request path and the whole item is void. */
     int is_warmup;
+    /* Start-up walks only (MYNAH_CUDA_STARTUP_WALK): stop after this many
+     * cancellation polls by cancelling, 0 = run to the end.  The driver polls
+     * every few steps (4 by default), so a cap of n stops after about 4n
+     * steps; the walk's plan only needs the stops in order.  The
+     * request keeps the pack's default max_steps, so its set is sized like a
+     * served request's and later admissions reuse it without reallocating;
+     * a max_steps cap would size the set for the cap (see startup_burst_run). */
+    unsigned stop_after;
+    unsigned polls;
 
     /* Streaming requests differ from batch ones in their sink and in nothing
      * else: same queue, same scheduler, same batch. The response header is
@@ -808,7 +817,8 @@ static void sink_on_done(void *ud, void *tag, int result) {
      * such comparison off by the warm-up count, which reads as the server
      * having invented a request. */
     if (j->is_warmup) {
-        job_finish(j, result == MYNAH_GRAPH_OK ? 0 : -1, NULL);
+        const int stopped = j->stop_after != 0u && result == MYNAH_GRAPH_CANCELLED;
+        job_finish(j, result == MYNAH_GRAPH_OK || stopped ? 0 : -1, NULL);
         return;
     }
 
@@ -846,6 +856,8 @@ static int sink_cancelled(void *ud, void *tag) {
     (void)ud;
     synth_job *j = (synth_job *)tag;
     synth_assert_scheduler();
+
+    if (j->stop_after != 0u && ++j->polls >= j->stop_after) return 1;
 
     /* The submitter walked away (batch deadline). Cheapest check, and it
      * covers both request shapes. */
@@ -1161,9 +1173,16 @@ static size_t pool_prefill_count(int cuda) {
 
 /* Returns how many of the `count` concurrent requests completed.  Request i
  * is capped at `caps[i]` steps; with `caps` NULL every request runs to its
- * own end (0 = the pack's own default). */
+ * own end (0 = the pack's own default).  With `stop` the cap is a stop after
+ * that many steps (a cancellation) and max_steps stays the pack's default:
+ * the per-request buffers (latents, codec positions) are sized from
+ * max_steps at admission, so a set made under a 2- or 36-step cap is too
+ * small for a served request, and the first served admissions would each
+ * free and reallocate it -- measured on an L4 at C320 as ~8 device
+ * allocations and frees per admission for the first two rounds of sets, and
+ * a first 30 s with TTFA p95 ~990 ms instead of ~690. */
 static size_t startup_burst_run(size_t count, const char *PREFILL_TEXT,
-                                const unsigned *caps) {
+                                const unsigned *caps, int stop) {
     if (count == 0u) return 0u;
     int *ids = NULL;
     size_t id_count = 0;
@@ -1196,7 +1215,8 @@ static size_t startup_burst_run(size_t count, const char *PREFILL_TEXT,
         job->request.text_ids = copy;
         job->request.text_length = id_count;
         job->request.speaker = g.default_speaker;
-        job->request.max_steps = caps == NULL ? 0u : caps[queued];
+        job->request.max_steps = caps == NULL || stop ? 0u : caps[queued];
+        job->stop_after = caps != NULL && stop ? caps[queued] : 0u;
         job->request.temperature = (float)g.info.default_temperature;
         job->request.topk = g.info.default_topk;
         job->request.use_local_transformer = 1;
@@ -1218,37 +1238,29 @@ static size_t startup_burst_run(size_t count, const char *PREFILL_TEXT,
     return done;
 }
 
-/* MYNAH_CUDA_STARTUP_WALK (CUDA only; see width_walk_run; opt-in): 1 runs the
- * bucket walk and a two-step slot-pool prefill; unset or 0 the full-width walk
- * and full-length prefill.  Opt-in because, measured on an L4 at C320, a burst
- * that arrives the moment the server is ready had a worse first 30 s (TTFA p95
- * 994 vs 693 ms, 14 stalls vs 0) though steady state and audio were equal: the
- * full-width walk warms more than the graphs it is named for. */
+/* MYNAH_CUDA_STARTUP_WALK (CUDA only; see width_walk_run): default on, the
+ * bucket walk; 0 is the rollback to the full-width walk.  The bucket walk
+ * stops its requests by cancellation, not by max_steps, so the sets it parks
+ * are sized like served ones (startup_burst_run).  Measured on an L4, 24L,
+ * --max-batch 320: ready 57 -> 16 s, bit-identical, C320 steady state and the
+ * first 30 s of a C320 burst arriving at ready equal to the full-width walk. */
 static int startup_walk_bucketed(void) {
     const char *setting = getenv("MYNAH_CUDA_STARTUP_WALK");
-    return setting != NULL && setting[0] != '\0' && strcmp(setting, "0") != 0;
+    return setting == NULL || setting[0] == '\0' || strcmp(setting, "0") != 0;
 }
 
-/* The prefill's requests leave their sets in the pool; how far each one runs
- * does not change what it parks (the cache is sized at admission from the
- * text, and the sentence never outgrows it), so after the bucket walk, which
- * has already run every set through steps and decodes, two steps are enough. */
-#define STARTUP_PREFILL_STEPS 2u
-
+/* The prefill runs its sentence to the end in both walks.  A two-step
+ * prefill (stopped before any audio is decoded) was tried after the bucket
+ * walk: start-up 5 s instead of 16 s at 320 rows on an L4, but a C320 burst
+ * arriving at ready then met one ~0.4 s step about 2 s in (gap p95 ~395 vs
+ * ~125 ms, 14 stalls at 250 ms), as did a prefill of a one-word text run to
+ * its end; the sentence run to its end leaves nothing of that behind. */
 static size_t pool_prefill_run(size_t count) {
-    unsigned *caps = NULL;
-    if (startup_walk_bucketed()) {
-        caps = (unsigned *)malloc(count * sizeof(*caps));
-        if (caps != NULL)
-            for (size_t i = 0; i < count; ++i) caps[i] = STARTUP_PREFILL_STEPS;
-    }
-    const size_t done = startup_burst_run(
+    return startup_burst_run(
         count,
         "The morning train left the quiet station on time, and everyone "
         "on board settled in for the long ride north.",
-        caps);
-    free(caps);
-    return done;
+        NULL, 0);
 }
 
 /* MYNAH_CUDA_WIDTH_BUCKETS (CUDA only): with bucketed step widths a small,
@@ -1267,7 +1279,7 @@ static int width_buckets_requested(int cuda) {
     return cuda && (setting == NULL || setting[0] == '\0' || strcmp(setting, "0") != 0);
 }
 
-/* MYNAH_CUDA_STARTUP_WALK=1 (opt-in): the bucket walk.  The full-width walk
+/* MYNAH_CUDA_STARTUP_WALK (default on): the bucket walk.  The full-width walk
  * below steps every width from `count` down to 1, two steps each, on a text
  * long enough that no request ends first: count^2 row-steps, every row's KV
  * grown to the long text, and at a raised ROW_CAP far more device memory than
@@ -1277,8 +1289,12 @@ static int width_buckets_requested(int cuda) {
  * step where rows retired (the condition input is re-staged) and once on a
  * step where none did.  Here the live width goes count -> count-1 (the top
  * bucket's retire step) and then straight to each smaller bucket, held for
- * two steps each: 4 + 2 * (buckets + 2) steps in all, on a short text whose
- * cache is the size of an ordinary first segment.  Returns 0 when it cannot
+ * two cancellation polls each: 4 + 2 * (buckets + 2) polls in all (the driver
+ * polls every 4 steps by default, so ~150 steps at 320 rows, ~2.7 s on an
+ * L4), on a short text whose cache is the size of an ordinary first segment.
+ * The requests are stopped by cancellation (synth_job.stop_after) with the
+ * default max_steps, so their sets are sized like served ones.  Returns 0
+ * when it cannot
  * plan (no buckets), so the caller falls back to the full-width walk. */
 static const char WALK_SHORT_TEXT[] =
     "The morning train left the quiet station on time, and everyone on board "
@@ -1312,7 +1328,7 @@ static size_t width_walk_run(size_t count) {
     unsigned *caps = (unsigned *)malloc(count * sizeof(*caps));
     if (caps == NULL) return 0u;
     if (startup_walk_bucketed() && bucket_walk_caps(count, caps)) {
-        const size_t done = startup_burst_run(count, WALK_SHORT_TEXT, caps);
+        const size_t done = startup_burst_run(count, WALK_SHORT_TEXT, caps, 1);
         free(caps);
         return done;
     }
@@ -1329,7 +1345,7 @@ static size_t width_walk_run(size_t count) {
         "The conductor walked slowly through the carriage, checking tickets and "
         "answering questions about the next connection, and the train kept its "
         "steady rhythm across the wide and quiet countryside.",
-        caps);
+        caps, 0);
     free(caps);
     return done;
 }
@@ -3603,8 +3619,8 @@ int main(int argc, char **argv) {
                         "(MYNAH_CUDA_WIDTH_BUCKETS)\n",
                 done, g.max_active, now_ms() - t0,
                 startup_walk_bucketed()
-                    ? "bucket walk, MYNAH_CUDA_STARTUP_WALK=1"
-                    : "full-width walk; MYNAH_CUDA_STARTUP_WALK=1 for the bucket walk",
+                    ? "bucket walk; MYNAH_CUDA_STARTUP_WALK=0 for the full-width walk"
+                    : "full-width walk, MYNAH_CUDA_STARTUP_WALK=0",
                 after.graph_captures - before.graph_captures,
                 after.decoder_graph_captures - before.decoder_graph_captures,
                 freed_mb);
