@@ -1034,10 +1034,14 @@ bank, **2-3 minute screens, not 30-minute soaks**), base vs this branch:
 | pack | topology | knee before | knee after | audio-s/s at the knee | STREAM_RTF p95 | TTFA p95 |
 |---|---|---|---|---|---|---|
 | 24L | 6 x 4, `--max-batch 8` | C12 | **C24** | 15.1 -> 22.6 | 0.793 | 380 ms |
-| 6L | 11 x 2, `--max-batch 8` | C28-C36 | **C36** (C42 one screen in two) | 33.9 -> 42.4 at C36 | 0.745 | 267 ms |
+| 6L | 11 x 2, `--max-batch 8` | C28 (C36 fails one screen in two) | **C36** at the edge (2 of 3 screens pass) | 33.9 -> 42.4 at C36 | 0.745 | 267 ms |
 | 6L, int8 backbone (opt-in, changes audio) | 11 x 2 | — | **C56** | 61.1 | 0.805 | 186 ms |
 
-No request failed at any level. Under load the 24L backbone runs ~1.8x slower
+No request failed at any level. A last check of the merged branch (same
+commands) gave 24L C24 at STREAM_RTF p95 0.786 with 0 stalls, missing only the
+drift tolerance by 0.001, and 6L C36 at 0.735 with 12 of 1436 requests over
+500 ms: on this shared host a 2-minute level at the knee is close to a coin
+toss, so read C24 and C36 as the knees and one step below as the safe point. Under load the 24L backbone runs ~1.8x slower
 than in the CLI: it is bound by weight traffic across workers on a host shared
 with other tenants, which is why fewer, wider workers (6 x 4) beat 11 x 2.
 On the 6L the codec is half of a worker's time. The int8 6L backbone is the
