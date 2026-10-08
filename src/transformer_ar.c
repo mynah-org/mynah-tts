@@ -1047,11 +1047,10 @@ static int tar_attend_head(const mynah_transformer_ar_config *config,
     /* Rejects non-finite scores, which is the last line of defence against a
      * NaN that slipped into the cache. */
     if (mynah_softmax_f32(scores, scores, span) != 0) return -1;
-    memset(oh, 0, head_dim * sizeof(float));
-    for (size_t j = 0; j < span; ++j) {
-        const float *vj = v_cache + (lo_slot + j) * attn_dim + h * head_dim;
-        mynah_axpy_f32(oh, vj, scores[j], head_dim);
-    }
+    /* The value pass with the head row held in registers across the window;
+     * byte-identical to memset + one mynah_axpy_f32 per key (kernels.c). */
+    mynah_attn_wsum_f32(oh, v_cache + lo_slot * attn_dim + h * head_dim,
+                        attn_dim, scores, span, head_dim);
     return 0;
 }
 

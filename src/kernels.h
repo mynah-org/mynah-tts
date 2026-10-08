@@ -107,6 +107,11 @@ int mynah_vecmath_self_test(char *error, size_t error_capacity);
 
 /* out[0..n) += weight * src[0..n) */
 void mynah_axpy_f32(float *out, const float *src, float weight, size_t n);
+/* out = sum_j weights[j] * src[j*stride .. +n), in j order from zero: the
+ * attention value pass.  Byte-identical to memset + mynah_axpy_f32 per row
+ * (see kernels.c); MYNAH_ATTN_WSUM=0 forces that loop. */
+void mynah_attn_wsum_f32(float *out, const float *src, size_t stride,
+                         const float *weights, size_t rows, size_t n);
 int mynah_softmax_f32(const float *logits, float *probabilities, size_t n);
 size_t mynah_argmax_f32(const float *values, size_t n);
 int mynah_kernels_self_test(char *error, size_t error_capacity);
