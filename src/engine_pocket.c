@@ -112,6 +112,14 @@ static void pocket_width_buckets_parse(void) {
     pocket_width_bucket_count = n;
 }
 
+/* See mynah_tts.h. */
+size_t mynah_tts_width_buckets(size_t *out, size_t capacity) {
+    (void)pthread_once(&pocket_width_buckets_once, pocket_width_buckets_parse);
+    for (size_t i = 0; out != NULL && i < pocket_width_bucket_count && i < capacity; ++i)
+        out[i] = pocket_width_buckets[i];
+    return pocket_width_bucket_count;
+}
+
 /* The width a batched step of `count` live rows executes at.  Without
  * buckets this is `count` itself; with buckets it is never below `count` and
  * never above `capacity` (the caller has already checked count <= capacity). */

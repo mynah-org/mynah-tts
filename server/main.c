@@ -1158,11 +1158,11 @@ static size_t pool_prefill_count(int cuda) {
     return n;
 }
 
-/* Returns how many of the `count` concurrent requests completed.  With
- * `stagger` 0 every request runs to its own end (the slot-pool prefill);
- * otherwise request i is capped at 4 + stagger*i steps (see width_walk_run). */
+/* Returns how many of the `count` concurrent requests completed.  Request i
+ * is capped at `caps[i]` steps; with `caps` NULL every request runs to its
+ * own end (0 = the pack's own default). */
 static size_t startup_burst_run(size_t count, const char *PREFILL_TEXT,
-                                unsigned stagger) {
+                                const unsigned *caps) {
     if (count == 0u) return 0u;
     int *ids = NULL;
     size_t id_count = 0;
@@ -1195,9 +1195,7 @@ static size_t startup_burst_run(size_t count, const char *PREFILL_TEXT,
         job->request.text_ids = copy;
         job->request.text_length = id_count;
         job->request.speaker = g.default_speaker;
-        job->request.max_steps = stagger == 0u
-            ? 0u                          /* the pack's own default */
-            : 4u + stagger * (unsigned)queued;
+        job->request.max_steps = caps == NULL ? 0u : caps[queued];
         job->request.temperature = (float)g.info.default_temperature;
         job->request.topk = g.info.default_topk;
         job->request.use_local_transformer = 1;
@@ -1219,12 +1217,37 @@ static size_t startup_burst_run(size_t count, const char *PREFILL_TEXT,
     return done;
 }
 
+/* MYNAH_CUDA_STARTUP_WALK (CUDA only; see width_walk_run; opt-in): 1 runs the
+ * bucket walk and a two-step slot-pool prefill; unset or 0 the full-width walk
+ * and full-length prefill.  Opt-in because, measured on an L4 at C320, a burst
+ * that arrives the moment the server is ready had a worse first 30 s (TTFA p95
+ * 994 vs 693 ms, 14 stalls vs 0) though steady state and audio were equal: the
+ * full-width walk warms more than the graphs it is named for. */
+static int startup_walk_bucketed(void) {
+    const char *setting = getenv("MYNAH_CUDA_STARTUP_WALK");
+    return setting != NULL && setting[0] != '\0' && strcmp(setting, "0") != 0;
+}
+
+/* The prefill's requests leave their sets in the pool; how far each one runs
+ * does not change what it parks (the cache is sized at admission from the
+ * text, and the sentence never outgrows it), so after the bucket walk, which
+ * has already run every set through steps and decodes, two steps are enough. */
+#define STARTUP_PREFILL_STEPS 2u
+
 static size_t pool_prefill_run(size_t count) {
-    return startup_burst_run(
+    unsigned *caps = NULL;
+    if (startup_walk_bucketed()) {
+        caps = (unsigned *)malloc(count * sizeof(*caps));
+        if (caps != NULL)
+            for (size_t i = 0; i < count; ++i) caps[i] = STARTUP_PREFILL_STEPS;
+    }
+    const size_t done = startup_burst_run(
         count,
         "The morning train left the quiet station on time, and everyone "
         "on board settled in for the long ride north.",
-        0u);
+        caps);
+    free(caps);
+    return done;
 }
 
 /* MYNAH_CUDA_WIDTH_BUCKETS (CUDA only): with bucketed step widths a small,
@@ -1243,8 +1266,57 @@ static int width_buckets_requested(int cuda) {
     return cuda && (setting == NULL || setting[0] == '\0' || strcmp(setting, "0") != 0);
 }
 
+/* MYNAH_CUDA_STARTUP_WALK=1 (opt-in): the bucket walk.  The full-width walk
+ * below steps every width from `count` down to 1, two steps each, on a text
+ * long enough that no request ends first: count^2 row-steps, every row's KV
+ * grown to the long text, and at a raised ROW_CAP far more device memory than
+ * serving needs (on a 24 GB GPU a 1024-row walk ran out of it and captured
+ * nothing).  The graphs it exists to capture are keyed by the execution width,
+ * which is the bucket, so the walk only has to visit each bucket, once on a
+ * step where rows retired (the condition input is re-staged) and once on a
+ * step where none did.  Here the live width goes count -> count-1 (the top
+ * bucket's retire step) and then straight to each smaller bucket, held for
+ * two steps each: 4 + 2 * (buckets + 2) steps in all, on a short text whose
+ * cache is the size of an ordinary first segment.  Returns 0 when it cannot
+ * plan (no buckets), so the caller falls back to the full-width walk. */
+static const char WALK_SHORT_TEXT[] =
+    "The morning train left the quiet station on time, and everyone on board "
+    "settled in for the long ride north. Outside, the fields turned from green "
+    "to gold as the sun climbed over the hills.";
+
+static int bucket_walk_caps(size_t count, unsigned *caps) {
+    size_t buckets[64];
+    size_t nb = mynah_tts_width_buckets(buckets, 64u);
+    if (nb == 0u || nb > 64u || count < 2u) return 0;
+    /* Live widths after each retirement event, descending: count - 1, then
+     * every bucket below it, then 0. */
+    size_t targets[67];
+    size_t nt = 0u;
+    targets[nt++] = count - 1u;
+    for (size_t k = nb; k-- > 0u;)
+        if (buckets[k] < count - 1u) targets[nt++] = buckets[k];
+    targets[nt++] = 0u;
+    /* Request i is the one whose retirement takes the width to count-1-i; it
+     * retires at the first event whose target is at or below that. */
+    size_t e = 0u;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t width_after = count - 1u - i;
+        while (targets[e] > width_after) ++e;
+        caps[i] = 4u + 2u * (unsigned)e;
+    }
+    return 1;
+}
+
 static size_t width_walk_run(size_t count) {
-    return startup_burst_run(
+    unsigned *caps = (unsigned *)malloc(count * sizeof(*caps));
+    if (caps == NULL) return 0u;
+    if (startup_walk_bucketed() && bucket_walk_caps(count, caps)) {
+        const size_t done = startup_burst_run(count, WALK_SHORT_TEXT, caps);
+        free(caps);
+        return done;
+    }
+    for (size_t i = 0; i < count; ++i) caps[i] = 4u + 2u * (unsigned)i;
+    const size_t done = startup_burst_run(
         count,
         "The morning train left the quiet station on time, and everyone on board "
         "settled in for the long ride north. Outside, the fields turned from green "
@@ -1256,7 +1328,9 @@ static size_t width_walk_run(size_t count) {
         "The conductor walked slowly through the carriage, checking tickets and "
         "answering questions about the next connection, and the train kept its "
         "steady rhythm across the wide and quiet countryside.",
-        2u);
+        caps);
+    free(caps);
+    return done;
 }
 
 /* -------------------------------------------------------------------- http */
@@ -2847,6 +2921,9 @@ static void usage(const char *argv0) {
 #define MAX_PACKS 16
 
 int main(int argc, char **argv) {
+    /* The start-up phase breakdown printed once the server is ready. */
+    const double t_main = now_ms();
+    double t_open = t_main;
     const char *pack_dir[MAX_PACKS];
     int pack_count = 0;
     int port = 8080;
@@ -3079,6 +3156,7 @@ int main(int argc, char **argv) {
         mynah_tts_model_get_info(packs[i], &pack_info[i]);
         pack_lang[i] = pack_info[i].language;
     }
+    t_open = now_ms();
 
     /* ---- materialise the model-owned caches, before anything is forked ----
      *
@@ -3477,9 +3555,12 @@ int main(int argc, char **argv) {
      * waits in the backlog and is served once it finishes. /health therefore
      * answers exactly when the server is warm, which is the honest definition
      * of ready and the one tests/test_server.sh polls. */
+    const double t_setup = now_ms();
+    double ms_warm = 0.0, ms_walk = 0.0, ms_prefill = 0.0;
     if (g.warmups > 0u) {
         const double t0 = now_ms();
         const int warm = warmup_run(g.warmups);
+        ms_warm = now_ms() - t0;
         fprintf(stderr, "warm-up: %u/%u request%s through the queue, admission and "
                         "per-request reset in %.0f ms%s\n",
                 g.warmups_done, g.warmups, g.warmups == 1u ? "" : "s",
@@ -3495,14 +3576,18 @@ int main(int argc, char **argv) {
         const double t0 = now_ms();
         const size_t done = width_walk_run(g.max_active);
         (void)mynah_tts_model_get_backend_metrics(g.model, &after);
+        ms_walk = now_ms() - t0;
         const double freed_mb =
             ((double)before.device_memory_free_bytes -
              (double)after.device_memory_free_bytes) / (1024.0 * 1024.0);
         fprintf(stderr, "width-bucket graph warm-up: %zu/%zu concurrent requests walked the "
-                        "batch width down to 1 in %.0f ms; graphs captured +%llu "
+                        "batch width down to 1 in %.0f ms (%s); graphs captured +%llu "
                         "(backbone/flow) +%llu (decoder gang); device memory %+.0f MiB "
                         "(MYNAH_CUDA_WIDTH_BUCKETS)\n",
                 done, g.max_active, now_ms() - t0,
+                startup_walk_bucketed()
+                    ? "bucket walk, MYNAH_CUDA_STARTUP_WALK=1"
+                    : "full-width walk; MYNAH_CUDA_STARTUP_WALK=1 for the bucket walk",
                 after.graph_captures - before.graph_captures,
                 after.decoder_graph_captures - before.decoder_graph_captures,
                 freed_mb);
@@ -3516,13 +3601,34 @@ int main(int argc, char **argv) {
         if (prefill > 0u) {
             const double t0 = now_ms();
             const size_t done = pool_prefill_run(prefill);
+            ms_prefill = now_ms() - t0;
             fprintf(stderr, "slot-pool prefill: %zu/%zu concurrent requests through the "
                             "queue in %.0f ms (MYNAH_CUDA_SLOT_POOL_PREFILL)\n",
-                    done, prefill, now_ms() - t0);
+                    done, prefill, ms_prefill);
         }
     }
     /* Start-up is over; the same re-plan once more, with traffic next. */
     if (device == MYNAH_TTS_DEVICE_CUDA) mynah_tts_startup_mark(1);
+    {
+        /* One line that says where start-up time went. The slot-pool prefill
+         * includes the re-plan that the first mark triggers at its first
+         * admission; the second mark's re-plan runs at the first served
+         * admission. */
+        mynah_tts_backend_metrics m;
+        memset(&m, 0, sizeof(m));
+        (void)mynah_tts_model_get_backend_metrics(g.model, &m);
+        const double used_mib = m.device_memory_bytes > m.device_memory_free_bytes
+            ? (double)(m.device_memory_bytes - m.device_memory_free_bytes) / 1048576.0
+            : 0.0;
+        fprintf(stderr, "start-up phases: model open %.0f ms, setup %.0f ms, warm-up "
+                        "%.0f ms, width walk %.0f ms, slot-pool prefill %.0f ms; ready "
+                        "after %.0f ms; device memory in use %.0f MiB; graphs captured "
+                        "%llu (fallbacks %llu), decoder gang graphs %llu, backbone "
+                        "batch max width %llu\n",
+                t_open - t_main, t_setup - t_open, ms_warm, ms_walk, ms_prefill,
+                now_ms() - t_main, used_mib, m.graph_captures, m.graph_fallbacks,
+                m.decoder_graph_captures, m.backbone_batch_max_width);
+    }
 
     queue_init(&g_queue);
     pthread_t workers[MYNAH_GRAPH_MAX_ACTIVE];
