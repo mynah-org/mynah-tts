@@ -1042,7 +1042,20 @@ static int sg_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     job.c = c; job.ldc = ldc;
     job.family = family;
     sg_plan_columns(&job);
-    sg_plan_rows(&job, 0u);
+    /* A task here is a whole ROW BLOCK -- every column group of it -- so the
+     * row plan must ask the pool for its tasks along rows alone.  Planned as
+     * sg_task plans, it divided the wanted task count by the column grid:
+     * the codec's last conv (m = 32, n = 1920, four column panels) came out
+     * as ONE task and ran on one thread of two, 465 us a frame with the
+     * second core idle.  Which thread computes a row block never changes a
+     * value (the strips and their per-element FMA chains are the same), so
+     * this is scheduling only; the taps self-test holds it with memcmp. */
+    {
+        const size_t grid_n = job.grid_n;
+        job.grid_n = 1u;
+        sg_plan_rows(&job, 0u);
+        job.grid_n = grid_n;
+    }
     if (job.grid_m == 0u || job.grid_m > (size_t)INT_MAX) {
         sg_bump(&g_sg.fused_refused);
         return 1;
