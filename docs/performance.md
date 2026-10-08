@@ -1035,7 +1035,7 @@ bank, **2-3 minute screens, not 30-minute soaks**), base vs this branch:
 |---|---|---|---|---|---|---|
 | 24L | 6 x 4, `--max-batch 8` | C12 | **C24** | 15.1 -> 22.6 | 0.793 | 380 ms |
 | 6L | 11 x 2, `--max-batch 8` | C28 (C36 fails one screen in two) | **C36** at the edge (2 of 3 screens pass) | 33.9 -> 42.4 at C36 | 0.745 | 267 ms |
-| 6L, int8 backbone (opt-in, changes audio) | 11 x 2 | — | **C56** | 61.1 | 0.805 | 186 ms |
+| 6L, int8 backbone (opt-in, changes audio) | 11 x 2 | — | **C48** safe, C56 at the edge | 61.8 at C48 | 0.709 | 160 ms |
 
 No request failed at any level. A last check of the merged branch (same
 commands) gave 24L C24 at STREAM_RTF p95 0.786 with 0 stalls, missing only the
@@ -1045,7 +1045,12 @@ toss, so read C24 and C36 as the knees and one step below as the safe point. Und
 than in the CLI: it is bound by weight traffic across workers on a host shared
 with other tenants, which is why fewer, wider workers (6 x 4) beat 11 x 2.
 On the 6L the codec is half of a worker's time. The int8 6L backbone is the
-obvious policy for hosts with no native bf16 dot, once it passes the ASR gate.
+obvious policy for hosts with no native bf16 dot. **ASR gate, 2026-10-08:** 20
+bank texts x 3 voices, seed 42, faster-whisper small.en, same normalisation:
+WER 1.57% bf16 against **1.44% int8** (60 utterances each; one short int8
+utterance over 30%, none for bf16). A clean C56 re-screen (no other load) gave
+2147 requests, STREAM_RTF p95 0.770, TTFA p95 182 ms but 5 stalls@500, so C56
+is the edge on this host and C48 (0 stalls, RTF p95 0.709) the safe point.
 
 Against Axion (32 Neoverse-V2 cores, 30-minute soaks: 24L C88, 6L C164), this
 slice reaches roughly a quarter (24L) to a third (6L) of an Axion core per CPU
