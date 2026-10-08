@@ -42,6 +42,7 @@
 /* Implemented by src/sgemm.c compiled with MYNAH_SGEMM_VARIANT=base. */
 int mynah_sgemm_f32_base(int trans_a, int trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda, const float *b, size_t ldb, float beta, float *c, size_t ldc);
 int mynah_sgemm_f32_conv_taps_base(size_t m, size_t n, size_t k, size_t taps, const float *weight, float *gather, const float *b, size_t ldb, size_t b_tap_stride, float beta, float *c, size_t ldc);
+int mynah_sgemm_f32_conv_taps_pre_base(size_t m, size_t n, size_t k, size_t taps, const float *pre_taps, const float *b, size_t ldb, size_t b_tap_stride, float beta, float *c, size_t ldc);
 void mynah_sgemm_f32_reference_base(int trans_a, int trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda, const float *b, size_t ldb, float beta, float *c, size_t ldc);
 mynah_sgemm_family mynah_sgemm_family_for_base(int trans_a, int trans_b, size_t m, size_t n, size_t k, const char **why);
 const char *mynah_sgemm_family_name_base(mynah_sgemm_family family);
@@ -56,6 +57,7 @@ void mynah_sgemm_dispatch_probes_base(void);
 /* Implemented by src/sgemm.c compiled with MYNAH_SGEMM_VARIANT=avx2. */
 int mynah_sgemm_f32_avx2(int trans_a, int trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda, const float *b, size_t ldb, float beta, float *c, size_t ldc);
 int mynah_sgemm_f32_conv_taps_avx2(size_t m, size_t n, size_t k, size_t taps, const float *weight, float *gather, const float *b, size_t ldb, size_t b_tap_stride, float beta, float *c, size_t ldc);
+int mynah_sgemm_f32_conv_taps_pre_avx2(size_t m, size_t n, size_t k, size_t taps, const float *pre_taps, const float *b, size_t ldb, size_t b_tap_stride, float beta, float *c, size_t ldc);
 void mynah_sgemm_f32_reference_avx2(int trans_a, int trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda, const float *b, size_t ldb, float beta, float *c, size_t ldc);
 mynah_sgemm_family mynah_sgemm_family_for_avx2(int trans_a, int trans_b, size_t m, size_t n, size_t k, const char **why);
 const char *mynah_sgemm_family_name_avx2(mynah_sgemm_family family);
@@ -77,6 +79,11 @@ int mynah_sgemm_f32(int trans_a, int trans_b, size_t m, size_t n, size_t k, floa
 int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps, const float *weight, float *gather, const float *b, size_t ldb, size_t b_tap_stride, float beta, float *c, size_t ldc) {
     return sgemm_use_avx2() ? mynah_sgemm_f32_conv_taps_avx2(m, n, k, taps, weight, gather, b, ldb, b_tap_stride, beta, c, ldc)
                             : mynah_sgemm_f32_conv_taps_base(m, n, k, taps, weight, gather, b, ldb, b_tap_stride, beta, c, ldc);
+}
+
+int mynah_sgemm_f32_conv_taps_pre(size_t m, size_t n, size_t k, size_t taps, const float *pre_taps, const float *b, size_t ldb, size_t b_tap_stride, float beta, float *c, size_t ldc) {
+    return sgemm_use_avx2() ? mynah_sgemm_f32_conv_taps_pre_avx2(m, n, k, taps, pre_taps, b, ldb, b_tap_stride, beta, c, ldc)
+                            : mynah_sgemm_f32_conv_taps_pre_base(m, n, k, taps, pre_taps, b, ldb, b_tap_stride, beta, c, ldc);
 }
 
 void mynah_sgemm_f32_reference(int trans_a, int trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda, const float *b, size_t ldb, float beta, float *c, size_t ldc) {

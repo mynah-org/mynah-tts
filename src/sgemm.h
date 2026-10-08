@@ -146,6 +146,21 @@ int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
                               const float *b, size_t ldb, size_t b_tap_stride,
                               float beta, float *c, size_t ldc);
 
+/* The same region with the taps ALREADY PERMUTED by the caller, as
+ * pre_taps[t][i][p] = weight[i * k * taps + p * taps + t] -- the layout
+ * src/seanet.c's sea_taps_all() memoises once per weight.  The per-frame
+ * gather above re-reads the whole weight with a `taps` stride on every call,
+ * which on a host whose L3 does not keep the codec resident (a 24-layer
+ * backbone streams 302 MB per step past it) is a DRAM-latency walk the size of
+ * the GEMM's own operand.  Here the tile reads tap t in place, at the same
+ * lda = k the gather produced, through the same micro-kernel instantiation,
+ * so the result is BYTE-IDENTICAL to mynah_sgemm_f32_conv_taps (same values,
+ * same strides, same machine code).  Same refusal rule and return codes. */
+int mynah_sgemm_f32_conv_taps_pre(size_t m, size_t n, size_t k, size_t taps,
+                                  const float *pre_taps, const float *b,
+                                  size_t ldb, size_t b_tap_stride, float beta,
+                                  float *c, size_t ldc);
+
 /* The definition of correctness: the naive i,j,p triple loop, always
  * compiled, never vectorised, never threaded.  Every kernel in sgemm.c is
  * checked against THIS by mynah_sgemm_self_test(), and src/backend.c uses it

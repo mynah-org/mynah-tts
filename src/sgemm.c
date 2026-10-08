@@ -20,7 +20,7 @@
  * architecturally guaranteed, so the compile-time choice is the right one and
  * there is no second variant to select.
  *
- * MYNAH_SGEMM_VARIANT renames the twelve public symbols.  It is defined for
+ * MYNAH_SGEMM_VARIANT renames the thirteen public symbols.  It is defined for
  * BOTH x86 variants -- `base` and `avx2` -- because if the baseline build kept
  * the plain names it would collide with the dispatcher that has to own them. */
 #if defined(MYNAH_SGEMM_VARIANT)
@@ -30,6 +30,7 @@
 #define mynah_sgemm_f32                    MYNAH_SGEMM_SYM(mynah_sgemm_f32)
 #define mynah_sgemm_self_test              MYNAH_SGEMM_SYM(mynah_sgemm_self_test)
 #define mynah_sgemm_f32_conv_taps          MYNAH_SGEMM_SYM(mynah_sgemm_f32_conv_taps)
+#define mynah_sgemm_f32_conv_taps_pre      MYNAH_SGEMM_SYM(mynah_sgemm_f32_conv_taps_pre)
 #define mynah_sgemm_f32_reference          MYNAH_SGEMM_SYM(mynah_sgemm_f32_reference)
 #define mynah_sgemm_narrow_max             MYNAH_SGEMM_SYM(mynah_sgemm_narrow_max)
 #define mynah_sgemm_family_for             MYNAH_SGEMM_SYM(mynah_sgemm_family_for)
@@ -592,6 +593,7 @@ typedef struct {
     size_t taps;
     const float *w_taps;    /* [m][k][taps]                   */
     float *gather;          /* [m][k] scratch, row-block private */
+    const float *pre_taps;  /* [taps][m][k], or NULL: no gather */
     size_t b_tap_stride;
 } sg_job;
 
@@ -674,12 +676,18 @@ static void sg_task_taps(void *ctx, int index) {
     local.a = j->gather;
     local.lda = j->k;
     for (size_t t = 0; t < j->taps; ++t) {
-        float *dst = j->gather + i0 * j->k;
-        const float *src = j->w_taps + i0 * j->k * j->taps + t;
-        for (size_t r = 0; r < rows; ++r) {
-            for (size_t p = 0; p < j->k; ++p) dst[p] = src[p * j->taps];
-            dst += j->k;
-            src += j->k * j->taps;
+        if (j->pre_taps != NULL) {
+            /* Already [taps][m][k]: the tile reads tap t in place, at the
+             * same lda the gather would have produced. */
+            local.a = j->pre_taps + t * j->m * j->k;
+        } else {
+            float *dst = j->gather + i0 * j->k;
+            const float *src = j->w_taps + i0 * j->k * j->taps + t;
+            for (size_t r = 0; r < rows; ++r) {
+                for (size_t p = 0; p < j->k; ++p) dst[p] = src[p * j->taps];
+                dst += j->k;
+                src += j->k * j->taps;
+            }
         }
         local.b = j->b + t * j->b_tap_stride;
         local.beta = (t == 0u) ? j->beta : 1.0f;
@@ -951,12 +959,13 @@ int mynah_sgemm_f32(int trans_a, int trans_b, size_t m, size_t n, size_t k,
                        trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 }
 
-int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
-                              const float *weight, float *gather,
-                              const float *b, size_t ldb, size_t b_tap_stride,
-                              float beta, float *c, size_t ldc) {
-    if (taps == 0u || weight == NULL || gather == NULL || b == NULL ||
-        c == NULL) {
+static int sg_conv_taps(size_t m, size_t n, size_t k, size_t taps,
+                        const float *weight, float *gather,
+                        const float *pre_taps,
+                        const float *b, size_t ldb, size_t b_tap_stride,
+                        float beta, float *c, size_t ldc) {
+    if (taps == 0u || (pre_taps == NULL && (weight == NULL || gather == NULL)) ||
+        b == NULL || c == NULL) {
         return -1;
     }
     if (m == 0u || n == 0u || k == 0u) return 1;
@@ -997,6 +1006,7 @@ int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     job.taps = taps;
     job.w_taps = weight;
     job.gather = gather;
+    job.pre_taps = pre_taps;
     job.b_tap_stride = b_tap_stride;
 
     /* The arithmetic is `taps` GEMMs, so it is counted as `taps` GEMMs: the
@@ -1017,6 +1027,23 @@ int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     }
     sg_hist_add(t_prof, 0, 0, m, n, k, (int)family, job.grid_m);
     return 0;
+}
+
+int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
+                              const float *weight, float *gather,
+                              const float *b, size_t ldb, size_t b_tap_stride,
+                              float beta, float *c, size_t ldc) {
+    return sg_conv_taps(m, n, k, taps, weight, gather, NULL, b, ldb,
+                        b_tap_stride, beta, c, ldc);
+}
+
+int mynah_sgemm_f32_conv_taps_pre(size_t m, size_t n, size_t k, size_t taps,
+                                  const float *pre_taps, const float *b,
+                                  size_t ldb, size_t b_tap_stride, float beta,
+                                  float *c, size_t ldc) {
+    if (pre_taps == NULL) return -1;
+    return sg_conv_taps(m, n, k, taps, NULL, NULL, pre_taps, b, ldb,
+                        b_tap_stride, beta, c, ldc);
 }
 
 int mynah_sgemm_f32_forced(mynah_sgemm_family want, mynah_sgemm_family *ran,
@@ -1290,6 +1317,30 @@ static int sg_taps_case(size_t m, size_t n, size_t k, size_t taps, float beta,
                               (t == 0u) ? beta : 1.0f, c_loop, n);
     }
     int bad = (rc == 0) && memcmp(c_fused, c_loop, m * n * sizeof(float)) != 0;
+    /* The pre-permuted entry against the same loop: [taps][m][k] built here
+     * the way src/seanet.c's memo builds it, and the same byte-identity bar. */
+    float *pre = bad ? NULL : (float *)malloc(m * k * taps * sizeof(float));
+    if (pre != NULL) {
+        for (size_t t = 0; t < taps; ++t)
+            for (size_t i = 0; i < m; ++i)
+                for (size_t p = 0; p < k; ++p)
+                    pre[(t * m + i) * k + p] = w[i * k * taps + p * taps + t];
+        for (size_t i = 0; i < m * n; ++i) c_fused[i] = 0.25f * (float)(i % 7u);
+        const int rc_pre = mynah_sgemm_f32_conv_taps_pre(
+            m, n, k, taps, pre, b, ldb, 1u, beta, c_fused, n);
+        if (rc_pre < 0 || rc_pre != rc ||
+            (rc_pre == 0 &&
+             memcmp(c_fused, c_loop, m * n * sizeof(float)) != 0)) {
+            snprintf(error, error_capacity,
+                     "sgemm taps self-test: the pre-permuted entry (rc %d) is "
+                     "not byte-identical to the per-tap loop at m=%zu n=%zu "
+                     "k=%zu taps=%zu", rc_pre, m, n, k, taps);
+            free(pre);
+            free(w); free(gather); free(b); free(c_fused); free(c_loop);
+            return -1;
+        }
+        free(pre);
+    }
     if (bad) {
         size_t at = 0;
         for (; at < m * n; ++at) if (c_fused[at] != c_loop[at]) break;
