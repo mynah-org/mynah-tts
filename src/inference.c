@@ -767,8 +767,11 @@ static int dec_submit(decode_ahead *dec, mynah_engine_ctx **gang,
                       const size_t *slot_index, size_t count) {
     char error[256];
     error[0] = '\0';
-    if (dec->engine->decode_submit(gang, count, first, want, dec->scratch, error,
-                                   sizeof(error)) != 0) {
+    mynah_hostprof_begin(MYNAH_HP_DEC_SUBMIT);
+    const int submit_rc = dec->engine->decode_submit(gang, count, first, want,
+                                                     dec->scratch, error, sizeof(error));
+    mynah_hostprof_end(MYNAH_HP_DEC_SUBMIT, count);
+    if (submit_rc != 0) {
         for (size_t g = 0; g < count; ++g)
             slot_fail(&dec->slots[slot_index[g]],
                       error[0] != '\0' ? error : "decoding audio failed");
@@ -824,6 +827,7 @@ static int dec_collect(decode_ahead *dec, int wait) {
     /* Retire and admission may have moved the members' slots; never dropped
      * them, because a decoding slot does not retire. */
     const size_t count = dec->count;
+    mynah_hostprof_begin(MYNAH_HP_DELIVER);
     for (size_t g = 0; g < count; ++g) dec->slot_of[g] = (size_t)-1;
     for (size_t i = 0; i < *dec->used; ++i) {
         synth_slot *s = &dec->slots[i];
@@ -852,6 +856,7 @@ static int dec_collect(decode_ahead *dec, int wait) {
         slot_emit(slot, pcm, dec->produced[g]);
         if (!dec->lent) free(pcm);
     }
+    mynah_hostprof_end(MYNAH_HP_DELIVER, count);
     dec->count = 0u;
     return 1;
 }
@@ -1151,14 +1156,18 @@ static int slot_retire(const mynah_tts_engine *engine, mynah_graph_sink *sink,
         outcome = slot_finalize(engine, slot, dump) != 0
             ? MYNAH_GRAPH_FAILED : MYNAH_GRAPH_OK;
     }
+    mynah_hostprof_begin(MYNAH_HP_CTX_FREE);
     engine->ctx_free(slot->ctx);
+    mynah_hostprof_end(MYNAH_HP_CTX_FREE, 1u);
     slot->ctx = NULL;
     if (outcome == MYNAH_GRAPH_OK && slot->error != NULL && slot->error_capacity > 0) {
         slot->error[0] = '\0';
     }
     void *const tag = slot->tag;
     memset(slot, 0, sizeof(*slot));
+    mynah_hostprof_begin(MYNAH_HP_ON_DONE);
     if (sink->on_done != NULL) sink->on_done(sink->ud, tag, outcome);
+    mynah_hostprof_end(MYNAH_HP_ON_DONE, 1u);
     return outcome == MYNAH_GRAPH_OK ? 0 : -1;
 }
 
@@ -1225,8 +1234,11 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
                       int lane_on, decode_ahead *dec) {
     char shared_error[256];
     shared_error[0] = '\0';
-    if (engine->step_batch(step_ctxs, live, scratch, shared_error,
-                           sizeof(shared_error)) != 0) {
+    mynah_hostprof_begin(MYNAH_HP_STEP_BATCH);
+    const int step_rc = engine->step_batch(step_ctxs, live, scratch, shared_error,
+                                           sizeof(shared_error));
+    mynah_hostprof_end(MYNAH_HP_STEP_BATCH, live);
+    if (step_rc != 0) {
         if (live <= 1u) {
             /* Alone in the batch, the attribution is not in doubt and there is
              * nothing to isolate it from. */
@@ -1243,8 +1255,11 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
 
     memset(results, 0, live * sizeof(*results));
     shared_error[0] = '\0';
-    if (engine->emit_batch(step_ctxs, live, results, scratch, shared_error,
-                           sizeof(shared_error)) != 0) {
+    mynah_hostprof_begin(MYNAH_HP_EMIT);
+    const int emit_rc = engine->emit_batch(step_ctxs, live, results, scratch,
+                                           shared_error, sizeof(shared_error));
+    mynah_hostprof_end(MYNAH_HP_EMIT, live);
+    if (emit_rc != 0) {
         int attributed = 0;
         for (size_t j = 0; j < live; ++j) {
             if (results[j].failed) {
@@ -1266,7 +1281,10 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
     }
     /* Delivery is decided for the whole batch at once, not slot by slot: that
      * is the only place the driver can see two requests' codec work together. */
+    mynah_hostprof_begin(MYNAH_HP_GANG);
     stream_gang(engine, caps, scratch, slots, step_slot, results, live, lane_on, dec);
+    mynah_hostprof_end(MYNAH_HP_GANG, live);
+    mynah_hostprof_begin(MYNAH_HP_POST_STEP);
     for (size_t j = 0; j < live; ++j) {
         synth_slot *slot = &slots[step_slot[j]];
         if (slot->failed) continue;
@@ -1283,6 +1301,7 @@ static void step_live(const mynah_tts_engine *engine, const mynah_engine_caps *c
             slot->continuation = 1;
         }
     }
+    mynah_hostprof_end(MYNAH_HP_POST_STEP, live);
 }
 
 /* The admission pass: fill free slots from the sink until it has nothing, a
@@ -1691,8 +1710,12 @@ static void step_ahead_select_launch(step_ahead *ah, synth_slot *slots,
 
 static void step_ahead_launch(step_ahead *ah, synth_slot *slots,
                               size_t *step_rr, size_t retired_last) {
+    mynah_hostprof_begin(MYNAH_HP_PREFILL);
     prefill_pass(ah->pre, retired_last);
+    mynah_hostprof_end(MYNAH_HP_PREFILL, 0u);
+    mynah_hostprof_begin(MYNAH_HP_LAUNCH);
     step_ahead_select_launch(ah, slots, step_rr);
+    mynah_hostprof_end(MYNAH_HP_LAUNCH, ah->count);
 }
 
 /* The selection and the launch, without the prefill pass (MYNAH_CUDA_PINGPONG
@@ -1749,6 +1772,7 @@ static size_t retire_pass(const mynah_tts_engine *engine, mynah_graph_sink *sink
                           synth_slot *slots, size_t *used, size_t slot_capacity,
                           int compact_rows, int dump_all, int *result) {
     const size_t before = *used;
+    mynah_hostprof_begin(MYNAH_HP_RETIRE);
     if (compact_rows) {
         /* Dense rows make this a real swap-remove.  Do not advance `i`
          * after the move: the last row may itself already be finished. */
@@ -1783,6 +1807,7 @@ static size_t retire_pass(const mynah_tts_engine *engine, mynah_graph_sink *sink
             --*used;
         }
     }
+    mynah_hostprof_end(MYNAH_HP_RETIRE, before - *used);
     return before - *used;
 }
 
@@ -2163,6 +2188,9 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
     const int serve_profile = getenv("MYNAH_SERVE_PROFILE") != NULL;
     const double t_profile0 = serve_profile ? mynah_phase_seconds() : 0.0;
     if (serve_profile) mynah_backend_sync_profile_reset();
+    /* MYNAH_SERVE_PROFILE=2: this thread's per-phase host breakdown. */
+    mynah_hostprof_bind();
+    mynah_hostprof_reset();
     /* Phase boundaries for the sink (graph.h: `phase`), profile runs only. */
     const int report_phase = serve_profile && sink->phase != NULL;
     unsigned long long iteration = 0ull;
@@ -2755,7 +2783,9 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         const unsigned long long t_admit =
             mynah_costmap_level() ? mynah_costmap_now_ns() : 0ull;
         iter_admits = 0u;
+        mynah_hostprof_begin(MYNAH_HP_ADMIT);
         admit_pass(&adm);
+        mynah_hostprof_end(MYNAH_HP_ADMIT, iter_admits);
         /* Admission is submitted rather than bracketed: it is declared
          * "derived" in the table because the region it sits under -- the
          * request -- is itself derived, and a blocking next_job() waiting for
@@ -2781,6 +2811,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
 
         /* ---- cancellation --------------------------------------------- */
         if (sink->cancelled != NULL && iteration % cancel_every == 0ull) {
+            mynah_hostprof_begin(MYNAH_HP_CANCEL);
             for (size_t i = 0; i < slot_capacity; ++i) {
                 /* A slot still prefilling is cancellable too, and has to be:
                  * otherwise a client that disconnects during a long prefill
@@ -2792,6 +2823,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                     slots[i].preparing = 0;
                 }
             }
+            mynah_hostprof_end(MYNAH_HP_CANCEL, used);
         }
 
         if (async_on) async_collect(&adm, 0);
@@ -2803,7 +2835,9 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
          * selects over the current arrangement, so they retire right here,
          * where the serial loop has already retired them. */
         if (dec != NULL) {
+            mynah_hostprof_begin(MYNAH_HP_DEC_COLLECT);
             (void)dec_collect(dec, 1);
+            mynah_hostprof_end(MYNAH_HP_DEC_COLLECT, 0u);
             const size_t rows = compact_rows ? used : slot_capacity;
             for (size_t i = 0; i < rows; ++i) slots[i].held = 0;
             if (ahead->count == 0u) {
@@ -2817,9 +2851,14 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
         /* ---- finish the prefills that are in flight -------------------- *
          * Then the late admission. With MYNAH_CUDA_STEP_OVERLAP this already
          * ran right after the last step, before the next one was queued. */
-        if (!prefilled_ahead) prefill_pass(&pre, retired_last);
+        if (!prefilled_ahead) {
+            mynah_hostprof_begin(MYNAH_HP_PREFILL);
+            prefill_pass(&pre, retired_last);
+            mynah_hostprof_end(MYNAH_HP_PREFILL, 0u);
+        }
         prefilled_ahead = 0;
         if (report_phase) sink->phase(sink->ud, iteration, 2);
+        mynah_hostprof_begin(MYNAH_HP_SELECT);
 
         /* ---- one bounded step over the live set -----------------------
          * A continuous service may retain 128 request contexts while the
@@ -2868,6 +2907,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             if (live > 0u) step_rr = next_step_rr;
             else step_rr = (step_rr + 1u) % resident_rows;
         }
+        mynah_hostprof_end(MYNAH_HP_SELECT, live);
         if (serve_profile) {
             ++occ_frames;
             occ_hist[live <= max_batch ? live : max_batch] += 1u;
@@ -2878,8 +2918,10 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             /* MYNAH_CUDA_DECODE_OVERLAP: this step's rows retire next pass. */
             if (dec != NULL)
                 for (size_t j = 0; j < live; ++j) slots[step_slot[j]].held = 1;
+            mynah_hostprof_begin(MYNAH_HP_STEP);
             step_live(engine, &caps, scratch, slots, step_ctxs, step_slot, results,
                       live, dump_all, lane_on, dec);
+            mynah_hostprof_end(MYNAH_HP_STEP, live);
             for (size_t i = 0; i < resident_rows; ++i) {
                 if (!slots[i].requeue) continue;
                 slots[i].requeue = 0;
@@ -3032,6 +3074,7 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
                     occ_blocked_s * pct);
             mynah_backend_sync_profile_print(stderr, iteration);
         }
+        mynah_hostprof_print(stderr, iteration);
     }
     if (timing) {
         t_ar = mynah_phase_seconds();

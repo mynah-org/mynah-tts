@@ -10268,6 +10268,7 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
         if (!ctx->cuda_backbone_device_owned) all_device_owned = 0;
     }
     /* A draw left over from a step whose emit never ran is not consumed. */
+    mynah_hostprof_begin(MYNAH_HP_OS_ROWS);
     pocket_onesync_rng_restore_all(ctxs, count);
 
     for (size_t i = 0; i < count; ++i) {
@@ -10298,6 +10299,8 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
     hidden_lazy = scratch->cuda_hidden_lazy_enabled;
     for (size_t i = 0; i < count && hidden_lazy; ++i)
         if (ctxs[i]->dump != NULL) hidden_lazy = 0;
+    mynah_hostprof_end(MYNAH_HP_OS_ROWS, count);
+    mynah_hostprof_begin(MYNAH_HP_OS_BACKBONE);
 
     /* 1. condition: the same resolved projection as pocket_cuda_condition_batch,
      * left in cuda_x for the backbone (no D2H, no host finite scan: a
@@ -10328,6 +10331,8 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
          * the ordinary path would have done with this failure. */
         if (rc != 0) goto fallback;
     }
+    mynah_hostprof_end(MYNAH_HP_OS_BACKBONE, count);
+    mynah_hostprof_begin(MYNAH_HP_OS_FLOW);
 
     /* 3. EOS logits, the same resolved projection as pocket_cuda_eos_batch. */
     {
@@ -10379,6 +10384,7 @@ static int pocket_onesync_step(mynah_engine_ctx *const *ctxs, size_t count,
                                        sizeof(local)) != 0)
         goto fallback_drain;
 
+    mynah_hostprof_end(MYNAH_HP_OS_FLOW, count);
     if (phase == POCKET_ONESYNC_QUEUE) {
         /* MYNAH_CUDA_STEP_OVERLAP: the frame is queued; the sync and the
          * commit wait for the finish.  Host state changed so far: the early
@@ -10414,6 +10420,7 @@ frame_sync:
         goto fallback_drain;
     }
 
+    mynah_hostprof_begin(MYNAH_HP_OS_FINISH);
     for (size_t i = 0; i < count && hidden_lazy; ++i) {
         /* `!(x == 0)` is also true for NaN.  The same outcome as the commit's
          * host scan returning 1: nothing committed, the ordinary path redoes
@@ -10455,6 +10462,7 @@ frame_sync:
     scratch->cuda_onesync_ready = 1;
     scratch->pp_onesync_failures = 0u;   /* MYNAH_CUDA_PINGPONG */
     (void)mynah_backend_note_backbone_batch(scratch->backend, count);
+    mynah_hostprof_end(MYNAH_HP_OS_FINISH, count);
     return 0;
 
 fallback_drain:
@@ -10829,6 +10837,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     }
     pocket_dump_flush(ctx);
     pocket_dump_free(ctx->dump);
+    mynah_hostprof_begin(MYNAH_HP_CF_DEVICE);
     /* MYNAH_CUDA_DEFERRED_RELEASE: with the slot pool the drain moves to a
      * fence on the parked set (pocket_cuda_slot_park); off, as always. */
     const int deferred = ctx->state != NULL &&
@@ -10848,6 +10857,8 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
     pocket_cuda_backbone_release(ctx);
     pocket_cuda_codec_release(ctx);
     pocket_cuda_decoder_release(ctx);
+    mynah_hostprof_end(MYNAH_HP_CF_DEVICE, 1u);
+    mynah_hostprof_begin(MYNAH_HP_CF_HOST);
     /* MYNAH_CTX_HOST_POOL: the host parts go to the pool here; the frees
      * below then see NULLs.  Off, as always. */
     if (ctx->state != NULL && ctx->state->ctx_host_pool != 0)
@@ -10888,6 +10899,7 @@ static void pocket_ctx_free(mynah_engine_ctx *ctx) {
         free(ctx->pcm);
     free(ctx->lent_pcm);
     free(ctx);
+    mynah_hostprof_end(MYNAH_HP_CF_HOST, 1u);
 }
 
 /* Opens the voice and resolves its model-owned KV prefix.  With the default
@@ -11922,6 +11934,7 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                                           : sizeof(float);
     char local[256];
     local[0] = '\0';
+    mynah_hostprof_begin(MYNAH_HP_PT_VOICE);
     /* Voice prefixes first: one D2D per layer and plane per fresh request.
      * A row that does not store its prefix (cuda_backbone_kv_skip, phase 2
      * of MYNAH_CUDA_SHARED_VOICE) copies nothing: it only records the shared
@@ -12001,6 +12014,7 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         ctx->cuda_voice_shared = ctx->cuda_backbone_kv_bf16 ? voice : NULL;
         ctx->cuda_voice_shared_positions = ctx->voice_positions;
     }
+    mynah_hostprof_end(MYNAH_HP_PT_VOICE, count);
     if (total > 0u) {
         /* Text embeddings: one packed device buffer, owned by the model and
          * grown outside any graph. */
@@ -12057,6 +12071,7 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         size_t rows = 0u, offset = 0u;
         size_t row_take[POCKET_MAX_BATCH], row_start[POCKET_MAX_BATCH];
         size_t row_ring[POCKET_MAX_BATCH];
+        mynah_hostprof_begin(MYNAH_HP_PT_H2D);
         for (size_t i = 0; i < count; ++i) {
             mynah_engine_ctx *ctx = ctxs[i];
             if (take[i] == 0u) continue;
@@ -12093,6 +12108,7 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             offset += take[i];
             ++rows;
         }
+        mynah_hostprof_end(MYNAH_HP_PT_H2D, rows);
         mynah_transformer_tile_layer layer[64];
         for (size_t l = 0; l < layers; ++l) {
             const mynah_transformer_ar_layer *src = &state->backbone_layers[l];
@@ -12149,8 +12165,10 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             .kv_int8 = state->cuda_kv_int8,
         };
         mynah_region_begin(MYNAH_RGN_PREFILL);
+        mynah_hostprof_begin(MYNAH_HP_PT_CALL);
         const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
                                                           local, sizeof(local));
+        mynah_hostprof_end(MYNAH_HP_PT_CALL, rows);
         mynah_region_end(MYNAH_RGN_PREFILL);
         /* The backend copied the tables into its staging before returning. */
         free(prefix);
@@ -12474,6 +12492,7 @@ static int pocket_prepare_slice_batch(
 
     mynah_region_begin(MYNAH_RGN_PREPARE);
     const int depth = mynah_region_depth();
+    mynah_hostprof_begin(MYNAH_HP_PRE_PROLOGUE);
     for (size_t i = 0; i < count; ++i) {
         if (ctxs[i]->seeding) continue;
         if ((ctxs[i]->segment_pending
@@ -12485,6 +12504,7 @@ static int pocket_prepare_slice_batch(
         }
         ctxs[i]->seeding = 1;
     }
+    mynah_hostprof_end(MYNAH_HP_PRE_PROLOGUE, count);
 
     {
         /* Device-owned rows: one prefill tile for all of them. */
@@ -12495,7 +12515,11 @@ static int pocket_prepare_slice_batch(
             else ++others;
         }
         if (owned_count > 0u) {
-            if (pocket_cuda_prefill_tile(owned, owned_count, 0, error, capacity) != 0) {
+            mynah_hostprof_begin(MYNAH_HP_PRE_TILE);
+            const int tile_rc = pocket_cuda_prefill_tile(owned, owned_count, 0, error,
+                                                         capacity);
+            mynah_hostprof_end(MYNAH_HP_PRE_TILE, owned_count);
+            if (tile_rc != 0) {
                 mynah_region_unwind(depth);
                 mynah_region_end(MYNAH_RGN_PREPARE);
                 return -1;
@@ -14006,6 +14030,7 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                  int *done, char *error, size_t capacity) {
     for (size_t i = 0; i < count; ++i) done[i] = 0;
     if (count == 0u || !pocket_cuda_mimi_tile_enabled()) return 0;
+    mynah_hostprof_begin(MYNAH_HP_MT_PRE);
     const mynah_engine_state *state = NULL;
     const float *input[POCKET_MAX_BATCH];
     float *output[POCKET_MAX_BATCH];
@@ -14104,9 +14129,12 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
     };
     char local[256];
     local[0] = '\0';
+    mynah_hostprof_end(MYNAH_HP_MT_PRE, rows);
     mynah_region_begin2(MYNAH_RGN_CODEC_TRANSFORMER);
+    mynah_hostprof_begin(MYNAH_HP_MT_CALL);
     const int rc = mynah_backend_tile_transformer_dev(state->backend, &desc,
                                                       local, sizeof(local));
+    mynah_hostprof_end(MYNAH_HP_MT_CALL, rows);
     mynah_region_end2(MYNAH_RGN_CODEC_TRANSFORMER);
     if (rc != 0) {
         /* Nothing was committed on the host. Owned rows cannot recover; the
@@ -14115,6 +14143,7 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
         return rc < 0 ? -1 : 0;
     }
     (void)mynah_backend_note_codec_transformer_batch(state->backend, rows, rows);
+    mynah_hostprof_begin(MYNAH_HP_MT_POST);
     for (size_t r = 0; r < rows; ++r) {
         mynah_engine_ctx *ctx = ctxs[index[r]];
         const size_t end = start[r] + cfg->upsample_stride;
@@ -14142,6 +14171,7 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
         ctx->cuda_codec_pending = 0;
         done[index[r]] = 1;
     }
+    mynah_hostprof_end(MYNAH_HP_MT_POST, rows);
     return 0;
 }
 
@@ -14746,6 +14776,7 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
 
             /* Queue every request's quantizer + upsample for this frame in
              * one submission before the per-request host preparation. */
+            mynah_hostprof_begin(MYNAH_HP_DS_UPSAMPLE);
             {
                 size_t gang_frames[POCKET_MAX_BATCH];
                 int gang_failed[POCKET_MAX_BATCH];
@@ -14767,6 +14798,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                                                  one_error, error, capacity);
                 }
             }
+            mynah_hostprof_end(MYNAH_HP_DS_UPSAMPLE, count);
+            mynah_hostprof_begin(MYNAH_HP_DS_PREPARE);
 
             for (size_t i = 0; i < count; ++i) {
                 if (failed[i] || out_samples[i] == NULL || f >= frame_count[i]) continue;
@@ -14780,6 +14813,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                 }
                 prepared[i] = 1;
             }
+            mynah_hostprof_end(MYNAH_HP_DS_PREPARE, count);
+            mynah_hostprof_begin(MYNAH_HP_DS_CODEC);
 
             /* All host-side frame preparation is complete. Run the pending
              * codec-transformer tiles together; contexts that cannot use the
@@ -14860,6 +14895,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                 }
             }
 
+            mynah_hostprof_end(MYNAH_HP_DS_CODEC, codec_count);
+            mynah_hostprof_begin(MYNAH_HP_DS_DECODER);
             mynah_engine_ctx *decoder_candidates[POCKET_MAX_BATCH];
             size_t decoder_candidate_indices[POCKET_MAX_BATCH];
             size_t decoder_candidate_count = 0u;
@@ -14930,6 +14967,8 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                 }
             }
 
+            mynah_hostprof_end(MYNAH_HP_DS_DECODER, decoder_candidate_count);
+            mynah_hostprof_begin(MYNAH_HP_DS_GATHER);
             if (submitted_count > 0u) {
                 if (decoder_batch_used)
                     (void)mynah_backend_decoder_note_batch(
@@ -14990,12 +15029,14 @@ static int pocket_decode_gang(mynah_engine_ctx *const *ctxs, size_t count,
                         defer->gang_pcm_index[r] = gang_pcm_index[r];
                     defer->fence = mynah_backend_fence_record(batch_backend);
                     defer->queued = 1;
+                    mynah_hostprof_end(MYNAH_HP_DS_GATHER, gang_pcm_rows);
                     mynah_region_end(MYNAH_RGN_CODEC);
                     return 0;
                 }
                 sync_failed = mynah_backend_sync(
                     batch_backend, sync_error, sizeof(sync_error)) != 0;
             }
+            mynah_hostprof_end(MYNAH_HP_DS_GATHER, gang_pcm_rows);
             pocket_decode_gang_land(ctxs, count, frame_count, out_samples,
                                     out_count, failed, &reported, error,
                                     capacity, batch_backend, submitted,
@@ -15025,6 +15066,7 @@ static int pocket_decode_audio_batch(mynah_engine_ctx *const *ctxs, size_t count
 static void pocket_decode_inflight_land(pocket_gang_inflight *g) {
     char sync_error[256];
     sync_error[0] = '\0';
+    mynah_hostprof_begin(MYNAH_HP_DEC_LAND);
     const int sync_failed = mynah_backend_fence_sync(g->backend, g->fence,
                                                      sync_error,
                                                      sizeof(sync_error)) != 0;
@@ -15040,6 +15082,7 @@ static void pocket_decode_inflight_land(pocket_gang_inflight *g) {
     pocket_decode_gang_advance(g->ctxs, g->count, g->frame_count, g->out_samples,
                                g->failed);
     g->queued = 0;
+    mynah_hostprof_end(MYNAH_HP_DEC_LAND, g->count);
 }
 
 /* Safety net, like pocket_cuda_ahead_discard: an engine call that could read
