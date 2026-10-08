@@ -12050,7 +12050,7 @@ static int pocket_cuda_prefill_fixed_order(void) {
     return cached;
 }
 
-/* MYNAH_CUDA_PREFILL_PINNED (opt-in, =1): the prefill tile
+/* MYNAH_CUDA_PREFILL_PINNED (default on, =0 rolls back): the prefill tile
  * stages the text embeddings it uploads in a pinned buffer and sends them with
  * one copy. From pageable memory each cudaMemcpyAsync first waits for the
  * stream, i.e. for the decode gang queued just before the prefill pass, so the
@@ -12060,7 +12060,7 @@ static int pocket_cuda_prefill_pinned_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *value = getenv("MYNAH_CUDA_PREFILL_PINNED");
-        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+        cached = value == NULL || value[0] == '\0' || strcmp(value, "0") != 0;
     }
     return cached;
 }
