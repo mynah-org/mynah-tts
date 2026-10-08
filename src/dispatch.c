@@ -1124,6 +1124,9 @@ static void collect_backends(row_sink *s) {
     add_unknown(s, "kernel.gelu_vector", "yes", "-", "MYNAH_GELU_SCALAR",
                 "[UNKNOWN] src/kernels.c did not register "
                 "mynah_gelu_vector_enabled()");
+    add_unknown(s, "kernel.attention", "yes", "-", "MYNAH_ATTN_SCORES",
+                "[UNKNOWN] src/kernels.c did not register the attention "
+                "score/value predicate");
     add_unknown(s, "kernel.fused_greedy", "yes", "-", "MYNAH_FUSED_GREEDY",
                 "[UNKNOWN] src/qmat.c did not register "
                 "mynah_qmat_fused_greedy_enabled()");

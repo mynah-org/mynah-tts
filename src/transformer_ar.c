@@ -1040,10 +1040,9 @@ static int tar_attend_head(const mynah_transformer_ar_config *config,
     const float *v_cache = k_cache + state->kv_half;
     const float *qh = q + h * head_dim;
     float *oh = rows->attn + b * attn_dim + h * head_dim;
-    for (size_t j = 0; j < span; ++j) {
-        const float *kj = k_cache + (lo_slot + j) * attn_dim + h * head_dim;
-        scores[j] = mynah_dot_f32(qh, kj, head_dim) * scale;
-    }
+    /* Byte-identical to one mynah_dot_f32 per key, times scale (kernels.c). */
+    mynah_attn_scores_f32(scores, qh, k_cache + lo_slot * attn_dim + h * head_dim,
+                          attn_dim, span, head_dim, scale);
     /* Rejects non-finite scores, which is the last line of defence against a
      * NaN that slipped into the cache. */
     if (mynah_softmax_f32(scores, scores, span) != 0) return -1;
