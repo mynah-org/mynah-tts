@@ -14240,6 +14240,7 @@ typedef struct {
     const size_t *index;
     const size_t *start;
     size_t stride;
+    int stale;                     /* MYNAH_CUDA_MIMI_STALE_WINDOW */
     int *done;
     pthread_mutex_t mu;            /* guards the two fields below */
     size_t failed_row;             /* SIZE_MAX: none */
@@ -14253,8 +14254,11 @@ static void pocket_mimi_post_body(void *ud, size_t begin, size_t end_row) {
         const size_t end = job->start[r] + job->stride;
         char local[256];
         local[0] = '\0';
-        if (mynah_transformer_ar_state_prepare_window(ctx->codec_transformer,
-                                                       end) != 0 ||
+        const int prepared = job->stale
+            ? mynah_transformer_ar_state_prepare_window_stale(ctx->codec_transformer,
+                                                              end)
+            : mynah_transformer_ar_state_prepare_window(ctx->codec_transformer, end);
+        if (prepared != 0 ||
             mynah_transformer_ar_state_set_window_offset(ctx->codec_transformer, end,
                                                   local, sizeof(local)) != 0) {
             ctx->cuda_mimi_tile_owned = 1;
@@ -14280,6 +14284,22 @@ static void pocket_mimi_post_body(void *ud, size_t begin, size_t end_row) {
         ctx->cuda_codec_pending = 0;
         job->done[job->index[r]] = 1;
     }
+}
+
+/* MYNAH_CUDA_MIMI_STALE_WINDOW (default on; =0 rolls back): a row the Mimi
+ * tile owns keeps its codec K/V only in the device ring and never reads the
+ * host window again (a failure drops the row; there is no host state to
+ * continue from), yet advancing its host offset compacted that window, a
+ * ~2 MB memmove per row every 250 positions (~16 frames): ~9 us per row and
+ * frame on an EPYC 7702. With the flag the window moves without its stale
+ * contents. Only host memory nobody reads changes; the audio cannot. */
+static int pocket_cuda_mimi_stale_window_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_MIMI_STALE_WINDOW");
+        cached = value == NULL || strcmp(value, "0") != 0;
+    }
+    return cached;
 }
 
 static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
@@ -14405,11 +14425,16 @@ static int pocket_cuda_mimi_tile(mynah_engine_ctx *const *ctxs, size_t count,
     job.index = index;
     job.start = start;
     job.stride = cfg->upsample_stride;
+    job.stale = pocket_cuda_mimi_stale_window_enabled();
     job.done = done;
     job.failed_row = SIZE_MAX;
     job.error[0] = '\0';
     pthread_mutex_init(&job.mu, NULL);
-    mynah_hostpool_run(rows, pocket_mimi_post_body, &job);
+    /* Without the copies the rows are a few stores each: not worth a wake. */
+    if (job.stale)
+        pocket_mimi_post_body(&job, 0u, rows);
+    else
+        mynah_hostpool_run(rows, pocket_mimi_post_body, &job);
     pthread_mutex_destroy(&job.mu);
     /* The serial loop reported every failing row in turn, so the message is
      * the last failing row's. */

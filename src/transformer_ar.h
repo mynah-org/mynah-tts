@@ -280,6 +280,12 @@ size_t mynah_transformer_ar_state_kv_base(
 /* Make room for an exclusive end position without advancing the state. */
 int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
                                                size_t end_position);
+/* The same window bookkeeping for a state whose host K/V is never read again
+ * (its cache lives elsewhere, e.g. on a device): the window moves exactly as
+ * `_prepare_window` moves it, but the stored K/V is not carried along, so its
+ * contents become meaningless. */
+int mynah_transformer_ar_state_prepare_window_stale(
+    mynah_transformer_ar_state *state, size_t end_position);
 
 /*
  * Copies a voice prefix into layer `layer`.  `kv` is

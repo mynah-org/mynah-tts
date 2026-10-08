@@ -888,8 +888,8 @@ static size_t tar_window_start(size_t position, size_t context) {
  * wider than the slack.
  *
  * A no-op on an unwindowed cache, which is every path that predates this. */
-static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
-                          size_t hi) {
+static int tar_kv_reserve_copy(mynah_transformer_ar_state *state, size_t keep_from,
+                               size_t hi, int copy) {
     if (state->kv_positions >= state->config.max_seq_len) return 0;
     if (hi < state->kv_base) return -1;   /* positions never rewind */
     if (hi - state->kv_base < state->kv_positions) return 0;
@@ -911,7 +911,7 @@ static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
         const size_t room = state->kv_positions - shift;
         if (keep > room) keep = room;
     }
-    if (keep > 0u) {
+    if (keep > 0u && copy) {
         const size_t row = state->attn_dim * sizeof(float);
         for (size_t l = 0; l < state->config.num_layers; ++l) {
             float *k = state->kv + l * state->kv_layer;
@@ -922,6 +922,23 @@ static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
     }
     state->kv_base = keep_from;
     return (hi - state->kv_base < state->kv_positions) ? 0 : -1;
+}
+
+static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
+                          size_t hi) {
+    return tar_kv_reserve_copy(state, keep_from, hi, 1);
+}
+
+int mynah_transformer_ar_state_prepare_window_stale(
+    mynah_transformer_ar_state *state, size_t end_position) {
+    if (state == NULL || end_position > state->config.max_seq_len ||
+        end_position < state->offset) {
+        return -1;
+    }
+    if (end_position == state->offset || end_position == 0u) return 0;
+    return tar_kv_reserve_copy(state,
+                               tar_window_start(state->offset, state->config.context),
+                               end_position - 1u, 0);
 }
 
 int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
