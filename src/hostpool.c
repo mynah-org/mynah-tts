@@ -15,6 +15,9 @@
  * Workers learn of a new region from `gen` (bumped at publication); they spin
  * on it for a short budget after each region, then park on a condition
  * variable. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* pthread_setname_np */
+#endif
 #include "hostpool.h"
 
 #include <pthread.h>
