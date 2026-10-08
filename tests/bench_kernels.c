@@ -155,6 +155,75 @@ int main(void) {
     }
     report("int8 dots (B=1)", median(t, REPS), (double)FFN * HID, k_i8);
 
+    {
+        /* Four activations over one weight pass: the serving step's shape at
+         * a few live slots per worker, and the codec conv's tap GEMM. */
+        void *xq4[4];
+        int ok = 1;
+        for (int b = 0; b < 4; ++b) {
+            xq4[b] = malloc(mynah_qmat_act_bytes(HID));
+            if (xq4[b] == NULL) { ok = 0; continue; }
+            for (size_t i = 0; i < HID; ++i) y[i] = x[(i + 97u * (size_t)b) % HID];
+            (void)mynah_qmat_act_quantize(xq4[b], y, HID);
+        }
+        static int32_t iout4[4 * FFN];
+        if (ok) {
+            for (int r = 0; r < REPS; ++r) {
+                const double t0 = now_ms();
+                mynah_qmat_dots_i8(wq, FFN, HID, rowsum,
+                                   (const void *const *)xq4, 4, iout4, FFN);
+                t[r] = now_ms() - t0;
+            }
+            report("int8 dots (B=4)", median(t, REPS), (double)FFN * HID, k_i8);
+        }
+        for (int b = 0; b < 4; ++b) free(xq4[b]);
+    }
+
+    {
+        /* The same dots over a weight matrix that does NOT fit any cache:
+         * 64 MiB, the regime of the 24-layer backbone's 302 MB step. Above,
+         * 4 MiB lives in one CCX's L3 on a Zen 2 and says nothing about the
+         * DRAM stream the decode step actually pays. */
+        enum { BR = 16384, BK = 4096, BB = 8 };
+        int8_t *bw = (int8_t *)malloc((size_t)BR * BK);
+        float *bf = (float *)malloc((size_t)BK * sizeof(float));
+        float *bsc = (float *)malloc((size_t)BR * sizeof(float));
+        int32_t *brs = (int32_t *)malloc((size_t)BR * sizeof(int32_t));
+        int32_t *bo = (int32_t *)malloc((size_t)BB * BR * sizeof(int32_t));
+        void *bx[BB];
+        int ok = bw != NULL && bf != NULL && bsc != NULL && brs != NULL && bo != NULL;
+        for (int b = 0; b < BB; ++b) {
+            bx[b] = malloc(mynah_qmat_act_bytes(BK));
+            if (bx[b] == NULL) ok = 0;
+        }
+        if (ok) {
+            for (size_t r = 0; r < BR; ++r) {
+                for (size_t i = 0; i < BK; ++i)
+                    bf[i] = 0.02f * (float)(((r * 131u + i) * 37u) % 101u) - 1.0f;
+                (void)mynah_qmat_pack_q8(bf, 1, BK, bw + r * BK, bsc + r, brs + r);
+            }
+            for (int b = 0; b < BB; ++b) {
+                for (size_t i = 0; i < BK; ++i)
+                    bf[i] = 0.01f * (float)(((i + 31u * (size_t)b) * 17u) % 211u) - 1.0f;
+                (void)mynah_qmat_act_quantize(bx[b], bf, BK);
+            }
+            static const int widths[3] = {1, 4, 8};
+            for (int wi = 0; wi < 3; ++wi) {
+                for (int r = 0; r < REPS; ++r) {
+                    const double t0 = now_ms();
+                    mynah_qmat_dots_i8(bw, BR, BK, brs, (const void *const *)bx,
+                                       (size_t)widths[wi], bo, BR);
+                    t[r] = now_ms() - t0;
+                }
+                char name[48];
+                snprintf(name, sizeof name, "int8 dots 64MiB B=%d", widths[wi]);
+                report(name, median(t, REPS), (double)BR * BK, k_i8);
+            }
+        }
+        for (int b = 0; b < BB; ++b) free(bx[b]);
+        free(bw); free(bf); free(bsc); free(brs); free(bo);
+    }
+
     for (int r = 0; r < REPS; ++r) {
         const double t0 = now_ms();
         mynah_qmat_matvec_bf16(y, x, wbf, bias, FFN, HID);
