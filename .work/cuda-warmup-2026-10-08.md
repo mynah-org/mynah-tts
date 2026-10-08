@@ -117,3 +117,60 @@ captures no graphs, or does not finish at all (2048 on 24 GB, 4096 on 48 GB).
 - The remaining linear cost is per-set creation at admission (~35-40 ms/set);
   pre-creating sets off the scheduler thread would cut the 1024-row walk further.
 - Re-measure the L40S `ROW_CAP=4096` 6L case with `MYNAH_CUDA_STARTUP_WALK=1`.
+
+## Follow-up: the cold-burst gap closed, bucket walk default on (branch `perf-warmup2`)
+
+Same box and method. Cold burst = fresh server, C320 closed loop for 30 s from the
+moment /health answers (`WARM=0`), `/metrics` snapshot at ready and after
+(`.work/l4-2026-10-08/jobs/cold.sh`, same ladder flags as `knee_closed.sh`).
+
+### Cause
+
+Not graphs: `MYNAH_CUDA_GRAPH_TRACE=1` after ready showed 74 captures (bucket walk)
+vs 93 (full-width walk), all under 3 ms. The `[CTX]` admission counters
+(`MYNAH_SERVE_PROFILE=1`) did show it: with the bucket walk the first 640 served
+admissions were all "fallback" (malloc 9259 -> 14739, free 8 -> 5447, ~8 device
+allocations and frees each) and only then became zero-call; with the full-width
+walk they were zero-call from the first. The walk and the prefill capped their
+requests with `max_steps` (4..36 and 2), and the per-request buffers (latents,
+codec positions, `pocket_ctx_sizes_of`) are sized from `max_steps` at admission,
+so every parked set was too small for a served request. The full-width walk's
+caps went up to 644 and its prefill ran with the default.
+
+Fix 1: the walk's requests keep the default `max_steps` and are stopped by
+cancellation instead (`synth_job.stop_after`, checked in `sink_cancelled`; the
+driver polls every 4 steps, so the walk takes ~150 steps at 320 rows, 2.7 s).
+Result: zero-call admissions from the start, TTFA p95 693 ms (= base 688), but
+gap p95 still ~395 ms and 14 stalls, all on the requests sent ~1.9 s in: one
+global ~0.4 s step (the profile's B309 worst 373 ms) about 2 s into the burst,
+when the new requests had only one frame buffered. VRAM timeline flat around it
+(no allocation). A two-step prefill (no audio decoded) and a one-word prefill
+run to its end both kept it; the prefill sentence run to its end (~75 steps,
+as the full-width path always did) removed it.
+
+Fix 2: the slot-pool prefill runs to the end in both modes (11 s at 320 rows).
+
+### Gates (24L, ROW_CAP 384, `--max-batch 320` unless noted)
+
+| gate | base (`=0`, full-width walk) | bucket walk (now default) |
+|---|---|---|
+| identity, CLI `--batch 32` / `--stream` / server C1 (`--max-batch 16`) | reference | 32/32, 32/32, 95/95 identical |
+| time to ready, VRAM at ready | 57.5 s, 16.0 GB | 15.7 s, 11.1 GB (walk 2.7 s, prefill 11.2 s) |
+| first 30 s of a C320 burst at ready: aps / RTF p95 / TTFA p95 / gap p95 / stalls@250 | 398 / 0.759 / 688 ms / 122 ms / 0; 396 / 0.763 / 680 / 122 / 0 | 391 / 0.772 / 683 ms / 124 ms / 0; 389 / 0.777 / 628 / 125 / 0 |
+| C320 2-min steady state: aps / RTF p95 / TTFA p95 / gap p95 | 377 / 0.786 / 123 / 126; 368 / 0.810 / 127 / 130 | 378 / 0.783 / 124 / 126 |
+
+Intermediate (not shipped): fix 1 with a two-step prefill: ready 5.2 s, first
+30 s 399 / 0.757 / 693 / 397 / 14 stalls; steady 368 / 0.807 and 374 / 0.791.
+Steady-state differences between all arms are run-to-run noise (base itself
+377 vs 368).
+
+Not re-measured: `ROW_CAP=1024` (the first opt-in version went 210 -> 54 s; the
+full-length prefill adds roughly what it costs at 1024 rows, 30-40 s by the
+earlier numbers) and the 6L pack.
+
+Decision: `MYNAH_CUDA_STARTUP_WALK` default on; `=0` restores the full-width walk.
+
+Open: what the prefill run to its end warms that the 2 s step needs (not
+graphs, not allocation; a one-word text run to its end does not do it). A
+shorter prefill that still covers it would take the 320-row start-up from
+16 s to ~5 s.
