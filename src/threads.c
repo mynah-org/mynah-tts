@@ -63,14 +63,21 @@
  * server/prefork.c's cgroup_cpu_budget() describes the same hazard for W*T.
  *
  * Returns the quota rounded UP (2.5 cpus lets 3 threads run part of the time),
- * or 0 when no finite quota is in force or nothing can be read.  The root
- * honours MYNAH_CGROUP_ROOT like server/prefork.c, so the parser can be pointed
- * at a fabricated tree.  Only the DEFAULT is capped: MYNAH_THREADS still wins,
- * and the pool width never changes a result (every pool reduction is
- * width-independent by construction, see src/sgemm.c and src/qmat.c). */
+ * or 0 when no finite quota is in force or nothing can be read.  Only the
+ * DEFAULT is capped: MYNAH_THREADS still wins, and the pool width never
+ * changes a result (every pool reduction is width-independent by
+ * construction, see src/sgemm.c and src/qmat.c).
+ *
+ * The root is fixed at build time (-DMYNAH_CGROUP_ROOT=... points the parser
+ * at a fabricated tree), NOT read from the environment: the width derived
+ * here is reported by the server's /health, and a value computed from a file
+ * whose path an environment variable chose is system data flowing to an HTTP
+ * client (CodeQL cpp/system-data-exposure). */
+#ifndef MYNAH_CGROUP_ROOT
+#define MYNAH_CGROUP_ROOT "/sys/fs/cgroup"
+#endif
 static long cgroup_quota_cpus(void) {
-    const char *root = getenv("MYNAH_CGROUP_ROOT");
-    if (root == NULL || root[0] == '\0') root = "/sys/fs/cgroup";
+    const char *root = MYNAH_CGROUP_ROOT;
     char path[512];
     double cpus = 0.0;
     snprintf(path, sizeof path, "%s/cpu.max", root);
