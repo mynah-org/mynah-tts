@@ -2968,11 +2968,56 @@ static void matvec_bf16_dpbf16_x1(float *out, const float *x,
 }
 
 /* The same saving for the widening kernel, which pays the same four-for-one. */
+/* One activation, FOUR ROWS AT A TIME.  One row is one FMA chain over k, and
+ * a chain on its own issues one FMA per FMA latency (five cycles on Zen 2):
+ * the 6-layer backbone's decode step ran at a fifth of the FMA rate here.
+ * Four rows are four independent chains, and the activation's bf16 rounding
+ * is done once per chunk instead of once per row.  Each row's chain, sum and
+ * tail are unchanged, so it is still bit for bit lane 0 of the x4 kernel.
+ * MYNAH_QMAT_BF16_ROWS=1 restores the one-row walk for an A/B. */
+static int qmat_bf16_rows4(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYNAH_QMAT_BF16_ROWS");
+        cached = (e != NULL && strcmp(e, "1") == 0) ? 0 : 1;
+    }
+    return cached;
+}
+
 __attribute__((target("avx2,fma")))
 static void matvec_bf16_avx2_x1(float *out, const float *x,
                                 const uint16_t *weights, const float *bias,
                                 size_t rows, size_t cols) {
-    for (size_t row = 0; row < rows; ++row) {
+    size_t row = 0;
+    if (qmat_bf16_rows4()) {
+        for (; row + 4u <= rows; row += 4u) {
+            const uint16_t *w0 = weights + row * cols;
+            const uint16_t *w1 = w0 + cols;
+            const uint16_t *w2 = w1 + cols;
+            const uint16_t *w3 = w2 + cols;
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+            size_t j = 0;
+            for (; j + 8u <= cols; j += 8u) {
+                const __m256 xr = qmat_bf16_round_ps(_mm256_loadu_ps(x + j));
+                a0 = _mm256_fmadd_ps(qmat_bf16_widen(w0 + j), xr, a0);
+                a1 = _mm256_fmadd_ps(qmat_bf16_widen(w1 + j), xr, a1);
+                a2 = _mm256_fmadd_ps(qmat_bf16_widen(w2 + j), xr, a2);
+                a3 = _mm256_fmadd_ps(qmat_bf16_widen(w3 + j), xr, a3);
+            }
+            float s[4] = {qmat_bf16_hsum(a0), qmat_bf16_hsum(a1),
+                          qmat_bf16_hsum(a2), qmat_bf16_hsum(a3)};
+            const uint16_t *wr[4] = {w0, w1, w2, w3};
+            for (size_t r = 0; r < 4u; ++r) {
+                float sr = s[r];
+                for (size_t jj = j; jj < cols; ++jj)
+                    sr += qmat_bf16_to_f32(wr[r][jj]) *
+                          qmat_bf16_to_f32(qmat_bf16_from_f32(x[jj]));
+                out[row + r] = sr + (bias == NULL ? 0.0f : bias[row + r]);
+            }
+        }
+    }
+    for (; row < rows; ++row) {
         const uint16_t *w = weights + row * cols;
         __m256 a0 = _mm256_setzero_ps();
         size_t j = 0;
