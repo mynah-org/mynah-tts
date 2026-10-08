@@ -941,9 +941,9 @@ static void collect_pool(row_sink *s) {
     snprintf(buf, sizeof buf, "%d", threads);
     add_row(s, "pool.threads", "yes", "-", "MYNAH_THREADS", buf,
             MYNAH_DISPATCH_SRC_RUNTIME,
-            "[runtime] mynah_num_threads(); default is hw.perflevel0.logicalcpu "
-            "on Apple Silicon (decode is DRAM-bound, E-cores lengthen the "
-            "barrier) and the online CPU count elsewhere");
+            "[runtime] mynah_num_threads(); default is the P-core count on "
+            "Apple Silicon (E-cores lengthen the barrier), else the affinity "
+            "mask capped by a cgroup cpu quota if one is set");
 
 #if defined(__APPLE__)
     {
