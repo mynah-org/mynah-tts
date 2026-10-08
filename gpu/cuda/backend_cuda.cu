@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <type_traits>
 #include <algorithm>
 #include <atomic>
@@ -1183,7 +1184,24 @@ struct cuda_pipeline_graph_entry {
     cudaGraphExec_t exec;
     bool valid;
     bool capturing;
+    double begin_ms; /* MYNAH_CUDA_GRAPH_TRACE: when the capture began */
 };
+
+/* MYNAH_CUDA_GRAPH_TRACE (diagnostic, off): one stderr line per pipeline graph
+ * capture with its key, identity, record and instantiate times. */
+static bool cuda_graph_trace_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("MYNAH_CUDA_GRAPH_TRACE");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+static double cuda_trace_now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
 
 /* A batched decoder graph owns its pointer metadata.  The eager decoder batch
  * path reuses four backend-wide device tables and fills them from small stack
@@ -12209,6 +12227,7 @@ extern "C" int mynah_cuda_graph_begin(void *opaque, size_t key,
     created.identity = identity;
     created.valid = false;
     created.capturing = true;
+    created.begin_ms = cuda_graph_trace_enabled() ? cuda_trace_now_ms() : 0.0;
     st->pipeline_graphs.push_back(created);
     return 0;
 }
@@ -12231,8 +12250,18 @@ extern "C" int mynah_cuda_graph_end(void *opaque, size_t key,
         return 1;
     }
     cudaGraphExec_t exec = nullptr;
+    const double recorded_ms =
+        cuda_graph_trace_enabled() ? cuda_trace_now_ms() : 0.0;
     const cudaError_t instantiate_status =
         cudaGraphInstantiate(&exec, graph, 0);
+    if (cuda_graph_trace_enabled()) {
+        const double done_ms = cuda_trace_now_ms();
+        std::fprintf(stderr,
+                     "mynah-tts: graph capture key 0x%zx identity %p: record %.2f ms, "
+                     "instantiate %.2f ms, %zu pipeline graphs\n",
+                     key, identity, recorded_ms - entry->begin_ms,
+                     done_ms - recorded_ms, st->pipeline_graphs.size());
+    }
     if (instantiate_status != cudaSuccess || exec == nullptr) {
         cudaGraphDestroy(graph);
         if (instantiate_status != cudaSuccess) ce(instantiate_status, e, ec);
