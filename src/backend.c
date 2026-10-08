@@ -1389,6 +1389,88 @@ void mynah_backend_sync_profile(double *wait_seconds, unsigned long long *calls)
         *calls = atomic_load_explicit(&g_sync_calls, memory_order_relaxed);
 }
 
+/* ---- MYNAH_SERVE_PROFILE=2: per-phase host breakdown (backend.h) -------- */
+
+static int g_hostprof = -1;   /* -1: not read yet */
+static _Thread_local int tl_hostprof_bound;
+static struct {
+    double t0, w0;             /* open interval */
+    int open;
+    unsigned long long calls, rows;
+    double wall, wait;
+} g_hp[MYNAH_HP_PHASES];
+
+static const char *const g_hp_name[MYNAH_HP_PHASES] = {
+    "admit", "cancel", "dec_collect", "  deliver", "prefill", "select", "step",
+    "  step_batch", "  emit", "  gang", "    dec_submit", "  dec_land", "  post_step",
+    "launch", "retire", "  ctx_free", "  on_done",
+    "x.pre_prologue", "x.pre_tile", "x.ds_upsample", "x.ds_prepare", "x.ds_codec",
+    "x.ds_decoder", "x.ds_gather", "x.os_rows", "x.os_backbone", "x.os_flow",
+    "x.os_finish", "x.pt_voice", "x.pt_h2d", "x.pt_call", "x.mt_pre", "x.mt_call",
+    "x.mt_post", "x.cf_device", "x.cf_host",
+};
+
+int mynah_hostprof_enabled(void) {
+    if (g_hostprof < 0) {
+        const char *e = getenv("MYNAH_SERVE_PROFILE");
+        g_hostprof = e != NULL && atoi(e) >= 2;
+    }
+    return g_hostprof;
+}
+
+void mynah_hostprof_bind(void) {
+    tl_hostprof_bound = mynah_hostprof_enabled();
+}
+
+void mynah_hostprof_reset(void) {
+    memset(g_hp, 0, sizeof(g_hp));
+}
+
+/* Fence waits (mynah_backend_fence_wait), profile level 2 only. */
+static _Atomic unsigned long long g_fence_wait_ns;
+
+static double hostprof_wait_now(void) {
+    return 1e-9 * (double)(atomic_load_explicit(&g_sync_wait_ns, memory_order_relaxed) +
+                           atomic_load_explicit(&g_fence_wait_ns, memory_order_relaxed));
+}
+
+void mynah_hostprof_begin(int phase) {
+    if (!tl_hostprof_bound || phase < 0 || phase >= MYNAH_HP_PHASES) return;
+    g_hp[phase].t0 = mynah_phase_seconds();
+    g_hp[phase].w0 = hostprof_wait_now();
+    g_hp[phase].open = 1;
+}
+
+void mynah_hostprof_end(int phase, size_t rows) {
+    if (!tl_hostprof_bound || phase < 0 || phase >= MYNAH_HP_PHASES ||
+        !g_hp[phase].open) return;
+    g_hp[phase].open = 0;
+    g_hp[phase].wall += mynah_phase_seconds() - g_hp[phase].t0;
+    g_hp[phase].wait += hostprof_wait_now() - g_hp[phase].w0;
+    g_hp[phase].calls++;
+    g_hp[phase].rows += rows;
+}
+
+void mynah_hostprof_print(FILE *out, unsigned long long iterations) {
+    if (!mynah_hostprof_enabled() || iterations == 0ull) return;
+    const double per = 1e3 / (double)iterations;
+    fprintf(out, "[HOSTP] per-phase host profile over %llu iterations (ms per iteration; "
+                 "host = wall - device wait (syncs and fence waits); indented rows are "
+                 "inside the row above)\n",
+            iterations);
+    fprintf(out, "[HOSTP]   %-14s %8s %9s %9s %9s %9s %10s\n", "phase", "calls/it",
+            "wall", "dev wait", "host", "rows/it", "host us/row");
+    for (int p = 0; p < MYNAH_HP_PHASES; ++p) {
+        if (g_hp[p].calls == 0ull) continue;
+        const double host = g_hp[p].wall - g_hp[p].wait;
+        fprintf(out, "[HOSTP]   %-14s %8.2f %9.3f %9.3f %9.3f %9.1f %10.3f\n",
+                g_hp_name[p], (double)g_hp[p].calls / (double)iterations,
+                g_hp[p].wall * per, g_hp[p].wait * per, host * per,
+                (double)g_hp[p].rows / (double)iterations,
+                g_hp[p].rows ? 1e6 * host / (double)g_hp[p].rows : 0.0);
+    }
+}
+
 int mynah_backend_batch_begin(const mynah_backend *backend,
                               char *error, size_t error_capacity) {
     if (backend == NULL) return -1;
@@ -1456,7 +1538,15 @@ void *mynah_backend_fence_record(const mynah_backend *backend) {
 void mynah_backend_fence_wait(const mynah_backend *backend, void *fence) {
     if (backend != NULL && backend->fence_wait != NULL && fence != NULL) {
         const double t0 = call_meter_begin();
+        /* MYNAH_SERVE_PROFILE=2: a fence wait is device time too (the
+         * per-phase host profile subtracts it; the sync totals do not). */
+        const double h0 = mynah_hostprof_enabled() ? mynah_phase_seconds() : 0.0;
         backend->fence_wait(backend->state, fence);
+        if (h0 != 0.0)
+            atomic_fetch_add_explicit(
+                &g_fence_wait_ns,
+                (unsigned long long)((mynah_phase_seconds() - h0) * 1e9),
+                memory_order_relaxed);
         call_meter_end(MYNAH_BACKEND_CALL_EVENT, t0);
     }
 }

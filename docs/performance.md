@@ -1002,6 +1002,57 @@ texts (ASR gate), nothing on single-chunk texts. Detail, including the failed
 experiments: `.work/pocket-tts-24l-cpu-serving-axion.md`; profiles
 `configs/perf/axion-c4a-32c-pocket-en.json` and `-24l.json`.
 
+## 2026-10-08 · PocketTTS on x86 AVX2 without VNNI — AMD EPYC 7702, ~24 vCPUs
+
+The first x86 serving figures for Pocket. A Vast.ai container on an AMD EPYC
+7702 (Zen 2): AVX2, FMA and F16C, **no AVX-512, no VNNI, no bf16 dot** — the
+cheapest x86 server class to rent. 128 threads are visible, but the cgroup
+`cpu.max` quota is 24.6 CPUs (SMT threads, so about 12 physical cores), and
+the engine's default thread count now follows that quota. gcc 13.3,
+`SIMD=auto`, `BLAS=none`. Detail, profiles and every screen:
+`.work/x86-avx2-2026-10-08.md`.
+
+What changed in the x86 kernels (all byte-identical audio, all on by default,
+each with an env or build rollback: `MYNAH_SEANET_PRETAPS=0`,
+`MYNAH_ATTN_WSUM=0`, `MYNAH_ATTN_SCORES=0`, `MYNAH_QMAT_AVX2_INT8=widen`,
+`MYNAH_QMAT_BF16_ROWS=1`, `-DMYNAH_SGEMM_AVX2_MR=4`):
+
+- an exact AVX2 int8 dot (sign trick: `VPSIGNB` + `VPMADDUBSW`, which cannot
+  saturate) that reads each weight row once for up to 8 activations: a 64 MiB
+  matrix at B=8 goes from 38.3 to 13.1 ms, and the 24L backbone step from
+  `8.2 + 9.9·B` to `8.5 + 5.8·B` ms — the same per-slot cost as Axion's;
+- a 6x16 FMA micro-kernel tile in `sgemm` (16x1024x1024: 0.95 -> 0.63 ms);
+- codec conv weights laid out once instead of every frame, and a row-split
+  plan for the fused conv taps (conv stack 6.2 -> 4.1 ms per frame);
+- attention scores four keys in flight and the value pass in registers;
+- a four-row bf16 single-activation kernel (6L RTF -9%).
+
+CLI, one request, 2 threads: 24L RTF 0.435 -> 0.311 (-28%), 6L 0.286 -> 0.210
+(-27%). Streaming server (`tools/serving_profile.py --mode soak`, mixed v2
+bank, **2-3 minute screens, not 30-minute soaks**), base vs this branch:
+
+| pack | topology | knee before | knee after | audio-s/s at the knee | STREAM_RTF p95 | TTFA p95 |
+|---|---|---|---|---|---|---|
+| 24L | 6 x 4, `--max-batch 8` | C12 | **C24** | 15.1 -> 22.6 | 0.793 | 380 ms |
+| 6L | 11 x 2, `--max-batch 8` | C28 (C36 fails one screen in two) | **C36** at the edge (2 of 3 screens pass) | 33.9 -> 42.4 at C36 | 0.745 | 267 ms |
+| 6L, int8 backbone (opt-in, changes audio) | 11 x 2 | — | **C56** | 61.1 | 0.805 | 186 ms |
+
+No request failed at any level. A last check of the merged branch (same
+commands) gave 24L C24 at STREAM_RTF p95 0.786 with 0 stalls, missing only the
+drift tolerance by 0.001, and 6L C36 at 0.735 with 12 of 1436 requests over
+500 ms: on this shared host a 2-minute level at the knee is close to a coin
+toss, so read C24 and C36 as the knees and one step below as the safe point. Under load the 24L backbone runs ~1.8x slower
+than in the CLI: it is bound by weight traffic across workers on a host shared
+with other tenants, which is why fewer, wider workers (6 x 4) beat 11 x 2.
+On the 6L the codec is half of a worker's time. The int8 6L backbone is the
+obvious policy for hosts with no native bf16 dot, once it passes the ASR gate.
+
+Against Axion (32 Neoverse-V2 cores, 30-minute soaks: 24L C88, 6L C164), this
+slice reaches roughly a quarter (24L) to a third (6L) of an Axion core per CPU
+— a gap that is mostly I8MM/BFMMLA against AVX2's widening multiply-adds. Hosts
+with AVX512-VNNI or AVX512-BF16 already take the `VPDPBUSD` / `VDPBF16PS`
+kernels automatically; they have not been served yet.
+
 ## 2026-09-28 · PocketTTS 24L on CUDA — one NVIDIA L4, C160 qualified
 
 Build f873125 (sources hashed in the bundle), `mynah-tts-server --device cuda`,

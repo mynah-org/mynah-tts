@@ -199,6 +199,11 @@ int mynah_tts_model_warm(mynah_tts_model *model, char *error,
  * next admission after each call (MYNAH_CUDA_SLOT_FIXED); everything else
  * ignores it, and a caller that never calls it keeps the load-time plan. */
 void mynah_tts_startup_mark(int serving);
+/* The CUDA step widths a batched Pocket step runs at (MYNAH_CUDA_WIDTH_BUCKETS),
+ * ascending, at most `capacity` of them copied to `out`. Returns how many there
+ * are; 0 means exact widths (buckets off). Process-wide; a server uses it to
+ * plan a start-up walk that visits each bucket once. */
+size_t mynah_tts_width_buckets(size_t *out, size_t capacity);
 int mynah_tts_model_get_info(const mynah_tts_model *model,
                              mynah_tts_model_info *info);
 int mynah_tts_model_get_backend_metrics(const mynah_tts_model *model,

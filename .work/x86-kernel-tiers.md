@@ -17,7 +17,8 @@ After the f32 runtime dispatch landed (E4-9), x86 reaches exactly three tiers:
 Two gaps, and both matter for exactly the hosts an EC2 matrix would choose
 between:
 
-1. **AVX-512 without VNNI** — Skylake-SP, Cascade Lake, Zen 3. They have 512-bit
+1. **AVX-512 without VNNI** — Skylake-SP and Skylake-X (Cascade Lake already has
+   AVX512-VNNI; Zen 2 and Zen 3 have no AVX-512 at all). They have 512-bit
    registers and no VPDPBUSD, so today they run the 256-bit AVX2 int8 dot and
    half the register file idles. This is the brief's X2 question, unanswered in
    code.

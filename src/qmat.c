@@ -71,7 +71,7 @@
 #define MYNAH_QMAT_X86_VNNI 1
 /* E14-2/E14-3. The same condition, named separately because it gates a
  * different pair of instructions: the AVX-512BW int8 dot for hosts that have
- * 512-bit registers and NO VPDPBUSD (Skylake-SP, Cascade Lake, Zen 3), and
+ * 512-bit registers and NO VPDPBUSD (Skylake-SP, Skylake-X), and
  * VDPBF16PS for the ones that have AVX512-BF16. Both are reached the same way
  * as VNNI -- target attribute on the kernel, CPUID at runtime -- so neither
  * needs a build flag and neither can SIGILL a host that lacks it. */
@@ -1151,7 +1151,7 @@ static void dot4_u8_i32(const uint8_t *xu, const int8_t *w, size_t cols,
 #if defined(MYNAH_QMAT_X86_AVX512)
 /* E14-2.  THE TIER BETWEEN AVX2 AND VNNI, WHICH HAD NO KERNEL.
  *
- * Skylake-SP, Cascade Lake and Zen 3 have 512-bit registers and no VPDPBUSD.
+ * Skylake-SP and Skylake-X have 512-bit registers and no VPDPBUSD.
  * Until now they ran the 256-bit AVX2 dot below and half the register file sat
  * idle -- the brief's "AVX-512 without VNNI" question, unanswered in code.
  *
@@ -1237,6 +1237,201 @@ static int32_t dot_q8_i32_avx2(const int8_t *qx, const int8_t *w, size_t k) {
     for (; j < k; ++j) result += (int32_t)qx[j] * (int32_t)w[j];
     return result;
 }
+
+/* ------------------------------------------- AVX2 int8 without a dot unit
+ *
+ * THE x86 HOSTS THAT ARE CHEAPEST TO RENT HAVE NO VPDPBUSD.  Zen 2 / Zen 3
+ * EPYC and every pre-Ice-Lake Xeon stop at AVX2 + FMA, so on them every int8
+ * weight in the backbone, the codec transformer and (when asked) the codec
+ * conv taps went through dot_q8_i32_avx2 above: per 16 multiply-adds, TWO
+ * loads and TWO widening shuffles (the activation is re-widened for every
+ * weight row, four times per quad) plus a madd, an add, and a full horizontal
+ * reduction per row.  Measured on an EPYC 7702 that kernel ran the 24-layer
+ * backbone at ~16 GB/s of int8 weights per two cores -- far from both the
+ * DRAM roof and the multiplier roof.
+ *
+ * VPMADDUBSW multiplies u8 by s8 and adds adjacent pairs into s16, 32 MACs
+ * per instruction.  The u8 operand is the obstacle for a signed activation,
+ * and the classical answer (llama.cpp's mul_sum_i8_pairs) is to move the sign
+ * across: x*w == |x| * (w * sign(x)), and VPSIGNB computes `w * sign(x)` --
+ * including the zero -- in one instruction.  So per 32 MACs and per weight
+ * row: one load, VPSIGNB, VPMADDUBSW, VPMADDWD by ones (s16 pairs -> s32), and
+ * one add.  |x| is computed once per activation chunk and shared by every row.
+ *
+ * EXACT, NOT APPROXIMATE, and the argument is two bounds:
+ *   - VPMADDUBSW saturates its s16 pair sum.  Both operands here lie in
+ *     [-127, 127] -- quantize_weight_int8 rounds v = w/scale with |v| <= 127,
+ *     and quantize_act_int8 clamps to +-127 -- so a pair sums to at most
+ *     2 * 127 * 127 = 32258 < 32767.  Nothing saturates.
+ *   - VPSIGNB on -128 would wrap; -128 never occurs, by the same two clamps.
+ * Every product and every sum is therefore the exact integer the scalar loop
+ * computes, the int32 reduction is order-free, and the result is
+ * BIT-IDENTICAL to dot_q8_i32_avx2 and to the scalar reference -- not within a
+ * tolerance.  self_test_avx2_sign_identity() asserts it with == at the edge
+ * values (+-127, 0) and at k tails that exercise the 16-wide and scalar ends.
+ *
+ * HOW THE ROWS ARE WALKED was measured, not guessed, and the answer was the
+ * opposite of the ARM one.  A single activation (B = 1, the latency path) and
+ * a decode batch of up to eight live slots both walk ONE weight row at a time
+ * -- one sequential DRAM stream per thread -- and the four-row quad, which
+ * shares |x| across rows, lost to it on Zen 2 at B = 1 (RTF 0.428 vs 0.382 on
+ * the 24-layer pack) and at B = 4 (-17% step).  Above eight activations -- the
+ * codec transformer's sixteen-row frame tile -- the quad wins and is kept.
+ *
+ * MYNAH_QMAT_AVX2_INT8=widen restores the old widen-then-madd kernel and
+ * =quad the row quad at every width, each for an A/B in one command; there is
+ * no numerical reason to, since the int32 is the same. */
+static int qmat_avx2_int8_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYNAH_QMAT_AVX2_INT8");
+        if (e != NULL && (strcmp(e, "widen") == 0 || strcmp(e, "0") == 0))
+            cached = 0;
+        else if (e != NULL && strcmp(e, "quad") == 0)
+            cached = 1;   /* the row quad at every width */
+        else
+            cached = 2;   /* one row per stream up to 8 activations */
+    }
+    return cached;
+}
+static int qmat_avx2_sign_enabled(void) { return qmat_avx2_int8_mode() != 0; }
+
+static inline int32_t q8s_hsum(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
+                              _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(s);
+}
+
+/* One weight row against one activation chunk: |x| * (w * sign(x)). */
+#define Q8S_STEP(acc, ax, x, wp)                                              \
+    (acc) = _mm256_add_epi32(                                                 \
+        (acc), _mm256_madd_epi16(                                             \
+                   _mm256_maddubs_epi16(                                      \
+                       (ax), _mm256_sign_epi8(                                \
+                                 _mm256_loadu_si256((const __m256i *)(wp)),   \
+                                 (x))),                                       \
+                   ones))
+#define Q8S_STEP128(acc, ax, x, wp)                                           \
+    (acc) = _mm_add_epi32(                                                    \
+        (acc), _mm_madd_epi16(                                                \
+                   _mm_maddubs_epi16(                                         \
+                       (ax), _mm_sign_epi8(                                   \
+                                 _mm_loadu_si128((const __m128i *)(wp)),      \
+                                 (x))),                                       \
+                   _mm256_castsi256_si128(ones)))
+
+static int32_t dot_q8_i32_avx2s(const int8_t *qx, const int8_t *w, size_t k) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
+    size_t j = 0;
+    for (; j + 64u <= k; j += 64u) {
+        const __m256i x0 = _mm256_loadu_si256((const __m256i *)(qx + j));
+        const __m256i x1 = _mm256_loadu_si256((const __m256i *)(qx + j + 32u));
+        Q8S_STEP(a0, _mm256_abs_epi8(x0), x0, w + j);
+        Q8S_STEP(a1, _mm256_abs_epi8(x1), x1, w + j + 32u);
+    }
+    for (; j + 32u <= k; j += 32u) {
+        const __m256i x0 = _mm256_loadu_si256((const __m256i *)(qx + j));
+        Q8S_STEP(a0, _mm256_abs_epi8(x0), x0, w + j);
+    }
+    int32_t s = q8s_hsum(_mm256_add_epi32(a0, a1));
+    if (j + 16u <= k) {
+        const __m128i x0 = _mm_loadu_si128((const __m128i *)(qx + j));
+        __m128i t = _mm_setzero_si128();
+        Q8S_STEP128(t, _mm_abs_epi8(x0), x0, w + j);
+        t = _mm_add_epi32(t, _mm_shuffle_epi32(t, _MM_SHUFFLE(1, 0, 3, 2)));
+        t = _mm_add_epi32(t, _mm_shuffle_epi32(t, _MM_SHUFFLE(2, 3, 0, 1)));
+        s += _mm_cvtsi128_si32(t);
+        j += 16u;
+    }
+    for (; j < k; ++j) s += (int32_t)qx[j] * (int32_t)w[j];
+    return s;
+}
+
+/* Four weight rows, one activation: |x| and the activation chunk are loaded
+ * once and feed four independent accumulator chains -- the shape matvec_q8's
+ * SDOT quad has on ARM, which the AVX2 quad never had (it called the
+ * one-row kernel four times). */
+static void dot4_q8_i32_avx2s(const int8_t *qx, const int8_t *w0,
+                              const int8_t *w1, const int8_t *w2,
+                              const int8_t *w3, size_t k, int32_t out[4]) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
+    __m256i a2 = _mm256_setzero_si256(), a3 = _mm256_setzero_si256();
+    size_t j = 0;
+    for (; j + 32u <= k; j += 32u) {
+        const __m256i x = _mm256_loadu_si256((const __m256i *)(qx + j));
+        const __m256i ax = _mm256_abs_epi8(x);
+        Q8S_STEP(a0, ax, x, w0 + j);
+        Q8S_STEP(a1, ax, x, w1 + j);
+        Q8S_STEP(a2, ax, x, w2 + j);
+        Q8S_STEP(a3, ax, x, w3 + j);
+    }
+    int32_t s0 = q8s_hsum(a0), s1 = q8s_hsum(a1);
+    int32_t s2 = q8s_hsum(a2), s3 = q8s_hsum(a3);
+    for (; j < k; ++j) {
+        const int32_t x = qx[j];
+        s0 += (int32_t)w0[j] * x;
+        s1 += (int32_t)w1[j] * x;
+        s2 += (int32_t)w2[j] * x;
+        s3 += (int32_t)w3[j] * x;
+    }
+    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+}
+
+/* One weight row against up to eight activations: the weight chunk is loaded
+ * once per step and the row is walked as ONE sequential stream, with an
+ * accumulator per activation.  This is the decode step's shape -- a handful of
+ * live slots per worker -- and on Zen 2 it measured faster than the row quad
+ * there, because the quad walks four DRAM streams at once and this walks one.
+ * Exact int32, like every kernel here. */
+#define Q8S_ACT(acc, xp)                                                      \
+    do {                                                                      \
+        const __m256i x_ = _mm256_loadu_si256((const __m256i *)((xp) + j));   \
+        (acc) = _mm256_add_epi32(                                             \
+            (acc), _mm256_madd_epi16(                                         \
+                       _mm256_maddubs_epi16(_mm256_abs_epi8(x_),              \
+                                            _mm256_sign_epi8(wv, x_)),        \
+                       ones));                                                \
+    } while (0)
+
+static void dot1xn_q8_i32_avx2s(const int8_t *const *xs, size_t nx,
+                                const int8_t *w, size_t k, int32_t *out) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i acc[8];
+    for (int b = 0; b < 8; ++b) acc[b] = _mm256_setzero_si256();
+    size_t j = 0;
+    if (nx <= 4u) {
+        const int8_t *x0 = xs[0];
+        const int8_t *x1 = xs[nx > 1u ? 1u : 0u];
+        const int8_t *x2 = xs[nx > 2u ? 2u : 0u];
+        const int8_t *x3 = xs[nx > 3u ? 3u : 0u];
+        for (; j + 32u <= k; j += 32u) {
+            const __m256i wv = _mm256_loadu_si256((const __m256i *)(w + j));
+            Q8S_ACT(acc[0], x0); Q8S_ACT(acc[1], x1);
+            Q8S_ACT(acc[2], x2); Q8S_ACT(acc[3], x3);
+        }
+    } else {
+        const int8_t *x[8];
+        for (size_t b = 0; b < 8u; ++b) x[b] = xs[b < nx ? b : 0u];
+        for (; j + 32u <= k; j += 32u) {
+            const __m256i wv = _mm256_loadu_si256((const __m256i *)(w + j));
+            Q8S_ACT(acc[0], x[0]); Q8S_ACT(acc[1], x[1]);
+            Q8S_ACT(acc[2], x[2]); Q8S_ACT(acc[3], x[3]);
+            Q8S_ACT(acc[4], x[4]); Q8S_ACT(acc[5], x[5]);
+            Q8S_ACT(acc[6], x[6]); Q8S_ACT(acc[7], x[7]);
+        }
+    }
+    for (size_t b = 0; b < nx; ++b) {
+        const int8_t *xb = xs[b];
+        int32_t v = q8s_hsum(acc[b]);
+        for (size_t t = j; t < k; ++t) v += (int32_t)w[t] * (int32_t)xb[t];
+        out[b] = v;
+    }
+}
+#undef Q8S_ACT
 #endif
 /* `qa` is int8_t* at QMAT_U8_OFF and uint8_t* (x+128) above it; `rowsum` is
  * this row's cached prefix sum and is read only in the unsigned case. */
@@ -1259,6 +1454,7 @@ static int32_t dot_q8_i32(const void *qa, const int8_t *w, int32_t rowsum,
     if (qmat_int8_avx512bw_ok()) return dot_q8_i32_avx512bw(qx, w, k);
 #endif
 #if defined(MYNAH_QMAT_AVX2)
+    if (qmat_avx2_sign_enabled()) return dot_q8_i32_avx2s(qx, w, k);
     return dot_q8_i32_avx2(qx, w, k);
 #else
     {
@@ -1813,6 +2009,31 @@ void mynah_qmat_dots_i8(const int8_t *w, size_t rows, size_t cols,
         return;
     }
 #endif
+#if defined(MYNAH_QMAT_AVX2)
+    if (qmat_avx2_sign_enabled()) {
+        /* Four weight rows held in L1 across the batch (the codec conv's tap
+         * GEMM is wide in the batch), each pair through the sign-trick quad.
+         * Exact int32, so it is the loop below to the bit. */
+        size_t row = 0;
+        for (; row + 4u <= rows; row += 4u) {
+            const int8_t *w0 = w + row * cols;
+            for (size_t b = 0; b < batch; ++b) {
+                int32_t s4[4];
+                dot4_q8_i32_avx2s((const int8_t *)xq[b], w0, w0 + cols,
+                                  w0 + 2u * cols, w0 + 3u * cols, cols, s4);
+                int32_t *ob = out + b * out_stride + row;
+                ob[0] = s4[0]; ob[1] = s4[1]; ob[2] = s4[2]; ob[3] = s4[3];
+            }
+        }
+        for (; row < rows; ++row) {
+            for (size_t b = 0; b < batch; ++b) {
+                out[b * out_stride + row] = dot_q8_i32(
+                    xq[b], w + row * cols, 0, cols, QMAT_U8_OFF);
+            }
+        }
+        return;
+    }
+#endif
     for (size_t b = 0; b < batch; ++b) {
         const int8_t *xb = (const int8_t *)xq[b];
         int32_t *ob = out + b * out_stride;
@@ -1885,11 +2106,31 @@ static void matvec_q8(float *out, const void *qa, float sx,
                                           bias == NULL ? 0.0f : bias[row + 3u]);
     }
 #elif defined(MYNAH_QMAT_AVX2)
+    /* This quad was always AVX2 (it called dot_q8_i32_avx2 directly, even
+     * where the AVX-512BW one-row tier resolved), so the sign kernels replace
+     * like for like: one row per stream by default, the four-row quad under
+     * MYNAH_QMAT_AVX2_INT8=quad. The int32 is exact either way. */
+    const int sign4 = qmat_avx2_sign_enabled();
     for (; row + 4u <= rows; row += 4u) {
-        const int32_t s0 = dot_q8_i32_avx2(qx, weights + row * cols, cols);
-        const int32_t s1 = dot_q8_i32_avx2(qx, weights + (row + 1u) * cols, cols);
-        const int32_t s2 = dot_q8_i32_avx2(qx, weights + (row + 2u) * cols, cols);
-        const int32_t s3 = dot_q8_i32_avx2(qx, weights + (row + 3u) * cols, cols);
+        int32_t s0, s1, s2, s3;
+        if (sign4 && qmat_avx2_int8_mode() != 1) {
+            const int8_t *w0 = weights + row * cols;
+            s0 = dot_q8_i32_avx2s(qx, w0, cols);
+            s1 = dot_q8_i32_avx2s(qx, w0 + cols, cols);
+            s2 = dot_q8_i32_avx2s(qx, w0 + 2u * cols, cols);
+            s3 = dot_q8_i32_avx2s(qx, w0 + 3u * cols, cols);
+        } else if (sign4) {
+            int32_t q[4];
+            const int8_t *w0 = weights + row * cols;
+            dot4_q8_i32_avx2s(qx, w0, w0 + cols, w0 + 2u * cols,
+                              w0 + 3u * cols, cols, q);
+            s0 = q[0]; s1 = q[1]; s2 = q[2]; s3 = q[3];
+        } else {
+            s0 = dot_q8_i32_avx2(qx, weights + row * cols, cols);
+            s1 = dot_q8_i32_avx2(qx, weights + (row + 1u) * cols, cols);
+            s2 = dot_q8_i32_avx2(qx, weights + (row + 2u) * cols, cols);
+            s3 = dot_q8_i32_avx2(qx, weights + (row + 3u) * cols, cols);
+        }
         out[row] = qmat_row_epilogue(s0, qmat_row_scale(scales[row], sx),
                                      bias == NULL ? 0.0f : bias[row]);
         out[row + 1u] = qmat_row_epilogue(s1, qmat_row_scale(scales[row + 1u], sx),
@@ -2727,11 +2968,56 @@ static void matvec_bf16_dpbf16_x1(float *out, const float *x,
 }
 
 /* The same saving for the widening kernel, which pays the same four-for-one. */
+/* One activation, FOUR ROWS AT A TIME.  One row is one FMA chain over k, and
+ * a chain on its own issues one FMA per FMA latency (five cycles on Zen 2):
+ * the 6-layer backbone's decode step ran at a fifth of the FMA rate here.
+ * Four rows are four independent chains, and the activation's bf16 rounding
+ * is done once per chunk instead of once per row.  Each row's chain, sum and
+ * tail are unchanged, so it is still bit for bit lane 0 of the x4 kernel.
+ * MYNAH_QMAT_BF16_ROWS=1 restores the one-row walk for an A/B. */
+static int qmat_bf16_rows4(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYNAH_QMAT_BF16_ROWS");
+        cached = (e != NULL && strcmp(e, "1") == 0) ? 0 : 1;
+    }
+    return cached;
+}
+
 __attribute__((target("avx2,fma")))
 static void matvec_bf16_avx2_x1(float *out, const float *x,
                                 const uint16_t *weights, const float *bias,
                                 size_t rows, size_t cols) {
-    for (size_t row = 0; row < rows; ++row) {
+    size_t row = 0;
+    if (qmat_bf16_rows4()) {
+        for (; row + 4u <= rows; row += 4u) {
+            const uint16_t *w0 = weights + row * cols;
+            const uint16_t *w1 = w0 + cols;
+            const uint16_t *w2 = w1 + cols;
+            const uint16_t *w3 = w2 + cols;
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+            size_t j = 0;
+            for (; j + 8u <= cols; j += 8u) {
+                const __m256 xr = qmat_bf16_round_ps(_mm256_loadu_ps(x + j));
+                a0 = _mm256_fmadd_ps(qmat_bf16_widen(w0 + j), xr, a0);
+                a1 = _mm256_fmadd_ps(qmat_bf16_widen(w1 + j), xr, a1);
+                a2 = _mm256_fmadd_ps(qmat_bf16_widen(w2 + j), xr, a2);
+                a3 = _mm256_fmadd_ps(qmat_bf16_widen(w3 + j), xr, a3);
+            }
+            float s[4] = {qmat_bf16_hsum(a0), qmat_bf16_hsum(a1),
+                          qmat_bf16_hsum(a2), qmat_bf16_hsum(a3)};
+            const uint16_t *wr[4] = {w0, w1, w2, w3};
+            for (size_t r = 0; r < 4u; ++r) {
+                float sr = s[r];
+                for (size_t jj = j; jj < cols; ++jj)
+                    sr += qmat_bf16_to_f32(wr[r][jj]) *
+                          qmat_bf16_to_f32(qmat_bf16_from_f32(x[jj]));
+                out[row + r] = sr + (bias == NULL ? 0.0f : bias[row + r]);
+            }
+        }
+    }
+    for (; row < rows; ++row) {
         const uint16_t *w = weights + row * cols;
         __m256 a0 = _mm256_setzero_ps();
         size_t j = 0;
@@ -4042,6 +4328,72 @@ static void qmat_batch_rows(const qmat_batch_job *j, size_t row0, size_t count) 
         for (; b < j->batch; ++b) {
             matvec_q8(j->out[b] + row0, qx + b * j->cols, j->sx[b], wb, sc,
                       NULL, bs, count, j->cols, QMAT_U8_OFF);
+        }
+        return;
+    }
+#endif
+#if defined(MYNAH_QMAT_AVX2)
+    /* THE SAME HOLE ON AVX2 WITHOUT VNNI, which the u8 branch at the bottom
+     * of this function cannot reach: it is gated on the unsigned encoding, and
+     * a Zen 2 / Zen 3 / pre-Ice-Lake host never leaves the signed one.  So a
+     * batch of B there walked the activations and re-read each 32-row weight
+     * block B times -- from L2 for a 4096-wide FFN row block, which is 128 KiB.
+     *
+     * Up to eight activations (a decode step's live slots) take one weight
+     * row at a time against all of them -- one load of the row, one DRAM
+     * stream.  Wider batches (the codec transformer's sixteen-row tile) go
+     * row-quad outer, batch inner: four weight rows (2 KiB at k=512) stay in
+     * L1 while every activation passes over them.  Either way every
+     * (row, activation) int32 is exact, so it equals what the single-row path
+     * computes, and the float epilogue is the shared helper.
+     * self_test_lane_widths holds it with memcmp at widths 1..9 against the
+     * row-at-a-time reference. */
+    if (e->qtype == QMAT_INT8 && j->level == QMAT_U8_OFF && j->qx != NULL &&
+        j->batch >= 2u && qmat_avx2_sign_enabled()) {
+        const int8_t *qx = (const int8_t *)j->qx;
+        const int8_t *wb = (const int8_t *)weights + row0 * j->cols;
+        const float *sc = e->scales + row0;
+        const float *bs = (j->bias == NULL) ? NULL : j->bias + row0;
+        size_t row = 0;
+        if (qmat_avx2_int8_mode() == 2 && j->batch <= 8u) {
+            for (; row < count; ++row) {
+                const int8_t *wr = wb + row * j->cols;
+                for (size_t b = 0; b < j->batch; b += 8u) {
+                    const size_t nx = j->batch - b < 8u ? j->batch - b : 8u;
+                    const int8_t *xs[8];
+                    int32_t acc[8];
+                    for (size_t t = 0; t < nx; ++t) xs[t] = qx + (b + t) * j->cols;
+                    dot1xn_q8_i32_avx2s(xs, nx, wr, j->cols, acc);
+                    for (size_t t = 0; t < nx; ++t) {
+                        j->out[b + t][row0 + row] = qmat_row_epilogue(
+                            acc[t], qmat_row_scale(sc[row], j->sx[b + t]),
+                            bs == NULL ? 0.0f : bs[row]);
+                    }
+                }
+            }
+            return;
+        }
+        for (; row + 4u <= count; row += 4u) {
+            const int8_t *w0 = wb + row * j->cols;
+            for (size_t b = 0; b < j->batch; ++b) {
+                int32_t acc[4];
+                dot4_q8_i32_avx2s(qx + b * j->cols, w0, w0 + j->cols,
+                                  w0 + 2u * j->cols, w0 + 3u * j->cols,
+                                  j->cols, acc);
+                float *out = j->out[b] + row0;
+                for (size_t r = 0; r < 4u; ++r) {
+                    out[row + r] = qmat_row_epilogue(
+                        acc[r], qmat_row_scale(sc[row + r], j->sx[b]),
+                        bs == NULL ? 0.0f : bs[row + r]);
+                }
+            }
+        }
+        for (; row < count; ++row) {
+            for (size_t b = 0; b < j->batch; ++b) {
+                j->out[b][row0 + row] = dot_q8(
+                    qx + b * j->cols, j->sx[b], wb + row * j->cols, sc[row], 0,
+                    j->cols, QMAT_U8_OFF, bs == NULL ? 0.0f : bs[row]);
+            }
         }
         return;
     }
@@ -6554,8 +6906,91 @@ done:
     return status;
 }
 
+#if defined(MYNAH_QMAT_AVX2)
+/* The sign-trick int8 kernels against the scalar int32 loop, with ==.
+ *
+ * The exactness argument above dot_q8_i32_avx2s rests on two bounds, so the
+ * inputs sit ON them: every weight and activation value in {-127, -1, 0, 1,
+ * 127} plus a pseudo-random fill, and the all-+-127 rows where a VPMADDUBSW
+ * pair reaches 32258 -- the closest a legal input gets to its saturation.  k
+ * covers the 64/32/16-wide bodies and every scalar tail length. */
+static int self_test_avx2_sign_identity(char *error, size_t error_capacity) {
+    enum { KMAX = 4096 + 37 };
+    static const size_t ks[] = {1, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65,
+                                97, 512, 1024, 1031, 2048, 4096, 4096 + 37};
+    static int8_t x[KMAX], w[4][KMAX];
+    uint32_t seed = 0x9e3779b9u;
+    for (int pattern = 0; pattern < 3; ++pattern) {
+        for (size_t i = 0; i < KMAX; ++i) {
+            for (int r = 0; r < 5; ++r) {
+                seed = seed * 1664525u + 1013904223u;
+                int v;
+                if (pattern == 0) v = (int)((seed >> 9) % 255u) - 127;
+                else if (pattern == 1) {
+                    static const int edge[5] = {-127, -1, 0, 1, 127};
+                    v = edge[(seed >> 11) % 5u];
+                } else {
+                    v = ((seed >> 13) & 1u) ? 127 : -127;
+                }
+                if (r == 4) x[i] = (int8_t)v;
+                else w[r][i] = (int8_t)v;
+            }
+        }
+        for (size_t t = 0; t < sizeof ks / sizeof ks[0]; ++t) {
+            const size_t k = ks[t];
+            int32_t ref[4], quad[4];
+            for (int r = 0; r < 4; ++r) {
+                int32_t s = 0;
+                for (size_t j = 0; j < k; ++j)
+                    s += (int32_t)x[j] * (int32_t)w[r][j];
+                ref[r] = s;
+            }
+            dot4_q8_i32_avx2s(x, w[0], w[1], w[2], w[3], k, quad);
+            /* The one-row kernel at every activation count: x and the four
+             * weight rows serve as eight activations against row w[0]. */
+            {
+                const int8_t *xs[8] = {x, w[1], w[2], w[3], x, w[3], w[2], w[1]};
+                for (size_t nx = 1; nx <= 8u; ++nx) {
+                    int32_t got[8];
+                    dot1xn_q8_i32_avx2s(xs, nx, w[0], k, got);
+                    for (size_t b = 0; b < nx; ++b) {
+                        int32_t want = 0;
+                        for (size_t j = 0; j < k; ++j)
+                            want += (int32_t)xs[b][j] * (int32_t)w[0][j];
+                        if (got[b] != want) {
+                            snprintf(error, error_capacity,
+                                     "AVX2 one-row int8 kernel is not exact: "
+                                     "pattern %d k=%zu nx=%zu lane %zu "
+                                     "want=%d got=%d", pattern, k, nx, b,
+                                     (int)want, (int)got[b]);
+                            return -1;
+                        }
+                    }
+                }
+            }
+            for (int r = 0; r < 4; ++r) {
+                const int32_t one = dot_q8_i32_avx2s(x, w[r], k);
+                const int32_t old = dot_q8_i32_avx2(x, w[r], k);
+                if (one != ref[r] || quad[r] != ref[r] || old != ref[r]) {
+                    snprintf(error, error_capacity,
+                             "AVX2 sign-trick int8 dot is not exact: pattern %d "
+                             "k=%zu row %d ref=%d one=%d quad=%d widen=%d",
+                             pattern, k, r, (int)ref[r], (int)one,
+                             (int)quad[r], (int)old);
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
 int mynah_qmat_self_test(char *error, size_t error_capacity) {
     if (self_test_u8_identity(error, error_capacity) != 0) return -1;
+#if defined(MYNAH_QMAT_AVX2)
+    if (self_test_avx2_sign_identity(error, error_capacity) != 0) return -1;
+#endif
 #if defined(MYNAH_QMAT_ARM_I8MM)
     if (self_test_i8mm_identity(error, error_capacity) != 0) return -1;
 #endif
@@ -6718,9 +7153,17 @@ const char *mynah_qmat_int8_kernel(const char **why) {
 #endif
 #if defined(MYNAH_QMAT_AVX2)
     if (why != NULL)
-        *why = "[predicate] src/qmat.c dot_q8_i32_avx2: no usable VPDPBUSD on "
-               "this CPU, so the int8 dot is the AVX2 widen-then-madd pair "
-               "(_mm256_cvtepi8_epi16 + _mm256_madd_epi16)";
+        *why = qmat_avx2_sign_enabled()
+            ? "[predicate] src/qmat.c dot_q8_i32_avx2s: no usable VPDPBUSD on "
+              "this CPU, so the int8 dot is the AVX2 sign trick "
+              "(_mm256_sign_epi8 + _mm256_maddubs_epi16 + _mm256_madd_epi16, "
+              "32 MACs per step; one row per stream up to 8 activations, row "
+              "quad above). Exact int32; MYNAH_QMAT_AVX2_INT8=widen|quad for "
+              "an A/B"
+            : "[predicate] src/qmat.c dot_q8_i32_avx2: no usable VPDPBUSD on "
+              "this CPU, and MYNAH_QMAT_AVX2_INT8=widen, so the int8 dot is the "
+              "AVX2 widen-then-madd pair (_mm256_cvtepi8_epi16 + "
+              "_mm256_madd_epi16)";
     return "avx2";
 #else
     if (why != NULL)
@@ -7076,7 +7519,7 @@ static int probe_avx512bw_int8(const char **why) {
         qmat_x86_avx512_probe(&bw, &bf);
         *why = on ? "[predicate] src/qmat.c dot_q8_i32_avx512bw: the int8 dot "
                     "for a host with 512-bit registers and NO VPDPBUSD "
-                    "(Skylake-SP, Cascade Lake, Zen 3). Executed against the "
+                    "(Skylake-SP, Skylake-X). Executed against the "
                     "scalar reference in this process and bit-identical"
                   : (bw && qmat_int8_avx512bw_ok()
                         ? "[predicate] the kernel is here and verified, and a "

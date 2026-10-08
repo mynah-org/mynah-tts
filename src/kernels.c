@@ -751,6 +751,73 @@ int mynah_kernels_self_test(char *error, size_t error_capacity) {
         snprintf(error, error_capacity, "empty softmax accepted");
         return -1;
     }
+
+    /* The attention value pass against the loop it replaces, with memcmp:
+     * the claim is byte identity, so a tolerance would test the wrong thing.
+     * Widths cover the 64/32/8 register chunks, a fallback width (12) and the
+     * 128 cap; strides wider than n, as in a multi-head cache row. */
+    {
+        enum { WS_ROWS = 37, WS_STRIDE = 136 };
+        static float src[WS_ROWS * WS_STRIDE], wts[WS_ROWS];
+        static float got[WS_STRIDE], want[WS_STRIDE];
+        static const size_t widths[] = {8, 12, 32, 40, 64, 72, 128};
+        unsigned x = 12345u;
+        for (size_t i = 0; i < (size_t)WS_ROWS * WS_STRIDE; ++i) {
+            x = x * 1664525u + 1013904223u;
+            src[i] = (float)((int)(x >> 9) % 2001 - 1000) * 1.37e-3f;
+        }
+        for (size_t j = 0; j < WS_ROWS; ++j) {
+            x = x * 1664525u + 1013904223u;
+            wts[j] = (float)((x >> 8) % 1000u) * 9.1e-4f;
+        }
+        for (size_t t = 0; t < sizeof widths / sizeof widths[0]; ++t) {
+            const size_t n = widths[t];
+            for (size_t rows = 1; rows <= WS_ROWS; rows += 12) {
+                mynah_attn_wsum_f32(got, src + 3, WS_STRIDE, wts, rows, n);
+                memset(want, 0, n * sizeof(float));
+                for (size_t j = 0; j < rows; ++j)
+                    mynah_axpy_f32(want, src + 3 + j * WS_STRIDE, wts[j], n);
+                if (memcmp(got, want, n * sizeof(float)) != 0) {
+                    snprintf(error, error_capacity,
+                             "attention value pass differs from the axpy loop "
+                             "at n=%zu rows=%zu", n, rows);
+                    return -1;
+                }
+            }
+        }
+    }
+    /* The score pass against the per-key loop.  On x86 the fast form only
+     * resolves after proving itself, so this also catches a proof that would
+     * pass while the kernel disagreed on a shape the proof did not try. */
+    {
+        enum { SC_ROWS = 23, SC_STRIDE = 72 };
+        static float q[SC_STRIDE], keys[SC_ROWS * SC_STRIDE];
+        static float got[SC_ROWS], want[SC_ROWS];
+        unsigned y = 777u;
+        for (size_t i = 0; i < SC_STRIDE; ++i) {
+            y = y * 1664525u + 1013904223u;
+            q[i] = (float)((int)(y >> 9) % 3001 - 1500) * 2.3e-3f;
+        }
+        for (size_t i = 0; i < (size_t)SC_ROWS * SC_STRIDE; ++i) {
+            y = y * 1664525u + 1013904223u;
+            keys[i] = (float)((int)(y >> 9) % 3001 - 1500) * 1.1e-3f;
+        }
+        static const size_t widths[] = {8, 24, 64, 72, 12};
+        for (size_t t = 0; t < sizeof widths / sizeof widths[0]; ++t) {
+            const size_t n = widths[t];
+            for (size_t rows = 1; rows <= SC_ROWS; rows += 5) {
+                mynah_attn_scores_f32(got, q, keys, SC_STRIDE, rows, n, 0.125f);
+                for (size_t j = 0; j < rows; ++j)
+                    want[j] = mynah_dot_f32(q, keys + j * SC_STRIDE, n) * 0.125f;
+                if (memcmp(got, want, rows * sizeof(float)) != 0) {
+                    snprintf(error, error_capacity,
+                             "attention score pass differs from the per-key "
+                             "dot at n=%zu rows=%zu", n, rows);
+                    return -1;
+                }
+            }
+        }
+    }
     error[0] = '\0';
     return 0;
 }
@@ -1959,6 +2026,191 @@ void mynah_axpy_f32(float *out, const float *src, float weight, size_t n) {
 #endif
 }
 
+/* out[0..n) = sum over j in 0..rows of weights[j] * src[j * stride + 0..n),
+ * accumulated in j order from zero -- i.e. EXACTLY `memset(out, 0); for j:
+ * mynah_axpy_f32(out, src + j * stride, weights[j], n)`, which is the attention
+ * value pass in src/transformer_ar.c.
+ *
+ * On x86 that loop loaded and stored the whole head row once per key: for a
+ * 64-wide head and a 300-key window, 2400 loads and 2400 stores per head to
+ * move eight registers' worth of state.  Here the head row lives in registers
+ * across the whole window (up to 128 floats, sixteen ymm), and each lane sees
+ * the same _mm256_fmadd_ps(w, src, acc) sequence axpy_f32_avx2 performs, in
+ * the same j order, from the same zero -- so the bytes are identical, not
+ * merely close.  Any shape the register form does not cover (n not a multiple
+ * of 8, n > 128, no AVX2) takes the axpy loop itself, so the fallback is the
+ * old code and not a second spelling of it.  MYNAH_ATTN_WSUM=0 forces the
+ * loop everywhere for an A/B. */
+static int attn_wsum_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYNAH_ATTN_WSUM");
+        cached = (e != NULL && (strcmp(e, "0") == 0 || strcmp(e, "off") == 0))
+                     ? 0 : 1;
+    }
+    return cached;
+}
+
+#if defined(MYNAH_KERNELS_X86_RT)
+#define ATTN_WSUM_CHUNK(NV)                                                   \
+    do {                                                                      \
+        __m256 acc[NV];                                                       \
+        for (int v_ = 0; v_ < (NV); ++v_) acc[v_] = _mm256_setzero_ps();      \
+        for (size_t j = 0; j < rows; ++j) {                                   \
+            const __m256 w = _mm256_set1_ps(weights[j]);                      \
+            const float *s_ = src + j * stride + c;                           \
+            for (int v_ = 0; v_ < (NV); ++v_)                                 \
+                acc[v_] = _mm256_fmadd_ps(w, _mm256_loadu_ps(s_ + 8 * v_),    \
+                                          acc[v_]);                           \
+        }                                                                     \
+        for (int v_ = 0; v_ < (NV); ++v_)                                     \
+            _mm256_storeu_ps(out + c + 8 * v_, acc[v_]);                      \
+    } while (0)
+
+__attribute__((target("avx2,fma")))
+static void attn_wsum_avx2(float *out, const float *src, size_t stride,
+                           const float *weights, size_t rows, size_t n) {
+    size_t c = 0;
+    for (; c + 64u <= n; c += 64u) ATTN_WSUM_CHUNK(8);
+    for (; c + 32u <= n; c += 32u) ATTN_WSUM_CHUNK(4);
+    for (; c + 8u <= n; c += 8u) ATTN_WSUM_CHUNK(1);
+}
+#undef ATTN_WSUM_CHUNK
+#endif
+
+void mynah_attn_wsum_f32(float *out, const float *src, size_t stride,
+                         const float *weights, size_t rows, size_t n) {
+#if defined(MYNAH_KERNELS_X86_RT)
+    if (n % 8u == 0u && n > 0u && n <= 128u && rows > 0u &&
+        attn_wsum_enabled() && mynah_kernels_x86_avx2()) {
+        attn_wsum_avx2(out, src, stride, weights, rows, n);
+        return;
+    }
+#else
+    (void)attn_wsum_enabled;
+#endif
+    memset(out, 0, n * sizeof(float));
+    for (size_t j = 0; j < rows; ++j)
+        mynah_axpy_f32(out, src + j * stride, weights[j], n);
+}
+
+/* scores[j] = mynah_dot_f32(q, keys + j * stride, n) * scale: the attention
+ * score pass, and on x86 the other half of the per-key cost.  One dot per key
+ * is one dependent chain of n/8 FMAs (eight for a 64-wide head, ~40 cycles of
+ * latency on Zen 2) plus a horizontal sum, behind a call and a dispatch check
+ * -- issued strictly one key after another.  Here four keys run as four
+ * independent chains, so the latency of one hides behind the others.
+ *
+ * BYTE IDENTITY IS PROVEN, NOT ASSUMED.  Each chain is the same
+ * _mm256_fmadd_ps sequence dot_f32_avx2 runs, from the same zero, but the
+ * horizontal sum is where a compiler gets a say: under -ffast-math GCC 13
+ * turns dot_f32_avx2's sequential `partial[0] + ... + partial[7]` into the
+ * tree ((p0+p4)+(p2+p6)) + ((p1+p5)+(p3+p7)), which is what attn_hsum8 below
+ * spells out -- and another compiler may choose differently.  So the first
+ * call in a process compares this kernel against mynah_dot_f32 bit for bit
+ * over a spread of lengths and values, and only a perfect match switches it
+ * on; anything else keeps the per-key loop for the life of the process.  The
+ * kernels self-test asserts the same.  MYNAH_ATTN_SCORES=0 forces the loop. */
+#if defined(MYNAH_KERNELS_X86_RT)
+__attribute__((target("avx2,fma")))
+static inline float attn_hsum8(__m256 acc) {
+    const __m128 s = _mm_add_ps(_mm256_extractf128_ps(acc, 1),
+                                _mm256_castps256_ps128(acc));
+    const __m128 t = _mm_add_ps(_mm_movehl_ps(s, s), s);
+    return _mm_cvtss_f32(_mm_add_ss(_mm_shuffle_ps(t, t, 0x55), t));
+}
+
+__attribute__((target("avx2,fma")))
+static void attn_scores_avx2(float *scores, const float *q, const float *keys,
+                             size_t stride, size_t rows, size_t n,
+                             float scale) {
+    size_t j = 0;
+    for (; j + 4u <= rows; j += 4u) {
+        const float *k0 = keys + j * stride;
+        const float *k1 = k0 + stride;
+        const float *k2 = k1 + stride;
+        const float *k3 = k2 + stride;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        for (size_t i = 0; i < n; i += 8u) {
+            const __m256 qv = _mm256_loadu_ps(q + i);
+            a0 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(k0 + i), a0);
+            a1 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(k1 + i), a1);
+            a2 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(k2 + i), a2);
+            a3 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(k3 + i), a3);
+        }
+        scores[j] = attn_hsum8(a0) * scale;
+        scores[j + 1u] = attn_hsum8(a1) * scale;
+        scores[j + 2u] = attn_hsum8(a2) * scale;
+        scores[j + 3u] = attn_hsum8(a3) * scale;
+    }
+    for (; j < rows; ++j) {
+        const float *kj = keys + j * stride;
+        __m256 a = _mm256_setzero_ps();
+        for (size_t i = 0; i < n; i += 8u)
+            a = _mm256_fmadd_ps(_mm256_loadu_ps(q + i), _mm256_loadu_ps(kj + i), a);
+        scores[j] = attn_hsum8(a) * scale;
+    }
+}
+
+/* The proof: -1 unresolved, 0 off, 1 on.  Racing first callers compute the
+ * same answer, so a plain relaxed store is enough. */
+static int attn_scores_proven(void) {
+    static int state = -1;
+    int v = __atomic_load_n(&state, __ATOMIC_RELAXED);
+    if (v >= 0) return v;
+    v = 0;
+    const char *e = getenv("MYNAH_ATTN_SCORES");
+    const int off = e != NULL && (strcmp(e, "0") == 0 || strcmp(e, "off") == 0);
+    if (!off && mynah_kernels_x86_avx2()) {
+        enum { PN = 128, PR = 9 };
+        float q[PN], k[PR * PN], got[PR];
+        unsigned x = 0x2545F491u;
+        v = 1;
+        for (int trial = 0; trial < 24 && v; ++trial) {
+            const size_t n = 8u * (size_t)(1 + trial % 16);
+            const float mag = (trial % 3 == 0) ? 1.0e-3f : (trial % 3 == 1 ? 1.0f : 37.0f);
+            for (size_t i = 0; i < PN; ++i) {
+                x = x * 1664525u + 1013904223u;
+                q[i] = mag * ((float)((int)(x >> 8) % 20001 - 10000) / 7919.0f);
+            }
+            for (size_t i = 0; i < (size_t)PR * PN; ++i) {
+                x = x * 1664525u + 1013904223u;
+                k[i] = (float)((int)(x >> 8) % 20001 - 10000) / 6007.0f;
+            }
+            const float scale = 0.125f + 0.01f * (float)trial;
+            attn_scores_avx2(got, q, k, PN, PR, n, scale);
+            for (size_t j = 0; j < PR; ++j) {
+                const float want = mynah_dot_f32(q, k + j * PN, n) * scale;
+                if (memcmp(&want, &got[j], sizeof want) != 0) { v = 0; break; }
+            }
+        }
+    }
+    __atomic_store_n(&state, v, __ATOMIC_RELAXED);
+    return v;
+}
+#endif
+
+void mynah_attn_scores_f32(float *scores, const float *q, const float *keys,
+                           size_t stride, size_t rows, size_t n, float scale) {
+#if defined(MYNAH_KERNELS_X86_RT)
+    if (n % 8u == 0u && n > 0u && attn_scores_proven()) {
+        attn_scores_avx2(scores, q, keys, stride, rows, n, scale);
+        return;
+    }
+#endif
+    for (size_t j = 0; j < rows; ++j)
+        scores[j] = mynah_dot_f32(q, keys + j * stride, n) * scale;
+}
+
+const char *mynah_attn_scores_kernel(void) {
+#if defined(MYNAH_KERNELS_X86_RT)
+    return attn_scores_proven() ? "avx2-x4" : "per-key";
+#else
+    return "per-key";
+#endif
+}
+
 int mynah_gelu_self_test(char *error, size_t error_capacity) {
     /* This used to be a no-op without Accelerate, which meant the gate that
      * existed to police the array GELU did nothing at all on the production
@@ -2179,7 +2431,27 @@ static int probe_svebf16(const char **why) { return probe_isa_bit(MYNAH_KERNELS_
  * mynah_kernels_dispatch_probes). The BIT stays defined in kernels.h because
  * the SVE form, MYNAH_KERNELS_ISA_SVEBF16, still belongs to this inventory. */
 
+/* kernel.attention: ON when the four-key score kernel proved itself in this
+ * process; the value pass (MYNAH_ATTN_WSUM) is named alongside, because the
+ * two together are the attention inner loop transformer_ar.c runs. */
+static int probe_attention(const char **why) {
+    static char text[240];
+    const char *scores = mynah_attn_scores_kernel();
+    const int on = strcmp(scores, "per-key") != 0;
+    snprintf(text, sizeof text,
+             "[predicate] src/kernels.c: scores %s (%s), value pass %s. Both "
+             "byte-identical to the per-key dot/axpy loop; MYNAH_ATTN_SCORES=0 "
+             "and MYNAH_ATTN_WSUM=0 force it",
+             scores,
+             on ? "proven bit-equal to mynah_dot_f32 at first use"
+                : "no AVX2, forced off, or the proof failed",
+             attn_wsum_enabled() ? "in registers" : "axpy loop");
+    *why = text;
+    return on;
+}
+
 void mynah_kernels_dispatch_probes(void) {
+    mynah_dispatch_register_probe("kernel.attention", probe_attention);
     /* NOTE FOR THE DISPATCH LANE (src/dispatch.c is not this lane's file):
      * there is no row id for the transcendentals, and a probe registered
      * under a new id is silently dropped because the row table lives there.

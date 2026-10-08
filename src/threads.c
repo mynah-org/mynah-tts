@@ -52,7 +52,55 @@
  * 4 threads gives 0.482 s versus 0.507 s for all 8.  Any other platform, and
  * any Mac without perflevel reporting, keeps the online-CPU count.
  * MYNAH_THREADS always wins. */
-static long default_threads(void) {
+/* The CPU QUOTA, as opposed to the mask.  sched_getaffinity says WHICH cpus
+ * this process may run on; a cgroup `cpu.max` (v2) or cfs_quota/period (v1)
+ * says HOW MUCH of them.  A container routinely sets only the second: the
+ * rented 24-vCPU slice of an EPYC 7702 this was found on shows all 128
+ * hardware threads in its mask and a quota of 2457600/100000 = 24.6 cpus.
+ * The mask alone sized the pool at 64 (PF_MAX_THREADS) there, and every
+ * barrier then waited on threads the CFS throttle had parked until the next
+ * 100 ms period -- latency with no busy thread to blame, which is exactly how
+ * server/prefork.c's cgroup_cpu_budget() describes the same hazard for W*T.
+ *
+ * Returns the quota rounded UP (2.5 cpus lets 3 threads run part of the time),
+ * or 0 when no finite quota is in force or nothing can be read.  The root
+ * honours MYNAH_CGROUP_ROOT like server/prefork.c, so the parser can be pointed
+ * at a fabricated tree.  Only the DEFAULT is capped: MYNAH_THREADS still wins,
+ * and the pool width never changes a result (every pool reduction is
+ * width-independent by construction, see src/sgemm.c and src/qmat.c). */
+static long cgroup_quota_cpus(void) {
+    const char *root = getenv("MYNAH_CGROUP_ROOT");
+    if (root == NULL || root[0] == '\0') root = "/sys/fs/cgroup";
+    char path[512];
+    double cpus = 0.0;
+    snprintf(path, sizeof path, "%s/cpu.max", root);
+    FILE *f = fopen(path, "r");
+    if (f != NULL) {
+        char quota[64] = {0};
+        long period = 0;
+        const int got = fscanf(f, "%63s %ld", quota, &period);
+        fclose(f);
+        if (got == 2 && period > 0 && strcmp(quota, "max") != 0) {
+            const double q = atof(quota);
+            if (q > 0.0) cpus = q / (double)period;
+        }
+    } else {
+        long q = -1, period = 0;
+        snprintf(path, sizeof path, "%s/cpu/cpu.cfs_quota_us", root);
+        f = fopen(path, "r");
+        if (f != NULL) { if (fscanf(f, "%ld", &q) != 1) q = -1; fclose(f); }
+        snprintf(path, sizeof path, "%s/cpu/cpu.cfs_period_us", root);
+        f = fopen(path, "r");
+        if (f != NULL) { if (fscanf(f, "%ld", &period) != 1) period = 0; fclose(f); }
+        if (q > 0 && period > 0) cpus = (double)q / (double)period;
+    }
+    if (cpus <= 0.0) return 0;
+    long n = (long)cpus;
+    if ((double)n < cpus) ++n;
+    return n < 1 ? 1 : n;
+}
+
+static long default_threads_uncapped(void) {
 #if defined(__APPLE__)
     int perf = 0;
     size_t size = sizeof(perf);
@@ -88,6 +136,13 @@ static long default_threads(void) {
     }
 #endif
     return sysconf(_SC_NPROCESSORS_ONLN);
+}
+
+static long default_threads(void) {
+    long n = default_threads_uncapped();
+    const long quota = cgroup_quota_cpus();
+    if (quota > 0 && quota < n) n = quota;
+    return n;
 }
 
 int mynah_num_threads(void) {

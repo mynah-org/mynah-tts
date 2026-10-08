@@ -149,6 +149,24 @@ static int sea_gemm_enabled(void) {
 #endif
 }
 
+/* MYNAH_SEANET_PRETAPS: "0" restores the per-frame weight re-layout in both
+ * GEMM paths below -- the strided gather inside the fused conv-tap region and
+ * the transposed (trans_a = 1) convtranspose GEMM -- for an A/B in one
+ * command.  The default reads the memoised re-layout instead.  Both arms are
+ * the same micro-kernel over the same values at the same lda, so the output is
+ * byte-identical either way; only where the bytes come from changes. */
+#if defined(MYNAH_SEANET_BLAS)
+static int sea_pretaps_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("MYNAH_SEANET_PRETAPS");
+        cached = (env != NULL && (strcmp(env, "0") == 0 ||
+                                  strcmp(env, "off") == 0)) ? 0 : 1;
+    }
+    return cached;
+}
+#endif
+
 #if defined(MYNAH_SEANET_BLAS)
 /* Every argument cblas_sgemm takes is an `int`, and all six of the ones below
  * come from `size_t` dimensions.  conv1d.c guards its narrowing
@@ -979,10 +997,26 @@ int mynah_causal_conv1d_apply(mynah_causal_conv1d *conv,
          * exactly where this is compiled in. */
         if (!fused && kernel > 1u) {
             const unsigned long long t_fused = sea_prof_now();
-            if (mynah_sgemm_f32_conv_taps(oc_count, out_len, in_channels,
-                                          kernel, weights->weight, conv->taps,
-                                          win, window_len, dilation, 0.0f,
-                                          output, out_len) == 0) {
+            /* The memoised [kernel][oc][ic] taps when there are any: the
+             * region then reads them in place instead of re-gathering the
+             * whole weight with a `kernel` stride on every frame.  Same
+             * values at the same lda, so the same bytes come out. */
+            const float *pre =
+                sea_pretaps_enabled()
+                    ? sea_taps_all(weights->weight, in_channels, oc_count, kernel)
+                    : NULL;
+            const int rc =
+                pre != NULL
+                    ? mynah_sgemm_f32_conv_taps_pre(oc_count, out_len,
+                                                    in_channels, kernel, pre,
+                                                    win, window_len, dilation,
+                                                    0.0f, output, out_len)
+                    : mynah_sgemm_f32_conv_taps(oc_count, out_len, in_channels,
+                                                kernel, weights->weight,
+                                                conv->taps, win, window_len,
+                                                dilation, 0.0f, output,
+                                                out_len);
+            if (rc == 0) {
                 fused = 1;
                 sea_prof_add(SEA_PH_CONV_TAPS, t_fused,
                              oc_count * out_len * in_channels * kernel);
@@ -1315,8 +1349,30 @@ int mynah_causal_convtr1d_apply(mynah_causal_convtr1d *convtr,
         }
         if (!q8) {
             const unsigned long long t_gemm = sea_prof_now();
-            sea_sgemm(1, rows, in_len, spec->in_channels, weights->weight, rows,
-                      input, in_len, 0.0f, convtr->taps, in_len);
+            /* op(A) = W^T, walked in place it is a column walk with a stride
+             * of `rows` floats -- 12 KiB on the first upsampling stage, a new
+             * page on every step of k.  sea_taps_all() with ONE output channel
+             * and `rows` taps is exactly that transpose, memoised once per
+             * weight: permuted[r][0][ic] = W[ic * rows + r].  The GEMM then
+             * reads four contiguous rows instead.  Same micro-kernel, same
+             * values, same order over k: byte-identical, and NULL (no memory)
+             * falls back to the in-place walk. */
+            const float *wt = NULL;
+#if defined(MYNAH_SEANET_OWN_SGEMM)
+            /* Our sgemm only: an external BLAS may pick a different kernel
+             * for the two layouts, and then the swap would be a numerical
+             * change wearing a memory-layout change's clothes. */
+            if (sea_pretaps_enabled() && rows > 1u)
+                wt = sea_taps_all(weights->weight, spec->in_channels, 1u, rows);
+#endif
+            if (wt != NULL) {
+                sea_sgemm(0, rows, in_len, spec->in_channels, wt,
+                          spec->in_channels, input, in_len, 0.0f, convtr->taps,
+                          in_len);
+            } else {
+                sea_sgemm(1, rows, in_len, spec->in_channels, weights->weight,
+                          rows, input, in_len, 0.0f, convtr->taps, in_len);
+            }
             sea_prof_add(SEA_PH_CONVTR_GEMM, t_gemm,
                          rows * in_len * spec->in_channels);
         }

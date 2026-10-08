@@ -169,7 +169,7 @@ STAMP_WRITE := $(shell mkdir -p $(BUILD_DIR) && \
 	fi)
 
 
-CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/sgemm_rt.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/text_segment.c src/dispatch.c src/costmap.c
+CORE_SOURCES := src/mynah_tts.c src/json.c src/weights.c src/mynah_util.c src/conv1d.c src/codec_nanocodec.c src/flow_head.c src/seanet.c src/transformer_ar.c src/voice_clone.c src/engine_magpie.c src/engine_magpie_ctx.c src/engine_pocket.c src/engine_registry.c src/inference.c src/kernels.c src/sgemm.c src/sgemm_rt.c src/convq8.c src/audio.c src/backend.c src/threads.c src/qmat.c src/tokenizer.c src/tokenizer_sentencepiece.c src/text_segment.c src/dispatch.c src/costmap.c src/hostpool.c
 CLI_SOURCE := cli/main.c
 # E14-4.  On x86 src/sgemm.c is built TWICE and src/sgemm_rt.c picks between
 # them at runtime; everywhere else it is built once as before.  The reason it
@@ -242,7 +242,7 @@ WINDOW_TEST_TARGET := $(BUILD_DIR)/tests/test_transformer_ar_window
 .PHONY: all cpu info caps simd-auto simd-auto-test self-test test test-c x86-cross x86-tier-parity kernel-bench stream-test driver-test window-test kernels-test qmat-test qmat-negative-control perf-profile-test dispatch-gate ternary-test server server-test server-multilang-test \
 	server-concurrency-test server-concurrency-test-all server-refusal-test segment-parity bench bench-matrix gen-matrix inspect convert convert-codec tokenizer synthesize oracle \
         oracle-pocket fake-pack goldens goldens-capture tokenizer-parity convert-pocket \
-        playback-sim-test json-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
+        playback-sim-test json-test hostpool-test json-negative-control kernels-negative-control serving-profile serving-wave serving-soak serving-quantum-sweep \
         metal cuda cuda-server gpu-selftest leaks ubsan asan clean lib shared install dist update-ingot \
         doctor census-test census-parity census-overhead alloc-shim alloc-constant-test observability-test
 
@@ -409,6 +409,17 @@ $(JSON_TEST_TARGET): $(JSON_TEST_SOURCES) src/json.h server/http_util.h $(BUILD_
 json-test: $(JSON_TEST_TARGET)
 	@$(JSON_TEST_TARGET)
 
+# The serving loop's host team (MYNAH_SERVE_HOST_THREADS): every region equals
+# the serial loop, at any team size and row count. Two files, millisecond-fast;
+# build it with CFLAGS=-fsanitize=thread for the race check.
+HOSTPOOL_TEST_TARGET := $(BUILD_DIR)/tests/test_hostpool
+$(HOSTPOOL_TEST_TARGET): tests/test_hostpool.c src/hostpool.c src/hostpool.h $(BUILD_STAMP)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_hostpool.c src/hostpool.c -lm -lpthread -o $@
+
+hostpool-test: $(HOSTPOOL_TEST_TARGET)
+	@$(HOSTPOOL_TEST_TARGET)
+
 # The negative control: break the parser four ways and require json-test to
 # catch each break. A suite that has only ever passed is not evidence that it
 # can fail. Slow-ish (four rebuilds of three files), so it is NOT in `make test`
@@ -525,7 +536,7 @@ self-test: $(TARGET)
 # is pure Python that the sanitizer never instruments, so a missing Python
 # module used to turn the Memory Safety workflow red while saying nothing about
 # memory safety. That happened -- numpy, 2026-09-21, four red sanitizer jobs.
-test-c: self-test kernels-test qmat-test driver-test window-test json-test simd-auto-test dispatch-gate
+test-c: self-test kernels-test qmat-test driver-test window-test json-test hostpool-test simd-auto-test dispatch-gate
 
 test: test-c playback-sim-test perf-profile-test ternary-test
 	@python3 tests/test_python_tools.py

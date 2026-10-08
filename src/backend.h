@@ -323,6 +323,60 @@ unsigned long long mynah_backend_stream_sync_queued_calls(void);
 #define mynah_backend_sync(backend, error, error_capacity) \
     mynah_backend_sync_at((backend), (error), (error_capacity), __FILE__, __LINE__)
 
+/* MYNAH_SERVE_PROFILE=2: where the serving loop's host time goes, per phase.
+ * Each phase accumulates its wall time and, separately, the device wait
+ * (mynah_backend_sync / fence syncs) reached inside it, so wall - wait is the
+ * phase's own host time. Phases may nest (an engine phase inside a loop
+ * phase); a phase never nests inside itself. Only the thread that called
+ * mynah_hostprof_bind() records; calls from any other thread are ignored, so
+ * helper threads cannot tear the counters. Off (the default, and level 1),
+ * every call returns at once. */
+enum {
+    MYNAH_HP_ADMIT = 0,     /* loop: admission pass (+ async collect) */
+    MYNAH_HP_CANCEL,        /* loop: cancellation poll */
+    MYNAH_HP_DEC_COLLECT,   /* loop: decode-ahead collect + delivery */
+    MYNAH_HP_DELIVER,       /*   the per-row hand-off of PCM (slot_emit loop) */
+    MYNAH_HP_PREFILL,       /* loop: prefill pass (incl. late admission) */
+    MYNAH_HP_SELECT,        /* loop: step row selection */
+    MYNAH_HP_STEP,          /* loop: step_live (step + emit + gang) */
+    MYNAH_HP_STEP_BATCH,    /*   engine step_batch (finish of a queued step) */
+    MYNAH_HP_EMIT,          /*   engine emit_batch */
+    MYNAH_HP_GANG,          /*   stream_gang: policy + decode submit */
+    MYNAH_HP_DEC_SUBMIT,    /*     engine decode_submit */
+    MYNAH_HP_DEC_LAND,      /*   engine: landing a decode gang (PCM copies) */
+    MYNAH_HP_POST_STEP,     /*   step_live: per-row state after the gang */
+    MYNAH_HP_LAUNCH,        /* loop: select + queue the next step (no prefill) */
+    MYNAH_HP_RETIRE,        /* loop: retire pass */
+    MYNAH_HP_CTX_FREE,      /*   engine ctx_free of retired rows */
+    MYNAH_HP_ON_DONE,       /*   sink on_done of retired rows */
+    MYNAH_HP_PRE_PROLOGUE,  /* prefill: seed / segment prologues */
+    MYNAH_HP_PRE_TILE,      /* prefill: the batched prefill tile */
+    MYNAH_HP_DS_UPSAMPLE,   /* decode gang: quantizer + upsample queue */
+    MYNAH_HP_DS_PREPARE,    /* decode gang: per-row frame prepare */
+    MYNAH_HP_DS_CODEC,      /* decode gang: codec transformer tiles */
+    MYNAH_HP_DS_DECODER,    /* decode gang: decoder submission */
+    MYNAH_HP_DS_GATHER,     /* decode gang: PCM gather + fence */
+    MYNAH_HP_OS_ROWS,       /* one-sync queue: per-row latent + noise */
+    MYNAH_HP_OS_BACKBONE,   /* one-sync queue: backbone launch */
+    MYNAH_HP_OS_FLOW,       /* one-sync queue: EOS + flow launch */
+    MYNAH_HP_OS_FINISH,     /* one-sync finish: after the sync (commit) */
+    MYNAH_HP_PT_VOICE,      /* prefill tile: voice prefix copies */
+    MYNAH_HP_PT_H2D,        /* prefill tile: text embedding uploads */
+    MYNAH_HP_PT_CALL,       /* prefill tile: the tile transformer call */
+    MYNAH_HP_MT_PRE,        /* Mimi tile: row gathering */
+    MYNAH_HP_MT_CALL,       /* Mimi tile: the tile transformer call */
+    MYNAH_HP_MT_POST,       /* Mimi tile: per-row host window advance */
+    MYNAH_HP_CF_DEVICE,     /* ctx_free: device sets parked / released */
+    MYNAH_HP_CF_HOST,       /* ctx_free: host pool park and host frees */
+    MYNAH_HP_PHASES
+};
+int mynah_hostprof_enabled(void);
+void mynah_hostprof_bind(void);       /* the calling thread records */
+void mynah_hostprof_reset(void);
+void mynah_hostprof_begin(int phase);
+void mynah_hostprof_end(int phase, size_t rows);
+void mynah_hostprof_print(FILE *out, unsigned long long iterations);
+
 /* Begin a resident GPU command batch.  CPU backends are no-ops.  The batch is
  * submitted by mynah_backend_sync at the next CPU-visible boundary. */
 int mynah_backend_batch_begin(const mynah_backend *backend,

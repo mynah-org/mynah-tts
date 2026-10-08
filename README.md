@@ -124,8 +124,12 @@ big enough to pay: -39% step time at one row), the same segmentation and
 AVX-512BW, AVX-512 VNNI (int8 2.27x over AVX2) and AVX512-BF16 `VDPBF16PS`
 (bf16 2.98x over the widening kernel). Each tier is proven against the scalar
 reference on first use before it is selected. These are kernel benchmarks on
-a Zen 4 host; no x86 serving figure is published yet. Detail:
-[performance](docs/performance.md).
+a Zen 4 host. The first x86 serving figures (2026-10-08) are on the low
+tier: an AMD EPYC 7702 with AVX2 and FMA only (no AVX-512, no VNNI), ~24 vCPUs
+of quota, where new AVX2 kernels (an exact int8 sign-trick dot, a 6x16 FMA
+tile, laid-out codec convs) took the streaming knee from C12 to **C24** on
+the 24L and to about **C36** on the 6L (2-3 minute screens at the knee), byte-identical audio.
+Detail: [performance](docs/performance.md).
 
 ### Magpie — single request
 

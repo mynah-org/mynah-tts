@@ -888,8 +888,8 @@ static size_t tar_window_start(size_t position, size_t context) {
  * wider than the slack.
  *
  * A no-op on an unwindowed cache, which is every path that predates this. */
-static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
-                          size_t hi) {
+static int tar_kv_reserve_copy(mynah_transformer_ar_state *state, size_t keep_from,
+                               size_t hi, int copy) {
     if (state->kv_positions >= state->config.max_seq_len) return 0;
     if (hi < state->kv_base) return -1;   /* positions never rewind */
     if (hi - state->kv_base < state->kv_positions) return 0;
@@ -911,7 +911,7 @@ static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
         const size_t room = state->kv_positions - shift;
         if (keep > room) keep = room;
     }
-    if (keep > 0u) {
+    if (keep > 0u && copy) {
         const size_t row = state->attn_dim * sizeof(float);
         for (size_t l = 0; l < state->config.num_layers; ++l) {
             float *k = state->kv + l * state->kv_layer;
@@ -922,6 +922,23 @@ static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
     }
     state->kv_base = keep_from;
     return (hi - state->kv_base < state->kv_positions) ? 0 : -1;
+}
+
+static int tar_kv_reserve(mynah_transformer_ar_state *state, size_t keep_from,
+                          size_t hi) {
+    return tar_kv_reserve_copy(state, keep_from, hi, 1);
+}
+
+int mynah_transformer_ar_state_prepare_window_stale(
+    mynah_transformer_ar_state *state, size_t end_position) {
+    if (state == NULL || end_position > state->config.max_seq_len ||
+        end_position < state->offset) {
+        return -1;
+    }
+    if (end_position == state->offset || end_position == 0u) return 0;
+    return tar_kv_reserve_copy(state,
+                               tar_window_start(state->offset, state->config.context),
+                               end_position - 1u, 0);
 }
 
 int mynah_transformer_ar_state_prepare_window(mynah_transformer_ar_state *state,
@@ -1040,18 +1057,16 @@ static int tar_attend_head(const mynah_transformer_ar_config *config,
     const float *v_cache = k_cache + state->kv_half;
     const float *qh = q + h * head_dim;
     float *oh = rows->attn + b * attn_dim + h * head_dim;
-    for (size_t j = 0; j < span; ++j) {
-        const float *kj = k_cache + (lo_slot + j) * attn_dim + h * head_dim;
-        scores[j] = mynah_dot_f32(qh, kj, head_dim) * scale;
-    }
+    /* Byte-identical to one mynah_dot_f32 per key, times scale (kernels.c). */
+    mynah_attn_scores_f32(scores, qh, k_cache + lo_slot * attn_dim + h * head_dim,
+                          attn_dim, span, head_dim, scale);
     /* Rejects non-finite scores, which is the last line of defence against a
      * NaN that slipped into the cache. */
     if (mynah_softmax_f32(scores, scores, span) != 0) return -1;
-    memset(oh, 0, head_dim * sizeof(float));
-    for (size_t j = 0; j < span; ++j) {
-        const float *vj = v_cache + (lo_slot + j) * attn_dim + h * head_dim;
-        mynah_axpy_f32(oh, vj, scores[j], head_dim);
-    }
+    /* The value pass with the head row held in registers across the window;
+     * byte-identical to memset + one mynah_axpy_f32 per key (kernels.c). */
+    mynah_attn_wsum_f32(oh, v_cache + lo_slot * attn_dim + h * head_dim,
+                        attn_dim, scores, span, head_dim);
     return 0;
 }
 

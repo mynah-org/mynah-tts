@@ -1,6 +1,7 @@
 #include "backend.h"
 #include "costmap.h"
 #include "row_cap.h"
+#include "hostpool.h"
 
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <type_traits>
 #include <algorithm>
 #include <atomic>
@@ -1183,7 +1185,24 @@ struct cuda_pipeline_graph_entry {
     cudaGraphExec_t exec;
     bool valid;
     bool capturing;
+    double begin_ms; /* MYNAH_CUDA_GRAPH_TRACE: when the capture began */
 };
+
+/* MYNAH_CUDA_GRAPH_TRACE (diagnostic, off): one stderr line per pipeline graph
+ * capture with its key, identity, record and instantiate times. */
+static bool cuda_graph_trace_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("MYNAH_CUDA_GRAPH_TRACE");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+static double cuda_trace_now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
 
 /* A batched decoder graph owns its pointer metadata.  The eager decoder batch
  * path reuses four backend-wide device tables and fills them from small stack
@@ -1234,6 +1253,10 @@ struct cuda_decoder_batch_graph_entry {
     bool layout_recording;
     bool layout_drift;
     bool patch_verified;
+    /* decoder_table_patch's scratch: the changed rows and their columns
+     * (capacity kept between calls). */
+    std::vector<size_t> patch_rows;
+    std::vector<float *const *> patch_columns;
 };
 
 struct cuda_backend_state;
@@ -6675,25 +6698,67 @@ static bool decoder_table_patch_ready(
     return true;
 }
 
+/* MYNAH_SERVE_HOST_THREADS: the changed rows of a table patch, in row
+ * chunks. Row i writes only its own cell (column i) of each slot's table, so
+ * chunks are independent; within a chunk the slots are the outer loop, so the
+ * writes of one slot go to consecutive cells instead of one cache line per
+ * slot and row. Same cells, same values as the row-by-row loop. */
+struct decoder_patch_job {
+    cuda_decoder_batch_graph_entry *entry;
+    const size_t *rows;            /* changed row indices, ascending */
+    float *const *const *columns;  /* columns[k]: rows[k]'s cached column */
+};
+
+static void decoder_table_patch_body(void *ud, size_t begin, size_t end) {
+    const decoder_patch_job *job = static_cast<const decoder_patch_job *>(ud);
+    const cuda_decoder_batch_graph_entry *entry = job->entry;
+    const size_t slots = entry->used_slots;
+    const size_t batch = entry->batch;
+    for (size_t s = 0u; s < slots; ++s) {
+        float **table = entry->host_tables + (s * 4u + entry->slot_channels[s]) * batch;
+        for (size_t k = begin; k < end; ++k) table[job->rows[k]] = job->columns[k][s];
+    }
+}
+
 /* Scatter the changed rows' columns.  The caller has waited for the graph's
  * previous launch (entry->done): its memcpy nodes read these pinned cells. */
 static void decoder_table_patch(cuda_decoder_batch_graph_entry *entry,
                                 mynah_backend_decoder *const *decoders,
                                 const float *const *inputs,
                                 float *const *outputs) {
-    const size_t slots = entry->used_slots;
     const bool held = entry->decoders.size() == entry->batch &&
                       entry->inputs.size() == entry->batch &&
                       entry->outputs.size() == entry->batch;
+    std::vector<size_t> &rows = entry->patch_rows;
+    std::vector<float *const *> &columns = entry->patch_columns;
+    rows.clear();
+    columns.clear();
+    try {
+        rows.reserve(entry->batch);
+        columns.reserve(entry->batch);
+    } catch (const std::bad_alloc &) {
+        /* No scratch: the row-by-row loop. */
+        const size_t slots = entry->used_slots;
+        for (size_t i = 0u; i < entry->batch; ++i) {
+            if (held && entry->decoders[i] == decoders[i] &&
+                entry->inputs[i] == inputs[i] && entry->outputs[i] == outputs[i])
+                continue;
+            for (size_t s = 0u; s < slots; ++s)
+                entry->host_tables[(s * 4u + entry->slot_channels[s]) * entry->batch +
+                                   i] = decoders[i]->table_column[s];
+        }
+        return;
+    }
     for (size_t i = 0u; i < entry->batch; ++i) {
         if (held && entry->decoders[i] == decoders[i] &&
             entry->inputs[i] == inputs[i] && entry->outputs[i] == outputs[i])
             continue;
-        const mynah_backend_decoder *decoder = decoders[i];
-        for (size_t s = 0u; s < slots; ++s)
-            entry->host_tables[(s * 4u + entry->slot_channels[s]) * entry->batch +
-                               i] = decoder->table_column[s];
+        rows.push_back(i);
+        columns.push_back(decoders[i]->table_column.data());
     }
+    if (rows.empty()) return;
+    decoder_patch_job job = {entry, rows.data(), columns.data()};
+    mynah_hostpool_run(rows.size(), decoder_table_patch_body, &job);
 }
 
 static float **decoder_current_table(const cuda_backend_state *backend,
@@ -12209,6 +12274,7 @@ extern "C" int mynah_cuda_graph_begin(void *opaque, size_t key,
     created.identity = identity;
     created.valid = false;
     created.capturing = true;
+    created.begin_ms = cuda_graph_trace_enabled() ? cuda_trace_now_ms() : 0.0;
     st->pipeline_graphs.push_back(created);
     return 0;
 }
@@ -12231,8 +12297,18 @@ extern "C" int mynah_cuda_graph_end(void *opaque, size_t key,
         return 1;
     }
     cudaGraphExec_t exec = nullptr;
+    const double recorded_ms =
+        cuda_graph_trace_enabled() ? cuda_trace_now_ms() : 0.0;
     const cudaError_t instantiate_status =
         cudaGraphInstantiate(&exec, graph, 0);
+    if (cuda_graph_trace_enabled()) {
+        const double done_ms = cuda_trace_now_ms();
+        std::fprintf(stderr,
+                     "mynah-tts: graph capture key 0x%zx identity %p: record %.2f ms, "
+                     "instantiate %.2f ms, %zu pipeline graphs\n",
+                     key, identity, recorded_ms - entry->begin_ms,
+                     done_ms - recorded_ms, st->pipeline_graphs.size());
+    }
     if (instantiate_status != cudaSuccess || exec == nullptr) {
         cudaGraphDestroy(graph);
         if (instantiate_status != cudaSuccess) ce(instantiate_status, e, ec);
