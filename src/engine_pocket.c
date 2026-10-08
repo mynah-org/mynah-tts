@@ -1082,6 +1082,11 @@ struct mynah_engine_state {
     int cuda_voice_kv_bf16;
     float *cuda_prefill_in;
     size_t cuda_prefill_in_floats;
+    /* MYNAH_CUDA_PREFILL_PINNED: pinned staging of the text embeddings the
+     * prefill tile uploads, and the fence of its last upload. */
+    float *cuda_prefill_host;
+    size_t cuda_prefill_host_floats;
+    void *cuda_prefill_host_fence;
 
     /* Idle per-request CUDA resource sets (MYNAH_CUDA_SLOT_POOL).  A retired
      * CUDA context parks its device buffers, resident decoder and pinned host
@@ -3962,6 +3967,9 @@ static void pocket_model_free(mynah_engine_state *state) {
         free(state->cuda_voice_kv);
     }
     mynah_backend_dev_free(state->backend, state->cuda_prefill_in);
+    if (state->cuda_prefill_host_fence != NULL)
+        mynah_backend_fence_wait(state->backend, state->cuda_prefill_host_fence);
+    mynah_backend_host_free(state->backend, state->cuda_prefill_host);
     mynah_sp_close(state->tokenizer);
     pocket_voices_free(state->voices, state->voice_count);
     if (state->voice_cache_mutex_ready) {
@@ -12034,6 +12042,21 @@ static int pocket_cuda_prefill_fixed_order(void) {
     return cached;
 }
 
+/* MYNAH_CUDA_PREFILL_PINNED (default on; =0 rolls back): the prefill tile
+ * stages the text embeddings it uploads in a pinned buffer and sends them with
+ * one copy. From pageable memory each cudaMemcpyAsync first waits for the
+ * stream, i.e. for the decode gang queued just before the prefill pass, so the
+ * scheduler sat out the whole decode there and the next step was queued only
+ * after it. Same bytes in the same device buffer either way. */
+static int pocket_cuda_prefill_pinned_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYNAH_CUDA_PREFILL_PINNED");
+        cached = value == NULL || strcmp(value, "0") != 0;
+    }
+    return cached;
+}
+
 static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
                                     int final, char *error, size_t capacity) {
     if (count == 0u) return 0;
@@ -12211,15 +12234,40 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
         size_t row_take[POCKET_MAX_BATCH], row_start[POCKET_MAX_BATCH];
         size_t row_ring[POCKET_MAX_BATCH];
         mynah_hostprof_begin(MYNAH_HP_PT_H2D);
+        /* MYNAH_CUDA_PREFILL_PINNED: the staging, free again once the last
+         * upload from it has run (an iteration ago: no wait in practice). */
+        float *staging = NULL;
+        if (pocket_cuda_prefill_pinned_enabled()) {
+            if (state->cuda_prefill_host_fence != NULL) {
+                mynah_backend_fence_wait(state->backend,
+                                         state->cuda_prefill_host_fence);
+                state->cuda_prefill_host_fence = NULL;
+            }
+            if (floats > state->cuda_prefill_host_floats) {
+                char ignored[256];
+                mynah_backend_host_free(state->backend, state->cuda_prefill_host);
+                state->cuda_prefill_host = NULL;
+                state->cuda_prefill_host_floats = 0u;
+                if (mynah_backend_host_alloc(state->backend, floats,
+                                             &state->cuda_prefill_host, ignored,
+                                             sizeof(ignored)) == 0)
+                    state->cuda_prefill_host_floats = floats;
+                else
+                    state->cuda_prefill_host = NULL;   /* pageable copies below */
+            }
+            staging = state->cuda_prefill_host;
+        }
         for (size_t i = 0; i < count; ++i) {
             mynah_engine_ctx *ctx = ctxs[i];
             if (take[i] == 0u) continue;
             float *dst = state->cuda_prefill_in + offset * cfg->hidden_dim;
-            if (mynah_backend_h2d(state->backend,
-                                  ctx->text_embed +
-                                      ctx->text_prefilled * cfg->hidden_dim,
-                                  dst, take[i] * cfg->hidden_dim, local,
-                                  sizeof(local)) != 0) {
+            const float *src = ctx->text_embed + ctx->text_prefilled * cfg->hidden_dim;
+            if (staging != NULL) {
+                memcpy(staging + offset * cfg->hidden_dim, src,
+                       take[i] * cfg->hidden_dim * sizeof(float));
+            } else if (mynah_backend_h2d(state->backend, src, dst,
+                                         take[i] * cfg->hidden_dim, local,
+                                         sizeof(local)) != 0) {
                 pocket_error(error, capacity, "pocket: CUDA prefill H2D: %s", local);
                 free(prefix);
                 return -1;
@@ -12246,6 +12294,22 @@ static int pocket_cuda_prefill_tile(mynah_engine_ctx *const *ctxs, size_t count,
             }
             offset += take[i];
             ++rows;
+        }
+        if (staging != NULL) {
+            if (mynah_backend_h2d(state->backend, staging, state->cuda_prefill_in,
+                                  offset * cfg->hidden_dim, local,
+                                  sizeof(local)) != 0) {
+                pocket_error(error, capacity, "pocket: CUDA prefill H2D: %s", local);
+                free(prefix);
+                return -1;
+            }
+            state->cuda_prefill_host_fence = mynah_backend_fence_record(state->backend);
+            if (state->cuda_prefill_host_fence == NULL) {
+                /* No fence: drain, so the next call may overwrite the staging. */
+                char drain[256];
+                drain[0] = '\0';
+                (void)mynah_backend_sync(state->backend, drain, sizeof(drain));
+            }
         }
         mynah_hostprof_end(MYNAH_HP_PT_H2D, rows);
         mynah_transformer_tile_layer layer[64];
