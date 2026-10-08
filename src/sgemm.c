@@ -20,7 +20,7 @@
  * architecturally guaranteed, so the compile-time choice is the right one and
  * there is no second variant to select.
  *
- * MYNAH_SGEMM_VARIANT renames the twelve public symbols.  It is defined for
+ * MYNAH_SGEMM_VARIANT renames the thirteen public symbols.  It is defined for
  * BOTH x86 variants -- `base` and `avx2` -- because if the baseline build kept
  * the plain names it would collide with the dispatcher that has to own them. */
 #if defined(MYNAH_SGEMM_VARIANT)
@@ -30,6 +30,7 @@
 #define mynah_sgemm_f32                    MYNAH_SGEMM_SYM(mynah_sgemm_f32)
 #define mynah_sgemm_self_test              MYNAH_SGEMM_SYM(mynah_sgemm_self_test)
 #define mynah_sgemm_f32_conv_taps          MYNAH_SGEMM_SYM(mynah_sgemm_f32_conv_taps)
+#define mynah_sgemm_f32_conv_taps_pre      MYNAH_SGEMM_SYM(mynah_sgemm_f32_conv_taps_pre)
 #define mynah_sgemm_f32_reference          MYNAH_SGEMM_SYM(mynah_sgemm_f32_reference)
 #define mynah_sgemm_narrow_max             MYNAH_SGEMM_SYM(mynah_sgemm_narrow_max)
 #define mynah_sgemm_family_for             MYNAH_SGEMM_SYM(mynah_sgemm_family_for)
@@ -145,8 +146,17 @@ typedef __m256 sg_vec;
 #else
 #define sg_fma(acc, a, b) _mm256_add_ps((acc), _mm256_mul_ps((a), (b)))
 #endif
-/* 16 architectural ymm registers: half of them may hold accumulators. */
-#define SG_ACC_VECS 8
+/* 16 architectural ymm registers.  The accumulator budget is 2 * SG_MR: two
+ * column vectors per micro-kernel row, which leaves two registers for op(B)
+ * and one for the broadcast.  See SG_MR below for why AVX2 takes six.
+ * EXTRA_CFLAGS=-DMYNAH_SGEMM_AVX2_MR=4 rebuilds the old 4x16 tile for an A/B;
+ * the output is the same either way. */
+#if defined(MYNAH_SGEMM_AVX2_MR)
+#define SG_MR_ISA MYNAH_SGEMM_AVX2_MR
+#else
+#define SG_MR_ISA 6
+#endif
+#define SG_ACC_VECS (2 * SG_MR_ISA)
 
 #else
 #define SG_ISA_NAME "scalar"
@@ -161,10 +171,27 @@ typedef float sg_vec;
 #define SG_ACC_VECS 16
 #endif
 
-/* Micro-kernel rows.  Four independent accumulator chains per column vector is
- * enough to cover the FMA latency on every core this runtime targets, and it
- * keeps the b operand loaded once per four FMAs. */
+/* Micro-kernel rows.  Four independent accumulator chains per column vector
+ * keeps the b operand loaded once per four FMAs, and on NEON (32 registers,
+ * 16 accumulators at two vectors) that already covers the FMA latency.
+ *
+ * AVX2 takes SIX: the classic 6x16 tile.  With 16 ymm registers the 4x16 tile
+ * held eight accumulators, and two FMA pipes of latency 4-5 (Zen 2, Skylake)
+ * need ten in flight to stay busy -- 4x16 capped every GEMM at ~80% of the
+ * FMA roof before a single load was counted.  Twelve accumulators, two op(B)
+ * loads and one broadcast is fifteen registers.  Measured on an EPYC 7702:
+ * sgemm 16x1024x1024 0.95 -> 0.63 ms single-threaded, codec conv stack -13%.
+ *
+ * Each output element is still ONE FMA chain over k from zero in the same
+ * order, whatever the tile height, so the result does not move: the 24-layer
+ * Pocket output is sha256-identical between the two tiles.  The taller tile
+ * leaves a taller ragged remainder, which a four-row strip takes before the
+ * one-row strip (sg_tile_nn). */
+#if defined(SG_MR_ISA)
+#define SG_MR SG_MR_ISA
+#else
 #define SG_MR 4
+#endif
 
 /* The narrow/panel boundary, DERIVED (see mynah_sgemm_narrow_max in sgemm.h):
  * the widest n whose whole C row block still fits in the accumulator budget.
@@ -564,6 +591,15 @@ static void sg_micro_tail(size_t rows, size_t cols, size_t k, const float *ap,
 
 SG_DEFINE_STRIP(sg_strip4, SG_MR, sg_micro4_4, sg_micro4_2, sg_micro4_1)
 SG_DEFINE_STRIP(sg_strip1, 1, sg_micro1_4, sg_micro1_2, sg_micro1_1)
+#if SG_MR > 4
+/* A taller tile leaves a taller ragged remainder (m = 16 is 6 + 6 + 4), and
+ * sending up to five rows through the one-row strip measured 2.1x slower on
+ * that shape.  A four-row strip takes the remainder first.  Same per-element
+ * arithmetic as every other instantiation: one FMA chain over k from zero. */
+SG_DEFINE_MICRO(sg_micror4_1, 4, 1)
+SG_DEFINE_MICRO(sg_micror4_2, 4, 2)
+SG_DEFINE_STRIP(sg_stripr4, 4, sg_micror4_2, sg_micror4_2, sg_micror4_1)
+#endif
 
 /* ======================================================================
  * The job and its tiles
@@ -592,6 +628,7 @@ typedef struct {
     size_t taps;
     const float *w_taps;    /* [m][k][taps]                   */
     float *gather;          /* [m][k] scratch, row-block private */
+    const float *pre_taps;  /* [taps][m][k], or NULL: no gather */
     size_t b_tap_stride;
 } sg_job;
 
@@ -609,6 +646,15 @@ static void sg_tile_nn(const sg_job *j, size_t i0, size_t rows, size_t j0,
     for (; i + SG_MR <= rows; i += SG_MR)
         sg_strip4(j->k, cols, j->nv_max, abase + i * ars, ars, acs, bbase,
                   j->ldb, j->alpha, j->beta, cbase + i * j->ldc, j->ldc);
+#if SG_MR > 4
+    /* nv_max is at most 2 here (SG_ACC_VECS / SG_MR), so the strip's
+     * four-vector slot -- wired to the two-vector kernel -- is never taken. */
+    if (i + 4u <= rows) {
+        sg_stripr4(j->k, cols, j->nv_max, abase + i * ars, ars, acs, bbase,
+                   j->ldb, j->alpha, j->beta, cbase + i * j->ldc, j->ldc);
+        i += 4u;
+    }
+#endif
     for (; i < rows; ++i)
         sg_strip1(j->k, cols, j->nv_max, abase + i * ars, ars, acs, bbase,
                   j->ldb, j->alpha, j->beta, cbase + i * j->ldc, j->ldc);
@@ -674,12 +720,18 @@ static void sg_task_taps(void *ctx, int index) {
     local.a = j->gather;
     local.lda = j->k;
     for (size_t t = 0; t < j->taps; ++t) {
-        float *dst = j->gather + i0 * j->k;
-        const float *src = j->w_taps + i0 * j->k * j->taps + t;
-        for (size_t r = 0; r < rows; ++r) {
-            for (size_t p = 0; p < j->k; ++p) dst[p] = src[p * j->taps];
-            dst += j->k;
-            src += j->k * j->taps;
+        if (j->pre_taps != NULL) {
+            /* Already [taps][m][k]: the tile reads tap t in place, at the
+             * same lda the gather would have produced. */
+            local.a = j->pre_taps + t * j->m * j->k;
+        } else {
+            float *dst = j->gather + i0 * j->k;
+            const float *src = j->w_taps + i0 * j->k * j->taps + t;
+            for (size_t r = 0; r < rows; ++r) {
+                for (size_t p = 0; p < j->k; ++p) dst[p] = src[p * j->taps];
+                dst += j->k;
+                src += j->k * j->taps;
+            }
         }
         local.b = j->b + t * j->b_tap_stride;
         local.beta = (t == 0u) ? j->beta : 1.0f;
@@ -951,12 +1003,13 @@ int mynah_sgemm_f32(int trans_a, int trans_b, size_t m, size_t n, size_t k,
                        trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 }
 
-int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
-                              const float *weight, float *gather,
-                              const float *b, size_t ldb, size_t b_tap_stride,
-                              float beta, float *c, size_t ldc) {
-    if (taps == 0u || weight == NULL || gather == NULL || b == NULL ||
-        c == NULL) {
+static int sg_conv_taps(size_t m, size_t n, size_t k, size_t taps,
+                        const float *weight, float *gather,
+                        const float *pre_taps,
+                        const float *b, size_t ldb, size_t b_tap_stride,
+                        float beta, float *c, size_t ldc) {
+    if (taps == 0u || (pre_taps == NULL && (weight == NULL || gather == NULL)) ||
+        b == NULL || c == NULL) {
         return -1;
     }
     if (m == 0u || n == 0u || k == 0u) return 1;
@@ -989,7 +1042,20 @@ int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     job.c = c; job.ldc = ldc;
     job.family = family;
     sg_plan_columns(&job);
-    sg_plan_rows(&job, 0u);
+    /* A task here is a whole ROW BLOCK -- every column group of it -- so the
+     * row plan must ask the pool for its tasks along rows alone.  Planned as
+     * sg_task plans, it divided the wanted task count by the column grid:
+     * the codec's last conv (m = 32, n = 1920, four column panels) came out
+     * as ONE task and ran on one thread of two, 465 us a frame with the
+     * second core idle.  Which thread computes a row block never changes a
+     * value (the strips and their per-element FMA chains are the same), so
+     * this is scheduling only; the taps self-test holds it with memcmp. */
+    {
+        const size_t grid_n = job.grid_n;
+        job.grid_n = 1u;
+        sg_plan_rows(&job, 0u);
+        job.grid_n = grid_n;
+    }
     if (job.grid_m == 0u || job.grid_m > (size_t)INT_MAX) {
         sg_bump(&g_sg.fused_refused);
         return 1;
@@ -997,6 +1063,7 @@ int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     job.taps = taps;
     job.w_taps = weight;
     job.gather = gather;
+    job.pre_taps = pre_taps;
     job.b_tap_stride = b_tap_stride;
 
     /* The arithmetic is `taps` GEMMs, so it is counted as `taps` GEMMs: the
@@ -1017,6 +1084,23 @@ int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
     }
     sg_hist_add(t_prof, 0, 0, m, n, k, (int)family, job.grid_m);
     return 0;
+}
+
+int mynah_sgemm_f32_conv_taps(size_t m, size_t n, size_t k, size_t taps,
+                              const float *weight, float *gather,
+                              const float *b, size_t ldb, size_t b_tap_stride,
+                              float beta, float *c, size_t ldc) {
+    return sg_conv_taps(m, n, k, taps, weight, gather, NULL, b, ldb,
+                        b_tap_stride, beta, c, ldc);
+}
+
+int mynah_sgemm_f32_conv_taps_pre(size_t m, size_t n, size_t k, size_t taps,
+                                  const float *pre_taps, const float *b,
+                                  size_t ldb, size_t b_tap_stride, float beta,
+                                  float *c, size_t ldc) {
+    if (pre_taps == NULL) return -1;
+    return sg_conv_taps(m, n, k, taps, NULL, NULL, pre_taps, b, ldb,
+                        b_tap_stride, beta, c, ldc);
 }
 
 int mynah_sgemm_f32_forced(mynah_sgemm_family want, mynah_sgemm_family *ran,
@@ -1092,6 +1176,8 @@ static const sg_case g_edges[] = {
     {64, 17,  63,  0, "one column past the narrow boundary"},
     {4,  64,  64,  0, "exactly SG_MR rows"},
     {6,  64,  64,  0, "SG_MR + 2 rows: the ragged row tail"},
+    {11, 40,  48,  0, "6 + 4 + 1 rows: every strip height of the 6x16 tile"},
+    {16, 24,  33,  0, "6 + 6 + 4 rows: the remainder that the four-row strip takes"},
     {70, 130, 70,  1, "transposed A, all ragged"},
     {33, 31,  29,  1, "transposed A, prime"},
 };
@@ -1290,6 +1376,30 @@ static int sg_taps_case(size_t m, size_t n, size_t k, size_t taps, float beta,
                               (t == 0u) ? beta : 1.0f, c_loop, n);
     }
     int bad = (rc == 0) && memcmp(c_fused, c_loop, m * n * sizeof(float)) != 0;
+    /* The pre-permuted entry against the same loop: [taps][m][k] built here
+     * the way src/seanet.c's memo builds it, and the same byte-identity bar. */
+    float *pre = bad ? NULL : (float *)malloc(m * k * taps * sizeof(float));
+    if (pre != NULL) {
+        for (size_t t = 0; t < taps; ++t)
+            for (size_t i = 0; i < m; ++i)
+                for (size_t p = 0; p < k; ++p)
+                    pre[(t * m + i) * k + p] = w[i * k * taps + p * taps + t];
+        for (size_t i = 0; i < m * n; ++i) c_fused[i] = 0.25f * (float)(i % 7u);
+        const int rc_pre = mynah_sgemm_f32_conv_taps_pre(
+            m, n, k, taps, pre, b, ldb, 1u, beta, c_fused, n);
+        if (rc_pre < 0 || rc_pre != rc ||
+            (rc_pre == 0 &&
+             memcmp(c_fused, c_loop, m * n * sizeof(float)) != 0)) {
+            snprintf(error, error_capacity,
+                     "sgemm taps self-test: the pre-permuted entry (rc %d) is "
+                     "not byte-identical to the per-tap loop at m=%zu n=%zu "
+                     "k=%zu taps=%zu", rc_pre, m, n, k, taps);
+            free(pre);
+            free(w); free(gather); free(b); free(c_fused); free(c_loop);
+            return -1;
+        }
+        free(pre);
+    }
     if (bad) {
         size_t at = 0;
         for (; at < m * n; ++at) if (c_fused[at] != c_loop[at]) break;

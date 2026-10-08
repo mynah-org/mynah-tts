@@ -941,9 +941,9 @@ static void collect_pool(row_sink *s) {
     snprintf(buf, sizeof buf, "%d", threads);
     add_row(s, "pool.threads", "yes", "-", "MYNAH_THREADS", buf,
             MYNAH_DISPATCH_SRC_RUNTIME,
-            "[runtime] mynah_num_threads(); default is hw.perflevel0.logicalcpu "
-            "on Apple Silicon (decode is DRAM-bound, E-cores lengthen the "
-            "barrier) and the online CPU count elsewhere");
+            "[runtime] mynah_num_threads(); default is the P-core count on "
+            "Apple Silicon (E-cores lengthen the barrier), else the affinity "
+            "mask capped by a cgroup cpu quota if one is set");
 
 #if defined(__APPLE__)
     {
@@ -1124,6 +1124,9 @@ static void collect_backends(row_sink *s) {
     add_unknown(s, "kernel.gelu_vector", "yes", "-", "MYNAH_GELU_SCALAR",
                 "[UNKNOWN] src/kernels.c did not register "
                 "mynah_gelu_vector_enabled()");
+    add_unknown(s, "kernel.attention", "yes", "-", "MYNAH_ATTN_SCORES",
+                "[UNKNOWN] src/kernels.c did not register the attention "
+                "score/value predicate");
     add_unknown(s, "kernel.fused_greedy", "yes", "-", "MYNAH_FUSED_GREEDY",
                 "[UNKNOWN] src/qmat.c did not register "
                 "mynah_qmat_fused_greedy_enabled()");
