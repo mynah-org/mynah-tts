@@ -16,6 +16,7 @@
  */
 #include "costmap.h"
 #include "graph.h"
+#include "hostpool.h"
 #include "mynah_tts_internal.h"
 #include "mynah_util.h"
 #include "threads.h"
@@ -3075,6 +3076,18 @@ static int serve(const mynah_tts_engine *engine, const mynah_tts_model *model,
             mynah_backend_sync_profile_print(stderr, iteration);
         }
         mynah_hostprof_print(stderr, iteration);
+        {
+            unsigned long long par = 0ull, inl = 0ull;
+            mynah_hostpool_stats(&par, &inl);
+            if (mynah_hostpool_threads() > 1)
+                fprintf(stderr,
+                        "[SERVE] host threads (MYNAH_SERVE_HOST_THREADS): %d, %llu "
+                        "regions in parallel (%.2f per iteration), %llu inline (below "
+                        "%zu rows)\n",
+                        mynah_hostpool_threads(), par,
+                        iteration ? (double)par / (double)iteration : 0.0, inl,
+                        mynah_hostpool_min_rows());
+        }
     }
     if (timing) {
         t_ar = mynah_phase_seconds();
