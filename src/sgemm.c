@@ -146,8 +146,17 @@ typedef __m256 sg_vec;
 #else
 #define sg_fma(acc, a, b) _mm256_add_ps((acc), _mm256_mul_ps((a), (b)))
 #endif
-/* 16 architectural ymm registers: half of them may hold accumulators. */
-#define SG_ACC_VECS 8
+/* 16 architectural ymm registers.  The accumulator budget is 2 * SG_MR: two
+ * column vectors per micro-kernel row, which leaves two registers for op(B)
+ * and one for the broadcast.  See SG_MR below for why AVX2 takes six.
+ * EXTRA_CFLAGS=-DMYNAH_SGEMM_AVX2_MR=4 rebuilds the old 4x16 tile for an A/B;
+ * the output is the same either way. */
+#if defined(MYNAH_SGEMM_AVX2_MR)
+#define SG_MR_ISA MYNAH_SGEMM_AVX2_MR
+#else
+#define SG_MR_ISA 6
+#endif
+#define SG_ACC_VECS (2 * SG_MR_ISA)
 
 #else
 #define SG_ISA_NAME "scalar"
@@ -162,10 +171,27 @@ typedef float sg_vec;
 #define SG_ACC_VECS 16
 #endif
 
-/* Micro-kernel rows.  Four independent accumulator chains per column vector is
- * enough to cover the FMA latency on every core this runtime targets, and it
- * keeps the b operand loaded once per four FMAs. */
+/* Micro-kernel rows.  Four independent accumulator chains per column vector
+ * keeps the b operand loaded once per four FMAs, and on NEON (32 registers,
+ * 16 accumulators at two vectors) that already covers the FMA latency.
+ *
+ * AVX2 takes SIX: the classic 6x16 tile.  With 16 ymm registers the 4x16 tile
+ * held eight accumulators, and two FMA pipes of latency 4-5 (Zen 2, Skylake)
+ * need ten in flight to stay busy -- 4x16 capped every GEMM at ~80% of the
+ * FMA roof before a single load was counted.  Twelve accumulators, two op(B)
+ * loads and one broadcast is fifteen registers.  Measured on an EPYC 7702:
+ * sgemm 16x1024x1024 0.95 -> 0.63 ms single-threaded, codec conv stack -13%.
+ *
+ * Each output element is still ONE FMA chain over k from zero in the same
+ * order, whatever the tile height, so the result does not move: the 24-layer
+ * Pocket output is sha256-identical between the two tiles.  The taller tile
+ * leaves a taller ragged remainder, which a four-row strip takes before the
+ * one-row strip (sg_tile_nn). */
+#if defined(SG_MR_ISA)
+#define SG_MR SG_MR_ISA
+#else
 #define SG_MR 4
+#endif
 
 /* The narrow/panel boundary, DERIVED (see mynah_sgemm_narrow_max in sgemm.h):
  * the widest n whose whole C row block still fits in the accumulator budget.
@@ -565,6 +591,15 @@ static void sg_micro_tail(size_t rows, size_t cols, size_t k, const float *ap,
 
 SG_DEFINE_STRIP(sg_strip4, SG_MR, sg_micro4_4, sg_micro4_2, sg_micro4_1)
 SG_DEFINE_STRIP(sg_strip1, 1, sg_micro1_4, sg_micro1_2, sg_micro1_1)
+#if SG_MR > 4
+/* A taller tile leaves a taller ragged remainder (m = 16 is 6 + 6 + 4), and
+ * sending up to five rows through the one-row strip measured 2.1x slower on
+ * that shape.  A four-row strip takes the remainder first.  Same per-element
+ * arithmetic as every other instantiation: one FMA chain over k from zero. */
+SG_DEFINE_MICRO(sg_micror4_1, 4, 1)
+SG_DEFINE_MICRO(sg_micror4_2, 4, 2)
+SG_DEFINE_STRIP(sg_stripr4, 4, sg_micror4_2, sg_micror4_2, sg_micror4_1)
+#endif
 
 /* ======================================================================
  * The job and its tiles
@@ -611,6 +646,15 @@ static void sg_tile_nn(const sg_job *j, size_t i0, size_t rows, size_t j0,
     for (; i + SG_MR <= rows; i += SG_MR)
         sg_strip4(j->k, cols, j->nv_max, abase + i * ars, ars, acs, bbase,
                   j->ldb, j->alpha, j->beta, cbase + i * j->ldc, j->ldc);
+#if SG_MR > 4
+    /* nv_max is at most 2 here (SG_ACC_VECS / SG_MR), so the strip's
+     * four-vector slot -- wired to the two-vector kernel -- is never taken. */
+    if (i + 4u <= rows) {
+        sg_stripr4(j->k, cols, j->nv_max, abase + i * ars, ars, acs, bbase,
+                   j->ldb, j->alpha, j->beta, cbase + i * j->ldc, j->ldc);
+        i += 4u;
+    }
+#endif
     for (; i < rows; ++i)
         sg_strip1(j->k, cols, j->nv_max, abase + i * ars, ars, acs, bbase,
                   j->ldb, j->alpha, j->beta, cbase + i * j->ldc, j->ldc);
@@ -1119,6 +1163,8 @@ static const sg_case g_edges[] = {
     {64, 17,  63,  0, "one column past the narrow boundary"},
     {4,  64,  64,  0, "exactly SG_MR rows"},
     {6,  64,  64,  0, "SG_MR + 2 rows: the ragged row tail"},
+    {11, 40,  48,  0, "6 + 4 + 1 rows: every strip height of the 6x16 tile"},
+    {16, 24,  33,  0, "6 + 6 + 4 rows: the remainder that the four-row strip takes"},
     {70, 130, 70,  1, "transposed A, all ragged"},
     {33, 31,  29,  1, "transposed A, prime"},
 };
