@@ -71,7 +71,7 @@
 #define MYNAH_QMAT_X86_VNNI 1
 /* E14-2/E14-3. The same condition, named separately because it gates a
  * different pair of instructions: the AVX-512BW int8 dot for hosts that have
- * 512-bit registers and NO VPDPBUSD (Skylake-SP, Cascade Lake, Zen 3), and
+ * 512-bit registers and NO VPDPBUSD (Skylake-SP, Skylake-X), and
  * VDPBF16PS for the ones that have AVX512-BF16. Both are reached the same way
  * as VNNI -- target attribute on the kernel, CPUID at runtime -- so neither
  * needs a build flag and neither can SIGILL a host that lacks it. */
@@ -1151,7 +1151,7 @@ static void dot4_u8_i32(const uint8_t *xu, const int8_t *w, size_t cols,
 #if defined(MYNAH_QMAT_X86_AVX512)
 /* E14-2.  THE TIER BETWEEN AVX2 AND VNNI, WHICH HAD NO KERNEL.
  *
- * Skylake-SP, Cascade Lake and Zen 3 have 512-bit registers and no VPDPBUSD.
+ * Skylake-SP and Skylake-X have 512-bit registers and no VPDPBUSD.
  * Until now they ran the 256-bit AVX2 dot below and half the register file sat
  * idle -- the brief's "AVX-512 without VNNI" question, unanswered in code.
  *
@@ -7519,7 +7519,7 @@ static int probe_avx512bw_int8(const char **why) {
         qmat_x86_avx512_probe(&bw, &bf);
         *why = on ? "[predicate] src/qmat.c dot_q8_i32_avx512bw: the int8 dot "
                     "for a host with 512-bit registers and NO VPDPBUSD "
-                    "(Skylake-SP, Cascade Lake, Zen 3). Executed against the "
+                    "(Skylake-SP, Skylake-X). Executed against the "
                     "scalar reference in this process and bit-identical"
                   : (bw && qmat_int8_avx512bw_ok()
                         ? "[predicate] the kernel is here and verified, and a "
