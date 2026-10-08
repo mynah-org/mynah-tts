@@ -12042,7 +12042,7 @@ static int pocket_cuda_prefill_fixed_order(void) {
     return cached;
 }
 
-/* MYNAH_CUDA_PREFILL_PINNED (default on; =0 rolls back): the prefill tile
+/* MYNAH_CUDA_PREFILL_PINNED (opt-in, =1): the prefill tile
  * stages the text embeddings it uploads in a pinned buffer and sends them with
  * one copy. From pageable memory each cudaMemcpyAsync first waits for the
  * stream, i.e. for the decode gang queued just before the prefill pass, so the
@@ -12052,7 +12052,7 @@ static int pocket_cuda_prefill_pinned_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *value = getenv("MYNAH_CUDA_PREFILL_PINNED");
-        cached = value == NULL || strcmp(value, "0") != 0;
+        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
     }
     return cached;
 }
@@ -14286,7 +14286,7 @@ static void pocket_mimi_post_body(void *ud, size_t begin, size_t end_row) {
     }
 }
 
-/* MYNAH_CUDA_MIMI_STALE_WINDOW (default on; =0 rolls back): a row the Mimi
+/* MYNAH_CUDA_MIMI_STALE_WINDOW (opt-in, =1): a row the Mimi
  * tile owns keeps its codec K/V only in the device ring and never reads the
  * host window again (a failure drops the row; there is no host state to
  * continue from), yet advancing its host offset compacted that window, a
@@ -14297,7 +14297,7 @@ static int pocket_cuda_mimi_stale_window_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *value = getenv("MYNAH_CUDA_MIMI_STALE_WINDOW");
-        cached = value == NULL || strcmp(value, "0") != 0;
+        cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
     }
     return cached;
 }

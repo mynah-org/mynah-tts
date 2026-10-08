@@ -3379,10 +3379,9 @@ int main(int argc, char **argv) {
     }
 
     /* MYNAH_SERVE_HOST_THREADS: the serving loop's per-row host loops on a
-     * small team (src/hostpool.h). CUDA serving only; an explicit N (0..16,
-     * 0 or 1 = off) overrides the automatic count, which follows the cpus this
-     * process may use: off up to 8, 2 threads up to 16, 4 above (the
-     * scheduler is one of them). */
+     * small team (src/hostpool.h). Opt-in: N (0..16, 0 or 1 = off) sets the
+     * team size; =auto follows the cpus this process may use: off up to 8,
+     * 2 threads up to 16, 4 above (the scheduler is one of them). */
     if (g_cuda_serving) {
         const int cpus = mynah_usable_cpus();
         mynah_hostpool_set_auto(cpus <= 8 ? 1 : cpus <= 16 ? 2 : 4);
@@ -3390,11 +3389,9 @@ int main(int argc, char **argv) {
         const int given = e != NULL && e[0] != '\0';
         const int threads = mynah_hostpool_threads();
         if (threads > 1)
-            fprintf(stderr, "serving-loop host threads: %d (%s; %d usable cpus; rows "
-                            "below %zu stay inline; MYNAH_SERVE_HOST_THREADS=0 to "
-                            "roll back)\n", threads,
-                    given ? "MYNAH_SERVE_HOST_THREADS" : "by default", cpus,
-                    mynah_hostpool_min_rows());
+            fprintf(stderr, "serving-loop host threads: %d (MYNAH_SERVE_HOST_THREADS=%s; "
+                            "%d usable cpus; rows below %zu stay inline)\n", threads,
+                    given ? e : "", cpus, mynah_hostpool_min_rows());
     }
 
     pthread_mutex_init(&g_batch.mu, NULL);

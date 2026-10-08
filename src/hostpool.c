@@ -127,16 +127,18 @@ static void *hp_worker(void *arg) {
 }
 
 static void hp_resolve(void) {
-    int threads = g_auto_threads;
+    int threads = 1;   /* unset: off */
     const char *e = getenv("MYNAH_SERVE_HOST_THREADS");
-    if (e != NULL && e[0] != '\0') {
+    if (e != NULL && strcmp(e, "auto") == 0) {
+        threads = g_auto_threads;
+    } else if (e != NULL && e[0] != '\0') {
         char *end = NULL;
         const long v = strtol(e, &end, 10);
         if (end != e && *end == '\0' && v >= 0 && v <= HP_MAX_THREADS) {
             threads = (int)v;
         } else {
-            fprintf(stderr, "ignoring MYNAH_SERVE_HOST_THREADS=%s (want 0..%d)\n", e,
-                    HP_MAX_THREADS);
+            fprintf(stderr, "ignoring MYNAH_SERVE_HOST_THREADS=%s (want 0..%d or auto)\n",
+                    e, HP_MAX_THREADS);
         }
     }
     if (threads < 1) threads = 1;

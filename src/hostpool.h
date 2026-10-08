@@ -21,8 +21,8 @@
  * the caller (which always participates) never waits for a sleeping thread
  * to start.
  *
- * Off by default outside CUDA serving; the server picks a count from the cpus
- * it may use. The team is private: it does not share the kernel pool of
+ * Off by default (opt-in until measured on a host-bound GPU); with =auto the
+ * server picks a count from the cpus it may use. The team is private: it does not share the kernel pool of
  * threads.c, which the GPU server runs at MYNAH_THREADS=1. */
 #ifndef MYNAH_TTS_HOSTPOOL_H
 #define MYNAH_TTS_HOSTPOOL_H
@@ -34,8 +34,8 @@ extern "C" {
 #endif
 
 /* Threads that run a region, the caller included; 1 = off (everything inline).
- * Resolved once: MYNAH_SERVE_HOST_THREADS=N (1..16, 0 or 1 = off) if set, else
- * the automatic value set by mynah_hostpool_set_auto (0 = off). */
+ * Resolved once: MYNAH_SERVE_HOST_THREADS=N (0..16, 0 or 1 = off), or =auto
+ * for the value set by mynah_hostpool_set_auto; unset = off. */
 int mynah_hostpool_threads(void);
 
 /* The server's automatic choice for this process (called before serving). */
