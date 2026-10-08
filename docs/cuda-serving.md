@@ -520,7 +520,11 @@ L13/L13b/L13d, A1b) are on for the CUDA backend only. Effects are 2-minute scree
 | `MYNAH_CUDA_SLOT_FIXED_ROWS` | the build's `ROW_CAP` | upper bound on fixed caches (1..`ROW_CAP`) | to cap A1b's VRAM | | unset |
 | `MYNAH_CUDA_PINGPONG` (L26) | off; only `=2` accepted | two row groups in one engine, one's host work under the other's GPU work; replaces L13 / L13b when set | experimental | 7-8 % slower than L13 + L13b once the GPU is ≥ 93 % busy | unset or `=0` |
 | `MYNAH_CUDA_PINGPONG_MIN` | 128 rows | below this many rows the loop does not split | with L26 only | | unset |
-| `MYNAH_SERVE_PROFILE` | off | `[SERVE]` report at shutdown, `[CTX]` lines, per-feature counters | diagnostics, benchmarks | | **unset**: any value, `=0` included, turns it on |
+| `MYNAH_SERVE_HOST_THREADS` | off (opt-in) | the serving loop's per-row host loops (one-sync row staging, gang landing, backbone row preparation, Mimi window advance, decoder table patch) run on a private team of N threads, scheduler included; rows claimed in fixed chunks, no CUDA call on a worker, order-dependent work merged serially in row order. `=auto`: off up to 8 usable CPUs, 2 up to 16, 4 above | host-bound GPUs (L40S class); not below 8 usable CPUs | bit-identical (CLI 32/32, stream 32/32, C1 95/95); L4 C320: gang landing 0.51 -> 0.28 ms, row staging 0.25 -> 0.15 ms per iteration (`.work/cuda-host-mt-2026-10-08.md`) | unset or `=0` |
+| `MYNAH_SERVE_HOST_MIN_ROWS` / `MYNAH_SERVE_HOST_SPIN_US` | 64 rows / 50 µs | regions below this many rows run inline; a worker spins this long after a region before parking | with `MYNAH_SERVE_HOST_THREADS` | | unset |
+| `MYNAH_CUDA_PREFILL_PINNED` | off (opt-in, `=1`) | the prefill tile stages the text embeddings in one pinned buffer and uploads them with one copy, instead of a pageable `cudaMemcpyAsync` per row, which first waited for the decode gang queued just before it | always, once screened on a host-bound GPU | L4 C320: the upload was 9.3 ms of host time per iteration (12.7 ms per call); same bytes, bit-identical | unset or `=0` |
+| `MYNAH_CUDA_MIMI_STALE_WINDOW` | off (opt-in, `=1`) | a row owned by the Mimi tile advances its host codec window without copying its stale host K/V (never read again: the K/V lives in the device ring) | always, once screened on a host-bound GPU | L4 C320: the copy was ~9 µs per row and frame, 2.0 ms per iteration; bit-identical | unset or `=0` |
+| `MYNAH_SERVE_PROFILE` | off | `[SERVE]` report at shutdown, `[CTX]` lines, per-feature counters; `=2` adds the `[HOSTP]` per-phase host table (wall, device wait, host, rows and µs per row for each loop and engine phase) | diagnostics, benchmarks | | **unset**: any value, `=0` included, turns it on |
 
 `MYNAH_CUDA_PINGPONG` warns when deferred release is rolled back
 (`MYNAH_CUDA_DEFERRED_RELEASE=0`) and when the fixed slot pool is rolled back
@@ -553,6 +557,7 @@ tolerance comparison.
 | variable | use |
 |---|---|
 | `MYNAH_SERVE_PROFILE=1` | per-batch-width step times and loop breakdown printed at shutdown |
+| `MYNAH_SERVE_PROFILE=2` | the same plus `[HOSTP]`: where the scheduler thread's host time goes, per phase |
 | `MYNAH_COST_MAP=2 MYNAH_NVTX=1` | NVTX ranges for Nsight Systems |
 | `MYNAH_CUDA_KV_GROW_LOG=1` | log each attention-cache growth |
 | `MYNAH_CUDA_KV_GROW_INITIAL_STEPS=N` | force growth early (bit-identity tests) |
