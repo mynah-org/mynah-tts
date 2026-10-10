@@ -21,8 +21,8 @@ at runtime. It runs two engines behind one seam:
     or 88 of the 24-layer model (30-minute soaks, zero stalls);
   - **one NVIDIA L4:** the 24-layer model streams 288-320 concurrent requests in
     screens with the current defaults, and 160 are qualified by 30-minute soaks;
-  - **one NVIDIA L40S:** 384 concurrent 24-layer streams at stream RTF p95 0.49
-    in a screen.
+  - **one NVIDIA L40S:** 1024 concurrent 24-layer streams at stream RTF p95
+    0.746 (30-minute soak, zero stalls).
 
   See the [CUDA serving guide](docs/cuda-serving.md) and
   [performance](docs/performance.md).
